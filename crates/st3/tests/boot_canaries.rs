@@ -76,7 +76,7 @@ fn canary(harness: &str, scenario: &str) {
             "python3",
         ])
         .arg(repo.join("scripts/st3-boot-canaries/run"))
-        .arg(env!("CARGO_BIN_EXE_st3"))
+        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
         .args([harness, scenario, "--bound", "180", "--scratch"])
         .arg(scratch.path())
@@ -99,6 +99,31 @@ fn canary(harness: &str, scenario: &str) {
         passed,
         "{}\n{}\n{}",
         result.unwrap_or_default(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The canary's private root is redrawn until its name avoids "st2": the fresh-seat boundary check
+/// rejects any launch path that mentions it, and a random name holds those letters by chance.
+#[test]
+fn the_canary_never_names_its_root_after_st2() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg(repo.join("scripts/st3-boot-canaries/run"))
+        .arg("--self-test")
+        .output();
+    let Ok(output) = output else {
+        assert!(
+            std::env::var_os("CI_RUN_ID").is_none(),
+            "CI must provide python3"
+        );
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

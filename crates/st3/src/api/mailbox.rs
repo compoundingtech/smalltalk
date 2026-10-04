@@ -135,7 +135,9 @@ fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
                     continue;
                 }
             }
-            messages.push(message);
+            if store.rollout_message_allowed(&message)? {
+                messages.push(message);
+            }
         }
         messages
     } else {
@@ -160,6 +162,7 @@ where
     let mut changed = state.event_notify.subscribe();
     let mut previous_seat = Vec::new();
     let mut previous_mailbox = Vec::new();
+    let mut previous_drain = None;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     let mut dirty = true;
     // What the last snapshot read, and when the last full snapshot ran. A wake reads the seat's
@@ -178,7 +181,9 @@ where
                 let store = state.store.clone();
                 let binding = fence.clone();
                 let unchanged = tokio::task::spawn_blocking(move || {
-                    store.mailbox_changed_since(&binding, &mark, &subjects)
+                    crate::profile::task("task mailbox-change-check", || {
+                        store.mailbox_changed_since(&binding, &mark, &subjects)
+                    })
                 })
                 .await
                 .is_ok_and(|changed| changed.is_ok_and(|changed| !changed));
@@ -192,8 +197,10 @@ where
             let binding = fence.clone();
             let read = read.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let mark = store.mailbox_watermark(&binding);
-                (mark, read(&store, &binding))
+                crate::profile::task("task mailbox-snapshot", || {
+                    let mark = store.mailbox_watermark(&binding);
+                    (mark, read(&store, &binding))
+                })
             })
             .await;
             let (mark, result) = match result {
@@ -258,6 +265,29 @@ where
                 }
                 previous_mailbox = bytes;
             }
+            if fence.component == "delivery" {
+                let drain = state
+                    .store
+                    .rollout(&fence.subject)
+                    .ok()
+                    .flatten()
+                    .filter(|o| o.holds_intake() && o.old_incarnation == fence.incarnation)
+                    .map(|o| o.id);
+                if drain != previous_drain {
+                    if send(
+                        &mut socket,
+                        &Frame::Drain {
+                            operation: drain.clone(),
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    previous_drain = drain;
+                }
+            }
             dirty = false;
         }
         tokio::select! {
@@ -266,6 +296,14 @@ where
                 Some(Ok(WsMessage::Text(report))) => {
                     if fence.component == "delivery" && state.store.check_mailbox(&fence).is_ok() {
                         delivery_presence::record(&fence.subject, &report);
+                        if let Ok(value) = serde_json::from_str::<Value>(&report)
+                            && let Some(id) = value["drain_operation"].as_str()
+                            && let Ok(Some(operation)) = state.store.rollout(&fence.subject)
+                            && operation.id == id && operation.old_incarnation == fence.incarnation && operation.drain_ack.is_none()
+                        {
+                            let _ = crate::rollout::phase(&state.store, &fence.subject, &operation, "drain-ack", None, &[]);
+                            signal_changed(&state);
+                        }
                     }
                 },
                 Some(Ok(WsMessage::Pong(_))) => {},

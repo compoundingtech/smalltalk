@@ -142,6 +142,7 @@
       "required": ["kind", "session_actor", "transport", "capabilities", "limits", "event_cursor", "oldest_event_cursor", "schemas"],
       "properties": {
         "kind": { "const": "capabilities" },
+        "machine_version": { "type": "string", "description": "Compile-time build identity of the responding daemon; absent on older servers." },
         "session_actor": { "$ref": "#/$defs/Id" },
         "transport": { "enum": ["unix", "fabric-loopback"] },
         "capabilities": { "type": "array", "items": { "$ref": "#/$defs/Capability" } },
@@ -561,6 +562,33 @@
         "limits": { "type": "array", "items": { "$ref": "#/$defs/UsageLimit" } }
       }
     },
+    "ClientConnections": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "member", "items"],
+      "properties": {
+        "kind": { "const": "client-connections" },
+        "member": { "type": "string" },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/ClientConnection" } }
+      }
+    },
+    "ClientConnection": {
+      "type": "object", "additionalProperties": false,
+      "required": ["actor", "person", "member", "via", "connected", "streams", "since", "last_seen", "follows"],
+      "properties": {
+        "actor": { "type": "string" },
+        "person": { "type": "string" },
+        "client": { "type": ["string", "null"] },
+        "device_id": { "type": "string" },
+        "device_name": { "type": "string" },
+        "member": { "type": "string" },
+        "via": { "enum": ["local", "gateway", "tailscale"] },
+        "connected": { "type": "boolean" },
+        "streams": { "type": "integer", "minimum": 0 },
+        "since": { "$ref": "#/$defs/Timestamp" },
+        "last_seen": { "$ref": "#/$defs/Timestamp" },
+        "follows": { "type": "array", "items": { "type": "string" } }
+      }
+    },
     "UsageLimit": {
       "type": "object", "additionalProperties": false,
       "required": ["account", "driver", "measured_at_unix_ms", "measured_by", "host", "seats"],
@@ -772,6 +800,7 @@
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } },
             "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present for local native seats that are running or waiting, including human-blocked harnesses; a stale path makes a running agent `waiting`." },
             "subagents": { "type": "array", "items": { "$ref": "#/$defs/AgentSubagent" }, "description": "The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field." },
+            "rollout": { "type": ["object", "null"], "description": "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." },
             "suspension": { "oneOf": [{ "$ref": "#/$defs/AgentSuspension" }, { "type": "null" }], "description": "The seat's latest suspend or resume and its phase. An older daemon omits the field." }
           }
         }
@@ -1495,7 +1524,9 @@
         "parameters": { "type": "object" }
       }
     },
-    "AgentCreateParameters": {"type": "object", "additionalProperties": false, "required": ["name", "harness"], "properties": {"name": {"type": "string", "minLength": 1}, "harness": {"enum": ["claude", "codex", "pi", "omp", "opencode"]}, "host": {"type": "string", "minLength": 1}, "model": {"type": "string", "minLength": 1}, "effort": {"type": "string", "minLength": 1}, "workspace": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1}, "message": {"type": "string", "minLength": 1}}},
+    "AgentRepository": {"type": "object", "additionalProperties": false, "required": ["path", "workspaces", "agent_ids"], "properties": {"path": {"type": "string"}, "workspaces": {"type": "array", "items": {"type": "string"}}, "agent_ids": {"type": "array", "items": {"type": "string"}}}},
+    "HostRepositories": {"type": "object", "additionalProperties": false, "required": ["host_id", "repositories"], "properties": {"host_id": {"type": "string"}, "repositories": {"type": "array", "items": {"$ref": "#/$defs/AgentRepository"}}}},
+    "AgentCreateParameters": {"type": "object", "additionalProperties": false, "required": ["name", "harness"], "properties": {"name": {"type": "string", "minLength": 1}, "harness": {"enum": ["claude", "codex", "pi", "omp", "opencode"]}, "host": {"type": "string", "minLength": 1}, "model": {"type": "string", "minLength": 1}, "effort": {"type": "string", "minLength": 1}, "workspace": {"type": "string", "minLength": 1}, "repo": {"type": "string", "minLength": 1}, "base": {"type": "string", "minLength": 1}, "branch": {"type": "string", "minLength": 1}, "remove_at_run_end": {"type": "boolean"}, "description": {"type": "string", "minLength": 1}, "message": {"type": "string", "minLength": 1}}},
     "AgentStopParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}, "reason": {"type": "string"}}},
     "AgentStartParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}}},
     "AgentSuspendParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}, "reason": {"type": "string"}}},

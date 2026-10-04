@@ -4,13 +4,17 @@
 
 The client uses standard `fetch`, so callers can supply a fetch implementation and a credential callback. Call `discover()` before rendering capability-dependent controls. List and event limits are checked against the server's advertised bounds. Submit fenced actions with the generated typed methods, then use `followOperation(operation_id)` for accepted actions. `terminalStream` opens the screen stream a `terminal.attach` capability allows and calls `onScreen` with each changed screen; it needs a WebSocket that accepts headers, such as React Native's, or a `socket` factory. `collectionStream` opens the one collections socket: `subscribe` holds a window of missions, attention, agents, or work, `subscribeTerminal` follows a terminal with its attach capability, and `subscribeConversation` follows an agent's or a session's conversation, each by a client-chosen ID; `onFrame` receives every frame. `applyWindow` folds `snapshot` and `changes` frames into a window's ordered rows. Commands sent before the socket opens wait for it.
 
-Run the local contract checks with:
+Run the client checks from the repository root with Node 24 or newer:
 
 ```sh
-cargo run -p st3-client-codegen -- --check
-apps/ios/node_modules/.bin/tsc --strict --noEmit --target ES2020 --module esnext --moduleResolution bundler --lib es2020,dom clients/typescript/st3-client/index.ts clients/typescript/st3-client/types.test.ts
-node --test clients/typescript/st3-client/contract.test.cjs
+npm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund
+npm test --prefix clients/typescript/st3-client
+npm run typecheck --prefix clients/typescript/st3-client
 ```
+
+The client package pins TypeScript 6.0.3 and Effect 4.0.0-rc.118 in its own development dependencies and lockfile. These commands need only the client installation. `npm test` runs the contract and schema tests; `npm run typecheck` checks the raw client, its type fixtures and the rich schemas with the strict compiler options declared in `package.json`.
+
+To verify generated files against the Rust generator, also run `cargo run -p st3-client-codegen -- --check`. The sibling [`st3-views`](../st3-views/README.md) package shares the phone's view models with other TypeScript clients. CI checks the generated client, shared views and iOS consumers together. To run these checks locally, install the locked dependencies in this package, `clients/typescript/st3-views` and `apps/ios`, then run `bash scripts/ci-typescript-client`.
 
 ## Rich Effect schemas
 
@@ -28,9 +32,9 @@ The synchronous and effectful decode helpers default to tolerant mode: unknown e
 
 Inline semantic keywords provide branded strings and subject references, UTC instants, durations, and redacted credentials. Integer codecs reject unsafe JavaScript integers on decode and encode. Duration codecs round to whole wire units on encode; second durations preserve exact safe-integer units without overflowing millisecond precision. Recursive Glass layouts remain validated through suspended schemas.
 
-With the Effect peer installed, run the focused rich runtime regressions using Node 24 or newer:
+After installing the client development dependencies, run the focused rich checks with:
 
 ```sh
-node --test clients/typescript/st3-client/schema.test.cjs
-tsc --strict --exactOptionalPropertyTypes --noEmit --target ES2024 --module esnext --moduleResolution bundler --lib esnext,dom clients/typescript/st3-client/Schema.generated.ts
+npm run test:schema --prefix clients/typescript/st3-client
+npm run typecheck:schema --prefix clients/typescript/st3-client
 ```

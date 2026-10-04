@@ -259,7 +259,7 @@ async fn st(socket: &Path, args: &[&str]) -> std::process::Output {
     let socket = socket.to_owned();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
             .env_remove("ST_AGENT")
             .env_remove("ST_MISSION_RUN")
             .args(["--endpoint", socket.to_str().unwrap()])
@@ -276,7 +276,7 @@ async fn cli(socket: &Path, subject: &str, actor: &str, timeout: &str) -> std::p
     let actor = actor.to_owned();
     let timeout = timeout.to_owned();
     tokio::task::spawn_blocking(move || {
-        std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
             .env_remove("ST_AGENT")
             .env_remove("ST_MISSION_RUN")
             .args([
@@ -471,7 +471,7 @@ async fn a_delayed_restart_does_not_stop_a_newer_incarnation() {
 
 #[test]
 fn restart_help_explains_seats_and_the_new_incarnation() {
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         .env_remove("ST_AGENT")
         .args(["agents", "--help"])
         .output()

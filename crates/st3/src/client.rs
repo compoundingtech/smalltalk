@@ -944,16 +944,15 @@ async fn unix_request(
         let person_header = person
             .map(|person| format!("X-St3-Person: {person}\r\n"))
             .unwrap_or_default();
-        stream
-            .write_all(
-                format!(
-                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{person_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .await?;
-        stream.write_all(body).await?;
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{person_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        // A handler may answer without consuming its body. Keep small bodies in the same
+        // write as their headers to avoid a separate body write racing Connection: close.
+        request.extend_from_slice(body);
+        stream.write_all(&request).await?;
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await?;
         Ok::<_, std::io::Error>(response)
@@ -1784,6 +1783,46 @@ mod tests {
         }
         assert!(socket.exists(), "the Unix API socket did not start");
         assert_request_transports(Client::unix(&socket)).await;
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn small_unix_posts_to_handlers_that_ignore_the_body_are_answered_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let app = Router::new().route(
+            "/v1/test",
+            get(|| async { Json(test_envelope(json!({}))) }).post(move || {
+                let calls = handler_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Json(test_envelope(json!({"answered": true})))
+                }
+            }),
+        );
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&server_socket, app).await.unwrap();
+        });
+        let client = Client::unix(&socket).with_outage_wait(Duration::ZERO, false);
+        for _ in 0..100 {
+            if client.get::<Value>("/v1/test").await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // Legacy preview handlers intentionally ignore their small JSON request body.
+        // They may answer and close as soon as Hyper parses the request headers.
+        for request in 0..10_000 {
+            let answer: Value = client
+                .post("/v1/test", &json!({"request": request}))
+                .await
+                .unwrap_or_else(|error| panic!("request {request}: {error:#}"));
+            assert_eq!(answer, json!({"answered": true}));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 10_000);
         server.abort();
     }
 

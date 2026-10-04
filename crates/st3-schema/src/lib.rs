@@ -1502,6 +1502,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "workspace.observed",
+            &["agent"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            None,
+            true,
+            &[],
+        ),
+        (
             "render.applied",
             &["agent", "exec", "pty"],
             WritePolicy::SystemOnly,
@@ -2291,13 +2300,20 @@ fn claim_retention(kind: &str) -> Retention {
         | "runtime.action.deadline-reached" => Retention::SystemLocal,
         // Other nodes read the current harness state and usage: step readiness is judged on
         // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
-        "harness.observed" | "harness.usage" | "harness.todo.observed" => Retention::Latest,
+        "harness.observed" | "harness.usage" | "harness.todo.observed" | "workspace.observed" => {
+            Retention::Latest
+        }
         _ => Retention::Durable,
     }
 }
 
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
     let names: &[(&str, FieldSpec)] = match kind {
+        "workspace.observed" => &[
+            ("host", required_string()),
+            ("workspace", required_string()),
+            ("repository", string()),
+        ],
         "harness.todo.observed" => &[
             ("harness", required_string()),
             ("session_id", required_string()),
@@ -2762,6 +2778,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         ],
         "runtime.action.requested" => &[
             ("action", string()),
+            ("rollout", object()),
             ("operation", string()),
             ("runtime_id", string()),
             ("terminal", boolean()),
@@ -2774,12 +2791,14 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         | "runtime.action.failed"
         | "runtime.action.deadline-reached" => &[
             ("action", string()),
+            ("rollout", object()),
             ("operation", string()),
             ("runtime_id", string()),
             ("terminal", boolean()),
             ("incarnation_id", string()),
             ("deadline_key", string()),
             ("desired_token", string()),
+            ("rollout_operation", string()),
             ("reason", string()),
             ("signal", string()),
             ("operation_status", string()),
@@ -2843,6 +2862,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
                     "indeterminate",
                 ]),
             ),
+            ("background_jobs", integer()),
             ("driver", string()),
             ("reason", string()),
             ("incarnation_id", string()),
@@ -2856,6 +2876,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("ownership_sequence", integer()),
             ("transition_sequence", integer()),
             ("evidence_incarnation", string()),
+            ("rollout_operation", string()),
             ("quiescent", boolean()),
             ("blocking", array()),
         ],
@@ -3886,6 +3907,7 @@ mod tests {
                 "work.released",
                 "work.renewed",
                 "work.submitted",
+                "workspace.observed",
             ]
         );
         assert_eq!(registry.digest().len(), 64);

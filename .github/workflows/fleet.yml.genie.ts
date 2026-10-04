@@ -148,6 +148,57 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       nix: { binaryCaches: readOnlyBinaryCaches },
       step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && genie --check'] }),
     }),
+    // Check the shared client and its iOS consumer before merge.
+    'typescript-client': {
+      name: 'typescript-client',
+      // Reuse freshness's slot so the five general ci1 runners can cover the initial fan-out.
+      needs: ['pick-runner', 'genie-freshness'],
+      if: "${{ !cancelled() && needs.genie-freshness.result == 'success' }}",
+      'runs-on': linuxRunsOn,
+      'timeout-minutes': 10,
+      defaults: { run: { shell: 'bash' } },
+      steps: [
+        { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+        // Node 24, as in the workspace shell; schema tests use its native TypeScript loading.
+        { uses: 'actions/setup-node@v4', with: { 'node-version': '24.18.0' } },
+        {
+          name: 'Fingerprint the locked dependencies',
+          id: 'lockfiles',
+          // ci1's Nix runner lacks the Node 20 helper used by GitHub's hashFiles expression.
+          run: `lockfiles_hash=$(sha256sum apps/ios/package-lock.json clients/typescript/st3-client/package-lock.json clients/typescript/st3-views/package-lock.json | sha256sum | cut -d ' ' -f1)
+printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
+        },
+        {
+          name: 'Cache the locked TypeScript and Effect toolchain',
+          id: 'typescript-cache',
+          uses: 'actions/cache@v5',
+          with: {
+            path: 'apps/ios/node_modules\nclients/typescript/st3-client/node_modules\nclients/typescript/st3-views/node_modules',
+            key: 'typescript-client-${{ runner.os }}-node24.18.0-${{ steps.lockfiles.outputs.hash }}',
+          },
+        },
+        {
+          name: 'Install locked client dependencies',
+          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
+          run: 'npm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund',
+        },
+        {
+          name: 'Run client contracts, schemas and strict typechecks',
+          run: 'npm test --prefix clients/typescript/st3-client\nnpm run typecheck --prefix clients/typescript/st3-client',
+        },
+        {
+          name: 'Install locked view dependencies',
+          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
+          run: 'npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund',
+        },
+        {
+          name: 'Install locked iOS dependencies',
+          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
+          run: 'npm ci --prefix apps/ios --ignore-scripts --no-audit --no-fund',
+        },
+        { name: 'Check shared views, fixtures and iOS consumers', run: 'npm test --prefix clients/typescript/st3-views\nnpm run typecheck --prefix clients/typescript/st3-views\napps/ios/node_modules/.bin/tsc --noEmit -p apps/ios\nnpm test --prefix apps/ios' },
+      ],
+    },
     // The Linux gate runs as three jobs on separate runners, each with its own caches.
     // `linux-gate` below is the single required check that collects them.
     'linux-tests': linuxStageJob({

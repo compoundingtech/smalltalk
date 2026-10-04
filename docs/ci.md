@@ -9,12 +9,13 @@ checks for that PR; macOS checks on PRs require the `macos-ci` label.
 
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
 (`.github/workflows/macos.yml`) replace the fleet's former Linux `st/ci` and optional `st/ci-macos`
-execution. The required checks on `main` are `linux-gate`, `isolation-vm` and `genie-freshness`,
+execution. The required checks on `main` are `linux-gate`, `isolation-vm`, `genie-freshness` and
+`typescript-client`,
 and `main` lands through GitHub's merge queue (see [Merge queue](#merge-queue)).
 
-Every pull request, including a fork and a draft, gets the Linux gate, the isolation VM and the
-freshness check. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
-the three required checks for each queued entry.
+Every pull request, including a fork and a draft, gets the Linux gate, the isolation VM, the
+freshness check and the TypeScript client check. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
+the required checks for each queued entry.
 Checkout uses GitHub's default `pull_request` merge ref, not the contributor's unmerged
 head: it tests that head merged with the current base. Strict branch protection also requires
 that the head itself contain the latest `main`. No `pull_request_target` job runs PR code,
@@ -23,7 +24,7 @@ and the gate has only `contents: read` permission. Forks do not receive publishi
 The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
 `linux-gate` is the single required check: it needs the three jobs and passes only when every one of
 them succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
-`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm` and the `linux-gate`
+`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm`, `typescript-client` and the `linux-gate`
 aggregate use `namespace-profile-linux-x86-64`. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
@@ -67,6 +68,19 @@ retry twice with fixed 30-second delays; a retry pass is reported as flaky, not 
 Each run isolates test `HOME` and XDG state. The summary records the tested SHA,
 each stage's elapsed time, result and exit code; each stage job uploads `<job>-logs` with its log and `.time` file.
 Nextest's final summary retains flaky outcomes.
+
+st3 integration fixtures use the separate `st3-fixture` executable, built automatically by
+the test-only `test-support` dev dependency. It captures an isolated Bash environment,
+reads only the fixture HOME's `.bash_profile`, preserves the fixture PATH, and ignores the
+launching seat's process ancestry. The production `st3` target has no runtime flag or
+environment variable that enables this behavior, even if the executable is renamed.
+Fixture command helpers clear inherited `ST_AGENT`/`ST3_*`; temporary-repository Git helpers
+isolate global/system config, hooks, signing and author identity on each command. Real
+repository commits keep the host's Git policy. Run the same suite from an agent seat with
+`nix develop --command cargo nextest run -p st3 --locked --profile ci --retries 0`.
+Boot, delivery-probe and messaging-fault fixtures put large executable copies in Cargo's target scratch
+directory, keeping their Unix sockets in short temporary paths. This avoids exhausting a
+host's temporary-filesystem quota when debug binaries are copied by parallel cases.
 
 The workspace suite still covers the token-free two-node messaging fault matrix. Its historical
 channel build remains independently pinned in `.github/messaging-compat-baseline.json`. Its
@@ -164,6 +178,24 @@ image does not boot. They run in a NixOS VM (`nix/transport-isolation-vm.nix`) i
 
 The VM requires all three tests to run and pass, with no isolation opt-out. The job summary
 records the KVM probe and each phase's elapsed time.
+
+### TypeScript client
+
+`typescript-client` runs on every PR, merge-group entry and main push. It installs Node 24.18.0
+(the workspace uses Node 24), the client's pinned TypeScript 6.0.3 and
+`effect@4.0.0-rc.118` development dependencies from its own lockfile. Both `node_modules`
+directories are cached together, keyed by both lockfiles and the Node version; a miss runs `npm ci --ignore-scripts` in each package.
+The lockfile fingerprint uses `sha256sum` in Bash so ci1's Nix runner needs no Node 20
+`hashFiles` helper when it evaluates the cache key.
+
+The client package's `npm test` runs the contract and schema tests with `node --test`;
+`npm run typecheck` runs its strict compiler checks. CI installs and checks the client before
+installing the iOS dependencies for the separate project typecheck.
+`bash scripts/ci-typescript-client` runs the client commands and `tsc --noEmit -p apps/ios` locally
+when both packages' dependencies are installed.
+The iOS project allows explicit TypeScript import extensions for generated-client consumers.
+The main ruleset requires `typescript-client`. It was enabled after the new job passed on main
+in [#1256](https://github.com/compoundingtech/smalltalk/pull/1256).
 
 ### macOS
 
@@ -323,14 +355,14 @@ gh pr merge NUMBER --auto
 ```
 
 The queue tests the pull request on top of the current `main` and the entries ahead of it with
-`linux-gate`, `isolation-vm` and `genie-freshness` (these run on the `merge_group` event; see the
+`linux-gate`, `isolation-vm`, `genie-freshness` and `typescript-client` (these run on the `merge_group` event; see the
 trigger in `fleet.yml.genie.ts`) and merges it with a merge commit when they pass. The pull
 request does not need to be rebased onto the latest `main` first. A draft cannot be queued. If a
 queued check fails, the entry leaves the queue and the pull request page says why: fix it and
 queue it again. The merge train (`st lanes join smalltalk`) is retired.
 
 The ruleset (`.github/repo-settings.json`, generated from `repo-settings.json.genie.ts`, applied
-by an administrator and never by CI) requires the three checks from GitHub Actions with an empty
+by an administrator and never by CI) requires the four checks from GitHub Actions with an empty
 bypass list, keeps the pull-request, deletion and force-push protections, and configures the queue:
 merge method MERGE, up to five entries build at once (see [Measured concurrency](#measured-concurrency)),
 up to five merge together, and a check that
@@ -361,6 +393,7 @@ on 2026-10-01 recorded the workspace limits with `nsc workspace concurrency --ou
 Namespace limits CPU and memory per platform; a workflow run is not a fixed unit of capacity.
 With the current 8x16 stage runners, a merge-queue Workspace CI group initially starts three
 8-vCPU/16-GiB stage jobs and two 8-vCPU/16-GiB profile jobs: 40 vCPUs and 80 GiB at peak.
+The TypeScript client job follows generator freshness and reuses its runner slot.
 PR and main runs also start `perf-cost`, taking their initial peak to 48 vCPUs and 96 GiB.
 Five complete merge-queue groups need 200 vCPUs and 400 GiB, within the Linux pool limit;
 `max_entries_to_build` remains 5 in both the generated and live main rulesets.

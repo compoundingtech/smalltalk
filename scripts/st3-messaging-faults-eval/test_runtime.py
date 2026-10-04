@@ -28,7 +28,7 @@ class RuntimeTests(unittest.TestCase):
                     if mode == "bus":
                         bus.bind(str(runtime / "bus"))
                     with patch.dict(os.environ, environment, clear=True):
-                        node = runner.Node(root, "amber", binary, {"PATH": "/bin"})
+                        node = runner.Node(root, "amber", binary, {"PATH": "/bin"}, root / "scratch")
                     if mode == "bus":
                         self.assertEqual(str(runtime), node.env["XDG_RUNTIME_DIR"])
                     else:

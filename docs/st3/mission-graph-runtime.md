@@ -661,6 +661,19 @@ gate "text omits value" { lacks "message/report" "UNVERIFIED" }
 
 `field` uses this argument order: path, full subject, operator, value. Operators are `is`, `starts-with`, and `contains`.
 
+An `exit_code` field gate on an `exec/...` subject fails when the exec has ended and
+its selected launch cannot restart, including a missing exit code after the process was killed.
+The failure names the exec and its exit code. A running exec or an exec that can restart keeps
+an unsatisfied gate pending. `restart "never"` cannot restart; `restart "on-failure"` cannot
+restart after exit 0. An observation from an older launch does not fail a new declaration's gate.
+Other subjects and fields retain their pending behavior. This predicate rule is separate from
+the exec gate contract below.
+
+`st missions show RUN` lists unresolved predicates of this kind under `STUCK GATES` (and
+`stuck_gates` in JSON), even when an earlier gate still waits. `st doctor` reports them in
+the `terminal-exec-gates` check. These diagnostics only inspect active runs and never decide a
+gate or change a step's state.
+
 Use `every` to apply one or more field predicates to every item in an observed list:
 
 ```kdl
@@ -1249,7 +1262,7 @@ agent "parser" {
 - A new `branch` starts at `base` without upstream tracking. A branch that already exists is checked out as it is.
 - A workspace that already exists is used as it is.
 - When the checkout fails, the agent does not start. st records a `workspace-unavailable` diagnostic and retries after 30 seconds.
-- With `remove-at-run-end=#true`, st removes the worktree after the agent's run ends and its runtime stops. The branch stays in the repository.
+- With `remove-at-run-end=#true`, st removes the worktree after the agent's run ends and its runtime stops. For a top-level seat without an owning run, an explicit stop ends it. The branch stays in the repository.
 - st keeps a worktree that has uncommitted or untracked changes, and records a `checkout-kept` warning. It also keeps a worktree whose workspace a current member still uses.
 
 [`fan-out.kdl`](../../examples/st3/fan-out.kdl) gives three parallel workers one checkout each.
@@ -1588,10 +1601,30 @@ Repeated failures of this condition keep one attention item open per schedule.
 The runtime withdraws it when a subsequent occurrence successfully starts work.
 
 The runtime gives each occurrence a deterministic mission run and a unique workspace below the declared root.
+The occurrence belongs to the schedule's stable identity, across parent revisions, re-publication,
+child revision changes and daemon restarts. An already reached tick is never replayed by
+`catch-up "latest"`. Members admitting the same tick while apart converge on one run and initial
+generation; the first creation in canonical claim order supplies its child definition.
+
+A fleet member holds scheduled admission until it has completed an exchange since startup, and
+while replication reports missing history or a deferred projection. A local-only daemon and a
+fleet's sole member can admit immediately. Other fleet members may continue local work during a
+partition; a cold member needs a peer exchange before starting scheduled work.
 
 The mission steps are normal claimable work. A schedule does not start another occurrence while its prior mission run remains active.
 
-Only the host that requested an occurrence's work starts it. The request can name a mission revision
+Only the schedule's owning host arms occurrences, requests work, and creates its workspaces and
+mission runs. An omitted `host` or `host "local"` means the selected declaration's originating host,
+including for schedules declared by a mission run; replication does not make each receiving member
+an owner. An explicit host selects that member. The owning host can also start an old request
+recorded by another member, so requests made by older daemons do not block the schedule forever.
+
+An unavailable workspace leaves its request pending. The owning daemon retries at most once every
+30 seconds per schedule and records each unchanged `workspace-unavailable` diagnostic once per
+schedule and code, including across daemon restarts. A different failure reason can surface a new
+diagnostic; another schedule's diagnostic cannot defeat this deduplication.
+
+The request can name a mission revision
 or owner run that has not reached that host yet. Then it stays pending, and the schedule records a
 `reconcile.fault` naming the cause. A request that cannot start for any other reason records
 `schedule.work-failed`, and the schedule fires again at its next occurrence.

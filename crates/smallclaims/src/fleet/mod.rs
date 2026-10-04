@@ -40,6 +40,9 @@ pub fn activate(store: &Store, state_dir: &Path, file: &FleetFile) -> Result<()>
     }
     let key = MemberKey::load(&file.node_key_path(state_dir))?;
     let public = key.public().to_owned();
+    // Activation may seal work written before a restart or before founding the fleet.
+    // Restore the complete signing chain first, including person root and device keys.
+    store.use_key_directory(&join::key_directory(state_dir))?;
     store.set_member_key(Some(Arc::new(key)))?;
     if file.anchor_key.as_deref() == Some(public.as_str()) {
         store.admit_fleet_anchor(&file.fleet_id, &public, file.mode.as_str())?;

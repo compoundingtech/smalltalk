@@ -61,8 +61,6 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
     ("GET /v1/client/missions/{*id}", 18.0),
     // Checkpoint status walks the sealed set (9.8x).
     ("GET /v1/checkpoint/status", 15.0),
-    // Device inventory reads every principal claim (9.8x).
-    ("GET /v1/client/devices", 15.0),
     // Runtimes read every runtime observation (3.8x for the list, 9.0x for one runtime).
     ("GET /v1/client/runtimes", 6.0),
     ("GET /v1/client/runtimes/{*id}", 14.0),
@@ -234,6 +232,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
     // Writes that need a live runtime or a person's approval the generated store lacks.
     ("POST /v1/agents/rename", "renames a declared agent"),
     ("POST /v1/agents/restart", "restarts a live seat"),
+    (
+        "POST /v1/agents/rollout",
+        "requires a running source-fenced native seat",
+    ),
     ("POST /v1/agents/start", "starts a seat"),
     ("POST /v1/agents/suspend", "suspends a live seat"),
     ("POST /v1/agents/resume", "resumes a live seat"),
@@ -470,12 +472,14 @@ const PROBES: &[Probe] = &[
         "/v1/client/documents/content?name={document_reference}",
     ),
     get("GET /v1/client/usage", "/v1/client/usage"),
+    get("GET /v1/client/clients", "/v1/client/clients"),
     get(
         "GET /v1/client/subject-definition",
         "/v1/client/subject-definition?subject={seat}",
     ),
     get("GET /v1/client/now", "/v1/client/now"),
     get("GET /v1/client/machines", "/v1/client/machines"),
+    get("GET /v1/client/hosts/{*id}", "/v1/client/hosts/local/repositories"),
     get("GET /v1/client/devices", "/v1/client/devices"),
     get("GET /v1/client/attention", "/v1/client/attention"),
     get(
@@ -620,6 +624,17 @@ const PROBES: &[Probe] = &[
     get("GET /v1/status", "/v1/status?subject={seat}"),
     get("GET /v1/desired/{*subject}", "/v1/desired/{seat}"),
     get("GET /v1/events", "/v1/events?limit=100"),
+    // The route streams JSON Lines rather than the JSON document the HTTP probe expects.
+    // Measure the same paged exporter directly, normalizing work by archive bytes.
+    direct("GET /v1/backup", |store, _, _| {
+        let mut archive = Vec::new();
+        store
+            .write_backup(&mut archive)
+            .map_err(|error| error.to_string())?;
+        String::from_utf8(archive)
+            .map(Value::String)
+            .map_err(|error| error.to_string())
+    }),
     get("GET /v1/doctor", "/v1/doctor"),
     get("GET /v1/repair", "/v1/repair"),
     get("GET /v1/replication/status", "/v1/replication/status"),

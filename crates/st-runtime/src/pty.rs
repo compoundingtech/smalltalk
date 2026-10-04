@@ -185,6 +185,70 @@ impl PtyRuntime {
         display_name: Option<&str>,
         tags: &BTreeMap<String, String>,
     ) -> Result<()> {
+        self.spawn_guarded(id, launch, cwd, env, display_name, tags, None, None)
+    }
+
+    /// Start a cutover only after its predecessor exited. A replay can reuse only the exact
+    /// operation's tagged replacement; an unrelated live incarnation is never adopted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_after(
+        &self,
+        id: &str,
+        launch: &Launch,
+        cwd: &Path,
+        env: &BTreeMap<String, String>,
+        display_name: Option<&str>,
+        tags: &BTreeMap<String, String>,
+        predecessor: &str,
+        operation: &str,
+    ) -> Result<()> {
+        self.spawn_guarded(
+            id,
+            launch,
+            cwd,
+            env,
+            display_name,
+            tags,
+            Some((predecessor, operation)),
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_after_checked(
+        &self,
+        id: &str,
+        launch: &Launch,
+        cwd: &Path,
+        env: &BTreeMap<String, String>,
+        display_name: Option<&str>,
+        tags: &BTreeMap<String, String>,
+        predecessor: &str,
+        operation: &str,
+        guard: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.spawn_guarded(
+            id,
+            launch,
+            cwd,
+            env,
+            display_name,
+            tags,
+            Some((predecessor, operation)),
+            Some(guard),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_guarded(
+        &self,
+        id: &str,
+        launch: &Launch,
+        cwd: &Path,
+        env: &BTreeMap<String, String>,
+        display_name: Option<&str>,
+        tags: &BTreeMap<String, String>,
+        cutover: Option<(&str, &str)>,
+        guard: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<()> {
         let _spawn_lock = self.acquire_spawn_lock(id)?;
         let fence = self.spawn_state_path(id, "pending");
         let mut before = self
@@ -201,6 +265,29 @@ impl PtyRuntime {
                 .snapshot()?
                 .into_iter()
                 .find(|observation| observation.name == id);
+        }
+        if let Some((predecessor, operation)) = cutover
+            && let Some(observed) = before.as_ref() {
+                anyhow::ensure!(
+                    observed.status != "unknown",
+                    "rollout cannot spawn while the PTY identity is unknown"
+                );
+                if observation_is_live(observed) {
+                    anyhow::ensure!(
+                        observed.tags.get("st3.rollout").map(String::as_str) == Some(operation)
+                            && observation_incarnation(observed)
+                                .as_deref()
+                                .is_some_and(|inc| inc != predecessor),
+                        "rollout cannot adopt another live PTY incarnation"
+                    );
+                } else {
+                    let same = observation_incarnation(observed).as_deref() == Some(predecessor)
+                        || (observed.pid.is_none()
+                            && predecessor.split_once(':').is_some_and(|(_, created)| {
+                                observed.created_at.as_deref() == Some(created)
+                            }));
+                    anyhow::ensure!(same, "rollout predecessor changed before spawn");
+                }
         }
         if before.as_ref().is_some_and(observation_is_live) {
             return Ok(());
@@ -219,6 +306,9 @@ impl PtyRuntime {
             let recorded = self.spawn_state_path(id, "scope");
             std::fs::write(&recorded, &unit)
                 .with_context(|| format!("record PTY scope {}", recorded.display()))?;
+        }
+        if let Some(guard) = guard {
+            guard()?;
         }
         let previous_incarnation = before.as_ref().and_then(observation_incarnation);
         std::fs::write(&fence, previous_incarnation.as_deref().unwrap_or_default())
@@ -248,6 +338,9 @@ impl PtyRuntime {
             ]);
         }
         let mut effective_tags = tags.clone();
+        if let Some((_, operation)) = cutover {
+            effective_tags.insert("st3.rollout".into(), operation.into());
+        }
         effective_tags.insert(
             "st3.isolation".into(),
             isolation_name(crate::isolation_mode()).into(),
@@ -950,6 +1043,64 @@ exit 0
     /// A live session's pid file, naming `pid` as its daemon.
     fn write_pid(registry: &Path, name: &str, pid: u32) {
         fs::write(registry.join(format!("{name}.pid")), pid.to_string()).unwrap();
+    }
+
+    #[test]
+    fn rollout_spawn_refuses_an_unrelated_live_incarnation_and_reuses_only_its_own_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        let binary = fake_pty(root.path(), "rollout-pty", "  publish replacement");
+        let runtime = PtyRuntime::new(registry.clone()).with_binary(binary.to_string_lossy());
+        for marker in ["someone-else", "cutover-one"] {
+            write_record(
+                &registry,
+                "work",
+                serde_json::json!({"createdAt":"replacement","tags":{"st3.rollout":marker}}),
+            );
+            write_pid(&registry, "work", std::process::id());
+            fs::write(registry.join("work.sock"), "").unwrap();
+            let result = runtime.spawn_after(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+                "42:original",
+                "cutover-one",
+            );
+            assert_eq!(result.is_ok(), marker == "cutover-one");
+            assert!(
+                !binary.with_extension("args").exists(),
+                "a replay must not execute a second spawn"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_spawn_rechecks_its_source_guard_inside_the_spawn_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(root.path(), "rollout-source", "  publish replacement");
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        let refusal = runtime.spawn_after_checked(
+            "work",
+            &Launch::Argv(vec!["true".into()]),
+            root.path(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+            "42:original",
+            "cutover-one",
+            &|| anyhow::bail!("source superseded"),
+        );
+        assert!(
+            refusal
+                .unwrap_err()
+                .to_string()
+                .contains("source superseded")
+        );
+        assert!(!binary.with_extension("args").exists());
     }
 
     /// A daemon socket for `name` that answers STATUS with `status` and PEEK with `screen`, and

@@ -278,7 +278,10 @@ fn mission_references(
             let Ok(resolved) = crate::mission::interpolate(agent, &variables) else {
                 continue;
             };
-            if !mission.revision_owners.contains(agent) && !scope.subject(graph, &resolved)? {
+            if !resolved.starts_with("person/")
+                && !mission.revision_owners.contains(agent)
+                && !scope.subject(graph, &resolved)?
+            {
                 refusals.push(format!(
                     "mission `{}` references missing eligible agent `{agent}`",
                     mission.subject

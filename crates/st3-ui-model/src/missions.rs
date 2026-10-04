@@ -80,6 +80,10 @@ pub enum StepState {
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Step {
+    /// Stable step-run identity, including when several open runs share a path.
+    pub id: String,
+    /// The claimant, else assignee; absent for agentless or unassigned steps.
+    pub seat: Option<String>,
     pub name: String,
     pub state: StepState,
     pub owner: Option<String>,
@@ -361,6 +365,10 @@ pub fn adapt<'a>(
                         None
                     };
                     Step {
+                        id: step.id.clone(),
+                        seat: (!step.agentless)
+                            .then(|| step.claimant.clone().or_else(|| step.assignee.clone()))
+                            .flatten(),
                         name: step.path.clone(),
                         state,
                         owner: if state == StepState::NeedsYou {

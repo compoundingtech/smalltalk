@@ -20,6 +20,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "launch",
             "lanes",
             "devices",
+            "clients",
         ],
     ),
     (
@@ -35,6 +36,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "replication",
             "apply",
             "sets",
+            "backup",
             "doctor",
             "rules",
             "repair",

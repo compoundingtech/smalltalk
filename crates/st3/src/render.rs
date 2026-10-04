@@ -3,8 +3,6 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result};
@@ -310,6 +308,15 @@ pub fn apply_all(
     desired: &[&DesiredSubject],
     host: &str,
 ) -> BTreeMap<String, Result<RenderResult>> {
+    apply_all_checked(store, desired, host, &|_| Ok(()))
+}
+
+pub(crate) fn apply_all_checked(
+    store: &Store,
+    desired: &[&DesiredSubject],
+    host: &str,
+    guard: &dyn Fn(&DesiredSubject) -> Result<()>,
+) -> BTreeMap<String, Result<RenderResult>> {
     let mut plans = BTreeMap::new();
     let mut results = BTreeMap::new();
     for subject in desired {
@@ -423,6 +430,31 @@ pub fn apply_all(
         if let Some(declaration) = desired.iter().find(|d| d.subject == subject)
             && let Err(error) = store.owned_desired_guard(declaration) {
             results.insert(subject, Err(error.into()));
+            continue;
+        }
+        if let Some(declaration) = desired.iter().find(|d| d.subject == subject) {
+            match crate::rollout::hold_render(store, declaration) {
+                Ok(true) => {
+                    results.insert(
+                        subject,
+                        Ok(RenderResult {
+                            warnings,
+                            receipts: Vec::new(),
+                        }),
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    results.insert(subject, Err(error));
+                    continue;
+                }
+            }
+        }
+        if let Some(declaration) = desired.iter().find(|d| d.subject == subject)
+            && let Err(error) = guard(declaration)
+        {
+            results.insert(subject, Err(error));
             continue;
         }
         if let Some(workspace) = native_workspaces.get(subject.as_str()) {
@@ -999,7 +1031,7 @@ mod tests {
     }
 
     fn git(workspace: &Path, arguments: &[&str]) {
-        let status = Command::new("git")
+        let status = crate::test_support::git()
             .args([
                 "-c",
                 "user.name=Example",
@@ -1208,13 +1240,13 @@ host "node" {{
     fn render_refuses_to_change_a_tracked_file() {
         let store = Store::open_memory("node").unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()
             .unwrap();
         fs::write(workspace.path().join("tracked"), "original\n").unwrap();
-        Command::new("git")
+        crate::test_support::git()
             .args(["add", "tracked"])
             .current_dir(workspace.path())
             .status()
@@ -1238,7 +1270,7 @@ host "node" {{
     fn git_exclude_updates_a_normal_repository_once() {
         let store = Store::open_memory("node").unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()

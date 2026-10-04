@@ -98,7 +98,7 @@ query distinguishes a recorded receipt, local visibility,
 supersession and current rollout. Remote replica visibility remains unknown in this response.
 
 Plain declaration-changing start, stop, rename and publication routes refuse managed subjects.
-Restart, suspend and resume keep their existing runtime behavior and require an unblocked set.
+Restart, suspend and resume require an unblocked set and cannot bypass an active or held owned-seat rollout. Use `st agents rollout` to retry its cutover with fresh fences.
 Use the set publisher to change a managed declaration or retire it.
 
 Owned sets do not install a repository watcher. Git-backed automation remains a separate,
@@ -110,3 +110,7 @@ request with intent, source, set fence and actor. Apply also needs the preview's
 when required, its retirement digest. Client-v0 read routes are `/v1/client/sets` and
 `/v1/client/sets/NAME`, with optional `?sha=SHA` on the detail route. Rust, Swift and TypeScript
 clients expose the additive `owned-set` resource and set list/detail operations.
+
+An optional [`when-idle` rollout policy](owned-seat-cutover.md) drains changed and retiring native seats
+and verifies their original conversation on the replacement. Without it, publication retains its
+immediate runtime behavior.

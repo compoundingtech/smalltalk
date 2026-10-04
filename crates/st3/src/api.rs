@@ -59,13 +59,14 @@ use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
+mod client_presence;
 mod client_v0;
-mod owned_sets;
 mod delivery_presence;
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
 mod mailbox;
+mod owned_sets;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
@@ -332,12 +333,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/documents/content", get(client_v0::document_get))
         .route("/v1/client/usage", get(client_v0::usage_period))
+        .route("/v1/client/clients", get(client_v0::clients_list))
         .route(
             "/v1/client/subject-definition",
             get(client_v0::subject_definition),
         )
         .route("/v1/client/now", get(client_v0::now))
         .route("/v1/client/machines", get(client_v0::machines))
+        .route("/v1/client/hosts/{*id}", get(client_v0::host_repositories))
         .route("/v1/client/devices", get(client_v0::devices))
         .route("/v1/client/attention", get(client_attention))
         .route("/v1/client/attention/{*id}", get(client_attention_detail))
@@ -457,6 +460,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/intent/apply", post(apply))
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
+        .route("/v1/agents/rollout", post(rollout_agent))
         .route("/v1/agents/start", post(start_mission_seat))
         .route("/v1/agents/suspend", post(suspend_agent))
         .route("/v1/agents/resume", post(resume_agent))
@@ -538,6 +542,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/doctor", get(doctor))
         .route("/v1/repair", get(operational_repair_plan))
         .route("/v1/repair/apply", post(apply_operational_repair))
+        .route("/v1/backup", get(backup_export))
         .route("/v1/replication/status", get(replication_status))
         .route("/v1/replication/records", get(replication_records))
         .route("/v1/replication/records/{*record}", get(replication_record))
@@ -764,6 +769,8 @@ async fn response_envelope(
         (Ok(None), None)
     };
     if let Ok(Some(session)) = &client_authentication {
+        // The clients connected now: kept in memory, shown by clients.list, never enforced.
+        client_presence::note_request(&state.node, session, request.headers(), client_now_ms());
         request.extensions_mut().insert(session.clone());
     }
     if let Some(snapshot) = &client_snapshot {
@@ -1479,6 +1486,7 @@ async fn client_capabilities(
     let capabilities = client_v0::capabilities(&session);
     Json(json!({
         "kind": "capabilities",
+        "machine_version": st_drivers::version::machine_version(),
         "session_actor": session.actor,
         "transport": session.transport,
         "capabilities": capabilities,
@@ -2223,6 +2231,7 @@ fn client_agent_resources_uncached(
                 })).collect::<Vec<_>>(),
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
+                "rollout": store.rollout(&subject.subject)?,
             });
             Ok((name, value))
         })
@@ -4366,6 +4375,12 @@ async fn serve_unix_with_ancestor(
     bind_harness: bool,
     ancestor: fn(u32) -> Option<String>,
 ) -> anyhow::Result<()> {
+    // Only st3-fixture initializes this process-local state. Disable host ancestry while
+    // retaining native-driver identification, which mailbox subscriptions require.
+    #[cfg(feature = "test-support")]
+    let bind_ancestry = bind_harness && crate::test_support::login_shell().is_none();
+    #[cfg(not(feature = "test-support"))]
+    let bind_ancestry = bind_harness;
     crate::config::validate_unix_socket_path(socket, "--socket or --client-gateway-socket")?;
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
@@ -4406,7 +4421,7 @@ async fn serve_unix_with_ancestor(
             // out of the accept loop so a slow lookup delays only this peer.
             let (bound_agent, caller, delivery_peer) = match peer_pid {
                 Some(pid) => tokio::task::spawn_blocking(move || {
-                    let bound_agent = bind_harness.then(|| ancestor(pid)).flatten();
+                    let bound_agent = bind_ancestry.then(|| ancestor(pid)).flatten();
                     let caller = Some(crate::profile::Caller::of_command(
                         local_process_arguments(pid).map(|(arguments, _)| arguments),
                         bound_agent.as_deref(),
@@ -4715,6 +4730,41 @@ fn record_legacy_poll(
 #[derive(Clone, Debug)]
 pub struct BoundAgent(pub String);
 
+/// Only a locally bound harness may recover a missing work fence from its own runtime.
+/// Explicit fences are retained so the action's validation can refuse stale callers.
+fn bind_work_incarnation(
+    state: &AppState,
+    bound: Option<&Extension<BoundAgent>>,
+    actor: Option<&str>,
+    incarnation: &mut Option<String>,
+) -> Result<Option<String>, ApiError> {
+    let Some(bound) = bound else { return Ok(None) };
+    let seat = &bound.0.0;
+    if actor.and_then(normalized_agent_actor).as_deref() != Some(seat.as_str()) {
+        return Err(ApiError::bad(St3Error::new(
+            "foreign-agent-actor",
+            format!(
+                "this harness is `{seat}` and cannot act as `{}`",
+                actor.unwrap_or("<none>")
+            ),
+        )));
+    }
+    let current = state
+        .store
+        .latest_claim(seat, Some("runtime.observed"))
+        .map_err(ApiError::internal)?
+        .filter(|runtime| runtime.body["fields"]["status"] == "running")
+        .and_then(|runtime| {
+            runtime.body["fields"]["incarnation_id"]
+                .as_str()
+                .map(str::to_owned)
+        });
+    if incarnation.is_none() {
+        *incarnation = current.clone();
+    }
+    Ok(current)
+}
+
 async fn guard_bound_request(
     request: Request<Body>,
     bound_agent: Option<&str>,
@@ -4753,6 +4803,7 @@ async fn guard_bound_request(
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
         "/v1/agents/restart",
+        "/v1/agents/rollout",
         "/v1/agents/start",
         "/v1/agents/suspend",
         "/v1/agents/resume",
@@ -4814,7 +4865,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
-        "features": {"owned_sets":1},
+        "features": {"owned_sets":1,"seat_rollout":1},
     })))
 }
 
@@ -5267,6 +5318,57 @@ fn unread_current_seat_counts(
     }
     Ok((pending, accepted))
 }
+fn terminal_exec_gates_check(store: &Store) -> anyhow::Result<DoctorCheck> {
+    fn has_exit_code_gate(mission: &crate::model::MissionSpec) -> bool {
+        let has_gate = |gates: &[crate::model::GateSpec]| {
+            gates.iter().any(|gate| {
+                matches!(gate, crate::model::GateSpec::Field { path, .. } if path == "exit_code")
+            })
+        };
+        has_gate(&mission.gates)
+            || mission.steps.values().any(|step| {
+                has_gate(&step.gates)
+                    || step
+                        .nested_mission
+                        .as_deref()
+                        .is_some_and(has_exit_code_gate)
+            })
+    }
+    let runs = store.open_mission_run_headers()?;
+    let missions = store.mission_specs_for_runs(
+        &runs
+            .iter()
+            .map(|run| run.subject.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let mut stuck = Vec::new();
+    for run in runs {
+        let Some(mission) = missions.get(&run.subject) else {
+            continue;
+        };
+        if !has_exit_code_gate(mission) {
+            continue;
+        }
+        // Detail-free step states suffice; do not hydrate wake, timing or loop histories.
+        if let Some(run) = store.mission_run_steps(&run.subject, false)? {
+            stuck.extend(crate::reconcile::stuck_field_gates(store, &run, mission)?);
+        }
+    }
+    stuck.sort();
+    Ok(DoctorCheck {
+        name: "terminal-exec-gates".into(),
+        status: if stuck.is_empty() { "pass" } else { "warn" }.into(),
+        message: if stuck.is_empty() {
+            "no unresolved field gates wait on execs that ended without a restart".into()
+        } else {
+            format!(
+                "stuck gates: {}; inspect `st missions show RUN`",
+                stuck.join("; ")
+            )
+        },
+    })
+}
+
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
     match state.store.index() {
@@ -5327,6 +5429,13 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: format!("could not compute the operational repair plan: {error}"),
         }),
     }
+    checks.push(
+        terminal_exec_gates_check(&state.store).unwrap_or_else(|error| DoctorCheck {
+            name: "terminal-exec-gates".into(),
+            status: "warn".into(),
+            message: format!("could not inspect terminal exec gates: {error}"),
+        }),
+    );
     match tempfile::Builder::new()
         .prefix(".st3-doctor-")
         .tempfile_in(&state.state_dir)
@@ -5974,6 +6083,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         "pass"
     };
     Ok(Json(DoctorReport {
+        machine_version: Some(st_drivers::version::machine_version()),
         status: report_status.into(),
         checks,
         performance: crate::performance::snapshot(),
@@ -6122,6 +6232,35 @@ async fn repair_replication_record(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(claim))
+}
+
+/// Spool one snapshot on a read worker; a slow downloader never holds the SQLite snapshot.
+async fn backup_export(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let store = state.store.clone();
+    let file = blocking_store(move || {
+        let mut file = tempfile::tempfile()?;
+        store.write_backup(&mut file)?;
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    })
+    .await?;
+    let file = tokio::fs::File::from_std(file);
+    let stream = futures_util::stream::try_unfold(file, |mut file| async move {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = vec![0_u8; 64 * 1024];
+        let read = file.read(&mut bytes).await?;
+        if read == 0 {
+            return Ok::<_, std::io::Error>(None);
+        }
+        bytes.truncate(read);
+        Ok(Some((bytes, file)))
+    });
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 async fn replication_export(
@@ -8396,6 +8535,56 @@ async fn publication_refusals(
 }
 
 #[derive(Deserialize)]
+struct AgentRolloutRequest {
+    subject: String,
+    actor: String,
+    expected_desired: String,
+    expected_incarnation: String,
+    policy: crate::rollout::Policy,
+    idempotency_key: String,
+}
+async fn rollout_agent(
+    State(state): State<AppState>,
+    Json(request): Json<AgentRolloutRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "invalid-rollout-actor")?;
+    let subject = agent_subject(request.subject);
+    let old =
+        crate::rollout::launched_member(&state.store, &subject, &request.expected_incarnation)
+            .map_err(ApiError::internal)?
+            .map(|(_, member)| member)
+            .or_else(|| {
+                state
+                    .store
+                    .rollout(&subject)
+                    .ok()
+                    .flatten()
+                    .filter(|o| o.old_incarnation == request.expected_incarnation)
+                    .map(|o| o.old_member)
+            })
+            .ok_or_else(|| {
+                ApiError::bad(St3Error::new(
+                    "rollout-launch-unknown",
+                    "the named incarnation has no original launch receipt",
+                ))
+            })?;
+    let response = state
+        .store
+        .request_rollout(
+            &subject,
+            &request.expected_desired,
+            &old,
+            &request.expected_incarnation,
+            &actor,
+            &request.policy,
+            &format!("seat-rollout-retry:{subject}:{}", request.idempotency_key),
+        )
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
+}
+
+#[derive(Deserialize)]
 struct AgentRestartRequest {
     subject: String,
     actor: String,
@@ -8420,6 +8609,17 @@ async fn restart_agent(
         .map_err(ApiError::internal)?
     {
         return Ok(Json(prior));
+    }
+    if state
+        .store
+        .rollout(&subject)
+        .map_err(ApiError::bad)?
+        .is_some_and(|o| o.holds_seat())
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "rollout-in-progress",
+            "the seat has a rollout; inspect it or retry with st agents rollout",
+        )));
     }
     if crate::suspension::current(&state.store, &subject)
         .map_err(ApiError::internal)?
@@ -8559,7 +8759,21 @@ fn suspension_target(
     ),
     ApiError,
 > {
-    state.store.owned_member_guard(subject).map_err(ApiError::bad)?;
+    state
+        .store
+        .owned_member_guard(subject)
+        .map_err(ApiError::bad)?;
+    if state
+        .store
+        .rollout(subject)
+        .map_err(ApiError::bad)?
+        .is_some_and(|o| o.holds_seat())
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "rollout-in-progress",
+            "the seat has a rollout; inspect it or retry with st agents rollout",
+        )));
+    }
     let status = state
         .store
         .status(Some(subject))
@@ -9479,8 +9693,29 @@ struct AttentionQuery {
 
 async fn ask_person(
     State(state): State<AppState>,
-    Json(request): Json<PersonAskRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<PersonAskRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    let expected = bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        Some(&request.actor),
+        &mut request.incarnation,
+    )?;
+    if bound.is_some()
+        && request.step.is_some()
+        && request.new_run.is_none()
+        && request.incarnation != expected
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-work-ask",
+            format!(
+                "only the current claimant and incarnation of live work can ask a person; expected incarnation `{}`, given `{}`",
+                expected.as_deref().unwrap_or("<none>"),
+                request.incarnation.as_deref().unwrap_or("<none>")
+            ),
+        )));
+    }
     let result = state.store.ask_person(&request).map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(result))
@@ -10934,9 +11169,13 @@ async fn list_mission_runs(
 ) -> Result<Json<Vec<MissionRunView>>, ApiError> {
     let store = state.store.clone();
     match (query.root, query.mission) {
-        (Some(root), None) => blocking_store(move || store.mission_runs_for_root(&root))
-            .await
-            .map(Json),
+        (Some(root), None) => blocking_store(move || {
+            let mut runs = store.mission_runs_for_root(&root)?;
+            annotate_stuck_gates(&store, &mut runs)?;
+            Ok(runs)
+        })
+        .await
+        .map(Json),
         (None, Some(mission)) => {
             blocking_store(move || store.active_mission_runs_for_mission(&mission))
                 .await
@@ -10949,16 +11188,37 @@ async fn list_mission_runs(
     }
 }
 
+fn annotate_stuck_gates(store: &Store, runs: &mut [MissionRunView]) -> anyhow::Result<()> {
+    let active = runs
+        .iter()
+        .filter(|run| matches!(run.status.as_str(), "running" | "standing" | "blocked"))
+        .map(|run| run.subject.clone())
+        .collect::<Vec<_>>();
+    let missions = store.mission_specs_for_runs(&active)?;
+    for run in runs {
+        if let Some(mission) = missions.get(&run.subject) {
+            run.stuck_gates = crate::reconcile::stuck_field_gates(store, run, mission)?;
+        }
+    }
+    Ok(())
+}
+
 async fn get_mission_run(
     State(state): State<AppState>,
     AxumPath(run): AxumPath<String>,
 ) -> Result<Json<MissionRunView>, ApiError> {
     let store = state.store.clone();
     let run_for_read = run.clone();
-    blocking_store(move || store.mission_run(&run_for_read))
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("mission run `{run}` does not exist")))
+    blocking_store(move || {
+        let Some(mut run) = store.mission_run(&run_for_read)? else {
+            return Ok(None);
+        };
+        annotate_stuck_gates(&store, std::slice::from_mut(&mut run))?;
+        Ok(Some(run))
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(|| ApiError::not_found(format!("mission run `{run}` does not exist")))
 }
 
 async fn revise_mission_run(
@@ -11508,8 +11768,15 @@ fn person_or_agent_actor(actor: &str, code: &'static str) -> Result<String, ApiE
 async fn publish_work_mission(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
-    Json(request): Json<MissionProductionRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<MissionProductionRequest>,
 ) -> Result<Json<MissionOutputView>, ApiError> {
+    bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        Some(&request.actor),
+        &mut request.incarnation,
+    )?;
     let step = state
         .store
         .step_run(&subject)
@@ -11743,8 +12010,15 @@ fn normalized_agent_actor(actor: &str) -> Option<String> {
 async fn post_work_action(
     State(state): State<AppState>,
     AxumPath((action, subject)): AxumPath<(String, String)>,
-    Json(request): Json<WorkRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<WorkRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        request.actor.as_deref(),
+        &mut request.incarnation,
+    )?;
     work_action_response(state, action, subject, request, None).await
 }
 
@@ -11752,8 +12026,15 @@ async fn post_work_action(
 async fn extend_work(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
-    Json(request): Json<crate::model::WorkExtendRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<crate::model::WorkExtendRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        request.actor.as_deref(),
+        &mut request.incarnation,
+    )?;
     let extend_ms = request.by_ms;
     let request = WorkRequest {
         actor: request.actor,
@@ -13096,6 +13377,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/agent-queue-moves",
             "/v1/agents/rename",
             "/v1/agents/restart",
+            "/v1/agents/rollout",
             "/v1/agents/start",
             "/v1/agents/suspend",
             "/v1/agents/resume",
@@ -14267,39 +14549,48 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 idempotency_key: None,
             })
             .unwrap();
-        let hold = Duration::from_secs(5);
+        let watchdog = Duration::from_secs(30);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let mut holders = Vec::new();
+        // Keep every resource held until all probes finish. Dropping the senders also
+        // releases the holders on assertion failure, so a failed probe cannot strand them.
+        let mut releases = Vec::new();
         let store = state.store.clone();
         let ready = ready_tx.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        releases.push(release_tx);
         holders.push(std::thread::spawn(move || {
             store.hold_write_transaction_for_test(|| {
                 ready.send(()).unwrap();
-                std::thread::sleep(hold);
+                let _ = release_rx.recv();
             });
         }));
         let store = state.store.clone();
         let ready = ready_tx.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        releases.push(release_tx);
         holders.push(std::thread::spawn(move || {
             store.hold_read_connections_for_test(|| {
                 ready.send(()).unwrap();
-                std::thread::sleep(hold);
+                let _ = release_rx.recv();
             });
         }));
         for _ in 0..8 {
             let (store, ready) = (state.store.clone(), ready_tx.clone());
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            releases.push(release_tx);
             holders.push(std::thread::spawn(move || {
                 store
                     .read_snapshot(|_| {
                         ready.send(()).unwrap();
-                        std::thread::sleep(hold);
+                        let _ = release_rx.recv();
                         Ok(())
                     })
                     .unwrap();
             }));
         }
         for _ in 0..holders.len() {
-            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            ready_rx.recv_timeout(watchdog).unwrap();
         }
 
         // As the daemon does when it starts, so no read makes the first diagnostic report.
@@ -14313,17 +14604,16 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/internal/fleet/membership",
             "/v1/client/operations",
         ] {
-            let started = Instant::now();
-            let response =
-                tokio::time::timeout(Duration::from_millis(250), get_request(app.clone(), path))
-                    .await;
+            // This is a deadlock watchdog, not a latency bound: runner scheduling can
+            // delay a request, but it must answer before any held resource is released.
+            let response = tokio::time::timeout(watchdog, get_request(app.clone(), path)).await;
             assert!(
                 response.is_ok(),
-                "{path} waited {:?} behind the writer or other reads",
-                started.elapsed()
+                "{path} did not answer while the writer and other reads were held"
             );
             assert_eq!(response.unwrap().0, StatusCode::OK, "{path}");
         }
+        drop(releases);
         for holder in holders {
             holder.join().unwrap();
         }
@@ -15895,6 +16185,58 @@ agent "good" {{ workspace {:?}; command "true" }}
     }
 
     #[tokio::test]
+    async fn publication_accepts_a_step_assigned_to_an_undeclared_person() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+        let kdl = r#"version 2
+mission "review" state="ready" {
+  goal "Review the candidate."
+  step "review" { assigned-to "person/reviewer" }
+}"#;
+
+        let (preview, status, applied) = preview_and_apply(app, kdl).await;
+        assert_eq!(preview["blockers"], json!([]));
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(
+            store.unresolved_graph_references().unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_accepts_available_work_for_a_person_and_an_existing_agent() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+        let (_, status, applied) = preview_and_apply(
+            app.clone(),
+            r#"version 2
+agent "example/worker" { workspace "/tmp"; command "true" }"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        let kdl = r#"version 2
+mission "review" state="ready" {
+  goal "Review the candidate."
+  step "review" {
+    available-to "person/reviewer"
+    available-to "agent/example/worker"
+  }
+}"#;
+
+        let (preview, status, applied) = preview_and_apply(app, kdl).await;
+        assert_eq!(preview["blockers"], json!([]));
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(
+            store.unresolved_graph_references().unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
     async fn publication_refuses_a_reference_that_does_not_resolve_without_a_write() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -15912,6 +16254,17 @@ mission "work" state="ready" {
         let (preview, status, error) = preview_and_apply(app.clone(), kdl).await;
         assert_eq!(preview["blockers"], json!([refusal]));
         assert_eq!(preview["warnings"], json!([]));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["code"], "unresolved-reference");
+        assert_eq!(error["details"]["refusals"], json!([refusal]));
+        assert_eq!(store.index().unwrap(), before);
+
+        let available = kdl.replace(
+            "assigned-to \"agent/example/nobody\"",
+            "available-to \"person/reviewer\"; available-to \"agent/example/nobody\"",
+        );
+        let (preview, status, error) = preview_and_apply(app.clone(), &available).await;
+        assert_eq!(preview["blockers"], json!([refusal]));
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
         assert_eq!(error["code"], "unresolved-reference");
         assert_eq!(error["details"]["refusals"], json!([refusal]));
@@ -15937,7 +16290,7 @@ mission "work" state="ready" {
                 std::fs::write(workspace.path().join("tracked"), "original\n").unwrap();
             }
             assert!(
-                std::process::Command::new("git")
+                crate::test_support::git()
                     .args(args)
                     .current_dir(workspace.path())
                     .status()
@@ -20638,3 +20991,6 @@ agent "seat" { workspace "/tmp"; command "true" }
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
 }
+
+#[cfg(test)]
+mod work_incarnation_tests;

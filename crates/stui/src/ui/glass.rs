@@ -2343,8 +2343,10 @@ impl Ui {
                 }
                 KeyCode::Char('g') if control => self.open_choice(None, Open::Glass),
                 KeyCode::Char('k') if control || command => glasses.palette = None,
-                // Ctrl (or Alt, or ⌘) and a digit show only that section; the same again shows all.
-                KeyCode::Char(digit @ '1'..='5') if control || alt || command => {
+                // Ctrl+Q quits from anywhere, the palette included.
+                KeyCode::Char('q') if control => self.quit = true,
+                // Ctrl (or ⌘) and a digit show only that section; the same again shows all.
+                KeyCode::Char(digit @ '1'..='5') if control || command => {
                     let section = digit as usize - '1' as usize;
                     palette.section = (palette.section != Some(section)).then_some(section);
                     palette.selected = 0;
@@ -2367,6 +2369,7 @@ impl Ui {
         // The conversation that typing reaches, if one has the focus: never while the sidebar
         // has the keys, whose own letters (b and p in Usage) must not type into a tab behind it.
         let conversation = self.composing_agent().filter(|_| !sidebar_keys);
+        let undelivered = self.undelivered().is_some();
         let Some(glasses) = self.glasses.as_mut() else {
             return false;
         };
@@ -2398,6 +2401,11 @@ impl Ui {
         // In a focused, attached terminal every key is the agent's; Ctrl+\ leaves it first.
         if terminal_focused {
             return false;
+        }
+        // Alt and a letter or digit commands nothing: on a Mac Option types a character instead,
+        // and the letter alone may act below.
+        if alt && matches!(key.code, KeyCode::Char(_)) {
+            return true;
         }
         let glass = glasses.glass();
         let tabs = glass.count(glass.focus).max(1);
@@ -2436,8 +2444,8 @@ impl Ui {
                     self.find_in(agent, "");
                 }
             }
-            // Ctrl chords work on a Mac, where Option types characters instead (Nathan,
-            // 2026-10-03); the Alt chords stay where Alt is Alt.
+            // Ctrl chords, not Alt: on a Mac Option and a letter types a character (Nathan,
+            // 2026-10-03).
             KeyCode::Char('e') if control && conversation.is_some() => self.toggle_all_tools(),
             KeyCode::Char('p') if control && conversation.is_some() => self.toggle_simple(),
             KeyCode::Char('d') if control && conversation.is_some() => self.toggle_details(),
@@ -2446,15 +2454,15 @@ impl Ui {
                     self.effects.push(Effect::Resend { entry });
                 }
             }
-            KeyCode::Char('o') if alt && conversation.is_some() => self.toggle_all_tools(),
-            KeyCode::Char('O') if alt && conversation.is_some() => self.toggle_simple(),
-            KeyCode::Char('i') if alt && conversation.is_some() => self.toggle_details(),
-            KeyCode::Char(letter @ ('r' | 'x')) if alt && conversation.is_some() && self.live => {
-                match self.undelivered() {
-                    Some(entry) if letter == 'r' => self.effects.push(Effect::Resend { entry }),
-                    Some(entry) => self.effects.push(Effect::Forget { entry }),
-                    None => {}
-                }
+            // Backspace takes a message st never had back into the box, to change or delete.
+            KeyCode::Backspace
+                if quiet
+                    && key.modifiers.is_empty()
+                    && conversation.is_some()
+                    && self.live
+                    && undelivered =>
+            {
+                self.take_back_undelivered()
             }
             KeyCode::Char('k') if control || command => self.open_palette(None, Open::Here),
             KeyCode::Char('s') if control => self.toggle_sidebar(),
@@ -2475,7 +2483,6 @@ impl Ui {
                 glasses.zoomed = !glasses.zoomed && glasses.glass().layout.groups().len() > 1;
             }
             KeyCode::Char('g') if control => self.open_glasses_palette(),
-            KeyCode::Char(digit @ '1'..='9') if alt => self.show_tab(digit as usize - '1' as usize),
             // Next and previous tab in the focused split: Ctrl+PgDn/PgUp, Ctrl+Tab where the
             // terminal reports it, and ] and [ whenever nothing is being typed.
             KeyCode::PageDown | KeyCode::Tab if control => self.show_tab((current + 1) % tabs),
@@ -3583,7 +3590,7 @@ mod tests {
         assert!(!ui.home_open());
         assert_eq!(ui.tab, 2, "back on the weekly release mission");
 
-        press(&mut ui, KeyCode::Char('1'), KeyModifiers::ALT);
+        ui.show_tab(0);
         assert_eq!(tabs(&ui).1, 0);
         // ] and [ type in a conversation tab; Ctrl+PgDn/PgUp move between tabs.
         press(&mut ui, KeyCode::PageDown, KeyModifiers::CONTROL);
@@ -3833,6 +3840,15 @@ mod tests {
             Some(shell)
         );
         assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+    }
+
+    #[test]
+    fn ctrl_q_quits_with_the_palette_open() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'k');
+        assert!(ui.palette_open());
+        ctrl(&mut ui, 'q');
+        assert!(ui.quit);
     }
 
     #[test]
@@ -4285,12 +4301,16 @@ mod tests {
         ui.help = false;
         // The commands are chords.
         let folded = ui.conversation_state.expanded.clone();
-        press(&mut ui, KeyCode::Char('o'), KeyModifiers::ALT);
+        ctrl(&mut ui, 'e');
         assert!(!ui.editing);
         assert_ne!(
             ui.conversation_state.expanded, folded,
-            "alt+o opens the tool calls"
+            "ctrl+e opens the tool calls"
         );
+        // Alt and a letter commands nothing: on a Mac Option types a character instead.
+        let expanded = ui.conversation_state.expanded.clone();
+        press(&mut ui, KeyCode::Char('o'), KeyModifiers::ALT);
+        assert_eq!(ui.conversation_state.expanded, expanded);
         ctrl(&mut ui, 'q');
         assert!(ui.quit);
     }
@@ -4400,9 +4420,10 @@ mod tests {
             });
         }
         assert!(screen(&ui).contains("unconfirmed, st did not answer"));
-        // Letters type in a conversation: resending and clearing are chords.
-        press(&mut ui, KeyCode::Char('r'), KeyModifiers::ALT);
-        press(&mut ui, KeyCode::Char('x'), KeyModifiers::ALT);
+        // Letters type in a conversation: Ctrl+R sends it again, and Backspace takes it back
+        // into the box to change or delete there.
+        ctrl(&mut ui, 'r');
+        press(&mut ui, KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(
             std::mem::take(&mut ui.effects),
             [
@@ -4413,6 +4434,11 @@ mod tests {
                     entry: "pending:token-1".into()
                 }
             ]
+        );
+        assert!(ui.editing);
+        assert_eq!(
+            ui.conversation_state.drafts["agent/example/atlas/builder"],
+            "hello"
         );
     }
 
@@ -5320,7 +5346,7 @@ mod tests {
         // A new glass by name, from the palette's glasses section (a digit types in a
         // conversation tab, so the palette opens first).
         ctrl(&mut ui, 'k');
-        press(&mut ui, KeyCode::Char('5'), KeyModifiers::ALT);
+        ctrl(&mut ui, '5');
         typed(&mut ui, "review");
         let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
         let new = ui
@@ -5495,7 +5521,6 @@ mod tests {
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned(), WEEKLY.to_owned()]]);
 
         // A change here goes to st on top of what st last sent.
-        press(&mut ui, KeyCode::Char('3'), KeyModifiers::ALT);
         ctrl(&mut ui, 'w');
         let sent = writes(&mut ui);
         assert!(

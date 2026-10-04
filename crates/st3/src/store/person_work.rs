@@ -268,8 +268,12 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
     let unfenced = requester.starts_with("daemon/") || is_update(ask);
     if !matches!(view.status.as_str(), "pending" | "ready")
         || !run_live(connection, &view.run, Some(&view.generation), false)?
-        || (!unfenced && !declaration_live(connection, requester)?)
     {
+        return Ok(false);
+    }
+    let requester_live = unfenced || declaration_live(connection, requester)?;
+    let retiring = !requester_live && super::rollouts::retiring_ask_live(connection, ask)?;
+    if !requester_live && !retiring {
         return Ok(false);
     }
     if unfenced {
@@ -282,11 +286,12 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
         if canonical::claim_key(connection, &declaration.id)? <= ask_key {
             continue;
         }
-        if declaration.body["kind"] == "stop"
-            || declaration.body["desired"]
-                .get("children")
-                .and_then(Value::as_array)
-                .is_some_and(|children| children.len() == 1 && children[0]["name"] == "stop")
+        if !retiring
+            && (declaration.body["kind"] == "stop"
+                || declaration.body["desired"]
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .is_some_and(|children| children.len() == 1 && children[0]["name"] == "stop"))
         {
             return Ok(false);
         }
@@ -485,7 +490,9 @@ impl Store {
                 || origin.claimant.as_deref() != Some(input.actor.as_str())
                 || origin.claim_incarnation != input.incarnation
                 || origin.claim_expires_at_unix_ms.is_none_or(|expiry| expiry <= now_ms()))) {
-                return Err(St3Error::new("stale-work-ask", "only the current claimant and incarnation of live work can ask a person"));
+                return Err(St3Error::new("stale-work-ask", format!(
+                    "only the current claimant and incarnation of live work can ask a person; expected incarnation `{}`, given `{}`",
+                    origin.claim_incarnation.as_deref().unwrap_or("<none>"), input.incarnation.as_deref().unwrap_or("<none>"))));
             }
             let waiting_since = input.legacy_request.as_ref().map(|id| tx.query_row("SELECT accepted_at_unix_ms FROM claims WHERE id=?1 AND kind='attention.requested'", [id], |row| row.get::<_, String>(0))).transpose().map_err(internal)?;
             let evidence = input.legacy_request.iter().cloned().collect::<Vec<_>>();

@@ -102,6 +102,23 @@ pub enum Endpoint {
     FabricLoopback(String),
 }
 
+/// The name and build this process reports to st in the `x-st3-client` header, for example
+/// "stui 0.1.0+a0c135e3". st lists it (clients.list, `st clients`) as reported; it is never
+/// identity or authority, and st never refuses a client for it.
+static CLIENT_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Name this process's client to st, once, before its first request; later calls are ignored.
+pub fn set_client_name(name: impl Into<String>) {
+    let name = name.into();
+    if hyper::header::HeaderValue::from_str(&name).is_ok() {
+        let _ = CLIENT_NAME.set(name);
+    }
+}
+
+fn client_name() -> Option<&'static str> {
+    CLIENT_NAME.get().map(String::as_str)
+}
+
 #[derive(Clone)]
 pub struct Client {
     endpoint: Endpoint,
@@ -1112,6 +1129,16 @@ impl Client {
         .await
     }
 
+    pub async fn host_repositories(
+        &self,
+        host: &str,
+    ) -> Result<Envelope<HostRepositories>, ClientError> {
+        self.get(&format!(
+            "/v1/client/hosts/{}/repositories",
+            percent_encode(host)
+        ))
+        .await
+    }
     pub async fn sets_list(
         &self,
         cursor: Option<&str>,
@@ -1162,6 +1189,9 @@ impl Client {
             format!("?{}", query.join("&"))
         };
         self.get(&format!("/v1/client/usage{query}")).await
+    }
+    pub async fn clients_list(&self) -> Result<Envelope<ClientConnections>, ClientError> {
+        self.get("/v1/client/clients").await
     }
     pub async fn now_list(
         &self,
@@ -2589,6 +2619,9 @@ impl Client {
                     if let Some(key) = key {
                         request = request.header("idempotency-key", key);
                     }
+                    if let Some(name) = client_name() {
+                        request = request.header("x-st3-client", name);
+                    }
                     if let Some(credential) = &self.credential {
                         request = request.bearer_auth(credential);
                     }
@@ -2713,6 +2746,9 @@ async fn unix_request(
     if let Some(person) = local_person {
         builder = builder.header("x-st3-person", person);
     }
+    if let Some(name) = client_name() {
+        builder = builder.header("x-st3-client", name);
+    }
     if body.is_some() {
         builder = builder.header("content-type", content_type);
     }
@@ -2792,6 +2828,14 @@ fn websocket_request(
             hyper::header::HeaderName::from_static("x-st3-person"),
             hyper::header::HeaderValue::from_str(person)
                 .map_err(|error| ClientError::Protocol(error.to_string()))?,
+        );
+    }
+    if let Some(name) = client_name()
+        && let Ok(value) = hyper::header::HeaderValue::from_str(name)
+    {
+        request.headers_mut().insert(
+            hyper::header::HeaderName::from_static("x-st3-client"),
+            value,
         );
     }
     Ok(request)

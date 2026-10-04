@@ -16,6 +16,16 @@ final class St3ClientTests: XCTestCase {
         let request = try ActionRequest.agentCreate(id: "action/create", idempotencyKey: "creation-test-key",
             fence: Fence(snapshotID: "snapshot/test"), parameters: parameters)
         XCTAssertEqual(request.parameters["message"], .string("--literal text"))
+        let checkout = AgentCreateParameters(name: "parser", harness: "codex", repo: "/work/repo",
+            base: "origin/main", branch: "parser", removeAtRunEnd: true)
+        let creation = try ActionRequest.agentCreate(id: "action/checkout", idempotencyKey: "checkout-test-key",
+            fence: Fence(snapshotID: "snapshot/test"), parameters: checkout)
+        XCTAssertEqual(creation.parameters["remove_at_run_end"], .bool(true))
+        XCTAssertNil(creation.parameters["removeAtRunEnd"])
+        let repositories = try JSONDecoder().decode(HostRepositories.self, from: Data(
+            #"{"host_id":"host/example","repositories":[{"path":"/work/repo","workspaces":["/work/parser"],"agent_ids":["agent/example.parser"]}]}"#.utf8))
+        XCTAssertEqual(repositories.hostID, "host/example")
+        XCTAssertEqual(repositories.repositories[0].agentIDs, ["agent/example.parser"])
     }
 
     func testGlassFixtureAndNullCreationBase() throws {
@@ -170,5 +180,16 @@ final class St3ClientTests: XCTestCase {
         guard case .redaction = timeline.items[7].body else { return XCTFail("redaction lost") }
         guard case .truncation = timeline.items[8].body else { return XCTFail("truncation lost") }
         guard case .error = timeline.items[9].body else { return XCTFail("error body lost") }
+    }
+
+    func testAKindThisClientDoesNotKnowReadsAsUnknown() throws {
+        let json = #"{"kind":"example-arrangement","id":"example-arrangement/person/avery/1","revision":"r1","updated_at":"2026-10-04T08:00:00Z","name":"Pinned"}"#
+        let resource = try JSONDecoder().decode(Resource.self, from: Data(json.utf8))
+        guard case .unknown(let unknown) = resource else { return XCTFail("an unknown kind is kept as unknown") }
+        XCTAssertEqual(unknown.kind, "example-arrangement")
+        XCTAssertEqual(resource.id, "example-arrangement/person/avery/1")
+        XCTAssertEqual(unknown.fields["name"], .string("Pinned"))
+        let again = try JSONDecoder().decode(Resource.self, from: JSONEncoder().encode(resource))
+        XCTAssertEqual(again.id, resource.id)
     }
 }

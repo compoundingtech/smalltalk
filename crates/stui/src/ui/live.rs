@@ -275,9 +275,16 @@ pub fn run(context: Context) -> Result<()> {
         ui.flash(
             "The classic layout is going away: plain stui opens spaces, with Ctrl+S for this list",
         );
+    } else if std::env::args().any(|arg| arg == "--old") {
+        ui.flash("The old screens are gone: this is spaces, and ? shows its keys");
     }
 
     let _guard = Guard::enter(ui.glasses.is_some())?;
+    // The release smoke test's probe: the terminal is restored after a panic too.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("STUI_TEST_PANIC_AFTER_ENTER").is_some() {
+        panic!("terminal restoration probe");
+    }
     // How images are drawn: asked of a terminal known to draw them, once, inside the
     // alternate screen and before any event is read. A terminal that never answers would
     // leave the query reading stdin and swallow keys, so others get half blocks unasked.
@@ -325,6 +332,7 @@ pub fn run(context: Context) -> Result<()> {
         }
         while let Ok(update) = incoming.try_recv() {
             match update {
+                feed::Update::GlassesVersion(version) => super::set_glasses_version(version),
                 feed::Update::Connected(member) => {
                     client = member;
                     extras.live = false;
@@ -1583,6 +1591,7 @@ async fn perform(
                         workspace: None,
                         description: None,
                         message,
+                        ..Default::default()
                     },
                 )
                 .await?;
@@ -2188,8 +2197,14 @@ mod tests {
         assert!(server.await.unwrap_err().is_cancelled());
         std::fs::remove_file(&socket).unwrap();
         (store, server) = serve(root.path(), &socket).await;
+        // The missions as st lists them, as the feed would bring them.
         let mut current = Model::default();
-        current.reload(&client).await.unwrap();
+        current.missions.items = client
+            .missions_list(None, Some(100), false)
+            .await
+            .unwrap()
+            .value
+            .items;
         perform(
             &client,
             "person/avery",

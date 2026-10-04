@@ -3,6 +3,7 @@ pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
 mod resources;
+mod rollouts;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -87,6 +88,7 @@ pub use smallclaims::store::{
 
 mod accounts;
 mod attention_snapshot;
+mod backup;
 mod checkpoint_rules;
 mod limits;
 mod person_work;
@@ -172,6 +174,9 @@ const MAX_STEP_EXTENSION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// smalltalk's projection tables, and the indexes its folds read the claim log through. The
 /// graph creates its own tables first; see `smallclaims::store::SCHEMA`.
 const SCHEMA: &str = r#"
+-- An unmanaged member's staging check needs tagged claims, not its runtime history.
+CREATE INDEX IF NOT EXISTS claims_owned_set_subject_index ON claims(subject)
+WHERE json_extract(body,'$.owned_set') IS NOT NULL;
 CREATE INDEX IF NOT EXISTS claims_terminal_history_index ON claims(store_index)
 WHERE kind IN ('mission-run.state','step-run.state','work.failed')
   AND json_extract(body,'$.fields.status') IN ('failed','cancelled','completed');
@@ -292,6 +297,7 @@ CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject
 -- Deleting a claim checks these references (foreign keys are on); see
 -- `operations_canonical_claim_index`.
 CREATE INDEX IF NOT EXISTS desired_claim_index ON desired(claim_id);
+CREATE INDEX IF NOT EXISTS desired_agent_host_index ON desired(json_extract(member, '$.host'), subject) WHERE kind='agent';
 
 -- A replicated projection finds a mission run tree's runs, generations and proposals from the
 -- claims that create them, without reading every such claim.
@@ -1185,6 +1191,16 @@ struct ChildMissionContext {
     root_run_id: String,
     parent_step_run: String,
     default_selector: Option<WorkSelector>,
+}
+
+fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str) -> Result<Option<String>> {
+    let Some(requested) = claim_by_id_tx(connection, discovery)?.filter(|claim|
+        claim.subject == resource && claim.body.pointer("/fields/kind").and_then(Value::as_str) == Some("vcs.ref")) else { return Ok(None); };
+    let Some(current) = latest_actual(connection, resource)?.and_then(|actual| actual.get("facts").cloned()) else { return Ok(None); };
+    let requested_head = requested.body.pointer("/fields/facts/head").and_then(Value::as_str);
+    if let Some((requested, current)) = requested_head.zip(current.get("head").and_then(Value::as_str))
+        && requested != current { return Ok(Some(format!("ref {resource} moved from head {requested} to {current}"))); }
+    Ok(None)
 }
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
@@ -2273,6 +2289,9 @@ impl Store {
         Ok(Self { graph, smalltalk })
     }
 
+    /// Open a shared-memory store for sequential fixtures and short-lived tools.
+    /// Concurrent server tests should use [`Self::open`]: shared-cache read/write
+    /// contention returns `SQLITE_LOCKED` immediately instead of waiting.
     pub fn open_memory(origin: impl Into<String>) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::default());
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -3100,7 +3119,7 @@ impl Store {
         &self,
         request: &MissionRunRequest,
     ) -> Result<MissionRunView, St3Error> {
-        self.create_mission_run_inner(request, None)
+        self.create_mission_run_inner(request, None, None, None)
     }
 
     pub fn mission_run_subject_for_idempotency_key(&self, idempotency_key: &str) -> String {
@@ -3131,13 +3150,62 @@ impl Store {
                 parent_step_run: normalize_step_run(parent_step_run),
                 default_selector: default_selector.cloned(),
             }),
+            None,
+            None,
         )
+    }
+
+    /// An occurrence belongs to its schedule, regardless of the requesting member or revision.
+    pub fn scheduled_mission_run_subject(schedule: &str, occurrence: u64) -> String {
+        format!(
+            "mission-run/{}",
+            &canonical_hash(&("schedule-occurrence", schedule, occurrence))
+                .expect("schedule occurrence identity serializes")[..32]
+        )
+    }
+
+    pub fn create_scheduled_mission_run(
+        &self,
+        request: &MissionRunRequest,
+        parent: Option<&MissionRunView>,
+        schedule: &str,
+        occurrence: u64,
+    ) -> Result<MissionRunView, St3Error> {
+        let subject = Self::scheduled_mission_run_subject(schedule, occurrence);
+        // A replicated or replayed run remains the occurrence's run even if the child head,
+        // workspace or parent revision has changed since its request was accepted.
+        if let Some(run) = self.mission_run(&subject).map_err(internal)? {
+            return Ok(run);
+        }
+        let child = parent.map(|parent| ChildMissionContext {
+            root_revision: parent.root_revision.clone(),
+            root_run_id: parent
+                .root_mission_run
+                .trim_start_matches("mission-run/")
+                .into(),
+            parent_step_run: normalize_step_run(schedule),
+            default_selector: None,
+        });
+        self.create_mission_run_inner(request, child, Some(&subject), None)
+    }
+
+    pub fn create_subscription_mission_run(&self, request: &MissionRunRequest,
+        parent: Option<&MissionRunView>, subscription: &str, resource: &str, discovery: &str,
+    ) -> Result<MissionRunView, St3Error> {
+        let child = parent.map(|parent| ChildMissionContext {
+            root_revision: parent.root_revision.clone(),
+            root_run_id: parent.root_mission_run.trim_start_matches("mission-run/").into(),
+            parent_step_run: normalize_step_run(subscription), default_selector: None,
+        });
+        self.create_mission_run_inner(request, child, None, Some((resource, discovery)))
     }
 
     fn create_mission_run_inner(
         &self,
         request: &MissionRunRequest,
         child: Option<ChildMissionContext>,
+        occurrence_subject: Option<&str>,
+        latest_ref: Option<(&str, &str)>,
     ) -> Result<MissionRunView, St3Error> {
         let mission_id = request
             .mission
@@ -3186,6 +3254,18 @@ impl Store {
             .map_err(internal)?,
         ));
         let mut connection = self.connection.write();
+        if let Some(subject) = occurrence_subject
+            && let Some(run) = connection
+                .query_row(
+                    "SELECT id FROM mission_runs WHERE id=?1",
+                    [subject.trim_start_matches("mission-run/")],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(internal)?
+        {
+            return mission_run_view_tx(&connection, &run).map_err(internal);
+        }
         if let Some((response, stored_hash)) = connection
             .query_row(
                 "SELECT i.response, r.request_hash FROM idempotency i JOIN mission_run_requests r ON r.operation_id=i.operation_id WHERE i.operation_id=?1",
@@ -3205,17 +3285,21 @@ impl Store {
         }
         let transaction = connection.transaction().map_err(internal)?;
         owned_sets::guard_mission_start(&transaction, mission_id)?;
+        if let Some((resource, discovery)) = latest_ref
+            && let Some(reason) = stale_ref_request_tx(&transaction, resource, discovery).map_err(internal)? {
+            return Err(St3Error::new("stale-ref-head", reason));
+        }
         let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
         enforce_mission_run_capacity(&transaction, &mission)?;
-        let run_id = self
-            .mission_run_subject_for_idempotency_key(&request.idempotency_key)
-            .trim_start_matches("mission-run/")
-            .to_owned();
-        let subject = format!("mission-run/{run_id}");
-        let generation_id = hex::encode(Sha256::digest(
-            format!("{}:{}:generation:1", self.origin, request.idempotency_key).as_bytes(),
-        ))[..32]
-            .to_owned();
+        let subject = occurrence_subject.map(str::to_owned).unwrap_or_else(|| {
+            self.mission_run_subject_for_idempotency_key(&request.idempotency_key)
+        });
+        let run_id = subject.trim_start_matches("mission-run/").to_owned();
+        let generation_key = occurrence_subject.map_or_else(
+            || format!("{}:{}:generation:1", self.origin, request.idempotency_key),
+            |subject| format!("{subject}:generation:1"),
+        );
+        let generation_id = hex::encode(Sha256::digest(generation_key.as_bytes()))[..32].to_owned();
         let generation_subject = format!("run-generation/{generation_id}");
         let root_revision = child
             .as_ref()
@@ -6580,6 +6664,9 @@ impl Store {
                 {
                     return serde_json::from_str(&response).map_err(internal);
                 }
+                if action == "claim" && rollouts::intake_held(transaction, &actor, &subject)? {
+                    return Err(St3Error::new("seat-rollout-draining", "the seat holds new work intake while its rollout drains; existing work may finish"));
+                }
                 let current = transaction
                     .query_row(
                         "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
@@ -7551,7 +7638,9 @@ impl Store {
                     .as_ref()
                     .filter(|row| row.kind == "agent")
                     .and_then(|row| row.member.as_deref())
-                    .and_then(|launched| serde_json::from_str::<crate::model::MemberSpec>(launched).ok())
+                    .and_then(|launched| {
+                        serde_json::from_str::<crate::model::MemberSpec>(launched).ok()
+                    })
                     .map(|launched| member.launch_changes(&launched))
                     .unwrap_or_default();
                 actions.push(if changes.is_empty() {
@@ -9856,6 +9945,38 @@ impl Store {
         )?;
         let rows = statement.query_map([], desired_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Repository candidates on one host, excluding members with neither a checkout nor any
+    /// published workspace evidence. Uses the host index rather than walking the fleet graph.
+    pub(crate) fn agent_repository_subjects(&self, host: &str) -> Result<Vec<DesiredSubject>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired
+             WHERE kind='agent' AND json_extract(member, '$.host')=?1
+               AND (EXISTS (SELECT 1 FROM json_each(body, '$.children') child WHERE json_extract(child.value, '$.name')='checkout')
+                    OR EXISTS (SELECT 1 FROM claims WHERE claims.subject=desired.subject AND claims.kind='workspace.observed'))
+             ORDER BY subject",
+        )?;
+        let rows = statement.query_map([host], desired_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn workspace_observation_from_host(
+        &self,
+        subject: &str,
+        host: &str,
+    ) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        connection
+            .prepare_cached(&format!(
+                "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND claims.kind='workspace.observed' AND claims.origin=?2
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1",
+            ))?
+            .query_row(params![subject, host], smallclaims::store::claim_from_row)
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Read an exact immutable declaration, or the revision selected by the desired projection.
@@ -12992,6 +13113,12 @@ impl Store {
         Ok(None)
     }
 
+    /// Unstarted ref deliveries collapse to the latest observed head. Running missions
+    /// retain their pinned discovery and exact CI gate, even when the ref moves again.
+    pub fn stale_ref_request(&self, resource: &str, discovery: &str) -> Result<Option<String>> {
+        stale_ref_request_tx(&self.readers.get(), resource, discovery)
+    }
+
     pub fn authoring_review_owner(&self, discovery: &str) -> Result<Option<String>> {
         let Some(claim) = self.claim_by_id(discovery)? else {
             return Ok(None);
@@ -14361,6 +14488,7 @@ impl Store {
                 | "daemon.started"
                 | "transport.observed"
                 | "render.applied"
+                | "workspace.observed"
                 | "work.claimed"
                 | "work.renewed"
                 | "work.progress"
@@ -17414,6 +17542,29 @@ fn mark_work_extensions_projected_tx(transaction: &Transaction<'_>) -> Result<()
     Ok(())
 }
 
+/// Upgrade only run trees with competing creation claims; ordinary runs already fold the same.
+fn migrate_occurrence_creation_projections_tx(transaction: &Transaction<'_>) -> Result<()> {
+    if transaction.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key='occurrence_creation_projection_rules' AND value='1')", [], |row| row.get::<_, bool>(0))? {
+        return Ok(());
+    }
+    let subjects = transaction.prepare("SELECT subject FROM claims WHERE kind='mission-run.created' GROUP BY subject HAVING COUNT(*)>1")?
+        .query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut roots = BTreeSet::new();
+    for subject in subjects {
+        if let Some(root) = run_tree_of_tx(transaction, &subject).map_err(anyhow::Error::new)? {
+            roots.insert(root);
+        }
+    }
+    for root in roots {
+        rebuild_run_tree_tx(transaction, &root).map_err(anyhow::Error::new)?;
+    }
+    transaction.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('occurrence_creation_projection_rules','1')",
+        [],
+    )?;
+    Ok(())
+}
+
 fn work_extension_roots_tx(transaction: &Transaction<'_>) -> Result<(BTreeSet<String>, bool)> {
     let subjects = transaction
         .prepare("SELECT DISTINCT subject FROM claims WHERE kind='work.extended'")?
@@ -18093,7 +18244,9 @@ fn message_view_tx(
         attachments: actual
             .get("attachments")
             .cloned()
-            .and_then(|value| serde_json::from_value::<Vec<crate::model::MessageAttachment>>(value).ok())
+            .and_then(|value| {
+                serde_json::from_value::<Vec<crate::model::MessageAttachment>>(value).ok()
+            })
             .unwrap_or_default()
             .into_iter()
             .filter(|attachment| {
@@ -24009,6 +24162,18 @@ fn project_mission_run_created(
             format!("claim `{}` has an invalid mission run subject", claim.id),
         )
     })?;
+    // Creation claims fold in canonical order. A second admission of the same occurrence must
+    // not append steps from another child revision to the winning initial generation.
+    if transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mission_runs WHERE id=?1)",
+            [run_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(internal)?
+    {
+        return Ok(());
+    }
     let mission_subject = fields
         .get("mission")
         .and_then(Value::as_str)
@@ -27806,6 +27971,7 @@ fn mission_run_header_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Miss
         updated_at_unix_ms: updated.parse().unwrap_or(0),
         steps: Vec::new(),
         loops: Vec::new(),
+        stuck_gates: Vec::new(),
     })
 }
 
@@ -46281,6 +46447,9 @@ fn append_claim_with_fences(
                 if message.to != fence.subject || input.actor.as_deref() != Some(&fence.subject) {
                     return Err(St3Error::new("wrong-message-recipient", "receipt belongs to another seat"));
                 }
+                if input.kind == "message.staged" && !rollouts::message_allowed(transaction, &message)? {
+                    return Err(St3Error::new("seat-rollout-draining", "new independent delivery waits for the seat rollout"));
+                }
                 matches!((input.kind.as_str(), message.status.as_str()),
                     ("message.staged", "delivered" | "read" | "closed") | ("message.delivered", "read" | "closed") | ("message.read", "closed"))
             } else { false };
@@ -46522,7 +46691,7 @@ fn append_latest_observation_fenced(
                 "harness.usage" => {
                     publish_due_usage_tx(transaction, &graph.origin, input, &local, now)?
                 }
-                "harness.todo.observed" => Some(publish_latest_claim_tx(
+                "harness.todo.observed" | "workspace.observed" => Some(publish_latest_claim_tx(
                     transaction,
                     &graph.origin,
                     &input.subject,

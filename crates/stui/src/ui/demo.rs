@@ -662,6 +662,8 @@ fn step(
     note: Option<&str>,
 ) -> Step {
     Step {
+        id: format!("step-run/demo/{name}"),
+        seat: owner.map(s),
         name: s(name),
         state,
         owner: owner.map(s),
