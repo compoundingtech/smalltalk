@@ -1896,6 +1896,14 @@ export const EventPage = /*#__PURE__*/ (() => Schema.Struct({
 export type EventPage = typeof EventPage.Type
 export type EventPageEncoded = typeof EventPage.Encoded
 
+export const MailBacklog = /*#__PURE__*/ (() => Schema.Struct({
+  "cleanup_command": Schema.String,
+  "count": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "threshold_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
+}).annotate({ identifier: "MailBacklog" }))()
+export type MailBacklog = typeof MailBacklog.Type
+export type MailBacklogEncoded = typeof MailBacklog.Encoded
+
 export const ReplicatedNotice = /*#__PURE__*/ (() => Schema.Struct({
   "complete": Schema.Boolean,
   "owner_host_id": Id,
@@ -2077,7 +2085,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded
