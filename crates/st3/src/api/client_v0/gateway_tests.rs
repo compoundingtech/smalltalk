@@ -359,7 +359,52 @@ mod gateway_tests {
             );
             // Reopening the same capability is the client-visible reconnect contract.
             drop(open());
+            let request = ActionRequest {
+                api_version: CLIENT_API_VERSION.into(),
+                id: "action/detach".into(),
+                action_type: "terminal.detach".into(),
+                idempotency_key: "detach".into(),
+                fence: Fence {
+                    runtime_incarnation: Some("terminal-runtime:i1".into()),
+                    ..Fence::default()
+                },
+                parameters: json!({"target_id": attachment["attachment_id"]}),
+            };
+            detach_terminal_attachment(&state, &session, &request).unwrap();
+            assert_eq!(
+                prepare_terminal_follow(&state, &session, "agent/terminal-owner",
+                    Some("terminal-runtime:i1"), attachment["stream_capability"].as_str())
+                    .err().unwrap().code,
+                "forbidden",
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn raw_capability_stays_single_use_and_detaches_when_its_viewer_drops() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let (session, _) = viewer_attachment(&state);
+        let Json(attachment) = raw_terminal::attachment(
+            State(state.clone()), Extension(session.clone()),
+            AxumPath("agent/terminal-owner".into()),
+            Json(serde_json::from_value(json!({
+                "runtime_incarnation": "terminal-runtime:i1", "mode": "peek",
+            })).unwrap()),
+        ).await.unwrap();
+        let consume = || consume_terminal_attachment_mode(
+            &state, &session, "terminal/agent/terminal-owner", "terminal-runtime:i1",
+            attachment["stream_capability"].as_str(), Some("peek"),
+        );
+        let viewer = consume().unwrap();
+        let subject = viewer.subject.clone();
+        assert_eq!(consume().unwrap_err().code, "forbidden");
+        assert_eq!(state.store.claims_for(&subject, None).unwrap().last().unwrap().kind,
+            "custom.client.terminal-consumed");
+        drop(viewer);
+        assert_eq!(state.store.claims_for(&subject, None).unwrap().last().unwrap().kind,
+            "custom.client.terminal-detached");
+        assert_eq!(consume().unwrap_err().code, "forbidden");
     }
 
     #[tokio::test]
