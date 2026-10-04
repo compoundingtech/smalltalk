@@ -14222,13 +14222,13 @@ impl Store {
         };
         self.readers
             .get()
-            .prepare_cached(&format!(
+            .prepare_cached(&canonical_sql(&format!(
                 "SELECT accepted_at_unix_ms, store_index
              FROM claims INDEXED BY claims_incarnation_accepted_index
              WHERE subject=?1 AND {INCARNATION_OF_CLAIM}=?2
-             ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, store_index
+             ORDER BY CANONICAL_ASC(claims)
              LIMIT 1"
-            ))?
+            )))?
             .query_row(params![subject, incarnation], |row| {
                 let time: String = row.get(0)?;
                 Ok((time.parse::<u128>().unwrap_or(u128::MAX), row.get(1)?))
