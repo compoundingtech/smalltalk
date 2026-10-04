@@ -114,6 +114,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     true,
                 ),
             )?;
+            if selected.manual {
+                // Keep the incumbent and its files. Only a fenced explicit request starts drain.
+                return Ok(true);
+            }
             let actor = selected
                 .actor
                 .as_deref()

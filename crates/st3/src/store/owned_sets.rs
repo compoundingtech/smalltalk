@@ -12,6 +12,9 @@ pub struct Source {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Member {
+    /// Derived from the authored seat and retained when its reference becomes a stop.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual_rollout: bool,
     pub kind: String,
     pub claim: String,
     pub revision: String,
@@ -92,6 +95,13 @@ pub(super) struct Plan {
     pub adoptions: BTreeMap<String, Vec<String>>,
     bundle_digest: String,
     pub materialize: BTreeSet<String>,
+}
+
+pub(super) fn manual_member(connection: &Connection, member: &Member) -> Result<bool, St3Error> {
+    Ok(member.manual_rollout
+        || claim(connection, &member.claim, None)?
+            .and_then(|c| serde_json::from_value::<DesiredSubject>(c.body).ok())
+            .is_some_and(|desired| crate::rollout::manual(&desired)))
 }
 
 pub fn subject(name: &str) -> Result<String, St3Error> {
@@ -215,6 +225,7 @@ pub(super) fn effective_members(
             member
         } else {
             Member {
+                manual_rollout: manual_member(connection, &member)?,
                 revision: desired_revision(&stop_declaration(&subject)?),
                 claim: view.claim.clone(),
                 kind: member.kind,
@@ -511,13 +522,40 @@ pub(super) fn plan_tx(
             && v.receipt.rollout == options.rollout
     });
     let mut blockers = Vec::new();
+    let mut manual_seats = input.subjects.values().any(crate::rollout::manual);
+    if let Some(view) = &old {
+        for member in view
+            .receipt
+            .members
+            .values()
+            .chain(view.receipt.retired.values())
+        {
+            manual_seats |= manual_member(transaction, member)?;
+        }
+    }
+    for desired in input
+        .subjects
+        .values()
+        .filter(|d| crate::rollout::manual(d))
+    {
+        if let Some(member) = &desired.member {
+            if let Err(refusal) = crate::native_resume::rollout_support(member) {
+                blockers.push(format!("{}: {}", desired.subject, refusal.reason));
+            }
+        } else {
+            blockers.push(format!(
+                "{}: manual rollout needs a native seat launch",
+                desired.subject
+            ));
+        }
+    }
     let membership = fleet_membership_tx(transaction).map_err(internal)?;
     for member in membership.incarnations().filter(|m| m.end.is_none()) {
         let supported: Option<bool> = transaction.query_row(&canonical_sql(
             "SELECT json_extract(body,'$.fields.features.owned_sets')=1 FROM claims
              WHERE subject=?1 AND kind='daemon.started' AND origin=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
             params![format!("daemon/{}",member.name),member.name],|row|row.get(0)).optional().map_err(internal)?.flatten();
-        if options.rollout.is_some() {
+        if options.rollout.is_some() || manual_seats {
             let rollout_supported: Option<bool> = transaction.query_row(&canonical_sql(
                 "SELECT json_extract(body,'$.fields.features.seat_rollout')=1 FROM claims
                  WHERE subject=?1 AND kind='daemon.started' AND origin=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
@@ -527,6 +565,15 @@ pub(super) fn plan_tx(
                     "host/{} has not advertised seat-rollout support; upgrade before activation",
                     member.name
                 ));
+            }
+        }
+        if manual_seats {
+            let supported: Option<bool> = transaction.query_row(&canonical_sql(
+                "SELECT json_extract(body,'$.fields.features.seat_rollout_manual')=1 FROM claims
+                 WHERE subject=?1 AND kind='daemon.started' AND origin=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                params![format!("daemon/{}",member.name),member.name],|row|row.get(0)).optional().map_err(internal)?.flatten();
+            if supported != Some(true) {
+                blockers.push(format!("host/{} has not advertised manual seat-rollout support; upgrade before activation", member.name));
             }
         }
         if supported != Some(true) {
@@ -626,10 +673,19 @@ pub(super) fn plan_tx(
                 ) {
                     (Some(new), Some(old)) => {
                         let changed = new.launch_changes(&old);
-                        if options.rollout.is_some() && !changed.is_empty() {
-                            if old_subject.as_ref().and_then(|d| crate::accounts::harness_binding(&d.desired))
-                                != input.subjects.get(s).and_then(|d| crate::accounts::harness_binding(&d.desired)) {
-                                blockers.push(format!("{s}: when-idle requires the same native account binding"));
+                        let manual = input.subjects.get(s).is_some_and(crate::rollout::manual);
+                        if (options.rollout.is_some() || manual) && !changed.is_empty() {
+                            if old_subject
+                                .as_ref()
+                                .and_then(|d| crate::accounts::harness_binding(&d.desired))
+                                != input
+                                    .subjects
+                                    .get(s)
+                                    .and_then(|d| crate::accounts::harness_binding(&d.desired))
+                            {
+                                blockers.push(format!(
+                                    "{s}: when-idle requires the same native account binding"
+                                ));
                             }
                             if let Err(refusal) = crate::native_resume::rollout_support(new) {
                                 blockers.push(format!("{s}: {}", refusal.reason));
@@ -653,7 +709,9 @@ pub(super) fn plan_tx(
                         } else {
                             format!(
                                 "{}: {}",
-                                if options.rollout.is_some() {
+                                if manual {
+                                    "publish declaration; rollout pending (manual)"
+                                } else if options.rollout.is_some() {
                                     "drain and resume native session"
                                 } else {
                                     "restart runtime"
@@ -690,7 +748,8 @@ pub(super) fn plan_tx(
             if live.contains_key(s) {
                 continue;
             }
-            if options.rollout.is_some() && m.kind == "agent" {
+            let manual = manual_member(transaction, m)?;
+            if (options.rollout.is_some() || manual) && m.kind == "agent" {
                 let old_member = claim(transaction, &m.claim, None)?
                     .and_then(|c| serde_json::from_value::<DesiredSubject>(c.body).ok())
                     .and_then(|d| d.member);
@@ -728,7 +787,9 @@ pub(super) fn plan_tx(
                     if m.kind == "schedule" {
                         "stop future occurrences; retain runs"
                     } else {
-                        if options.rollout.is_some() {
+                        if manual {
+                            "publish retirement; rollout pending (manual)"
+                        } else if options.rollout.is_some() {
                             "drain and retire runtime; retain conversation and history"
                         } else {
                             "stop runtime; retain conversation and history"
@@ -737,7 +798,9 @@ pub(super) fn plan_tx(
                     .into(),
                 );
             }
-            retired.insert(s.clone(), m.clone());
+            let mut retiring_member = m.clone();
+            retiring_member.manual_rollout = manual;
+            retired.insert(s.clone(), retiring_member);
         }
     }
     let retiring = changes
@@ -835,6 +898,7 @@ pub(super) fn commit_tx(
                     [s.trim_start_matches("mission/")],
                     |row| {
                         Ok(Member {
+                            manual_rollout: false,
                             kind: "mission".into(),
                             claim: row.get(0)?,
                             revision: row.get(1)?,
@@ -847,6 +911,14 @@ pub(super) fn commit_tx(
                 .map_err(internal)?
                 .ok_or_else(|| St3Error::new("missing-set-member", s.clone()))?;
             Member {
+                manual_rollout: if change == "retiring" {
+                    plan.retired.get(s).is_some_and(|m| m.manual_rollout)
+                } else {
+                    plan.intent
+                        .subjects
+                        .get(s)
+                        .is_some_and(crate::rollout::manual)
+                },
                 kind: if s.starts_with("agent/") {
                     "agent"
                 } else {

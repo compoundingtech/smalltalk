@@ -96,9 +96,17 @@ prove a seat is running. Label-only updates share their existing launch lineage,
 seat stays current while its reported launched token retains the original label revision. A commit
 query distinguishes a recorded receipt, local visibility,
 supersession and current rollout. Remote replica visibility remains unknown in this response.
+`st sets status <set> --sha <sha>` returns 404 until that SHA has a receipt; this is intended.
+Read `st sets show <set>` to obtain the current revision for publication fencing.
+
+A native seat can declare `rollout "manual"` in its body. The declaration is published and
+included in the receipt digest, while a changed running seat stays on its incarnation until
+`st agents rollout <seat>` is requested. Reads show `published, rollout pending (manual)`;
+this intentional deferral allows the source's `satisfied` field to be true while `running`
+remains false. The property survives each complete apply and needs no apply-time flag.
 
 Plain declaration-changing start, stop, rename and publication routes refuse managed subjects.
-Restart, suspend and resume require an unblocked set and cannot bypass an active or held owned-seat rollout. Use `st agents rollout` to retry its cutover with fresh fences.
+Restart, suspend and resume require an unblocked set and cannot bypass an active, held or pending manual owned-seat rollout. Use `st agents rollout` to retry its cutover with fresh fences.
 Use the set publisher to change a managed declaration or retire it.
 
 Owned sets do not install a repository watcher. Git-backed automation remains a separate,
@@ -112,5 +120,5 @@ when required, its retirement digest. Client-v0 read routes are `/v1/client/sets
 clients expose the additive `owned-set` resource and set list/detail operations.
 
 An optional [`when-idle` rollout policy](owned-seat-cutover.md) drains changed and retiring native seats
-and verifies their original conversation on the replacement. Without it, publication retains its
-immediate runtime behavior.
+and verifies their original conversation on the replacement. Without it, automatic seats retain their
+immediate runtime behavior. Manual seats defer cutover with or without the set policy.

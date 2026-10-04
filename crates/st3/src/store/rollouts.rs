@@ -9,11 +9,20 @@ fn selection(connection: &Connection, subject: &str) -> Result<Option<Selection>
     let desired = connection.query_row("SELECT subject,kind,body,member,owner_run,owner_generation,owner_step FROM desired WHERE subject=?1",
         [subject],desired_from_row).map_err(internal)?;
     for view in owned_sets::selected(connection, None)? {
-        if !owned_sets::effective_members(connection, &view, None)?.contains_key(subject) {
+        let members = owned_sets::effective_members(connection, &view, None)?;
+        let Some((member, _, _)) = members.get(subject) else {
             continue;
-        }
-        let Some(policy) = view.receipt.rollout.clone() else {
-            return Ok(None);
+        };
+        // Retirement keeps the last authored seat policy even though its desired node is stop.
+        let manual = if desired.kind == "stop" {
+            owned_sets::manual_member(connection, member)?
+        } else {
+            crate::rollout::manual(&desired)
+        };
+        let policy = match view.receipt.rollout.clone() {
+            Some(policy) => policy,
+            None if manual => Policy::when_idle(30 * 60 * 1000, false),
+            None => return Ok(None),
         };
         let actor = claim_by_id_tx(connection, &view.claim)
             .map_err(internal)?
@@ -24,6 +33,7 @@ fn selection(connection: &Connection, subject: &str) -> Result<Option<Selection>
             receipt: view.claim,
             source: view.receipt.source,
             policy,
+            manual,
             desired_token: row.claim_id,
             target,
             desired,
@@ -142,14 +152,16 @@ fn operation(connection: &Connection, subject: &str) -> Result<Option<Operation>
     }
     if selected.set == operation.set
         && selected.target == operation.target
-        && selected.policy != operation.publication_policy
+        && (selected.policy != operation.publication_policy
+            || selected.manual != operation.publication_manual)
         && matches!(operation.phase.as_str(), "running" | "retired")
     {
         return Ok(None);
     }
     if selected.set != operation.set
         || selected.target != operation.target
-        || selected.policy != operation.publication_policy
+        || (selected.policy != operation.publication_policy
+            || selected.manual != operation.publication_manual)
     {
         operation.phase = "superseded".into();
     }
@@ -329,7 +341,7 @@ impl Store {
                 }
                 return Ok(prior);
             }
-            let selected = selection(tx, subject)?.ok_or_else(|| St3Error::new("rollout-not-enabled", "publish an owned set with --rollout when-idle first"))?;
+            let selected = selection(tx, subject)?.ok_or_else(|| St3Error::new("rollout-not-enabled", "publish an owned set with --rollout when-idle or a rollout manual seat first"))?;
             if selected.desired_token != expected_token {
                 return Err(St3Error::new("stale-rollout-target", "selected declaration changed; read it again"));
             }
@@ -354,7 +366,7 @@ impl Store {
                 .collect::<Result<BTreeMap<_,_>,_>>().map_err(internal)?;
             let operation = Operation { id: String::new(), set: selected.set, receipt: selected.receipt,
                 source: selected.source, desired_token: selected.desired_token, target: selected.target,
-                policy: policy.clone(), publication_policy: selected.policy, old_incarnation: incarnation.into(),
+                policy: policy.clone(), publication_policy: selected.policy, publication_manual: selected.manual, old_incarnation: incarnation.into(),
                 old_member: old.clone(), deadline_unix_ms: now.saturating_add(policy.deadline_ms.into()),
                 requested_by: Some(actor.into()), requested_at_unix_ms: now, phase: if ended { "stopping" } else { "draining" }.into(),
                 phase_at_unix_ms: now, drain_ack: None, start_attempted: false, allowed_work, native_session_id: carry.and_then(|o|o.native_session_id.clone()), native_path: carry.and_then(|o|o.native_path.clone()), native_account: carry.and_then(|o|o.native_account.clone()), replacement_incarnation: None,

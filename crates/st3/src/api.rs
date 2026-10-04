@@ -2231,7 +2231,7 @@ fn client_agent_resources_uncached(
                 })).collect::<Vec<_>>(),
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
-                "rollout": store.rollout(&subject.subject)?,
+                "rollout": crate::rollout::status(store, &subject.subject)?,
             });
             Ok((name, value))
         })
@@ -4865,7 +4865,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
-        "features": {"owned_sets":1,"seat_rollout":1},
+        "features": {"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1},
     })))
 }
 
@@ -8615,6 +8615,9 @@ async fn restart_agent(
         .rollout(&subject)
         .map_err(ApiError::bad)?
         .is_some_and(|o| o.holds_seat())
+        || crate::rollout::status(&state.store, &subject)
+            .map_err(ApiError::internal)?
+            .is_some_and(|s| s["mode"] == "manual" && s["phase"] == "pending")
     {
         return Err(ApiError::bad(St3Error::new(
             "rollout-in-progress",
@@ -8768,6 +8771,9 @@ fn suspension_target(
         .rollout(subject)
         .map_err(ApiError::bad)?
         .is_some_and(|o| o.holds_seat())
+        || crate::rollout::status(&state.store, subject)
+            .map_err(ApiError::internal)?
+            .is_some_and(|s| s["mode"] == "manual" && s["phase"] == "pending")
     {
         return Err(ApiError::bad(St3Error::new(
             "rollout-in-progress",

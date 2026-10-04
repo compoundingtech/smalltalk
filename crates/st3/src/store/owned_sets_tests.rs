@@ -939,3 +939,72 @@ fn rollout_signed_partition_heal_keeps_the_winning_owner_operation_and_status() 
         assert_eq!(operation.blocking, vec!["claimed-work"]);
     }
 }
+
+#[test]
+fn manual_rollout_policy_requires_each_active_daemon_and_is_in_the_receipt_digest() {
+    let stores = signed_fleet();
+    let source = "version 2\nagent \"garden/orchard\" { rollout \"manual\"; harness \"claude\" { model \"example-model\"; } }";
+    let input = crate::graph::parse_owned_set_intent(source, "amber").unwrap();
+    let opts = options(&stores[0], 1);
+    let preview = stores[0].owned_set_preview(&input, &opts).unwrap();
+    assert_eq!(
+        preview
+            .blockers
+            .iter()
+            .filter(|b| b.contains("manual seat-rollout support"))
+            .count(),
+        3
+    );
+    for from in &stores {
+        from.append_claim(&ClaimInput {
+            subject: format!("daemon/{}", from.origin), kind:"daemon.started".into(), actor:None,
+            fields:serde_json::from_value(json!({"status":"running","features":{"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1}})).unwrap(),
+            evidence:vec![],expected_subject:None,idempotency_key:None,
+        }).unwrap();
+        for to in &stores {
+            if from.origin != to.origin {
+                signed_share(from, to);
+            }
+        }
+    }
+    let automatic =
+        crate::graph::parse_owned_set_intent(&source.replace("rollout \"manual\";", ""), "amber")
+            .unwrap();
+    let automatic_preview = stores[0].owned_set_preview(&automatic, &opts).unwrap();
+    let manual_preview = stores[0].owned_set_preview(&input, &opts).unwrap();
+    assert!(
+        manual_preview.blockers.is_empty(),
+        "{:?}",
+        manual_preview.blockers
+    );
+    assert_ne!(manual_preview.digest, automatic_preview.digest);
+    apply(&stores[0], &input, 1);
+    let receipt = stores[0].owned_sets().unwrap().remove(0).receipt;
+    assert_ne!(
+        receipt.bundle_digest,
+        canonical_hash(&(&automatic.subjects, &automatic.missions)).unwrap()
+    );
+    assert!(crate::rollout::manual(
+        &stores[0]
+            .desired_subject_with_writer("agent/garden/orchard")
+            .unwrap()
+            .unwrap()
+            .0
+    ));
+    let unsupported = crate::graph::parse_owned_set_intent(
+        "version 2\nagent \"garden/orchard\" { rollout \"manual\"; command \"true\"; }",
+        "amber",
+    )
+    .unwrap();
+    let preview = stores[0]
+        .owned_set_preview(&unsupported, &options(&stores[0], 2))
+        .unwrap();
+    assert!(
+        preview
+            .blockers
+            .iter()
+            .any(|b| b.contains("typed native harness")),
+        "{:?}",
+        preview.blockers
+    );
+}

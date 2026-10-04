@@ -2150,6 +2150,28 @@ impl<R: RuntimeControl> Reconciler<R> {
                             self.runtime.observe_exec(&member.runtime_id)?
                         };
                         if self.reconcile_rollout(subject, observed.as_ref(), blocked.as_ref())? {
+                            if subject.kind == "agent"
+                                && let Some(observation) =
+                                    observed.as_ref().filter(|o| o.status == "running")
+                                && let Some(incarnation) = observation.incarnation_id.as_deref()
+                                && crate::rollout::status(&self.store, &subject.subject)?
+                                    .is_some_and(|s| {
+                                        s["mode"] == "manual" && s["phase"] == "pending"
+                                    })
+                            {
+                                let old = crate::rollout::launched_member(
+                                    &self.store,
+                                    &subject.subject,
+                                    incarnation,
+                                )?
+                                .map_or_else(|| member.clone(), |(_, old)| old);
+                                // Deferring cutover must not stop ready work reaching the incumbent.
+                                work_message_agents.push((
+                                    subject.subject.clone(),
+                                    incarnation.to_owned(),
+                                    old,
+                                ));
+                            }
                             return Ok(());
                         }
                         if subject.kind == "agent"

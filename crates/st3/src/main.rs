@@ -4950,7 +4950,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         fields: BTreeMap::from([
             (
                 "features".into(),
-                serde_json::json!({"owned_sets":1,"seat_rollout":1}),
+                serde_json::json!({"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1}),
             ),
             ("status".into(), Value::String("running".into())),
             ("pid".into(), Value::from(std::process::id())),
@@ -12464,7 +12464,16 @@ fn render_client_agent(
         } else {
             ""
         };
-        let _ = writeln!(output, "ROLLOUT      {phase}{forced} · {id}");
+        if rollout["mode"] == "manual" && phase == "pending" {
+            let _ = writeln!(output, "ROLLOUT      published, rollout pending (manual)");
+            let _ = writeln!(
+                output,
+                "CUTOVER      st agents rollout {} --as ACTOR",
+                agent.header.id
+            );
+        } else {
+            let _ = writeln!(output, "ROLLOUT      {phase}{forced} · {id}");
+        }
         if let Some(blockers) = rollout["blocking"]
             .as_array()
             .filter(|items| !items.is_empty())
