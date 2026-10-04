@@ -9,6 +9,40 @@ import type {
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };
+/** Transport options, never serialized into a query or action body. */
+export type RequestOptions = { signal?: AbortSignal };
+/** Validate framing only, leaving resource rows and timeline entries raw for tolerant consumers.
+ * Unknown kinds and additive fields retain the existing forward-compatible behavior. */
+function validateCollectionFrame(frame: unknown): void {
+    const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+    const strings = (value: unknown): boolean => Array.isArray(value) && value.every(item => typeof item === 'string');
+    if (!record(frame) || typeof frame.kind !== 'string') throw new Error('Unexpected st collections message');
+    let valid = true;
+    switch (frame.kind) {
+        case 'snapshot':
+        case 'changes':
+            valid = typeof frame.id === 'string' && typeof frame.collection === 'string'
+                && typeof frame.has_more === 'boolean' && record(frame.snapshot) && strings(frame.order)
+                && (frame.kind === 'snapshot' ? Array.isArray(frame.items) : Array.isArray(frame.upserts) && strings(frame.removes));
+            break;
+        case 'conversation':
+            valid = typeof frame.id === 'string' && frame.collection === 'conversation'
+                && typeof frame.session_id === 'string' && typeof frame.replace === 'boolean'
+                && Array.isArray(frame.items) && (frame.has_more === undefined || typeof frame.has_more === 'boolean');
+            break;
+        case 'screen':
+            valid = typeof frame.id === 'string' && frame.collection === 'terminal' && record(frame.snapshot) && record(frame.value);
+            break;
+        case 'resync':
+            valid = typeof frame.id === 'string';
+            break;
+        case 'error':
+            valid = (frame.id === undefined || typeof frame.id === 'string') && typeof frame.message === 'string';
+            break;
+    }
+    if (!valid) throw new Error(`Malformed st collections ${frame.kind} frame`);
+}
+
 export type ListOptions = PageOptions & { history?: boolean; owner_run?: string; actor?: string; status?: string; native_only?: boolean };
 export type EventOptions = { after?: string; limit?: number; wait_ms?: number };
 export type ClientOptions = {
@@ -55,6 +89,8 @@ export type CollectionSocket = TerminalSocket & {
 export type CollectionSocketFactory = (url: string, protocols: string[], headers: Record<string, string>) => CollectionSocket;
 export type CollectionStreamOptions = {
     onFrame: (frame: CollectionFrame) => void;
+    /** Actual WebSocket readiness, before buffered commands are flushed. */
+    onOpen?: () => void;
     /** Called once when the socket ends: without an error after a normal close. Open a new
      * socket and subscribe again; its snapshots are authoritative. */
     onEnd?: (error?: Error) => void;
@@ -132,18 +168,21 @@ export class St3Client {
         this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     }
 
-    async capabilities(): Promise<EnvelopeOf<Capabilities>> {
-        const response = await this.request<Capabilities>('GET', '/v1/client/capabilities');
+    async capabilities(options: RequestOptions = {}): Promise<EnvelopeOf<Capabilities>> {
+        const response = await this.request<Capabilities>('GET', '/v1/client/capabilities', undefined, undefined, undefined, options);
         this.discovered = response;
         return response;
     }
 
-    async discover(): Promise<EnvelopeOf<Capabilities>> {
-        return this.discovered ?? this.capabilities();
+    async discover(options: RequestOptions = {}): Promise<EnvelopeOf<Capabilities>> {
+        options.signal?.throwIfAborted();
+        return this.discovered ?? this.capabilities(options);
     }
 
-    private async request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, idempotencyKey?: string, raw?: { contentType: string }): Promise<EnvelopeOf<T>> {
+    private async request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, idempotencyKey?: string, raw?: { contentType: string }, options: RequestOptions = {}): Promise<EnvelopeOf<T>> {
+        options.signal?.throwIfAborted();
         const credential = await this.credential?.();
+        options.signal?.throwIfAborted();
         const headers: Record<string, string> = { Accept: 'application/json' };
         if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
         if (credential) headers.Authorization = `Bearer ${credential}`;
@@ -151,8 +190,10 @@ export class St3Client {
         if (body !== undefined) headers['Content-Type'] = raw?.contentType ?? 'application/json';
         const response = await this.fetchImpl(this.baseUrl + path, {
             method, headers, ...(body === undefined ? {} : { body: raw ? (body as BodyInit) : JSON.stringify(body) }),
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
         });
         const payload: unknown = await response.json();
+        options.signal?.throwIfAborted();
         if (!payload || typeof payload !== 'object' || (payload as { api_version?: unknown }).api_version !== API_VERSION) {
             throw new Error('Unexpected st client API response');
         }
@@ -165,8 +206,9 @@ export class St3Client {
         return payload as EnvelopeOf<T>;
     }
 
-    private async get<T>(path: string, kind?: 'events'): Promise<EnvelopeOf<T>> {
-        const capabilities = await this.discover();
+    private async get<T>(path: string, kind?: 'events', options: RequestOptions = {}): Promise<EnvelopeOf<T>> {
+        const capabilities = await this.discover(options);
+        options.signal?.throwIfAborted();
         const url = new URL(path, this.baseUrl + '/');
         const limit = url.searchParams.get('limit');
         if (limit !== null) bounded(Number(limit), kind === 'events' ? capabilities.value.limits.max_event_items : capabilities.value.limits.max_page_items, 'limit');
@@ -174,28 +216,28 @@ export class St3Client {
         if (wait !== null && (!Number.isSafeInteger(Number(wait)) || Number(wait) < 0 || Number(wait) > capabilities.value.limits.max_wait_ms)) {
             throw new RangeError(`wait_ms exceeds negotiated maximum ${capabilities.value.limits.max_wait_ms}`);
         }
-        return this.request<T>('GET', path);
+        return this.request<T>('GET', path, undefined, undefined, undefined, options);
     }
 
     /** Keep one image (PNG, JPEG, GIF or WebP, at most 10 MiB) on the member this client talks to. Name the answer's `blob` in a `message.send` attachment. */
-    uploadBlob(bytes: Blob | ArrayBuffer | Uint8Array, mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'): Promise<EnvelopeOf<BlobUpload>> {
-        return this.request<BlobUpload>('POST', '/v1/client/blobs', bytes, undefined, { contentType: mediaType });
+    uploadBlob(bytes: Blob | ArrayBuffer | Uint8Array, mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp', requestOptions: RequestOptions = {}): Promise<EnvelopeOf<BlobUpload>> {
+        return this.request<BlobUpload>('POST', '/v1/client/blobs', bytes, undefined, { contentType: mediaType }, requestOptions);
     }
 
     /** Up to 512 KiB of an attachment from `offset`, base64 in `data`. */
-    blobChunk(sha256: string, options: { message?: string; offset?: number } = {}): Promise<EnvelopeOf<BlobChunk>> {
+    blobChunk(sha256: string, options: { message?: string; offset?: number } = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<BlobChunk>> {
         const query = new URLSearchParams();
         query.set('offset', String(options.offset ?? 0));
         if (options.message) query.set('message', options.message);
-        return this.request<BlobChunk>('GET', `/v1/client/blobs/${encodeURIComponent(sha256)}/chunk?${query}`);
+        return this.request<BlobChunk>('GET', `/v1/client/blobs/${encodeURIComponent(sha256)}/chunk?${query}`, undefined, undefined, undefined, requestOptions);
     }
 
     /** A whole attachment, read in chunks. Pass the message that carries it. */
-    async blob(sha256: string, message?: string): Promise<Uint8Array> {
+    async blob(sha256: string, message?: string, requestOptions: RequestOptions = {}): Promise<Uint8Array> {
         const parts: Uint8Array[] = [];
         let received = 0;
         for (;;) {
-            const chunk = (await this.blobChunk(sha256, { ...(message === undefined ? {} : { message }), offset: received })).value;
+            const chunk = (await this.blobChunk(sha256, { ...(message === undefined ? {} : { message }), offset: received }, requestOptions)).value;
             const binary = atob(chunk.data);
             const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
             if (bytes.length === 0 && received < chunk.size) throw new Error('A blob chunk came back empty');
@@ -209,17 +251,17 @@ export class St3Client {
         return whole;
     }
 
-    async submitAction(request: ActionRequest): Promise<EnvelopeOf<ActionResult>> {
-        await this.discover();
-        return this.request<ActionResult>('POST', '/v1/client/actions', request);
+    async submitAction(request: ActionRequest, options: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> {
+        await this.discover(options);
+        return this.request<ActionResult>('POST', '/v1/client/actions', request, undefined, undefined, options);
     }
 
-    async beginPairing(request: PairingBegin): Promise<EnvelopeOf<PairingChallenge>> {
-        return this.request<PairingChallenge>('POST', '/v1/client/pairings', request);
+    async beginPairing(request: PairingBegin, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<PairingChallenge>> {
+        return this.request<PairingChallenge>('POST', '/v1/client/pairings', request, undefined, undefined, requestOptions);
     }
 
-    async completePairing(id: string, request: PairingComplete): Promise<EnvelopeOf<PairedSession>> {
-        return this.request<PairedSession>('POST', `/v1/client/pairings/${encodeURIComponent(routedId(id))}/complete`, request);
+    async completePairing(id: string, request: PairingComplete, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<PairedSession>> {
+        return this.request<PairedSession>('POST', `/v1/client/pairings/${encodeURIComponent(routedId(id))}/complete`, request, undefined, undefined, requestOptions);
     }
 
     async followOperation(id: string, options: { signal?: AbortSignal; intervalMs?: number } = {}): Promise<EnvelopeOf<Resource>> {
@@ -227,7 +269,7 @@ export class St3Client {
         if (!Number.isSafeInteger(intervalMs) || intervalMs < 100) throw new RangeError('intervalMs must be at least 100');
         while (true) {
             if (options.signal?.aborted) throw new Error('Operation follow aborted');
-            const result = await this.operationsGet(id);
+            const result = await this.operationsGet(id, options);
             if (result.value.kind !== 'operation') throw new Error('Operation detail returned another resource kind');
             if (result.value.state === 'completed' || result.value.state === 'failed') return result;
             await new Promise<void>((resolve, reject) => {
@@ -300,21 +342,38 @@ export class St3Client {
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? (defaultTerminalSocket as unknown as CollectionSocketFactory))(url.toString(), [COLLECTIONS_SUBPROTOCOL], headers);
-        let ended = false, open = false;
+        let ended = false, open = false, opening = false;
         const waiting: string[] = [];
-        const stop = () => { ended = true; socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
+        const stop = () => { ended = true; waiting.length = 0; socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
         const end = (error?: Error) => { if (ended) return; stop(); options.onEnd?.(error); };
         const send = (command: Record<string, unknown>) => {
             if (ended) return;
             const text = JSON.stringify(command);
             if (open) socket.send(text); else waiting.push(text);
         };
-        socket.onopen = () => { open = true; for (const text of waiting.splice(0)) socket.send(text); };
+        socket.onopen = () => {
+            if (ended || open || opening) return;
+            opening = true;
+            try {
+                options.onOpen?.();
+                // onOpen commands join the existing queue: cancellation and replacement must
+                // follow earlier subscriptions, even though the native socket is already ready.
+                for (const text of waiting) {
+                    if (ended) break;
+                    socket.send(text);
+                }
+                waiting.length = 0;
+                open = !ended;
+                opening = false;
+            } catch (error) { end(error instanceof Error ? error : new Error(String(error))); socket.close(1000); }
+        };
         socket.onmessage = event => {
-            let frame: CollectionFrame;
-            try { frame = JSON.parse(String(event.data)) as CollectionFrame; } catch { end(new Error('A collections message is not JSON')); socket.close(1000); return; }
-            if (!frame || typeof frame !== 'object' || typeof frame.kind !== 'string') { end(new Error('Unexpected st collections message')); socket.close(1000); return; }
-            options.onFrame(frame);
+            if (ended) return;
+            try {
+                const frame: unknown = JSON.parse(String(event.data));
+                validateCollectionFrame(frame);
+                options.onFrame(frame as CollectionFrame);
+            } catch (error) { end(error instanceof Error ? error : new Error(String(error))); socket.close(1000); }
         };
         socket.onclose = event => end(event.code === 1000 ? undefined : new Error(`The collections socket closed (${event.code}${event.reason ? ` ${event.reason}` : ''})`));
         socket.onerror = () => end(new Error('The collections socket failed'));
@@ -328,9 +387,9 @@ export class St3Client {
         };
     }
 
-    listGlasses(options: PageOptions = {}): Promise<EnvelopeOf<Page>> { return this.get(`/v1/client/glasses${query(options)}`); }
-    getGlass(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`); }
-    putGlass(id: string, request: GlassPut, idempotencyKey: string): Promise<EnvelopeOf<Glass>> { return this.request('PUT', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey); }
-    deleteGlass(id: string, request: GlassDelete, idempotencyKey: string): Promise<EnvelopeOf<Glass>> { return this.request('DELETE', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey); }
+    listGlasses(options: PageOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get(`/v1/client/glasses${query(options)}`, undefined, requestOptions); }
+    getGlass(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, undefined, requestOptions); }
+    putGlass(id: string, request: GlassPut, idempotencyKey: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Glass>> { return this.request('PUT', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey, undefined, requestOptions); }
+    deleteGlass(id: string, request: GlassDelete, idempotencyKey: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Glass>> { return this.request('DELETE', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey, undefined, requestOptions); }
     // @st3-codegen:typescript-operation-methods
 }

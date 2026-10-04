@@ -1102,52 +1102,52 @@ fn typescript_operation_methods(
         if id == "conversation.search" {
             writeln!(
                 out,
-                "    async {method}(text: string, options: {{ agent?: string; since?: string; cursor?: string; limit?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ text, ...options }})); }}"
+                "    async {method}(text: string, options: {{ agent?: string; since?: string; cursor?: string; limit?: number }} = {{}}, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ text, ...options }}), undefined, requestOptions); }}"
             )?;
         } else if id == "events.list" {
             writeln!(
                 out,
-                "    async {method}(options: EventOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events'); }}"
+                "    async {method}(options: EventOptions = {{}}, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events', requestOptions); }}"
             )?;
         } else if id == "clients.list" {
             writeln!(
                 out,
-                "    async {method}(): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}'); }}"
+                "    async {method}(requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}', undefined, requestOptions); }}"
             )?;
         } else if id == "usage.period" {
             writeln!(
                 out,
-                "    async {method}(options: {{ since_ms?: number; until_ms?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options)); }}"
+                "    async {method}(options: {{ since_ms?: number; until_ms?: number }} = {{}}, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), undefined, requestOptions); }}"
             )?;
         } else if id == "document.get" {
             writeln!(
                 out,
-                "    async {method}(name: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }})); }}"
+                "    async {method}(name: string, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }}), undefined, requestOptions); }}"
             )?;
         } else if id == "resources.list" {
             writeln!(
                 out,
-                "    async resourcesList(filters: ResourcesFilter = {{}}, options: PageOptions = {{}}): Promise<EnvelopeOf<ResourcesPage>> {{ return this.get('{route}' + query({{ ...filters, ...options }})); }}"
+                "    async resourcesList(filters: ResourcesFilter = {{}}, options: PageOptions = {{}}, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<ResourcesPage>> {{ return this.get('{route}' + query({{ ...filters, ...options }}), undefined, requestOptions); }}"
             )?;
         } else if id == "agent-declaration.get" {
             writeln!(
                 out,
-                "    async {method}(id: string, revision?: string, showEnvValues = false): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query({{ revision, show_env_values: showEnvValues }})); }}"
+                "    async {method}(id: string, revision?: string, showEnvValues = false, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query({{ revision, show_env_values: showEnvValues }}), undefined, requestOptions); }}"
             )?;
         } else if id == "host.repositories" {
             writeln!(
                 out,
-                "    async hostRepositories(id: string): Promise<EnvelopeOf<HostRepositories>> {{ return this.get(`{route}`); }}"
+                "    async hostRepositories(id: string, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<HostRepositories>> {{ return this.get(`{route}`, undefined, requestOptions); }}"
             )?;
         } else if id == "subject.definition" {
             writeln!(
                 out,
-                "    async subjectDefinition(subject: string, showEnvValues = false): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ subject, show_env_values: showEnvValues }})); }}"
+                "    async subjectDefinition(subject: string, showEnvValues = false, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ subject, show_env_values: showEnvValues }}), undefined, requestOptions); }}"
             )?;
         } else if id == "conversation.changes" {
             writeln!(
                 out,
-                "    async {method}(id: string, options: {{ after?: string; wait_ms?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query(options)); }}"
+                "    async {method}(id: string, options: {{ after?: string; wait_ms?: number }} = {{}}, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query(options), undefined, requestOptions); }}"
             )?;
         } else if id == "timeline.list" || id == "terminal.screen" || id.ends_with(".get") {
             let query_suffix = if id == "timeline.list" {
@@ -1162,17 +1162,17 @@ fn typescript_operation_methods(
             };
             writeln!(
                 out,
-                "    async {method}(id: string{option_arg}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}`{query_suffix}); }}"
+                "    async {method}(id: string{option_arg}, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}`{query_suffix}, undefined, requestOptions); }}"
             )?;
         } else if id.starts_with("launch-") {
             writeln!(
                 out,
-                "    async {method}(id: string, options: PageOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query(options)); }}"
+                "    async {method}(id: string, options: PageOptions = {{}}, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query(options), undefined, requestOptions); }}"
             )?;
         } else {
             writeln!(
                 out,
-                "    async {method}(options: ListOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options)); }}"
+                "    async {method}(options: ListOptions = {{}}, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), undefined, requestOptions); }}"
             )?;
         }
     }
@@ -1180,7 +1180,7 @@ fn typescript_operation_methods(
         let method = lower_camel(&pascal(action));
         writeln!(
             out,
-            "    async {method}(input: Omit<ActionOf<'{action}'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> {{ return this.submitAction({{ ...input, api_version: API_VERSION, type: '{action}' }} as ActionOf<'{action}'>); }}"
+            "    async {method}(input: Omit<ActionOf<'{action}'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<ActionResult>> {{ return this.submitAction({{ ...input, api_version: API_VERSION, type: '{action}' }} as ActionOf<'{action}'>, requestOptions); }}"
         )?;
     }
     Ok(out.trim_end().into())

@@ -9,6 +9,40 @@ import type {
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };
+/** Transport options, never serialized into a query or action body. */
+export type RequestOptions = { signal?: AbortSignal };
+/** Validate framing only, leaving resource rows and timeline entries raw for tolerant consumers.
+ * Unknown kinds and additive fields retain the existing forward-compatible behavior. */
+function validateCollectionFrame(frame: unknown): void {
+    const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+    const strings = (value: unknown): boolean => Array.isArray(value) && value.every(item => typeof item === 'string');
+    if (!record(frame) || typeof frame.kind !== 'string') throw new Error('Unexpected st collections message');
+    let valid = true;
+    switch (frame.kind) {
+        case 'snapshot':
+        case 'changes':
+            valid = typeof frame.id === 'string' && typeof frame.collection === 'string'
+                && typeof frame.has_more === 'boolean' && record(frame.snapshot) && strings(frame.order)
+                && (frame.kind === 'snapshot' ? Array.isArray(frame.items) : Array.isArray(frame.upserts) && strings(frame.removes));
+            break;
+        case 'conversation':
+            valid = typeof frame.id === 'string' && frame.collection === 'conversation'
+                && typeof frame.session_id === 'string' && typeof frame.replace === 'boolean'
+                && Array.isArray(frame.items) && (frame.has_more === undefined || typeof frame.has_more === 'boolean');
+            break;
+        case 'screen':
+            valid = typeof frame.id === 'string' && frame.collection === 'terminal' && record(frame.snapshot) && record(frame.value);
+            break;
+        case 'resync':
+            valid = typeof frame.id === 'string';
+            break;
+        case 'error':
+            valid = (frame.id === undefined || typeof frame.id === 'string') && typeof frame.message === 'string';
+            break;
+    }
+    if (!valid) throw new Error(`Malformed st collections ${frame.kind} frame`);
+}
+
 export type ListOptions = PageOptions & { history?: boolean; owner_run?: string; actor?: string; status?: string; native_only?: boolean };
 export type EventOptions = { after?: string; limit?: number; wait_ms?: number };
 export type ClientOptions = {
@@ -55,6 +89,8 @@ export type CollectionSocket = TerminalSocket & {
 export type CollectionSocketFactory = (url: string, protocols: string[], headers: Record<string, string>) => CollectionSocket;
 export type CollectionStreamOptions = {
     onFrame: (frame: CollectionFrame) => void;
+    /** Actual WebSocket readiness, before buffered commands are flushed. */
+    onOpen?: () => void;
     /** Called once when the socket ends: without an error after a normal close. Open a new
      * socket and subscribe again; its snapshots are authoritative. */
     onEnd?: (error?: Error) => void;
@@ -132,18 +168,21 @@ export class St3Client {
         this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     }
 
-    async capabilities(): Promise<EnvelopeOf<Capabilities>> {
-        const response = await this.request<Capabilities>('GET', '/v1/client/capabilities');
+    async capabilities(options: RequestOptions = {}): Promise<EnvelopeOf<Capabilities>> {
+        const response = await this.request<Capabilities>('GET', '/v1/client/capabilities', undefined, undefined, undefined, options);
         this.discovered = response;
         return response;
     }
 
-    async discover(): Promise<EnvelopeOf<Capabilities>> {
-        return this.discovered ?? this.capabilities();
+    async discover(options: RequestOptions = {}): Promise<EnvelopeOf<Capabilities>> {
+        options.signal?.throwIfAborted();
+        return this.discovered ?? this.capabilities(options);
     }
 
-    private async request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, idempotencyKey?: string, raw?: { contentType: string }): Promise<EnvelopeOf<T>> {
+    private async request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, idempotencyKey?: string, raw?: { contentType: string }, options: RequestOptions = {}): Promise<EnvelopeOf<T>> {
+        options.signal?.throwIfAborted();
         const credential = await this.credential?.();
+        options.signal?.throwIfAborted();
         const headers: Record<string, string> = { Accept: 'application/json' };
         if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
         if (credential) headers.Authorization = `Bearer ${credential}`;
@@ -151,8 +190,10 @@ export class St3Client {
         if (body !== undefined) headers['Content-Type'] = raw?.contentType ?? 'application/json';
         const response = await this.fetchImpl(this.baseUrl + path, {
             method, headers, ...(body === undefined ? {} : { body: raw ? (body as BodyInit) : JSON.stringify(body) }),
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
         });
         const payload: unknown = await response.json();
+        options.signal?.throwIfAborted();
         if (!payload || typeof payload !== 'object' || (payload as { api_version?: unknown }).api_version !== API_VERSION) {
             throw new Error('Unexpected st client API response');
         }
@@ -165,8 +206,9 @@ export class St3Client {
         return payload as EnvelopeOf<T>;
     }
 
-    private async get<T>(path: string, kind?: 'events'): Promise<EnvelopeOf<T>> {
-        const capabilities = await this.discover();
+    private async get<T>(path: string, kind?: 'events', options: RequestOptions = {}): Promise<EnvelopeOf<T>> {
+        const capabilities = await this.discover(options);
+        options.signal?.throwIfAborted();
         const url = new URL(path, this.baseUrl + '/');
         const limit = url.searchParams.get('limit');
         if (limit !== null) bounded(Number(limit), kind === 'events' ? capabilities.value.limits.max_event_items : capabilities.value.limits.max_page_items, 'limit');
@@ -174,28 +216,28 @@ export class St3Client {
         if (wait !== null && (!Number.isSafeInteger(Number(wait)) || Number(wait) < 0 || Number(wait) > capabilities.value.limits.max_wait_ms)) {
             throw new RangeError(`wait_ms exceeds negotiated maximum ${capabilities.value.limits.max_wait_ms}`);
         }
-        return this.request<T>('GET', path);
+        return this.request<T>('GET', path, undefined, undefined, undefined, options);
     }
 
     /** Keep one image (PNG, JPEG, GIF or WebP, at most 10 MiB) on the member this client talks to. Name the answer's `blob` in a `message.send` attachment. */
-    uploadBlob(bytes: Blob | ArrayBuffer | Uint8Array, mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'): Promise<EnvelopeOf<BlobUpload>> {
-        return this.request<BlobUpload>('POST', '/v1/client/blobs', bytes, undefined, { contentType: mediaType });
+    uploadBlob(bytes: Blob | ArrayBuffer | Uint8Array, mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp', requestOptions: RequestOptions = {}): Promise<EnvelopeOf<BlobUpload>> {
+        return this.request<BlobUpload>('POST', '/v1/client/blobs', bytes, undefined, { contentType: mediaType }, requestOptions);
     }
 
     /** Up to 512 KiB of an attachment from `offset`, base64 in `data`. */
-    blobChunk(sha256: string, options: { message?: string; offset?: number } = {}): Promise<EnvelopeOf<BlobChunk>> {
+    blobChunk(sha256: string, options: { message?: string; offset?: number } = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<BlobChunk>> {
         const query = new URLSearchParams();
         query.set('offset', String(options.offset ?? 0));
         if (options.message) query.set('message', options.message);
-        return this.request<BlobChunk>('GET', `/v1/client/blobs/${encodeURIComponent(sha256)}/chunk?${query}`);
+        return this.request<BlobChunk>('GET', `/v1/client/blobs/${encodeURIComponent(sha256)}/chunk?${query}`, undefined, undefined, undefined, requestOptions);
     }
 
     /** A whole attachment, read in chunks. Pass the message that carries it. */
-    async blob(sha256: string, message?: string): Promise<Uint8Array> {
+    async blob(sha256: string, message?: string, requestOptions: RequestOptions = {}): Promise<Uint8Array> {
         const parts: Uint8Array[] = [];
         let received = 0;
         for (;;) {
-            const chunk = (await this.blobChunk(sha256, { ...(message === undefined ? {} : { message }), offset: received })).value;
+            const chunk = (await this.blobChunk(sha256, { ...(message === undefined ? {} : { message }), offset: received }, requestOptions)).value;
             const binary = atob(chunk.data);
             const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
             if (bytes.length === 0 && received < chunk.size) throw new Error('A blob chunk came back empty');
@@ -209,17 +251,17 @@ export class St3Client {
         return whole;
     }
 
-    async submitAction(request: ActionRequest): Promise<EnvelopeOf<ActionResult>> {
-        await this.discover();
-        return this.request<ActionResult>('POST', '/v1/client/actions', request);
+    async submitAction(request: ActionRequest, options: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> {
+        await this.discover(options);
+        return this.request<ActionResult>('POST', '/v1/client/actions', request, undefined, undefined, options);
     }
 
-    async beginPairing(request: PairingBegin): Promise<EnvelopeOf<PairingChallenge>> {
-        return this.request<PairingChallenge>('POST', '/v1/client/pairings', request);
+    async beginPairing(request: PairingBegin, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<PairingChallenge>> {
+        return this.request<PairingChallenge>('POST', '/v1/client/pairings', request, undefined, undefined, requestOptions);
     }
 
-    async completePairing(id: string, request: PairingComplete): Promise<EnvelopeOf<PairedSession>> {
-        return this.request<PairedSession>('POST', `/v1/client/pairings/${encodeURIComponent(routedId(id))}/complete`, request);
+    async completePairing(id: string, request: PairingComplete, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<PairedSession>> {
+        return this.request<PairedSession>('POST', `/v1/client/pairings/${encodeURIComponent(routedId(id))}/complete`, request, undefined, undefined, requestOptions);
     }
 
     async followOperation(id: string, options: { signal?: AbortSignal; intervalMs?: number } = {}): Promise<EnvelopeOf<Resource>> {
@@ -227,7 +269,7 @@ export class St3Client {
         if (!Number.isSafeInteger(intervalMs) || intervalMs < 100) throw new RangeError('intervalMs must be at least 100');
         while (true) {
             if (options.signal?.aborted) throw new Error('Operation follow aborted');
-            const result = await this.operationsGet(id);
+            const result = await this.operationsGet(id, options);
             if (result.value.kind !== 'operation') throw new Error('Operation detail returned another resource kind');
             if (result.value.state === 'completed' || result.value.state === 'failed') return result;
             await new Promise<void>((resolve, reject) => {
@@ -300,21 +342,38 @@ export class St3Client {
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? (defaultTerminalSocket as unknown as CollectionSocketFactory))(url.toString(), [COLLECTIONS_SUBPROTOCOL], headers);
-        let ended = false, open = false;
+        let ended = false, open = false, opening = false;
         const waiting: string[] = [];
-        const stop = () => { ended = true; socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
+        const stop = () => { ended = true; waiting.length = 0; socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
         const end = (error?: Error) => { if (ended) return; stop(); options.onEnd?.(error); };
         const send = (command: Record<string, unknown>) => {
             if (ended) return;
             const text = JSON.stringify(command);
             if (open) socket.send(text); else waiting.push(text);
         };
-        socket.onopen = () => { open = true; for (const text of waiting.splice(0)) socket.send(text); };
+        socket.onopen = () => {
+            if (ended || open || opening) return;
+            opening = true;
+            try {
+                options.onOpen?.();
+                // onOpen commands join the existing queue: cancellation and replacement must
+                // follow earlier subscriptions, even though the native socket is already ready.
+                for (const text of waiting) {
+                    if (ended) break;
+                    socket.send(text);
+                }
+                waiting.length = 0;
+                open = !ended;
+                opening = false;
+            } catch (error) { end(error instanceof Error ? error : new Error(String(error))); socket.close(1000); }
+        };
         socket.onmessage = event => {
-            let frame: CollectionFrame;
-            try { frame = JSON.parse(String(event.data)) as CollectionFrame; } catch { end(new Error('A collections message is not JSON')); socket.close(1000); return; }
-            if (!frame || typeof frame !== 'object' || typeof frame.kind !== 'string') { end(new Error('Unexpected st collections message')); socket.close(1000); return; }
-            options.onFrame(frame);
+            if (ended) return;
+            try {
+                const frame: unknown = JSON.parse(String(event.data));
+                validateCollectionFrame(frame);
+                options.onFrame(frame as CollectionFrame);
+            } catch (error) { end(error instanceof Error ? error : new Error(String(error))); socket.close(1000); }
         };
         socket.onclose = event => end(event.code === 1000 ? undefined : new Error(`The collections socket closed (${event.code}${event.reason ? ` ${event.reason}` : ''})`));
         socket.onerror = () => end(new Error('The collections socket failed'));
@@ -328,111 +387,111 @@ export class St3Client {
         };
     }
 
-    listGlasses(options: PageOptions = {}): Promise<EnvelopeOf<Page>> { return this.get(`/v1/client/glasses${query(options)}`); }
-    getGlass(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`); }
-    putGlass(id: string, request: GlassPut, idempotencyKey: string): Promise<EnvelopeOf<Glass>> { return this.request('PUT', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey); }
-    deleteGlass(id: string, request: GlassDelete, idempotencyKey: string): Promise<EnvelopeOf<Glass>> { return this.request('DELETE', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey); }
-    async hostRepositories(id: string): Promise<EnvelopeOf<HostRepositories>> { return this.get(`/v1/client/hosts/${encodeURIComponent(routedId(id))}/repositories`); }
-    async setsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/sets' + query(options)); }
-    async setsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/sets/${encodeURIComponent(routedId(id))}`); }
-    async documentGet(name: string): Promise<EnvelopeOf<DocumentContent>> { return this.get('/v1/client/documents/content' + query({ name })); }
-    async subjectDefinition(subject: string, showEnvValues = false): Promise<EnvelopeOf<SubjectDefinition>> { return this.get('/v1/client/subject-definition' + query({ subject, show_env_values: showEnvValues })); }
-    async usagePeriod(options: { since_ms?: number; until_ms?: number } = {}): Promise<EnvelopeOf<UsagePeriod>> { return this.get('/v1/client/usage' + query(options)); }
-    async clientsList(): Promise<EnvelopeOf<ClientConnections>> { return this.get('/v1/client/clients'); }
-    async nowList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/now' + query(options)); }
-    async machinesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/machines' + query(options)); }
-    async devicesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/devices' + query(options)); }
-    async attentionList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/attention' + query(options)); }
-    async attentionGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/attention/${encodeURIComponent(routedId(id))}`); }
-    async messagesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/messages' + query(options)); }
-    async messagesGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/messages/${encodeURIComponent(routedId(id))}`); }
-    async launchesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/launches' + query(options)); }
-    async launchesGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/launches/${encodeURIComponent(routedId(id))}`); }
-    async launchVariantsList(id: string, options: PageOptions = {}): Promise<EnvelopeOf<Page>> { return this.get(`/v1/client/launches/${encodeURIComponent(routedId(id))}/variants` + query(options)); }
-    async launchDecisionsList(id: string, options: PageOptions = {}): Promise<EnvelopeOf<Page>> { return this.get(`/v1/client/launches/${encodeURIComponent(routedId(id))}/decisions` + query(options)); }
-    async launchApprovalsList(id: string, options: PageOptions = {}): Promise<EnvelopeOf<Page>> { return this.get(`/v1/client/launches/${encodeURIComponent(routedId(id))}/approvals` + query(options)); }
-    async missionsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/missions' + query(options)); }
-    async missionsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/missions/${encodeURIComponent(routedId(id))}`); }
-    async workList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/work' + query(options)); }
-    async workGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/work/${encodeURIComponent(routedId(id))}`); }
-    async resourcesList(filters: ResourcesFilter = {}, options: PageOptions = {}): Promise<EnvelopeOf<ResourcesPage>> { return this.get('/v1/client/resources' + query({ ...filters, ...options })); }
-    async agentsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/agents' + query(options)); }
-    async agentsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/agents/${encodeURIComponent(routedId(id))}`); }
-    async agentDeclarationGet(id: string, revision?: string, showEnvValues = false): Promise<EnvelopeOf<AgentDeclaration>> { return this.get(`/v1/client/agent-declarations/${encodeURIComponent(routedId(id))}` + query({ revision, show_env_values: showEnvValues })); }
-    async statusHistoryGet(id: string): Promise<EnvelopeOf<StatusHistory>> { return this.get(`/v1/client/status-history/${encodeURIComponent(routedId(id))}`); }
-    async agentQueueGet(id: string): Promise<EnvelopeOf<AgentQueue>> { return this.get(`/v1/client/agent-queues/${encodeURIComponent(routedId(id))}`); }
-    async runtimesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/runtimes' + query(options)); }
-    async runtimesGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/runtimes/${encodeURIComponent(routedId(id))}`); }
-    async observersList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/observers' + query(options)); }
-    async observersGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/observers/${encodeURIComponent(routedId(id))}`); }
-    async subscriptionsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/subscriptions' + query(options)); }
-    async subscriptionsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/subscriptions/${encodeURIComponent(routedId(id))}`); }
-    async lanesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/lanes' + query(options)); }
-    async lanesGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/lanes/${encodeURIComponent(routedId(id))}`); }
-    async terminalsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/terminals' + query(options)); }
-    async operationsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/operations' + query(options)); }
-    async operationsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/operations/${encodeURIComponent(routedId(id))}`); }
-    async historyList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/history' + query(options)); }
-    async historyGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/history/${encodeURIComponent(routedId(id))}`); }
-    async sessionsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/sessions' + query(options)); }
-    async sessionsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/sessions/${encodeURIComponent(routedId(id))}`); }
-    async conversationSearch(text: string, options: { agent?: string; since?: string; cursor?: string; limit?: number } = {}): Promise<EnvelopeOf<ConversationSearch>> { return this.get('/v1/client/conversations/search' + query({ text, ...options })); }
-    async timelineList(id: string, options: PageOptions = {}): Promise<EnvelopeOf<TimelinePage>> { return this.get(`/v1/client/sessions/${encodeURIComponent(routedId(id))}/timeline` + query(options)); }
-    async conversationChanges(id: string, options: { after?: string; wait_ms?: number } = {}): Promise<EnvelopeOf<ConversationChanges>> { return this.get(`/v1/client/conversations/${encodeURIComponent(routedId(id))}/changes` + query(options)); }
-    async eventsList(options: EventOptions = {}): Promise<EnvelopeOf<EventPage>> { return this.get('/v1/client/events' + query(options), 'events'); }
-    async terminalScreen(id: string): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`); }
-    async glassesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/glasses' + query(options)); }
-    async glassesGet(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(routedId(id))}`); }
-    async agentCreate(input: Omit<ActionOf<'agent.create'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.create' } as ActionOf<'agent.create'>); }
-    async agentQueueMove(input: Omit<ActionOf<'agent.queue-move'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.queue-move' } as ActionOf<'agent.queue-move'>); }
-    async agentResume(input: Omit<ActionOf<'agent.resume'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.resume' } as ActionOf<'agent.resume'>); }
-    async agentStart(input: Omit<ActionOf<'agent.start'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.start' } as ActionOf<'agent.start'>); }
-    async agentStop(input: Omit<ActionOf<'agent.stop'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.stop' } as ActionOf<'agent.stop'>); }
-    async agentSuspend(input: Omit<ActionOf<'agent.suspend'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.suspend' } as ActionOf<'agent.suspend'>); }
-    async attentionResolve(input: Omit<ActionOf<'attention.resolve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'attention.resolve' } as ActionOf<'attention.resolve'>); }
-    async laneApprove(input: Omit<ActionOf<'lane.approve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.approve' } as ActionOf<'lane.approve'>); }
-    async laneJoin(input: Omit<ActionOf<'lane.join'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.join' } as ActionOf<'lane.join'>); }
-    async laneLeave(input: Omit<ActionOf<'lane.leave'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.leave' } as ActionOf<'lane.leave'>); }
-    async laneMark(input: Omit<ActionOf<'lane.mark'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.mark' } as ActionOf<'lane.mark'>); }
-    async laneMove(input: Omit<ActionOf<'lane.move'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.move' } as ActionOf<'lane.move'>); }
-    async launchApprove(input: Omit<ActionOf<'launch.approve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.approve' } as ActionOf<'launch.approve'>); }
-    async launchCancel(input: Omit<ActionOf<'launch.cancel'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.cancel' } as ActionOf<'launch.cancel'>); }
-    async launchCreate(input: Omit<ActionOf<'launch.create'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.create' } as ActionOf<'launch.create'>); }
-    async launchPreview(input: Omit<ActionOf<'launch.preview'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.preview' } as ActionOf<'launch.preview'>); }
-    async launchRevise(input: Omit<ActionOf<'launch.revise'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.revise' } as ActionOf<'launch.revise'>); }
-    async messageClose(input: Omit<ActionOf<'message.close'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'message.close' } as ActionOf<'message.close'>); }
-    async messageRead(input: Omit<ActionOf<'message.read'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'message.read' } as ActionOf<'message.read'>); }
-    async messageSend(input: Omit<ActionOf<'message.send'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'message.send' } as ActionOf<'message.send'>); }
-    async missionApproveRevision(input: Omit<ActionOf<'mission.approve-revision'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.approve-revision' } as ActionOf<'mission.approve-revision'>); }
-    async missionCancel(input: Omit<ActionOf<'mission.cancel'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.cancel' } as ActionOf<'mission.cancel'>); }
-    async missionCancelRevision(input: Omit<ActionOf<'mission.cancel-revision'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.cancel-revision' } as ActionOf<'mission.cancel-revision'>); }
-    async missionRevise(input: Omit<ActionOf<'mission.revise'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.revise' } as ActionOf<'mission.revise'>); }
-    async missionStart(input: Omit<ActionOf<'mission.start'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.start' } as ActionOf<'mission.start'>); }
-    async pairingRevoke(input: Omit<ActionOf<'pairing.revoke'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'pairing.revoke' } as ActionOf<'pairing.revoke'>); }
-    async reviewApprove(input: Omit<ActionOf<'review.approve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'review.approve' } as ActionOf<'review.approve'>); }
-    async reviewReject(input: Omit<ActionOf<'review.reject'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'review.reject' } as ActionOf<'review.reject'>); }
-    async reviewRequestChanges(input: Omit<ActionOf<'review.request-changes'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'review.request-changes' } as ActionOf<'review.request-changes'>); }
-    async runtimeContextClear(input: Omit<ActionOf<'runtime.context-clear'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'runtime.context-clear' } as ActionOf<'runtime.context-clear'>); }
-    async runtimeReset(input: Omit<ActionOf<'runtime.reset'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'runtime.reset' } as ActionOf<'runtime.reset'>); }
-    async runtimeRestart(input: Omit<ActionOf<'runtime.restart'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'runtime.restart' } as ActionOf<'runtime.restart'>); }
-    async runtimeSignal(input: Omit<ActionOf<'runtime.signal'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'runtime.signal' } as ActionOf<'runtime.signal'>); }
-    async runtimeStop(input: Omit<ActionOf<'runtime.stop'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'runtime.stop' } as ActionOf<'runtime.stop'>); }
-    async sessionImport(input: Omit<ActionOf<'session.import'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'session.import' } as ActionOf<'session.import'>); }
-    async terminalAttach(input: Omit<ActionOf<'terminal.attach'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.attach' } as ActionOf<'terminal.attach'>); }
-    async terminalCreate(input: Omit<ActionOf<'terminal.create'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.create' } as ActionOf<'terminal.create'>); }
-    async terminalDetach(input: Omit<ActionOf<'terminal.detach'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.detach' } as ActionOf<'terminal.detach'>); }
-    async terminalEnd(input: Omit<ActionOf<'terminal.end'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.end' } as ActionOf<'terminal.end'>); }
-    async terminalInput(input: Omit<ActionOf<'terminal.input'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.input' } as ActionOf<'terminal.input'>); }
-    async terminalResize(input: Omit<ActionOf<'terminal.resize'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.resize' } as ActionOf<'terminal.resize'>); }
-    async workAsk(input: Omit<ActionOf<'work.ask'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.ask' } as ActionOf<'work.ask'>); }
-    async workCancelAsk(input: Omit<ActionOf<'work.cancel-ask'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.cancel-ask' } as ActionOf<'work.cancel-ask'>); }
-    async workClaim(input: Omit<ActionOf<'work.claim'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.claim' } as ActionOf<'work.claim'>); }
-    async workComplete(input: Omit<ActionOf<'work.complete'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.complete' } as ActionOf<'work.complete'>); }
-    async workDone(input: Omit<ActionOf<'work.done'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.done' } as ActionOf<'work.done'>); }
-    async workFail(input: Omit<ActionOf<'work.fail'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.fail' } as ActionOf<'work.fail'>); }
-    async workProgress(input: Omit<ActionOf<'work.progress'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.progress' } as ActionOf<'work.progress'>); }
-    async workPublishMission(input: Omit<ActionOf<'work.publish-mission'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.publish-mission' } as ActionOf<'work.publish-mission'>); }
-    async workRelease(input: Omit<ActionOf<'work.release'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.release' } as ActionOf<'work.release'>); }
-    async workRenew(input: Omit<ActionOf<'work.renew'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.renew' } as ActionOf<'work.renew'>); }
-    async workRetry(input: Omit<ActionOf<'work.retry'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.retry' } as ActionOf<'work.retry'>); }
+    listGlasses(options: PageOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get(`/v1/client/glasses${query(options)}`, undefined, requestOptions); }
+    getGlass(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, undefined, requestOptions); }
+    putGlass(id: string, request: GlassPut, idempotencyKey: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Glass>> { return this.request('PUT', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey, undefined, requestOptions); }
+    deleteGlass(id: string, request: GlassDelete, idempotencyKey: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Glass>> { return this.request('DELETE', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey, undefined, requestOptions); }
+    async hostRepositories(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<HostRepositories>> { return this.get(`/v1/client/hosts/${encodeURIComponent(routedId(id))}/repositories`, undefined, requestOptions); }
+    async setsList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/sets' + query(options), undefined, requestOptions); }
+    async setsGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/sets/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async documentGet(name: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<DocumentContent>> { return this.get('/v1/client/documents/content' + query({ name }), undefined, requestOptions); }
+    async subjectDefinition(subject: string, showEnvValues = false, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<SubjectDefinition>> { return this.get('/v1/client/subject-definition' + query({ subject, show_env_values: showEnvValues }), undefined, requestOptions); }
+    async usagePeriod(options: { since_ms?: number; until_ms?: number } = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<UsagePeriod>> { return this.get('/v1/client/usage' + query(options), undefined, requestOptions); }
+    async clientsList(requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ClientConnections>> { return this.get('/v1/client/clients', undefined, requestOptions); }
+    async nowList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/now' + query(options), undefined, requestOptions); }
+    async machinesList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/machines' + query(options), undefined, requestOptions); }
+    async devicesList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/devices' + query(options), undefined, requestOptions); }
+    async attentionList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/attention' + query(options), undefined, requestOptions); }
+    async attentionGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/attention/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async messagesList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/messages' + query(options), undefined, requestOptions); }
+    async messagesGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/messages/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async launchesList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/launches' + query(options), undefined, requestOptions); }
+    async launchesGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/launches/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async launchVariantsList(id: string, options: PageOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get(`/v1/client/launches/${encodeURIComponent(routedId(id))}/variants` + query(options), undefined, requestOptions); }
+    async launchDecisionsList(id: string, options: PageOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get(`/v1/client/launches/${encodeURIComponent(routedId(id))}/decisions` + query(options), undefined, requestOptions); }
+    async launchApprovalsList(id: string, options: PageOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get(`/v1/client/launches/${encodeURIComponent(routedId(id))}/approvals` + query(options), undefined, requestOptions); }
+    async missionsList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/missions' + query(options), undefined, requestOptions); }
+    async missionsGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/missions/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async workList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/work' + query(options), undefined, requestOptions); }
+    async workGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/work/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async resourcesList(filters: ResourcesFilter = {}, options: PageOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ResourcesPage>> { return this.get('/v1/client/resources' + query({ ...filters, ...options }), undefined, requestOptions); }
+    async agentsList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/agents' + query(options), undefined, requestOptions); }
+    async agentsGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/agents/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async agentDeclarationGet(id: string, revision?: string, showEnvValues = false, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<AgentDeclaration>> { return this.get(`/v1/client/agent-declarations/${encodeURIComponent(routedId(id))}` + query({ revision, show_env_values: showEnvValues }), undefined, requestOptions); }
+    async statusHistoryGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<StatusHistory>> { return this.get(`/v1/client/status-history/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async agentQueueGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<AgentQueue>> { return this.get(`/v1/client/agent-queues/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async runtimesList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/runtimes' + query(options), undefined, requestOptions); }
+    async runtimesGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/runtimes/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async observersList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/observers' + query(options), undefined, requestOptions); }
+    async observersGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/observers/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async subscriptionsList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/subscriptions' + query(options), undefined, requestOptions); }
+    async subscriptionsGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/subscriptions/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async lanesList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/lanes' + query(options), undefined, requestOptions); }
+    async lanesGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/lanes/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async terminalsList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/terminals' + query(options), undefined, requestOptions); }
+    async operationsList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/operations' + query(options), undefined, requestOptions); }
+    async operationsGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/operations/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async historyList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/history' + query(options), undefined, requestOptions); }
+    async historyGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/history/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async sessionsList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/sessions' + query(options), undefined, requestOptions); }
+    async sessionsGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/sessions/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async conversationSearch(text: string, options: { agent?: string; since?: string; cursor?: string; limit?: number } = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ConversationSearch>> { return this.get('/v1/client/conversations/search' + query({ text, ...options }), undefined, requestOptions); }
+    async timelineList(id: string, options: PageOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<TimelinePage>> { return this.get(`/v1/client/sessions/${encodeURIComponent(routedId(id))}/timeline` + query(options), undefined, requestOptions); }
+    async conversationChanges(id: string, options: { after?: string; wait_ms?: number } = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ConversationChanges>> { return this.get(`/v1/client/conversations/${encodeURIComponent(routedId(id))}/changes` + query(options), undefined, requestOptions); }
+    async eventsList(options: EventOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<EventPage>> { return this.get('/v1/client/events' + query(options), 'events', requestOptions); }
+    async terminalScreen(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`, undefined, requestOptions); }
+    async glassesList(options: ListOptions = {}, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/glasses' + query(options), undefined, requestOptions); }
+    async glassesGet(id: string, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(routedId(id))}`, undefined, requestOptions); }
+    async agentCreate(input: Omit<ActionOf<'agent.create'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.create' } as ActionOf<'agent.create'>, requestOptions); }
+    async agentQueueMove(input: Omit<ActionOf<'agent.queue-move'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.queue-move' } as ActionOf<'agent.queue-move'>, requestOptions); }
+    async agentResume(input: Omit<ActionOf<'agent.resume'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.resume' } as ActionOf<'agent.resume'>, requestOptions); }
+    async agentStart(input: Omit<ActionOf<'agent.start'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.start' } as ActionOf<'agent.start'>, requestOptions); }
+    async agentStop(input: Omit<ActionOf<'agent.stop'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.stop' } as ActionOf<'agent.stop'>, requestOptions); }
+    async agentSuspend(input: Omit<ActionOf<'agent.suspend'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.suspend' } as ActionOf<'agent.suspend'>, requestOptions); }
+    async attentionResolve(input: Omit<ActionOf<'attention.resolve'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'attention.resolve' } as ActionOf<'attention.resolve'>, requestOptions); }
+    async laneApprove(input: Omit<ActionOf<'lane.approve'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.approve' } as ActionOf<'lane.approve'>, requestOptions); }
+    async laneJoin(input: Omit<ActionOf<'lane.join'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.join' } as ActionOf<'lane.join'>, requestOptions); }
+    async laneLeave(input: Omit<ActionOf<'lane.leave'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.leave' } as ActionOf<'lane.leave'>, requestOptions); }
+    async laneMark(input: Omit<ActionOf<'lane.mark'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.mark' } as ActionOf<'lane.mark'>, requestOptions); }
+    async laneMove(input: Omit<ActionOf<'lane.move'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.move' } as ActionOf<'lane.move'>, requestOptions); }
+    async launchApprove(input: Omit<ActionOf<'launch.approve'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.approve' } as ActionOf<'launch.approve'>, requestOptions); }
+    async launchCancel(input: Omit<ActionOf<'launch.cancel'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.cancel' } as ActionOf<'launch.cancel'>, requestOptions); }
+    async launchCreate(input: Omit<ActionOf<'launch.create'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.create' } as ActionOf<'launch.create'>, requestOptions); }
+    async launchPreview(input: Omit<ActionOf<'launch.preview'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.preview' } as ActionOf<'launch.preview'>, requestOptions); }
+    async launchRevise(input: Omit<ActionOf<'launch.revise'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.revise' } as ActionOf<'launch.revise'>, requestOptions); }
+    async messageClose(input: Omit<ActionOf<'message.close'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'message.close' } as ActionOf<'message.close'>, requestOptions); }
+    async messageRead(input: Omit<ActionOf<'message.read'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'message.read' } as ActionOf<'message.read'>, requestOptions); }
+    async messageSend(input: Omit<ActionOf<'message.send'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'message.send' } as ActionOf<'message.send'>, requestOptions); }
+    async missionApproveRevision(input: Omit<ActionOf<'mission.approve-revision'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.approve-revision' } as ActionOf<'mission.approve-revision'>, requestOptions); }
+    async missionCancel(input: Omit<ActionOf<'mission.cancel'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.cancel' } as ActionOf<'mission.cancel'>, requestOptions); }
+    async missionCancelRevision(input: Omit<ActionOf<'mission.cancel-revision'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.cancel-revision' } as ActionOf<'mission.cancel-revision'>, requestOptions); }
+    async missionRevise(input: Omit<ActionOf<'mission.revise'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.revise' } as ActionOf<'mission.revise'>, requestOptions); }
+    async missionStart(input: Omit<ActionOf<'mission.start'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.start' } as ActionOf<'mission.start'>, requestOptions); }
+    async pairingRevoke(input: Omit<ActionOf<'pairing.revoke'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'pairing.revoke' } as ActionOf<'pairing.revoke'>, requestOptions); }
+    async reviewApprove(input: Omit<ActionOf<'review.approve'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'review.approve' } as ActionOf<'review.approve'>, requestOptions); }
+    async reviewReject(input: Omit<ActionOf<'review.reject'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'review.reject' } as ActionOf<'review.reject'>, requestOptions); }
+    async reviewRequestChanges(input: Omit<ActionOf<'review.request-changes'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'review.request-changes' } as ActionOf<'review.request-changes'>, requestOptions); }
+    async runtimeContextClear(input: Omit<ActionOf<'runtime.context-clear'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'runtime.context-clear' } as ActionOf<'runtime.context-clear'>, requestOptions); }
+    async runtimeReset(input: Omit<ActionOf<'runtime.reset'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'runtime.reset' } as ActionOf<'runtime.reset'>, requestOptions); }
+    async runtimeRestart(input: Omit<ActionOf<'runtime.restart'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'runtime.restart' } as ActionOf<'runtime.restart'>, requestOptions); }
+    async runtimeSignal(input: Omit<ActionOf<'runtime.signal'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'runtime.signal' } as ActionOf<'runtime.signal'>, requestOptions); }
+    async runtimeStop(input: Omit<ActionOf<'runtime.stop'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'runtime.stop' } as ActionOf<'runtime.stop'>, requestOptions); }
+    async sessionImport(input: Omit<ActionOf<'session.import'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'session.import' } as ActionOf<'session.import'>, requestOptions); }
+    async terminalAttach(input: Omit<ActionOf<'terminal.attach'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.attach' } as ActionOf<'terminal.attach'>, requestOptions); }
+    async terminalCreate(input: Omit<ActionOf<'terminal.create'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.create' } as ActionOf<'terminal.create'>, requestOptions); }
+    async terminalDetach(input: Omit<ActionOf<'terminal.detach'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.detach' } as ActionOf<'terminal.detach'>, requestOptions); }
+    async terminalEnd(input: Omit<ActionOf<'terminal.end'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.end' } as ActionOf<'terminal.end'>, requestOptions); }
+    async terminalInput(input: Omit<ActionOf<'terminal.input'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.input' } as ActionOf<'terminal.input'>, requestOptions); }
+    async terminalResize(input: Omit<ActionOf<'terminal.resize'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'terminal.resize' } as ActionOf<'terminal.resize'>, requestOptions); }
+    async workAsk(input: Omit<ActionOf<'work.ask'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.ask' } as ActionOf<'work.ask'>, requestOptions); }
+    async workCancelAsk(input: Omit<ActionOf<'work.cancel-ask'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.cancel-ask' } as ActionOf<'work.cancel-ask'>, requestOptions); }
+    async workClaim(input: Omit<ActionOf<'work.claim'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.claim' } as ActionOf<'work.claim'>, requestOptions); }
+    async workComplete(input: Omit<ActionOf<'work.complete'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.complete' } as ActionOf<'work.complete'>, requestOptions); }
+    async workDone(input: Omit<ActionOf<'work.done'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.done' } as ActionOf<'work.done'>, requestOptions); }
+    async workFail(input: Omit<ActionOf<'work.fail'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.fail' } as ActionOf<'work.fail'>, requestOptions); }
+    async workProgress(input: Omit<ActionOf<'work.progress'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.progress' } as ActionOf<'work.progress'>, requestOptions); }
+    async workPublishMission(input: Omit<ActionOf<'work.publish-mission'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.publish-mission' } as ActionOf<'work.publish-mission'>, requestOptions); }
+    async workRelease(input: Omit<ActionOf<'work.release'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.release' } as ActionOf<'work.release'>, requestOptions); }
+    async workRenew(input: Omit<ActionOf<'work.renew'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.renew' } as ActionOf<'work.renew'>, requestOptions); }
+    async workRetry(input: Omit<ActionOf<'work.retry'>, 'api_version' | 'type'>, requestOptions: RequestOptions = {}): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.retry' } as ActionOf<'work.retry'>, requestOptions); }
 }

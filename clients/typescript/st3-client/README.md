@@ -10,6 +10,22 @@ The client uses standard `fetch`, so callers can supply a fetch implementation a
 
 The default transport binds `globalThis.fetch` to `globalThis`, preserving the receiver required by browser implementations. Supplying `fetchImpl` overrides that default without rebinding the custom implementation.
 
+Every HTTP method accepts a final optional `RequestOptions` argument (`{ signal?: AbortSignal }`).
+Existing query options and optional defaults keep their positions: for example,
+`runtimesGet(id, { signal })`, `messageSend(input, { signal })`, and
+`resourcesList(filters, pageOptions, { signal })`. Cancellation is checked before fetching
+and after asynchronous credentials/discovery; the signal stays attached to native fetch while
+the JSON body is consumed. Cancellation does not prove an action was not delivered and never retries it.
+
+`collectionStream` resolves to the pre-open command surface. Its optional `onOpen` callback
+reports actual WebSocket readiness once, before buffered commands flush. Commands issued inside
+`onOpen` queue behind prior commands, preserving cancellation and replacement order. Closing or
+throwing during `onOpen` discards the queue. Known frame envelopes
+are structurally validated before `onFrame`; resource rows and timeline entries remain raw for
+tolerant per-row decoding. Unknown kinds and additive fields remain available to consumers.
+Malformed framing and exceptions from `onFrame` or `onOpen` close the socket and reach `onEnd(error)`
+once instead of escaping the WebSocket event handler.
+
 Run the client checks from the repository root with Node 24 or newer:
 
 ```sh
