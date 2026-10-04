@@ -27,8 +27,9 @@ and the gate has only `contents: read` permission. Forks do not receive publishi
 The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
 `linux-gate` is the single required check: it needs the three jobs and passes only when every one of
 them succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
-`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm`, `typescript-client` and the `linux-gate`
-aggregate use `namespace-profile-linux-x86-64`. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
+`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm` and `typescript-client`
+use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggregate uses GitHub-hosted
+`ubuntu-latest`, so it cannot queue behind build or benchmark jobs. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
 
@@ -282,8 +283,9 @@ through the API and picks one pool for the whole run:
   unavailable, and always for a pull request from a fork. The repository is public and a self-hosted
   runner runs whatever a job asks, so fork code never reaches ci1 (and forks receive no secrets).
 
-Every other job's `runs-on` reads `pick-runner`'s output and falls back to its Namespace label when
-the output is empty. The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
+Build and test jobs read `pick-runner`'s output and fall back to their Namespace label when
+the output is empty. The aggregate stays on GitHub-hosted capacity regardless of that choice.
+The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
 names its three stages instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
 Priority selection follows the fork boundary, so a fork label cannot reach a self-hosted runner.
 The private host controller keeps the priority slot out of the ordinary pool and removes its merge
@@ -296,7 +298,7 @@ Two runs that pick at the same moment can both choose ci1; the later run's jobs 
 runners on ci1.
 
 The switch is the repository variable `CI1_RUNNERS`: unset (the default), `pick-runner` is skipped
-and every run goes to Namespace with no extra job. `on` turns the choice on, and unsetting it turns
+and build/test jobs go to Namespace. `on` turns the choice on, and unsetting it turns
 it off again without a pull request. `pick-runner` reads the runners with the
 `CI1_RUNNERS_READ_TOKEN` secret, a token that may only read the organization's self-hosted runners;
 without it non-queue runs go to Namespace. Merge-group runs need no organization status token; a failed PR-label lookup retains merge capacity.
