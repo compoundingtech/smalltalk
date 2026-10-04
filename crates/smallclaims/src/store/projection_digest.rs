@@ -106,7 +106,11 @@ pub fn row_sql(columns: &[String], prefix: &str) -> String {
             if matches!(column.as_str(), "bytes" | "binding_key") {
                 format!("hex({prefix}{column})")
             } else {
-                format!("{prefix}{column}")
+                // JSON functions attach a transient subtype to TEXT. NEW values can retain
+                // it in triggers, while a later table scan sees plain stored TEXT. Strip it
+                // without changing the persisted scalar type or the logical row encoding.
+                let value = format!("{prefix}{column}");
+                format!("CASE WHEN typeof({value})='text' THEN {value}||'' ELSE {value} END")
             }
         })
         .collect::<Vec<_>>()
@@ -130,7 +134,8 @@ pub fn initialize(connection: &Connection, tables: &[(&str, &[&str])]) -> Result
         .iter()
         .map(|(table, excluded)| Ok((*table, columns(connection, table, excluded)?)))
         .collect::<Result<Vec<_>>>()?;
-    let signature = serde_json::to_string(&(6, &registry))?;
+    // Rebuild v6 triggers and cached sums that could hash transient JSON subtypes.
+    let signature = serde_json::to_string(&(7, &registry))?;
     let previous: Option<String> = connection
         .query_row(
             "SELECT value FROM meta WHERE key='projection_digest_registry'",
@@ -521,4 +526,70 @@ pub fn oracle(
         ),
     );
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trigger_rows_match_stored_scalars_for_json_producing_writes() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE fixture(text_value TEXT, integer_value INTEGER, real_value REAL, null_value TEXT, bytes BLOB);
+             CREATE TABLE captured(row_json TEXT);",
+        ).unwrap();
+        let columns = [
+            "text_value",
+            "integer_value",
+            "real_value",
+            "null_value",
+            "bytes",
+        ]
+        .map(str::to_owned);
+        for (event, prefix) in [("INSERT", "NEW."), ("UPDATE", "NEW."), ("DELETE", "OLD.")] {
+            connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER capture_{event} AFTER {event} ON fixture BEGIN
+                   INSERT INTO captured VALUES({}); END;",
+                    row_sql(&columns, prefix),
+                ))
+                .unwrap();
+        }
+        for json in ["{}", "[1,2]", "true", "null", "7", "2.5", "\"signal\""] {
+            connection
+                .execute(
+                    "INSERT INTO fixture VALUES(json(?1),7,2.5,NULL,x'0102')",
+                    [json],
+                )
+                .unwrap();
+            let stored: String = connection
+                .query_row(
+                    &format!("SELECT {} FROM fixture", row_sql(&columns, "")),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&stored).unwrap(),
+                serde_json::json!([json, 7, 2.5, null, "0102"]),
+            );
+            let captured = || {
+                connection
+                    .query_row(
+                        "SELECT row_json FROM captured ORDER BY rowid DESC LIMIT 1",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(captured(), stored, "INSERT {json}");
+            connection
+                .execute("UPDATE fixture SET text_value=json(?1)", [json])
+                .unwrap();
+            assert_eq!(captured(), stored, "UPDATE {json}");
+            connection.execute("DELETE FROM fixture", []).unwrap();
+            assert_eq!(captured(), stored, "DELETE {json}");
+        }
+    }
 }

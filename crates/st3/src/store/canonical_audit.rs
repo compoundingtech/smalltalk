@@ -1054,6 +1054,77 @@ fn fresh_and_additively_migrated_column_orders_have_identical_full_digests() {
 }
 
 #[test]
+fn reopening_a_legacy_json_subtype_digest_reseeds_and_replaces_its_triggers() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("legacy-digest.sqlite3");
+    let store = Store::open(&path, "alder").unwrap();
+    write_audit_history(&store);
+    let expected = {
+        let connection = store.connection.lock().unwrap();
+        let columns = projection_digest::columns(&connection, "desired", &[]).unwrap();
+        let legacy_row = |prefix: &str| {
+            format!(
+                "json_array({})",
+                columns
+                    .iter()
+                    .map(|column| format!("{prefix}{column}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        // Reproduce v6's trigger: JSON-producing SQL tags NEW.member as nested JSON,
+        // although SQLite persists exactly the same member bytes as ordinary TEXT.
+        connection
+            .execute_batch(&format!(
+                "DROP TRIGGER projection_digest_desired_update;
+             CREATE TRIGGER projection_digest_desired_update AFTER UPDATE ON desired BEGIN {} END;",
+                projection_digest::change_sql(
+                    "desired",
+                    &legacy_row("OLD."),
+                    &legacy_row("NEW."),
+                    0
+                )
+            ))
+            .unwrap();
+        assert_eq!(connection.execute(
+            "UPDATE desired SET member=json_set(COALESCE(member,'{}'), '$.host', 'birch') WHERE subject='agent/alder.worker'",
+            [],
+        ).unwrap(), 1);
+        let expected = projection_digest::oracle(&connection).unwrap();
+        assert_ne!(projection_digest::tables(&connection).unwrap(), expected);
+        let signature: String = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='projection_digest_registry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut signature: Value = serde_json::from_str(&signature).unwrap();
+        signature[0] = json!(6);
+        connection
+            .execute(
+                "UPDATE meta SET value=?1 WHERE key='projection_digest_registry'",
+                [serde_json::to_string(&signature).unwrap()],
+            )
+            .unwrap();
+        expected
+    };
+    drop(store);
+    let reopened = Store::open(&path, "alder").unwrap();
+    let connection = reopened.connection.lock().unwrap();
+    assert_eq!(projection_digest::tables(&connection).unwrap(), expected);
+    assert_eq!(projection_digest::oracle(&connection).unwrap(), expected);
+    assert_eq!(connection.execute(
+        "UPDATE desired SET member=json_set(member, '$.host', 'elm') WHERE subject='agent/alder.worker'",
+        [],
+    ).unwrap(), 1);
+    assert_ne!(projection_digest::tables(&connection).unwrap(), expected);
+    assert_eq!(
+        projection_digest::tables(&connection).unwrap(),
+        projection_digest::oracle(&connection).unwrap()
+    );
+}
+#[test]
 fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
     let store = Store::open_memory("alder").unwrap();
     write_audit_history(&store);
@@ -1082,15 +1153,20 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
                 > 0,
             "shuffle history must exercise {table}"
         );
+        // Always cover the indexed agent membership, independent of other desired kinds.
+        let selected_row = if *table == "desired" {
+            "SELECT rowid FROM desired WHERE kind='agent' ORDER BY rowid LIMIT 1".to_owned()
+        } else {
+            format!("SELECT rowid FROM {table} ORDER BY rowid LIMIT 1")
+        };
         for (column, kind) in columns {
             let before_generation = projection_digest::generation(&connection).unwrap();
             let transaction = connection.transaction().unwrap();
             let expression = if *table == "operations" && column == "state" {
                 "CASE state WHEN 'active' THEN 'conflict' ELSE 'active' END".to_owned()
             } else if *table == "desired" && column == "member" {
-                // The host index requires valid JSON; concatenate to keep ordinary TEXT,
-                // as bound reducer values are, rather than SQLite's transient JSON subtype.
-                "json_set(COALESCE(member,'{}'),'$.__digest_audit',1)||''".to_owned()
+                // The host index parses this JSON during UPDATE, before digest comparison.
+                "json_set(COALESCE(member,'{}'), '$.host', COALESCE(json_extract(member,'$.host'),'')||'-changed')".to_owned()
             } else if kind == "INTEGER" {
                 format!("COALESCE({column},0)+1")
             } else if kind == "BLOB" {
@@ -1098,7 +1174,13 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
             } else {
                 format!("COALESCE({column},'')||'-changed'")
             };
-            transaction.execute(&format!("UPDATE {table} SET {column}={expression} WHERE rowid=(SELECT rowid FROM {table} LIMIT 1)"), []).unwrap();
+            let changed = transaction
+                .execute(
+                    &format!("UPDATE {table} SET {column}={expression} WHERE rowid=({selected_row})"),
+                    [],
+                )
+                .unwrap_or_else(|error| panic!("mutating {table}.{column}: {error}"));
+            assert_eq!(changed, 1, "must exercise {table}.{column}");
             let current = projection_digest::tables(&transaction).unwrap();
             assert_eq!(
                 current,
