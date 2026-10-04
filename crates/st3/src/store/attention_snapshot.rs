@@ -576,6 +576,73 @@ impl Store {
         }))
     }
 
+    /// Turn failures are durable harness observations, not process exits. In particular an
+    /// app-server can stay alive after a policy refusal, and a capacity refusal remains
+    /// retryable. Both must be visible as faults until positive recovery or replacement.
+    fn codex_turn_fault_items(
+        &self,
+        person: Option<&str>,
+        as_of: u128,
+    ) -> Result<Vec<AttentionItemView>> {
+        let mut items = Vec::new();
+        for desired in self.desired_subjects()?.into_iter().filter(|desired| {
+            desired.kind == "agent"
+                && desired
+                    .member
+                    .as_ref()
+                    .is_some_and(|member| member.driver.as_deref() == Some("codex"))
+        }) {
+            let connection = self.readers.get();
+            if !person_work::declaration_live(&connection, &desired.subject)? {
+                continue;
+            }
+            drop(connection);
+            let Some(harness) = self.current_harness(&desired.subject)? else {
+                continue;
+            };
+            if harness.observed_at_unix_ms > as_of {
+                continue;
+            }
+            let Some(detail) = crate::codex_failure::failure_detail(
+                harness.driver.as_deref().unwrap_or_default(),
+                &harness.state,
+                harness.reason.as_deref(),
+            ) else {
+                continue;
+            };
+            let reviewer = "person/operator";
+            if person.is_some_and(|person| person != reviewer) {
+                continue;
+            }
+            let source = desired.subject;
+            items.push(AttentionItemView {
+                episode: harness.claim,
+                priority: "high".into(),
+                kind: "fault".into(),
+                review_mode: None,
+                subject: source.clone(),
+                person: reviewer.into(),
+                requester_id: None,
+                launch_id: None,
+                variant_id: None,
+                message_id: None,
+                title: "A Codex turn failed".into(),
+                detail: format!("{source}: {}. {detail}", harness.reason.as_deref().unwrap()),
+                mission: None,
+                mission_run: desired.owner_run,
+                step: None,
+                targets: vec![source.clone()],
+                requested_at_unix_ms: harness.observed_at_unix_ms,
+                actions: vec![attention_action(
+                    "inspect seat",
+                    &["st", "agents", "show", &source],
+                )],
+                request: None,
+            });
+        }
+        Ok(items)
+    }
+
     fn parked_runtime_attention_items(
         &self,
         person: Option<&str>,
@@ -852,6 +919,7 @@ impl Store {
         items.extend(self.observer_attention_items(person, as_of)?);
         items.extend(self.loop_attention_items(person, as_of)?);
         items.extend(self.parked_runtime_attention_items(person, as_of)?);
+        items.extend(self.codex_turn_fault_items(person, as_of)?);
         for failure in self.operational_failures()? {
             if failure.status != "pending"
                 || failure.requested_at_unix_ms > as_of

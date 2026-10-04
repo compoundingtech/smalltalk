@@ -4353,7 +4353,8 @@ fn transcript_proves_only_the_latest_matching_failed_completion() {
         failed_completed_turn_from_codex_frames(&[
             started("old"),
             completed("old", Some("unauthorized")),
-        ]),
+        ])
+        .map(|turn| turn["id"].as_str().unwrap().to_owned()),
         Some("old".into())
     );
     assert_eq!(
@@ -6168,6 +6169,88 @@ fn error_frame(turn: &str, error_info: Value, will_retry: bool) -> Value {
             "willRetry": will_retry,
         }
     })
+}
+
+#[test]
+fn a_failed_result_without_an_error_notification_retains_the_policy_cause() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::Held {
+        reason: CodexHoldReason::SystemError,
+        turn_id: None,
+    });
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &json!({
+            "method": "turn/completed", "params": {"threadId": "thread-main",
+            "turn": {"id": "failed", "status": "failed", "error": {
+                "message": "Provider policy refusal", "codexErrorInfo": "cyberPolicy"}}}
+        }),
+    );
+    assert_eq!(
+        observed_record(&agent_dir).reason.as_deref(),
+        Some("policy")
+    );
+    let driver_diagnostic::Observed::Failure(failure) = turn_diagnostic(&agent_dir) else {
+        panic!("the result itself proves the refusal")
+    };
+    assert_eq!(failure.reason, driver_diagnostic::Reason::TurnPolicy);
+}
+
+#[test]
+fn rollout_recovery_keeps_policy_and_capacity_distinct_and_capacity_retryable() {
+    for (word, expected_reason, diagnostic, activity) in [
+        (
+            "cyber_policy",
+            "policy",
+            driver_diagnostic::Reason::TurnPolicy,
+            harness_state::Activity::Ended,
+        ),
+        (
+            "server_overloaded",
+            "providerCapacity",
+            driver_diagnostic::Reason::TurnServerOverloaded,
+            harness_state::Activity::Idle,
+        ),
+        (
+            "unauthorized",
+            "providerAuth",
+            driver_diagnostic::Reason::ProviderAuthRejected,
+            harness_state::Activity::Ended,
+        ),
+    ] {
+        let frames = [
+            json!({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "failed"}}),
+            json!({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "failed",
+                "error": {"message": "Producer refusal", "codex_error_info": word}}}),
+        ];
+        let turn = failed_completed_turn_from_codex_frames(&frames).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let mut delivery = Some(inbox_delivery(tmp.path(), config));
+        let mut state = subscribed_state(CodexObservedState::Held {
+            reason: CodexHoldReason::SystemError,
+            turn_id: None,
+        });
+        recover_failed_codex_turn(&mut state, &mut delivery, &turn);
+        delivery.as_mut().unwrap().observe_harness(&state.observed);
+        let observed = observed_record(&agent_dir);
+        assert_eq!(observed.state, activity, "{word}");
+        assert_eq!(observed.reason.as_deref(), Some(expected_reason), "{word}");
+        let driver_diagnostic::Observed::Failure(failure) = turn_diagnostic(&agent_dir) else {
+            panic!("rollout cause must be diagnostic evidence: {word}")
+        };
+        assert_eq!(failure.reason, diagnostic);
+        state.observe(&json!({"method":"thread/status/changed",
+            "params":{"threadId":"thread-main", "status":{"type":"systemError"}}})).unwrap();
+        delivery.as_mut().unwrap().observe_harness(&state.observed);
+        assert_eq!(observed_record(&agent_dir).reason.as_deref(), Some(expected_reason),
+            "a late generic status cannot replace the recovered cause");
+    }
 }
 
 fn observed_record(agent_dir: &Path) -> harness_state::Observed {
