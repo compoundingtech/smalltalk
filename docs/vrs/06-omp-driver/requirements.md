@@ -55,8 +55,10 @@ pi's env fallbacks. Measured integration evidence:
   each unseen exact installed producer and shipped extension in an isolated scratch RPC session.
   Extension load, lifecycle names, the positive post-`agent_end` idle edge, harmless approval
   correlation, and completed consumption of one native delivery must all pass. Transport
-  acceptance is separate evidence. Cache the exact release with executable, installation,
-  interpreter, extension and probe identity; a same-version replacement cannot reuse a pass.
+  acceptance is separate evidence. Cache the exact release with executable, package manifest and
+  available lockfile, interpreter, extension and probe identity; a same-version executable or
+  metadata replacement cannot reuse a pass. Never traverse the whole installation or refuse a
+  build for installation size.
   A failed or indeterminate check refuses launch and names the boundary in doctor and agent
   state. Empty HOME/XDG/workspace/PTY roots and a loopback model isolate managed seats,
   credentials and history. A new passing version needs no allowlist or st update.

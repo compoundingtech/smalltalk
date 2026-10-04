@@ -498,14 +498,14 @@ pub(crate) fn resolve_executable(binary: &str) -> Result<PathBuf> {
     fs::canonicalize(resolved).with_context(|| format!("resolving installed executable {binary}"))
 }
 
-/// Include a script's interpreter and npm installation closure. Hashing only a CLI shim would
-/// miss a same-version dependency replacement. Immutable store paths are also part of identity.
+/// Fingerprint the executable, script runtime and installation metadata without traversing
+/// package assets. Bundled code belongs to the executable; package manifests and lockfiles
+/// identify dependency releases. This is build identity, not an integrity scan of every asset.
 fn executable_identity(path: &Path) -> Result<String> {
     let mut hash = Sha256::new();
-    let mut count = 0_usize;
-    let mut size = 0_u64;
-    let mut visited = std::collections::BTreeSet::new();
-    hash_tree(path, &mut hash, &mut count, &mut size, &mut visited)?;
+    // Changing the identity policy invalidates both old measurements and old exceptions.
+    hash.update(b"st.installed-producer.executable-runtime-metadata.v2");
+    hash_identity_file(path, &mut hash)?;
     let mut prefix = [0_u8; 256];
     let n = File::open(path)?.read(&mut prefix)?;
     if let Some(shebang) = String::from_utf8_lossy(&prefix[..n])
@@ -520,68 +520,74 @@ fn executable_identity(path: &Path) -> Result<String> {
             } else {
                 interpreter
             };
-            let runtime = resolve_executable(interpreter)?;
-            hash_tree(&runtime, &mut hash, &mut count, &mut size, &mut visited)?;
+            hash_identity_file(&resolve_executable(interpreter)?, &mut hash)?;
         }
-        if let Some(package) = path
+    }
+    if let Some(package) = path
+        .ancestors()
+        .skip(1)
+        .take(3)
+        .find(|p| p.join("package.json").is_file())
+    {
+        hash_identity_file(&package.join("package.json"), &mut hash)?;
+        for name in [
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "bun.lock",
+            "bun.lockb",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+        ] {
+            hash_optional_identity_file(&package.join(name), &mut hash)?;
+        }
+        // npm's hidden lock lives beside the installed packages, including scoped packages.
+        if let Some(modules) = package
             .ancestors()
-            .skip(1)
-            .take(3)
-            .find(|p| p.join("package.json").is_file())
+            .find(|p| p.file_name().is_some_and(|n| n == "node_modules"))
         {
-            hash_tree(package, &mut hash, &mut count, &mut size, &mut visited)?;
+            hash_optional_identity_file(&modules.join(".package-lock.json"), &mut hash)?;
         }
     }
     Ok(format!("{hash:x}", hash = hash.finalize()))
 }
 
-fn hash_tree(
-    path: &Path,
-    hash: &mut Sha256,
-    count: &mut usize,
-    size: &mut u64,
-    visited: &mut std::collections::BTreeSet<PathBuf>,
-) -> Result<()> {
-    hash.update(path.as_os_str().as_encoded_bytes());
-    if !visited.insert(path.to_owned()) {
-        return Ok(());
+fn hash_optional_identity_file(path: &Path, hash: &mut Sha256) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => hash_identity_file(path, hash),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hash.update(b"absent");
+            hash.update((path.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
+            hash.update(path.as_os_str().as_encoded_bytes());
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
-    *count += 1;
+}
+
+fn hash_identity_file(path: &Path, hash: &mut Sha256) -> Result<()> {
+    let resolved = fs::canonicalize(path)?;
+    let mut file = File::open(&resolved)?;
+    let metadata = file.metadata()?;
     anyhow::ensure!(
-        *count <= 100_000,
-        "producer installation exceeds admission file bound"
+        metadata.is_file(),
+        "producer identity is not a regular file"
     );
-    let metadata = fs::symlink_metadata(path)?;
+    hash.update(b"file");
+    for identity_path in [path, resolved.as_path()] {
+        let bytes = identity_path.as_os_str().as_encoded_bytes();
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
     hash.update(metadata.permissions().mode().to_le_bytes());
-    if metadata.file_type().is_symlink() {
-        // Canonical identity catches dependency symlinks changing target. Npm runtime symlinks
-        // may point to sibling packages; hash those too, with the same bounded traversal.
-        hash_tree(&fs::canonicalize(path)?, hash, count, size, visited)?;
-    } else if metadata.is_dir() {
-        let mut children = fs::read_dir(path)?
-            .map(|e| e.map(|e| e.path()))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        children.sort();
-        for child in children {
-            hash_tree(&child, hash, count, size, visited)?;
+    hash.update(metadata.len().to_le_bytes());
+    // Streaming keeps memory bounded; there is no installation byte/file-count limit.
+    let mut buffer = [0_u8; 65536];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
         }
-    } else if metadata.is_file() {
-        *size += metadata.len();
-        anyhow::ensure!(
-            *size <= 1024 * 1024 * 1024,
-            "producer installation exceeds admission byte bound"
-        );
-        let mut file = File::open(path)?;
-        let mut buffer = [0_u8; 65536];
-        loop {
-            let n = file.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            hash.update(&buffer[..n]);
-        }
-    } else {
-        anyhow::bail!("producer installation contains a non-regular file");
+        hash.update(&buffer[..n]);
     }
     Ok(())
 }
@@ -1140,16 +1146,86 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn installation_symlink_cycles_are_bounded_and_dependencies_change_identity() {
+    fn large_installation_assets_and_cycles_do_not_block_identity_or_override() {
         use std::os::unix::fs::symlink;
         let directory = tempfile::tempdir().unwrap();
         let binary = fake_omp(directory.path());
         fs::write(directory.path().join("package.json"), "{}").unwrap();
-        fs::write(directory.path().join("dependency"), "one").unwrap();
+        let asset = File::create(directory.path().join("model.bin")).unwrap();
+        asset.set_len(2 * 1024 * 1024 * 1024).unwrap();
         symlink(directory.path(), directory.path().join("cycle")).unwrap();
         let first = executable_identity(&binary).unwrap();
-        fs::write(directory.path().join("dependency"), "two").unwrap();
-        assert_ne!(first, executable_identity(&binary).unwrap());
+        fs::write(directory.path().join("unrelated-asset"), "data").unwrap();
+        assert_eq!(first, executable_identity(&binary).unwrap());
+        let state = directory.path().join("state");
+        let adapter = directory.path().join("extension.ts");
+        fs::write(&adapter, "fixture").unwrap();
+        override_build(
+            binary.to_str().unwrap(),
+            Driver::Omp,
+            Some(&adapter),
+            &state,
+            "offline fixture",
+        )
+        .unwrap();
+        revoke_override(
+            binary.to_str().unwrap(),
+            Driver::Omp,
+            Some(&adapter),
+            &state,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn package_manifest_and_lockfile_changes_invalidate_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = fake_omp(directory.path());
+        let manifest = directory.path().join("package.json");
+        fs::write(
+            &manifest,
+            r#"{"version":"1","dependencies":{"fixture":"1"}}"#,
+        )
+        .unwrap();
+        let first = executable_identity(&binary).unwrap();
+        fs::write(
+            &manifest,
+            r#"{"version":"1","dependencies":{"fixture":"2"}}"#,
+        )
+        .unwrap();
+        let second = executable_identity(&binary).unwrap();
+        assert_ne!(first, second);
+        let lock = directory.path().join("package-lock.json");
+        fs::write(&lock, "one").unwrap();
+        let third = executable_identity(&binary).unwrap();
+        assert_ne!(second, third);
+        fs::write(&lock, "two").unwrap();
+        assert_ne!(third, executable_identity(&binary).unwrap());
+        fs::remove_file(&lock).unwrap();
+        assert_eq!(second, executable_identity(&binary).unwrap());
+    }
+
+    #[test]
+    fn npm_hidden_lock_and_runtime_replacement_change_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let modules = directory.path().join("node_modules");
+        let package = modules.join("@fixture/producer");
+        fs::create_dir_all(package.join("dist")).unwrap();
+        fs::write(package.join("package.json"), "{}").unwrap();
+        let runtime = directory.path().join("runtime");
+        fs::write(&runtime, "runtime one").unwrap();
+        let binary = package.join("dist/cli.js");
+        fs::write(&binary, format!("#!{}\nfixture", runtime.display())).unwrap();
+        let first = executable_identity(&binary).unwrap();
+        let lock = modules.join(".package-lock.json");
+        fs::write(&lock, "dependencies one").unwrap();
+        let second = executable_identity(&binary).unwrap();
+        assert_ne!(first, second);
+        fs::write(&lock, "dependencies two").unwrap();
+        let third = executable_identity(&binary).unwrap();
+        assert_ne!(second, third);
+        fs::write(&runtime, "runtime two").unwrap();
+        assert_ne!(third, executable_identity(&binary).unwrap());
     }
 
     #[test]
