@@ -1087,10 +1087,10 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
             let transaction = connection.transaction().unwrap();
             let expression = if *table == "operations" && column == "state" {
                 "CASE state WHEN 'active' THEN 'conflict' ELSE 'active' END".to_owned()
-            } else if *table == "claims" && column == "body" {
-                // Claim-body expression indexes require valid JSON even when testing
-                // projection corruption independently of the normal reducers.
-                "json_set(body,'$.digest_probe','changed')".to_owned()
+            } else if *table == "desired" && column == "member" {
+                // Keep indexed member JSON valid. Concatenation clears json_set's
+                // transient JSON subtype so digest triggers see the persisted TEXT.
+                "json_set(COALESCE(member,'{}'),'$.digest_probe','changed')||''".to_owned()
             } else if kind == "INTEGER" {
                 format!("COALESCE({column},0)+1")
             } else if kind == "BLOB" {
@@ -1098,7 +1098,8 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
             } else {
                 format!("COALESCE({column},'')||'-changed'")
             };
-            transaction.execute(&format!("UPDATE {table} SET {column}={expression} WHERE rowid=(SELECT rowid FROM {table} LIMIT 1)"), []).unwrap();
+            transaction.execute(&format!("UPDATE {table} SET {column}={expression} WHERE rowid=(SELECT rowid FROM {table} LIMIT 1)"), [])
+                .unwrap_or_else(|error| panic!("mutate {table}.{column}: {error}"));
             let current = projection_digest::tables(&transaction).unwrap();
             assert_eq!(
                 current,
