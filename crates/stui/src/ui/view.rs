@@ -64,6 +64,28 @@ pub struct World {
     /// Each account's freshest limits reading, from the same read.
     #[serde(skip)]
     pub usage_limits: Vec<st3_client::UsageLimit>,
+    /// The clients connected to this member now and those seen in the last few minutes.
+    pub clients: Load<Vec<Connected>>,
+}
+
+/// A client connected to this member, as it describes itself.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Connected {
+    /// Its reported name and build, "stui 0.1.0+ab12cd3"; empty when it sent none.
+    pub client: String,
+    /// The person or agent it acts for, and the paired device when one is acting.
+    pub who: String,
+    pub device: Option<String>,
+    pub member: String,
+    /// `local`, `gateway` or `tailscale`.
+    pub via: String,
+    pub connected: bool,
+    /// "since 4m", or "seen 2m ago" once it has gone.
+    pub when: String,
+    /// What it follows: windows, conversations and terminals.
+    pub follows: Vec<String>,
+    /// Its reported build is older than the member's own.
+    pub older: bool,
 }
 
 // ------------------------------------------------------------------ attention
@@ -245,6 +267,9 @@ impl Harness {
 pub enum AgentState {
     /// Waiting on the person.
     NeedsYou,
+    /// Its harness is not logged in to its provider: someone has to log it in on its host.
+    /// It clears by itself once st sees the harness signed in; no restart is needed.
+    NeedsLogin,
     Fault,
     Working,
     Idle,

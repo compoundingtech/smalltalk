@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `93cab337c51b7787708bde598f57b3067f5a006d1fea0b383b5ba52860a5f107`
+Digest: `2fe4547a760708f82e4835888338b1ee68332717451f8f971fcb92cc05864194`
 
 ## Subject families
 
@@ -95,7 +95,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `harness.context-clear.result` | `agent` | `system-only` | `once` | `durable` | `context_epoch:string`, `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string` |  |
 | `harness.diagnostic` | `agent` | `same-subject-actor` | `append` | `durable` | `attempt:integer`, `auth_attention_key:string`, `code:string`, `driver:string`, `incarnation_id:string`, `matched_line:string`, `observed_since_ms:integer`, `ownership_sequence:integer`, `provider_auth_sequence:integer`, `readiness_epoch:integer`, `reason:string`, `retry_after_unix_ms:integer`, `retry_attempt:integer`, `severity:string`, `status:string`, `step_run:subject-reference(step-run)`, `wake_attempts:integer` |  |
 | `harness.limits` | `agent` | `same-subject-actor` | `append` | `durable` | `account:string`, `account_ref:string`, `driver!:string`, `five_hour_percent:number`, `five_hour_resets_at_unix_ms:integer`, `incarnation_id:string`, `measured_at_unix_ms!:integer`, `plan:string`, `weekly_percent:number`, `weekly_resets_at_unix_ms:integer` |  |
-| `harness.observed` | `agent` | `same-subject-actor` | `append` | `latest` | `ask:string`, `background_jobs:integer`, `blocked_on:string`, `blocking:array`, `driver:string`, `evidence_incarnation:string`, `exit:string`, `incarnation_id:string`, `input_buffer:string`, `observed_at_ms:integer`, `observed_since_ms:integer`, `ownership_sequence:integer`, `provider_auth:boolean`, `provider_auth_sequence:integer`, `quiescent:boolean`, `reason:string`, `rollout_operation:string`, `state!:string`, `transition_sequence:integer`, `transport:string` |  |
+| `harness.observed` | `agent` | `same-subject-actor` | `append` | `latest` | `ask:string`, `background_jobs:integer`, `blocked_on:string`, `blocking:array`, `driver:string`, `evidence_incarnation:string`, `exit:string`, `incarnation_id:string`, `input_buffer:string`, `observed_at_ms:integer`, `observed_since_ms:integer`, `ownership_sequence:integer`, `provider_auth:boolean`, `provider_auth_sequence:integer`, `quiescent:boolean`, `reason:string`, `rollout_operation:string`, `state!:string`, `status_transition:boolean`, `transition_sequence:integer`, `transport:string` |  |
 | `harness.session-file` | `agent` | `authorized-requester` | `append` | `durable` | `account_ref:string`, `agent:subject-reference(agent)`, `discovery_revision:string`, `harness!:string`, `incarnation_id:string`, `modified_at:string`, `path:string`, `session_id!:string`, `source_session:string`, `status:string` |  |
 | `harness.telemetry` | `agent` | `same-subject-actor` | `append` | `local` | `driver!:string`, `incarnation_id!:string`, `signals!:object`, `unit!:string` |  |
 | `harness.timeline` | `agent` | `same-subject-actor` | `append` | `local` | `body!:object`, `driver!:string`, `entry_id!:string`, `entry_type!:string`, `final!:boolean`, `incarnation_id!:string`, `observed_at_unix_ms:integer`, `operation!:string`, `revision!:integer`, `role!:string`, `sequence:integer`, `source_id:string` |  |

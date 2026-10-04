@@ -2888,6 +2888,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("input_buffer", string()),
             ("exit", string()),
             ("observed_since_ms", integer()),
+            ("status_transition", boolean()),
             ("observed_at_ms", integer()),
             ("ownership_sequence", integer()),
             ("transition_sequence", integer()),

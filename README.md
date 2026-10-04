@@ -27,6 +27,9 @@ rules, outcomes and rich step details retain stui's existing behavior.
 Adapted steps retain their stable step-run `id` and claimant-or-assignee `seat` (absent for
 agentless steps), so consumers can select duplicate paths across open runs and navigate to
 the actual execution seat without reconstructing identity from display labels.
+`Mission.step_metadata` retains each selected step's raw `blocked_reason` and `last_progress`,
+keyed by its step-run ID. These facts survive state changes independently of a step's waiting
+blocker or derived queue `note`, and are not normalized by display text policies.
 Shared widgets and other UI models are separate follow-up work, not part of this mission extraction.
 
 ## Install

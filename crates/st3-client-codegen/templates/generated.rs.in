@@ -903,6 +903,10 @@ pub struct Agent {
     #[serde(default)]
     pub harness_error_state: Option<String>,
     #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub observation: Option<String>,
+    #[serde(default)]
     pub blocked_on: Option<String>,
     #[serde(default)]
     pub ask: Option<String>,
@@ -1081,6 +1085,23 @@ pub enum AgentQueuePlacement {
     After,
 }
 /// One agent seat's current claim and its ordered queue of mission runs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StatusHistory {
+    pub kind: String,
+    pub seat: String,
+    pub items: Vec<StatusTransition>,
+    pub retained_from: String,
+    pub complete: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StatusTransition {
+    pub seat: String,
+    pub runtime_incarnation: String,
+    pub state: Option<String>,
+    pub observed_at: String,
+    pub reset: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentQueue {
     pub kind: String,
