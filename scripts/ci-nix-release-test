@@ -16,8 +16,10 @@ def output(*args, cwd=None):
 
 
 system = output('nix', 'eval', '--impure', '--raw', '--expr', 'builtins.currentSystem')
-archive = json.loads(output('nix', 'flake', 'archive', '--json', str(repo)))
-nixpkgs = archive['inputs']['nixpkgs']['path']
+# Only the fixture's nixpkgs input is needed. Archiving the whole graph also downloads
+# unused historical inputs, even when their package outputs already exist in the store.
+nixpkgs = output('nix', 'eval', '--impure', '--raw', '--expr',
+                 f'(builtins.getFlake {json.dumps(str(repo))}).inputs.nixpkgs.outPath')
 with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)
     fixture = root / 'example'
