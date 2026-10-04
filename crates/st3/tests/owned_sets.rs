@@ -785,6 +785,7 @@ async fn manual_rollout_publishes_with_automatic_member_and_only_moves_on_explic
         .get(&format!("/v1/client/agents/{manual}"))
         .await
         .unwrap();
+    assert_eq!(agent["state"], "running");
     assert_eq!(agent["rollout"]["mode"], "manual");
     assert_eq!(
         agent["rollout"]["status"],

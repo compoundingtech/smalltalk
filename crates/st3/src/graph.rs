@@ -1232,8 +1232,9 @@ fn parse_agent(
         )
     })?;
     validate_agent_body(children, &node_name)?;
-    if let Some(mode) = child_string(children, "rollout")? {
-        if mode != "manual" {
+    if let Some(policy) = unique_child(children, "rollout")? {
+        ensure_no_properties(policy)?;
+        if one_string(policy)? != "manual" {
             return Err(St3Error::new(
                 "invalid-seat-rollout",
                 "seat rollout must be manual",
@@ -6527,6 +6528,7 @@ schedule "daily" {
             "rollout 1;",
             "rollout \"manual\"; rollout \"manual\";",
             "rollout \"manual\" { ignored; }",
+            "rollout \"manual\" ignored=\"value\";",
         ] {
             assert!(
                 parse_owned_set_intent(&source.replace("rollout \"manual\";", field), "amber")
