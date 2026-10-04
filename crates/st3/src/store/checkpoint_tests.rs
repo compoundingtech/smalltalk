@@ -1753,19 +1753,35 @@ fn status_history_checkpoint_drops_old_transitions_but_keeps_current_state_start
 fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
     let store = Store::open_memory("cedar").unwrap();
     let append = |kind: &str, fields: Value| {
-        store.append_claim(&ClaimInput {
-            subject:"agent/cedar".into(), kind:kind.into(), actor:Some("agent/cedar".into()),
-            fields:serde_json::from_value(fields).unwrap(), evidence:Vec::new(),
-            expected_subject:None, idempotency_key:None,
-        }).unwrap()
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/cedar".into(),
+                kind: kind.into(),
+                actor: Some("agent/cedar".into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap()
     };
-    append("runtime.observed", json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}));
+    append(
+        "runtime.observed",
+        json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}),
+    );
     for index in 0..220 {
-        append("harness.observed", json!({"state":if index%2==0 {"idle"} else {"working"}, "incarnation_id":"one"}));
+        append(
+            "harness.observed",
+            json!({"state":if index%2==0 {"idle"} else {"working"}, "incarnation_id":"one"}),
+        );
     }
     let cut = now_ms() + 1_000;
     let before = store.seat_status_history("agent/cedar", cut).unwrap();
-    let since = store.current_harness("agent/cedar").unwrap().unwrap().since_unix_ms;
+    let since = store
+        .current_harness("agent/cedar")
+        .unwrap()
+        .unwrap()
+        .since_unix_ms;
     let sealed = store.checkpoint_sealed_set(cut).unwrap();
     let plan = plan_drops(&sealed);
     assert!(!plan.claims.is_empty());
@@ -1773,11 +1789,21 @@ fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
     let copy = scratch.path().join("checkpoint.sqlite3");
     store.copy_store_to(&copy).unwrap();
     let proof = prove_on_copy(&copy, &sealed, &plan).unwrap();
-    assert!(proof.passed, "bounded transitions and current since must survive the proof: {:?}", proof.mismatches);
+    assert!(
+        proof.passed,
+        "bounded transitions and current since must survive the proof: {:?}",
+        proof.mismatches
+    );
     {
         let mut connection = store.connection.write();
         let transaction = connection.transaction().unwrap();
-        record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims).unwrap();
+        record_checkpoint_tombstones_tx(
+            &transaction,
+            &checkpoint_name(cut),
+            &plan.envelopes,
+            &plan.claims,
+        )
+        .unwrap();
         delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
         transaction.commit().unwrap();
     }
@@ -1785,7 +1811,14 @@ fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
     assert_eq!(after["items"], before["items"]);
     assert_eq!(after["retained_from"], before["retained_from"]);
     assert_eq!(after["complete"], false);
-    assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().since_unix_ms, since);
+    assert_eq!(
+        store
+            .current_harness("agent/cedar")
+            .unwrap()
+            .unwrap()
+            .since_unix_ms,
+        since
+    );
 }
 
 #[test]
