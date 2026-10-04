@@ -1314,7 +1314,9 @@ fn observe_payload(
                 .context("Claude hook resume generation is invalid")
         })
         .transpose()?;
-    if event == "SessionStart" {
+    if event == "SessionStart"
+        && payload["agent_id"].as_str().is_none_or(str::is_empty)
+    {
         let binding = match (runtime_id, exported_session.as_deref()) {
             (Some(runtime_id), Some(runtime_incarnation)) => Some(record_session_start_binding(
                 session_dir,
@@ -1445,15 +1447,7 @@ fn write_native_session_binding(
     incarnation: &str,
     native_id: &str,
 ) -> Result<()> {
-    harness_state::write_json_atomic(
-        &agent_dir.join("claude-native-session"),
-        &serde_json::json!({
-            "incarnation": incarnation,
-            "native_session_id": native_id,
-        }),
-        agent_dir,
-        ".claude-native-session",
-    )
+    crate::harness_events::bind_claude_session(agent_dir, incarnation, native_id)
 }
 
 /// Select the ownership a hook write acts under. The wrapper's exported token makes hook writes

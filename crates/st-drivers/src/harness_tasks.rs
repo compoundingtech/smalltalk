@@ -26,23 +26,13 @@ pub fn observe_claude(agent_dir: &Path, event: &str, payload: &Value, runtime: &
         || event != "PostToolUse"
         || payload["tool_name"].as_str() != Some("TodoWrite")
         || payload["agent_id"].as_str().is_some_and(|id| !id.is_empty())
+        || runtime.is_empty()
     {
         return Ok(());
     }
     let Some(session) = payload["session_id"].as_str().filter(|id| !id.is_empty()) else {
         return Ok(());
     };
-    let binding = match std::fs::read(agent_dir.join("claude-native-session")) {
-        Ok(raw) => serde_json::from_slice::<Value>(&raw)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if runtime.is_empty()
-        || binding["incarnation"].as_str() != Some(runtime)
-        || binding["native_session_id"].as_str() != Some(session)
-    {
-        return Ok(());
-    }
     // Prefer the native successful response. A present malformed response must not be replaced
     // with plausible input; absence alone permits the documented full replacement input.
     let source = payload.pointer("/tool_response/newTodos")
@@ -185,8 +175,8 @@ mod tests {
         crate::harness_events::enable(root.path(), "seat-runtime").unwrap();
         crate::harness_events::write_snapshot(root.path(), "harness-state",
             br#"{"incarnation":"provider-runtime"}"#).unwrap();
-        std::fs::write(root.path().join("claude-native-session"),
-            br#"{"incarnation":"provider-runtime","native_session_id":"native-session"}"#).unwrap();
+        crate::harness_events::bind_claude_session(
+            root.path(), "provider-runtime", "native-session").unwrap();
         root
     }
 
@@ -205,11 +195,29 @@ mod tests {
         observe_claude(root.path(), "PostToolUse", &other, "provider-runtime").unwrap();
         other.as_object_mut().unwrap().remove("agent_id");
         other["session_id"] = "different-session".into();
-        observe_claude(root.path(), "PostToolUse", &other, "provider-runtime").unwrap();
+        observe_claude(root.path(), "PostToolUse", &other, "provider-runtime").unwrap_err();
         let stored: Value = serde_json::from_slice(&crate::harness_events::read_snapshot(
             root.path(), "harness-todo").unwrap().unwrap()).unwrap();
         assert_eq!(stored["phases"][0]["tasks"][0]["content"], "Parent work");
         assert_eq!(stored["totals"]["in_progress"], 1);
+    }
+
+    #[test]
+    fn clear_within_one_wrapper_refuses_a_prepared_predecessor_snapshot() {
+        let root = enabled_agent();
+        let old = normalize(&json!([]), "claude", "native-session", "provider-runtime",
+            "TodoWrite", false).unwrap();
+        crate::harness_events::bind_claude_session(
+            root.path(), "provider-runtime", "cleared-session").unwrap();
+        let mut current = claude(json!([{"content":"New session work","status":"pending"}]));
+        current["session_id"] = "cleared-session".into();
+        observe_claude(root.path(), "PostToolUse", &current, "provider-runtime").unwrap();
+        let before = crate::harness_events::read_snapshot(root.path(), "harness-todo").unwrap();
+        crate::harness_events::write_snapshot(root.path(), "harness-todo", &old).unwrap_err();
+        assert_eq!(crate::harness_events::read_snapshot(root.path(), "harness-todo").unwrap(), before);
+        let stored: Value = serde_json::from_slice(before.as_ref().unwrap()).unwrap();
+        assert_eq!(stored["session_id"], "cleared-session");
+        assert_eq!(stored["phases"][0]["tasks"][0]["content"], "New session work");
     }
 
     #[test]
