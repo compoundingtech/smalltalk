@@ -60,7 +60,7 @@ const linuxStageJob = ({
   'runs-on': linuxStageRunsOn,
   'timeout-minutes': 120,
   defaults: { run: { shell: 'bash' } },
-  env: { ...buildEnv, ...env },
+  env: { ...buildEnv, ...env, CI_CACHE_DEV_SHELL: 'default' },
   steps: [
     ...setup,
     {

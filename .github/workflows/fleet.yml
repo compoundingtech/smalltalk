@@ -125,8 +125,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
-          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+          key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: |
+            nix5-${{ github.job }}-${{ runner.os }}-
+            nix4-${{ github.job }}-${{ runner.os }}-
       - name: Remember genuine source inputs before compiling
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
       - name: Install Nix
@@ -249,6 +251,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
       CI_RUN_ID: ${{ github.run_id }}
+      CI_CACHE_DEV_SHELL: default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -282,8 +285,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
-          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+          key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: |
+            nix5-${{ github.job }}-${{ runner.os }}-
+            nix4-${{ github.job }}-${{ runner.os }}-
       - name: Remember genuine source inputs before compiling
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
       - name: Install Nix
@@ -382,6 +387,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
       CLIPPY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+      CI_CACHE_DEV_SHELL: default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -415,8 +421,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
-          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+          key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: |
+            nix5-${{ github.job }}-${{ runner.os }}-
+            nix4-${{ github.job }}-${{ runner.os }}-
       - name: Remember genuine source inputs before compiling
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
       - name: Install Nix
@@ -494,6 +502,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      CI_CACHE_DEV_SHELL: default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -527,8 +536,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
-          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+          key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: |
+            nix5-${{ github.job }}-${{ runner.os }}-
+            nix4-${{ github.job }}-${{ runner.os }}-
       - name: Remember genuine source inputs before compiling
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
       - name: Install Nix
@@ -661,8 +672,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
-          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+          key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: |
+            nix5-${{ github.job }}-${{ runner.os }}-
+            nix4-${{ github.job }}-${{ runner.os }}-
       - name: Remember genuine source inputs before compiling
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
       - name: Install Nix
@@ -798,8 +811,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
-          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+          key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: |
+            nix5-${{ github.job }}-${{ runner.os }}-
+            nix4-${{ github.job }}-${{ runner.os }}-
       - name: Remember genuine source inputs before compiling
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
       - name: Install Nix

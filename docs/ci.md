@@ -53,7 +53,7 @@ remains available for a full run. Release and deployment workflows keep their ow
 
 Each stage restores a job-keyed `actions/cache` entry (Namespace serves it from its accelerated
 backend) holding Cargo's registry and the workspace `target/` directory, keyed on `Cargo.lock` and
-`flake.lock`, workspace manifests and linker configuration. A second keyed entry (`nix4-<job>-...`) holds a signed local Nix binary cache in
+`flake.lock`, workspace manifests and linker configuration. A second keyed entry (`nix5-<job>-...`) holds a signed local Nix binary cache in
 `$RUNNER_TEMP/st-ci-cache`. Its key includes `flake.lock`, the flake, Nix expressions and both compatibility baseline pins.
 `scripts/ci-nix-cache use` makes it a preferred substituter. After a successful stage, `save`
 copies reference-free downloads and sources fetched by the run, plus the closures of the fleet
@@ -426,8 +426,9 @@ fingerprint the installed Rust compiler and, on macOS, the Swift compiler and SD
 runner restores a compatible completed run's outputs and the original tracked-source
 nanosecond timestamps only for that exact clean SHA. Git metadata is never restamped.
 Cargo still rebuilds dirty or changed source and embeds the genuine source identity.
-The signed Nix cache includes the complete job shell closure, so a target hit does not
-rebuild the immutable PTY and collector tools before Cargo starts.
+The signed Nix cache retains locally built shell tools and their runtime closures, so
+a target hit does not rebuild the immutable PTY and collector before Cargo starts.
+Upstream-signed compilers and Node stay with their faster public binary caches.
 Persistent ci1 runners keep their source checkpoint beside the actual target directory.
 A first build of a new source warns that no snapshot exists and restores dependency caches;
 a repeat reuses its snapshot without consuming the shared dependency-cache quota.

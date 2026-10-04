@@ -52,13 +52,21 @@ case "$cmd" in
       xargs nix copy --to "$to" --no-check-sigs --no-recursive < "$cache.paths"
     fi
     roots=()
-    # A fresh runner otherwise rebuilds immutable PTY/collector tools before Cargo,
-    # even with a target-cache hit. Retain the complete shell, including its tools.
+    # Cache locally built shell tools (PTY, collector, etc.), not the upstream-signed
+    # compiler/Node closure, which cache.nixos.org serves faster than another archive.
     if [ -n "${CI_CACHE_DEV_SHELL:-}" ]; then
       system=$(nix eval --impure --raw --expr builtins.currentSystem)
-      shell_root="$RUNNER_TEMP/ci-dev-shell"
-      nix build --no-update-lock-file --out-link "$shell_root" ".#devShells.$system.$CI_CACHE_DEV_SHELL"
-      roots+=("$shell_root")
+      nix eval --json ".#devShells.$system.$CI_CACHE_DEV_SHELL" \
+        --apply 'shell: map toString ((shell.buildInputs or []) ++ (shell.nativeBuildInputs or []))' |
+        jq -r '.[]' > "$dir/shell-inputs"
+      shell_inputs=()
+      while IFS= read -r path; do shell_inputs+=("$path"); done < "$dir/shell-inputs"
+      if [ "${#shell_inputs[@]}" -gt 0 ]; then
+        nix path-info --json --json-format 1 "${shell_inputs[@]}" |
+          jq -r 'if type == "object" then to_entries | map(select((.value.signatures // []) == [])) | map(.key)
+                 else map(select((.signatures // []) == [])) | map(.path) end | .[]' > "$dir/shell-roots"
+        while IFS= read -r path; do roots+=("$path"); done < "$dir/shell-roots"
+      fi
     fi
     [ -e "$RUNNER_TEMP/vm-driver" ] && roots+=("$RUNNER_TEMP/vm-driver")
     # Performance keeps its small devShell closure as well as downloads, avoiding cold tool setup.

@@ -120,8 +120,8 @@ export const nixCacheStep = {
   uses: 'actions/cache@v4',
   with: {
     path: '${{ runner.temp }}/st-ci-cache',
-    key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
-    'restore-keys': 'nix4-${{ github.job }}-${{ runner.os }}-',
+    key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
+    'restore-keys': 'nix5-${{ github.job }}-${{ runner.os }}-\nnix4-${{ github.job }}-${{ runner.os }}-',
   },
 } as const
 
