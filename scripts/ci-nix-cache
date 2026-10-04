@@ -50,6 +50,8 @@ case "$cmd" in
     to="file://$cache?secret-key=$key.sec&compression=zstd"
     xargs -a "$cache.paths" -r nix copy --to "$to" --no-check-sigs --no-recursive
     roots=()
+    # Performance keeps its small devShell closure as well as downloads, avoiding cold tool setup.
+    [ -n "${CI_PERF_SHELL_ROOT:-}" ] && roots+=("$CI_PERF_SHELL_ROOT")
     [ -e "$RUNNER_TEMP/baseline" ] && roots+=("$RUNNER_TEMP/baseline")
     [ -n "${ST3_MESSAGING_COMPAT_BIN:-}" ] && roots+=("${ST3_MESSAGING_COMPAT_BIN%/bin/st3}")
     [ -n "${ST2_VISTA_COMPONENT:-}" ] && roots+=("${ST2_VISTA_COMPONENT%%/share/*}")

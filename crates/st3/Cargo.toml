@@ -10,6 +10,8 @@ autotests = false
 [features]
 # Enabled through the self dev-dependency during tests, never by a production build.
 test-support = []
+# Opt in only in Performance; ordinary workspace checks need not build a second test binary.
+perf-load = []
 
 [dependencies]
 anyhow = "1"
@@ -88,6 +90,11 @@ doc = false
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+[[test]]
+name = "perf_load"
+path = "tests/perf_load.rs"
+required-features = ["perf-load"]
 
 [[test]]
 name = "api_accept"
