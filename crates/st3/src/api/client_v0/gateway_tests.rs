@@ -81,6 +81,7 @@ mod gateway_tests {
                 device_name: "Browser".into(),
                 person_id: "person/alex".into(),
                 full_control: None,
+                scopes: None,
             }),
         )
         .await
