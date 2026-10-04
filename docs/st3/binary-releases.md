@@ -68,6 +68,11 @@ GitHub's Actions cache nor FlakeHub. The `nix-release-proof` artifact records th
 targets, and output paths. The scheduled check starts four hours before the daily release schedule
 to catch package breakage early.
 
+The st3 Nix check uses nextest to give each test its own process, including CPU-budget and
+delivery-presence fixtures. Python, Node, and the Linux process utilities are declared test inputs;
+the historical messaging binary is pinned in the lockfile and supplied before the sandbox starts.
+The native runtime suite and documentation tests remain covered.
+
 ## Daily releases
 
 **Smalltalk daily release** (`release-daily.yml`) runs at 05:17 UTC and on manual dispatch. It takes the

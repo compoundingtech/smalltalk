@@ -18,7 +18,7 @@ export default githubWorkflow({
     "schedule": [{ "cron": "17 1 * * *" }],
     "workflow_dispatch": {},
     "pull_request": {
-      "paths": [".github/workflows/nix.yml*", "scripts/ci-nix-release*", "flake.nix", "flake.lock", "nix/**"]
+      "paths": [".github/workflows/nix.yml*", ".github/messaging-compat-baseline.json", "scripts/ci-nix-release*", "flake.nix", "flake.lock", "nix/**"]
     }
   },
   "permissions": { "contents": "read" },

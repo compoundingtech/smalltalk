@@ -13,6 +13,8 @@
     # Re-pin to effect-utils main once the Rust helpers and repo-settings PRs merge.
     effect-utils.url =
       "github:overengineeringstudio/effect-utils/3089f7e1faa82d7a4cb4de0e8d485164f837708b";
+    # The messaging fixture must not invoke Nix or fetch a historical build in the sandbox.
+    messaging-baseline.url = "github:compoundingtech/smalltalk/678103d3e8ae873a158bb2cb951d3ffefdf698c4";
   };
 
   outputs =
@@ -23,6 +25,7 @@
       fenix,
       pty,
       effect-utils,
+      messaging-baseline,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -116,6 +119,15 @@
           assert bindings.libghostty-vt == "=${pty.lib.libghosttyContract.rustBindingsVersion}";
           assert bindings.libghostty-vt-sys.version == "=${pty.lib.libghosttyContract.rustBindingsVersion}";
           pty.packages.${system}.libghostty-vt;
+
+        messagingBaseline =
+          assert messaging-baseline.rev == (builtins.fromJSON (builtins.readFile ./.github/messaging-compat-baseline.json)).commit;
+          messaging-baseline.packages.${system}.st3.overrideAttrs (_: {
+          doCheck = false;
+          nativeCheckInputs = [ ];
+          postInstall = "";
+          cargoBuildFlags = [ "-p" "st3" ];
+        });
 
         # buildRustPackage compiles the workspace once per derivation, so a gate that differs from
         # an existing derivation only by test selection is folded into that derivation's check
@@ -369,6 +381,19 @@
             "-p"
             "stui"
           ];
+          # Every test gets its own process, as in the native gate. Shared-process Cargo tests
+          # pollute CPU measurements and outlive the daemon delivery-presence startup grace.
+          checkPhase = ''
+            runHook preCheck
+            cargo nextest run --release --offline --target ${rustHostTarget} \
+              --build-jobs "$NIX_BUILD_CORES" --test-threads "$NIX_BUILD_CORES" --retries 0 \
+              ${pkgs.lib.escapeShellArgs st3Check.cargoTestFlags} \
+              -- ${pkgs.lib.escapeShellArgs st3Check.checkFlags}
+            cargo test --doc --release --offline --target ${rustHostTarget} \
+              -j "$NIX_BUILD_CORES" ${pkgs.lib.escapeShellArgs st3Check.cargoTestFlags}
+            runHook postCheck
+          '';
+          ST3_MESSAGING_COMPAT_BIN = "${messagingBaseline}/bin/st3";
           # These two tests put an openpty(3) terminal into raw mode. In the macOS Nix build one
           # fails and the other hangs, so they run on Linux only until they pass on macOS.
           checkFlags = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
@@ -400,8 +425,12 @@
             pkgs.jq
             pkgs.rustfmt
             pkgs.which
+            pkgs.cargo-nextest
+            pkgs.python3
+            pkgs.nodejs
             ptyPackage
           ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.util-linux ]
           # Native session discovery lists processes with ps and lsof on macOS (Linux reads /proc).
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             pkgs.ps
@@ -425,7 +454,10 @@
 
         # Installing the current tools must not depend on running the full runtime suite.
         # Keep that suite as checks.st3; st/ci also runs it in the native test environment.
-        st3 = st3Check.overrideAttrs (_: { doCheck = false; });
+        st3 = st3Check.overrideAttrs (_: {
+          doCheck = false;
+          ST3_MESSAGING_COMPAT_BIN = "";
+        });
 
         st3Help = pkgs.runCommand "st3-help-${version}" { } ''
           test "$(readlink ${st3}/bin/st)" = st3
