@@ -438,17 +438,19 @@ mod gateway_tests {
     }
 
     async fn next_json(socket: &mut TestSocket) -> Value {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match socket.next().await.unwrap().unwrap() {
-                    Message::Text(value) => return serde_json::from_str(&value).unwrap(),
-                    Message::Binary(value) => return serde_json::from_slice(&value).unwrap(),
-                    _ => {}
-                }
+        tokio::time::timeout(Duration::from_secs(5), next_json_frame(socket))
+            .await
+            .unwrap()
+    }
+
+    async fn next_json_frame(socket: &mut TestSocket) -> Value {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                Message::Text(value) => return serde_json::from_str(&value).unwrap(),
+                Message::Binary(value) => return serde_json::from_slice(&value).unwrap(),
+                _ => {}
             }
-        })
-        .await
-        .unwrap()
+        }
     }
 
     fn viewer_attachment(state: &AppState) -> (ClientSession, Value) {
@@ -1644,10 +1646,16 @@ mod gateway_tests {
         .await;
         follow(&mut timing_socket, "timing-term", &timing_attachment).await;
         open(&mut timing_socket, "timing-in", "timing-term").await;
-        let timing_closed =
-            tokio::time::timeout(Duration::from_secs(45), next_input(&mut timing_socket))
-                .await
-                .expect("idle socket must revoke expired authority without another input frame");
+        let timing_closed = tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                let frame = next_json_frame(&mut timing_socket).await;
+                if frame["kind"] != "screen" && frame["collection"] != "terminal" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("idle socket must revoke expired authority without another input frame");
         assert_eq!(timing_closed["kind"], "input-closed");
         assert_eq!(timing_closed["id"], "timing-in");
         assert_eq!(timing_closed["reason"], "revoked");
