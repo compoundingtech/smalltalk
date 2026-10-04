@@ -611,7 +611,8 @@ pub(super) fn plan_tx(
         || !input.resource_refreshes.is_empty()
         || !input.replica_repairs.is_empty()
         || input.subjects.values().any(|s| {
-            !matches!(s.kind.as_str(), "agent" | "schedule")
+            (!matches!(s.kind.as_str(), "agent" | "schedule")
+                && !(s.kind == "resource" && crate::graph::declared_uri(&s.desired).is_some()))
                 || s.owner_run.is_some()
                 || s.owner_step.is_some()
         })
@@ -731,6 +732,7 @@ pub(super) fn plan_tx(
     let live: BTreeMap<String, String> = input
         .subjects
         .iter()
+        .filter(|(_, d)| crate::graph::declared_uri(&d.desired).is_none())
         .map(|(s, d)| (s.clone(), desired_revision(d)))
         .chain(
             input
@@ -848,6 +850,17 @@ pub(super) fn plan_tx(
         }
         heads.insert(s.clone(), tokens);
         retired.remove(s);
+    }
+    // Shared reference targets are published with the bundle, but are never set members.
+    for desired in input
+        .subjects
+        .values()
+        .filter(|d| crate::graph::declared_uri(&d.desired).is_some())
+    {
+        heads.insert(
+            desired.subject.clone(),
+            intent_leaves_tx(transaction, &desired.subject).map_err(internal)?,
+        );
     }
     for s in &options.adopt {
         if !live.contains_key(s) {
