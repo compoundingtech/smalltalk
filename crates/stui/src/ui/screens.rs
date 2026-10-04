@@ -125,6 +125,7 @@ pub fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
         | AttentionKind::Request { .. } => ("◆", theme::PERSON),
         AttentionKind::Fault { .. } => ("✕", theme::FAULT),
         AttentionKind::Message { .. } => ("✉", theme::SAPPHIRE),
+        AttentionKind::Update { .. } => ("✦", theme::GREEN),
     }
 }
 
@@ -1033,12 +1034,22 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                             ("y", "Yes", Hit::Key('y'), theme::GREEN),
                             ("n", "No", Hit::Key('n'), theme::RED),
                             ("c", "Answer in words", Hit::Key('c'), theme::ACCENT),
-                            ("r", "Nothing to do", Hit::Key('r'), theme::OVERLAY1),
+                            (
+                                "x",
+                                "Dismiss: nothing to do",
+                                Hit::Key('x'),
+                                theme::OVERLAY1,
+                            ),
                         ]);
                     } else {
                         card.buttons(&[
                             ("c", "Answer", Hit::Key('c'), theme::ACCENT),
-                            ("r", "Nothing to do", Hit::Key('r'), theme::OVERLAY1),
+                            (
+                                "x",
+                                "Dismiss: nothing to do",
+                                Hit::Key('x'),
+                                theme::OVERLAY1,
+                            ),
                         ]);
                     }
                 }
@@ -1046,8 +1057,50 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             card.wrap(
                 &text::inline(
                     &format!(
-                        "{from} is waiting on you: answer it, or r if there is nothing for you to do. Either way the step it waits on continues."
+                        "{from} is waiting on you: answer it, or x to dismiss it when there is nothing for you to do. Either way the step it waits on continues."
                     ),
+                    theme::dim(),
+                ),
+                inner,
+            );
+        }
+        AttentionKind::Update {
+            from,
+            body,
+            about,
+            subjects,
+        } => {
+            card.line(Line::from(vec![
+                span("from  ", theme::dim()),
+                span(from.clone(), theme::strong(theme::PERSON)),
+            ]));
+            card.blank();
+            card.lines(text::markdown(&spaced(body), inner, theme::text()));
+            let links = std::iter::once(("about".to_owned(), about.clone()))
+                .filter(|(_, about)| !about.is_empty())
+                .chain(subjects.iter().cloned());
+            let mut first = true;
+            for (label, target) in links {
+                if first {
+                    card.blank();
+                    first = false;
+                }
+                card.lines(text::wrap(
+                    &[
+                        text::run(label, theme::text()),
+                        text::run(format!("  {target}"), theme::fg(theme::ACCENT)),
+                    ],
+                    inner,
+                    &[text::run(" ↗ ", theme::fg(theme::ACCENT))],
+                    &[text::run("   ", theme::dim())],
+                    None,
+                ));
+            }
+            card.blank();
+            card.buttons(&[("x", "Dismiss", Hit::Key('x'), theme::GREEN)]);
+            card.wrap(
+                &text::inline(
+                    "Nothing waits on this. It clears once you have read it: x, or leave it open a moment.",
                     theme::dim(),
                 ),
                 inner,
@@ -1070,7 +1123,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             } else {
                 card.buttons(&[
                     ("c", "Reply", Hit::Key('c'), theme::ACCENT),
-                    ("m", "Mark read", Hit::Key('m'), theme::GREEN),
+                    ("x", "Dismiss: mark read", Hit::Key('x'), theme::GREEN),
                     (
                         "l",
                         "Remind me later · demo",

@@ -23,6 +23,7 @@ st-resource-protocol = { path = "../st-resource-protocol" }
 st2-resource-providers = { path = "../st2-resource-providers", optional = true }
 st2-resource-wasip2 = { path = "../st2-resource-wasip2", optional = true, features = ["runtime"] }
 st-wire = { path = "../st-wire" }
+st3-schema = { path = "../st3-schema" }
 tempfile = "3"
 toml = "0.9"
 opentelemetry = "0.30"

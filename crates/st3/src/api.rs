@@ -39,14 +39,14 @@ use crate::model::{
     GateResultRequest, HumanReviewView, IntentInput, LaunchApproveAndStartRequest,
     LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionOption,
     LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest,
-    LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendRequest,
-    MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
-    MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest, MissionRunRequest,
-    MissionRunView, OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult,
-    PlannerSpec, PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
-    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicaRecordView,
-    ReplicationExportRequest, ReplicationExportResponse, ReplicationHealAnswer,
+    LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendReceipt,
+    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
+    MissionResponse, MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest,
+    MissionRunRequest, MissionRunView, OperationalRepairApplyRequest, OperationalRepairPlan,
+    OperationalRepairResult, PlannerSpec, PlanningApprovalRequest, PlanningCancelRequest,
+    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
+    PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest, QuickAgentResponse,
+    ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse, ReplicationHealAnswer,
     ReplicationHealAnswerRequest, ReplicationHealNextRequest, ReplicationHealStep,
     ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
     ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
@@ -59,11 +59,14 @@ use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
+mod client_presence;
 mod client_v0;
 mod delivery_presence;
 mod delivery_probes;
+mod github_watch;
 mod harness_events;
 mod mailbox;
+mod owned_sets;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
@@ -233,6 +236,8 @@ impl ApiError {
     fn bad(error: St3Error) -> Self {
         let status = match error.code {
             "stale-subject"
+            | "owned-set-refused"
+            | "set-managed-subject"
             | "missing-subject-token"
             | "stale-document-token"
             | "stale-incarnation"
@@ -313,6 +318,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route("/v1/client/sets", get(owned_sets::list))
+        .route("/v1/client/sets/{*id}", get(owned_sets::get))
         .route("/v1/client/glasses", get(client_v0::glasses_list))
         .route(
             "/v1/client/glasses/{id}",
@@ -326,12 +333,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/documents/content", get(client_v0::document_get))
         .route("/v1/client/usage", get(client_v0::usage_period))
+        .route("/v1/client/clients", get(client_v0::clients_list))
         .route(
             "/v1/client/subject-definition",
             get(client_v0::subject_definition),
         )
         .route("/v1/client/now", get(client_v0::now))
         .route("/v1/client/machines", get(client_v0::machines))
+        .route("/v1/client/hosts/{*id}", get(client_v0::host_repositories))
         .route("/v1/client/devices", get(client_v0::devices))
         .route("/v1/client/attention", get(client_attention))
         .route("/v1/client/attention/{*id}", get(client_attention_detail))
@@ -444,9 +453,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/schema", get(schema))
         .route("/v1/intent/mission", post(mission))
+        .route("/v1/gate-checks", post(start_gate_check))
+        .route("/v1/gate-checks/{id}", get(read_gate_check))
+        .route("/v1/sets/preview", post(owned_sets::preview))
+        .route("/v1/sets/apply", post(owned_sets::apply))
         .route("/v1/intent/apply", post(apply))
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
+        .route("/v1/agents/rollout", post(rollout_agent))
         .route("/v1/agents/start", post(start_mission_seat))
         .route("/v1/agents/suspend", post(suspend_agent))
         .route("/v1/agents/resume", post(resume_agent))
@@ -521,12 +535,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/read/{*subject}", get(read_message))
         .route("/v1/messages/delivery/{*subject}", get(message_delivery))
+        .route("/v1/messages/by-key", get(message_by_key))
         .route("/v1/status", get(status))
         .route("/v1/desired/{*subject}", get(get_desired))
         .route("/v1/events", get(events))
         .route("/v1/doctor", get(doctor))
         .route("/v1/repair", get(operational_repair_plan))
         .route("/v1/repair/apply", post(apply_operational_repair))
+        .route("/v1/backup", get(backup_export))
         .route("/v1/replication/status", get(replication_status))
         .route("/v1/replication/records", get(replication_records))
         .route("/v1/replication/records/{*record}", get(replication_record))
@@ -628,6 +644,11 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(cancel_revision_proposal),
         )
         .route("/v1/work/ask", post(ask_person))
+        .route("/v1/github/watch", post(github_watch::watch))
+        .route("/v1/github/unwatch", post(github_watch::unwatch))
+        .route("/v1/github/watches", get(github_watch::watches))
+        .route("/v1/github/comment", post(github_watch::comment))
+        .route("/v1/github/own", post(github_watch::own))
         .route("/v1/work/done", post(done_person_step))
         .route("/v1/work/cancel-ask", post(cancel_person_ask))
         .route("/v1/work", get(list_work))
@@ -748,6 +769,8 @@ async fn response_envelope(
         (Ok(None), None)
     };
     if let Ok(Some(session)) = &client_authentication {
+        // The clients connected now: kept in memory, shown by clients.list, never enforced.
+        client_presence::note_request(&state.node, session, request.headers(), client_now_ms());
         request.extensions_mut().insert(session.clone());
     }
     if let Some(snapshot) = &client_snapshot {
@@ -1463,6 +1486,7 @@ async fn client_capabilities(
     let capabilities = client_v0::capabilities(&session);
     Json(json!({
         "kind": "capabilities",
+        "machine_version": st_drivers::version::machine_version(),
         "session_actor": session.actor,
         "transport": session.transport,
         "capabilities": capabilities,
@@ -1861,7 +1885,19 @@ fn client_agent_resources(
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
     let mut items = store.cached_agent_resources(snapshot_index, history, || {
-        client_agent_resources_uncached(store, history, snapshot_index)
+        let mut items = client_agent_resources_uncached(store, history, snapshot_index)?;
+        let subjects = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
+        for item in &mut items {
+            let claims = observations.get(item["id"].as_str().unwrap_or_default());
+            item["todo"] = client_v0::agent_todo_value(
+                claims.and_then(|claims| claims.get("harness.todo.observed")),
+                claims.and_then(|claims| claims.get("harness.session-file")),
+                item["incarnation_id"].as_str(),
+            );
+        }
+        Ok(items)
     })?;
     let local_host = client_host_id(store.origin());
     for item in &mut items {
@@ -2195,6 +2231,7 @@ fn client_agent_resources_uncached(
                 })).collect::<Vec<_>>(),
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
+                "rollout": store.rollout(&subject.subject)?,
             });
             Ok((name, value))
         })
@@ -2788,6 +2825,46 @@ async fn message_delivery(
         Ok(Json(json!({ "id": subject, "from": message.from, "to": message.to,
             "delivery": message_delivery_value(&message.to, &message.status, sent_at, client_now_ms()) })))
     }).await
+}
+
+#[derive(Deserialize)]
+struct MessageKeyQuery {
+    key: String,
+}
+
+/// The message a send's idempotency key landed as, so a client whose send went unanswered can
+/// tell whether it was sent before it sends again. Only a message send or reply answers; any
+/// other key is `message-not-sent`.
+async fn message_by_key(
+    State(state): State<AppState>,
+    Query(query): Query<MessageKeyQuery>,
+) -> Result<Json<MessageSendReceipt>, ApiError> {
+    blocking_api(move || {
+        let not_sent = || ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "message-not-sent".into(),
+            message: format!("no message was sent with idempotency key `{}`", query.key),
+            details: Box::default(),
+        };
+        let claim = state
+            .store
+            .operation_claim(&query.key)
+            .map_err(ApiError::internal)?
+            .filter(|claim| claim.kind == "message.sent")
+            .ok_or_else(not_sent)?;
+        let message = state
+            .store
+            .message(&claim.subject)
+            .map_err(ApiError::internal)?
+            .ok_or_else(not_sent)?;
+        Ok(Json(MessageSendReceipt {
+            message,
+            idempotency_key: query.key.clone(),
+            already_sent: true,
+            sent_at: Some(client_timestamp(claim.accepted_at_unix_ms)),
+        }))
+    })
+    .await
 }
 
 fn launch_session_id(id: &str) -> &str {
@@ -4298,6 +4375,12 @@ async fn serve_unix_with_ancestor(
     bind_harness: bool,
     ancestor: fn(u32) -> Option<String>,
 ) -> anyhow::Result<()> {
+    // Only st3-fixture initializes this process-local state. Disable host ancestry while
+    // retaining native-driver identification, which mailbox subscriptions require.
+    #[cfg(feature = "test-support")]
+    let bind_ancestry = bind_harness && crate::test_support::login_shell().is_none();
+    #[cfg(not(feature = "test-support"))]
+    let bind_ancestry = bind_harness;
     crate::config::validate_unix_socket_path(socket, "--socket or --client-gateway-socket")?;
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
@@ -4338,7 +4421,7 @@ async fn serve_unix_with_ancestor(
             // out of the accept loop so a slow lookup delays only this peer.
             let (bound_agent, caller, delivery_peer) = match peer_pid {
                 Some(pid) => tokio::task::spawn_blocking(move || {
-                    let bound_agent = bind_harness.then(|| ancestor(pid)).flatten();
+                    let bound_agent = bind_ancestry.then(|| ancestor(pid)).flatten();
                     let caller = Some(crate::profile::Caller::of_command(
                         local_process_arguments(pid).map(|(arguments, _)| arguments),
                         bound_agent.as_deref(),
@@ -4647,6 +4730,41 @@ fn record_legacy_poll(
 #[derive(Clone, Debug)]
 pub struct BoundAgent(pub String);
 
+/// Only a locally bound harness may recover a missing work fence from its own runtime.
+/// Explicit fences are retained so the action's validation can refuse stale callers.
+fn bind_work_incarnation(
+    state: &AppState,
+    bound: Option<&Extension<BoundAgent>>,
+    actor: Option<&str>,
+    incarnation: &mut Option<String>,
+) -> Result<Option<String>, ApiError> {
+    let Some(bound) = bound else { return Ok(None) };
+    let seat = &bound.0.0;
+    if actor.and_then(normalized_agent_actor).as_deref() != Some(seat.as_str()) {
+        return Err(ApiError::bad(St3Error::new(
+            "foreign-agent-actor",
+            format!(
+                "this harness is `{seat}` and cannot act as `{}`",
+                actor.unwrap_or("<none>")
+            ),
+        )));
+    }
+    let current = state
+        .store
+        .latest_claim(seat, Some("runtime.observed"))
+        .map_err(ApiError::internal)?
+        .filter(|runtime| runtime.body["fields"]["status"] == "running")
+        .and_then(|runtime| {
+            runtime.body["fields"]["incarnation_id"]
+                .as_str()
+                .map(str::to_owned)
+        });
+    if incarnation.is_none() {
+        *incarnation = current.clone();
+    }
+    Ok(current)
+}
+
 async fn guard_bound_request(
     request: Request<Body>,
     bound_agent: Option<&str>,
@@ -4681,9 +4799,11 @@ async fn guard_bound_request(
     }
     if ![
         "/v1/intent/apply",
+        "/v1/sets/",
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
         "/v1/agents/restart",
+        "/v1/agents/rollout",
         "/v1/agents/start",
         "/v1/agents/suspend",
         "/v1/agents/resume",
@@ -4691,6 +4811,7 @@ async fn guard_bound_request(
         "/v1/delivery/hold",
         "/v1/lane-changes",
         "/v1/work/",
+        "/v1/github/",
         "/v1/attention",
         "/v1/launches",
         "/v1/mission-runs/",
@@ -4744,6 +4865,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
+        "features": {"owned_sets":1,"seat_rollout":1},
     })))
 }
 
@@ -5196,6 +5318,57 @@ fn unread_current_seat_counts(
     }
     Ok((pending, accepted))
 }
+fn terminal_exec_gates_check(store: &Store) -> anyhow::Result<DoctorCheck> {
+    fn has_exit_code_gate(mission: &crate::model::MissionSpec) -> bool {
+        let has_gate = |gates: &[crate::model::GateSpec]| {
+            gates.iter().any(|gate| {
+                matches!(gate, crate::model::GateSpec::Field { path, .. } if path == "exit_code")
+            })
+        };
+        has_gate(&mission.gates)
+            || mission.steps.values().any(|step| {
+                has_gate(&step.gates)
+                    || step
+                        .nested_mission
+                        .as_deref()
+                        .is_some_and(has_exit_code_gate)
+            })
+    }
+    let runs = store.open_mission_run_headers()?;
+    let missions = store.mission_specs_for_runs(
+        &runs
+            .iter()
+            .map(|run| run.subject.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let mut stuck = Vec::new();
+    for run in runs {
+        let Some(mission) = missions.get(&run.subject) else {
+            continue;
+        };
+        if !has_exit_code_gate(mission) {
+            continue;
+        }
+        // Detail-free step states suffice; do not hydrate wake, timing or loop histories.
+        if let Some(run) = store.mission_run_steps(&run.subject, false)? {
+            stuck.extend(crate::reconcile::stuck_field_gates(store, &run, mission)?);
+        }
+    }
+    stuck.sort();
+    Ok(DoctorCheck {
+        name: "terminal-exec-gates".into(),
+        status: if stuck.is_empty() { "pass" } else { "warn" }.into(),
+        message: if stuck.is_empty() {
+            "no unresolved field gates wait on execs that ended without a restart".into()
+        } else {
+            format!(
+                "stuck gates: {}; inspect `st missions show RUN`",
+                stuck.join("; ")
+            )
+        },
+    })
+}
+
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
     match state.store.index() {
@@ -5256,6 +5429,13 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: format!("could not compute the operational repair plan: {error}"),
         }),
     }
+    checks.push(
+        terminal_exec_gates_check(&state.store).unwrap_or_else(|error| DoctorCheck {
+            name: "terminal-exec-gates".into(),
+            status: "warn".into(),
+            message: format!("could not inspect terminal exec gates: {error}"),
+        }),
+    );
     match tempfile::Builder::new()
         .prefix(".st3-doctor-")
         .tempfile_in(&state.state_dir)
@@ -5903,6 +6083,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         "pass"
     };
     Ok(Json(DoctorReport {
+        machine_version: Some(st_drivers::version::machine_version()),
         status: report_status.into(),
         checks,
         performance: crate::performance::snapshot(),
@@ -6051,6 +6232,35 @@ async fn repair_replication_record(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(claim))
+}
+
+/// Spool one snapshot on a read worker; a slow downloader never holds the SQLite snapshot.
+async fn backup_export(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let store = state.store.clone();
+    let file = blocking_store(move || {
+        let mut file = tempfile::tempfile()?;
+        store.write_backup(&mut file)?;
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    })
+    .await?;
+    let file = tokio::fs::File::from_std(file);
+    let stream = futures_util::stream::try_unfold(file, |mut file| async move {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = vec![0_u8; 64 * 1024];
+        let read = file.read(&mut bytes).await?;
+        if read == 0 {
+            return Ok::<_, std::io::Error>(None);
+        }
+        bytes.truncate(read);
+        Ok(Some((bytes, file)))
+    });
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 async fn replication_export(
@@ -7881,12 +8091,9 @@ async fn cancel_planning_session(
 }
 
 fn required_planning_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
-    let id = launch_session_id(id);
-    state
-        .store
-        .planning_session(id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("launch `{id}` does not exist")))
+    // Legacy CLI launch IDs can themselves begin with `launch/`. Resolve the exact stored
+    // ID before treating that prefix as the client resource namespace.
+    client_launch_session(state, id)
 }
 
 fn normalize_planning_reviewer(value: &str) -> String {
@@ -8166,6 +8373,61 @@ async fn mission(
     Ok(Json(response))
 }
 
+/// Start running each exec gate of a mission file once, the way a run would: `st missions check`.
+/// The answer lists every gate; poll `GET /v1/gate-checks/{id}` until it is finished.
+async fn start_gate_check(
+    State(state): State<AppState>,
+    Json(request): Json<crate::model::GateCheckRequest>,
+) -> Result<Json<crate::model::GateCheckView>, ApiError> {
+    let initial = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
+    // Check the commands a publication would store: document names pinned to their versions.
+    let intent = state
+        .store
+        .document_bindings_at(&initial.document_refs, None)
+        .ok()
+        .and_then(|bindings| resolve_document_references(&request.intent.kdl, &bindings).ok())
+        .and_then(|resolved| parse_intent(&resolved, &state.node).ok())
+        .unwrap_or(initial);
+    let workspace = std::path::Path::new(&request.workspace);
+    if !workspace.is_absolute() {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-check-workspace",
+            "a gate check's workspace must be an absolute path",
+        )));
+    }
+    let (node, state_dir, pty_root) = (state.node, state.state_dir, state.pty_root);
+    let view = tokio::task::spawn_blocking(move || {
+        crate::gate_check::start(
+            crate::gate_check::CheckHost {
+                node: &node,
+                state_dir: &state_dir,
+                pty_root: &pty_root,
+            },
+            &intent,
+            &request.workspace,
+            &request.inputs,
+        )
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow::anyhow!(error)))?
+    .map_err(ApiError::internal)?;
+    Ok(Json(view))
+}
+
+async fn read_gate_check(
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<crate::model::GateCheckView>, ApiError> {
+    tokio::task::spawn_blocking(move || crate::gate_check::poll(&id))
+        .await
+        .map_err(|error| ApiError::internal(anyhow::anyhow!(error)))?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "no such gate check: it started over an hour ago or the daemon restarted",
+            )
+        })
+}
+
 /// One preview warning for each agent the publication declares, directly or inside a mission,
 /// that carries authority blocks, which free mode ignores.
 fn ignored_authority_warnings(
@@ -8273,6 +8535,56 @@ async fn publication_refusals(
 }
 
 #[derive(Deserialize)]
+struct AgentRolloutRequest {
+    subject: String,
+    actor: String,
+    expected_desired: String,
+    expected_incarnation: String,
+    policy: crate::rollout::Policy,
+    idempotency_key: String,
+}
+async fn rollout_agent(
+    State(state): State<AppState>,
+    Json(request): Json<AgentRolloutRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "invalid-rollout-actor")?;
+    let subject = agent_subject(request.subject);
+    let old =
+        crate::rollout::launched_member(&state.store, &subject, &request.expected_incarnation)
+            .map_err(ApiError::internal)?
+            .map(|(_, member)| member)
+            .or_else(|| {
+                state
+                    .store
+                    .rollout(&subject)
+                    .ok()
+                    .flatten()
+                    .filter(|o| o.old_incarnation == request.expected_incarnation)
+                    .map(|o| o.old_member)
+            })
+            .ok_or_else(|| {
+                ApiError::bad(St3Error::new(
+                    "rollout-launch-unknown",
+                    "the named incarnation has no original launch receipt",
+                ))
+            })?;
+    let response = state
+        .store
+        .request_rollout(
+            &subject,
+            &request.expected_desired,
+            &old,
+            &request.expected_incarnation,
+            &actor,
+            &request.policy,
+            &format!("seat-rollout-retry:{subject}:{}", request.idempotency_key),
+        )
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
+}
+
+#[derive(Deserialize)]
 struct AgentRestartRequest {
     subject: String,
     actor: String,
@@ -8289,6 +8601,7 @@ async fn restart_agent(
     } else {
         format!("agent/{}", request.subject)
     };
+    state.store.owned_member_guard(&subject).map_err(ApiError::bad)?;
     let key = format!("agent-restart:{subject}:{}", request.idempotency_key);
     if let Some(prior) = state
         .store
@@ -8296,6 +8609,17 @@ async fn restart_agent(
         .map_err(ApiError::internal)?
     {
         return Ok(Json(prior));
+    }
+    if state
+        .store
+        .rollout(&subject)
+        .map_err(ApiError::bad)?
+        .is_some_and(|o| o.holds_seat())
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "rollout-in-progress",
+            "the seat has a rollout; inspect it or retry with st agents rollout",
+        )));
     }
     if crate::suspension::current(&state.store, &subject)
         .map_err(ApiError::internal)?
@@ -8435,6 +8759,21 @@ fn suspension_target(
     ),
     ApiError,
 > {
+    state
+        .store
+        .owned_member_guard(subject)
+        .map_err(ApiError::bad)?;
+    if state
+        .store
+        .rollout(subject)
+        .map_err(ApiError::bad)?
+        .is_some_and(|o| o.holds_seat())
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "rollout-in-progress",
+            "the seat has a rollout; inspect it or retry with st agents rollout",
+        )));
+    }
     let status = state
         .store
         .status(Some(subject))
@@ -8666,6 +9005,8 @@ pub(crate) fn request_resume(
 
 #[derive(Deserialize)]
 struct NativeSessionReport {
+    #[serde(default)]
+    account_ref: Option<String>,
     subject: String,
     actor: String,
     incarnation_id: String,
@@ -8709,6 +9050,9 @@ async fn report_native_session(
     ]);
     if let Some(path) = request.path {
         fields.insert("path".into(), Value::String(path));
+    }
+    if let Some(account) = request.account_ref.filter(|name| !name.is_empty()) {
+        fields.insert("account_ref".into(), Value::String(account));
     }
     let claim = state
         .store
@@ -9349,8 +9693,29 @@ struct AttentionQuery {
 
 async fn ask_person(
     State(state): State<AppState>,
-    Json(request): Json<PersonAskRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<PersonAskRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    let expected = bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        Some(&request.actor),
+        &mut request.incarnation,
+    )?;
+    if bound.is_some()
+        && request.step.is_some()
+        && request.new_run.is_none()
+        && request.incarnation != expected
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-work-ask",
+            format!(
+                "only the current claimant and incarnation of live work can ask a person; expected incarnation `{}`, given `{}`",
+                expected.as_deref().unwrap_or("<none>"),
+                request.incarnation.as_deref().unwrap_or("<none>")
+            ),
+        )));
+    }
     let result = state.store.ask_person(&request).map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(result))
@@ -9754,8 +10119,8 @@ async fn post_review(
 async fn send_message(
     State(state): State<AppState>,
     Json(request): Json<MessageSendRequest>,
-) -> Result<Json<MessageView>, ApiError> {
-    blocking_api(move || accept_message(&state, request, None, None)).await
+) -> Result<Json<MessageSendReceipt>, ApiError> {
+    blocking_api(move || accept_message_receipt(&state, request, None, None).map(Json)).await
 }
 
 /// The fields a device signs on a message it sends, in the `fields-v1` format.
@@ -9876,6 +10241,18 @@ fn accept_message(
     session_id: Option<String>,
     device_signature: Option<smallclaims::principal::ClaimSignature>,
 ) -> Result<Json<MessageView>, ApiError> {
+    accept_message_receipt(state, request, session_id, device_signature)
+        .map(|receipt| Json(receipt.message))
+}
+
+/// Accept one message, or find the one its idempotency key already sent. The receipt says which,
+/// so a client that repeats an unanswered send can say that nothing new was sent.
+fn accept_message_receipt(
+    state: &AppState,
+    request: MessageSendRequest,
+    session_id: Option<String>,
+    device_signature: Option<smallclaims::principal::ClaimSignature>,
+) -> Result<MessageSendReceipt, ApiError> {
     if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "empty-message",
@@ -9963,11 +10340,12 @@ fn accept_message(
         fields,
         evidence: Vec::new(),
         expected_subject: None,
-        idempotency_key: Some(request.idempotency_key),
+        idempotency_key: Some(request.idempotency_key.clone()),
     };
-    let record = match &device_signature {
-        Some(signature) => state.store.append_signed_claim(&input, signature).map(|(claim, _)| claim),
-        None => state.store.append_claim(&input),
+    // A repeated key returns the first claim and says it appended nothing.
+    let (record, appended) = match &device_signature {
+        Some(signature) => state.store.append_signed_claim(&input, signature),
+        None => state.store.append_claim_outcome(&input),
     }
     .map_err(ApiError::bad)?;
     let mut work_wake = is_work_wake(&request.tags);
@@ -9981,18 +10359,23 @@ fn accept_message(
         settle_answered_message(&state.store, parent, &from, &to, &subject, &record.id)?;
     }
     signal_message_changed(state, "message.sent", work_wake);
-    Ok(Json(MessageView {
-        subject,
-        from,
-        to,
-        content: request.content,
-        status: "sent".into(),
-        title: request.title,
-        in_reply_to: request.in_reply_to,
-        tags: request.tags,
-        created_index: record.store_index,
-        attachments,
-    }))
+    Ok(MessageSendReceipt {
+        message: MessageView {
+            subject,
+            from,
+            to,
+            content: request.content,
+            status: "sent".into(),
+            title: request.title,
+            in_reply_to: request.in_reply_to,
+            tags: request.tags,
+            created_index: record.store_index,
+            attachments,
+        },
+        idempotency_key: request.idempotency_key,
+        already_sent: !appended,
+        sent_at: Some(client_timestamp(record.accepted_at_unix_ms)),
+    })
 }
 
 /// A recipient's successful reply is durable evidence that the parent was consumed.
@@ -10786,9 +11169,13 @@ async fn list_mission_runs(
 ) -> Result<Json<Vec<MissionRunView>>, ApiError> {
     let store = state.store.clone();
     match (query.root, query.mission) {
-        (Some(root), None) => blocking_store(move || store.mission_runs_for_root(&root))
-            .await
-            .map(Json),
+        (Some(root), None) => blocking_store(move || {
+            let mut runs = store.mission_runs_for_root(&root)?;
+            annotate_stuck_gates(&store, &mut runs)?;
+            Ok(runs)
+        })
+        .await
+        .map(Json),
         (None, Some(mission)) => {
             blocking_store(move || store.active_mission_runs_for_mission(&mission))
                 .await
@@ -10801,16 +11188,37 @@ async fn list_mission_runs(
     }
 }
 
+fn annotate_stuck_gates(store: &Store, runs: &mut [MissionRunView]) -> anyhow::Result<()> {
+    let active = runs
+        .iter()
+        .filter(|run| matches!(run.status.as_str(), "running" | "standing" | "blocked"))
+        .map(|run| run.subject.clone())
+        .collect::<Vec<_>>();
+    let missions = store.mission_specs_for_runs(&active)?;
+    for run in runs {
+        if let Some(mission) = missions.get(&run.subject) {
+            run.stuck_gates = crate::reconcile::stuck_field_gates(store, run, mission)?;
+        }
+    }
+    Ok(())
+}
+
 async fn get_mission_run(
     State(state): State<AppState>,
     AxumPath(run): AxumPath<String>,
 ) -> Result<Json<MissionRunView>, ApiError> {
     let store = state.store.clone();
     let run_for_read = run.clone();
-    blocking_store(move || store.mission_run(&run_for_read))
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("mission run `{run}` does not exist")))
+    blocking_store(move || {
+        let Some(mut run) = store.mission_run(&run_for_read)? else {
+            return Ok(None);
+        };
+        annotate_stuck_gates(&store, std::slice::from_mut(&mut run))?;
+        Ok(Some(run))
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(|| ApiError::not_found(format!("mission run `{run}` does not exist")))
 }
 
 async fn revise_mission_run(
@@ -11360,8 +11768,15 @@ fn person_or_agent_actor(actor: &str, code: &'static str) -> Result<String, ApiE
 async fn publish_work_mission(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
-    Json(request): Json<MissionProductionRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<MissionProductionRequest>,
 ) -> Result<Json<MissionOutputView>, ApiError> {
+    bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        Some(&request.actor),
+        &mut request.incarnation,
+    )?;
     let step = state
         .store
         .step_run(&subject)
@@ -11595,8 +12010,15 @@ fn normalized_agent_actor(actor: &str) -> Option<String> {
 async fn post_work_action(
     State(state): State<AppState>,
     AxumPath((action, subject)): AxumPath<(String, String)>,
-    Json(request): Json<WorkRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<WorkRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        request.actor.as_deref(),
+        &mut request.incarnation,
+    )?;
     work_action_response(state, action, subject, request, None).await
 }
 
@@ -11604,8 +12026,15 @@ async fn post_work_action(
 async fn extend_work(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
-    Json(request): Json<crate::model::WorkExtendRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<crate::model::WorkExtendRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        request.actor.as_deref(),
+        &mut request.incarnation,
+    )?;
     let extend_ms = request.by_ms;
     let request = WorkRequest {
         actor: request.actor,
@@ -12948,6 +13377,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/agent-queue-moves",
             "/v1/agents/rename",
             "/v1/agents/restart",
+            "/v1/agents/rollout",
             "/v1/agents/start",
             "/v1/agents/suspend",
             "/v1/agents/resume",
@@ -13073,7 +13503,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         // Only the seat itself reports its native session.
         let report = |actor: &str| {
             json!({"subject": subject, "actor": actor, "incarnation_id": incarnation,
-                   "harness": "claude", "session_id": "native-one"})
+                   "harness": "claude", "session_id": "native-one", "account_ref": "ada/one"})
         };
         let (_, body) = json_request(
             app.clone(),
@@ -13085,6 +13515,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let (status, body) =
             json_request(app.clone(), "/v1/agents/native-session", report(subject)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["body"]["fields"]["account_ref"], "ada/one");
         append(
             "harness.observed",
             json!({"state": "idle", "incarnation_id": incarnation, "quiescent": true,
@@ -14118,39 +14549,48 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 idempotency_key: None,
             })
             .unwrap();
-        let hold = Duration::from_secs(5);
+        let watchdog = Duration::from_secs(30);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let mut holders = Vec::new();
+        // Keep every resource held until all probes finish. Dropping the senders also
+        // releases the holders on assertion failure, so a failed probe cannot strand them.
+        let mut releases = Vec::new();
         let store = state.store.clone();
         let ready = ready_tx.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        releases.push(release_tx);
         holders.push(std::thread::spawn(move || {
             store.hold_write_transaction_for_test(|| {
                 ready.send(()).unwrap();
-                std::thread::sleep(hold);
+                let _ = release_rx.recv();
             });
         }));
         let store = state.store.clone();
         let ready = ready_tx.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        releases.push(release_tx);
         holders.push(std::thread::spawn(move || {
             store.hold_read_connections_for_test(|| {
                 ready.send(()).unwrap();
-                std::thread::sleep(hold);
+                let _ = release_rx.recv();
             });
         }));
         for _ in 0..8 {
             let (store, ready) = (state.store.clone(), ready_tx.clone());
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            releases.push(release_tx);
             holders.push(std::thread::spawn(move || {
                 store
                     .read_snapshot(|_| {
                         ready.send(()).unwrap();
-                        std::thread::sleep(hold);
+                        let _ = release_rx.recv();
                         Ok(())
                     })
                     .unwrap();
             }));
         }
         for _ in 0..holders.len() {
-            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            ready_rx.recv_timeout(watchdog).unwrap();
         }
 
         // As the daemon does when it starts, so no read makes the first diagnostic report.
@@ -14164,17 +14604,16 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/internal/fleet/membership",
             "/v1/client/operations",
         ] {
-            let started = Instant::now();
-            let response =
-                tokio::time::timeout(Duration::from_millis(250), get_request(app.clone(), path))
-                    .await;
+            // This is a deadlock watchdog, not a latency bound: runner scheduling can
+            // delay a request, but it must answer before any held resource is released.
+            let response = tokio::time::timeout(watchdog, get_request(app.clone(), path)).await;
             assert!(
                 response.is_ok(),
-                "{path} waited {:?} behind the writer or other reads",
-                started.elapsed()
+                "{path} did not answer while the writer and other reads were held"
             );
             assert_eq!(response.unwrap().0, StatusCode::OK, "{path}");
         }
+        drop(releases);
         for holder in holders {
             holder.join().unwrap();
         }
@@ -15746,6 +16185,58 @@ agent "good" {{ workspace {:?}; command "true" }}
     }
 
     #[tokio::test]
+    async fn publication_accepts_a_step_assigned_to_an_undeclared_person() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+        let kdl = r#"version 2
+mission "review" state="ready" {
+  goal "Review the candidate."
+  step "review" { assigned-to "person/reviewer" }
+}"#;
+
+        let (preview, status, applied) = preview_and_apply(app, kdl).await;
+        assert_eq!(preview["blockers"], json!([]));
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(
+            store.unresolved_graph_references().unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_accepts_available_work_for_a_person_and_an_existing_agent() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+        let (_, status, applied) = preview_and_apply(
+            app.clone(),
+            r#"version 2
+agent "example/worker" { workspace "/tmp"; command "true" }"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        let kdl = r#"version 2
+mission "review" state="ready" {
+  goal "Review the candidate."
+  step "review" {
+    available-to "person/reviewer"
+    available-to "agent/example/worker"
+  }
+}"#;
+
+        let (preview, status, applied) = preview_and_apply(app, kdl).await;
+        assert_eq!(preview["blockers"], json!([]));
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(
+            store.unresolved_graph_references().unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
     async fn publication_refuses_a_reference_that_does_not_resolve_without_a_write() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -15763,6 +16254,17 @@ mission "work" state="ready" {
         let (preview, status, error) = preview_and_apply(app.clone(), kdl).await;
         assert_eq!(preview["blockers"], json!([refusal]));
         assert_eq!(preview["warnings"], json!([]));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["code"], "unresolved-reference");
+        assert_eq!(error["details"]["refusals"], json!([refusal]));
+        assert_eq!(store.index().unwrap(), before);
+
+        let available = kdl.replace(
+            "assigned-to \"agent/example/nobody\"",
+            "available-to \"person/reviewer\"; available-to \"agent/example/nobody\"",
+        );
+        let (preview, status, error) = preview_and_apply(app.clone(), &available).await;
+        assert_eq!(preview["blockers"], json!([refusal]));
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
         assert_eq!(error["code"], "unresolved-reference");
         assert_eq!(error["details"]["refusals"], json!([refusal]));
@@ -15788,7 +16290,7 @@ mission "work" state="ready" {
                 std::fs::write(workspace.path().join("tracked"), "original\n").unwrap();
             }
             assert!(
-                std::process::Command::new("git")
+                crate::test_support::git()
                     .args(args)
                     .current_dir(workspace.path())
                     .status()
@@ -17613,6 +18115,11 @@ version 2
             assert_eq!(status, StatusCode::OK, "{sent}");
             let (status, repeated) = json_request(app.clone(), "/v1/messages", reply).await;
             assert_eq!(status, StatusCode::OK, "{repeated}");
+            // The repeat is told it found the first reply, not that it sent one.
+            assert_eq!(sent["already_sent"], false, "{sent}");
+            assert_eq!(repeated["already_sent"], true, "{repeated}");
+            assert_eq!(repeated["subject"], sent["subject"]);
+            assert_eq!(repeated["sent_at"], sent["sent_at"]);
             let (_, settled) = get_request(
                 app.clone(),
                 &format!(
@@ -20484,3 +20991,6 @@ agent "seat" { workspace "/tmp"; command "true" }
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
 }
+
+#[cfg(test)]
+mod work_incarnation_tests;

@@ -1,8 +1,8 @@
 import { githubRepoSettings, githubRuleset } from '../repos/effect-utils/genie/external.ts'
 
-// Landing goes through GitHub's merge queue, gated on the three Namespace checks. Apply only after the
-// `merge_group` trigger is on main (without it the queue never receives its checks and merges freeze).
-// Keep the live main ruleset's other protections; only replace the CI check and add the queue.
+// Landing goes through GitHub's merge queue. Apply the fourth required check only after
+// typescript-client has passed on main; the live ruleset keeps its three existing checks until then.
+// Every required job must run on merge_group, or the queue never receives its checks and merges freeze.
 export default githubRepoSettings({
   repository: { allow_auto_merge: true, delete_branch_on_merge: true },
   rulesets: [githubRuleset({
@@ -39,6 +39,7 @@ export default githubRepoSettings({
             { context: 'linux-gate', integration_id: 15368 },
             { context: 'isolation-vm', integration_id: 15368 },
             { context: 'genie-freshness', integration_id: 15368 },
+            { context: 'typescript-client', integration_id: 15368 },
           ],
         },
       },
@@ -49,7 +50,7 @@ export default githubRepoSettings({
           merge_method: 'MERGE',
           grouping_strategy: 'ALLGREEN',
           // Namespace's measured Linux limit is 320 vCPU / 640 GiB. Each full Workspace CI group
-          // initially requests 64 vCPU / 128 GiB, so five groups fit; PR and main jobs share capacity.
+          // initially requests 40 vCPU / 80 GiB, so five groups fit; PR and main jobs share capacity.
           max_entries_to_build: 5,
           max_entries_to_merge: 5,
           min_entries_to_merge: 1,

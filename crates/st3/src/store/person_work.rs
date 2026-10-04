@@ -268,8 +268,12 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
     let unfenced = requester.starts_with("daemon/") || is_update(ask);
     if !matches!(view.status.as_str(), "pending" | "ready")
         || !run_live(connection, &view.run, Some(&view.generation), false)?
-        || (!unfenced && !declaration_live(connection, requester)?)
     {
+        return Ok(false);
+    }
+    let requester_live = unfenced || declaration_live(connection, requester)?;
+    let retiring = !requester_live && super::rollouts::retiring_ask_live(connection, ask)?;
+    if !requester_live && !retiring {
         return Ok(false);
     }
     if unfenced {
@@ -282,11 +286,12 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
         if canonical::claim_key(connection, &declaration.id)? <= ask_key {
             continue;
         }
-        if declaration.body["kind"] == "stop"
-            || declaration.body["desired"]
-                .get("children")
-                .and_then(Value::as_array)
-                .is_some_and(|children| children.len() == 1 && children[0]["name"] == "stop")
+        if !retiring
+            && (declaration.body["kind"] == "stop"
+                || declaration.body["desired"]
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .is_some_and(|children| children.len() == 1 && children[0]["name"] == "stop"))
         {
             return Ok(false);
         }
@@ -368,6 +373,11 @@ pub(super) fn enrich_responses(
           json_extract(request.body,'$.fields.origin_step')=?1 FROM claims resolution JOIN claims request
         ON request.subject=resolution.subject AND request.kind='work.person-asked'
         WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
+          -- Only asks this step made, or the step's own ask: an index walk, not every answer.
+          AND resolution.subject IN (
+            SELECT subject FROM claims WHERE kind='work.person-asked'
+              AND json_extract(body,'$.fields.origin_step')=?1
+            UNION SELECT ?1)
           AND ((json_extract(request.body,'$.fields.origin_step')=?1
                 AND json_extract(request.body,'$.fields.origin_attempt')=?2)
             OR (resolution.subject=?1 AND json_extract(resolution.body,'$.fields.attempt')=?2))
@@ -480,7 +490,9 @@ impl Store {
                 || origin.claimant.as_deref() != Some(input.actor.as_str())
                 || origin.claim_incarnation != input.incarnation
                 || origin.claim_expires_at_unix_ms.is_none_or(|expiry| expiry <= now_ms()))) {
-                return Err(St3Error::new("stale-work-ask", "only the current claimant and incarnation of live work can ask a person"));
+                return Err(St3Error::new("stale-work-ask", format!(
+                    "only the current claimant and incarnation of live work can ask a person; expected incarnation `{}`, given `{}`",
+                    origin.claim_incarnation.as_deref().unwrap_or("<none>"), input.incarnation.as_deref().unwrap_or("<none>"))));
             }
             let waiting_since = input.legacy_request.as_ref().map(|id| tx.query_row("SELECT accepted_at_unix_ms FROM claims WHERE id=?1 AND kind='attention.requested'", [id], |row| row.get::<_, String>(0))).transpose().map_err(internal)?;
             let evidence = input.legacy_request.iter().cloned().collect::<Vec<_>>();
@@ -652,37 +664,6 @@ impl Store {
             }
             Ok(changed)
         }).map_err(anyhow::Error::msg)?
-    }
-
-    /// A request the daemon itself puts on a person's home, as `actor` (`daemon/NAME`), in a run
-    /// of its own. Every node that asks with the same name and key names the same step, so the
-    /// request appears once. Clients cannot reach this: `ask_person` accepts only agents.
-    pub(crate) fn ask_person_as_daemon(
-        &self,
-        actor: &str,
-        person: &str,
-        title: &str,
-        reason: &str,
-        name: &str,
-        key: &str,
-    ) -> Result<StepRunView, St3Error> {
-        if !actor.starts_with("daemon/")
-            || !person.starts_with("person/")
-            || person.matches('/').count() != 1
-            || title.trim().is_empty()
-            || reason.trim().is_empty()
-            || key.is_empty()
-        {
-            return Err(St3Error::new(
-                "invalid-person-ask",
-                "a daemon ask needs a daemon actor, a person, a title, a reason and a key",
-            ));
-        }
-        self.connection
-            .batched(|tx| {
-                ask_as_daemon_tx(tx, &self.origin, actor, person, title, reason, name, key)
-            })
-            .map_err(internal)?
     }
 
     /// Brings a person information they asked for. Nothing waits on an update: it stays on the
@@ -2382,55 +2363,4 @@ mission "writer-load" state="ready" {
             "stale-fence"
         );
     }
-}
-
-/// `Store::ask_person_as_daemon` inside a writer transaction the caller already holds, such as a
-/// resource observation that routes an item to a person.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ask_as_daemon_tx(
-    tx: &Transaction<'_>,
-    origin: &str,
-    actor: &str,
-    person: &str,
-    title: &str,
-    reason: &str,
-    name: &str,
-    key: &str,
-) -> Result<StepRunView, St3Error> {
-    let identity = serde_json::to_string(&(actor, name, key)).map_err(internal)?;
-    let hash = hex::encode(Sha256::digest(identity.as_bytes()));
-    let generation = format!("ask-{}", &hash[..32]);
-    let subject = format!("step-run/{generation}/ask");
-    if request(tx, &subject).map_err(internal)?.is_some() {
-        return step(tx, &subject)
-            .map_err(internal)?
-            .ok_or_else(|| St3Error::new("missing-step-run", "the ask is no longer retained"));
-    }
-    let mission_id = format!("person-ask/{}", &hash[..32]);
-    let kdl = format!(
-        "version 2\nmission {mission_id:?} state=\"ready\" {{ goal {title:?}; step \"ask\" {{ assigned-to {person:?}; goal {reason:?}; }} }}"
-    );
-    let mut intent = crate::graph::parse_internal_intent(&kdl, origin)?;
-    let mission = intent
-        .missions
-        .remove(&mission_id)
-        .ok_or_else(|| St3Error::new("internal", "the person mission could not be parsed"))?;
-    let claim = append_claim_tx(
-        tx,
-        origin,
-        &subject,
-        "work.person-asked",
-        Some(actor),
-        &json!({"fields": {"run": format!("mission-run/person-ask/{}", &hash[..32]),
-            "generation": format!("run-generation/{generation}"),
-            "person": person, "title": title, "reason": reason, "key": key,
-            "attempt": 1, "status": "ready", "mission_spec": mission}}),
-        &[],
-        None,
-    )
-    .map_err(claim_append_error)?;
-    project(tx, &claim)?;
-    step(tx, &subject)
-        .map_err(internal)?
-        .ok_or_else(|| St3Error::new("missing-step-run", "the ask could not be projected"))
 }

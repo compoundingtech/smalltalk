@@ -1,0 +1,150 @@
+{
+  "schema": "smalltalk.onboarding-rehearsal.v1",
+  "date_utc": "2026-10-03",
+  "environment": {
+    "os": "Ubuntu 24.04.5 LTS x86_64",
+    "image": "noble-server-cloudimg-amd64.img, 20260926",
+    "machines": [
+      "studio",
+      "beacon",
+      "lighthouse"
+    ],
+    "isolation": "Fresh QEMU/KVM guests; no shared daemon or existing Mac installer touched",
+    "credentials": "Existing harness and GitHub account authentication reused privately; not included in receipts"
+  },
+  "builds": {
+    "release": "v0.3.4",
+    "source": "122f114830053669fdd125375941f1f8f7616069",
+    "st3_sha256": "5b434cb73c8d9c6879766f473d45fff1ec5dee62df4ebcfa1e1e58694be70a1a",
+    "reported_version": "st 0.1.0",
+    "nix_source": "0c6b10d044f6a8a3b051639b55f53522cc9a9b11",
+    "nix_store": "/nix/store/2ggapnqp03104rvq5wy5nisglwyzvkpf-st3-0.1.0",
+    "claude": "2.1.288, sonnet resolved to claude-sonnet-5-5"
+  },
+  "checks": [
+    {
+      "page": "getting-started",
+      "result": "passed Linux path",
+      "evidence": "Latest archive downloaded, checksum checked, installer and PATH run on studio/beacon/lighthouse; native Claude installed, workspace trusted, channel installed/status ready; systemd user daemon and linger verified. Fresh exact --advertise-loopback fleet creation additionally checked on lighthouse."
+    },
+    {
+      "page": "getting-started",
+      "result": "passed Nix alternative",
+      "evidence": "Exact nix profile install command built and installed st3, stui and pty on beacon; profile lists the locked source above."
+    },
+    {
+      "page": "getting-started",
+      "result": "passed real first mission",
+      "run": "mission-run/garden/first-note/one",
+      "evidence": "Actual Claude seat created a three-sentence garden-note.md and completed its step. Attach/detach, stui Missions and Agents, CLI message and stop/start checked."
+    },
+    {
+      "page": "two-machines",
+      "result": "passed SSH join and bidirectional synchronization",
+      "evidence": "Single-use loopback invitation, dial-out join over encrypted SSH tunnel. Same declared worker and mission arrived, first comparison had 125 envelopes and equal graph; beacon-origin Replication check message read on studio. Workspaces stayed local."
+    },
+    {
+      "page": "two-machines",
+      "result": "passed unreachable member",
+      "evidence": "Tunnel closed and reopened; beacon became last-seen. Doctor replication check passed with last-seen member, 128 envelopes, zero unresolved records and zero unhealthy projections."
+    },
+    {
+      "page": "missions-in-practice",
+      "result": "passed revise, queue and planned human gate",
+      "runs": [
+        "mission-run/garden/readme/one",
+        "mission-run/garden/summary/one"
+      ],
+      "evidence": "Prepared README, replaced mission with v2 mission-only file, completed added check-links step. --after held summary while approval waited; queue move did not bypass it. Exact approval completed README and released summary, both completed."
+    },
+    {
+      "page": "missions-in-practice",
+      "result": "passed structured choice with explicit incarnation workaround",
+      "run": "mission-run/garden/format/one",
+      "person_step": "step-run/e3b923ab9c12b5328c0cd63490a064fd/ask-6dd16c247f5635b15f00a8fd1b0be23b",
+      "evidence": "Seat asked, worker lease was released while waiting, person answered markdown, seat read person_answers, created catalog.md and completed. Original command without incarnation failed; tracked separately below."
+    },
+    {
+      "page": "talking-to-agents",
+      "result": "passed CLI, attachments, UI and structured requests",
+      "evidence": "Send/status/reply and PNG attachment delivered to actual seat; seat described image. stui Ctrl+K selected worker, composer sent test and worker replied. Home and Ctrl+Q checked. Structured decision accepted publish and feedback accepted free text; answers retained."
+    },
+    {
+      "page": "talking-to-agents",
+      "result": "passed pairing challenge command",
+      "evidence": "devices pair --full-control created a pairing challenge; secrets omitted. No physical phone paired during this rehearsal."
+    },
+    {
+      "page": "seat-lifecycle",
+      "result": "passed restart, stop/start, suspend/resume and import",
+      "evidence": "Native session ee7c07b6-5e0a-4588-9bc5-ed307cb9acaf preserved by suspend/resume; message answered after resume and restart. Direct saved native session 22222222-3333-4444-8555-666666666666 discovered and imported as agent/import/claude/ab7e3aaa348e831468455426, then stopped. Show/history and delivery states checked."
+    },
+    {
+      "page": "upgrading-st",
+      "result": "passed database copy and pinned reinstall on both members",
+      "evidence": "SQLite online backup quick_check returned ok, private keys/fleet copied; v0.3.4 archive checksums and BUILD.json inspected. service install refreshed/restarted daemon/replication; live seats adopted. Upgrade check message delivered and answered, worker delivery current. No incompatible downgrade attempted."
+    },
+    {
+      "page": "github-integration",
+      "result": "passed real repository observer and subscription child work",
+      "repository": "compoundingtech/garden-onboarding-rehearsal",
+      "pr": "https://github.com/compoundingtech/garden-onboarding-rehearsal/pull/2",
+      "issue": "https://github.com/compoundingtech/garden-onboarding-rehearsal/issues/1",
+      "runs": [
+        "mission-run/8e0a70e9c4f4ecfb57a904a6876dc367",
+        "mission-run/83e315be1f067ca7597588bc56e8f85a"
+      ],
+      "evidence": "Healthy empty baseline created no child work; later PR and issue started finite runs in isolated child workspaces. Both completed actual review/triage with graph evidence. No comments/reviews posted by children, per brief. Intake canceled with documented command. Guest GitHub transport needed IPv6 disabled after unreachable/503 responses."
+    },
+    {
+      "page": "when-something-is-wrong",
+      "result": "passed diagnostics",
+      "evidence": "doctor, services, missions show, agents show/queue, bounded subject history, terminals peek, usage by agent/mission and repair dry-run executed. Dry-run found no operational repairs. Optional tool/login/IO warnings distinguished from failed checks."
+    },
+    {
+      "page": "getting-started",
+      "result": "passed expanded Nix tool-path check",
+      "evidence": "With the installed Nix profile selected on beacon, command -v st stui pty resolves all three under $HOME/.nix-profile/bin."
+    },
+    {
+      "page": "ios-app",
+      "result": "passed native-independent steps on fresh Linux guest",
+      "source": "bbe5bbb17632deba2b8fc5a9e46ae483bba62198",
+      "tools": "Nix nodejs_24: Node 24.21.0, npm 11.19.0",
+      "evidence": "Shallow repository clone, npm ci, typecheck, 31 tests passed / zero failed, iOS Expo prebuild --clean --no-install generated smalltalk.xcodeproj and smalltalk.xcscheme, export:ios bundled 928 modules and exported dist. CocoaPods evaluates as 1.16.2 for aarch64-darwin; package is Mac-only, so no unsupported Linux build attempted."
+    }
+  ],
+  "known_failures": [
+    {
+      "issue": "https://github.com/compoundingtech/smalltalk/issues/1228",
+      "severity": "P0",
+      "evidence": "Standalone grants sealed unsigned; subsequent fleet claims invalid because delegation grant is unsigned. Matching replication digests still possible. Bounded read-only receipt supplied to principals builder, who confirmed Store::open sealing before keys load. Guide retains limitation."
+    },
+    {
+      "issue": "https://github.com/compoundingtech/smalltalk/issues/1236",
+      "evidence": "Claude native shell lacks ST3_INCARNATION. Step-owned work ask returns stale-work-ask despite live held claim; explicit current claim incarnation succeeds. Guide includes verified workaround."
+    },
+    {
+      "area": "Claude message channel after restart",
+      "evidence": "Some launches had failed MCP channel and delivery stale; attached /mcp and selected st-channel Reconnect. Delivery became current and queued work ran. Investigated further in rehearsal; not treated as a passed automatic recovery."
+    }
+  ],
+  "not_verified": [
+    "Fresh macOS installation/signing/permission prompts and voice helper build: explicitly marked in getting-started.",
+    "Fresh browser OAuth login: native login prompts checked, then existing account auth reused.",
+    "Physical phone composer/pairing end-to-end: pairing CLI checked, client behavior sourced from existing phone documentation.",
+    "Incompatible schema rollback: intentionally not exercised.",
+    "iOS native CocoaPods installation, Xcode build/signing, simulator launch, and physical device run: explicitly marked not yet verified on a fresh Mac in ios-app.md."
+  ],
+  "backup_feature_at_review": "Claim-backup mission still running and not merged when checked; guide uses SQLite copy and one-line coming note.",
+  "private_receipts": "/tmp/st-getting-started-vm on rehearsal host; includes bounded signature/claim evidence and VM wrappers. Credentials and pairing invitations are deliberately excluded from this public receipt.",
+  "newcomer_feedback": {
+    "message": "message/24115236206dcf25",
+    "revisions": [
+      "Assume harness login is known; retain Small Talk channel setup and workspace preparation.",
+      "Give Nix a direct route and explain bundled tools/build dependencies and Home Manager ownership.",
+      "Add docs/ios-app.md for local simulator/device builds and pairing."
+    ],
+    "installer_recommendation": "A focused prerequisite-aware bootstrap follow-up; release/Nix already install the core tools. No new bootstrap tool is claimed by this docs PR."
+  }
+}

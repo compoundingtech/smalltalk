@@ -9,7 +9,7 @@ import { Banners, Empty, StatusLine, useDebugScroll, useListsOnFocus, useRefresh
 import { MISSION_LEGEND, missionRows, missionSections, missionTitle, missionWord, stepStyle, wordName, wordStyle, type MissionRow } from '../missionsView';
 import type { RootParams, RootScreen } from '../navigation';
 import { missionSteps } from '../presentation';
-import { homeRows } from '../homeView';
+import { homeRows } from '@smalltalk/st3-views';
 import { useStore, type Planner } from '../store';
 import { theme } from '../theme';
 import { Button, Field, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
@@ -104,8 +104,8 @@ export function MissionScreen({ route, navigation }: RootScreen<'Mission'>) {
         {waiting.map(row => <ListRow
           key={row.item.id}
           glyph={row.glyph}
-          glyphColor={row.color}
-          title={<T numberOfLines={2}><T color={row.color}>{row.kind} </T><T bold>{row.title}</T></T>}
+          glyphColor={theme[row.color]}
+          title={<T numberOfLines={2}><T color={theme[row.color]}>{row.kind} </T><T bold>{row.title}</T></T>}
           second="tap to answer"
           onPress={() => navigation.navigate('Attention', { id: row.item.id })}
         />)}

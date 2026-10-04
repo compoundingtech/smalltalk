@@ -172,6 +172,7 @@ order from the same admitted claims.
 | `local_latest_slots` | Local observation log | For each `latest` slot this node writes: its last replicated observation and time, and the newest local observation no claim carries yet |
 | `local_usage_seen` | Local deduplication index | Stable provider response IDs from local timeline observations; never replicated |
 | `local_usage_totals` | Local cumulative observation projection | Token buckets from accepted local response observations; never replicated and retained across log trimming |
+| `local_seat_accounts` | Local operational fact | The account chosen for each pooled seat on this node; retained across restarts, never replicated |
 | `revision_proposals` | Projection | `revision-proposal.*` claims |
 | `planning_sessions` | Projection | `planning-session.*` claims |
 | `planning_candidates` | Projection | `planning-session.candidate-submitted` claims |
@@ -228,3 +229,8 @@ Eval history stays in the immutable claim log.
 A cleanup residue produces `eval.verdict` with `verdict=fail`.
 
 A cleanup infrastructure error produces `eval.verdict` with `verdict=void`.
+
+`workspace.observed` is a latest-only replicated observation written by the owning host during
+agent workspace reconciliation. It carries `host`, `workspace`, and an optional `repository`.
+The reconciler writes only changed values. Repository suggestions combine those observations
+with current checkout declarations; a gateway reads graph evidence and never scans host disks.

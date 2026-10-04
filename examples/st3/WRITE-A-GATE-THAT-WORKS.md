@@ -4,6 +4,23 @@ This example verifies an invented catalog index with
 [`gate-recovery.kdl`](gate-recovery.kdl) and
 [`verify-catalog-index.sh`](verify-catalog-index.sh).
 
+## First, look for a built-in gate
+
+Most gates check something st can answer itself. Use these instead of a command:
+
+```kdl
+gate "the handoff is published" { document "doc/example/catalog/handoff" }
+gate "the fix merged" { merged "example/catalog#42" }
+gate "linux-gate passed on main" { ci-passed "linux-gate" repo="example/catalog" branch="main" }
+gate "the index suite passes on main" { cargo-test "index" package="catalog" }
+```
+
+A `document` gate never greps a listing that shows only its first page, and `cargo-test` tells
+failing tests (not yet) from a build this host cannot make (broken).
+[`land-and-verify.kdl`](land-and-verify.kdl) uses all four, and the
+[mission reference](../../docs/st3/mission-graph-runtime.md#built-in-gates) explains each one.
+When none fits, write an exec gate, as the rest of this guide does.
+
 ## Failure first: time limits and unchecked scripts
 
 A gate like this is fragile:
@@ -22,7 +39,9 @@ step "verify-index" timeout="1m" {
 
 It gives the step no time beyond its own gate and says nothing about whether the shell file
 parses. The owning step can time out while its gate is still legitimately using its full minute.
-A syntax error waits until runtime if nobody checks it before publication.
+A syntax error waits until runtime if nobody checks it before publication; `st missions check`
+runs the gate once, now, the way a run would, and `st missions publish` refuses a gate that check
+finds broken.
 
 Gates use the same captured interactive login-shell environment as agents and daemon commands.
 Programs such as `bash` resolve through that PATH; absolute binary paths are optional.
@@ -44,7 +63,9 @@ gate_workspace="$(mktemp -d)"
 printf '%s\n' 'catalog version 1' >"$gate_workspace/catalog-index.txt"
 
 /bin/bash -n examples/st3/verify-catalog-index.sh
-st missions publish examples/st3/gate-recovery.kdl --as person/operator
+st missions check examples/st3/gate-recovery.kdl --workspace "$gate_workspace"
+st missions publish examples/st3/gate-recovery.kdl --workspace "$gate_workspace" \
+  --as person/operator
 st missions start example/catalog-gate \
   --id example/catalog-gate/first \
   --workspace "$gate_workspace" \

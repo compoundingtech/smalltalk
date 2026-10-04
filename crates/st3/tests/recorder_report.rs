@@ -1,5 +1,4 @@
 use std::fs;
-use std::process::Command;
 
 #[test]
 fn the_cli_combines_host_logs_without_a_daemon() {
@@ -31,7 +30,7 @@ fn the_cli_combines_host_logs_without_a_daemon() {
         .unwrap();
         logs.push(path);
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_st3"))
+    let output = st3::test_support::command(env!("CARGO_BIN_EXE_st3-fixture"))
         .args(["--json", "recorder", "report", "--hours", "24"])
         .arg("--log")
         .arg(&logs[0])
@@ -57,7 +56,7 @@ fn the_cli_combines_host_logs_without_a_daemon() {
 #[test]
 fn an_out_of_range_period_is_a_cli_error() {
     let root = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_st3"))
+    let output = st3::test_support::command(env!("CARGO_BIN_EXE_st3-fixture"))
         .args(["recorder", "report", "--hours", "10000000000"])
         .env("HOME", root.path())
         .env("XDG_CONFIG_HOME", root.path().join("config"))

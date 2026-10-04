@@ -259,7 +259,7 @@ async fn st(socket: &Path, args: &[&str]) -> std::process::Output {
     let socket = socket.to_owned();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
             .env_remove("ST_AGENT")
             .env_remove("ST_MISSION_RUN")
             .args(["--endpoint", socket.to_str().unwrap()])
@@ -276,7 +276,7 @@ async fn cli(socket: &Path, subject: &str, actor: &str, timeout: &str) -> std::p
     let actor = actor.to_owned();
     let timeout = timeout.to_owned();
     tokio::task::spawn_blocking(move || {
-        std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
             .env_remove("ST_AGENT")
             .env_remove("ST_MISSION_RUN")
             .args([
@@ -471,7 +471,7 @@ async fn a_delayed_restart_does_not_stop_a_newer_incarnation() {
 
 #[test]
 fn restart_help_explains_seats_and_the_new_incarnation() {
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         .env_remove("ST_AGENT")
         .args(["agents", "--help"])
         .output()
@@ -654,6 +654,171 @@ async fn starting_a_stopped_mission_seat_restores_its_declaration_and_creates_no
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn starting_a_stopped_step_seat_restores_its_declaration() {
     starts_a_stopped_mission_seat_on_its_own_declaration(Shape::Step).await;
+}
+
+fn github_observer_running(store: &Store, thread: &st3::github_watch::ThreadRef) -> bool {
+    store.desired_subjects_named(&[thread.observer()]).unwrap().into_iter().next()
+        .and_then(|desired| st3::graph::observer_spec(&desired.desired))
+        .is_some_and(|spec| !spec.stopped)
+}
+
+/// CLI stop/start and an observation while stopped against this fixture's isolated daemon.
+/// The native mailbox stream proof lives beside its authenticated API in api/mailbox.rs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_then_start_keeps_a_github_watch_and_its_queued_wake() {
+    // A mission seat also exercises restoring its original owning declaration.
+    let (fixture, subject) = Fixture::new(true).await;
+    let thread = st3::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
+    let watch = thread.watch(&subject);
+    fixture
+        .store
+        .declare_watch(&thread, &subject, None)
+        .unwrap();
+    let began = fixture.store.watch_view(&watch).unwrap().unwrap()["since"].clone();
+    let observe = |comments: Value| {
+        let subscriptions = fixture
+            .store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .filter_map(|desired| {
+                st3::graph::subscription_spec(&desired.desired)
+                    .filter(|spec| !spec.stopped)
+                    .map(|spec| (desired.subject, spec))
+            })
+            .collect::<Vec<_>>();
+        fixture
+            .store
+            .record_resource_observation(
+                &thread.observer(),
+                &fixture
+                    .store
+                    .selected_desired_revision(&thread.observer())
+                    .unwrap()
+                    .unwrap(),
+                None,
+                &thread.resource(),
+                None,
+                &json!({"repository_id": 7, "issues": [{"number": 12, "new": false,
+                "state": "open", "title": "Example thread", "recent_comments": comments}]}),
+                0,
+                &subscriptions,
+            )
+            .unwrap();
+    };
+    observe(json!([]));
+    let socket = fixture.root.path().join("st3.sock");
+    succeeded(
+        &st(
+            &socket,
+            &["agents", "stop", &subject, "--as", "person/avery"],
+        )
+        .await,
+    );
+    fixture.reconciler.reconcile_once().unwrap();
+    assert_eq!(
+        fixture.store.watch_view(&watch).unwrap().unwrap()["state"],
+        "active"
+    );
+    assert!(github_observer_running(&fixture.store, &thread));
+    observe(
+        json!([{"kind": "comment", "id": 91, "author": "fern-example",
+        "at": chrono::Utc::now().to_rfc3339()}]),
+    );
+    let queued = fixture
+        .store
+        .messages(Some(&subject), false)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.tags.iter().any(|tag| tag == "github-watch"))
+        .collect::<Vec<_>>();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].status, "sent");
+
+    // A restarted daemon still sees a stopped declaration owning a live watch.
+    let daemon = restarted_daemon(&fixture);
+    daemon.reconcile_once().unwrap();
+    assert_eq!(
+        fixture.store.watch_view(&watch).unwrap().unwrap()["state"],
+        "active"
+    );
+    succeeded(
+        &st(
+            &socket,
+            &["agents", "start", &subject, "--as", "person/avery"],
+        )
+        .await,
+    );
+    daemon.reconcile_once().unwrap();
+    assert_eq!(
+        fixture.store.watch_view(&watch).unwrap().unwrap()["since"],
+        began
+    );
+    assert_eq!(
+        fixture.store.watch_view(&watch).unwrap().unwrap()["state"],
+        "active"
+    );
+    let after = fixture.store.messages(Some(&subject), false).unwrap();
+    assert!(
+        after
+            .iter()
+            .any(|message| message.subject == queued[0].subject && message.status == "sent")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_a_retired_seats_declaration_ends_its_watch_and_stops_the_last_observer() {
+    let (fixture, subject) = Fixture::new(true).await;
+    let thread = st3::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
+    fixture
+        .store
+        .declare_watch(&thread, &subject, None)
+        .unwrap();
+    let run = fixture
+        .store
+        .desired_subject_with_writer(&subject)
+        .unwrap()
+        .unwrap()
+        .0
+        .owner_run
+        .unwrap();
+    fixture
+        .store
+        .set_mission_run_state(
+            run.trim_start_matches("mission-run/"),
+            "completed",
+            "terminal",
+            None,
+        )
+        .unwrap();
+    fixture.reconciler.reconcile_once().unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .watch_view(&thread.watch(&subject))
+            .unwrap()
+            .unwrap()["state"],
+        "active",
+        "ending the run and stopping the seat keeps its declared conversation"
+    );
+    fixture.store.discard_desired_owned_by(&run).unwrap();
+    fixture.reconciler.reconcile_once().unwrap();
+    let view = fixture
+        .store
+        .watch_view(&thread.watch(&subject))
+        .unwrap()
+        .unwrap();
+    assert_eq!(view["state"], "ended");
+    assert_eq!(view["ended"], "seat-ended");
+    assert!(!github_observer_running(&fixture.store, &thread));
+    assert!(
+        fixture
+            .store
+            .messages(Some(&subject), false)
+            .unwrap()
+            .into_iter()
+            .all(|message| !message.tags.iter().any(|tag| tag == "github-watch"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

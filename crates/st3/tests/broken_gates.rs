@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 //! Exec gates that cannot answer hold their work for a revision instead of failing the run.
+//! Exit-code field gates fail when a terminal exec cannot satisfy them.
 //!
 //! Each step replays a gate that failed a run whose work was done: a cargo gate whose PATH lacked
 //! the linker (twice), a memory threshold that could never pass, a grep of a listing that showed
@@ -8,7 +9,7 @@
 use std::fs::File;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -33,10 +34,9 @@ impl Daemon {
             executable(&bin.join(name), source);
         }
         let log = File::create(root.join("daemon.log")).unwrap();
-        let child = Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        let child = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
             .env_clear()
             .env("HOME", root)
-            .env("SHELL", "/bin/bash")
             .env(
                 "PATH",
                 format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
@@ -83,7 +83,7 @@ impl Daemon {
     }
 
     fn run_cli(&self, args: &[&str]) -> std::process::Output {
-        Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
             .env_clear()
             .env("HOME", &self.root)
             .env("ST3_DAEMON_WAIT", "0")
@@ -198,14 +198,209 @@ fn wait_for(label: &str, mut condition: impl FnMut() -> bool) {
     }
 }
 
+#[test]
+fn a_terminal_exec_fails_its_unsatisfied_field_gate() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(root.path());
+    let file = root.path().join("mission.kdl");
+    std::fs::write(
+        &file,
+        r#"version 2
+mission "orchid/replay" state="ready" {
+  goal "Fail an impossible exit-code predicate."
+  completion { when "all-steps-exhausted" }
+  step "prepare" {
+    agentless
+    exec "prepare" {
+      host "orchid"
+      workspace "."
+      command "exit 2"
+      restart "never"
+    }
+    gate "prepared" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/prepare" is 0
+    }
+  }
+  step "ship" {
+    depends-on { step "prepare" completed }
+    agentless
+  }
+}
+"#,
+    )
+    .unwrap();
+    daemon.command(&[
+        "missions",
+        "publish",
+        file.to_str().unwrap(),
+        "--as",
+        PUBLISHER,
+        "--no-gate-check",
+    ]);
+    daemon.command(&[
+        "missions",
+        "start",
+        "orchid/replay",
+        "--id",
+        "orchid/replay",
+        "--workspace",
+        root.path().to_str().unwrap(),
+        "--as",
+        PUBLISHER,
+    ]);
+    wait_for("the failed field gate", || {
+        daemon.step("prepare")["status"] == "failed"
+    });
+    let step = daemon.step("prepare");
+    let reason = step["blocked_reason"].as_str().unwrap();
+    assert!(reason.contains("exec/orchid/replay/prepare"), "{step}");
+    assert!(reason.contains("exit code 2"), "{step}");
+    wait_for("the run to fail", || daemon.run()["status"] == "failed");
+    assert_ne!(daemon.step("ship")["status"], "completed");
+    let results = daemon.gate_results();
+    assert!(
+        results.iter().any(|claim| {
+            claim["body"]["fields"]["gate"] == "prepared"
+                && claim["body"]["fields"]["verdict"] == "fail"
+                && claim["body"]["fields"]["reason"] == reason
+        }),
+        "{results:?}"
+    );
+}
+
+#[test]
+fn missions_and_doctor_surface_a_terminal_field_gate_behind_a_pending_gate() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(root.path());
+    let file = root.path().join("mission.kdl");
+    std::fs::write(
+        &file,
+        r#"version 2
+mission "orchid/replay" state="ready" {
+  goal "Explain an impossible predicate behind a pending gate."
+  step "prepare" {
+    agentless
+    exec "prepare" {
+      host "orchid"
+      workspace "."
+      command "touch running; while [ ! -f release ]; do sleep 0.1; done; exit 2"
+      restart "never"
+    }
+    gate "an external result exists" { exists "resource/orchid/result" }
+    gate "prepared" { field "exit_code" "exec/${ST_MISSION_RUN}/prepare" is 0 }
+  }
+}
+"#,
+    )
+    .unwrap();
+    daemon.command(&[
+        "missions",
+        "publish",
+        file.to_str().unwrap(),
+        "--as",
+        PUBLISHER,
+        "--no-gate-check",
+    ]);
+    daemon.command(&[
+        "missions",
+        "start",
+        "orchid/replay",
+        "--id",
+        "orchid/replay",
+        "--workspace",
+        root.path().to_str().unwrap(),
+        "--as",
+        PUBLISHER,
+    ]);
+    let check = || {
+        // Other doctor checks can fail on a host without all runtime tools.
+        let output = daemon.run_cli(&["doctor"]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "terminal-exec-gates")
+            .unwrap()
+            .clone()
+    };
+    wait_for("the exec to be running", || {
+        root.path().join("running").exists()
+    });
+    assert!(daemon.run()["stuck_gates"].is_null());
+    assert_eq!(check()["status"], "pass");
+    std::fs::write(root.path().join("release"), "go").unwrap();
+    wait_for("the terminal exec diagnostic", || {
+        daemon.run()["stuck_gates"]
+            .as_array()
+            .is_some_and(|gates| !gates.is_empty())
+    });
+    let run = daemon.run();
+    assert_eq!(run["status"], "running");
+    let stuck = run["stuck_gates"][0].as_str().unwrap();
+    assert!(
+        stuck.contains(daemon.step("prepare")["subject"].as_str().unwrap()),
+        "{stuck}"
+    );
+    assert!(stuck.contains("prepared"), "{stuck}");
+    assert!(stuck.contains("exec/orchid/replay/prepare"), "{stuck}");
+    assert!(stuck.contains("exit code 2"), "{stuck}");
+    let health = check();
+    assert_eq!(health["status"], "warn", "{health}");
+    assert!(
+        health["message"].as_str().unwrap().contains(stuck),
+        "{health}"
+    );
+    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+        .env_clear()
+        .env("HOME", root.path())
+        .env("ST3_DAEMON_WAIT", "0")
+        .args([
+            "--endpoint",
+            root.path().join("daemon.sock").to_str().unwrap(),
+            "missions",
+            "show",
+            RUN,
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let human = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        human.contains("STUCK GATES") && human.contains(stuck),
+        "{human}"
+    );
+    // Diagnostics must not decide the unreachable gate, and must drop an ended run.
+    assert!(
+        !daemon
+            .gate_results()
+            .iter()
+            .any(|claim| claim["body"]["fields"]["gate"] == "prepared")
+    );
+    daemon.command(&[
+        "missions",
+        "cancel",
+        RUN,
+        "--reason",
+        "the test is done",
+        "--as",
+        PUBLISHER,
+    ]);
+    wait_for("the run to be cancelled", || {
+        daemon.run()["status"] == "cancelled"
+    });
+    assert!(daemon.run()["stuck_gates"].is_null());
+    assert_eq!(check()["status"], "pass");
+}
+
 /// The replay mission. `fixed` selects the revised gates; nothing else differs.
 fn mission(root: &Path, fixed: bool) -> String {
     let tools = root.join("tools");
     let linker = root.join("linker");
     let path = if fixed {
-        format!("{}:{}:/usr/bin:/bin", tools.display(), linker.display())
+        format!("{}:{}", tools.display(), linker.display())
     } else {
-        format!("{}:/usr/bin:/bin", tools.display())
+        tools.display().to_string()
     };
     let suite = |name: &str| format!("export PATH={path}; cargo test -p orchid --test {name}");
     let threshold = if fixed { "8000000000" } else { "1200" };
@@ -253,21 +448,25 @@ fn mission(root: &Path, fixed: bool) -> String {
     )
 }
 
-#[test]
-fn broken_gates_wait_for_a_revision_that_then_passes_their_steps() {
-    let root = tempfile::tempdir().unwrap();
+/// An isolated daemon whose host lacks the linker on the gates' PATH, holding a hundred documents
+/// that sort before the handoff document.
+fn replay_host(root: &Path) -> Daemon {
     // `cargo` needs the `mold` linker on PATH, as the gates' cargo builds did.
-    std::fs::create_dir_all(root.path().join("tools")).unwrap();
-    std::fs::create_dir_all(root.path().join("linker")).unwrap();
+    std::fs::create_dir_all(root.join("tools")).unwrap();
+    std::fs::create_dir_all(root.join("linker")).unwrap();
+    // Supply only the gate tools: mold must stay absent until the revision adds it.
+    for name in ["awk", "cat", "grep", "sh", "env"] {
+        let tool = st_runtime::resolve_executable(name, &std::env::vars().collect()).unwrap();
+        std::os::unix::fs::symlink(tool, root.join("tools").join(name)).unwrap();
+    }
     executable(
-        &root.path().join("tools/cargo"),
+        &root.join("tools/cargo"),
         "#!/bin/sh\ncommand -v mold >/dev/null 2>&1 || { echo 'error: linker `mold` not found' >&2; exit 101; }\necho 'test result: ok. 12 passed'\n",
     );
-    executable(&root.path().join("linker/mold"), "#!/bin/sh\nexit 0\n");
-    let daemon = Daemon::start(root.path());
-
+    executable(&root.join("linker/mold"), "#!/bin/sh\nexit 0\n");
+    let daemon = Daemon::start(root);
     // The published document sorts after the first hundred, as the handoff document did.
-    let note = root.path().join("note.md");
+    let note = root.join("note.md");
     std::fs::write(&note, "A note.\n").unwrap();
     for index in 0..100 {
         daemon.command(&[
@@ -278,7 +477,7 @@ fn broken_gates_wait_for_a_revision_that_then_passes_their_steps() {
             &format!("doc/orchid/note-{index:03}"),
         ]);
     }
-    let handoff = root.path().join("handoff.md");
+    let handoff = root.join("handoff.md");
     std::fs::write(&handoff, "The handoff.\n").unwrap();
     daemon.command(&[
         "documents",
@@ -287,7 +486,15 @@ fn broken_gates_wait_for_a_revision_that_then_passes_their_steps() {
         "--as",
         "doc/orchid/stream-handoff",
     ]);
+    daemon
+}
 
+#[test]
+fn broken_gates_wait_for_a_revision_that_then_passes_their_steps() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = replay_host(root.path());
+
+    // Publish the broken gates as their runs had them; publish would otherwise refuse them.
     let file = root.path().join("replay.kdl");
     std::fs::write(&file, mission(root.path(), false)).unwrap();
     daemon.command(&[
@@ -296,6 +503,7 @@ fn broken_gates_wait_for_a_revision_that_then_passes_their_steps() {
         file.to_str().unwrap(),
         "--as",
         PUBLISHER,
+        "--no-gate-check",
     ]);
     daemon.command(&[
         "missions",
@@ -389,4 +597,214 @@ fn broken_gates_wait_for_a_revision_that_then_passes_their_steps() {
         assert_eq!(step["status"], "completed", "{step}");
     }
     assert!(daemon.attention().is_empty(), "{:#?}", daemon.attention());
+}
+
+#[test]
+fn a_check_answers_for_each_gate_and_publish_refuses_a_broken_one() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = replay_host(root.path());
+    let workspace = root.path().to_str().unwrap();
+    let file = root.path().join("replay.kdl");
+    std::fs::write(&file, mission(root.path(), false)).unwrap();
+    let file = file.to_str().unwrap();
+
+    let checked = daemon.run_cli(&["missions", "check", file, "--workspace", workspace]);
+    assert_eq!(checked.status.code(), Some(1), "{checked:?}");
+    let view: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    let answer = |owner: &str| {
+        view["gates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gate| gate["owner"] == owner)
+            .cloned()
+            .unwrap_or_else(|| panic!("no gate for {owner}: {view:#}"))
+    };
+    for (owner, expected, reason, output) in [
+        ("step diet", "broken", "exited 101", "mold"),
+        ("step isolation", "broken", "exited 101", "mold"),
+        ("step memory", "not-yet", "", "memory"),
+        (
+            "step handoff",
+            "broken",
+            "listed 100 items and more exist",
+            "",
+        ),
+        (
+            "step listed",
+            "broken",
+            "the mission limit must be 1 through 200",
+            "",
+        ),
+    ] {
+        let gate = answer(owner);
+        assert_eq!(gate["answer"], expected, "{gate:#}");
+        assert_eq!(gate["host"], "orchid");
+        assert!(
+            gate["reason"].as_str().unwrap_or("").contains(reason),
+            "{gate:#}"
+        );
+        assert!(
+            gate["output"].as_str().unwrap().contains(output),
+            "{gate:#}"
+        );
+    }
+
+    // Publish runs the same check and refuses the broken gates, naming each one.
+    let refused = daemon.run_cli(&[
+        "missions",
+        "publish",
+        file,
+        "--as",
+        PUBLISHER,
+        "--workspace",
+        workspace,
+    ]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("4 exec gates cannot answer as written"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("the log diet suite passes on main"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("error: linker `mold` not found"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--no-gate-check"), "{stderr}");
+    let listed = daemon.command(&["missions", "ls"]);
+    assert!(!listed.to_string().contains("orchid/replay"), "{listed}");
+
+    // The corrected gates answer; not yet does not stop a publication.
+    let fixed = root.path().join("fixed.kdl");
+    std::fs::write(&fixed, mission(root.path(), true)).unwrap();
+    let fixed = fixed.to_str().unwrap();
+    let checked = daemon.run_cli(&["missions", "check", fixed, "--workspace", workspace]);
+    assert!(checked.status.success(), "{checked:?}");
+    let view: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    for gate in view["gates"].as_array().unwrap() {
+        let expected = if gate["owner"] == "step listed" {
+            "not-yet"
+        } else {
+            "pass"
+        };
+        assert_eq!(gate["answer"], expected, "{gate:#}");
+    }
+    daemon.command(&[
+        "missions",
+        "publish",
+        fixed,
+        "--as",
+        PUBLISHER,
+        "--workspace",
+        workspace,
+    ]);
+    let listed = daemon.command(&["missions", "ls"]);
+    assert!(listed.to_string().contains("orchid/replay"), "{listed}");
+
+    // A gate for another host, or in a workspace a run creates later, is unchecked, not broken.
+    let elsewhere = root.path().join("elsewhere.kdl");
+    std::fs::write(
+        &elsewhere,
+        r#"version 2
+mission "orchid/elsewhere" state="ready" {
+  goal "Check gates this host cannot run yet."
+  step "remote" {
+    gate "the build host has the artifact" { exec "true"; host "cobalt"; workspace "."; }
+  }
+  step "later" {
+    gate "the checkout is clean" { exec "true"; host "orchid"; workspace "checkout"; }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let checked = daemon.run_cli(&[
+        "missions",
+        "check",
+        elsewhere.to_str().unwrap(),
+        "--workspace",
+        workspace,
+    ]);
+    assert!(checked.status.success(), "{checked:?}");
+    let view: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    let gates = view["gates"].as_array().unwrap();
+    assert_eq!(gates.len(), 2, "{view:#}");
+    assert!(
+        gates.iter().all(|gate| gate["answer"] == "unchecked"),
+        "{view:#}"
+    );
+    assert!(
+        gates[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("host `cobalt`")
+    );
+    assert!(
+        gates[1]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not exist here yet")
+    );
+
+    // A gate that reads an input runs with the value given, and is unchecked without one. A
+    // built-in gate runs its `st gate` command; this host has no GitHub token, so it is broken.
+    let inputs = root.path().join("inputs.kdl");
+    std::fs::write(
+        &inputs,
+        r#"version 2
+mission "orchid/inputs" state="ready" {
+  goal "Check gates that read inputs."
+  input "release" kind="text"
+  input "pull_request" kind="text"
+  step "tag" {
+    gate "the release is 1.4.0" { exec "test '${input.release}' = 1.4.0"; host "orchid"; workspace "."; }
+  }
+  step "land" {
+    gate "the fix merged" { merged "${input.pull_request}" }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let inputs = inputs.to_str().unwrap();
+    let check = |extra: &[&str]| {
+        let mut args = vec!["missions", "check", inputs, "--workspace", workspace];
+        args.extend_from_slice(extra);
+        let output = daemon.run_cli(&args);
+        let view: Value = serde_json::from_slice(&output.stdout).unwrap();
+        (output.status.code(), view)
+    };
+    let (code, view) = check(&[]);
+    assert_eq!(code, Some(0), "{view:#}");
+    for gate in view["gates"].as_array().unwrap() {
+        assert_eq!(gate["answer"], "unchecked", "{gate:#}");
+        assert!(
+            gate["reason"].as_str().unwrap().contains("--input "),
+            "{gate:#}"
+        );
+    }
+    let (code, view) = check(&[
+        "--input",
+        "release=1.4.0",
+        "--input",
+        "pull_request=acme/app#7",
+    ]);
+    assert_eq!(code, Some(1), "{view:#}");
+    assert_eq!(view["gates"][0]["answer"], "pass", "{view:#}");
+    let merged = &view["gates"][1];
+    assert_eq!(merged["answer"], "broken", "{merged:#}");
+    assert_eq!(merged["exit_code"], 3, "{merged:#}");
+    assert!(
+        merged["output"]
+            .as_str()
+            .unwrap()
+            .contains("broken: GitHub observers have no token"),
+        "{merged:#}"
+    );
+    let (_, view) = check(&["--input", "release=1.5.0"]);
+    assert_eq!(view["gates"][0]["answer"], "not-yet", "{view:#}");
 }

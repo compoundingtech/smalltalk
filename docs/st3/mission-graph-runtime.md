@@ -661,6 +661,19 @@ gate "text omits value" { lacks "message/report" "UNVERIFIED" }
 
 `field` uses this argument order: path, full subject, operator, value. Operators are `is`, `starts-with`, and `contains`.
 
+An `exit_code` field gate on an `exec/...` subject fails when the exec has ended and
+its selected launch cannot restart, including a missing exit code after the process was killed.
+The failure names the exec and its exit code. A running exec or an exec that can restart keeps
+an unsatisfied gate pending. `restart "never"` cannot restart; `restart "on-failure"` cannot
+restart after exit 0. An observation from an older launch does not fail a new declaration's gate.
+Other subjects and fields retain their pending behavior. This predicate rule is separate from
+the exec gate contract below.
+
+`st missions show RUN` lists unresolved predicates of this kind under `STUCK GATES` (and
+`stuck_gates` in JSON), even when an earlier gate still waits. `st doctor` reports them in
+the `terminal-exec-gates` check. These diagnostics only inspect active runs and never decide a
+gate or change a step's state.
+
 Use `every` to apply one or more field predicates to every item in an observed list:
 
 ```kdl
@@ -685,14 +698,54 @@ including baselines, dependencies, loop exit gates, and ordinary gates.
 
 A mission gate can also use `deadline "10m"`. A step uses its `timeout` property instead.
 
+### Built-in gates
+
+st answers what gates shelled out for most. Prefer one of these to an `exec` gate that does the
+same thing:
+
+```kdl
+gate "the handoff is published" { document "doc/acme/release/handoff" }
+gate "the fix merged" { merged "acme/app#42" }
+gate "linux-gate passed on main" { ci-passed "linux-gate" repo="acme/app" branch="main" }
+gate "CI passed on the release commit" { ci-passed "st/ci" repo="acme/app" commit="${input.commit}" }
+gate "the parser suite passes on main" { cargo-test "parser" package="app" }
+```
+
+- `document "doc/NAME"` passes once any version of the document is stored, and
+  `document "doc/NAME@SHA256"` once that exact version is. It is a graph predicate: it waits
+  without running anything and passes as soon as the document arrives. Publication neither
+  requires the document nor pins its version. Use it instead of grepping `st documents ls`, which
+  lists 100 documents by default.
+- `merged "OWNER/REPO#NUMBER"` passes once the pull request merged. A pull request that closed
+  without merging breaks the gate.
+- `ci-passed "CHECK" repo="OWNER/REPO"` with `commit="SHA"` or `branch="NAME"` passes once the
+  check run or commit status named CHECK succeeded on that commit, or on the branch's head. A
+  pending, failed or missing check is not yet: a rerun or a new commit can still pass.
+- `cargo-test "TARGET" package="PACKAGE"` fetches `ref` (`origin/main` by default), checks it out in
+  a worktree st keeps for the repository beneath its state directory (or at `worktree="DIR"`), builds
+  the test target, and runs it. A ref without that target or package, a failed fetch, and failing
+  tests are not yet. A target that does not build breaks the gate: a ref that passed its own CI
+  almost always fails to build only on a host that lacks something, such as a linker. The worktree
+  keeps its `target` directory between checks, so later checks build incrementally.
+
+`merged`, `ci-passed`, and `cargo-test` run as exec gates whose command is
+`"$ST3_BIN" gate KIND ...`. They take the exec gate's `host` (`local` by default), `workspace`
+(`${ST_WORKSPACE}` by default; for `cargo-test`, the repository), and `time-limit` (two minutes,
+or an hour for `cargo-test`). They check again when not yet, break the same way, and
+`st missions check` runs them. `merged` and `ci-passed` read GitHub with the token st's observers
+use (`GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`); without one, the gate is broken. Each
+`st gate KIND` command also runs by hand and prints its answer; `st gate --help` lists them.
+
+A mission stores each of these as the gate it expands to: an `exists` predicate or an exec gate.
+
 ### Mechanical gates
 
 ```kdl
-gate "the tests pass" {
-  exec "cargo test --workspace"
+gate "the release notes name every change" {
+  exec "./scripts/check-release-notes.sh"
   host "local"
   workspace "${ST_WORKSPACE}"
-  env { RUST_BACKTRACE "1" }
+  env { RELEASE "1.4.0" }
   time-limit "10m"
 }
 ```
@@ -721,22 +774,24 @@ refusal. A reader that stops early, such as `grep -q` on a match, closes the lis
 reports it, so a gate that found what it looked for still passes.
 
 A shell exits 127 for a command it cannot find, and `cargo test` exits 101 when it cannot build or a
-test fails, so both are broken. Write a check that exits 1 when it should wait; here `grep -q` exits
-1 until the document exists:
+test fails, so both are broken. Write a check that exits 1 when it should wait; here `git cat-file`
+fails until the pushed branch has the file:
 
 ```kdl
-gate "the release notes are published" {
-  exec "st documents ls doc/acme/release-notes | grep -q 'doc/acme/release-notes'"
+gate "the pushed branch has release notes" {
+  exec "git fetch --quiet origin release-notes 2>/dev/null || exit 1; git cat-file -e FETCH_HEAD:RELEASE-NOTES.md 2>/dev/null || exit 1"
   host "local"
   workspace "${ST_WORKSPACE}"
 }
 ```
 
-To wait on a test suite rather than break on it, end its command with `|| exit 1`. A build that
-cannot start then waits too, so do that only for a check already known to run.
+For a cargo test target, use the built-in `cargo-test` gate, which tells failing tests (not yet)
+from a build this host cannot make (broken). To wait on another test suite rather than break on it,
+end its command with `|| exit 1`. A build that cannot start then waits too, so do that only for a
+check already known to run.
 
 Filter or name what a check looks for. `st documents ls` lists 100 documents by default, so a check
-that greps the whole listing breaks once more exist; the prefix in the example lists only the
+that greps the whole listing breaks once more exist; the built-in `document` gate names the one
 document it needs.
 
 A broken gate does not fail its step. The step keeps waiting, and st raises one attention item for
@@ -755,6 +810,27 @@ gate holds the loop for a revision.
 An eval run keeps the verdicts its judges give. Nobody revises an eval run, so there an exec gate
 that says not yet or is broken fails its boundary, as any status but 0 did before, and st raises no
 attention item.
+
+#### Check a gate before you publish it
+
+`st missions check FILE` runs each exec gate in the file once, now, on this host, with the
+environment and `ST_GATE_REPORT` a run gives it, and prints each answer: pass, not yet, broken, or
+unchecked. `--workspace DIR` (the current directory by default) stands for the run's workspace,
+`--input NAME=VALUE` gives an input as `missions start` does, and the other run variables name the
+check. Gates run one at a time, in the order the file declares them. A gate declared for another
+host, whose workspace does not exist yet, or that reads an input the check was not given, is
+unchecked; check it where it will run, or with the input. The command exits 1 when a gate is broken. A check runs
+each command for real, so a gate with side effects has them when it is checked, too.
+
+```sh
+st missions check release.kdl --workspace ~/src/app --input commit=4f2a9c1
+```
+
+`st missions publish` runs the same check first and refuses a mission with a broken gate, printing
+each gate's answer and the end of a broken check's output. Not yet does not stop a publication:
+before the work exists, most gates should say not yet. `--workspace` names the workspace for the
+check. `--no-gate-check` publishes without it, for a gate whose check cannot run before its run,
+such as one that waits on a lock the run takes.
 
 Each check records its result on the gate's `gate.result` subject. The result's `verdict` is
 `pass`, `fail` for not yet, or `error` for broken, so every fleet build can read it; its
@@ -1186,7 +1262,7 @@ agent "parser" {
 - A new `branch` starts at `base` without upstream tracking. A branch that already exists is checked out as it is.
 - A workspace that already exists is used as it is.
 - When the checkout fails, the agent does not start. st records a `workspace-unavailable` diagnostic and retries after 30 seconds.
-- With `remove-at-run-end=#true`, st removes the worktree after the agent's run ends and its runtime stops. The branch stays in the repository.
+- With `remove-at-run-end=#true`, st removes the worktree after the agent's run ends and its runtime stops. For a top-level seat without an owning run, an explicit stop ends it. The branch stays in the repository.
 - st keeps a worktree that has uncommitted or untracked changes, and records a `checkout-kept` warning. It also keeps a worktree whose workspace a current member still uses.
 
 [`fan-out.kdl`](../../examples/st3/fan-out.kdl) gives three parallel workers one checkout each.
@@ -1525,10 +1601,30 @@ Repeated failures of this condition keep one attention item open per schedule.
 The runtime withdraws it when a subsequent occurrence successfully starts work.
 
 The runtime gives each occurrence a deterministic mission run and a unique workspace below the declared root.
+The occurrence belongs to the schedule's stable identity, across parent revisions, re-publication,
+child revision changes and daemon restarts. An already reached tick is never replayed by
+`catch-up "latest"`. Members admitting the same tick while apart converge on one run and initial
+generation; the first creation in canonical claim order supplies its child definition.
+
+A fleet member holds scheduled admission until it has completed an exchange since startup, and
+while replication reports missing history or a deferred projection. A local-only daemon and a
+fleet's sole member can admit immediately. Other fleet members may continue local work during a
+partition; a cold member needs a peer exchange before starting scheduled work.
 
 The mission steps are normal claimable work. A schedule does not start another occurrence while its prior mission run remains active.
 
-Only the host that requested an occurrence's work starts it. The request can name a mission revision
+Only the schedule's owning host arms occurrences, requests work, and creates its workspaces and
+mission runs. An omitted `host` or `host "local"` means the selected declaration's originating host,
+including for schedules declared by a mission run; replication does not make each receiving member
+an owner. An explicit host selects that member. The owning host can also start an old request
+recorded by another member, so requests made by older daemons do not block the schedule forever.
+
+An unavailable workspace leaves its request pending. The owning daemon retries at most once every
+30 seconds per schedule and records each unchanged `workspace-unavailable` diagnostic once per
+schedule and code, including across daemon restarts. A different failure reason can surface a new
+diagnostic; another schedule's diagnostic cannot defeat this deduplication.
+
+The request can name a mission revision
 or owner run that has not reached that host yet. Then it stays pending, and the schedule records a
 `reconcile.fault` naming the cause. A request that cannot start for any other reason records
 `schedule.work-failed`, and the schedule fires again at its next occurrence.

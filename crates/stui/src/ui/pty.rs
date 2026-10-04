@@ -3,12 +3,17 @@
 //! emulator here. The PTY takes the pane's size, keys go to it as bytes, and the history that
 //! scrolls off the top stays here to scroll back through.
 
+use super::theme;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line as GridLine};
+use alacritty_terminal::index::{Column, Line as GridLine, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor};
+use alacritty_terminal::term::{Config, Term, TermMode, viewport_to_point};
+use alacritty_terminal::vte::ansi::{
+    Color as AnsiColor, CursorShape, CursorStyle, NamedColor, Processor,
+};
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pty_client::connection::{SessionConnection, SessionEvent};
 use ratatui::buffer::Buffer;
@@ -25,12 +30,35 @@ const HISTORY: usize = 10_000;
 /// How long the first screen may take to arrive.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The PTY daemon answers terminal queries itself, so the emulator's answers go nowhere.
+/// What the program asked of its terminal that stui acts on: a copy for the person's clipboard
+/// (OSC 52), the window title, the bell. The PTY daemon answers terminal queries itself, so
+/// the emulator's own answers go nowhere.
 #[derive(Clone, Default)]
-struct Quiet;
+struct Requests(Arc<Mutex<Asked>>);
 
-impl EventListener for Quiet {
-    fn send_event(&self, _event: Event) {}
+/// What the program asked since stui last looked.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Asked {
+    /// Text the program copied, for the person's clipboard.
+    pub(crate) copied: Option<String>,
+    /// The title the program gave its window; `None` when it never did or reset it.
+    pub(crate) title: Option<String>,
+    pub(crate) bell: bool,
+}
+
+impl EventListener for Requests {
+    fn send_event(&self, event: Event) {
+        let mut asked = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match event {
+            // Only a copy: a program reading the person's clipboard is refused, as by default
+            // in most terminals.
+            Event::ClipboardStore(_, text) => asked.copied = Some(text),
+            Event::Title(title) => asked.title = Some(title),
+            Event::ResetTitle => asked.title = None,
+            Event::Bell => asked.bell = true,
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +80,7 @@ impl Dimensions for Size {
 }
 
 struct Screen {
-    term: Term<Quiet>,
+    term: Term<Requests>,
     parser: Processor,
     /// Why the session is over, once it is.
     ended: Option<String>,
@@ -62,22 +90,42 @@ struct Screen {
     attached: bool,
     /// When output last arrived, so stui can draw more often while it flows.
     output_at: Option<Instant>,
+    /// What the program asks of the terminal, shared with the emulator that hears it.
+    requests: Requests,
+    /// Where the selection being dragged began.
+    anchor: Option<Point>,
 }
 
 impl Screen {
-    fn new(size: Size) -> Self {
+    fn new(size: Size, requests: Requests) -> Self {
         let config = Config {
             scrolling_history: HISTORY,
+            // A shape no program can ask for, so stui can tell when none did.
+            default_cursor_style: UNASKED,
             ..Config::default()
         };
         Self {
-            term: Term::new(config, &size, Quiet),
+            term: Term::new(config, &size, requests.clone()),
             parser: Processor::new(),
             ended: None,
             dropped_at: None,
             attached: false,
             output_at: None,
+            requests,
+            anchor: None,
         }
+    }
+
+    /// The grid point at a cell of the pane, counting the history scrolled to; `None` past the
+    /// screen.
+    fn point(&self, column: u16, row: u16) -> Option<Point> {
+        let (rows, columns) = (self.term.screen_lines(), self.term.columns());
+        (usize::from(row) < rows && usize::from(column) < columns).then(|| {
+            viewport_to_point(
+                self.term.grid().display_offset(),
+                Point::new(usize::from(row), Column(usize::from(column))),
+            )
+        })
     }
 
     fn feed(&mut self, bytes: &[u8]) {
@@ -117,7 +165,7 @@ impl NativeTerminal {
             rows: rows.max(1),
             columns: columns.max(1),
         };
-        let screen = Arc::new(Mutex::new(Screen::new(size)));
+        let screen = Arc::new(Mutex::new(Screen::new(size, Requests::default())));
         let input = start(stream, name, size, &screen);
         Self {
             screen,
@@ -169,7 +217,12 @@ impl NativeTerminal {
 
     /// Send what was typed, at the bottom of the history.
     pub(crate) fn write(&self, bytes: Vec<u8>) {
-        self.lock().term.scroll_display(Scroll::Bottom);
+        {
+            let mut screen = self.lock();
+            screen.term.scroll_display(Scroll::Bottom);
+            // Typing lets go of a selection, as in a terminal.
+            screen.term.selection = None;
+        }
         self.send(Input::Bytes(bytes));
     }
 
@@ -234,6 +287,84 @@ impl NativeTerminal {
         }
     }
 
+    /// Begin a selection at a cell of the pane (zero-based), as a press does: a second press in
+    /// a row selects the word there, a third the line.
+    pub(crate) fn select_from(&self, column: u16, row: u16, clicks: u8) {
+        let mut screen = self.lock();
+        let Some(point) = screen.point(column, row) else {
+            return;
+        };
+        let kind = match clicks {
+            0 | 1 => SelectionType::Simple,
+            2 => SelectionType::Semantic,
+            _ => SelectionType::Lines,
+        };
+        screen.anchor = Some(point);
+        screen.term.selection = Some(Selection::new(kind, point, Side::Left));
+    }
+
+    /// Carry the selection to where the mouse is now, at a cell of the pane that may be past its
+    /// edges: above or below scrolls the history a line, as terminals do.
+    pub(crate) fn select_to(&self, column: i32, row: i32) {
+        let mut screen = self.lock();
+        let rows = screen.term.screen_lines() as i32;
+        let columns = screen.term.columns() as i32;
+        if row < 0 {
+            screen.term.scroll_display(Scroll::Delta(1));
+        } else if row >= rows {
+            screen.term.scroll_display(Scroll::Delta(-1));
+        }
+        let Some(point) = screen.point(
+            column.clamp(0, columns - 1) as u16,
+            row.clamp(0, rows - 1) as u16,
+        ) else {
+            return;
+        };
+        // The cell where it began and the cell under the mouse are both in, whichever way the
+        // drag went.
+        let (Some(anchor), Some(kind)) = (
+            screen.anchor,
+            screen.term.selection.as_ref().map(|selection| selection.ty),
+        ) else {
+            return;
+        };
+        let (from, to) = if point < anchor {
+            (Side::Right, Side::Left)
+        } else {
+            (Side::Left, Side::Right)
+        };
+        let mut selection = Selection::new(kind, anchor, from);
+        selection.update(point, to);
+        screen.term.selection = Some(selection);
+    }
+
+    /// The selected text as it would paste: a line the program's output wrapped stays one line.
+    pub(crate) fn selected(&self) -> Option<String> {
+        self.lock()
+            .term
+            .selection_to_string()
+            .filter(|text| !text.is_empty())
+    }
+
+    /// What the program asked of its terminal since the last look. A copy and a bell are taken;
+    /// the title stays until the program changes it.
+    pub(crate) fn asked(&self) -> Asked {
+        let requests = self.lock().requests.clone();
+        let mut asked = requests.0.lock().unwrap_or_else(|error| error.into_inner());
+        Asked {
+            copied: asked.copied.take(),
+            title: asked.title.clone(),
+            bell: std::mem::take(&mut asked.bell),
+        }
+    }
+
+    /// The title the program gave its window, when it gave one.
+    pub(crate) fn title(&self) -> Option<String> {
+        let requests = self.lock().requests.clone();
+        let asked = requests.0.lock().unwrap_or_else(|error| error.into_inner());
+        asked.title.clone().filter(|title| !title.trim().is_empty())
+    }
+
     /// Scroll the history by a page: up when `up`.
     pub(crate) fn page(&self, up: bool) {
         let mut screen = self.lock();
@@ -263,15 +394,22 @@ impl NativeTerminal {
             .is_some_and(|at| at.elapsed() < Duration::from_millis(250))
     }
 
-    /// Draw the screen, or the history scrolled to, into `area`.
-    pub(crate) fn draw(&self, buf: &mut Buffer, area: Rect) {
+    /// Draw the screen, or the history scrolled to, into `area`. With `real_cursor` the cursor
+    /// is not drawn but returned, for the person's own terminal cursor to show it.
+    pub(crate) fn draw(&self, buf: &mut Buffer, area: Rect, real_cursor: bool) -> Option<Cursor> {
         let screen = self.lock();
         let grid = screen.term.grid();
         let offset = grid.display_offset() as i32;
         let rows = grid.screen_lines().min(usize::from(area.height));
         let columns = grid.columns().min(usize::from(area.width));
+        let selection = screen
+            .term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&screen.term));
         for row in 0..rows {
-            let cells = &grid[GridLine(row as i32 - offset)];
+            let line = GridLine(row as i32 - offset);
+            let cells = &grid[line];
             let mut spans: Vec<Span<'static>> = Vec::new();
             for column in 0..columns {
                 let cell = &cells[Column(column)];
@@ -281,7 +419,10 @@ impl NativeTerminal {
                 {
                     continue;
                 }
-                let style = cell_style(cell.fg, cell.bg, cell.flags);
+                let mut style = cell_style(cell.fg, cell.bg, cell.flags);
+                if selection.is_some_and(|range| range.contains(Point::new(line, Column(column)))) {
+                    style = style.bg(theme::SELECTION_BG);
+                }
                 let mut text = if cell.flags.contains(Flags::HIDDEN) || cell.c == '\t' {
                     ' '.to_string()
                 } else {
@@ -297,20 +438,60 @@ impl NativeTerminal {
             }
             buf.set_line(area.x, area.y + row as u16, &Line::from(spans), area.width);
         }
-        // The cursor, when the bottom is shown and the program shows it.
+        // The cursor, when the bottom is shown and the program shows it: the person's own
+        // terminal cursor where it has the keys, so it keeps the shape the program asked for
+        // (vim's bar while inserting), blinks, and places an input method's text; otherwise
+        // an inverted cell.
         let point = grid.cursor.point;
-        let shape = screen.term.cursor_style().shape;
+        let style = screen.term.cursor_style();
         if offset == 0
             && screen.ended.is_none()
             && screen.term.mode().contains(TermMode::SHOW_CURSOR)
-            && shape != CursorShape::Hidden
+            && style.shape != CursorShape::Hidden
             && let (Ok(row), column) = (u16::try_from(point.line.0), point.column.0)
             && row < area.height
             && column < usize::from(area.width)
-            && let Some(cell) = buf.cell_mut((area.x + column as u16, area.y + row))
         {
-            cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            let (x, y) = (area.x + column as u16, area.y + row);
+            if real_cursor {
+                return Some(Cursor {
+                    x,
+                    y,
+                    style: cursor_style(style.shape, style.blinking),
+                });
+            }
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
         }
+        None
+    }
+}
+
+/// The cursor style until a program asks for one: the person's own shape is kept then.
+const UNASKED: CursorStyle = CursorStyle {
+    shape: CursorShape::HollowBlock,
+    blinking: false,
+};
+
+/// Where the terminal's own cursor goes on the screen, and its shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cursor {
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) style: SetCursorStyle,
+}
+
+/// The person's terminal cursor for the shape a program asked of its own.
+fn cursor_style(shape: CursorShape, blinking: bool) -> SetCursorStyle {
+    match (shape, blinking) {
+        (CursorShape::HollowBlock, _) => SetCursorStyle::DefaultUserShape,
+        (CursorShape::Beam, true) => SetCursorStyle::BlinkingBar,
+        (CursorShape::Beam, false) => SetCursorStyle::SteadyBar,
+        (CursorShape::Underline, true) => SetCursorStyle::BlinkingUnderScore,
+        (CursorShape::Underline, false) => SetCursorStyle::SteadyUnderScore,
+        (_, true) => SetCursorStyle::BlinkingBlock,
+        (_, false) => SetCursorStyle::SteadyBlock,
     }
 }
 
@@ -400,7 +581,8 @@ fn run(
                     rows: screen.term.screen_lines() as u16,
                     columns: screen.term.columns() as u16,
                 };
-                *screen = Screen::new(size);
+                let requests = screen.requests.clone();
+                *screen = Screen::new(size, requests);
                 screen.attached = true;
                 screen.feed(&bytes);
             }
@@ -717,7 +899,7 @@ mod tests {
         let shown = |terminal: &NativeTerminal| {
             let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
             let area = buf.area;
-            terminal.draw(&mut buf, area);
+            terminal.draw(&mut buf, area, false);
             buf.content
                 .iter()
                 .map(|cell| cell.symbol())
@@ -756,6 +938,90 @@ mod tests {
         assert!(shown(&terminal).contains("old 0"), "{}", shown(&terminal));
     }
 
+    #[test]
+    fn a_drag_selects_as_a_terminal_copies_and_a_program_copies_and_names_itself() {
+        use pty_core::protocol::{MessageType, encode_packet};
+        use std::io::{Read as _, Write as _};
+        let wait = |done: &dyn Fn() -> bool| {
+            let start = Instant::now();
+            while !done() {
+                assert!(start.elapsed() < Duration::from_secs(5), "timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let drawn = |terminal: &NativeTerminal| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 10, 4));
+            let area = buf.area;
+            terminal.draw(&mut buf, area, false);
+            buf
+        };
+        let (stui, mut daemon) = UnixStream::pair().unwrap();
+        let terminal = NativeTerminal::spawn(stui, "test", "one".into(), 4, 10);
+        let mut bytes = [0_u8; 64];
+        let _ = daemon.read(&mut bytes).unwrap();
+        daemon
+            .write_all(&encode_packet(MessageType::Screen, b""))
+            .unwrap();
+        // Ten columns: the first line wraps.
+        daemon
+            .write_all(&encode_packet(
+                MessageType::Data,
+                b"hello world wraps\r\nnext line",
+            ))
+            .unwrap();
+        wait(&|| {
+            drawn(&terminal)
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .contains("next")
+        });
+        // A drag across the wrapped line copies it as the one line the program wrote.
+        terminal.select_from(0, 0, 1);
+        terminal.select_to(6, 1);
+        assert_eq!(terminal.selected().as_deref(), Some("hello world wraps"));
+        assert_eq!(drawn(&terminal)[(0, 0)].bg, theme::SELECTION_BG);
+        assert_ne!(drawn(&terminal)[(0, 2)].bg, theme::SELECTION_BG);
+        // Dragging back past where it began takes the cell under the mouse too.
+        terminal.select_from(4, 0, 1);
+        terminal.select_to(0, 0);
+        assert_eq!(terminal.selected().as_deref(), Some("hello"));
+        // A second press selects the word, a third the line.
+        terminal.select_from(6, 2, 2);
+        assert_eq!(terminal.selected().as_deref(), Some("line"));
+        terminal.select_from(6, 2, 3);
+        assert!(terminal.selected().unwrap().starts_with("next line"));
+        // A press without a drag selects nothing.
+        terminal.select_from(2, 2, 1);
+        assert_eq!(terminal.selected(), None);
+        // Typing lets go of the selection.
+        terminal.select_from(0, 0, 1);
+        terminal.select_to(3, 0);
+        terminal.write(b"x".to_vec());
+        assert_eq!(terminal.selected(), None);
+        // A program copies through OSC 52 and names its window; stui hears both once.
+        daemon
+            .write_all(&encode_packet(
+                MessageType::Data,
+                b"\x1b]52;c;aGk=\x07\x1b]2;build log\x07\x07",
+            ))
+            .unwrap();
+        wait(&|| terminal.title().is_some());
+        assert_eq!(terminal.title().as_deref(), Some("build log"));
+        let asked = terminal.asked();
+        assert_eq!(asked.copied.as_deref(), Some("hi"));
+        assert!(asked.bell);
+        assert_eq!(
+            terminal.asked(),
+            Asked {
+                copied: None,
+                title: Some("build log".into()),
+                bell: false,
+            }
+        );
+    }
+
     /// A PTY session daemon, played by the test: answer ATTACH with a screen, then data.
     #[test]
     fn a_session_draws_into_the_pane_takes_its_size_and_keys_and_ends() {
@@ -792,7 +1058,7 @@ mod tests {
             let mut buf = Buffer::empty(Rect::new(0, 0, 20, 4));
             {
                 let area = buf.area;
-                terminal.draw(&mut buf, area);
+                terminal.draw(&mut buf, area, false);
             }
             buf.content
                 .iter()
@@ -803,7 +1069,7 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 4));
         {
             let area = buf.area;
-            terminal.draw(&mut buf, area);
+            terminal.draw(&mut buf, area, false);
         }
         assert_eq!(buf[(0, 1)].symbol(), "w");
         assert!(buf[(0, 1)].modifier.contains(Modifier::BOLD));
@@ -830,7 +1096,7 @@ mod tests {
             let mut buf = Buffer::empty(Rect::new(0, 0, 40, 10));
             {
                 let area = buf.area;
-                terminal.draw(&mut buf, area);
+                terminal.draw(&mut buf, area, false);
             }
             buf.content
                 .iter()

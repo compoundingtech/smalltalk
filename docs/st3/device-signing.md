@@ -26,8 +26,10 @@ Every client's tests check against that file.
    - `device_public_key`: the device's public key.
    - `key_storage`: `secure-enclave` or `software`. Optional.
    - `code`: the pairing code.
-3. The daemon pairs the device as before. When `device_public_key` is a signing key, the daemon
-   also enrolls it:
+3. The daemon pairs the device as before. When `device_public_key` is a signing key and the
+   pairing grants `control.messages` (`st devices pair --full-control`), the daemon also enrolls
+   it. A device paired only to read, such as a display, gets no key that speaks for the person.
+   Enrolment:
    - The person's root key, which that node holds, writes a `principal.key-granted` claim with
      role `device`.
    - The answer gains `device_key_chain`: the claim IDs of the device's grant and then of the

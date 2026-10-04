@@ -26,9 +26,14 @@ def load(name, path):
 probe = load("delivery_probe", HERE / "st3-delivery-probe")
 faults = load("messaging_faults", HERE / "st3-messaging-faults-eval/run")
 BINARY = None
+SCRATCH = None
 if "--binary" in sys.argv:
     index = sys.argv.index("--binary")
     BINARY = Path(sys.argv[index + 1]).resolve()
+    del sys.argv[index:index + 2]
+if "--scratch" in sys.argv:
+    index = sys.argv.index("--scratch")
+    SCRATCH = Path(sys.argv[index + 1]).resolve()
     del sys.argv[index:index + 2]
 
 
@@ -210,13 +215,14 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
 class NativeProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_read_outage_attention_and_recovery(self):
         directory = Path(tempfile.mkdtemp(prefix="delivery-probe-"))
+        binary_directory = Path(tempfile.mkdtemp(prefix="delivery-probe-binaries-", dir=SCRATCH))
         nodes = []
         try:
             env = {"PATH": os.environ["PATH"], "USER": os.environ.get("USER", "eval"),
                    "LOGNAME": os.environ.get("USER", "eval"), "SHELL": "/bin/bash", "LANG": "C.UTF-8"}
             if os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
                 env["DBUS_SESSION_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"]
-            nodes = [faults.Node(directory, host, BINARY, env) for host in ("amber", "cobalt")]
+            nodes = [faults.Node(directory, host, BINARY, env, binary_directory) for host in ("amber", "cobalt")]
             ports = [faults.free_port(), faults.free_port()]
             secret = directory / "secret"
             secret.write_text("9" * 64)
@@ -310,6 +316,7 @@ agent "probe/{node.name}" {{
         finally:
             for node in reversed(nodes):
                 await node.cleanup()
+            shutil.rmtree(binary_directory)
 
 
 if __name__ == "__main__":

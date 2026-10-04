@@ -1,5 +1,7 @@
 # Small Talk
 
+**[Get started](docs/getting-started.md)** — install Small Talk and give your first agent a mission.
+
 ## Continuous integration
 
 Small Talk runs pull request CI and every push to `main` on GitHub Actions with Namespace runners.
@@ -21,8 +23,11 @@ Its broad name is intentional; initially it contains only stui's mission model (
 `missions::adapt` borrows typed mission and agent projections plus unresolved, actor-filtered
 attention. Callers supply the current time and display policies explicitly; collection loading,
 clocks and application naming remain outside the crate. Mission precedence, queue/keep-open
-rules, outcomes and rich step details retain stui's existing behavior. Shared widgets and other
-UI models are separate follow-up work, not part of this mission extraction.
+rules, outcomes and rich step details retain stui's existing behavior.
+Adapted steps retain their stable step-run `id` and claimant-or-assignee `seat` (absent for
+agentless steps), so consumers can select duplicate paths across open runs and navigate to
+the actual execution seat without reconstructing identity from display labels.
+Shared widgets and other UI models are separate follow-up work, not part of this mission extraction.
 
 ## Install
 
@@ -42,6 +47,12 @@ omit dependency debug info. On both platforms the shell sets `RUSTC_WRAPPER` to
 sccache. Run tests with `cargo nextest run --workspace --locked`.
 Outside the Nix shell, install mold on Linux and cargo-nextest separately; the
 repository's `.cargo/config.toml` still selects mold for Linux builds.
+
+`st --version` names the source revision and whether the build came from Nix or local source.
+`st --version --json` returns a stable `machine_version` without needing a daemon.
+`st doctor --json` and client capabilities expose the responding daemon's `machine_version`,
+so an installed CLI and a running daemon can be compared. All versions use metadata baked at
+compile time, independent of the caller's directory or environment.
 
 This installs `st3`, the `st` symlink, the `stui` terminal app, `st3-migrate`, and the pinned
 `pty` terminal runtime. The default, `st`, `st3`, and `small-talk` Nix package names all select
@@ -334,14 +345,23 @@ person = "person/ada"
 enabled = true
 stop_at_weekly_percent = 95
 keep = ["agent/example/coordinator"]
+notify = "agent/example/operations"
 fresh = "1h"
 ```
 
 When an account's freshest weekly reading, no older than `fresh`, reaches the percentage, each
 node stops the seats it hosts on that account, except those in `keep`, and the node that measured
-the reading puts one request on the person's home naming the stopped seats and the reset time.
+the reading sends one message to `notify`, naming the affected seats and the reset time. The
+operations agent groups alerts, acts on standing instructions, and asks a person through a
+structured request only when a decision is needed. Enabled policies require `notify` to name
+an agent; the legacy `ask` setting is accepted but never sends raw events to a person.
 Each seat is stopped once per weekly window: start it again and it stays up until the reset. Give
 every node that hosts seats the same `[limits]`.
+
+A person who owns more than one Claude or Codex account declares them and binds a seat to one or to
+a pool; a pooled seat at its limit restarts on another account instead of stopping, and `st usage`
+names each account ([model accounts](docs/st3/accounts.md)). A seat that binds nothing runs on the
+harness's default login.
 
 The seat starts its harness in the workspace with no prompt. It stays idle, taking no turn, until
 a person types in its terminal or a message is posted to it. A seat you declare as
@@ -457,10 +477,16 @@ st conversations archive MESSAGE --as person/ada
 st conversations search "release date" --agent agent/example/worker --since 2026-10-01T00:00:00Z
 ```
 
-If a send or reply goes unanswered, st retries once with the same message and idempotency
-key. If delivery remains unconfirmed, the error prints the key: rerun the same command with
-`--idempotency-key KEY` to recover its result without sending a second message. Use a new key
-for a new message.
+Running the same send or reply again never sends it twice. Without `--idempotency-key`, st names
+the message by its sender, recipient (or the message it answers), title, body, tags, attachments
+and the hour, so a repeat within the hour or the next reports the message already sent
+(`already_sent` with `--json`) and sends nothing; the same words a few hours later are a new
+message. An explicit `--idempotency-key` names one message at any hour, and reusing it with
+different words is refused.
+
+If a send goes unanswered, st retries once with the same key. If it is still unconfirmed, the
+message may have landed: the error prints its key and the command that tells whether it did,
+`st conversations status --idempotency-key KEY`. Running the same command again is safe.
 
 `st conversations sessions` lists harness sessions and `st conversations timeline SESSION`
 shows one conversation as stui shows it: messages, Small Talk, and tool calls folded to a line

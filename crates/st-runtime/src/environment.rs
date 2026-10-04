@@ -50,7 +50,9 @@ pub fn is_shell_startup_timeout(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<ShellStartupTimeout>())
 }
 
-fn login_environment_from(shell: &Path, timeout: Duration) -> Result<BTreeMap<String, String>> {
+/// Capture a caller-selected shell with the usual PTY and timeout behavior.
+/// Production account capture still selects the passwd shell.
+pub fn login_environment_from(shell: &Path, timeout: Duration) -> Result<BTreeMap<String, String>> {
     login_environment_with_args(
         shell,
         timeout,

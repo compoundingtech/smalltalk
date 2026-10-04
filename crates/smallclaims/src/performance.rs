@@ -24,6 +24,10 @@ struct Bucket {
     client_requests: BTreeMap<String, Sample>,
     /// Wakes of the reconciler by what caused them.
     wakes: BTreeMap<String, Sample>,
+    /// Writes a full reconcile pass made that an incremental pass would have missed.
+    corrections: BTreeMap<String, Sample>,
+    /// Item evaluations by whether an incremental pass would have run them.
+    evaluations: BTreeMap<String, Sample>,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Table {
@@ -32,6 +36,8 @@ enum Table {
     Clients,
     ClientRequests,
     Wakes,
+    Corrections,
+    Evaluations,
 }
 impl Bucket {
     fn table(&self, table: Table) -> &BTreeMap<String, Sample> {
@@ -41,6 +47,8 @@ impl Bucket {
             Table::Clients => &self.clients,
             Table::ClientRequests => &self.client_requests,
             Table::Wakes => &self.wakes,
+            Table::Corrections => &self.corrections,
+            Table::Evaluations => &self.evaluations,
         }
     }
     fn table_mut(&mut self, table: Table) -> &mut BTreeMap<String, Sample> {
@@ -50,6 +58,8 @@ impl Bucket {
             Table::Clients => &mut self.clients,
             Table::ClientRequests => &mut self.client_requests,
             Table::Wakes => &mut self.wakes,
+            Table::Corrections => &mut self.corrections,
+            Table::Evaluations => &mut self.evaluations,
         }
     }
 }
@@ -60,6 +70,13 @@ struct Meter {
     buckets: VecDeque<(Instant, Bucket)>,
 }
 static METER: OnceLock<Mutex<Meter>> = OnceLock::new();
+
+/// Clear process-wide accounting before an isolated metrics test starts its requests.
+/// Callers must not run alongside other tests that rely on the meter's contents.
+#[cfg(feature = "test-support")]
+pub fn reset_for_test() {
+    *METER.get_or_init(Mutex::default).lock().unwrap() = Meter::default();
+}
 
 impl Meter {
     fn prune(&mut self, now: Instant) {
@@ -184,10 +201,20 @@ impl Meter {
             .take(20)
             .map(|(cause, s)| json!({"cause": cause, "count": s.count}))
             .collect::<Vec<_>>();
+        let corrections = self
+            .totals(Table::Corrections)
+            .into_iter()
+            .map(|(item, s)| json!({"item": item, "count": s.count}))
+            .collect::<Vec<_>>();
+        let evaluations = self
+            .totals(Table::Evaluations)
+            .into_iter()
+            .map(|(item, s)| json!({"item": item, "count": s.count, "cpu_ms": s.cpu_us as f64 / 1000.0}))
+            .collect::<Vec<_>>();
         json!({"window_seconds":300,"requests":by_time(Table::Requests),"queries":by_time(Table::Queries),
             "request_count":request_count,"sampled_seconds":window_seconds,
             "clients":by_count(Table::Clients),"client_requests":by_count(Table::ClientRequests),
-            "reconciler_wakes":wakes,
+            "reconciler_wakes":wakes,"incremental_corrections":corrections,"incremental_evaluations":evaluations,
             "query_time_note":"Statement wall time includes row processing; concurrent times overlap."})
     }
 }
@@ -287,6 +314,30 @@ pub fn record_wake(source: &str, detail: Option<&str>) {
         label,
         Duration::ZERO,
         0,
+    );
+}
+/// Count a write that a full reconcile pass made for `item` (an item kind, such as `mission-run`)
+/// that an incremental pass would have skipped. Every one is a bug in what the incremental pass
+/// tracks; see `doc/fleet/smalltalk/idle-cpu-incremental-design`.
+pub fn record_correction(item: &str) {
+    METER.get_or_init(Mutex::default).lock().unwrap().record(
+        Instant::now(),
+        Table::Corrections,
+        item.to_owned(),
+        Duration::ZERO,
+        0,
+    );
+}
+/// Count one evaluation of an item of kind `item`, under whether an incremental pass would have
+/// run it (`needed`) or skipped it, with the CPU it cost.
+pub fn record_evaluation(item: &str, needed: bool, cpu: Duration) {
+    let label = format!("{item} · {}", if needed { "needed" } else { "skippable" });
+    METER.get_or_init(Mutex::default).lock().unwrap().record(
+        Instant::now(),
+        Table::Evaluations,
+        label,
+        Duration::ZERO,
+        u64::try_from(cpu.as_nanos()).unwrap_or(u64::MAX),
     );
 }
 pub fn snapshot() -> Value {

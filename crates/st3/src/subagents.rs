@@ -60,6 +60,8 @@ pub struct Publisher {
     incarnation: String,
     agent_dir: PathBuf,
     home: Option<PathBuf>,
+    /// `$CLAUDE_CONFIG_DIR`, when the seat runs on its own Claude login directory.
+    claude_config: Option<PathBuf>,
     codex_home: Option<PathBuf>,
     /// The incarnation stamped on the harness timeline, which a subagent's usage joins.
     timeline_incarnation: Option<String>,
@@ -115,6 +117,9 @@ impl Publisher {
             incarnation: incarnation.into(),
             agent_dir: agent_dir.into(),
             home: std::env::var_os("HOME").map(PathBuf::from),
+            claude_config: std::env::var_os("CLAUDE_CONFIG_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
             codex_home: st_drivers::codex_app_server::codex_home(),
             timeline_incarnation: None,
             lease_ms: lease_ms(),
@@ -125,6 +130,7 @@ impl Publisher {
     /// Read transcripts beneath these homes instead of this process's (`HOME`, `CODEX_HOME`).
     pub fn with_homes(mut self, home: Option<PathBuf>, codex_home: Option<PathBuf>) -> Self {
         self.home = home;
+        self.claude_config = None;
         self.codex_home = codex_home;
         self
     }
@@ -516,7 +522,13 @@ impl Publisher {
             return ended.tokens;
         }
         let transcript = ended.subagent.transcript.as_deref()?;
-        match ledger::claude_transcript_tokens(transcript, self.home.as_deref()?) {
+        // A seat bound to an account runs with its own `CLAUDE_CONFIG_DIR`, and Claude writes its
+        // transcripts there.
+        let claude_config = match &self.claude_config {
+            Some(config) => config.clone(),
+            None => self.home.as_deref()?.join(".claude"),
+        };
+        match ledger::claude_transcript_tokens(transcript, &claude_config) {
             Ok(tokens) => Some(tokens),
             Err(error) => {
                 tracing::debug!(

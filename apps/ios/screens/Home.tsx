@@ -1,10 +1,10 @@
-import { useLayoutEffect, useMemo, useRef } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { Alert, Linking, Pressable, ScrollView, SectionList, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { Banners, Empty, StatusLine, useDebugScroll, useRefresh } from '../chrome';
 import { ContextMenu } from '../menu';
-import { HOME_LEGEND, homeRows, homeSections, type HomeRow } from '../homeView';
+import { HOME_LEGEND, homeRows, homeSections, type HomeRow, cleanMessageText, ANSWERS, isRequest, report, spaced, yesNo } from '@smalltalk/st3-views';
 import type { RootParams } from '../navigation';
 import { agentName } from '../agentsView';
 import { attentionActionLabel, attentionKindLabel } from '../presentation';
@@ -13,8 +13,6 @@ import { useStore } from '../store';
 import { randomName } from '../launcher';
 import { theme } from '../theme';
 import { Button, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
-import { cleanMessageText } from '../conversationView';
-import { ANSWERS, isRequest, report, spaced, yesNo } from '../requestView';
 import type { RootScreen } from '../navigation';
 
 // Home: what needs the person, as stui's Home lists it.
@@ -40,6 +38,21 @@ export function HomeScreen() {
     });
   }, [navigation, actions]);
   const sections = useMemo(() => homeSections(rows).map(section => ({ ...section, data: section.rows })), [rows]);
+  // Dismiss, as stui's x: a request is closed with word to its asker that there is nothing for
+  // the person to do (after a confirm), an update or a message is read. A decision has none.
+  const dismiss = (row: HomeRow): (() => void) | undefined => {
+    const item = row.item;
+    if (item.update && item.actions.includes('work.done')) return () => void actions.done(item, 'Read', 'read');
+    if (isRequest(item.attention_kind) && item.actions.includes('work.done')) {
+      const asker = item.requester_id?.replace(/^agent\//, '') ?? 'the agent';
+      return () => Alert.alert(`Tell ${asker} there is nothing for you to do`, row.title, [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Dismiss', onPress: () => void actions.done(item, ANSWERS.nothing) },
+      ]);
+    }
+    if (item.actions.includes('message.read')) return () => void actions.markRead(item);
+    return undefined;
+  };
   return <Screen>
     <Banners />
     <SectionList
@@ -53,12 +66,13 @@ export function HomeScreen() {
         { id: 'open', title: 'Open', symbol: 'arrow.up.right', run: () => navigation.navigate('Attention', { id: row.item.id }) },
         ...(agentOf(row) ? [{ id: 'chat', title: 'Chat with the agent', symbol: 'bubble.left.and.bubble.right', run: () => navigation.navigate('Conversation', { target: agentOf(row)! }) }] : []),
         ...(row.item.mission_id ? [{ id: 'mission', title: 'Open the mission', symbol: 'point.3.connected.trianglepath.dotted', run: () => navigation.navigate('Mission', { id: row.item.mission_id! }) }] : []),
-        ...(row.item.actions.includes('work.done') && !busy && status === 'online' ? [{ id: 'done', title: 'Complete step', symbol: 'checkmark.circle', run: () => Alert.prompt('Complete step', row.title, summary => { if (summary.trim()) void actions.done(row.item, summary); }) }] : []),
+        ...(row.item.actions.includes('work.done') && !row.item.update && !busy && status === 'online' ? [{ id: 'done', title: 'Complete step', symbol: 'checkmark.circle', run: () => Alert.prompt('Complete step', row.title, summary => { if (summary.trim()) void actions.done(row.item, summary); }) }] : []),
+        ...(dismiss(row) && !busy && status === 'online' ? [{ id: 'dismiss', title: 'Dismiss', symbol: 'xmark.circle', run: dismiss(row)! }] : []),
       ]}>
         <ListRow
           glyph={row.glyph}
-          glyphColor={row.color}
-          title={<T numberOfLines={1}><T color={row.color}>{row.kind.padEnd(9)}</T><T bold>{row.title}</T></T>}
+          glyphColor={theme[row.color]}
+          title={<T numberOfLines={1}><T color={theme[row.color]}>{row.kind.padEnd(9)}</T><T bold>{row.title}</T></T>}
           second={`${row.waiting ? `${row.waiting} · ` : ''}waited ${row.age}`}
           onPress={() => navigation.navigate('Attention', { id: row.item.id })}
         />
@@ -68,7 +82,7 @@ export function HomeScreen() {
       ListEmptyComponent={<Empty text={loadErrors.attention ? `Attention could not be loaded: ${loadErrors.attention}` : hasSynced ? 'Nothing needs you.' : 'Checking what needs you…'} />}
       ListFooterComponent={<View>
         {truncated.attention ? <Note tone="warning">More items exist beyond these 200. `st now` lists them all.</Note> : null}
-        <Legend entries={HOME_LEGEND} />
+        <Legend entries={HOME_LEGEND.map(entry => ({ ...entry, color: theme[entry.color] }))} />
       </View>}
       style={{ flex: 1 }}
     />
@@ -78,20 +92,49 @@ export function HomeScreen() {
 // One attention item: what it asks, who raised it, and what can be done here.
 export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) {
   const { data, busy, status, actions } = useStore();
-  const item = data.attention.find(candidate => candidate.id === route.params.id);
+  const found = data.attention.find(candidate => candidate.id === route.params.id);
+  // An update clears once read, which is as soon as it is opened; it stays here while it is read.
+  const kept = useRef(found);
+  if (found) kept.current = found;
+  const item = found ?? (kept.current?.update ? kept.current : undefined);
+  const read = useRef(false);
+  useEffect(() => {
+    if (!item?.update || read.current || status !== 'online') return;
+    read.current = true;
+    void actions.done(item, 'Read', 'read');
+  }, [item?.id, status]);
   if (!item) return <Screen><Banners /><Empty text="This item is no longer open." /></Screen>;
   const [row] = homeRows([item], undefined);
   const agentId = [item.requester_id, item.source_id].find(id => id?.startsWith('agent/'));
   const agent = agentId ? data.agents.find(candidate => candidate.id === agentId) : undefined;
   const mission = item.mission_id ? data.missions.find(candidate => candidate.id === item.mission_id) : undefined;
-  const other = item.actions.filter(action => action !== 'work.done');
+  const other = item.actions.filter(action => action !== 'work.done' && action !== 'message.read');
+  if (item.update) {
+    const from = agent ? agentName(agent) : item.requester_id?.replace(/^agent\//, '') ?? 'An agent';
+    return <Screen>
+      <Banners />
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 8, paddingBottom: 32 }}>
+        <T><T bold color={theme[row.color]}>{row.glyph} update</T><T dim>  {row.age} ago</T></T>
+        <T bold selectable>{row.title}</T>
+        <T><T dim>from  </T><T bold color={theme.person}>{from}</T></T>
+        <Markdown text={spaced(cleanMessageText(item.detail || item.update.summary || ''))} color={theme.text} />
+        <T dim selectable>about {item.update.about}</T>
+        {item.update.subjects?.map((subject, index) => subject.url
+          ? <Pressable key={index} onPress={() => void Linking.openURL(subject.url!)}><T color={theme.accent}>↗ {subject.label}</T></Pressable>
+          : <T key={index} dim>↗ {subject.label}  {subject.ref ?? ''}</T>)}
+        <T dim>Nothing waits on this. Opening it marked it read, so it has left Home.</T>
+        {agentId ? <Button label={`chat with ${from}`} onPress={() => navigation.navigate('Conversation', { target: agentId, title: from })} /> : null}
+        <T dim selectable>{item.id}</T>
+      </ScrollView>
+    </Screen>;
+  }
   if (isRequest(item.attention_kind) && item.actions.includes('work.done')) {
     const from = agent ? agentName(agent) : item.requester_id?.replace(/^agent\//, '') ?? 'An agent';
     return <Screen>
       <Banners />
       {/* Automatic insets keep the end of a long request clear of the floating tab bar. */}
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 8, paddingBottom: 32 }}>
-        <T><T bold color={row.color}>{row.glyph} request</T><T dim>  {item.priority} · waited {row.age}</T></T>
+        <T><T bold color={theme[row.color]}>{row.glyph} request</T><T dim>  {item.priority} · waited {row.age}</T></T>
         <T bold selectable>{row.title}</T>
         <T><T dim>asks  </T><T bold color={theme.person}>{from}</T></T>
         {item.request ? <StructuredRequestView item={item} request={item.request} from={from} onAnswered={() => navigation.goBack()} /> : <>
@@ -109,7 +152,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
   return <Screen>
     <Banners />
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 6, paddingBottom: 32 }}>
-      <T><T bold color={row.color}>{row.glyph} {row.kind}</T><T dim>  {attentionKindLabel(item.attention_kind)} · {item.priority} · waited {row.age}</T></T>
+      <T><T bold color={theme[row.color]}>{row.glyph} {row.kind}</T><T dim>  {attentionKindLabel(item.attention_kind)} · {item.priority} · waited {row.age}</T></T>
       <T bold selectable>{row.title}</T>
       {item.detail ? <Markdown text={item.detail} color={theme.subtext0} /> : null}
       {item.because ? <T soft>because {item.because}</T> : null}
@@ -118,6 +161,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
       {agentId ? <Button label={`chat with ${agent ? agentName(agent) : agentId}`} onPress={() => navigation.navigate('Conversation', { target: agentId, title: agent ? agentName(agent) : undefined })} /> : null}
       <T dim selectable>{item.id}{item.source_id !== item.id ? ` · from ${item.source_id}` : ''}</T>
       {item.actions.includes('work.done') ? <Button label={attentionActionLabel('work.done').toLowerCase()} disabled={busy || status !== 'online'} onPress={() => Alert.prompt('Complete step', item.title, summary => { if (summary.trim()) void actions.done(item, summary).then(done => { if (done) navigation.goBack(); }); })} /> : null}
+      {item.actions.includes('message.read') ? <Button label="dismiss: mark read" disabled={busy || status !== 'online'} onPress={() => void actions.markRead(item).then(done => { if (done) navigation.goBack(); })} /> : null}
       {other.length ? <Note>in the CLI: {other.map(attentionActionLabel).join(', ')}</Note> : null}
     </ScrollView>
   </Screen>;
@@ -131,7 +175,10 @@ function StructuredRequestView({ item, request, from, onAnswered }: { item: Para
   const { busy, status, actions } = useStore();
   const disabled = busy || status !== 'online';
   const label = (id: string) => request.answers?.find(answer => answer.id === id)?.label ?? id;
-  const send = (answer: { id: string; label: string }) => Alert.alert(`Answer ${from} “${answer.label}”`, undefined, [
+  const send = (answer: { id: string; label: string; outcome?: string | null }) => answer.outcome === 'request_changes'
+    // Requesting changes needs the changes, in words.
+    ? Alert.prompt(answer.label, 'What should change?', text => { if (text.trim()) void actions.done(item, text.trim(), answer.id).then(done => { if (done) onAnswered(); }); })
+    : Alert.alert(`Answer ${from} “${answer.label}”`, undefined, [
     { text: 'Cancel', style: 'cancel' },
     { text: 'Send', onPress: () => void actions.done(item, answer.label, answer.id).then(done => { if (done) onAnswered(); }) },
   ]);

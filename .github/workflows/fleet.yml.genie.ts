@@ -5,7 +5,21 @@ import {
   plainFlakeJob,
   plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
-import { buildEnv, commonSetupSteps, linuxStageRunner, linuxRunner, readOnlyBinaryCaches, workspacePreparationSteps } from './workspace-ci.ts'
+import {
+  afterPickRunner,
+  buildEnv,
+  commonSetupSteps,
+  linuxRunner,
+  linuxRunsOn,
+  linuxStageJob as namespaceStageJob,
+  linuxStageRunner,
+  linuxStageRunsOn,
+  perfStoresCache,
+  pickRunnerJob,
+  pickRunnerJobId,
+  readOnlyBinaryCaches,
+  workspacePreparationSteps,
+} from './workspace-ci.ts'
 
 // Namespace offers nested virtualization on linux/amd64. Prove /dev/kvm can create a VM before
 // anything else; QEMU is also forbidden to fall back to emulation (nix/transport-isolation-vm.nix).
@@ -25,7 +39,8 @@ print(f"KVM API {version}: created a VM")
 EOF
 printf 'KVM: \\x60%s\\x60, CPU virtualization flag %s, VM creation succeeded\\n\\n| Phase | Elapsed |\\n| --- | --- |\\n' "$(ls -l /dev/kvm)" "$(grep -m1 -oE 'vmx|svm' /proc/cpuinfo || echo none)" >> "$GITHUB_STEP_SUMMARY"`
 
-// One Linux gate stage: its own runner and caches, the common setup, then scripts/ci-linux.
+// One Linux gate stage: its own runner (ci1 or Namespace, see pickRunnerJob) and caches, the common
+// setup, then scripts/ci-linux.
 const linuxStageJob = ({
   name,
   stage,
@@ -42,7 +57,8 @@ const linuxStageJob = ({
   extraLogs?: string
 }) => ({
   name,
-  'runs-on': linuxStageRunner,
+  ...afterPickRunner,
+  'runs-on': linuxStageRunsOn,
   'timeout-minutes': 120,
   defaults: { run: { shell: 'bash' } },
   env: { ...buildEnv, ...env },
@@ -55,7 +71,7 @@ const linuxStageJob = ({
     nixDevelopStep({ name: description ?? 'Run nextest', command: ['bash', 'scripts/ci-linux', stage] }),
     {
       name: 'Save Nix outputs to the local Nix cache',
-      if: 'success()',
+      if: "success() && env.CI_LOCAL_CACHES != '1'",
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
     {
@@ -94,6 +110,7 @@ export default githubWorkflow({
     selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
   },
   jobs: {
+    [pickRunnerJobId]: pickRunnerJob,
     // Namespace runners are already authenticated. Manual runs record the platform resource limits
     // alongside the CI workload so queue concurrency can be chosen from the actual account capacity.
     'namespace-capacity': {
@@ -125,11 +142,63 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
     },
     'genie-freshness': plainFlakeJob({
       name: 'genie-freshness',
-      runsOn: linuxRunner,
+      ...afterPickRunner,
+      runsOn: linuxRunsOn,
       'timeout-minutes': 20,
       nix: { binaryCaches: readOnlyBinaryCaches },
-      step: nixDevelopStep({ name: 'Check generated files', flake: '.#genie', command: ['genie', '--check'] }),
+      step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && genie --check'] }),
     }),
+    // Check the shared client and its iOS consumer before merge.
+    'typescript-client': {
+      name: 'typescript-client',
+      // Reuse freshness's slot so the five general ci1 runners can cover the initial fan-out.
+      needs: ['pick-runner', 'genie-freshness'],
+      if: "${{ !cancelled() && needs.genie-freshness.result == 'success' }}",
+      'runs-on': linuxRunsOn,
+      'timeout-minutes': 10,
+      defaults: { run: { shell: 'bash' } },
+      steps: [
+        { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+        // Node 24, as in the workspace shell; schema tests use its native TypeScript loading.
+        { uses: 'actions/setup-node@v4', with: { 'node-version': '24.18.0' } },
+        {
+          name: 'Fingerprint the locked dependencies',
+          id: 'lockfiles',
+          // ci1's Nix runner lacks the Node 20 helper used by GitHub's hashFiles expression.
+          run: `lockfiles_hash=$(sha256sum apps/ios/package-lock.json clients/typescript/st3-client/package-lock.json clients/typescript/st3-views/package-lock.json | sha256sum | cut -d ' ' -f1)
+printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
+        },
+        {
+          name: 'Cache the locked TypeScript and Effect toolchain',
+          id: 'typescript-cache',
+          uses: 'actions/cache@v5',
+          with: {
+            path: 'apps/ios/node_modules\nclients/typescript/st3-client/node_modules\nclients/typescript/st3-views/node_modules',
+            key: 'typescript-client-${{ runner.os }}-node24.18.0-${{ steps.lockfiles.outputs.hash }}',
+          },
+        },
+        {
+          name: 'Install locked client dependencies',
+          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
+          run: 'npm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund',
+        },
+        {
+          name: 'Run client contracts, schemas and strict typechecks',
+          run: 'npm test --prefix clients/typescript/st3-client\nnpm run typecheck --prefix clients/typescript/st3-client',
+        },
+        {
+          name: 'Install locked view dependencies',
+          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
+          run: 'npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund',
+        },
+        {
+          name: 'Install locked iOS dependencies',
+          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
+          run: 'npm ci --prefix apps/ios --ignore-scripts --no-audit --no-fund',
+        },
+        { name: 'Check shared views, fixtures and iOS consumers', run: 'npm test --prefix clients/typescript/st3-views\nnpm run typecheck --prefix clients/typescript/st3-views\napps/ios/node_modules/.bin/tsc --noEmit -p apps/ios\nnpm test --prefix apps/ios' },
+      ],
+    },
     // The Linux gate runs as three jobs on separate runners, each with its own caches.
     // `linux-gate` below is the single required check that collects them.
     'linux-tests': linuxStageJob({
@@ -155,15 +224,16 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
     }),
     'linux-gate': {
       name: 'linux-gate',
-      needs: ['linux-tests', 'linux-clippy', 'linux-fleet-compat'],
+      needs: [pickRunnerJobId, 'linux-tests', 'linux-clippy', 'linux-fleet-compat'],
       // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
       if: 'always()',
-      'runs-on': linuxRunner,
+      'runs-on': linuxRunsOn,
       'timeout-minutes': 5,
       steps: [
         {
           name: 'Require every Linux stage to pass',
-          env: { RESULTS: '${{ join(needs.*.result, \' \') }}' },
+          // The stages only: pick-runner is skipped whenever ci1 is off.
+          env: { RESULTS: '${{ needs.linux-tests.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }}' },
           run: `echo "stage results: $RESULTS"
 for result in $RESULTS; do
   [ "$result" = success ] || exit 1
@@ -171,11 +241,30 @@ done`,
         },
       ],
     },
+    // The cost check: SQLite work per daemon request on a small and a ten times larger generated
+    // store. Counts, not timings, so a lightly optimized build only speeds up the generation.
+    // Not part of linux-gate; it must finish before linux-tests does (docs/ci.md). The load test
+    // runs in perf.yml. It runs where the stages run, and skips merge-queue entries, which do not
+    // wait for it, so each queued entry still needs only its required jobs' capacity. A required
+    // perf-cost must run there too.
+    'perf-cost': namespaceStageJob({
+      name: 'perf-cost',
+      stage: 'cost',
+      runsOn: linuxStageRunner,
+      condition: "github.event_name != 'merge_group'",
+      setup: commonSetupSteps,
+      description: 'Run the cost check',
+      command: ['bash', 'scripts/ci-perf', 'cost'],
+      env: { CARGO_PROFILE_DEV_OPT_LEVEL: '1' },
+      extraLogs: '${{ runner.temp }}/perf/',
+      before: [perfStoresCache('cost')],
+    }),
     // st2's transport-isolation cascade tests need a real systemd user manager, which the
     // runner image lacks. A NixOS VM runs this job's prebuilt test binary; it compiles nothing.
     'isolation-vm': {
       name: 'isolation-vm',
-      'runs-on': linuxRunner,
+      ...afterPickRunner,
+      'runs-on': linuxRunsOn,
       'timeout-minutes': 60,
       defaults: { run: { shell: 'bash' } },
       env: buildEnv,

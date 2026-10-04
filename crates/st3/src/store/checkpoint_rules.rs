@@ -16,9 +16,11 @@ use smallclaims::store::checkpoint_agreement::*;
 
 /// The rule engine's version. It is part of the rules digest, so nodes agree on a checkpoint only
 /// when they run the same rules. Version 5 leaves repaired originals out of the sealed set and
-/// proves on the sealed claims' blobs only, so a node on an earlier version seals different terms
-/// instead of verifying a different set or graph.
-pub const RULES_VERSION: u32 = 5;
+/// proves on the sealed claims' blobs only. Version 6 applies work extensions to the canonical
+/// graph and execution timing, so older builds seal different rules rather than publishing an
+/// incompatible one-time graph or reader verification under the same terms. Version 7 selects
+/// one initial definition when members independently create the same scheduled occurrence.
+pub const RULES_VERSION: u32 = 7;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -157,6 +159,7 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
         }
         // Limits are read as each seat's newest reading.
         "harness.limits" => Some((Rule::Newest, slot(&[]))),
+        "harness.todo.observed" => Some((Rule::Newest, slot(&[]))),
         // An observer records a resource's complete facts in every observation, so its newest
         // observation replaces the older ones. A repository observer records each item as its
         // own resource, so each item keeps its latest state. A version that a subscription request
@@ -811,7 +814,7 @@ pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128)
             "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
              WHERE claims.subject=?1 AND claims.kind IN (
                  'step-run.state','step-run.carried','work.claimed','work.renewed',
-                 'work.progress','work.submitted','work.failed','work.released')
+                 'work.progress','work.submitted','work.failed','work.released','work.extended')
              ORDER BY {CANONICAL_ORDER}"
         ))?
         .query_map([subject], claim_from_row)?

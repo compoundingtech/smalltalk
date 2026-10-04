@@ -10,14 +10,11 @@ import { agentGlyph, agentName, agentState, agentWord, harnessColor, harnessName
 import { Banners } from '../chrome';
 import rules from '../../../fixtures/clients/conversation-style.json';
 import { tokenColor, type ConversationRules } from '../conversationStyle';
-import { COLLAPSED_TOOL_LINES, conversationEntries, staleLine, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry, type MailImage } from '../conversationView';
+import { COLLAPSED_TOOL_LINES, conversationEntries, staleLine, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry, type MailImage, simplify, type SimpleRow, sessionPerson, applyConversation, applyOlderPage, isUnresolved, olderFailed, olderLoading, olderNote, type Conversation } from '@smalltalk/st3-views';
 import { addImages, fromDataUri, MAX_IMAGES, megabytes, picked, type Picked } from '../images';
 import { rememberBounded } from '../boundedCache';
-import { simplify, type SimpleRow } from '../conversationSimple';
 import { dictationAvailable, startDictation } from '../modules/st-dictation';
-import { sessionPerson } from '../homeView';
 import type { RootScreen } from '../navigation';
-import { applyConversation, applyOlderPage, isUnresolved, olderFailed, olderLoading, olderNote, type Conversation } from '../sessionView';
 import { useStore } from '../store';
 import { fonts, theme } from '../theme';
 import { Button, Field, LINE, Markdown, T } from '../ui';
@@ -127,6 +124,14 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     });
   }, [navigation, title, agent, status, actions]);
 
+  // st follows the session an agent had when the subscription started. After the agent restarts
+  // into a new session, subscribe again, once per new session, or this would keep showing the old
+  // one (and a message sent to the new one would never show up here).
+  const [followed, setFollowed] = useState<string | undefined>(undefined);
+  const currentSession = agent?.current_session_id ?? undefined;
+  useEffect(() => {
+    if (currentSession && timeline.sessionId && timeline.sessionId !== currentSession && followed !== currentSession) setFollowed(currentSession);
+  }, [currentSession, timeline.sessionId, followed]);
   // The socket sends the newest page, then each change; it never polls. Only while visible.
   useFocusEffect(useCallback(() => {
     if (!feed || unresolved) return;
@@ -142,7 +147,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       onIssue: setIssue,
     });
     return () => follow.close();
-  }, [feed, target, unresolved, conversationCache]));
+  }, [feed, target, unresolved, conversationCache, followed]));
 
   const names = useMemo(() => {
     const map = new Map(data.agents.map(candidate => [candidate.id, agentName(candidate)]));

@@ -8,6 +8,8 @@ use super::*;
 /// the graph for the caches its reads use.
 #[derive(Default)]
 pub struct SmalltalkRuntime {
+    #[cfg(test)]
+    pub(crate) work_extension_roots_rebuilt: std::sync::atomic::AtomicUsize,
     /// Simulate different build registries on isolated nodes in compatibility tests.
     #[cfg(test)]
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,
@@ -63,9 +65,19 @@ impl Runtime for SmalltalkRuntime {
                 "INSERT OR REPLACE INTO meta(key,value) VALUES('canonical_shared_projection_rules','2')",
                 [],
             )?;
+            if !work_extension_roots_tx(transaction)?.1 {
+                mark_work_extensions_projected_tx(transaction)?;
+            }
         } else {
             rebuild_derived_tables_once_tx(transaction)?;
+            let rebuilt = migrate_work_extension_projections_tx(transaction)?;
+            #[cfg(test)]
+            self.work_extension_roots_rebuilt
+                .store(rebuilt, Ordering::Relaxed);
+            #[cfg(not(test))]
+            let _ = rebuilt;
         }
+        migrate_occurrence_creation_projections_tx(transaction)?;
         Ok(())
     }
 
@@ -126,8 +138,9 @@ impl Runtime for SmalltalkRuntime {
         &self,
         transaction: &Transaction<'_>,
         origin: &str,
+        through: u64,
     ) -> Result<bool, St3Error> {
-        try_project_simple_replication_tx(transaction, origin)
+        try_project_simple_replication_tx(transaction, origin, through)
     }
 
     fn replay_from_nothing(&self, transaction: &Transaction<'_>) -> Result<(), St3Error> {
@@ -146,6 +159,15 @@ impl Runtime for SmalltalkRuntime {
             .unwrap_or_else(PoisonError::into_inner);
         cache.views.clear();
         cache.statuses.clear();
+        drop(cache);
+        self.agent_status_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.agent_resources_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     fn digest_tables(&self) -> &'static [(&'static str, &'static [&'static str])] {
@@ -184,7 +206,7 @@ impl Runtime for SmalltalkRuntime {
 
 /// The version of smalltalk's shared projection layout, beside the claim vocabulary. Nodes whose
 /// layouts differ keep exchanging claim authority but do not compare projection maps.
-const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.resources.v1";
+const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.schedule-occurrences.v1";
 
 /// The replication `schema_digest`: the claim vocabulary digest and the shared projection layout.
 pub(crate) fn compatibility_digest(registry_digest: &str) -> String {

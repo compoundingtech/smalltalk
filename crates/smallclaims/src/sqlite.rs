@@ -67,6 +67,9 @@ pub struct WriterGuard<'a> {
     pub committed_index: &'a AtomicU64,
     /// When profiling, when this thread took the writer.
     pub acquired: Option<std::time::Instant>,
+    /// The connection's changed-row count when it was lent, so the rows this thread changed are
+    /// noted for it when it gives the connection back; see `touched::writes`.
+    pub changes_at_lend: u64,
 }
 
 impl WriterConnection {
@@ -110,6 +113,7 @@ impl WriterConnection {
             .recv()
             .expect("the writer thread lends its connection");
         WriterGuard {
+            changes_at_lend: connection.total_changes(),
             connection: Some(connection),
             give_back,
             committed_index: &self.committed_index,
@@ -128,9 +132,29 @@ impl WriterConnection {
         debug_assert_no_pinned_read();
         let outcome = Mutex::new(None);
         let slot = &outcome;
+        let changed_rows = AtomicU64::new(0);
+        let changed = &changed_rows;
+        // The job runs on the writer thread; what it wrote is handed back to this one.
+        let capture = crate::touched::recording_wrote();
+        let wrote_rows = Mutex::new(Vec::new());
+        let wrote = &wrote_rows;
         let run: Box<dyn FnOnce(&Transaction<'_>) -> bool + Send + '_> = Box::new(move |tx| {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(tx)));
+            let before = tx.total_changes();
+            let (result, written) = if capture {
+                crate::touched::record_wrote(|| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(tx)))
+                })
+            } else {
+                (
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(tx))),
+                    Vec::new(),
+                )
+            };
             let succeeded = matches!(result, Ok(Ok(_)));
+            if succeeded {
+                changed.store(tx.total_changes().saturating_sub(before), Ordering::Relaxed);
+                *wrote.lock().unwrap_or_else(PoisonError::into_inner) = written;
+            }
             *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
             succeeded
         });
@@ -153,7 +177,16 @@ impl WriterConnection {
         let result = outcome.into_inner().unwrap_or_else(PoisonError::into_inner);
         match (result, committed) {
             (Some(Err(panic)), _) => std::panic::resume_unwind(panic),
-            (Some(Ok(result)), Ok(())) => Ok(result),
+            (Some(Ok(result)), Ok(())) => {
+                crate::touched::note_writes(changed_rows.load(Ordering::Relaxed));
+                for entry in wrote_rows
+                    .into_inner()
+                    .unwrap_or_else(PoisonError::into_inner)
+                {
+                    crate::touched::note_wrote(|| entry);
+                }
+                Ok(result)
+            }
             // The batch failed to begin or to commit, or failed before it ran this write.
             (_, Err(error)) => Err(error),
             (None, Ok(())) => Err("the writer answered a write it did not run".into()),
@@ -324,6 +357,11 @@ impl Drop for WriterGuard<'_> {
         if let Ok(index) = current_index(&connection) {
             self.committed_index.store(index, Ordering::Release);
         }
+        crate::touched::note_writes(
+            connection
+                .total_changes()
+                .saturating_sub(self.changes_at_lend),
+        );
         crate::profile::writer_released(self.acquired.take());
         let _ = self.give_back.send(connection);
     }
@@ -505,6 +543,124 @@ pub fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
     }
 }
 
+/// Record every statement `connection` runs: its time in the profile, and with `test-support`,
+/// its work in [`work`].
+pub fn observe(connection: &mut Connection) {
+    #[cfg(any(test, feature = "test-support"))]
+    work::count(connection);
+    connection.profile(Some(record_sqlite_time));
+}
+
+/// The work SQLite did for every statement this process ran, read from each statement's own
+/// counters as it finishes, so a test can see whether a request's work grows with the store.
+/// Timings vary from machine to machine; these counts do not.
+#[cfg(any(test, feature = "test-support"))]
+pub mod work {
+    use std::collections::BTreeMap;
+    use std::ffi::{c_int, c_uint, c_void};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, PoisonError};
+
+    use rusqlite::{Connection, ffi};
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct SqliteWork {
+        pub statements: u64,
+        /// Virtual machine instructions, which every row read, compared or written costs.
+        pub vm_steps: u64,
+        /// Steps forward through a table without an index.
+        pub fullscan_steps: u64,
+        /// Sorts SQLite ran because no index gave the order.
+        pub sorts: u64,
+        /// Rows put into indexes SQLite built for one statement because none existed.
+        pub autoindex_rows: u64,
+    }
+
+    impl std::ops::Sub for SqliteWork {
+        type Output = SqliteWork;
+
+        fn sub(self, before: SqliteWork) -> SqliteWork {
+            SqliteWork {
+                statements: self.statements - before.statements,
+                vm_steps: self.vm_steps - before.vm_steps,
+                fullscan_steps: self.fullscan_steps - before.fullscan_steps,
+                sorts: self.sorts - before.sorts,
+                autoindex_rows: self.autoindex_rows - before.autoindex_rows,
+            }
+        }
+    }
+
+    static STATEMENTS: AtomicU64 = AtomicU64::new(0);
+    static VM_STEPS: AtomicU64 = AtomicU64::new(0);
+    static FULLSCAN_STEPS: AtomicU64 = AtomicU64::new(0);
+    static SORTS: AtomicU64 = AtomicU64::new(0);
+    static AUTOINDEX_ROWS: AtomicU64 = AtomicU64::new(0);
+
+    /// Everything counted so far, in every connection of this process.
+    pub fn total() -> SqliteWork {
+        SqliteWork {
+            statements: STATEMENTS.load(Ordering::Relaxed),
+            vm_steps: VM_STEPS.load(Ordering::Relaxed),
+            fullscan_steps: FULLSCAN_STEPS.load(Ordering::Relaxed),
+            sorts: SORTS.load(Ordering::Relaxed),
+            autoindex_rows: AUTOINDEX_ROWS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Count `connection`'s statements. SQLite reports each one when it starts and when it
+    /// finishes, also when a trigger or a foreign-key check did the work inside it.
+    pub(super) fn count(connection: &Connection) {
+        // SAFETY: the callback only reads the statement's counters, and the handle stays valid
+        // for the connection's life, which ends the registration with it.
+        unsafe {
+            ffi::sqlite3_trace_v2(
+                connection.handle(),
+                (ffi::SQLITE_TRACE_STMT | ffi::SQLITE_TRACE_PROFILE) as c_uint,
+                Some(traced),
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    const COUNTERS: [c_int; 4] = [
+        ffi::SQLITE_STMTSTATUS_VM_STEP,
+        ffi::SQLITE_STMTSTATUS_FULLSCAN_STEP,
+        ffi::SQLITE_STMTSTATUS_SORT,
+        ffi::SQLITE_STMTSTATUS_AUTOINDEX,
+    ];
+
+    /// Each running statement's counters when it started. A statement's counters add up over
+    /// its runs until someone resets them, and tests read them too, so this never resets them.
+    static STARTED: Mutex<BTreeMap<usize, [u64; 4]>> = Mutex::new(BTreeMap::new());
+
+    unsafe extern "C" fn traced(
+        event: c_uint,
+        _context: *mut c_void,
+        statement: *mut c_void,
+        _detail: *mut c_void,
+    ) -> c_int {
+        let key = statement as usize;
+        let statement = statement.cast::<ffi::sqlite3_stmt>();
+        // SAFETY: SQLite passes the statement that started or finished.
+        let read = |counter: c_int| unsafe { ffi::sqlite3_stmt_status(statement, counter, 0) };
+        let now = COUNTERS.map(|counter| u64::try_from(read(counter)).unwrap_or(0));
+        let mut started = STARTED.lock().unwrap_or_else(PoisonError::into_inner);
+        if event == ffi::SQLITE_TRACE_STMT as c_uint {
+            // A trigger's start reports the statement again; the first start counts.
+            started.entry(key).or_insert(now);
+            return 0;
+        }
+        let before = started.remove(&key).unwrap_or([0; 4]);
+        let spent = |index: usize| now[index].saturating_sub(before[index]);
+        STATEMENTS.fetch_add(1, Ordering::Relaxed);
+        VM_STEPS.fetch_add(spent(0), Ordering::Relaxed);
+        FULLSCAN_STEPS.fetch_add(spent(1), Ordering::Relaxed);
+        SORTS.fetch_add(spent(2), Ordering::Relaxed);
+        AUTOINDEX_ROWS.fetch_add(spent(3), Ordering::Relaxed);
+        0
+    }
+}
+
 pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connection> {
     let flags = if shared_memory {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
@@ -513,7 +669,7 @@ pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connecti
     };
     let mut connection = Connection::open_with_flags(path, flags)
         .with_context(|| format!("open st read connection {}", path.display()))?;
-    connection.profile(Some(record_sqlite_time));
+    observe(&mut connection);
     connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     connection.execute_batch(
         "PRAGMA busy_timeout = 5000;

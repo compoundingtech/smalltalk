@@ -82,6 +82,62 @@ fn refuse_authored(argv: &[String], flags: &[&str]) -> Result<(), Refusal> {
     }
 }
 
+/// Refuse authored session selectors before a rollout can stop the incumbent.
+pub fn rollout_support(member: &crate::model::MemberSpec) -> Result<(), Refusal> {
+    if !member.terminal {
+        return Err(Refusal::new(
+            "unsupported-rollout",
+            "native rollout requires its PTY session",
+        ));
+    }
+    let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+        return Err(Refusal::new(
+            "unsupported-rollout",
+            "rollout needs a typed native harness launch",
+        ));
+    };
+    let provider = argv
+        .iter()
+        .position(|argument| argument == "--")
+        .map_or(argv.as_slice(), |index| &argv[index + 1..]);
+    match member.driver.as_deref() {
+        Some("claude") => refuse_authored(
+            provider,
+            &[
+                "-c",
+                "--continue",
+                "-r",
+                "--resume",
+                "--session-id",
+                "--fork-session",
+                "--from-pr",
+                "--teleport",
+            ],
+        ),
+        Some("pi" | "omp") => refuse_authored(
+            provider,
+            &[
+                "-c",
+                "--continue",
+                "-r",
+                "--resume",
+                "--session",
+                "--session-id",
+                "--fork",
+                "--no-session",
+            ],
+        ),
+        Some("opencode") => {
+            refuse_authored(provider, &["-c", "--continue", "-s", "--session", "--fork"])
+        }
+        Some("codex") => codex_check(provider, "rollout-preflight"),
+        _ => Err(Refusal::new(
+            "unsupported-rollout",
+            "rollout needs a supported native harness",
+        )),
+    }
+}
+
 fn insert_after_program(mut argv: Vec<String>, arguments: &[&str]) -> Vec<String> {
     argv.splice(1..1, arguments.iter().map(|item| (*item).to_owned()));
     argv

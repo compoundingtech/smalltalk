@@ -1,12 +1,15 @@
 # Smalltalk terminal client
 
-`stui` opens the new screens on the live graph (Home, Agents, Missions, Fleet, and a demo-only
-Worktrees tab). `stui --demo` shows them on invented data and sends nothing; `stui --old` opens
-the previous screens, described below, while they are retired. The screens follow
-[docs/clients/ui-contract.md](../../docs/clients/ui-contract.md), shared with the iOS app.
+`stui` opens spaces on the live graph: splits with their own tabs, each showing a conversation,
+a mission, a terminal, Home or usage. `stui --space NAME` opens a named space. `stui --demo`
+shows them on invented data and sends nothing. `stui --classic` keeps the layout from before
+spaces for now; it is going away ([#1166](https://github.com/compoundingtech/smalltalk/issues/1166)).
+The screens follow [docs/clients/ui-contract.md](../../docs/clients/ui-contract.md), shared with the
+iOS app.
 
 `stui` connects through the generated Rust `st3.client.v0` client, the same typed data boundary
-used by the CLI. It paints immediately, hydrates attention/agents/sessions first, then fills in
+used by the CLI. Its subscriptions, reconnects, snapshot model and cache come from
+[`st3-feed`](../st3-feed/README.md). It paints immediately, hydrates attention/agents/sessions first, then fills in
 mission and fleet details without blocking keys. A private, actor-and-endpoint-scoped read-only
 cache keeps the last snapshot visible while reconnecting. Actions still need a live connection
 and fresh fences; there is no offline mutation queue.
@@ -24,40 +27,15 @@ credentials, offline cache, and automatic reconnect. `--client` requires a saved
 `--local` selects the local daemon even when a pairing exists. While offline, stui keeps its last
 display, shows the last connection time, queues no mutations, and offers `r` to retry now.
 
-Keys: `1`–`5` switch Now, Chat, Control, Fleet, and Tree; arrow keys or a sidebar click select an item;
-the mouse wheel and PageUp/PageDown scroll the detail pane; `End` follows the newest Chat message;
-`h` or the History control opens Chat history and details, and its Load older pages control fetches more history;
-`s` hides the sidebar; `v` or the Select text control releases mouse capture for native terminal text
-selection (press `v` again to return); `i` shows connection details; `q` quits.
-Now cards show the available action keys. Choose an action, enter a reason for a review decision,
-then confirm with `y`; actions without a typed TUI flow are marked CLI. Chat shows recent received messages for the selected agent and
-bounded normalized history for its current session. It preserves message line breaks, simplifies Markdown headings, lists, quotes and code blocks, and hides known internal transcript markup across supported drivers. Running undeclared
-harness sessions discovered on the connected host also appear there and in Fleet. An exact native session offers `m` to import it into st3 after `y` confirmation; this stops the exact running process and resumes it under st3. Unresolved processes cannot be imported from the TUI. Their discovery refreshes every
-15 seconds even without a graph event. Discovery is local to the connected host, not a claim
-that unqueried machines have no undeclared sessions. Press `c` to compose for a managed agent
-and Enter to attach its available terminal. Declared agents follow their `under` relationships
-in the Chat tree, including st3 descendants under the st3 parent; undeclared sessions remain separate. Active work badges keep top-level agents' work visible. Control groups missions by blocked,
-waiting, running, standing, drafts, and archive. It shows progress for the latest run and the
-current step, owner, blockers, and next action in the detail pane. A `+` on progress means the
-bounded history did not include every step. System missions are hidden initially; `x` toggles them. In Control, `c` starts a
-new mission launch. During attach, the
-terminal receives every key except Ctrl+backslash, which detaches. The visible Return control
-can be focused by clicking it and activated with Enter. On terminals narrower than 66 columns,
-the sidebar hides automatically.
-
-Tree shows running mission steps, standing seat queues, unstarted missions, and agents grouped by
-host and seat kind. Select a run or standing seat and press Enter to inspect its steps or queue;
-Esc returns to the overview. The tree uses one bounded server projection and refreshes when
-relevant graph events arrive.
-
-Now contains only open attention addressed to the current person. Agent transcript text and
-unread messages do not become person attention. Resource lists stop after four pages of 50 items;
-the active conversation pages past status-only entries until it has twelve content entries or
-reaches four pages. Older loaded messages are shown in the History pane, which can fetch up to
-32 pages on demand. Recent messages load only for the selected agent.
-Event bursts refresh affected projections; a full refresh runs every two minutes. The
-event cursor is bounded and deduplicated; a
-cursor gap clears the cached timeline and reloads projections from a fresh capability cursor.
+Keys (`?` shows them all): `Ctrl+K` opens anything (agents, missions, machines, spaces, and what
+was said in conversations); `Tab` and `Shift+Tab` move between a split's tabs; `Alt+arrows` move
+between splits; `Ctrl+T`, `Ctrl+V`, `Ctrl+X` and `Ctrl+W` open a tab, split right or below, and
+close a tab; `Ctrl+S` shows the sidebar and `Ctrl+H` opens Home over the space; `Ctrl+Q` quits.
+In a conversation, letters type into its message box and commands are chords: `Ctrl+F` finds,
+`Ctrl+E` expands tool output, `Ctrl+P` simplifies, `Ctrl+D` shows the agent's details, `Ctrl+]`
+attaches the agent's terminal and `Ctrl+\` leaves it. A drag selects text in one pane and copies
+it on release. Scrolling to the top of a conversation loads the page before it. Home cards show
+their own keys; `y` confirms what a card asks, and Enter never does.
 
 Verification:
 
@@ -65,11 +43,15 @@ Verification:
 cargo test -p stui --locked
 cargo build -p stui --locked
 ST3_PERSON=person/<your-id> python3 crates/stui/tests/pty_smoke.py
-ST3_PERSON=person/<your-id> python3 crates/stui/tests/interaction_qa.py target/debug/stui
+ST3_PERSON=person/<your-id> python3 crates/stui/tests/interaction_qa.py target/debug/stui AGENT_NAME
+ST3_PERSON=person/<your-id> python3 crates/stui/tests/attachment_qa.py target/debug/stui AGENT_NAME
 ```
 
-The PTY smoke test needs a running local daemon. It checks first-frame and key-to-redraw latency,
-also against a deliberately stalled getter, plus alternate-screen restoration after normal exit,
-SIGTERM, a long-running PTY hangup, and a debug panic. For a packaged release binary, pass its path followed by `--no-panic`;
-the release build has no debug panic hook. Ignored live tests measure first data and full-snapshot
-latency.
+The PTY smoke test runs with or without a local daemon. It checks first-frame and key-to-redraw
+latency, also against a deliberately stalled getter, plus alternate-screen restoration after
+normal exit, SIGTERM, a long-running PTY hangup, and a debug panic. For a packaged release
+binary, pass its path followed by `--no-panic`; the release build has no debug panic hook. The two
+QA scripts need a live daemon and the `pty` executable: one opens an agent from `Ctrl+K`, scrolls
+it and drags to copy; the other attaches the agent's terminal and leaves it by `Ctrl+\` and by a
+click on its header. Use a person of their own (such as `person/<qa-name>`) so they mark nothing
+read for anyone.

@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -570,7 +570,7 @@ struct Node(Vec<Child>);
 impl Node {
     fn start(dir: &Path, path_dir: &Path) -> Self {
         let spawn = |args: &[&str], log: &str| {
-            Command::new(env!("CARGO_BIN_EXE_st3"))
+            st3::test_support::command(env!("CARGO_BIN_EXE_st3-fixture"))
                 .args(args)
                 .arg("--config")
                 .arg(dir.join("config.toml"))

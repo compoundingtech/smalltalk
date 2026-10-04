@@ -35,8 +35,21 @@ fleet_compat() {
 }
 
 clippy_and_codegen() {
-  cargo clippy --workspace --all-targets --locked
+  cargo clippy --workspace --all-targets --locked || return
+  # Workspace consumers enable drawing; check the standalone model separately.
+  cargo clippy -p st3-conversation-ui --no-default-features --all-targets --locked || return
   cargo run --locked -p st3-client-codegen -- --check
+}
+
+conversation_model() {
+  # A workspace build unifies stui/st's ratatui feature, which would hide model dependencies.
+  cargo test -p st3-conversation-ui --no-default-features --locked || return
+  local dependencies
+  dependencies=$(cargo tree -p st3-conversation-ui --no-default-features --locked -e normal --prefix none) || return
+  if [[ "$dependencies" == *ratatui* ]]; then
+    echo "the standalone conversation model must not depend on ratatui" >&2
+    return 1
+  fi
 }
 
 # Guard current products before any stage can report success.
@@ -46,8 +59,9 @@ python3 scripts/check-st-boundary
 start=$SECONDS status=0
 case "$stage" in
   # The nextest --no-run step already compiled the test executables.
-  tests) bash scripts/ci-nextest run --test-threads "$(nproc)" \
-    2>&1 | tee "$logs/$stage.log" || status=$? ;;
+  tests) {
+    conversation_model && bash scripts/ci-nextest run --test-threads "${CI_LOCAL_TEST_THREADS:-$(nproc)}"
+  } 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   clippy) clippy_and_codegen 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   fleet-compat) fleet_compat 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   *) echo "unknown stage: $stage" >&2; exit 2 ;;

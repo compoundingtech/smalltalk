@@ -44,7 +44,13 @@ struct Pending {
     effect: Effect,
     /// The exact request last sent; a retry repeats it so st can answer with the first result.
     sent: Arc<Mutex<Option<Sent>>>,
+    /// When it was last sent (or sent again): one st has not answered for a while is said to be
+    /// unconfirmed, so it can be sent again or cleared rather than wait forever.
+    since: Instant,
 }
+
+/// How long a message waits for st's answer before it says st has not confirmed it.
+const UNANSWERED_AFTER: Duration = Duration::from_secs(30);
 
 /// A message request as sent: st keys its receipt on the whole request.
 #[derive(Clone, Debug)]
@@ -249,6 +255,8 @@ pub fn run(context: Context) -> Result<()> {
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
     // The agent or session whose conversation the feed holds.
     let mut conversing: Vec<String> = Vec::new();
+    // The session each conversation was last subscribed again for, so it is asked once.
+    let mut resubscribed: BTreeMap<String, String> = BTreeMap::new();
     let mut preview_requested: HashSet<String> = HashSet::new();
     let mut body_requested: HashSet<String> = HashSet::new();
     let mut read_receipts = ReadReceipts::default();
@@ -267,9 +275,16 @@ pub fn run(context: Context) -> Result<()> {
         ui.flash(
             "The classic layout is going away: plain stui opens spaces, with Ctrl+S for this list",
         );
+    } else if std::env::args().any(|arg| arg == "--old") {
+        ui.flash("The old screens are gone: this is spaces, and ? shows its keys");
     }
 
     let _guard = Guard::enter(ui.glasses.is_some())?;
+    // The release smoke test's probe: the terminal is restored after a panic too.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("STUI_TEST_PANIC_AFTER_ENTER").is_some() {
+        panic!("terminal restoration probe");
+    }
     // How images are drawn: asked of a terminal known to draw them, once, inside the
     // alternate screen and before any event is read. A terminal that never answers would
     // leave the query reading stdin and swallow keys, so others get half blocks unasked.
@@ -290,6 +305,8 @@ pub fn run(context: Context) -> Result<()> {
     // Attaching a dropped terminal again: whether a try is out, and how many failed.
     let mut reattaching = false;
     let mut reattach_tries = 0_u32;
+    // The cursor shape last set, so it changes only when the attached terminal asks.
+    let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
     // The tab shown on the last pass: opening a tab loads what only it needs.
     let mut shown_tab = usize::MAX;
     // When usage was last asked for and over how many hours, and whether that read is out.
@@ -315,6 +332,7 @@ pub fn run(context: Context) -> Result<()> {
         }
         while let Ok(update) = incoming.try_recv() {
             match update {
+                feed::Update::GlassesVersion(version) => super::set_glasses_version(version),
                 feed::Update::Connected(member) => {
                     client = member;
                     extras.live = false;
@@ -480,6 +498,7 @@ pub fn run(context: Context) -> Result<()> {
                             Ok(id) => {
                                 entry.message_id = id;
                                 entry.failed = None;
+                                entry.unconfirmed = false;
                             }
                             Err((error, unconfirmed)) => {
                                 entry.failed = Some(error);
@@ -487,6 +506,18 @@ pub fn run(context: Context) -> Result<()> {
                             }
                         }
                     }
+                    // st took it. The copy here gives way once the conversation shows it, which
+                    // may already have happened; with no id to look for, at once.
+                    pending.retain(|entry| {
+                        entry.token != token
+                            || entry.failed.is_some()
+                            || entry.message_id.as_ref().is_some_and(|id| {
+                                !timelines
+                                    .values()
+                                    .flat_map(|timeline| &timeline.items)
+                                    .any(|item| matches!(&item.body, TimelineBody::Message(message) if &message.message_id == id))
+                            })
+                    });
                 }
                 Fetched::Preview(id, preview) => {
                     extras.previews.insert(id, preview);
@@ -715,6 +746,10 @@ pub fn run(context: Context) -> Result<()> {
             conversing = wanted;
             changed = true;
         }
+        changed |= mark_unanswered(&mut pending);
+        for target in moved_sessions(&conversing, &model, &timelines, &mut resubscribed) {
+            let _ = commands.send(Command::Resubscribe { target });
+        }
         if tab == 0
             && let Some(id) = selected.clone()
             && !preview_requested.contains(&id)
@@ -794,6 +829,7 @@ pub fn run(context: Context) -> Result<()> {
                 }
             });
         }
+        ui.read_open_update();
         let mut effects = Vec::new();
         for effect in std::mem::take(&mut ui.effects) {
             // A glass change is kept until st confirms it, and goes once st is reachable.
@@ -932,6 +968,7 @@ pub fn run(context: Context) -> Result<()> {
                     };
                     retry.failed = None;
                     retry.unconfirmed = false;
+                    retry.since = Instant::now();
                     changed = true;
                     (
                         retry.effect.clone(),
@@ -983,6 +1020,7 @@ pub fn run(context: Context) -> Result<()> {
                         unconfirmed: false,
                         effect: effect.clone(),
                         sent: sent.clone(),
+                        since: Instant::now(),
                     });
                     changed = true;
                     (effect, Some(token), Some(sent))
@@ -1049,6 +1087,16 @@ pub fn run(context: Context) -> Result<()> {
         ui.step_voice();
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui.render(frame))?;
+        // The attached terminal's cursor shape (vim's bar while inserting), and the person's
+        // own shape back once it is gone.
+        let style = ui.cursor_style();
+        if style != cursor_style {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                style.unwrap_or(crossterm::cursor::SetCursorStyle::DefaultUserShape)
+            );
+            cursor_style = style;
+        }
         execute!(io::stdout(), EndSynchronizedUpdate)?;
         let visible = ui.visible_messages();
         let incoming: HashSet<_> = timelines
@@ -1110,6 +1158,7 @@ pub fn run(context: Context) -> Result<()> {
         {
             reattach_tries = 0;
         }
+        ui.terminal_requests();
         // While an attached terminal's output flows, or voice listens, draw it as it comes.
         let flowing = ui.voice.is_some()
             || ui
@@ -1292,8 +1341,60 @@ async fn older_page(
     Err("this session is too long to read further back here; st conversations timeline reads it all".into())
 }
 
+/// Say of each message st has not answered for a while that it is unconfirmed, so the person
+/// can send it again (safely: the same request) or clear it, rather than watch it wait forever.
+fn mark_unanswered(pending: &mut [Pending]) -> bool {
+    let mut marked = false;
+    for entry in pending {
+        if entry.message_id.is_none()
+            && entry.failed.is_none()
+            && entry.since.elapsed() >= UNANSWERED_AFTER
+        {
+            entry.failed = Some("still waiting after 30 s".into());
+            entry.unconfirmed = true;
+            marked = true;
+        }
+    }
+    marked
+}
+
+/// The followed agents whose conversation shows a session they have since left: st resolves an
+/// agent to its session when a subscription starts, so after a restart that subscription keeps
+/// the old one (Nathan's message to a restarted seat sat at "sending…" because it landed in the
+/// new session, which his stui was not showing). Each is named once per new session.
+fn moved_sessions(
+    conversing: &[String],
+    model: &Model,
+    timelines: &BTreeMap<String, st3_conversation_ui::Timeline>,
+    resubscribed: &mut BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut moved = Vec::new();
+    for target in conversing {
+        let Some(current) = model
+            .agents()
+            .find(|agent| &agent.header.id == target)
+            .and_then(|agent| agent.current_session_id.clone())
+        else {
+            continue;
+        };
+        let shown = timelines
+            .get(target)
+            .and_then(|timeline| timeline.session_id.as_deref());
+        if shown.is_some_and(|shown| shown != current)
+            && resubscribed.get(target) != Some(&current)
+        {
+            resubscribed.insert(target.clone(), current);
+            moved.push(target.clone());
+        }
+    }
+    moved
+}
+
 /// The quiet line above a conversation's oldest entry: how to see more, that more is on its
 /// way, why it could not come, or that this is where the session starts.
+/// The entry above a conversation's oldest that says how far back it goes.
+pub(crate) const HISTORY_NOTE: &str = "history";
+
 fn history_note(timeline: &st3_conversation_ui::Timeline) -> Option<super::view::Entry> {
     use st3_conversation_ui::Body;
     let older = &timeline.older;
@@ -1309,7 +1410,7 @@ fn history_note(timeline: &st3_conversation_ui::Timeline) -> Option<super::view:
         "Start of this session · earlier ones: st conversations sessions".to_owned()
     };
     Some(super::view::Entry {
-        id: "history".into(),
+        id: HISTORY_NOTE.into(),
         at: String::new(),
         body: Body::Event(text),
     })
@@ -1490,6 +1591,7 @@ async fn perform(
                         workspace: None,
                         description: None,
                         message,
+                        ..Default::default()
                     },
                 )
                 .await?;
@@ -1517,7 +1619,13 @@ async fn perform(
             let Resource::Attention(attention) = &current.value else {
                 anyhow::bail!("This launch changed; look again");
             };
-            let launch = client.launches_get(&attention.source_id).await?;
+            let launch_id = attention.launch_id.as_deref().unwrap_or_else(|| {
+                attention
+                    .source_id
+                    .strip_prefix("planning-session/")
+                    .unwrap_or(&attention.source_id)
+            });
+            let launch = client.launches_get(launch_id).await?;
             let Resource::Launch(resource) = launch.value else {
                 anyhow::bail!("The launch is gone");
             };
@@ -1844,6 +1952,280 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn live_sends_retries_discussions_and_creation_survive_daemon_restarts() {
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("daemon.sock");
+        async fn serve(
+            root: &std::path::Path,
+            socket: &std::path::Path,
+        ) -> (Arc<st3::store::Store>, tokio::task::JoinHandle<()>) {
+            let store =
+                Arc::new(st3::store::Store::open(&root.join("graph.db"), "ui-actions").unwrap());
+            let state = st3::api::AppState {
+                store: store.clone(),
+                notify: Arc::new(tokio::sync::Notify::new()),
+                event_notify: tokio::sync::watch::channel(0_u64).0,
+                node: "ui-actions".into(),
+                state_dir: root.into(),
+                pty_root: root.join("pty"),
+                pty_binary: "pty".into(),
+                fleet_id: None,
+                configured_peers: vec![],
+                client_relay: None,
+                native_session_home: None,
+                planner_default: Default::default(),
+            };
+            let path = socket.to_owned();
+            let server = tokio::spawn(async move {
+                st3::api::serve_unix(&path, st3::api::router(state))
+                    .await
+                    .unwrap();
+            });
+            for _ in 0..100 {
+                if socket.exists() {
+                    Client::unix_as(socket, "person/avery")
+                        .capabilities()
+                        .await
+                        .unwrap();
+                    return (store, server);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("private UI daemon did not listen");
+        }
+        let (mut store, mut server) = serve(root.path(), &socket).await;
+        let client = Client::unix_as(&socket, "person/avery");
+        let model = Model::default();
+        let image = root.path().join("copper.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nproof").unwrap();
+        let sent = Mutex::new(None);
+        let send = Effect::Send {
+            agent: "agent/example/worker".into(),
+            text: "Copper proof".into(),
+            tags: vec![],
+            images: vec![image],
+        };
+        let (_, message) = perform(&client, "person/avery", &model, send.clone(), Some(&sent))
+            .await
+            .unwrap();
+        let message = message.unwrap();
+        assert_eq!(
+            store.message(&message).unwrap().unwrap().attachments.len(),
+            1
+        );
+        let index = store.index().unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        std::fs::remove_file(&socket).unwrap();
+        (store, server) = serve(root.path(), &socket).await;
+        // This is the live loop's resend path: replay the preserved request first.
+        let replay = send_message(
+            &client,
+            "agent/example/worker",
+            "Copper proof".into(),
+            None,
+            None,
+            None,
+            vec![],
+            store
+                .message(&message)
+                .unwrap()
+                .unwrap()
+                .attachments
+                .iter()
+                .map(|a| st3_client::AttachmentInput {
+                    blob: format!("blob/{}", a.sha256),
+                    media_type: a.media_type.clone(),
+                    name: a.name.clone(),
+                })
+                .collect(),
+            Some(&sent),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.as_deref(), Some(message.as_str()));
+        assert_eq!(store.index().unwrap(), index);
+        for effect in [
+            Effect::Discuss {
+                to: "agent/example/worker".into(),
+                title: "Copper discussion".into(),
+                text: "Record the evidence".into(),
+            },
+            Effect::CreateAgent {
+                name: "example/copper".into(),
+                harness: "claude".into(),
+                model: None,
+                effort: None,
+                host: None,
+                message: None,
+            },
+            Effect::CreateTerminal {
+                name: "Copper shell".into(),
+            },
+            Effect::CreateLaunch {
+                title: "Copper launch".into(),
+                request: "Prepare the copper proof".into(),
+                mission: "mission/example/copper".into(),
+                workspace: root.path().display().to_string(),
+            },
+        ] {
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+            std::fs::remove_file(&socket).unwrap();
+            (store, server) = serve(root.path(), &socket).await;
+            perform(&client, "person/avery", &model, effect, None)
+                .await
+                .unwrap();
+        }
+        assert!(
+            store
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .any(|item| item.subject == "agent/example/copper")
+        );
+        assert_eq!(store.planning_sessions(true).unwrap().len(), 1);
+        let launch = store.planning_sessions(true).unwrap().pop().unwrap();
+        let transport = st3::client::Client::unix_as(&socket, "person/avery").unwrap();
+        let _: serde_json::Value = transport.post(&format!("/v1/launches/{}/variants/default/submit", launch.id), &st3::model::PlanningCandidateSubmitRequest {
+            actor: launch.planner.clone(), markdown: b"Copper proof".to_vec(),
+            kdl: b"version 2\nmission \"example/copper\" state=\"ready\" { goal \"Record the copper proof.\"; step \"proof\" { agentless } }\n".to_vec(),
+            idempotency_key: "ui-prepare-candidate".into(),
+        }).await.unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        std::fs::remove_file(&socket).unwrap();
+        (store, server) = serve(root.path(), &socket).await;
+        let attention: serde_json::Value = transport.get("/v1/client/attention").await.unwrap();
+        let review = attention["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["source_id"] == launch.subject)
+            .unwrap();
+        perform(
+            &client,
+            "person/avery",
+            &model,
+            Effect::LaunchRevise {
+                id: review["id"].as_str().unwrap().into(),
+                feedback: "Name the copper evidence".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.planning_session(&launch.id).unwrap().unwrap().status,
+            "revision-requested"
+        );
+        let challenge: serde_json::Value = transport.post("/v1/client/pairings", &serde_json::json!({"api_version": "st3.client.v0", "device_name": "Copper phone", "person_id": "person/avery", "full_control": true})).await.unwrap();
+        let paired: serde_json::Value = transport.post(&format!("/v1/client/pairings/{}/complete", challenge["pairing_id"].as_str().unwrap().trim_start_matches("pairing/")), &serde_json::json!({"api_version": "st3.client.v0", "code": challenge["code"], "device_public_key": "copper-phone-key-000000000000000000000000"})).await.unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        std::fs::remove_file(&socket).unwrap();
+        (store, server) = serve(root.path(), &socket).await;
+        perform(
+            &client,
+            "person/avery",
+            &model,
+            Effect::RevokeDevice {
+                id: paired["device_id"].as_str().unwrap().into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            Client::unix_gateway(&socket, paired["credential"].as_str().unwrap())
+                .capabilities()
+                .await
+                .is_err()
+        );
+        // A retired/changed Home message card cannot accidentally send a reply.
+        let index = store.index().unwrap();
+        assert!(
+            perform(
+                &client,
+                "person/avery",
+                &model,
+                Effect::Reply {
+                    id: "attention/absent-card".into(),
+                    to: "agent/example/worker".into(),
+                    text: "Copper reply".into()
+                },
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(store.index().unwrap(), index);
+        let source = "version 2\nmission \"example/cancel\" state=\"ready\" { goal \"Record the proof.\"; step \"proof\" { agentless } }\n";
+        let intent = st3::parse_intent(source, "ui-actions").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                st3::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "ui-cancel-definition",
+                Some("person/avery"),
+            )
+            .unwrap();
+        let run = store
+            .create_mission_run(&st3::model::MissionRunRequest {
+                mission: "example/cancel".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/avery".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "ui-cancel-run".into(),
+            })
+            .unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        std::fs::remove_file(&socket).unwrap();
+        (store, server) = serve(root.path(), &socket).await;
+        // The missions as st lists them, as the feed would bring them.
+        let mut current = Model::default();
+        current.missions.items = client
+            .missions_list(None, Some(100), false)
+            .await
+            .unwrap()
+            .value
+            .items;
+        perform(
+            &client,
+            "person/avery",
+            &current,
+            Effect::CancelRun {
+                mission: "mission/example/cancel".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .step_run(&run.steps[0].subject)
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        server.abort();
+    }
 
     /// A stale fence is retried for an action that reads a fresh one each try, but not for an
     /// attention action: it already moved once to its source's current card. A busy or absent
@@ -2200,6 +2582,69 @@ mod tests {
             ..Default::default()
         };
         assert!(note(timeline).starts_with("Start of this session"));
+    }
+
+    #[test]
+    fn a_restarted_agents_conversation_follows_its_new_session_once() {
+        let target = "agent/example/harbor/keeper".to_owned();
+        let mut model = Model::default();
+        model.agents.items.push(
+            serde_json::from_str(r#"{"kind":"agent","id":"agent/example/harbor/keeper","revision":"a","updated_at":"2026-10-03T08:28:00Z","name":"Keeper","state":"running","reachability":"reachable","current_session_id":"session/new"}"#)
+                .unwrap(),
+        );
+        let mut timelines = BTreeMap::new();
+        let mut timeline = st3_conversation_ui::Timeline::default();
+        timeline.apply(st3_conversation_ui::Frame {
+            replace: true,
+            session_id: Some("session/old".into()),
+            ..Default::default()
+        });
+        timelines.insert(target.clone(), timeline);
+        let mut asked = BTreeMap::new();
+        let conversing = [target.clone()];
+        assert_eq!(
+            moved_sessions(&conversing, &model, &timelines, &mut asked),
+            [target.clone()]
+        );
+        // Asked once for that session, not on every pass.
+        assert!(moved_sessions(&conversing, &model, &timelines, &mut asked).is_empty());
+        // Once the conversation shows the new session, nothing more is asked.
+        timelines.get_mut(&target).unwrap().apply(st3_conversation_ui::Frame {
+            replace: true,
+            session_id: Some("session/new".into()),
+            ..Default::default()
+        });
+        asked.clear();
+        assert!(moved_sessions(&conversing, &model, &timelines, &mut asked).is_empty());
+    }
+
+    #[test]
+    fn a_message_st_has_not_answered_becomes_unconfirmed_so_it_can_go_again() {
+        let pending = |since: Instant| Pending {
+            token: "t".into(),
+            agent: "agent/example/cos".into(),
+            text: "hello".into(),
+            at: "10:29".into(),
+            message_id: None,
+            failed: None,
+            unconfirmed: false,
+            effect: Effect::Send {
+                agent: "agent/example/cos".into(),
+                text: "hello".into(),
+                tags: Vec::new(),
+                images: Vec::new(),
+            },
+            sent: Arc::new(Mutex::new(None)),
+            since,
+        };
+        let mut fresh = [pending(Instant::now())];
+        assert!(!mark_unanswered(&mut fresh));
+        assert!(fresh[0].failed.is_none());
+        let mut waiting = [pending(Instant::now() - UNANSWERED_AFTER)];
+        assert!(mark_unanswered(&mut waiting));
+        assert!(waiting[0].unconfirmed && waiting[0].failed.is_some());
+        // Said once.
+        assert!(!mark_unanswered(&mut waiting));
     }
 
     fn fixture_screen() -> st3_client::TerminalScreen {

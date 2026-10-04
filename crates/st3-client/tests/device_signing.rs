@@ -258,6 +258,43 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
     );
     let client = Client::fabric_loopback(&base, &paired.credential);
 
+    // A device paired only to read gets no signing key.
+    let viewer = Device::new();
+    let limited = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Hall display".into(),
+            person_id: PERSON.into(),
+            full_control: None,
+        })
+        .await
+        .unwrap();
+    let display = Client::fabric_pairing(&base)
+        .pairing_complete(
+            &limited.value.pairing_id,
+            &PairingComplete {
+                api_version: st3_client::API_VERSION.into(),
+                code: limited.value.code,
+                device_public_key: viewer.public(),
+                key_storage: None,
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    assert!(
+        display.device_key_chain.is_empty(),
+        "a read-only device signs nothing"
+    );
+    assert!(
+        state
+            .store
+            .claims_for(PERSON, Some(smallclaims::principal::KEY_GRANTED))
+            .unwrap()
+            .iter()
+            .all(|grant| grant.body["fields"]["key"] != viewer.public())
+    );
+
     // A signed message is written with the phone's signature, and every member verifies it.
     let signature = phone.sign_message(
         &chain,
@@ -371,7 +408,16 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
         "nonce-phone-send-4",
         now_ms() - 60 * 60 * 1000,
     );
-    let message = refused(send(&client, "phone-message-send-4", "agent/alder", "late", stale).await);
+    let message = refused(
+        send(
+            &client,
+            "phone-message-send-4",
+            "agent/alder",
+            "late",
+            stale,
+        )
+        .await,
+    );
     assert!(message.contains("15 minutes"), "{message}");
     let loose = phone.sign_message(
         &chain,

@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -209,7 +209,7 @@ fn seat_driver(root: &Path, socket: &Path, index: usize) -> Child {
         std::fs::create_dir_all(root.join(directory)).unwrap();
     }
     let (runtime_id, _) = seat(index);
-    Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+    st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         // Its own process group, so stopping the seat also stops the stand-in provider.
         .process_group(0)
         .current_dir(root.join("workspace"))

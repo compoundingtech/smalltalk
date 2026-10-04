@@ -123,6 +123,7 @@ fn usage_limits() -> Vec<st3_client::UsageLimit> {
     vec![
         st3_client::UsageLimit {
             account: s("anthropic"),
+            account_ref: None,
             driver: s("claude"),
             plan: Some(s("max")),
             five_hour_percent: Some(41.0),
@@ -136,6 +137,7 @@ fn usage_limits() -> Vec<st3_client::UsageLimit> {
         },
         st3_client::UsageLimit {
             account: s("openai"),
+            account_ref: None,
             driver: s("codex"),
             plan: None,
             five_hour_percent: None,
@@ -660,6 +662,8 @@ fn step(
     note: Option<&str>,
 ) -> Step {
     Step {
+        id: format!("step-run/demo/{name}"),
+        seat: owner.map(s),
         name: s(name),
         state,
         owner: owner.map(s),

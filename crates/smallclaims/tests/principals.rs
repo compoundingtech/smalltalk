@@ -439,6 +439,154 @@ fn a_restart_keeps_the_keys_and_rebuilds_the_same_verdicts() {
     );
 }
 
+#[test]
+fn founding_does_not_rewrite_already_sealed_unsigned_delegations() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let path = smallclaims::fleet::join::store_path(root);
+    let (existing, envelopes) = {
+        let store = Store::open(&path, "studio", Arc::new(Plain)).unwrap();
+        store
+            .set_node_key(Arc::new(
+                smallclaims::fleet::join::standalone_node_key(root).unwrap(),
+            ))
+            .unwrap();
+        store
+            .use_key_directory(&smallclaims::fleet::join::key_directory(root))
+            .unwrap();
+        let existing = note(
+            &store,
+            Some("agent/garden/worker"),
+            "already affected history",
+        );
+        // Reproduce the old startup's irreversible unsigned sealing, with the held keys
+        // still on disk. Activation may sign envelopes, but cannot rewrite their payloads.
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        smallclaims::store::seed_replica_envelopes_tx(&transaction, "studio", None).unwrap();
+        transaction.commit().unwrap();
+        let envelopes = connection
+            .prepare("SELECT envelope_hash,CAST(payload AS BLOB) FROM replica_envelopes ORDER BY sequence")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        (existing, envelopes)
+    };
+    smallclaims::fleet::join::found(root, "studio", &Default::default()).unwrap();
+    let file = smallclaims::fleet::FleetFile::load(root).unwrap().unwrap();
+    let store = Store::open(&path, "studio", Arc::new(Plain)).unwrap();
+    smallclaims::fleet::activate(&store, root, &file).unwrap();
+    let next = note(
+        &store,
+        Some("agent/garden/worker"),
+        "after affected history",
+    );
+    seal(&store);
+    assert_eq!(verdict(&store, &existing), Verdict::Unsigned);
+    assert!(matches!(verdict(&store, &next), Verdict::Invalid(reason)
+        if reason.starts_with("delegation ") && reason.ends_with(" is unsigned")));
+    assert!(store.claim_verdict_counts().unwrap()["unsigned"] > 0);
+    let connection = store.readers.get();
+    for (hash, payload) in envelopes {
+        let current: Vec<u8> = connection
+            .query_row(
+                "SELECT CAST(payload AS BLOB) FROM replica_envelopes WHERE envelope_hash=?1",
+                [&hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, payload, "immutable affected envelope {hash}");
+    }
+}
+
+#[test]
+fn a_populated_standalone_store_founds_a_fleet_without_losing_unsealed_delegations() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let path = smallclaims::fleet::join::store_path(root);
+    let keys = smallclaims::fleet::join::key_directory(root);
+    let node_key = Arc::new(smallclaims::fleet::join::standalone_node_key(root).unwrap());
+    let existing = {
+        let store = Store::open(&path, "studio", Arc::new(Plain)).unwrap();
+        store.set_node_key(node_key.clone()).unwrap();
+        store.use_key_directory(&keys).unwrap();
+        let person = note(&store, Some("person/ada"), "before founding");
+        let agent = note(
+            &store,
+            Some("agent/garden/worker"),
+            "live seat before founding",
+        );
+        // No replication exchange or checkpoint has sealed this recent work yet.
+        assert!(store.claim_signature(&agent.id).unwrap().is_none());
+        [person, agent]
+    };
+    let founded = smallclaims::fleet::join::found(
+        root,
+        "studio",
+        &smallclaims::fleet::join::MemberSettings {
+            transports: Some(Vec::new()),
+            advertise_loopback: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(founded.anchor_key, node_key.public());
+    let file = smallclaims::fleet::FleetFile::load(root).unwrap().unwrap();
+    let store = Store::open(&path, "studio", Arc::new(Plain)).unwrap();
+    // Fleet activation itself must restore the held keys before it seals old work.
+    smallclaims::fleet::activate(&store, root, &file).unwrap();
+    let person = note(&store, Some("person/ada"), "after founding");
+    let agent = note(
+        &store,
+        Some("agent/garden/worker"),
+        "live seat after founding",
+    );
+    seal(&store);
+    for claim in existing.iter().chain([&person, &agent]) {
+        assert_eq!(verdict(&store, claim), Verdict::Verified, "{}", claim.id);
+    }
+    let peer = Store::open_memory("beacon", Arc::new(Plain)).unwrap();
+    peer.bind_fleet(&founded.fleet_id).unwrap();
+    peer.pin_fleet_anchor(&founded.anchor_key).unwrap();
+    let exchange = store
+        .export_replication_exchange_answering(
+            &founded.fleet_id,
+            &peer.replication_inventory().unwrap(),
+            &peer.replication_signature_requests().unwrap(),
+        )
+        .unwrap();
+    peer.receive_replication_exchange("studio", &founded.fleet_id, &exchange)
+        .unwrap();
+    peer.validate_replication_backlog().unwrap();
+    peer.project_replication_backlog().unwrap();
+    for claim in existing.iter().chain([&person, &agent]) {
+        assert_eq!(
+            verdict(&peer, claim),
+            Verdict::Verified,
+            "peer {}",
+            claim.id
+        );
+    }
+    drop(store);
+    let restarted = Store::open(&path, "studio", Arc::new(Plain)).unwrap();
+    smallclaims::fleet::activate(&restarted, root, &file).unwrap();
+    let next = note(
+        &restarted,
+        Some("agent/garden/worker"),
+        "live seat after another restart",
+    );
+    seal(&restarted);
+    assert_eq!(verdict(&restarted, &next), Verdict::Verified);
+    assert_eq!(
+        restarted.claim_signature(&agent.id).unwrap().unwrap().key,
+        restarted.claim_signature(&next.id).unwrap().unwrap().key
+    );
+}
+
 /// Deterministic shuffles without a dependency.
 fn shuffled<T: Clone>(items: &[T], mut seed: u64) -> Vec<T> {
     let mut items = items.to_vec();

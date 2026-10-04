@@ -157,6 +157,8 @@ struct Record {
     /// Absent in records from writers predating the axis, which defaults to `none`.
     #[serde(default)]
     ask: Ask,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    background_jobs: Option<u64>,
     /// Diagnostic only. No consumer branches on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
@@ -205,6 +207,7 @@ pub struct Observation {
     pub blocked_on: BlockedOn,
     pub input_buffer: InputBuffer,
     pub ask: Ask,
+    pub background_jobs: Option<u64>,
     pub reason: Option<String>,
     pub exit: Option<String>,
 }
@@ -216,6 +219,7 @@ impl Observation {
             blocked_on,
             input_buffer,
             ask: Ask::None,
+            background_jobs: None,
             reason: None,
             exit: None,
         }
@@ -434,6 +438,7 @@ impl Writer {
                     && current.blocked_on == observation.blocked_on
                     && current.input_buffer == observation.input_buffer
                     && current.ask == observation.ask
+                    && current.background_jobs == observation.background_jobs
                     && current.reason == observation.reason
                     && current.exit == observation.exit
             });
@@ -475,6 +480,7 @@ impl Writer {
             blocked_on: observation.blocked_on,
             input_buffer: observation.input_buffer,
             ask: observation.ask,
+            background_jobs: observation.background_jobs,
             reason: observation.reason,
             exit: observation.exit,
             pty_session: self.pty_session.clone(),
@@ -543,6 +549,7 @@ pub struct Observed {
     pub blocked_on: BlockedOn,
     pub input_buffer: InputBuffer,
     pub ask: Ask,
+    pub background_jobs: Option<u64>,
     pub harness: Option<String>,
     pub since_ms: Option<u64>,
     /// When the owning driver last refreshed this evidence.
@@ -566,6 +573,7 @@ impl Observed {
             blocked_on: BlockedOn::Unknown,
             input_buffer: InputBuffer::Unknown,
             ask: Ask::Unknown,
+            background_jobs: None,
             harness,
             since_ms: None,
             observed_at_ms: None,
@@ -668,6 +676,7 @@ pub fn read_raw_at(
         blocked_on: record.blocked_on,
         input_buffer: record.input_buffer,
         ask: record.ask,
+        background_jobs: record.background_jobs,
         harness,
         since_ms: Some(record.since_ms),
         observed_at_ms: Some(record.written_at_ms),
@@ -862,6 +871,7 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
         blocked_on: BlockedOn::None,
         input_buffer: InputBuffer::Unknown,
         ask: Ask::None,
+        background_jobs: None,
         reason: Some("superseded".to_string()),
         exit: None,
         pty_session: None,
@@ -1284,6 +1294,7 @@ mod tests {
                 blocked_on: BlockedOn::None,
                 input_buffer: InputBuffer::Unknown,
                 ask: Ask::None,
+                background_jobs: None,
                 reason: None,
                 exit: None,
                 pty_session: None,
@@ -1490,6 +1501,7 @@ mod tests {
             blocked_on: BlockedOn::None,
             input_buffer: InputBuffer::Unknown,
             ask: Ask::None,
+            background_jobs: None,
             reason: None,
             exit: None,
             pty_session: Some("worker".to_string()),
@@ -2271,5 +2283,23 @@ mod tests {
         );
         drop(held);
         assert!(probe(), "dropping the guard must release the record lock");
+    }
+}
+
+#[cfg(test)]
+mod background_job_tests {
+    use super::*;
+
+    #[test]
+    fn background_job_count_changes_survive_the_owned_record_and_heartbeat() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = Writer::new(root.path(), "example.worker", "omp", Some("fixture".into()));
+        for jobs in [Some(2), Some(0), None] {
+            let mut observation = Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Empty);
+            observation.background_jobs = jobs;
+            writer.observe(observation).unwrap();
+            writer.heartbeat().unwrap();
+            assert_eq!(read(&harness_state_path(root.path()), None).unwrap().background_jobs, jobs);
+        }
     }
 }

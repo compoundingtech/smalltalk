@@ -9,12 +9,13 @@ checks for that PR; macOS checks on PRs require the `macos-ci` label.
 
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
 (`.github/workflows/macos.yml`) replace the fleet's former Linux `st/ci` and optional `st/ci-macos`
-execution. The required checks on `main` are `linux-gate`, `isolation-vm` and `genie-freshness`,
+execution. The required checks on `main` are `linux-gate`, `isolation-vm`, `genie-freshness` and
+`typescript-client`,
 and `main` lands through GitHub's merge queue (see [Merge queue](#merge-queue)).
 
-Every pull request, including a fork and a draft, gets the Linux gate, the isolation VM and the
-freshness check. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
-the three required checks for each queued entry.
+Every pull request, including a fork and a draft, gets the Linux gate, the isolation VM, the
+freshness check and the TypeScript client check. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
+the required checks for each queued entry.
 Checkout uses GitHub's default `pull_request` merge ref, not the contributor's unmerged
 head: it tests that head merged with the current base. Strict branch protection also requires
 that the head itself contain the latest `main`. No `pull_request_target` job runs PR code,
@@ -22,9 +23,11 @@ and the gate has only `contents: read` permission. Forks do not receive publishi
 
 The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
 `linux-gate` is the single required check: it needs the three jobs and passes only when every one of
-them succeeded (a skipped or cancelled stage fails it). The stage jobs use the Namespace shape
-`nscloud-ubuntu-24.04-amd64-16x32` (16 vCPUs, 32 GB); `genie-freshness`, `isolation-vm` and the
-`linux-gate` aggregate use `namespace-profile-linux-x86-64`. `scripts/ci-linux STAGE` runs one stage:
+them succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
+`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm`, `typescript-client` and the `linux-gate`
+aggregate use `namespace-profile-linux-x86-64`. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
+until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
+limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
 
 - `linux-tests`: prepares the provider component fixtures, installs matching rendered st2 hooks,
   builds the selected test executables with dev/test debug info and incremental compilation
@@ -65,6 +68,19 @@ retry twice with fixed 30-second delays; a retry pass is reported as flaky, not 
 Each run isolates test `HOME` and XDG state. The summary records the tested SHA,
 each stage's elapsed time, result and exit code; each stage job uploads `<job>-logs` with its log and `.time` file.
 Nextest's final summary retains flaky outcomes.
+
+st3 integration fixtures use the separate `st3-fixture` executable, built automatically by
+the test-only `test-support` dev dependency. It captures an isolated Bash environment,
+reads only the fixture HOME's `.bash_profile`, preserves the fixture PATH, and ignores the
+launching seat's process ancestry. The production `st3` target has no runtime flag or
+environment variable that enables this behavior, even if the executable is renamed.
+Fixture command helpers clear inherited `ST_AGENT`/`ST3_*`; temporary-repository Git helpers
+isolate global/system config, hooks, signing and author identity on each command. Real
+repository commits keep the host's Git policy. Run the same suite from an agent seat with
+`nix develop --command cargo nextest run -p st3 --locked --profile ci --retries 0`.
+Boot, delivery-probe and messaging-fault fixtures put large executable copies in Cargo's target scratch
+directory, keeping their Unix sockets in short temporary paths. This avoids exhausting a
+host's temporary-filesystem quota when debug binaries are copied by parallel cases.
 
 The workspace suite still covers the token-free two-node messaging fault matrix. Its historical
 channel build remains independently pinned in `.github/messaging-compat-baseline.json`. Its
@@ -163,6 +179,24 @@ image does not boot. They run in a NixOS VM (`nix/transport-isolation-vm.nix`) i
 The VM requires all three tests to run and pass, with no isolation opt-out. The job summary
 records the KVM probe and each phase's elapsed time.
 
+### TypeScript client
+
+`typescript-client` runs on every PR, merge-group entry and main push. It installs Node 24.18.0
+(the workspace uses Node 24), the client's pinned TypeScript 6.0.3 and
+`effect@4.0.0-rc.118` development dependencies from its own lockfile. Both `node_modules`
+directories are cached together, keyed by both lockfiles and the Node version; a miss runs `npm ci --ignore-scripts` in each package.
+The lockfile fingerprint uses `sha256sum` in Bash so ci1's Nix runner needs no Node 20
+`hashFiles` helper when it evaluates the cache key.
+
+The client package's `npm test` runs the contract and schema tests with `node --test`;
+`npm run typecheck` runs its strict compiler checks. CI installs and checks the client before
+installing the iOS dependencies for the separate project typecheck.
+`bash scripts/ci-typescript-client` runs the client commands and `tsc --noEmit -p apps/ios` locally
+when both packages' dependencies are installed.
+The iOS project allows explicit TypeScript import extensions for generated-client consumers.
+The main ruleset requires `typescript-client`. It was enabled after the new job passed on main
+in [#1256](https://github.com/compoundingtech/smalltalk/pull/1256).
+
 ### macOS
 
 The non-required `macos-ci` job uses `namespace-profile-macos-arm64` and runs on PR events while
@@ -175,10 +209,109 @@ reusing the fleet's long-lived target lanes and macOS debug-object cleanup polic
 
 Namespace runs these jobs through its GitHub App. If the app loses access to this repository, or
 the profile has no capacity, jobs queue with no matching runner. A queued required check is not
-a pass. Do not silently fall back to hosted or fleet runners.
+a pass. Apart from the ci1 choice below, which is made once per run before any job starts, do not
+fall back to hosted or fleet runners.
+
+### ci1: our own runners, with Namespace as overflow
+
+ci1 is a dedicated machine of ours that runs GitHub self-hosted runners for this repository, with
+warm caches kept on the machine. GitHub has no overflow between runner labels, so `Workspace CI`
+starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
+through the API and picks one pool for the whole run:
+
+- `ci1` when at least `CI1_MIN_IDLE` (default 5, the jobs a run starts at once) runners with that
+  label are online and idle; merge-group runs ask for `ci1-merge`, which a runner reserved for the
+  merge queue also carries, so queued merges never wait behind pull request pushes;
+- Namespace otherwise, exactly as above: when ci1 is busy or offline, when the runner list is
+  unavailable, and always for a pull request from a fork. The repository is public and a self-hosted
+  runner runs whatever a job asks, so fork code never reaches ci1 (and forks receive no secrets).
+
+Every other job's `runs-on` reads `pick-runner`'s output and falls back to its Namespace label when
+the output is empty. The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
+names its three stages instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
+Two runs that pick at the same moment can both choose ci1; the later run's jobs then wait for
+runners on ci1.
+
+The switch is the repository variable `CI1_RUNNERS`: unset (the default), `pick-runner` is skipped
+and every run goes to Namespace with no extra job. `on` turns the choice on, and unsetting it turns
+it off again without a pull request. `pick-runner` reads the runners with the
+`CI1_RUNNERS_READ_TOKEN` secret, a token that may only read the organization's self-hosted runners;
+without it every run goes to Namespace.
+
+On ci1 each runner is ephemeral: it takes one job, runs it as its own user in a fresh work directory
+with its own `/tmp`, and nothing the job started outlives it. The runner names a Cargo home in
+`CI_LOCAL_CARGO_HOME`; the stage jobs then skip the `actions/cache` restores and the local Nix
+cache, use that Cargo home, and Cargo keeps its intermediate build files in a per-runner build
+directory, while sccache shares compiled crates between all runners and the Nix store is the
+machine's own. The machine's configuration lives in the private network repository.
+Initial Cargo build and nextest concurrency on ci1 is four threads per runner, with a 14 GiB
+per-job memory limit; tune those limits from measured runs on the machine.
 
 `CI_RUN_ID` keeps the messaging-fault evidence under `target/messaging-faults/`, which is
 uploaded with the stage logs.
+
+### Performance gate
+
+Two jobs check the daemon's rules that reads are instant, writes are short, and no query's cost
+grows with the whole store. Neither is part of `linux-gate`; making one required is a decision
+for the repository's owner. Both run `scripts/ci-perf`, and `.config/nextest.toml` keeps their
+tests out of `linux-tests`.
+
+`perf-cost` runs `daemon_cost::` (`crates/st3/tests/daemon_cost.rs`) on every pull request and
+`main` push, on the stages' runner. It skips
+merge-queue entries, which wait only for required checks, so a queued entry needs no more runners
+than before (see [Measured concurrency](#measured-concurrency)); if it becomes required, it must
+run there too. It generates a store at scale 0.01 and one at 0.1 with the
+`daemon_bench` generator, serves each from an in-process daemon, and counts the SQLite work of
+every route: virtual machine steps, steps through a table without an index, sorts and
+auto-index rows, read from each statement's counters as it finishes
+(`smallclaims::sqlite::work`, built only with `test-support`). A request fails when its work at
+the larger scale is more than three times its work at the smaller, after dividing by how much its
+answer grew. It also measures a replication round as the worker runs it (summary, push, receive)
+and a checkpoint trim, per deleted row. Counts do not depend on the machine, so the job builds
+with `opt-level = 1` only to generate the stores faster.
+
+- Every route `api.rs` declares is measured or listed in `NOT_MEASURED` with its reason; a new
+  route fails `the_cost_check_covers_every_route` until it is one or the other.
+- `KNOWN_GROWTH` lists the routes whose work already grew with the store when the check
+  landed, each with a ceiling of half again its measured growth. A listed route fails if it grows
+  past its ceiling, and fails once fixed until it leaves the list.
+- The check failed on both regressions that reached production: the shape of #814 (a correlated
+  canonical-order subquery in the document reads; `GET /v1/documents` went from 84,865 to
+  8,007,288 steps for a store ten times larger) and the foreign-key columns #1103 indexed (a trim's
+  work per deleted row grew 7.3 times, its full-scan steps 9.3 times).
+
+`perf-load` runs `daemon_load::` in a release build, in its own `Performance` workflow
+(`perf.yml`): nightly on `main`, on pull requests that change the daemon or the store, and on
+dispatch. It serves a store the size of a busy host's (scale 1, about 240,000 claims) to the
+request mix and rates that host's daemon reported in its busiest five-minute window (30 requests a
+second: harness events, mailbox pages, claims, desired state, delivery holds, replication rounds,
+renewals, status and work reads, and a person's reads), with the reconciler running and 30
+concurrent seat event long-polls. Quiet polls have a 31-second budget for their intentional
+30-second wait; mailbox WebSockets require authenticated native drivers and are excluded.
+It fails when
+a request's p99 or the daemon's CPU passes its budget, or is more than 20% worse than the worst of
+main's last five reports: one run's p99 on a shared runner can be twice the next run's, so a
+regression is what passes several. Main's successful runs add their report
+(`perf-load-baseline-*` in the Actions cache). Relative latency comparisons start once five
+main reports exist; until then every path still checks its absolute p99 budget and every request
+error fails. CPU compares as soon as one main report exists, because it averages the whole run.
+Relative latency tolerates 5 ms of noise, or 50 ms when either path has fewer than 50 samples:
+those sparse p99s are effectively observed maxima. This bounded tolerance still catches large
+regressions on rare paths. CPU tolerates 0.05 cores. A run without any baseline checks only the
+absolute budgets and errors. It is
+not in Workspace CI because with warm caches it takes as long as `linux-tests`, and twice as long
+when its stores must generate.
+
+Both jobs keep their generated stores in the Actions cache, keyed by the generator and
+`docs/st3/schema.md`, so a store from an older generator is never measured.
+
+Run either locally with `TMPDIR=/var/tmp`; `ST_BENCH_DIR` keeps the generated stores between runs:
+
+```sh
+cargo test -p st3 --test integration daemon_cost:: -- --nocapture --test-threads 1
+ST_LOAD_GATE=1 cargo test --release -p st3 --test integration daemon_load:: -- --nocapture
+```
 
 ## Generated files and existing workflows
 
@@ -222,14 +355,14 @@ gh pr merge NUMBER --auto
 ```
 
 The queue tests the pull request on top of the current `main` and the entries ahead of it with
-`linux-gate`, `isolation-vm` and `genie-freshness` (these run on the `merge_group` event; see the
+`linux-gate`, `isolation-vm`, `genie-freshness` and `typescript-client` (these run on the `merge_group` event; see the
 trigger in `fleet.yml.genie.ts`) and merges it with a merge commit when they pass. The pull
 request does not need to be rebased onto the latest `main` first. A draft cannot be queued. If a
 queued check fails, the entry leaves the queue and the pull request page says why: fix it and
 queue it again. The merge train (`st lanes join smalltalk`) is retired.
 
 The ruleset (`.github/repo-settings.json`, generated from `repo-settings.json.genie.ts`, applied
-by an administrator and never by CI) requires the three checks from GitHub Actions with an empty
+by an administrator and never by CI) requires the four checks from GitHub Actions with an empty
 bypass list, keeps the pull-request, deletion and force-push protections, and configures the queue:
 merge method MERGE, up to five entries build at once (see [Measured concurrency](#measured-concurrency)),
 up to five merge together, and a check that
@@ -258,9 +391,12 @@ on 2026-10-01 recorded the workspace limits with `nsc workspace concurrency --ou
 | macOS arm64 | 96 | 224 GiB |
 
 Namespace limits CPU and memory per platform; a workflow run is not a fixed unit of capacity.
-Each Workspace CI group initially starts three 16-vCPU/32-GiB stage jobs and two
-8-vCPU/16-GiB profile jobs: 64 vCPUs and 128 GiB at peak. Five complete groups fit the Linux
-limit, which matches `max_entries_to_build: 5` in both the generated and live main rulesets.
+With the current 8x16 stage runners, a merge-queue Workspace CI group initially starts three
+8-vCPU/16-GiB stage jobs and two 8-vCPU/16-GiB profile jobs: 40 vCPUs and 80 GiB at peak.
+The TypeScript client job follows generator freshness and reuses its runner slot.
+PR and main runs also start `perf-cost`, taking their initial peak to 48 vCPUs and 96 GiB.
+Five complete merge-queue groups need 200 vCPUs and 400 GiB, within the Linux pool limit;
+`max_entries_to_build` remains 5 in both the generated and live main rulesets.
 PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
 are available. The `linux-gate` aggregate starts after the three stage jobs finish, so it does
 not add to the initial peak. macOS uses its own pool.
@@ -304,7 +440,8 @@ gh api --method POST repos/compoundingtech/smalltalk/actions/runs/RUN_ID/force-c
 gh run rerun RUN_ID
 ```
 
-A queued Namespace job is never a pass. Do not fall back to another runner.
+A queued Namespace job is never a pass. Do not fall back to another runner by hand; only
+`pick-runner` chooses between ci1 and Namespace, before a run's jobs start.
 
 ## Inspect a failure
 

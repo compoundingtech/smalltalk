@@ -12,6 +12,25 @@ local Unix socket and authenticated paired HTTP over Tailscale or optional Fabri
 [`clients/typescript/st3-client`](../../../clients/typescript/st3-client). Regenerate all three
 clients' contract tables with `cargo run -p st3-client-codegen`;
 CI and local verification use `cargo run -p st3-client-codegen -- --check` for byte stability.
+The contract digest is written once, in `crates/st3-client/src/contract.rs`. When generated
+client files conflict in a merge, resolve the schema and template files, take either side of every
+generated file (`git checkout --theirs -- clients crates/st3-client/src/contract.rs
+crates/st3-client/src/generated.rs`), and run the generator again; never edit generated files by
+hand.
+
+`ResourceHeader.operational` describes current versus historical state, actionability, reasons,
+and optional owner-generation/runtime-incarnation identities. Work also exposes `agentless`,
+claim expiry, execution start/elapsed time, and timeout in milliseconds. These fields are optional
+for older servers; an absent expiry/start/timeout and an explicit null both mean no value.
+Mission visualization and message `reply_to` may likewise be null. Agent reachability includes
+`reachable` and `indeterminate`; machines use the `machine` resource kind.
+Mission cards also declare total runs, per-state run counts, and whether their recent-run window
+is truncated. Sessions expose their optional runtime incarnation. Clients need not infer these
+fields from untyped excess-property bags.
+
+The collections socket's `CollectionCommand` and `CollectionFrame` definitions live in the same
+schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
+command/frame definitions, and subscription bound; see [collections](collections.md).
 
 ### Agent activity and human blocking
 
@@ -291,6 +310,30 @@ its end is `validation-failed`. `limits` lists each account's freshest limits re
 host it was measured, and the seats whose newest reading names the account. A harness that does
 not report a value leaves it out. The Rust method is `Client::usage_period(since_ms, until_ms)`;
 Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
+
+### Clients connected now
+
+A client may name itself and its build in an `x-st3-client` header on every request and stream,
+for example `stui 0.1.0+a0c135e3`, `smalltalk-ios 1.0 (42)` or `st 0.1.0+a0c135e3`. The Rust
+crate sends what `st3_client::set_client_name` was given; the TypeScript client takes `client` in
+its options, and Swift `client:` in its initializer. The header is optional, and st shows it as
+reported: it is never identity or authority, and no client is refused, slowed or warned for its
+version.
+
+Each member keeps, in memory only, the clients connected to it now: every open collection,
+conversation or terminal stream, and every client that made a request in the last five minutes.
+`GET /v1/client/clients` (`clients.list`, which requires `read.projections`) reads them as
+`ClientConnections { kind: "client-connections", member, items }`, newest first. Each
+`ClientConnection` has the acting session (`actor`), the person or agent whose authority it
+uses (`person`), the reported `client`, the paired `device_id` and `device_name` when a paired
+device's session is acting, the `member` it reached, `via` (`local` for the member's own Unix
+socket; `gateway` for a paired device through the client gateway, which a Tailscale forward and
+Fabric both reach, so st cannot tell them apart; `tailscale` when Tailscale Serve names itself),
+whether it is `connected` now with how many open `streams`, `since` and `last_seen`, and what it
+`follows`: windows by name, `conversation:ID` and `terminal:ID`. Another member's clients are on
+that member's list. The Rust method is `Client::clients_list()`, Swift `clientsList()` and
+TypeScript `clientsList()`. `st clients` (or `--json`) prints the list, and `st devices ls` adds
+"connected now" or "last seen" with the reported build to each paired device.
 
 
 `operations` is the client-safe operational view: daemon health, host reachability, transport
@@ -691,6 +734,7 @@ not change it. A terminal action may use an older snapshot from the same host, w
 and explicit revision fences still apply. Attach/detach do not require a screen sequence fence.
 `revision` digests the rest of
 the screen: equal revisions mean equal screens, and a stream never sends the same revision twice.
+The optional `kitty_keyboard` mode carries the active Kitty keyboard enhancement bitmask.
 
 Each line keeps its plain `text`, without trailing spaces, and adds `runs`: styled text from column
 zero. A run has `text` and, when they differ from the terminal default, `fg` and `bg` colors and
@@ -698,6 +742,9 @@ zero. A run has `text` and, when they differ from the terminal default, `fg` and
 a palette index from 0 to 255, where 0 to 15 are the client's ANSI theme colors, or a `#rrggbb`
 string. The runs spell `text`, followed by any trailing blanks that are visible because of their
 background, inverse, or underline. Hidden text is sent as spaces.
+Optional line `wrapped` marks automatic continuation to the next row. Optional run `cells`
+records display width rather than text length; `strikethrough` is present when set, and `link`
+contains the hyperlink `uri`. Generated Rust, Swift, and TypeScript models preserve these fields.
 
 When the terminal's runtime incarnation changes or its process exits, the server sends one
 `stale-fence` error envelope and closes the stream, with the error code as the close reason. Other
@@ -814,14 +861,41 @@ rules, adding a required action parameter, or changing action semantics requires
 version or API version. Clients preserve unknown enum cases for display but never send an action
 whose capability version they do not understand.
 
+### Inline schema semantics
+
+The shared JSON Schema carries client semantics next to the wire constraints, not in a separate
+registry. Standard Draft 2020-12 validators ignore these `x-st-*` annotations:
+
+- `x-st-ref` names the subject family, a set of allowed families, or `*` for a generic subject.
+  Named IDs retain the `family/non-whitespace-suffix` wire shape, including nested suffixes.
+  Mission run-generation maps validate both mission-run keys and run-generation values.
+- `x-st-brand` distinguishes opaque cursors, revisions, preview tokens, idempotency keys, and
+  screen revisions. They remain strings on the wire; compare for equality and echo them unchanged.
+- `x-st-codec` identifies RFC 3339 timestamps, Unix epoch milliseconds, millisecond/second
+  durations, and redacted credentials. Units and credential sensitivity are explicit.
+- Root `x-st-integers: "json-safe"` declares the safe-integer policy for generated JSON clients.
+  Existing JSON Schema bounds still apply.
+
+Evolving mission, agent, timeline, and error enums use `anyOf` with known values plus a string
+branch. Consumers accept future strings without changing their wire value. `Resource` includes
+`UnknownResource`, which preserves a future kind's valid header and arbitrary payload. Its kind
+exclusion prevents malformed known resources from falling through that branch. The generated raw
+Rust, Swift, and TypeScript `Resource` types model known kinds only, so TypeScript keeps
+discriminant narrowing on `kind`.
+
+Daemon conformance uses a strict test-only view of the same schema: it closes composed resource
+fields, tightens open enums to known values, and removes `UnknownResource`. Consumer tolerance
+does not authorize producers to emit undeclared cases or weaken family-ID validation.
+
 ## Conformance assets
 
 [`schemas/client-v0.schema.json`](schemas/client-v0.schema.json) contains the shared wire types.
 [`schemas/operations.json`](schemas/operations.json) is the machine-readable route/action/capability
 manifest. [`fixtures/manifest.json`](fixtures/manifest.json) maps every golden fixture to its root
 schema definition. The Rust tests validate fixture coverage, IDs, ordering, fences, timeline links,
-and deterministic preview tokens. Ignored baseline tests exercise the missing implementation and
-are intentionally red until the corresponding server work lands.
+and deterministic preview tokens. Daemon conformance tests validate synthetic collection,
+conversation, and terminal frames with a Draft 2020-12 validator and reject undeclared resource
+fields in the strict test view. No real user data is required for the conformance vectors.
 
 ## Private glasses
 
@@ -904,11 +978,32 @@ Member daemons replicate the claims; paired clients read them through a member g
 ## Agent and plain-shell creation
 
 `agent.create` takes `name`, `harness` (`claude`, `codex`, `omp`, `pi`, `opencode`), optional `host`,
-`model`, `effort`, `workspace`, `description`, and `message`. Names are stable seat identities as
+`model`, `effort`, `workspace`, `repo`, `base`, `branch`, `remove_at_run_end`, `description`, and `message`. Names are stable seat identities as
 in `st agents new`. Workspace paths are absolute on the selected host; omission asks that host for
 its usual new-agent directory. The host creates missing agent workspaces. OpenCode does not accept
 `effort`. Message text is nonempty, at most 64 KiB, and uses the native harness startup argument.
 An existing active seat requires a different name; a stopped seat may be deliberately recreated.
+
+`repo` is an existing repository's absolute path on the selected host. It adds the existing
+`checkout` declaration and creates the agent workspace as a worktree. `base` defaults to
+`origin/main`; `branch` defaults to the simple agent name with Git-invalid characters replaced
+by dashes. An existing branch is reused. `base`, `branch`, and `remove_at_run_end` require `repo`.
+An optional `workspace` chooses the worktree destination; otherwise the host names it as usual.
+With `remove_at_run_end: true`, stopping a top-level seat removes its clean worktree after its
+runtime stops. A mission seat removes it during run cleanup. The branch stays; changed or shared
+worktrees stay with a diagnostic. A branch in another worktree reports that path and waits for
+a changed declaration instead of repeatedly retrying Git. Missing repositories prevent launch
+and produce an agent fault naming the path. An existing workspace must match the repository and
+branch; a plain directory cannot bypass the checkout.
+
+`GET /v1/client/hosts/{id}/repositories` (`host.repositories`) returns `HostRepositories`:
+`host_id` and `repositories`, each with `path`, `workspaces`, and `agent_ids`. Any member can
+answer for any host from replicated checkout declarations and latest `workspace.observed`
+claims authored by that host. Reconciliation observes Git directories for plain workspaces;
+reads never inspect another host's disk or scan the filesystem. Suggestions include currently
+declared agents only and can be empty before the owning host reconciles a plain workspace.
+Rust exposes `host_repositories`; TypeScript and Swift expose `hostRepositories`.
+The same read is `st agents repos [--host HOST] [--json]`.
 
 `terminal.create` takes a nonempty display `name` (up to 160 bytes), optional `host` and absolute
 `cwd`. An omitted directory uses the selected daemon's directory. It declares a standalone PTY

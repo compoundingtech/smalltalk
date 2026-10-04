@@ -1,8 +1,10 @@
 use crate::*;
+#[cfg(feature = "ratatui")]
 use ratatui::style::Color;
-use ratatui::text::Line;
+#[cfg(feature = "ratatui")]
 use std::collections::HashSet;
 
+#[cfg(feature = "ratatui")]
 pub(crate) fn theme() -> Theme {
     Theme {
         user_bg: Color::Black,
@@ -146,6 +148,7 @@ fn an_earlier_page_from_another_session_is_dropped_and_a_new_session_starts_over
 }
 
 #[test]
+#[cfg(feature = "ratatui")]
 fn theme_and_timestamp_changes_invalidate_cached_entry_styles_and_labels() {
     let cache = Cache::default();
     let mut entries = vec![Entry {
@@ -187,7 +190,7 @@ fn scrolling_pauses_following_and_counts_new_lines_until_latest_is_requested() {
 
 #[test]
 fn selection_uses_display_columns_in_both_drag_directions() {
-    let lines = vec![Line::from("a界b"), Line::from("done")];
+    let lines = vec!["a界b", "done"];
     let mut selection = Selection {
         pane: "session/a".into(),
         anchor: (0, 1),
@@ -196,7 +199,7 @@ fn selection_uses_display_columns_in_both_drag_directions() {
     assert_eq!(selection.text(&lines), "界b\ndo");
     std::mem::swap(&mut selection.anchor, &mut selection.head);
     assert_eq!(selection.text(&lines), "界b\ndo");
-    assert_eq!(selection.text(&[]), "");
+    assert_eq!(selection.text::<&str>(&[]), "");
 }
 
 #[test]
@@ -204,12 +207,12 @@ fn selection_copies_text_without_the_message_edge_indent_or_fences() {
     // Nathan, 2026-10-03: a command copied out of a message came with the "▎" edge on every
     // line.
     let lines = vec![
-        Line::from("▎ you · 10:02"),
-        Line::from("▎ Run this:"),
-        Line::from("▎ ```sh"),
-        Line::from("▎   mkdir -p ~/.config/demo"),
-        Line::from("▎     touch ~/.config/demo/keys.env"),
-        Line::from("▎ ```"),
+        "▎ you · 10:02",
+        "▎ Run this:",
+        "▎ ```sh",
+        "▎   mkdir -p ~/.config/demo",
+        "▎     touch ~/.config/demo/keys.env",
+        "▎ ```",
     ];
     let mut selection = Selection {
         pane: "session/a".into(),
@@ -227,10 +230,44 @@ fn selection_copies_text_without_the_message_edge_indent_or_fences() {
     selection.anchor = (1, 6);
     assert_eq!(selection.text(&lines), "this:");
     // Text that only looks like an edge mid-line stays.
-    let plain = vec![Line::from("a ▎ b")];
+    let plain = vec!["a ▎ b"];
     selection.anchor = (0, 0);
     selection.head = (0, 9);
     assert_eq!(selection.text(&plain), "a ▎ b");
+}
+
+#[test]
+#[cfg(feature = "ratatui")]
+fn copying_wrapped_lines_gives_back_only_the_real_newlines() {
+    // Nathan, 2026-10-03: a line the pane wrapped is one line on the clipboard.
+    let body = "first paragraph is long enough to wrap across several pane lines\nsecond line\n\nhttps://example.com/a/really/long/path/that/cannot/break/at/a/space";
+    let entries = vec![Entry {
+        id: "m".into(),
+        at: "10:00".into(),
+        body: Body::Mail {
+            from: "you".into(),
+            to: "agent".into(),
+            subject: String::new(),
+            body: body.into(),
+            delivered: false,
+            dictated: false,
+            images: Vec::new(),
+        },
+    }];
+    let doc = Cache::default().render(&entries, 30, &HashSet::new(), "", &theme());
+    assert!(doc.lines.len() > 8, "the body wraps at this width");
+    // From the body's first line to the end.
+    let first = doc
+        .lines
+        .iter()
+        .position(|line| text::plain(line).contains("first paragraph"))
+        .unwrap();
+    let selection = Selection {
+        pane: "session/a".into(),
+        anchor: (first, 0),
+        head: (doc.lines.len() - 1, 200),
+    };
+    assert_eq!(selection.text(&doc.lines).trim_end(), body);
 }
 
 #[test]
@@ -256,4 +293,82 @@ fn pane_intents_keep_other_sessions_drafts_and_expansion_independent() {
     assert!(state.expanded.contains("tool/b"));
     assert_eq!(state.load_older(true), Some(PaneIntent::LoadOlder));
     assert_eq!(state.load_older(false), None);
+}
+
+#[test]
+fn selection_joins_wrapped_lines_from_another_renderer() {
+    struct Line<'a>(&'a str, Option<&'a str>);
+    impl SelectionLine for Line<'_> {
+        fn plain_text(&self) -> std::borrow::Cow<'_, str> {
+            std::borrow::Cow::Borrowed(self.0)
+        }
+
+        fn continuation(&self) -> Option<&str> {
+            self.1
+        }
+    }
+    let lines = [
+        Line("▎ a long", None),
+        Line("▎ paragraph", Some(" ")),
+        Line("▎ https://example.com/", None),
+        Line("▎ path", Some("")),
+        Line("▎ ```sh", None),
+        Line("▎   echo hello", None),
+        Line("▎ ```", None),
+    ];
+    let mut selection = Selection {
+        pane: "session/a".into(),
+        anchor: (0, 0),
+        head: (lines.len() - 1, 80),
+    };
+    assert_eq!(
+        selection.text(&lines),
+        "a long paragraph\nhttps://example.com/path\n  echo hello"
+    );
+    assert_eq!(selection.text(&[String::from("plain text")]), "plain text");
+    // A selection that starts in a continuation must not join text outside the selection.
+    selection.anchor = (1, 4);
+    selection.head = (1, 8);
+    assert_eq!(selection.text(&lines), "ragra");
+}
+
+#[test]
+fn shared_transcripts_match_without_a_renderer() {
+    for (input, expected) in [
+        (
+            include_str!("../../../fixtures/clients/transcripts/claude.json"),
+            include_str!("../../../fixtures/clients/transcripts/claude.expected.json"),
+        ),
+        (
+            include_str!("../../../fixtures/clients/transcripts/codex.json"),
+            include_str!("../../../fixtures/clients/transcripts/codex.expected.json"),
+        ),
+        (
+            include_str!("../../../fixtures/clients/transcripts/deliveries.json"),
+            include_str!("../../../fixtures/clients/transcripts/deliveries.expected.json"),
+        ),
+    ] {
+        let items = serde_json::from_str::<Vec<st3_client::TimelineEntry>>(input).unwrap();
+        let mut entries =
+            serde_json::to_value(adapt::conversation(&items, &Default::default())).unwrap();
+        // The local display time depends on the host's time zone, not the conversation model.
+        for entry in entries.as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("at");
+        }
+        assert_eq!(
+            entries,
+            serde_json::from_str::<serde_json::Value>(expected).unwrap()
+        );
+    }
+}
+
+#[test]
+fn shared_style_rules_are_available_without_a_renderer() {
+    assert_eq!(
+        serde_json::to_value(style::RULES).unwrap(),
+        serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../fixtures/clients/conversation-style.json"
+        ))
+        .unwrap()
+    );
 }

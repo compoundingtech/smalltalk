@@ -152,7 +152,7 @@ async fn bootstrap_waits_for_reconciliation(status: &str, previous: Option<&str>
     std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
     let binary = std::env::var_os("ST3_BOOTSTRAP_TEST_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_st3")));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_st3-fixture")));
     let binary_path = binary.to_string_lossy().into_owned();
     let environment = BTreeMap::from([
         ("HOME", root.path().to_string_lossy().into_owned()),

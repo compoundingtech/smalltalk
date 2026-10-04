@@ -3,39 +3,50 @@
 //! Cargo builds only the targets the manifest names (`autotests = false`), so add a
 //! `mod NAME;` line here or an explicit test target for every new file.
 
+mod action_coverage;
 mod agents_restart;
+mod backup;
 mod boot_canaries;
 mod broken_gates;
 mod client_creation;
 mod client_glasses;
+mod client_presence;
 mod client_v0_cli;
 mod client_v0_contract;
 mod codex_bootstrap;
 mod command_recorder;
 mod convergence;
 mod daemon_bench;
+mod daemon_cost;
+mod daemon_load;
 mod daemon_environment;
 mod daemon_restart;
+mod driver_incarnation;
 mod delivery_probe;
 mod examples;
 mod fault_isolation;
 mod first_sync;
 mod fleet;
+mod gate_kinds;
 mod getting_started;
+mod hermetic;
 mod hook_telemetry;
 mod human_gates;
 mod idle_budget;
 mod log_diet;
+mod message_send_once;
 mod messaging_faults;
 mod mission_cancellation;
 mod no_st2_seat;
 mod operational_state_contract;
+mod owned_sets;
 mod reconcile_pass_perf;
 mod recorder_report;
 mod seat_queue_perf;
 mod subagent_publisher;
 mod subagents_seat;
 mod terminal_attach;
+mod version;
 
 #[test]
 fn every_test_file_is_built() {
