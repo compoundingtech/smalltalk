@@ -3771,16 +3771,15 @@ async fn missing_mission_preserves_the_client_v0_not_found_error_shape() {
 async fn custom_subject_contract_pagination_and_paired_person_reply() {
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());
-    state
-        .store
-        .register_custom_kind(&st3::store::custom::RegistrationRequest {
-            manifest: serde_json::from_str(include_str!(
-                "../../../examples/st3/custom-review.json"
-            ))
-            .unwrap(),
-            actor: "agent/garden/seed".into(),
-        })
-        .unwrap();
+    let mut manifest: st3_schema::custom::Manifest = serde_json::from_str(include_str!(
+        "../../../examples/st3/custom-review.json"
+    )).unwrap();
+    manifest.attention.as_mut().unwrap().episode = st3_schema::custom::Expr::Constant {
+        value: serde_json::json!("garden question; keep"),
+    };
+    state.store.register_custom_kind(&st3::store::custom::RegistrationRequest {
+        manifest, actor: "agent/garden/seed".into(),
+    }).unwrap();
     for name in ["one", "two"] {
         state.store.append_claim(&st3::model::ClaimInput{subject:format!("custom/garden/review/v1/{name}"),kind:"custom.garden.review.v1.requested".into(),actor:Some("agent/garden/seed".into()),fields:serde_json::from_value(serde_json::json!({"title":"Retain the seed history?","detail":"Choose Keep or Discard.","recipient":"person/lichen"})).unwrap(),evidence:vec![],expected_subject:None,idempotency_key:None}).unwrap();
     }
@@ -3827,6 +3826,7 @@ async fn custom_subject_contract_pagination_and_paired_person_reply() {
         assert_eq!(card["attention_kind"], "agent-request");
         assert_eq!(card["actions"], serde_json::json!([]));
         assert!(card["detail"].as_str().unwrap().contains("st subject reply"));
+        assert!(card["detail"].as_str().unwrap().contains("--episode 'garden question; keep'"));
     }
     // Model the pre-extension closed enums: the entire page remains readable.
     let mut old_schema = json(asset_root().join("schemas/client-v0.schema.json"));
