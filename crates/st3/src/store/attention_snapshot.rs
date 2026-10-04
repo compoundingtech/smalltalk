@@ -900,6 +900,16 @@ impl Store {
                 continue;
             }
             let f = &claim.body["fields"];
+            // Upgrades retain historical operational episodes. A current login with a concrete
+            // person has one derived person item; the old agent fault must not ask again.
+            if f["condition"] == "provider-auth"
+                && self
+                    .current_harness(source)?
+                    .is_some_and(|h| h.state == "needs-login")
+                && self.agent_person(source)?.is_some()
+            {
+                continue;
+            }
             if matches!(
                 f["condition"].as_str(),
                 Some("readiness" | "provider-auth" | "provider-trust" | "provider-update")

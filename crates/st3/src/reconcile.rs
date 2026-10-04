@@ -32098,6 +32098,26 @@ version 2
                 .unwrap();
         };
         publish(false, 1, "one");
+        store
+            .record_runtime_failure(
+                "attention/retained-login-episode",
+                &AttentionRequest {
+                    reviewer: "person/avery".into(),
+                    title: "Retained login fault".into(),
+                    reason: "pre-upgrade credential refusal".into(),
+                    severity: "error".into(),
+                    targets: vec!["agent/node.seat".into()],
+                    actor: RECONCILER_ACTOR.into(),
+                    idempotency_key: "retained-login-episode".into(),
+                },
+                "provider-auth",
+            )
+            .unwrap();
+        assert!(
+            store.fault_items(None).unwrap().is_empty(),
+            "the derived login item replaces the retained agent fault"
+        );
+
         reconciler.reconcile_once().unwrap();
         reconciler.reconcile_once().unwrap();
         assert_eq!(
