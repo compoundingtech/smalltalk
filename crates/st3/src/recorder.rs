@@ -559,16 +559,15 @@ fn relay(
             break;
         }
         signaled |= forward_signals(read_end, Some(pid));
-        if descriptors[1].revents != 0 {
-            if let Some(output) = &stdout {
-                if copy_stdout(
-                    output.as_raw_fd(), 8192, last_line, read_end,
-                    Some(&mut child), &mut signaled,
-                ).is_err() {
-                    // Closing the reader makes the child's next write observe EPIPE naturally.
-                    stdout = None;
-                }
-            }
+        if descriptors[1].revents != 0
+            && let Some(output) = &stdout
+            && copy_stdout(
+                output.as_raw_fd(), 8192, last_line, read_end,
+                Some(&mut child), &mut signaled,
+            ).is_err()
+        {
+            // Closing the reader makes the child's next write observe EPIPE naturally.
+            stdout = None;
         }
     }
     match child.wait() {
@@ -648,12 +647,11 @@ fn copy_stdout(
     while written < bytes.len() {
         // An interrupted write can consume SIGCHLD too. Recheck before every blocking poll,
         // not just after poll wakes; try_wait caches the exact status for the enclosing loop.
-        if *signaled {
-            if let Some(process) = child.as_deref_mut() {
-                if process.try_wait()?.is_some() {
-                    child = None;
-                }
-            }
+        if *signaled
+            && let Some(process) = child.as_deref_mut()
+            && process.try_wait()?.is_some()
+        {
+            child = None;
         }
         // Do not make fd1 nonblocking: its open-file flags belong to the caller too. Poll and
         // write at most PIPE_BUF instead, so an ordinary pipe cannot strand signal forwarding
