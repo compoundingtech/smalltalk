@@ -17,6 +17,11 @@ archives need neither Nix nor Rust installed. Harness CLIs and their logins rema
 
 ## Install or update
 
+If a populated v0.3.4 store may have unsigned delegation grants, follow the
+[founder signing audit](founder-signing-audit.md) before doctor or restart. Preserve raw state and
+keys first. A build containing prevention #1269 can sign preserved unsealed work; it retains
+signature warnings from already-sealed affected payloads.
+
 Choose a tag from the repository's Releases page, then download the archive for your machine
 and its `.sha256` file. For example, with GitHub CLI:
 

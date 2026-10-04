@@ -4,6 +4,8 @@ Your machines can share one fleet: each daemon keeps a local replica of the grap
 
 Finish [getting started](getting-started.md) on the first machine. Install Small Talk, set `person = "person/ada"`, and start its user service on the second machine too. Harnesses and their logins are needed only on machines that will run seats.
 
+The v0.3.4 fresh-machine rehearsal found [invalid claim-signature warnings](https://github.com/compoundingtech/smalltalk/issues/1228): a standalone restart can seal grants unsigned, and later fleet claims depend on them. For a suspected affected store, [capture a bounded read-only audit before founding, joining, doctor or restart operations](st3/founder-signing-audit.md). The prevention fix is included in v0.3.5's source, but upgrading does not repair already-sealed unsigned history; the guide preserves that distinction and the existing rehearsal's limits.
+
 ## Join over SSH
 
 This worked example calls the first machine **studio** and the second **beacon**. It uses SSH to encrypt a connection between their loopback listeners. You need SSH access from beacon to studio; use your actual SSH destination when prompted. If you already use Tailscale or Fabric, [fleet join](fleet-join.md#what-a-person-types) gives the shorter route with automatic transport discovery.
@@ -63,7 +65,7 @@ st doctor
 
 The same declared worker and first mission should appear. `replication status` reports the last successful exchange, backlog, authority digest, graph digest, and table digests. After both members have caught up and writes settle, matching authority digests mean they hold the same replicated history. With matching builds and no waiting claims, matching graph and table digests also confirm the same shared projections. During an upgrade, a reader may hold claims that need a newer build; update it before comparing projections.
 
-The v0.3.4 fresh-machine rehearsal found [invalid claim-signature warnings](https://github.com/compoundingtech/smalltalk/issues/1228): a standalone restart can seal grants unsigned, and later fleet claims depend on them. If doctor reports that warning, retain the report and follow the issue; matching replication digests alone do not establish valid claim signatures.
+If doctor reports invalid claim-signature warnings, retain the report and follow the [operator guidance](st3/founder-signing-audit.md); matching replication digests alone do not establish valid claim signatures.
 
 To show that a write travels back from beacon, send a message **on beacon**:
 
