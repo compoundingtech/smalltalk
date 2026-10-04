@@ -495,10 +495,10 @@ export type Envelope = {
   api_version: "st3.client.v0";
   request_id: RequestId;
   snapshot: Snapshot;
-  value: (Capabilities | DocumentContent | SubjectDefinition | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
+  value: (Capabilities | PrivateNotesSubject | DocumentContent | SubjectDefinition | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
-export type ErrorCode = ("attention-migrated" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
+export type ErrorCode = ("attention-migrated" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "private-notes-unreachable" | "private-notes-carrier-conflict" | "private-notes-indeterminate" | "internal" | string);
 
 export type ErrorEnvelope = {
   api_version: "st3.client.v0";
@@ -525,6 +525,7 @@ export type Fence = {
   attempt?: number;
   mission_generation?: RunGenerationId;
   preview_token?: string;
+  private_notes?: PrivateNotesFence;
   readiness_epoch?: number;
   runtime_desired_revision?: string;
   runtime_incarnation?: string;
@@ -964,7 +965,7 @@ export type PairingBegin = {
   device_name: string;
   full_control?: boolean;
   person_id: string;
-  scopes?: Array<"read.projections" | "read.glasses" | "control.glasses" | "terminal.read" | "control.attention" | "control.launches">;
+  scopes?: Array<"read.projections" | "read.glasses" | "control.glasses" | "terminal.read" | "control.attention" | "control.launches" | "notes.read" | "notes.write">;
 };
 
 export type PairingChallenge = {
@@ -1035,6 +1036,38 @@ export type PlannerConfig = {
   effort?: string;
   model?: string;
   provider: "codex" | "claude" | "pi" | "omp" | "opencode";
+};
+
+export type PrivateNotesAction = {
+  fence: Fence;
+  id: "private-notes.write";
+};
+
+export type PrivateNotesData = {
+  fence: PrivateNotesFence;
+  markdown: string;
+  uri: PrivateNotesUri;
+};
+
+export type PrivateNotesFence = {
+  carrier_generation: Revision;
+  revision: Revision;
+};
+
+export type PrivateNotesSubject = {
+  actions: Array<PrivateNotesAction>;
+  data: PrivateNotesData;
+  family: "private-notes";
+  live: null;
+  ref: PrivateNotesUri;
+  schema: "st3.private-notes@1";
+};
+
+export type PrivateNotesUri = string;
+
+export type PrivateNotesWriteParameters = {
+  markdown: string;
+  uri: PrivateNotesUri;
 };
 
 export type ProjectionEvent = Omit<{
@@ -1798,6 +1831,7 @@ export type ActionRequest =
   workspace: string;
 }; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'pairing.revoke'; parameters: TargetParameters; fence: Fence }) |
+  (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'private-notes.write'; parameters: PrivateNotesWriteParameters; fence: Fence & Required<Pick<Fence, 'private_notes'>> }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'review.approve'; parameters: TargetParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'review.reject'; parameters: TargetParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'review.request-changes'; parameters: TargetParameters; fence: Fence }) |
