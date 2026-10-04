@@ -35,9 +35,20 @@ fleet_compat() {
 }
 
 clippy_and_codegen() {
-  cargo clippy --workspace --all-targets --locked || return
+  python3 scripts/clippy-ratchet-test || return
+  cargo metadata --no-deps --format-version 1 --locked > "$logs/clippy-metadata.json" || return
+  rustc --version > "$logs/clippy-rustc.txt" || return
+  cargo clippy --version > "$logs/clippy-version.txt" || return
+  cargo clippy --workspace --all-targets --locked --message-format=json \
+    | tee "$logs/clippy-workspace.jsonl" | python3 scripts/clippy_ratchet.py --render || return
   # Workspace consumers enable drawing; check the standalone model separately.
-  cargo clippy -p st3-conversation-ui --no-default-features --all-targets --locked || return
+  cargo clippy -p st3-conversation-ui --no-default-features --all-targets --locked --message-format=json \
+    | tee "$logs/clippy-model.jsonl" | python3 scripts/clippy_ratchet.py --render || return
+  local base_args=()
+  if [[ -n "${CLIPPY_BASE_SHA:-}" && "$CLIPPY_BASE_SHA" != 0000000000000000000000000000000000000000 ]]; then
+    base_args=(--base-ref "$CLIPPY_BASE_SHA")
+  fi
+  python3 scripts/clippy_ratchet.py --logs "$logs" "${base_args[@]}" || return
   cargo run --locked -p st3-client-codegen -- --check
 }
 

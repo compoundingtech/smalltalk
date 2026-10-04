@@ -214,7 +214,9 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       name: 'linux-clippy',
       stage: 'clippy',
       setup: commonSetupSteps,
-      description: 'Run clippy and the generated-client check',
+      description: 'Run the Clippy warning ratchet and generated-client check',
+      // Compare to the event's immutable base, including queued merges and main pushes.
+      env: { CLIPPY_BASE_SHA: '${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}' },
     }),
     'linux-fleet-compat': linuxStageJob({
       name: 'linux-fleet-compat',
