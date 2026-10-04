@@ -317,7 +317,7 @@ fn usage_rollups_keep_hourly_ends_in_the_window_and_one_baseline_before_it() {
 }
 
 #[test]
-fn limits_keep_each_seats_newest_reading() {
+fn limits_keep_source_observations_even_when_the_same_seat_publishes_again() {
     let mut sealed = Sealed::default();
     let reading = |sealed: &mut Sealed, subject, at: u128| {
         sealed.add(
@@ -333,8 +333,8 @@ fn limits_keep_each_seats_newest_reading() {
     let first = [1, 2, 3].map(|offset| reading(&mut sealed, AGENT, T + offset));
     let other = reading(&mut sealed, "agent/alder.other", T + 4);
     let plan = plan_drops(&sealed.build());
-    assert_eq!(dropped(&plan), ids([&first[0], &first[1]]));
-    let _ = other;
+    assert!(dropped(&plan).is_empty());
+    let _ = (first, other);
 }
 
 #[test]

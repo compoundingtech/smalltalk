@@ -93,6 +93,69 @@ fn value(output: &Output) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"fresh\" { workspace \"/tmp\"; command \"true\"; }\nagent \"stale\" { workspace \"/tmp\"; command \"true\"; }",
+        store.origin(),
+    ).unwrap();
+    store.apply_internal(&intent, "two-seats").unwrap();
+    let fresh = format!("agent/{}.fresh", store.origin());
+    let stale = format!("agent/{}.stale", store.origin());
+    let now = st_drivers::message::now_ms();
+    // Old producers stamp every status-line refresh as a new observation. The low seat
+    // publishes last with a newer stamp, but both readings belong to the same quota window.
+    for (seat, weekly, at) in [(&fresh, 96.0, now - 60_000), (&stale, 45.0, now)] {
+        store.append_claim(&ClaimInput {
+            subject: seat.clone(), kind: "harness.limits".into(), actor: Some(seat.clone()),
+            fields: serde_json::from_value(serde_json::json!({
+                "driver": "claude", "account": "claude/example", "incarnation_id": "example-inc",
+                "weekly_percent": weekly, "weekly_resets_at_unix_ms": now + 3_600_000,
+                "measured_at_unix_ms": at,
+            })).unwrap(), evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(state))
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let cli = value(&run_cli(&socket, &["usage"]).await);
+    assert_eq!(cli["limits"][0]["weekly_percent"], 96.0);
+    assert_eq!(cli["limits"][0]["measured_at_unix_ms"], now - 60_000);
+    let human = run_cli_human(&socket, &["usage"]).await;
+    assert!(human.status.success());
+    assert!(String::from_utf8_lossy(&human.stdout).contains("96%"));
+    let client = st3_client::Client::unix_as(&socket, "person/avery");
+    let report = client.usage_period(None, None).await.unwrap();
+    assert_eq!(report.value.limits[0].weekly_percent, Some(96.0));
+    assert_eq!(report.value.limits[0].measured_at_unix_ms, now - 60_000);
+    let outcome = store
+        .enforce_account_limits(
+            &st3::store::LimitsPolicy {
+                stop_at_weekly_percent: 95,
+                keep: Default::default(),
+                notify: "agent/example/operations".into(),
+                fresh_ms: 3_600_000,
+            },
+            u128::from(now),
+        )
+        .unwrap();
+    assert_eq!(outcome.stopped, [fresh, stale]);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_seat_bootstraps_cancels_and_stops_with_its_own_cli_identity() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");

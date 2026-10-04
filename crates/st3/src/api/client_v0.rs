@@ -873,7 +873,7 @@ pub(super) async fn usage_period(
             fields.retain(|_, value| value.as_str() != Some(""));
         }
     }
-    // Each account's freshest limits reading; what a harness did not report is left out.
+    // The shared account limits selection; what a harness did not report is left out.
     let limits = limits
         .into_iter()
         .map(|limit| {
