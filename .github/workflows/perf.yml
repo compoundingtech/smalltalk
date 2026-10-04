@@ -1,45 +1,17 @@
 # Generated file - DO NOT EDIT
 # Source: perf.yml.genie.ts
 
-name: Performance
+name: Performance paired mail backlog
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - crates/smallclaims/**
-      - crates/st3/src/**
-      - crates/st3/tests/daemon_*.rs
-      - crates/st3/tests/perf_load.rs
-      - crates/st3/Cargo.toml
-      - Cargo.toml
-      - Cargo.lock
-      - .cargo/config.toml
-      - flake.nix
-      - flake.lock
-      - docs/st3/schema.md
-      - scripts/ci-perf*
-      - scripts/ci-nix-cache
-      - .github/workflows/perf.yml
-  schedule:
-    - cron: 23 2 * * *
-  pull_request:
-    paths:
-      - crates/smallclaims/**
-      - crates/st3/src/**
-      - crates/st3/tests/daemon_*.rs
-      - crates/st3/tests/perf_load.rs
-      - crates/st3/Cargo.toml
-      - Cargo.toml
-      - Cargo.lock
-      - .cargo/config.toml
-      - flake.nix
-      - flake.lock
-      - docs/st3/schema.md
-      - scripts/ci-perf*
-      - scripts/ci-nix-cache
-      - .github/workflows/perf.yml
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        type: string
+        required: true
+      head_sha:
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -101,39 +73,83 @@ jobs:
         run: bash scripts/ci-nix-cache use
       - name: Prepare fast scratch space for a new store recipe
         run: if [ ! -s "$RUNNER_TEMP/st-bench/generated-1.sqlite3" ]; then sudo mount -o remount,size=10G /dev/shm; fi
-      - name: Run the release load test
+      - name: Build both sources and measure main/head on one warm worker
         shell: bash
-        run: "nix develop '.#perf' -c bash scripts/ci-perf load"
-        id: load
-      - id: cache
-        name: Save build and Nix snapshots
-        if: "!cancelled() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (steps.load.outcome == 'success' || steps.load.outcome == 'failure')"
         run: |
-          if ! python3 scripts/ci-perf-cache check-report; then exit 0; fi
-          nix print-dev-env .#perf --profile "$RUNNER_TEMP/perf-shell" > /dev/null
-          nix develop .#perf -c env TMPDIR="$RUNNER_TEMP" sccache --show-stats
-          CI_PERF_SHELL_ROOT="$RUNNER_TEMP/perf-shell" bash scripts/ci-nix-cache save
-          python3 scripts/ci-perf-cache pack
-      - name: Retain the build and Nix cache
-        if: "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PERF_BUILD_SNAPSHOT }}
-          path: "${{ runner.temp }}/perf-snapshots/build.tar.zst"
-          compression-level: 0
-          retention-days: 7
-          if-no-files-found: error
-          overwrite: true
-      - name: Retain the generated stores
-        if: "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PERF_STORES_SNAPSHOT }}
-          path: "${{ runner.temp }}/perf-snapshots/stores.tar.zst"
-          compression-level: 0
-          retention-days: 7
-          if-no-files-found: error
-          overwrite: true
+          nix develop '.#perf' -c python3 -c 'import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          import time
+
+          main_sha, head_sha = os.environ['"'"'PAIR_BASE'"'"'], os.environ['"'"'PAIR_HEAD'"'"']
+          import re
+          assert all(re.fullmatch(r'"'"'[0-9a-f]{40}'"'"', sha) for sha in [main_sha, head_sha])
+          root = Path(os.environ['"'"'RUNNER_TEMP'"'"'])
+          out = root / '"'"'perf'"'"'
+          out.mkdir(exist_ok=True)
+          reports = {}
+          binaries = {}
+          for name, sha in [('"'"'main'"'"', main_sha), ('"'"'head'"'"', head_sha)]:
+              subprocess.run(['"'"'git'"'"', '"'"'checkout'"'"', '"'"'--detach'"'"', sha], check=True)
+              assert subprocess.check_output(['"'"'git'"'"', '"'"'status'"'"', '"'"'--porcelain'"'"']).strip() == b'"'"''"'"'
+              env = dict(os.environ, AGENT_SPEC_REVISION=sha)
+              env.pop('"'"'ST_AGENT'"'"', None)
+              with (out / f'"'"'paired-{name}-build.jsonl'"'"').open('"'"'w'"'"') as log:
+                  subprocess.run(['"'"'cargo'"'"', '"'"'test'"'"', '"'"'--release'"'"', '"'"'-p'"'"', '"'"'st3'"'"', '"'"'--features'"'"', '"'"'perf-load'"'"',
+                                  '"'"'--test'"'"', '"'"'perf_load'"'"', '"'"'--locked'"'"', '"'"'--no-run'"'"', '"'"'--message-format=json'"'"'],
+                                 env=env, stdout=log, check=True)
+              artifacts = [json.loads(line) for line in (out / f'"'"'paired-{name}-build.jsonl'"'"').read_text().splitlines()]
+              executable = next(a['"'"'executable'"'"'] for a in artifacts if a.get('"'"'reason'"'"') == '"'"'compiler-artifact'"'"'
+                                and a.get('"'"'executable'"'"') and a['"'"'target'"'"']['"'"'name'"'"'] == '"'"'perf_load'"'"')
+              binaries[name] = root / f'"'"'paired-{name}-perf-load'"'"'
+              shutil.copy2(executable, binaries[name])
+
+          # Both builds are warm before measurement. These are the unchanged, independently built
+          # main/head load tests on the same runner, checkout path, and generated-store recipe.
+          for name, sha in [('"'"'main'"'"', main_sha), ('"'"'head'"'"', head_sha)]:
+              subprocess.run(['"'"'git'"'"', '"'"'checkout'"'"', '"'"'--detach'"'"', sha], check=True)
+              report = out / f'"'"'paired-{name}.json'"'"'
+              env = dict(os.environ, ST_LOAD_GATE='"'"'1'"'"', ST_LOAD_REPORT=str(report),
+                         ST_LOAD_BASELINE=str(root / '"'"'perf-baseline'"'"'),
+                         ST_BENCH_DIR=str(root / '"'"'st-bench'"'"'), TMPDIR=str(root))
+              env.pop('"'"'ST_AGENT'"'"', None)
+              start = time.monotonic()
+              with (out / f'"'"'paired-{name}.log'"'"').open('"'"'w'"'"') as log:
+                  result = subprocess.run([str(binaries[name]), '"'"'daemon_load::'"'"', '"'"'--nocapture'"'"'],
+                                          env=env, stdout=log, stderr=subprocess.STDOUT)
+              reports[name] = json.loads(report.read_text())
+              reports[name]['"'"'source_sha'"'"'] = sha
+              reports[name]['"'"'test_exit'"'"'] = result.returncode
+              reports[name]['"'"'wall_seconds'"'"'] = time.monotonic() - start
+              print(name, sha, '"'"'test exit'"'"', result.returncode, '"'"'cores'"'"', reports[name]['"'"'daemon_cores'"'"'], flush=True)
+
+          main, head = reports['"'"'main'"'"'], reports['"'"'head'"'"']
+          failures = []
+          for name, after in head['"'"'paths'"'"'].items():
+              before = main['"'"'paths'"'"'][name]
+              slack = 50 if min(before['"'"'count'"'"'], after['"'"'count'"'"']) < 50 else 5
+              if after['"'"'p99_ms'"'"'] > before['"'"'p99_ms'"'"'] * 1.2 and after['"'"'p99_ms'"'"'] > before['"'"'p99_ms'"'"'] + slack:
+                  failures.append({'"'"'path'"'"': name, '"'"'main_p99_ms'"'"': before['"'"'p99_ms'"'"'], '"'"'head_p99_ms'"'"': after['"'"'p99_ms'"'"']})
+              if after['"'"'p99_ms'"'"'] > after['"'"'budget_ms'"'"']:
+                  failures.append({'"'"'path'"'"': name, '"'"'absolute_budget_failed'"'"': True})
+          if head['"'"'daemon_cores'"'"'] > main['"'"'daemon_cores'"'"'] * 1.2 and head['"'"'daemon_cores'"'"'] > main['"'"'daemon_cores'"'"'] + .05:
+              failures.append({'"'"'cpu_regression'"'"': True})
+          if head['"'"'daemon_cores'"'"'] > 2 or sum(head['"'"'failed'"'"'].values()) or head['"'"'long_poll_seats'"'"'] != 30:
+              failures.append({'"'"'absolute_cpu_or_request_failure'"'"': True})
+          result = {'"'"'main'"'"': main, '"'"'head'"'"': head, '"'"'direct_pair_failures'"'"': failures,
+                    '"'"'runner_name'"'"': os.environ.get('"'"'RUNNER_NAME'"'"'),
+                    '"'"'note'"'"': '"'"'Direct pair uses unchanged 20% ratio and 5/50 ms slack. Original saved-baseline test exits are retained; this diagnostic does not alter or waive the CI gates.'"'"'}
+          (out / '"'"'paired-comparison.json'"'"').write_text(json.dumps(result, indent=2) + '"'"'\n'"'"')
+          print(json.dumps({'"'"'failures'"'"': failures}, indent=2), flush=True)
+          sys.exit(bool(failures))
+          '
+        id: load
+        env:
+          PAIR_BASE: ${{ inputs.base_sha }}
+          PAIR_HEAD: ${{ inputs.head_sha }}
       - name: Retain the load report, log and timing
         uses: actions/upload-artifact@v4
         if: always()

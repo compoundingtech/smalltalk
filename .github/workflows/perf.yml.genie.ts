@@ -1,35 +1,13 @@
 import { defaultActionlintConfig, githubWorkflow, nixDevelopStep, plainFlakeSetupSteps } from '../../repos/effect-utils/genie/external.ts'
 import { buildEnv, linuxStageRunner, readOnlyBinaryCaches } from './workspace-ci.ts'
 
-const snapshotAttempt = "!cancelled() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (steps.load.outcome == 'success' || steps.load.outcome == 'failure')"
-const snapshotPublished = "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
-const paths = [
-  'crates/smallclaims/**',
-  'crates/st3/src/**',
-  'crates/st3/tests/daemon_*.rs',
-  'crates/st3/tests/perf_load.rs',
-  'crates/st3/Cargo.toml',
-  'Cargo.toml',
-  'Cargo.lock',
-  '.cargo/config.toml',
-  'flake.nix',
-  'flake.lock',
-  'docs/st3/schema.md',
-  'scripts/ci-perf*',
-  'scripts/ci-nix-cache',
-  '.github/workflows/perf.yml',
-]
+const paired = "import json\nimport os\nfrom pathlib import Path\nimport shutil\nimport subprocess\nimport sys\nimport time\n\nmain_sha, head_sha = os.environ['PAIR_BASE'], os.environ['PAIR_HEAD']\nimport re\nassert all(re.fullmatch(r'[0-9a-f]{40}', sha) for sha in [main_sha, head_sha])\nroot = Path(os.environ['RUNNER_TEMP'])\nout = root / 'perf'\nout.mkdir(exist_ok=True)\nreports = {}\nbinaries = {}\nfor name, sha in [('main', main_sha), ('head', head_sha)]:\n    subprocess.run(['git', 'checkout', '--detach', sha], check=True)\n    assert subprocess.check_output(['git', 'status', '--porcelain']).strip() == b''\n    env = dict(os.environ, AGENT_SPEC_REVISION=sha)\n    env.pop('ST_AGENT', None)\n    with (out / f'paired-{name}-build.jsonl').open('w') as log:\n        subprocess.run(['cargo', 'test', '--release', '-p', 'st3', '--features', 'perf-load',\n                        '--test', 'perf_load', '--locked', '--no-run', '--message-format=json'],\n                       env=env, stdout=log, check=True)\n    artifacts = [json.loads(line) for line in (out / f'paired-{name}-build.jsonl').read_text().splitlines()]\n    executable = next(a['executable'] for a in artifacts if a.get('reason') == 'compiler-artifact'\n                      and a.get('executable') and a['target']['name'] == 'perf_load')\n    binaries[name] = root / f'paired-{name}-perf-load'\n    shutil.copy2(executable, binaries[name])\n\n# Both builds are warm before measurement. These are the unchanged, independently built\n# main/head load tests on the same runner, checkout path, and generated-store recipe.\nfor name, sha in [('main', main_sha), ('head', head_sha)]:\n    subprocess.run(['git', 'checkout', '--detach', sha], check=True)\n    report = out / f'paired-{name}.json'\n    env = dict(os.environ, ST_LOAD_GATE='1', ST_LOAD_REPORT=str(report),\n               ST_LOAD_BASELINE=str(root / 'perf-baseline'),\n               ST_BENCH_DIR=str(root / 'st-bench'), TMPDIR=str(root))\n    env.pop('ST_AGENT', None)\n    start = time.monotonic()\n    with (out / f'paired-{name}.log').open('w') as log:\n        result = subprocess.run([str(binaries[name]), 'daemon_load::', '--nocapture'],\n                                env=env, stdout=log, stderr=subprocess.STDOUT)\n    reports[name] = json.loads(report.read_text())\n    reports[name]['source_sha'] = sha\n    reports[name]['test_exit'] = result.returncode\n    reports[name]['wall_seconds'] = time.monotonic() - start\n    print(name, sha, 'test exit', result.returncode, 'cores', reports[name]['daemon_cores'], flush=True)\n\nmain, head = reports['main'], reports['head']\nfailures = []\nfor name, after in head['paths'].items():\n    before = main['paths'][name]\n    slack = 50 if min(before['count'], after['count']) < 50 else 5\n    if after['p99_ms'] > before['p99_ms'] * 1.2 and after['p99_ms'] > before['p99_ms'] + slack:\n        failures.append({'path': name, 'main_p99_ms': before['p99_ms'], 'head_p99_ms': after['p99_ms']})\n    if after['p99_ms'] > after['budget_ms']:\n        failures.append({'path': name, 'absolute_budget_failed': True})\nif head['daemon_cores'] > main['daemon_cores'] * 1.2 and head['daemon_cores'] > main['daemon_cores'] + .05:\n    failures.append({'cpu_regression': True})\nif head['daemon_cores'] > 2 or sum(head['failed'].values()) or head['long_poll_seats'] != 30:\n    failures.append({'absolute_cpu_or_request_failure': True})\nresult = {'main': main, 'head': head, 'direct_pair_failures': failures,\n          'runner_name': os.environ.get('RUNNER_NAME'),\n          'note': 'Direct pair uses unchanged 20% ratio and 5/50 ms slack. Original saved-baseline test exits are retained; this diagnostic does not alter or waive the CI gates.'}\n(out / 'paired-comparison.json').write_text(json.dumps(result, indent=2) + '\\n')\nprint(json.dumps({'failures': failures}, indent=2), flush=True)\nsys.exit(bool(failures))\n"
 
 // Performance always stays on Namespace. Main's successful runs seed durable snapshots and
 // real baseline reports. Each PR can also reuse its own snapshots, outside the dependency-cache pool.
 export default githubWorkflow({
-  name: 'Performance',
-  on: {
-    push: { branches: ['main'], paths },
-    schedule: [{ cron: '23 2 * * *' }],
-    pull_request: { paths },
-    workflow_dispatch: {},
-  },
+  name: 'Performance paired mail backlog',
+  on: { workflow_dispatch: { inputs: { base_sha: { type: 'string', required: true }, head_sha: { type: 'string', required: true } } } },
   permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' },
   concurrency: {
     group: 'perf-${{ github.event.pull_request.number || github.run_id }}',
@@ -81,29 +59,7 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
           // copied to RUNNER_TEMP before measuring: measurements still use the normal disk.
           run: 'if [ ! -s "$RUNNER_TEMP/st-bench/generated-1.sqlite3" ]; then sudo mount -o remount,size=10G /dev/shm; fi',
         },
-        { ...nixDevelopStep({ name: 'Run the release load test', flake: '.#perf', command: ['bash', 'scripts/ci-perf', 'load'] }), id: 'load' },
-        {
-          id: 'cache',
-          name: 'Save build and Nix snapshots',
-          if: snapshotAttempt,
-          run: `if ! python3 scripts/ci-perf-cache check-report; then exit 0; fi
-nix print-dev-env .#perf --profile "$RUNNER_TEMP/perf-shell" > /dev/null
-nix develop .#perf -c env TMPDIR="$RUNNER_TEMP" sccache --show-stats
-CI_PERF_SHELL_ROOT="$RUNNER_TEMP/perf-shell" bash scripts/ci-nix-cache save
-python3 scripts/ci-perf-cache pack`,
-        },
-        {
-          name: 'Retain the build and Nix cache',
-          if: snapshotPublished,
-          uses: 'actions/upload-artifact@v4',
-          with: { name: '${{ env.PERF_BUILD_SNAPSHOT }}', path: '${{ runner.temp }}/perf-snapshots/build.tar.zst', 'compression-level': 0, 'retention-days': 7, 'if-no-files-found': 'error', overwrite: true },
-        },
-        {
-          name: 'Retain the generated stores',
-          if: snapshotPublished,
-          uses: 'actions/upload-artifact@v4',
-          with: { name: '${{ env.PERF_STORES_SNAPSHOT }}', path: '${{ runner.temp }}/perf-snapshots/stores.tar.zst', 'compression-level': 0, 'retention-days': 7, 'if-no-files-found': 'error', overwrite: true },
-        },
+        { ...nixDevelopStep({ name: 'Build both sources and measure main/head on one warm worker', flake: '.#perf', command: ['python3', '-c', paired] }), id: 'load', env: { PAIR_BASE: '${{ inputs.base_sha }}', PAIR_HEAD: '${{ inputs.head_sha }}' } },
         {
           name: 'Retain the load report, log and timing',
           uses: 'actions/upload-artifact@v4',
