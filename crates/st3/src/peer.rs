@@ -11,18 +11,18 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State, OriginalUri, Query};
 use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{DefaultBodyLimit, OriginalUri, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::{SinkExt as _, StreamExt as _};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use notify::Watcher as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::watch;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
 pub use smallclaims::sync::{
     Backend, FleetAuth, Local, MAX_EXCHANGE_BYTES, MAX_MANIFEST_BYTES, WorkerConfig,
@@ -31,7 +31,9 @@ use smallclaims::sync::{dial_targets, signed_error_response_for, signed_response
 
 use crate::client::Client;
 use crate::config::{Config, PeerConfig};
-use crate::fleet::transport::{Fabric, LocalTransports, Route, local_addresses, parse_route, resolve_tool};
+use crate::fleet::transport::{
+    Fabric, LocalTransports, Route, local_addresses, parse_route, resolve_tool,
+};
 use crate::fleet::{FleetView, MemberKey};
 use crate::model::{
     ApiResponse, ReplicaEnvelopeId, ReplicationExchange, ReplicationExportRequest,
@@ -44,6 +46,7 @@ use crate::store::{
     CheckpointAction, CheckpointManifest, CheckpointManifestNeed, CheckpointManifestPage,
     CheckpointManifestRequest,
 };
+mod raw_lease;
 
 /// The peer listener's shared state, with this node's daemon as the store.
 type PeerState = smallclaims::sync::PeerState<MainBackend>;
@@ -104,9 +107,7 @@ pub enum ClientReadOperation {
         parameters: serde_json::Value,
     },
     /// The directory this host gives a new agent that names no workspace.
-    AgentWorkspace {
-        identity: String,
-    },
+    AgentWorkspace { identity: String },
     /// Up to 512 KiB of an attachment from `offset`, from the member that took the upload. The
     /// answer is base64 in JSON with the file's size; the reader asks again until it has it all.
     Blob {
@@ -257,6 +258,26 @@ impl ClientRelay {
     pub fn with_links(mut self, store: Arc<Store>) -> Self {
         self.links = Some(store);
         self
+    }
+
+    pub(crate) fn legacy_authority(&self) -> bool {
+        self.legacy
+    }
+
+    fn accept_raw_watcher(&self, sender: &crate::fleet::Sender) -> Result<()> {
+        let view = self
+            .links
+            .as_ref()
+            .context("raw watch membership authority unavailable")?
+            .fleet_view_for_client()?;
+        crate::fleet::accept(
+            &view,
+            sender,
+            self.peers.iter().any(|peer| peer.name == sender.name),
+            self.legacy,
+        )
+        .map_err(|refusal| anyhow::anyhow!("raw watcher refused: {refusal:?}"))?;
+        Ok(())
     }
 
     /// Whether a read for this host has somewhere to go: the host itself, or a peer that can
@@ -705,86 +726,100 @@ impl ClientRelay {
 
     /// Open a persistent authenticated byte route to the terminal's owning member.
     /// Unlike screen reads this never polls or creates a temporary geometry writer.
-    pub async fn raw_terminal(
+    pub(crate) async fn raw_terminal(
         &self,
         host: &str,
         person: &str,
         terminal_id: &str,
         incarnation: &str,
         mode: st3_client::RawTerminalMode,
-    ) -> Result<tokio::net::UnixStream> {
+        lease: Option<Arc<crate::api::RawTerminalLease>>,
+    ) -> Result<(tokio::net::UnixStream, tokio::sync::mpsc::Sender<Value>)> {
         let target = host.strip_prefix("host/").context("invalid owner host")?;
         let mode = match mode {
             st3_client::RawTerminalMode::Attach => "attach",
             st3_client::RawTerminalMode::Peek => "peek",
         };
-        let path = format!("{RAW_TERMINAL_PATH}?person={}&terminal={}&incarnation={}&mode={mode}",
-            urlencoding::encode(person), urlencoding::encode(terminal_id), urlencoding::encode(incarnation));
+        let mut path = format!(
+            "{RAW_TERMINAL_PATH}?person={}&terminal={}&incarnation={}&mode={mode}",
+            urlencoding::encode(person),
+            urlencoding::encode(terminal_id),
+            urlencoding::encode(incarnation)
+        );
+        if let Some(lease) = &lease {
+            lease.revalidate()?;
+            path.push_str("&binding=");
+            path.push_str(&urlencoding::encode(&serde_json::to_string(
+                &lease.binding,
+            )?));
+        }
         let mut last = None;
-        for peer in self.next_hops(target, &[self.node.clone()]).into_iter().filter(|peer| peer.name == target) {
+        for peer in self
+            .next_hops(target, &[self.node.clone()])
+            .into_iter()
+            .filter(|peer| peer.name == target)
+        {
             let result = async {
                 let url = match parse_route(&peer.url).context("invalid raw terminal route")? {
                     Route::Http(url) => url,
                     Route::Fabric { node, protocol } => {
-                        let address = self.fabric.as_ref().context("Fabric unavailable")?.dial(&node, &protocol).await?;
+                        let address = self
+                            .fabric
+                            .as_ref()
+                            .context("Fabric unavailable")?
+                            .dial(&node, &protocol)
+                            .await?;
                         format!("http://{address}")
                     }
                 };
-                let base = url.strip_prefix("http://").context("peer byte transport requires HTTP")?;
-                let mut request = format!("ws://{}{path}", base.trim_end_matches('/')).into_client_request()?;
-                request.headers_mut().extend(self.auth.request_headers_method("GET", &path, &self.node, &[])?);
+                let base = url
+                    .strip_prefix("http://")
+                    .context("peer byte transport requires HTTP")?;
+                let mut request =
+                    format!("ws://{}{path}", base.trim_end_matches('/')).into_client_request()?;
+                request
+                    .headers_mut()
+                    .extend(
+                        self.auth
+                            .request_headers_method("GET", &path, &self.node, &[])?,
+                    );
                 let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-                    .max_message_size(Some(64 * 1024)).max_frame_size(Some(64 * 1024));
-                let (socket, response) = tokio::time::timeout(CLIENT_READ_TIMEOUT, tokio_tungstenite::connect_async_with_config(request, Some(config), false)).await??;
-                let sender = self.auth.verify_sender(response.headers(), "RESPONSE", &path, &[], Some(&peer.name), Some(&FleetAuth::body_digest(&[])))?;
-                let view = self.links.as_ref().and_then(|store| store.fleet_view_sealed().ok()).unwrap_or_default();
-                crate::fleet::accept(&view, &sender, self.peers.iter().any(|peer| peer.name == sender.name), self.legacy)
-                    .map_err(|refusal| anyhow::anyhow!("raw terminal member refused: {refusal:?}"))?;
-                let (client, bridge) = tokio::net::UnixStream::pair()?;
-                let bridge = bridge.into_std()?;
-                let monitor = tokio::io::unix::AsyncFd::new(bridge.try_clone()?)?;
-                let bridge = tokio::net::UnixStream::from_std(bridge)?;
-                tokio::spawn(async move {
-                    let (mut sink, mut source) = socket.split();
-                    let (mut reader, mut writer) = bridge.into_split();
-                    let flush = tokio::sync::Notify::new();
-                    let upload = async {
-                        let mut bytes = [0_u8; 16 * 1024];
-                        loop {
-                            tokio::select! {
-                                read = reader.read(&mut bytes) => {
-                                    let Ok(count) = read else { break; };
-                                    if count == 0 || sink.send(tokio_tungstenite::tungstenite::Message::Binary(bytes[..count].to_vec().into())).await.is_err() { break; }
-                                }
-                                () = flush.notified() => {
-                                    if sink.flush().await.is_err() { break; }
-                                }
-                            }
-                        }
-                    };
-                    let download = async {
-                        while let Some(Ok(message)) = source.next().await {
-                            match message {
-                                tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
-                                    if writer.write_all(&bytes).await.is_err() { break; }
-                                }
-                                tokio_tungstenite::tungstenite::Message::Ping(_) => flush.notify_one(),
-                                tokio_tungstenite::tungstenite::Message::Pong(_) => {}
-                                _ => break,
-                            }
-                        }
-                    };
-                    let closed = async {
-                        loop {
-                            let Ok(mut ready) = monitor.readable().await else { break; };
-                            if ready.ready().is_read_closed() || ready.ready().is_error() { break; }
-                            ready.clear_ready();
-                        }
-                    };
-                    tokio::select! { () = upload => {}, () = download => {}, () = closed => {} }
-                });
-                Ok::<_, anyhow::Error>(client)
-            }.await;
+                    .max_message_size(Some(64 * 1024))
+                    .max_frame_size(Some(64 * 1024));
+                let (socket, response) = tokio::time::timeout(
+                    CLIENT_READ_TIMEOUT,
+                    tokio_tungstenite::connect_async_with_config(request, Some(config), false),
+                )
+                .await??;
+                let sender = self.auth.verify_sender(
+                    response.headers(),
+                    "RESPONSE",
+                    &path,
+                    &[],
+                    Some(&peer.name),
+                    Some(&FleetAuth::body_digest(&[])),
+                )?;
+                let view = self
+                    .links
+                    .as_ref()
+                    .and_then(|store| store.fleet_view_sealed().ok())
+                    .unwrap_or_default();
+                crate::fleet::accept(
+                    &view,
+                    &sender,
+                    self.peers.iter().any(|peer| peer.name == sender.name),
+                    self.legacy,
+                )
+                .map_err(|refusal| anyhow::anyhow!("raw terminal member refused: {refusal:?}"))?;
+                raw_lease::gateway_bridge(
+                    socket,
+                    lease.clone(),
+                    self.clone(),
+                    peer.name.clone(),
+                    sender.member_key,
+                )
+            }
+            .await;
             match result {
                 Ok(stream) => return Ok(stream),
                 Err(error) => last = Some(error),
@@ -879,6 +914,7 @@ struct RawTerminalQuery {
     terminal: String,
     incarnation: String,
     mode: st3_client::RawTerminalMode,
+    binding: Option<String>,
 }
 
 async fn receive_raw_terminal(
@@ -888,35 +924,106 @@ async fn receive_raw_terminal(
     Query(query): Query<RawTerminalQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let path = uri.path_and_query().map_or(uri.path(), |value| value.as_str());
-    if path.len() > 16_384 || !query.person.starts_with("person/") || query.person.matches('/').count() != 1 {
+    let path = uri
+        .path_and_query()
+        .map_or(uri.path(), |value| value.as_str());
+    if path.len() > 16_384
+        || !query.person.starts_with("person/")
+        || query.person.matches('/').count() != 1
+    {
         return (StatusCode::BAD_REQUEST, "invalid raw terminal route").into_response();
     }
-    let _sender = match state.auth().verify_sender(&headers, "GET", path, &[], None, None) {
+    let _sender = match state
+        .auth()
+        .verify_sender(&headers, "GET", path, &[], None, None)
+    {
         Ok(sender) if state.accept(&sender).is_ok() => sender,
         _ => return (StatusCode::UNAUTHORIZED, "untrusted raw terminal member").into_response(),
     };
+    if query.mode == st3_client::RawTerminalMode::Peek {
+        let binding: crate::api::RawTerminalLeaseBinding = match query
+            .binding
+            .as_deref()
+            .and_then(|binding| serde_json::from_str(binding).ok())
+        {
+            Some(binding) => binding,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "PEEK route requires original lease binding",
+                )
+                    .into_response();
+            }
+        };
+        if binding.gateway_member_key != _sender.member_key
+            || binding.owner_member_key.as_deref() != state.auth().member_key()
+            || binding.gateway != format!("host/{}", _sender.name)
+            || binding.owner != format!("host/{}", state.node())
+            || binding.person != query.person
+            || binding.terminal != query.terminal
+            || binding.incarnation != query.incarnation
+            || binding.mode != "peek"
+        {
+            return (StatusCode::FORBIDDEN, "raw lease route binding differs").into_response();
+        }
+        return raw_lease::receive_owner(
+            websocket,
+            state,
+            path.to_owned(),
+            binding,
+            _sender.member_key,
+        )
+        .await;
+    }
     // The owner daemon validates its current graph incarnation and person authority, then
     // connects once. The peer worker carries that one connection, not synthetic screens.
     let client = st3_client::Client::unix_as(state.backend().socket(), &query.person);
     let transport = async {
-        let attachment = client.raw_terminal_attachment(&query.terminal, &query.incarnation, query.mode).await?;
+        let attachment = client
+            .raw_terminal_attachment(&query.terminal, &query.incarnation, query.mode)
+            .await?;
         if attachment.owner_host_id != format!("host/{}", state.node()) {
-            return Err(st3_client::ClientError::Protocol("raw terminal route is not owner-local".into()));
+            return Err(st3_client::ClientError::Protocol(
+                "raw terminal route is not owner-local".into(),
+            ));
         }
         client.raw_terminal_stream(&attachment).await
-    }.await;
+    }
+    .await;
     let transport = match transport {
         Ok(transport) => transport,
-        Err(st3_client::ClientError::Api(_, _, _)) => return (StatusCode::CONFLICT, "owner rejected raw terminal incarnation or authority").into_response(),
-        Err(_) => return (StatusCode::BAD_GATEWAY, "owner raw terminal unavailable").into_response(),
+        Err(st3_client::ClientError::Api(_, _, _)) => {
+            return (
+                StatusCode::CONFLICT,
+                "owner rejected raw terminal incarnation or authority",
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (StatusCode::BAD_GATEWAY, "owner raw terminal unavailable").into_response();
+        }
     };
-    let signed = match state.auth().response_headers_for(path, state.node(), &[], &FleetAuth::body_digest(&[])) {
+    let signed = match state.auth().response_headers_for(
+        path,
+        state.node(),
+        &[],
+        &FleetAuth::body_digest(&[]),
+    ) {
         Ok(headers) => headers,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "raw terminal signature failed").into_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "raw terminal signature failed",
+            )
+                .into_response();
+        }
     };
-    let mut response = websocket.max_message_size(64 * 1024).max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| crate::api::raw_terminal_splice(socket, transport, None));
+    let mut response = websocket
+        .max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .on_upgrade(move |socket| {
+            crate::api::raw_terminal_splice(socket, transport, None, None, None)
+        });
     response.headers_mut().extend(signed);
     response
 }
@@ -982,7 +1089,8 @@ async fn receive_client_read(
                 return forward_client_read(&state, &request).await;
             }
         }
-        let client = st3_client::Client::unix_as(state.backend().socket(), &request.authority_actor);
+        let client =
+            st3_client::Client::unix_as(state.backend().socket(), &request.authority_actor);
         match request.request {
             ClientReadOperation::ConversationChanges {
                 session_id,
@@ -1265,7 +1373,12 @@ impl MainBackend {
 impl Backend for MainBackend {
     async fn ready(&self) {
         loop {
-            if self.client.get::<serde_json::Value>("/v1/health").await.is_ok() {
+            if self
+                .client
+                .get::<serde_json::Value>("/v1/health")
+                .await
+                .is_ok()
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1364,7 +1477,10 @@ impl Backend for MainBackend {
             .await
     }
 
-    async fn adopt_checkpoint(&self, manifest: &CheckpointManifest) -> Result<Vec<CheckpointAction>> {
+    async fn adopt_checkpoint(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<Vec<CheckpointAction>> {
         self.client
             .post("/v1/internal/replication/checkpoint-adopt", manifest)
             .await
@@ -1484,8 +1600,8 @@ mod tests {
     use sha2::{Digest as _, Sha256};
     use smallclaims::fleet::MemberKey;
     use smallclaims::sync::{
-        FleetContext, PeerState, exchange, fetch_checkpoint_manifest, heal,
-        peer_router, replication_http_client,
+        FleetContext, PeerState, exchange, fetch_checkpoint_manifest, heal, peer_router,
+        replication_http_client,
     };
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt as _;
@@ -1516,6 +1632,7 @@ mod tests {
     }
 
     include!("peer/raw_terminal_tests.rs");
+    include!("peer/raw_lease_tests.rs");
 
     #[tokio::test]
     async fn a_gateway_streams_a_remote_terminal_through_owner_long_polls() {
@@ -1565,8 +1682,8 @@ mod tests {
 
         // The owner's PTY session: a replay on PEEK, then whatever output the test writes.
         fs::create_dir_all(&owner.pty_root).unwrap();
-        let sessions = tokio::net::UnixListener::bind(owner.pty_root.join("remote-runtime.sock"))
-            .unwrap();
+        let sessions =
+            tokio::net::UnixListener::bind(owner.pty_root.join("remote-runtime.sock")).unwrap();
         let (output, _) = tokio::sync::broadcast::channel::<Vec<u8>>(16);
         let session_output = output.clone();
         tokio::spawn(async move {
@@ -1581,8 +1698,14 @@ mod tests {
                     };
                     let mut peek = [0_u8; 6];
                     if stream.read_exact(&mut peek).await.is_err()
-                        || stream.write_all(&packet(10, &[0, 24, 0, 80])).await.is_err()
-                        || stream.write_all(&packet(5, b"owner shell\r\n$ ")).await.is_err()
+                        || stream
+                            .write_all(&packet(10, &[0, 24, 0, 80]))
+                            .await
+                            .is_err()
+                        || stream
+                            .write_all(&packet(5, b"owner shell\r\n$ "))
+                            .await
+                            .is_err()
                     {
                         return;
                     }
@@ -1599,10 +1722,17 @@ mod tests {
         let main_socket = owner_socket.clone();
         let owner_app = crate::api::router(owner.clone());
         tokio::spawn(async move { crate::api::serve_unix(&main_socket, owner_app).await });
-        let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "owner-node".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["gateway-node".into()])));
+        let peer = PeerState::new(
+            MainBackend::new(owner_socket.to_path_buf()),
+            "owner-node".into(),
+            FleetAuth::test("fleet-test", &[7; 32]),
+            FleetContext::legacy(BTreeSet::from(["gateway-node".into()])),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(
+            async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await },
+        );
 
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
@@ -1808,10 +1938,17 @@ mod tests {
         let main_socket = owner_socket.clone();
         let owner_app = crate::api::router(owner.clone());
         tokio::spawn(async move { crate::api::serve_unix(&main_socket, owner_app).await });
-        let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "owner-node".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["gateway-node".into()])));
+        let peer = PeerState::new(
+            MainBackend::new(owner_socket.to_path_buf()),
+            "owner-node".into(),
+            FleetAuth::test("fleet-test", &[7; 32]),
+            FleetContext::legacy(BTreeSet::from(["gateway-node".into()])),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(
+            async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await },
+        );
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1927,10 +2064,17 @@ mod tests {
         let main_socket = owner_socket.clone();
         let owner_app = crate::api::router(owner);
         tokio::spawn(async move { crate::api::serve_unix(&main_socket, owner_app).await });
-        let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "owner-node".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["gateway-node".into()])));
+        let peer = PeerState::new(
+            MainBackend::new(owner_socket.to_path_buf()),
+            "owner-node".into(),
+            FleetAuth::test("fleet-test", &[7; 32]),
+            FleetContext::legacy(BTreeSet::from(["gateway-node".into()])),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(
+            async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await },
+        );
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2021,10 +2165,17 @@ mod tests {
         let main_socket = owner_socket.clone();
         let owner_app = crate::api::router(owner);
         tokio::spawn(async move { crate::api::serve_unix(&main_socket, owner_app).await });
-        let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "owner-node".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["gateway-node".into()])));
+        let peer = PeerState::new(
+            MainBackend::new(owner_socket.to_path_buf()),
+            "owner-node".into(),
+            FleetAuth::test("fleet-test", &[7; 32]),
+            FleetContext::legacy(BTreeSet::from(["gateway-node".into()])),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(
+            async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await },
+        );
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2082,7 +2233,10 @@ mod tests {
         assert_eq!(message.attachments[0].origin, "host/owner-node");
 
         // Sync carries the claim to the gateway; the bytes are not part of it.
-        for claim in owner_store.claims_for(&message.subject, Some("message.sent")).unwrap() {
+        for claim in owner_store
+            .claims_for(&message.subject, Some("message.sent"))
+            .unwrap()
+        {
             gateway_store
                 .append_claim(&crate::model::ClaimInput {
                     subject: message.subject.clone(),
@@ -2116,7 +2270,10 @@ mod tests {
                     .await
                     .unwrap();
                 let status = response.status();
-                (status, to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                (
+                    status,
+                    to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                )
             }
         };
         // A seat on the gateway gets the file written where its harness can open it.
@@ -2132,14 +2289,30 @@ mod tests {
         .unwrap();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].name.as_deref(), Some("paste.png"));
-        assert_eq!(fs::read(notices[0].path.as_deref().unwrap()).unwrap(), image);
-        assert!(notices[0].path.as_deref().unwrap().ends_with(&format!("{hash}.png")));
+        assert_eq!(
+            fs::read(notices[0].path.as_deref().unwrap()).unwrap(),
+            image
+        );
+        assert!(
+            notices[0]
+                .path
+                .as_deref()
+                .unwrap()
+                .ends_with(&format!("{hash}.png"))
+        );
         fs::remove_file(BlobDir::under(gateway_root.path()).path(&hash)).unwrap();
         let (status, bytes) = read("person/avery", message.subject.clone()).await;
-        assert!(status.is_success(), "{}", String::from_utf8_lossy(&bytes[..bytes.len().min(300)]));
+        assert!(
+            status.is_success(),
+            "{}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(300)])
+        );
         assert_eq!(bytes.as_ref(), image.as_slice());
         assert_eq!(
-            BlobDir::under(gateway_root.path()).read(&hash).unwrap().unwrap(),
+            BlobDir::under(gateway_root.path())
+                .read(&hash)
+                .unwrap()
+                .unwrap(),
             image,
             "the gateway keeps a copy for its own readers"
         );
@@ -2151,7 +2324,10 @@ mod tests {
         fs::remove_file(BlobDir::under(gateway_root.path()).path(&hash)).unwrap();
         let (status, bytes) = read("person/avery", message.subject.clone()).await;
         assert_eq!(status, StatusCode::GONE);
-        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["code"], "blob-expired");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["code"],
+            "blob-expired"
+        );
         // An owner that cannot be reached is a different answer.
         let message_elsewhere = {
             let mut fields = owner_store
@@ -2175,7 +2351,10 @@ mod tests {
         };
         let (status, bytes) = read("person/avery", message_elsewhere).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["code"], "remote-unavailable");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["code"],
+            "remote-unavailable"
+        );
     }
 
     #[tokio::test]
@@ -2319,11 +2498,18 @@ mod tests {
         // Each node: its daemon on a Unix socket, and a replication worker that accepts the
         // node before it in the chain.
         let serve_worker = |node: &str, accepts: &str, socket: &Path| {
-            let peer = PeerState::new(MainBackend::new(PathBuf::from(socket)), node.into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from([accepts.into()])));
+            let peer = PeerState::new(
+                MainBackend::new(PathBuf::from(socket)),
+                node.into(),
+                FleetAuth::test("fleet-test", &[7; 32]),
+                FleetContext::legacy(BTreeSet::from([accepts.into()])),
+            );
             async move {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
-                tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+                tokio::spawn(async move {
+                    axum::serve(listener, peer_router(peer, smalltalk_routes())).await
+                });
                 address
             }
         };
@@ -2627,7 +2813,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let auth = FleetAuth::test("fleet-test", &[5; 32]);
-        let peer = PeerState::new(MainBackend::new(socket.to_path_buf()), "middle".into(), auth.clone(), FleetContext::legacy(BTreeSet::from(["near".into()])));
+        let peer = PeerState::new(
+            MainBackend::new(socket.to_path_buf()),
+            "middle".into(),
+            auth.clone(),
+            FleetContext::legacy(BTreeSet::from(["near".into()])),
+        );
         let send = |route: ClientReadRoute| {
             let body = serde_json::to_vec(&ClientReadRequest {
                 authority_actor: "person/test".into(),
@@ -2949,10 +3140,17 @@ mod tests {
         let served_owner = owner_socket.clone();
         let owner_app = crate::api::router(owner.clone());
         tokio::spawn(async move { crate::api::serve_unix(&served_owner, owner_app).await });
-        let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "conversation-owner".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["conversation-gateway".into()])));
+        let peer = PeerState::new(
+            MainBackend::new(owner_socket.to_path_buf()),
+            "conversation-owner".into(),
+            FleetAuth::test("fleet-test", &[7; 32]),
+            FleetContext::legacy(BTreeSet::from(["conversation-gateway".into()])),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(
+            async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await },
+        );
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
@@ -3136,7 +3334,12 @@ mod tests {
         }
         assert!(socket.exists());
         let auth = FleetAuth::test("fleet-test", &[4; 32]);
-        let peer = PeerState::new(MainBackend::new(socket.to_path_buf()), "owner".into(), auth.clone(), FleetContext::legacy(BTreeSet::from(["source".into()])));
+        let peer = PeerState::new(
+            MainBackend::new(socket.to_path_buf()),
+            "owner".into(),
+            auth.clone(),
+            FleetContext::legacy(BTreeSet::from(["source".into()])),
+        );
         let body = serde_json::to_vec(&ClientReadRequest {
             authority_actor: "person/test".into(),
             relay: None,
@@ -3155,7 +3358,10 @@ mod tests {
         *request.headers_mut() = auth
             .request_headers_for(CLIENT_READ_PATH, "source", &body)
             .unwrap();
-        let response = peer_router(peer.clone(), smalltalk_routes()).oneshot(request).await.unwrap();
+        let response = peer_router(peer.clone(), smalltalk_routes())
+            .oneshot(request)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let headers = response.headers().clone();
         let bytes = to_bytes(response.into_body(), MAX_CLIENT_READ_BYTES)
@@ -3187,7 +3393,10 @@ mod tests {
         *rejected.headers_mut() = auth
             .request_headers_for(CLIENT_READ_PATH, "unconfigured", &body)
             .unwrap();
-        let response = peer_router(peer, smalltalk_routes()).oneshot(rejected).await.unwrap();
+        let response = peer_router(peer, smalltalk_routes())
+            .oneshot(rejected)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         server.abort();
     }
@@ -3231,8 +3440,14 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let state = PeerState::new(Local(target.clone()), "target".into(), auth.clone(), FleetContext::legacy(BTreeSet::from(["source".into()])));
-        let server = tokio::spawn(axum::serve(listener, peer_router(state, Router::new())).into_future());
+        let state = PeerState::new(
+            Local(target.clone()),
+            "target".into(),
+            auth.clone(),
+            FleetContext::legacy(BTreeSet::from(["source".into()])),
+        );
+        let server =
+            tokio::spawn(axum::serve(listener, peer_router(state, Router::new())).into_future());
         let peer = PeerConfig {
             name: "target".into(),
             url: format!("http://{address}"),
@@ -3347,8 +3562,14 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let state = PeerState::new(Local(alder.clone()), "alder".into(), auth.clone(), FleetContext::legacy(BTreeSet::from(["cedar".into()])));
-        let server = tokio::spawn(axum::serve(listener, peer_router(state, Router::new())).into_future());
+        let state = PeerState::new(
+            Local(alder.clone()),
+            "alder".into(),
+            auth.clone(),
+            FleetContext::legacy(BTreeSet::from(["cedar".into()])),
+        );
+        let server =
+            tokio::spawn(axum::serve(listener, peer_router(state, Router::new())).into_future());
         let peer = PeerConfig {
             name: "alder".into(),
             url: format!("http://{address}"),
@@ -3358,17 +3579,10 @@ mod tests {
         let http = replication_http_client();
         let dialer = FleetContext::legacy(BTreeSet::from(["alder".into()]));
         for _ in 0..10 {
-            let moved = exchange(
-                &http,
-                &Local(cedar.clone()),
-                "cedar",
-                &peer,
-                &auth,
-                &dialer,
-            )
-            .await
-            .unwrap()
-            .0;
+            let moved = exchange(&http, &Local(cedar.clone()), "cedar", &peer, &auth, &dialer)
+                .await
+                .unwrap()
+                .0;
             if !moved {
                 break;
             }
@@ -3427,8 +3641,16 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let state = PeerState::new(Local(source.clone()), "source".into(), auth.clone(), FleetContext::legacy(BTreeSet::from(["target".into()])));
-        let server = tokio::spawn(async move { axum::serve(listener, peer_router(state, Router::new())).await });
+        let state = PeerState::new(
+            Local(source.clone()),
+            "source".into(),
+            auth.clone(),
+            FleetContext::legacy(BTreeSet::from(["target".into()])),
+        );
+        let server =
+            tokio::spawn(
+                async move { axum::serve(listener, peer_router(state, Router::new())).await },
+            );
         let peer = PeerConfig {
             name: "source".into(),
             url: format!("http://{address}"),
@@ -3673,9 +3895,15 @@ mod tests {
             )
             .is_empty()
         );
-        let state = PeerState::new(MainBackend::new(sockets[1].to_path_buf()), "target".into(), auth.clone(), FleetContext::legacy(BTreeSet::from(["source".into()])));
-        let peer_server =
-            tokio::spawn(async move { axum::serve(listener, peer_router(state, smalltalk_routes())).await });
+        let state = PeerState::new(
+            MainBackend::new(sockets[1].to_path_buf()),
+            "target".into(),
+            auth.clone(),
+            FleetContext::legacy(BTreeSet::from(["source".into()])),
+        );
+        let peer_server = tokio::spawn(async move {
+            axum::serve(listener, peer_router(state, smalltalk_routes())).await
+        });
         let peer = PeerConfig {
             name: "target".into(),
             url: format!("http://{address}"),
@@ -3683,16 +3911,9 @@ mod tests {
         let backend = MainBackend::new(sockets[0].to_path_buf());
         let context = FleetContext::legacy(BTreeSet::from(["target".into()]));
         let http = replication_http_client();
-        exchange(
-            &http,
-            &backend,
-            "source",
-            &peer,
-            &auth,
-            &context,
-        )
-        .await
-        .unwrap();
+        exchange(&http, &backend, "source", &peer, &auth, &context)
+            .await
+            .unwrap();
         assert!(
             target
                 .latest_claim("host/target", Some("transport.observed"))
@@ -3702,16 +3923,9 @@ mod tests {
         target
             .record_transport_observation("source", "up", None, None)
             .unwrap();
-        exchange(
-            &http,
-            &backend,
-            "source",
-            &peer,
-            &auth,
-            &context,
-        )
-        .await
-        .unwrap();
+        exchange(&http, &backend, "source", &peer, &auth, &context)
+            .await
+            .unwrap();
         assert!(
             source
                 .latest_claim("host/source", Some("transport.observed"))
@@ -3733,5 +3947,4 @@ mod tests {
             server.abort();
         }
     }
-
 }

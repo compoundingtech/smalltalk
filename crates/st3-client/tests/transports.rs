@@ -192,7 +192,8 @@ impl FakePty {
                             () = uploads => {}
                             () = downloads => {}
                         }
-                    }.await;
+                    }
+                    .await;
                     closed.notify_one();
                 });
             }
@@ -281,7 +282,9 @@ async fn assert_raw_terminal_transport(
         "a consumed capability must not open a second connector",
     );
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), input.recv()).await.is_err(),
+        tokio::time::timeout(Duration::from_millis(100), input.recv())
+            .await
+            .is_err(),
         "the consumer, not the transport, must send the opening PTY frame",
     );
     let opening = match mode {
@@ -293,7 +296,9 @@ async fn assert_raw_terminal_transport(
     stream.write_all(&opening[2..]).await.unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), input.recv())
-            .await.unwrap().unwrap(),
+            .await
+            .unwrap()
+            .unwrap(),
         opening,
     );
     let mut expected = Vec::new();
@@ -303,7 +308,9 @@ async fn assert_raw_terminal_transport(
     expected.extend(pty_packet(5, replay));
     let mut received = vec![0; expected.len()];
     tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(received, expected);
 
     let upload = match mode {
@@ -316,7 +323,9 @@ async fn assert_raw_terminal_transport(
         while uploaded.len() < upload.len() {
             uploaded.extend(input.recv().await.unwrap());
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert_eq!(uploaded, upload);
 
     let output = b"\0\xff\x1b[?1049h\x1b[38;2;1;2;3mraw\r\n";
@@ -325,27 +334,36 @@ async fn assert_raw_terminal_transport(
     let expected = pty_packet(0, output);
     let mut received = vec![0; expected.len()];
     tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
-        .await.unwrap().unwrap();
-    assert_eq!(received, expected, "output must remain PTY bytes, not a screen projection");
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        received, expected,
+        "output must remain PTY bytes, not a screen projection"
+    );
     pty.exit();
     let mut exit = [0_u8; 9];
     tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut exit))
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(exit.as_slice(), pty_packet(4, &0_i32.to_be_bytes()));
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0_u8; 1]))
-            .await.unwrap().unwrap(),
+            .await
+            .unwrap()
+            .unwrap(),
         0,
         "the remote PTY close must reach the returned connector",
     );
     tokio::time::timeout(Duration::from_secs(5), pty.closed.notified())
-        .await.unwrap();
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn raw_terminal_bytes_capability_replay_and_close_over_unix() {
-    let (_root, state, pty, client, server) =
-        serve_terminal_state("raw-client-unix", 24, 80).await;
+    let (_root, state, pty, client, server) = serve_terminal_state("raw-client-unix", 24, 80).await;
     let incarnation = format!("{}:2026-09-30T00:00:00.000Z", std::process::id());
     publish_terminal(&state, &incarnation);
     let mut replay = b"terminal ready\r\n$ ".to_vec();
@@ -356,30 +374,63 @@ async fn raw_terminal_bytes_capability_replay_and_close_over_unix() {
 }
 
 #[tokio::test]
-async fn dropping_a_raw_connector_closes_a_backpressured_attachment() {
+async fn dropping_a_controlled_raw_connector_closes_a_backpressured_attachment() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    let (_root, state, pty, client, server) =
-        serve_terminal_state("raw-client-drop", 24, 80).await;
+    let (_root, state, pty, client, server) = serve_terminal_state("raw-client-drop", 24, 80).await;
     let incarnation = format!("{}:2026-09-30T00:00:00.000Z", std::process::id());
     publish_terminal(&state, &incarnation);
     let attachment = client
-        .raw_terminal_attachment("terminal/agent/terminal-demo", &incarnation, RawTerminalMode::Peek)
-        .await.unwrap();
-    let mut stream = client.raw_terminal_stream(&attachment).await.unwrap();
+        .raw_terminal_attachment(
+            "terminal/agent/terminal-demo",
+            &incarnation,
+            RawTerminalMode::Peek,
+        )
+        .await
+        .unwrap();
+    let controlled = client
+        .raw_terminal_stream_controlled(&attachment)
+        .await
+        .unwrap();
+    let activity = controlled.activity;
+    let retained_activity = activity.clone();
+    let mut stream = controlled.stream;
     stream.write_all(&pty_packet(6, &[0])).await.unwrap();
-    let replay = [pty_packet(10, &[0, 24, 0, 80]), pty_packet(5, b"terminal ready\r\n$ ")].concat();
+    let replay = [
+        pty_packet(10, &[0, 24, 0, 80]),
+        pty_packet(5, b"terminal ready\r\n$ "),
+    ]
+    .concat();
     let mut received = vec![0_u8; replay.len()];
     tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(received, replay);
     pty.write(&vec![0xff; 8 * 1024 * 1024]);
     let mut first = [0_u8; 1];
     tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut first))
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(first, [0]);
     drop(stream);
     tokio::time::timeout(Duration::from_secs(5), pty.closed.notified())
-        .await.expect("dropping a slow consumer must release the PTY connection");
+        .await
+        .expect("dropping a slow consumer must release the PTY connection");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), activity.selected_use())
+            .await
+            .unwrap()
+            .is_err(),
+        "dropping the byte connector must close renewal even when activity handles survive",
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), retained_activity.selected_use())
+            .await
+            .unwrap()
+            .is_err(),
+        "activity clones must not retain the bridge",
+    );
     server.abort();
 }
 
@@ -389,31 +440,36 @@ async fn raw_terminal_bytes_capability_replay_and_close_over_paired_gateways() {
         serve_terminal_state("raw-client-paired", 24, 80).await;
     let incarnation = format!("{}:2026-09-30T00:00:00.000Z", std::process::id());
     publish_terminal(&state, &incarnation);
-    let challenge = local.pairing_begin(&PairingBegin {
-        api_version: st3_client::API_VERSION.into(),
-        device_name: "Raw terminal device".into(),
-        person_id: "person/avery".into(),
-        full_control: Some(true),
-    }).await.unwrap();
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Raw terminal device".into(),
+            person_id: "person/avery".into(),
+            full_control: Some(true),
+        })
+        .await
+        .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = st3::api::fabric_router(state.clone());
     let http_server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let paired = Client::fabric_pairing(&base).pairing_complete(
-        &challenge.value.pairing_id,
-        &PairingComplete {
-            api_version: st3_client::API_VERSION.into(),
-            code: challenge.value.code,
-            device_public_key: "raw-terminal-public-key-000000000000000000000".into(),
-            key_storage: None,
-        },
-    ).await.unwrap();
+    let paired = Client::fabric_pairing(&base)
+        .pairing_complete(
+            &challenge.value.pairing_id,
+            &PairingComplete {
+                api_version: st3_client::API_VERSION.into(),
+                code: challenge.value.code,
+                device_public_key: "raw-terminal-public-key-000000000000000000000".into(),
+                key_storage: None,
+            },
+        )
+        .await
+        .unwrap();
     let gateway_socket = state.state_dir.join("raw-client-gateway.sock");
     let server_socket = gateway_socket.clone();
     let app = st3::api::fabric_router(state);
-    let gateway_server = tokio::spawn(async move {
-        st3::api::serve_unix(&server_socket, app).await
-    });
+    let gateway_server =
+        tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
     wait_for_socket(&gateway_socket).await;
     let clients = [
         Client::unix_gateway(&gateway_socket, &paired.value.credential),
@@ -430,7 +486,13 @@ async fn raw_terminal_bytes_capability_replay_and_close_over_paired_gateways() {
         Client::fabric_loopback(&base, "invalid-credential"),
     ] {
         assert!(matches!(
-            client.raw_terminal_attachment("terminal/agent/terminal-demo", &incarnation, RawTerminalMode::Peek).await,
+            client
+                .raw_terminal_attachment(
+                    "terminal/agent/terminal-demo",
+                    &incarnation,
+                    RawTerminalMode::Peek
+                )
+                .await,
             Err(ClientError::Api(ErrorCode::Forbidden, _, _)),
         ));
     }
@@ -573,10 +635,9 @@ async fn terminal_stream_sends_changed_screens_and_nothing_while_idle() {
     );
 
     let attachment = attach_terminal(&client, "stream-exit").await;
-    let (mut stream, reconnected) =
-        first_screen(&client, &attachment, "terminal-demo-runtime:i2")
-            .await
-            .unwrap();
+    let (mut stream, reconnected) = first_screen(&client, &attachment, "terminal-demo-runtime:i2")
+        .await
+        .unwrap();
     assert_eq!(reconnected.value.lines[1].text, "$ echo hi");
     pty.exit();
     let ended = tokio::time::timeout(Duration::from_secs(5), stream.next())
@@ -961,7 +1022,10 @@ mission "example/definition" state="ready" {
 }
 "#;
     let intent = st3::graph::parse_intent(source, "client-definition").unwrap();
-    state.store.apply_internal(&intent, "definition-fixture").unwrap();
+    state
+        .store
+        .apply_internal(&intent, "definition-fixture")
+        .unwrap();
     // An observed runtime alone has no desired declaration to reconstruct.
     publish_terminal(&state, "terminal-demo-runtime:i1");
     let app = st3::api::router(state.clone());
@@ -979,12 +1043,30 @@ mission "example/definition" state="ready" {
         st3::graph::redact_agent_env_values(&mut redacted);
         assert_eq!(serde_json::to_value(&definition.desired).unwrap(), redacted);
         let reparsed = st3::graph::parse_intent(&definition.kdl, "client-definition").unwrap();
-        assert_eq!(reparsed.subjects[subject].desired, redacted, "{}", definition.kdl);
-        assert!(!serde_json::to_string(&definition).unwrap().contains("fixture-secret"));
+        assert_eq!(
+            reparsed.subjects[subject].desired, redacted,
+            "{}",
+            definition.kdl
+        );
+        assert!(
+            !serde_json::to_string(&definition)
+                .unwrap()
+                .contains("fixture-secret")
+        );
         let status = state.store.status(Some(subject)).unwrap();
-        let status = status.subjects.iter().find(|item| item.subject == subject).unwrap();
-        assert_eq!(Some(&definition.desired_revision), status.desired_revision.as_ref());
-        assert_eq!(Some(&definition.desired_token), status.desired_token.as_ref());
+        let status = status
+            .subjects
+            .iter()
+            .find(|item| item.subject == subject)
+            .unwrap();
+        assert_eq!(
+            Some(&definition.desired_revision),
+            status.desired_revision.as_ref()
+        );
+        assert_eq!(
+            Some(&definition.desired_token),
+            status.desired_token.as_ref()
+        );
         assert_eq!(definition.conflicts, status.conflicts);
         assert_eq!(response.snapshot.store_index, state.store.index().unwrap());
 
@@ -994,16 +1076,30 @@ mission "example/definition" state="ready" {
             Err(ClientError::Api(ErrorCode::Forbidden, _, _))
         ));
         let person = Client::unix_as(&socket, "person/test");
-        let definition = person.subject_definition(subject, true).await.unwrap().value;
+        let definition = person
+            .subject_definition(subject, true)
+            .await
+            .unwrap()
+            .value;
         let ast = serde_json::to_value(&definition.desired).unwrap();
         assert_eq!(ast, intent.subjects[subject].desired);
-        assert!(definition.kdl.contains("fixture-secret"), "{}", definition.kdl);
+        assert!(
+            definition.kdl.contains("fixture-secret"),
+            "{}",
+            definition.kdl
+        );
 
         let rendered = st3::graph::parse_intent(&definition.kdl, "client-definition").unwrap();
-        let preview = state.store.mission(&rendered, st3::model::IntentInput {
-            kdl: definition.kdl,
-            source_name: None,
-        }).unwrap();
+        let preview = state
+            .store
+            .mission(
+                &rendered,
+                st3::model::IntentInput {
+                    kdl: definition.kdl,
+                    source_name: None,
+                },
+            )
+            .unwrap();
         assert_eq!(preview.normalized["declarations"], serde_json::json!([ast]));
         assert!(preview.changes.is_empty(), "{:?}", preview.changes);
     }
@@ -1028,9 +1124,14 @@ mission "example/definition" state="ready" {
         "x".repeat(1_100_000),
     );
     let oversized = st3::graph::parse_intent(&oversized, "client-definition").unwrap();
-    state.store.apply_internal(&oversized, "large-definition-fixture").unwrap();
+    state
+        .store
+        .apply_internal(&oversized, "large-definition-fixture")
+        .unwrap();
     assert!(matches!(
-        client.subject_definition("agent/example/large-definition", false).await,
+        client
+            .subject_definition("agent/example/large-definition", false)
+            .await,
         Err(ClientError::Api(ErrorCode::ValidationFailed, _, _))
     ));
     server.abort();
@@ -1042,26 +1143,41 @@ async fn conversation_search_uses_the_typed_unix_client_and_private_reader() {
     let socket = root.path().join("st3.sock");
     let state = state(root.path(), "search-unix");
     for (id, person) in [("visible", "person/ada"), ("private", "person/blair")] {
-        state.store.append_claim(&ClaimInput {
-            subject: format!("message/{id}"), kind: "message.sent".into(),
-            actor: Some("agent/scribe".into()), fields: BTreeMap::from([
-                ("from".into(), serde_json::json!("agent/scribe")),
-                ("to".into(), serde_json::json!(person)),
-                ("content".into(), serde_json::json!("café orchid")),
-                ("status".into(), serde_json::json!("sent")),
-            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: format!("message/{id}"),
+                kind: "message.sent".into(),
+                actor: Some("agent/scribe".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), serde_json::json!("agent/scribe")),
+                    ("to".into(), serde_json::json!(person)),
+                    ("content".into(), serde_json::json!("café orchid")),
+                    ("status".into(), serde_json::json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
     }
     let app = st3::api::router(state);
     let server_socket = socket.clone();
     let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
     wait_for_socket(&socket).await;
-    let client = Client::unix_as(&socket,"person/ada");
-    let hits = client.conversation_search("café orchid",Some("agent/scribe"),None,None,Some(50)).await.unwrap();
-    assert_eq!(hits.value.items.len(),1);
-    assert_eq!(hits.value.items[0].entry_id,"message/visible");
-    assert!(matches!(Client::unix(&socket).conversation_search("orchid",None,None,None,None).await,
-        Err(ClientError::Api(ErrorCode::Forbidden, _, _))));
+    let client = Client::unix_as(&socket, "person/ada");
+    let hits = client
+        .conversation_search("café orchid", Some("agent/scribe"), None, None, Some(50))
+        .await
+        .unwrap();
+    assert_eq!(hits.value.items.len(), 1);
+    assert_eq!(hits.value.items[0].entry_id, "message/visible");
+    assert!(matches!(
+        Client::unix(&socket)
+            .conversation_search("orchid", None, None, None, None)
+            .await,
+        Err(ClientError::Api(ErrorCode::Forbidden, _, _))
+    ));
     server.abort();
 }
 

@@ -33,8 +33,8 @@ use crate::hash::{
 };
 use crate::replication::*;
 use crate::sqlite::{
-    PINNED_READER, PinnedRead, ReadPool, SQLITE_COMMIT_NANOS, SQLITE_COMMITS, SQLITE_NANOS,
-    STATEMENT_CACHE_CAPACITY, WriterConnection,
+    CommitObserver, PINNED_READER, PinnedRead, ReadPool, SQLITE_COMMIT_NANOS, SQLITE_COMMITS,
+    SQLITE_NANOS, STATEMENT_CACHE_CAPACITY, WriterConnection,
 };
 
 pub mod canonical;
@@ -404,6 +404,22 @@ pub struct Store {
 }
 
 impl Store {
+    /// Observe committed authority before writes acknowledge success. The callback reads through
+    /// the supplied writer connection and must not acquire the writer itself. Keep the returned
+    /// handle for the authorization's lifetime; dropping it unregisters and waits for a callback
+    /// running on another thread. Self-drop is safe. Register before rechecking current authority
+    /// outside a pinned snapshot, because registration does not report a commit whose observer
+    /// snapshot was already taken.
+    ///
+    /// Callbacks must fail closed on read errors, must not panic, and should capture owners weakly
+    /// to avoid cycles. See [`WriterConnection::observe_commits`].
+    pub fn observe_commits(
+        &self,
+        callback: impl Fn(&Connection) + Send + Sync + 'static,
+    ) -> CommitObserver {
+        self.connection.observe_commits(callback)
+    }
+
     /// Open the store at `path`, creating it when it does not exist, with `runtime`'s tables
     /// and projections beside the graph's.
     pub fn open(path: &Path, origin: impl Into<String>, runtime: Arc<dyn Runtime>) -> Result<Self> {
@@ -4522,7 +4538,10 @@ impl Store {
     pub fn expire_blob_uploads(&self, ttl_ms: u64) -> Result<usize> {
         let cutoff = (now_ms() as u64).saturating_sub(ttl_ms);
         let connection = self.connection.write();
-        Ok(connection.execute("DELETE FROM local_blob_uploads WHERE uploaded_ms<?1", [cutoff])?)
+        Ok(connection.execute(
+            "DELETE FROM local_blob_uploads WHERE uploaded_ms<?1",
+            [cutoff],
+        )?)
     }
 
     pub fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {
@@ -5482,7 +5501,10 @@ impl Store {
 
     /// Force an admission or deferral after the final index read, before clearing its state.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn project_replication_backlog_before_clear(&self, before_clear: impl FnMut()) -> Result<bool> {
+    pub fn project_replication_backlog_before_clear(
+        &self,
+        before_clear: impl FnMut(),
+    ) -> Result<bool> {
         self.project_replication_backlog_chunks(|| {}, before_clear)
     }
 
