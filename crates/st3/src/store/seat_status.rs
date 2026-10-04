@@ -675,13 +675,16 @@ mod tests {
     fn native_login_since_survives_activity_until_successful_recovery() {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
+        let observed_at = std::cell::Cell::new(now_ms() as u64 - 1_000);
         let native = |state: &str, auth: bool| {
+            observed_at.set(observed_at.get() + 1);
             store
                 .append_claim(&input(
                     "harness.observed",
                     json!({
                         "incarnation_id":"one", "state":state, "provider_auth":auth,
-                        "driver":"claude", "provider_auth_sequence": if auth { 2 } else { 1 }
+                        "driver":"claude", "provider_auth_sequence": if auth { 2 } else { 1 },
+                        "observed_at_ms": observed_at.get()
                     }),
                 ))
                 .unwrap()
@@ -691,11 +694,17 @@ mod tests {
         native("idle", false);
         let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(blocked.state, "needs-login");
-        assert_eq!(blocked.since_unix_ms, first.accepted_at_unix_ms);
+        assert_eq!(
+            blocked.since_unix_ms,
+            u128::from(first.body["fields"]["observed_at_ms"].as_u64().unwrap())
+        );
         let restored = native("idle", true);
         let idle = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(idle.state, "idle");
-        assert_eq!(idle.since_unix_ms, restored.accepted_at_unix_ms);
+        assert_eq!(
+            idle.since_unix_ms,
+            u128::from(restored.body["fields"]["observed_at_ms"].as_u64().unwrap())
+        );
         let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
         let states = history["items"]
             .as_array()
