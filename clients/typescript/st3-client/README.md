@@ -18,7 +18,9 @@ and after asynchronous credentials/discovery; the signal stays attached to nativ
 the JSON body is consumed. Cancellation does not prove an action was not delivered and never retries it.
 
 `collectionStream` resolves to the pre-open command surface. Its optional `onOpen` callback
-reports actual WebSocket readiness once, before buffered commands flush. Known frame envelopes
+reports actual WebSocket readiness once, before buffered commands flush. Commands issued inside
+`onOpen` queue behind prior commands, preserving cancellation and replacement order. Closing or
+throwing during `onOpen` discards the queue. Known frame envelopes
 are structurally validated before `onFrame`; resource rows and timeline entries remain raw for
 tolerant per-row decoding. Unknown kinds and additive fields remain available to consumers.
 Malformed framing and exceptions from `onFrame` or `onOpen` close the socket and reach `onEnd(error)`
