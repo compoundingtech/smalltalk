@@ -16931,6 +16931,10 @@ agent "shared/reader" {
   command "true"
   restart "never"
   resource "issue" uri="https://github.com/example/project/issues/42"
+  resource "mission-worker" uri="urn:example:one" reason="mission-worker"
+  resource "agent/mission-worker" uri="urn:example:two" reason="agent/mission-worker"
+  resource "step-worker" uri="urn:example:three" reason="step-worker"
+  resource "agent/step-worker" subject="resource/worker" reason="agent/step-worker"
 }
 mission "shared-resource" state="ready" timeout="1m" {
   concurrent-runs max=4
@@ -16940,6 +16944,10 @@ mission "shared-resource" state="ready" timeout="1m" {
     command "true"
     restart "never"
     resource "issue" uri="https://github.com/example/project/issues/42"
+    resource "mission-worker" uri="urn:example:one" reason="mission-worker"
+    resource "agent/mission-worker" uri="urn:example:two" reason="agent/mission-worker"
+    resource "step-worker" uri="urn:example:three" reason="step-worker"
+    resource "agent/step-worker" subject="resource/worker" reason="agent/step-worker"
   }
   step "work" {
     assigned-to "agent/${ST_MISSION_RUN}/step-worker"
@@ -16948,6 +16956,10 @@ mission "shared-resource" state="ready" timeout="1m" {
       command "true"
       restart "never"
       resource "issue" uri="https://github.com/example/project/issues/42"
+      resource "mission-worker" uri="urn:example:one" reason="mission-worker"
+      resource "agent/mission-worker" uri="urn:example:two" reason="agent/mission-worker"
+      resource "step-worker" uri="urn:example:three" reason="step-worker"
+      resource "agent/step-worker" subject="resource/worker" reason="agent/step-worker"
     }
   }
 }
