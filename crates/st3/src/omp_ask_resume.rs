@@ -24,7 +24,9 @@ pub fn pending_ask(transcript: &str) -> Option<String> {
     let mut pending: Option<String> = None;
     let mut exited_with_pending_ask = false;
     for line in transcript.lines() {
-        let row: serde_json::Value = serde_json::from_str(line).ok()?;
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         if row["type"] == "custom"
             && row["customType"] == "tool_execution_start"
             && row["data"]["toolName"] == "ask"
@@ -109,6 +111,7 @@ fn healing_command(
 }
 
 pub async fn heal(binary: &str, sessions: &Path, id: &str) -> Result<String> {
+    st_drivers::omp_session::verify_version_for_heal(binary)?;
     let stdout = tempfile::NamedTempFile::new()?;
     let stderr = tempfile::NamedTempFile::new()?;
     let mut child = healing_command(binary, sessions, id, std::env::vars_os().map(|(key, _)| key))
@@ -198,6 +201,20 @@ mod tests {
     }
 
     #[test]
+    fn malformed_middle_line_preserves_pending_ask_and_later_answer() {
+        let transcript = concat!(
+            "{\"type\":\"custom\",\"customType\":\"tool_execution_start\",\"data\":{\"toolName\":\"ask\",\"toolCallId\":\"X\"}}\n",
+            "{malformed\n",
+            "{\"type\":\"custom\",\"customType\":\"session_exit\",\"data\":{\"pendingToolCalls\":[{\"toolCallId\":\"X\"}]}}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"X\",\"isError\":true,\"content\":[{\"type\":\"text\",\"text\":\"Ask input was cancelled\"}]}}\n",
+        );
+        assert_eq!(pending_ask(transcript).as_deref(), Some("X"));
+        assert!(pending_ask(&format!(
+            "{transcript}{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"Continue without the picker\"}}]}}}}\n"
+        )).is_none());
+    }
+
+    #[test]
     fn shutdown_cancellation_is_interrupted_but_person_cancellation_is_answered() {
         let fixture = include_str!("../fixtures/omp-resume/managed-stop-cancelled.jsonl");
         assert_eq!(
@@ -239,7 +256,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let binary = root.path().join("omp-canary");
-        fs::write(&binary, "#!/bin/sh\nif read -r input; then exit 17; fi\nprintf '%s\\n' \"$@\"\nprintf 'stdin-eof\\n' >&2\n").unwrap();
+        fs::write(&binary, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'omp/18.4.10\\n'; exit 0; fi\nif read -r input; then exit 17; fi\nprintf '%s\\n' \"$@\"\nprintf 'stdin-eof\\n' >&2\n").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let captured = heal(binary.to_str().unwrap(), root.path(), "native-id")
             .await
@@ -253,7 +270,7 @@ mod tests {
         );
         fs::write(
             &binary,
-            "#!/bin/sh\nprintf 'heal-rejected\\n' >&2\nexit 23\n",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'omp/18.4.10\\n'; exit 0; fi\nprintf 'heal-rejected\\n' >&2\nexit 23\n",
         )
         .unwrap();
         let error = heal(binary.to_str().unwrap(), root.path(), "native-id")
@@ -262,6 +279,31 @@ mod tests {
             .to_string();
         assert!(error.contains("23"));
         assert!(error.contains("heal-rejected"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unadmitted_version_cannot_heal_the_selected_transcript() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let transcript = root.path().join("selected.jsonl");
+        let original = include_str!("../fixtures/omp-resume/managed-stop-cancelled.jsonl");
+        fs::write(&transcript, original).unwrap();
+        let binary = root.path().join("omp-unadmitted");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'omp/18.5.0\\n'; exit 0; fi\nprintf 'healed\\n' > '{}'\n",
+                transcript.display()
+            ),
+        ).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = heal(binary.to_str().unwrap(), root.path(), "selected")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("18.5.0 is unverified"), "{error}");
+        assert_eq!(fs::read_to_string(&transcript).unwrap(), original);
     }
 
     #[test]
@@ -293,7 +335,7 @@ mod tests {
         assert!(read_pending(&root.path().join("missing")).is_none());
         assert!(read_pending(root.path()).is_none());
         fs::write(&path, [start.as_bytes(), &[0xff]].concat()).unwrap();
-        assert!(read_pending(&path).is_none());
+        assert_eq!(read_pending(&path).as_deref(), Some("X"));
         fs::write(&path, format!("{{\"type\":\"session\",\"id\":\"selected\",\"label\":\"�\"}}\n{start}").as_bytes()).unwrap();
         let bytes = fs::read(&path).unwrap();
         let invalid = bytes.windows(3).position(|part| part == [0xef,0xbf,0xbd]).unwrap();

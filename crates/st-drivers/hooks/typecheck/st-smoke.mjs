@@ -170,7 +170,10 @@ if (driver === "omp") {
         assert.equal(globalThis.__stOmpChannel.restoringAsk.toolCallId, "restored-ask");
         await bridgeEvents.get("tool_execution_start")({ toolName: "ask", toolCallId: "restored-ask" }, bridgeCtx);
         await untilBridge(() => read().some((frame) => frame.type === "delivery_ready"));
-        assert.equal(read().filter((frame) => frame.type === "state").at(-1).blockedOn, "human");
+        const reopened = read().filter((frame) => frame.type === "state").at(-1);
+        assert.equal(reopened.blockedOn, "human");
+        assert.equal(reopened.ask, "question");
+        assert.ok(reopened.reason.includes("restored-ask"), "human-blocking reason names the reopened ask");
         assert.equal(globalThis.__stOmpChannel.pendingAskToolCallId, "restored-ask");
         mock.timers.tick(10_001);
       } else {
