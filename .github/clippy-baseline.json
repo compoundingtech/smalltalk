@@ -19,7 +19,7 @@
       "clippy::too_many_arguments": 2
     },
     "st3": {
-      "clippy::cloned_ref_to_slice_refs": 6,
+      "clippy::cloned_ref_to_slice_refs": 5,
       "clippy::collapsible_if": 30,
       "clippy::collapsible_match": 1,
       "clippy::derivable_impls": 1,
