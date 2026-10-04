@@ -2996,6 +2996,9 @@ struct AgentStartArgs {
     harness: Option<String>,
     #[arg(long)]
     host: Option<String>,
+    /// Record permission to start this placement before unreachable source hosts acknowledge exit.
+    #[arg(long, conflicts_with = "print_kdl")]
+    source_offline: bool,
     /// Override the workspace; new seats default to the current directory.
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -8110,7 +8113,7 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
         output.push('\n');
         let _ = writeln!(
             output,
-            "LIMITS  {} · the freshest reading of each account",
+            "LIMITS  {} · the highest recent weekly reading of each account",
             limits.len()
         );
         let _ = writeln!(output, "WEEKLY  5-HOUR  WEEKLY RESET  MEASURED  account");
@@ -10736,6 +10739,8 @@ async fn run_agents(
             let client = cli_client(endpoint);
             let (subject, tokens, existing, mission) =
                 agent_start_declaration(&client, &args).await?;
+            anyhow::ensure!(!args.source_offline || existing.is_some(),
+                "--source-offline needs an existing seat with a pending placement handoff");
             let response = if let Some(mission) = mission {
                 anyhow::ensure!(
                     args.harness.is_none()
@@ -10749,6 +10754,12 @@ async fn run_agents(
                      that declaration through its mission"
                 );
                 if let MissionSeatStart::Declared(run) = mission {
+                    if args.source_offline {
+                        let agent = agent_start_status(endpoint, &client, &subject, &args).await?;
+                        if json_output { return print_value(&agent, true); }
+                        print!("{}", render_client_agent(&agent, &[], current_unix_ms()?));
+                        return Ok(());
+                    }
                     println!(
                         "{subject} is declared by {run}; `st agents restart {subject}` relaunches it"
                     );
@@ -10780,27 +10791,27 @@ async fn run_agents(
                 )
                 .await?
             };
-            print_value(&response, json_output)?;
-            if !json_output
-                && let Some(subject) = response
-                    .subject_tokens
-                    .keys()
-                    .find(|subject| subject.starts_with("agent/"))
-            {
-                let agent = generated_client(endpoint, None)?
-                    .agents_get(subject)
-                    .await?;
-                if let ClientResource::Agent(agent) = agent.value {
+            let agent = agent_start_status(endpoint, &client, &subject, &args).await?;
+            if json_output {
+                let mut value = serde_json::to_value(&response)?;
+                value["handoff"] = serde_json::to_value(&agent.handoff)?;
+                print_value(&value, true)?;
+            } else {
+                print_value(&response, false)?;
+                if let Some(handoff) = &agent.handoff {
+                    println!("{subject}: {} → {}", handoff.phase, handoff.destination);
+                    if !handoff.pending_sources.is_empty() {
+                        println!("Waiting for source stop: {}", handoff.pending_sources.join(", "));
+                    }
+                    if !handoff.overridden_sources.is_empty() {
+                        println!("Source-offline override recorded: {}", handoff.overridden_sources.join(", "));
+                    }
+                } else {
                     let state = cli_help::agent_state(
-                        &agent.state,
-                        agent.harness_state.as_deref(),
-                        agent.fault.as_deref(),
-                        &agent.reachability,
+                        &agent.state, agent.harness_state.as_deref(),
+                        agent.fault.as_deref(), &agent.reachability,
                     );
-                    print!(
-                        "{}",
-                        cli_help::agent_next_steps(subject, &args.actor, &state)
-                    );
+                    print!("{}", cli_help::agent_next_steps(&subject, &args.actor, &state));
                 }
             }
             Ok(())
@@ -11023,6 +11034,36 @@ enum MissionSeatStart {
     Declared(String),
     /// Someone stopped it; the daemon restores the run's declaration.
     Stopped,
+}
+
+async fn agent_start_status(
+    endpoint: &Endpoint,
+    client: &Client,
+    subject: &str,
+    args: &AgentStartArgs,
+) -> Result<st3_client::Agent> {
+    let generated = generated_client(endpoint, None)?;
+    let ClientResource::Agent(mut agent) = generated.agents_get(subject).await?.value else {
+        anyhow::bail!("`{subject}` is not an agent");
+    };
+    if args.source_offline {
+        let handoff = agent.handoff.as_ref()
+            .context("--source-offline needs a placement handoff with former source hosts")?;
+        if !handoff.pending_sources.is_empty() {
+            client.post::<_, st3::model::ClaimRecord>("/v1/agents/source-offline", &json!({
+                "subject": subject,
+                "actor": args.actor,
+                "desired_token": handoff.desired_token,
+                "sources": handoff.pending_sources,
+                "idempotency_key": format!("source-offline:{}", uuid::Uuid::now_v7()),
+            })).await?;
+            let ClientResource::Agent(updated) = generated.agents_get(subject).await?.value else {
+                anyhow::bail!("`{subject}` is not an agent");
+            };
+            agent = updated;
+        }
+    }
+    Ok(agent)
 }
 
 async fn agent_start_declaration(
@@ -12438,6 +12479,14 @@ fn render_client_agent(
 
     if let Some(fault) = &agent.fault {
         let _ = writeln!(output, "FAULT        {fault}");
+    }
+    if let Some(handoff) = &agent.handoff {
+        let pending = if handoff.pending_sources.is_empty() { String::new() }
+            else { format!(" · waiting for {}", handoff.pending_sources.join(", ")) };
+        let _ = writeln!(output, "HANDOFF      {} → {}{pending}", handoff.phase, handoff.destination);
+        if !handoff.overridden_sources.is_empty() {
+            let _ = writeln!(output, "SOURCE OFFLINE {} · override recorded", handoff.overridden_sources.join(", "));
+        }
     }
     if let Some(suspension) = &agent.suspension {
         let session = match (&suspension.harness, &suspension.native_session_id) {
@@ -16654,7 +16703,7 @@ async fn publish_harness_limits(
         ("incarnation_id".into(), Value::String(incarnation.into())),
         (
             "measured_at_unix_ms".into(),
-            Value::from(observed.observed_at_ms),
+            Value::from(limits.observed_at_ms.unwrap_or(observed.observed_at_ms)),
         ),
     ]);
     for (name, value) in [("account", &observed.account), ("plan", &observed.plan)] {
@@ -17179,13 +17228,26 @@ fn accept_managed_channel_frame(
     observer: &mut Option<st_drivers::pi_channel::EventObserver>,
     line: &str,
 ) -> Result<bool> {
-    if let Some(observer) = observer.as_mut()
-        && let Ok(frame) = serde_json::from_str::<Value>(line)
-    {
-        observer.observe(&frame)?;
-        if frame["type"] == "todo" {
-            // The managed observer committed this snapshot to the durable outbox already.
-            return Ok(false);
+    if let Ok(frame) = serde_json::from_str::<Value>(line) {
+        let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("unknown");
+        let handled = match frame_type {
+            "state" | "session" | "ready" | "delivered" | "read" | "failed" | "todo" => true,
+            "timeline" | "context" | "turn" => observer.is_some(),
+            _ => false,
+        };
+        if !handled {
+            tracing::debug!(
+                frame_type,
+                observer_enabled = observer.is_some(),
+                "unhandled pi-family channel frame"
+            );
+        }
+        if let Some(observer) = observer.as_mut() {
+            observer.observe(&frame)?;
+            if frame["type"] == "todo" {
+                // The managed observer committed this snapshot to the durable outbox already.
+                return Ok(false);
+            }
         }
     }
     let publish = state.accept_frame(line);
@@ -17240,8 +17302,12 @@ fn activate_channel_todo_observations(
     Ok(observations)
 }
 
+// Wall-clock minute boundaries can be one second apart; confirmations need a full period.
+const CHANNEL_TODO_END_CONFIRMATION_GAP: Duration = Duration::from_secs(60);
+
 async fn remove_confirmed_ended_channel_todo_outbox(
-    client: &Client, subject: &str, incarnation: &str, dir: &Path, end_seen: &mut bool,
+    client: &Client, subject: &str, incarnation: &str, dir: &Path,
+    end_seen: &mut Option<tokio::time::Instant>,
 ) -> Result<bool> {
     let status: Result<StatusResponse> = client.get(&format!(
         "/v1/status?subject={}", urlencoding::encode(subject),
@@ -17249,20 +17315,38 @@ async fn remove_confirmed_ended_channel_todo_outbox(
     let status = match status {
         Ok(status) => status,
         Err(error) => {
-            *end_seen = false;
+            *end_seen = None;
             return Err(error);
         }
     };
     let ended = status.subjects.first().and_then(|seat| seat.actual.as_ref())
         .is_some_and(|actual| todo_runtime_has_ended(actual, incarnation));
-    let confirmed = ended && *end_seen;
-    *end_seen = ended;
-    if confirmed
-    {
+    if !ended {
+        *end_seen = None;
+        return Ok(false);
+    }
+    let first_seen = end_seen.get_or_insert_with(tokio::time::Instant::now);
+    if first_seen.elapsed() >= CHANNEL_TODO_END_CONFIRMATION_GAP {
         fs::remove_dir_all(dir)?;
         return Ok(true);
     }
     Ok(false)
+}
+
+async fn finish_channel_todo_outbox(
+    client: &Client, subject: &str, incarnation: &str, dir: &Path,
+    end_seen: &mut Option<tokio::time::Instant>,
+) -> Result<bool> {
+    loop {
+        if remove_confirmed_ended_channel_todo_outbox(
+            client, subject, incarnation, dir, end_seen,
+        ).await? {
+            return Ok(true);
+        }
+        let Some(first_seen) = *end_seen else { return Ok(false); };
+        // EOF is not an independent liveness confirmation until the same gap has elapsed.
+        tokio::time::sleep_until(first_seen + CHANNEL_TODO_END_CONFIRMATION_GAP).await;
+    }
 }
 
 async fn run_pi_channel(
@@ -17402,7 +17486,7 @@ async fn run_pi_channel(
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
     let mut checked_todo_minute = None;
-    let mut todo_end_seen = false;
+    let mut todo_end_seen = None;
     loop {
         tokio::select! {
             wake = async { match todo_observations.as_mut() {
@@ -17475,7 +17559,7 @@ async fn run_pi_channel(
                             if let Err(error) = observations.drain(client, subject, driver, &mut false).await {
                                 warn_pi_channel(subject, &error, &mut last_warning);
                             }
-                            if let Err(error) = remove_confirmed_ended_channel_todo_outbox(
+                            if let Err(error) = finish_channel_todo_outbox(
                                 client, subject, &incarnation, &observations.dir, &mut todo_end_seen,
                             ).await {
                                 warn_pi_channel(subject, &error, &mut last_warning);
@@ -20207,7 +20291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn todo_transient_liveness_miss_preserves_spool_until_consecutive_confirmations() {
+    async fn todo_liveness_confirmation_requires_full_period_including_eof() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("spool");
         fs::create_dir(&dir).unwrap();
@@ -20239,12 +20323,26 @@ mod tests {
             while !path.exists() { tokio::task::yield_now().await; }
         }).await.unwrap();
         let client = Client::unix(&path);
-        let mut end_seen = false;
+        tokio::time::pause();
+        // Keep socket I/O from automatically advancing the paused clock to unrelated timers.
+        let clock_guard = tokio::spawn(async {
+            loop { tokio::task::yield_now().await; }
+        });
+        let mut end_seen = None;
         observe("vanished");
         assert!(!remove_confirmed_ended_channel_todo_outbox(
             &client, "agent/seat", "current", &dir, &mut end_seen,
         ).await.unwrap());
         assert_eq!(fs::read(dir.join("pending")).unwrap(), b"unpublished todo");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        tokio::time::advance(Duration::from_secs(58)).await;
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        assert!(dir.join("pending").exists());
         observe("running");
         assert!(!remove_confirmed_ended_channel_todo_outbox(
             &client, "agent/seat", "current", &dir, &mut end_seen,
@@ -20267,9 +20365,29 @@ mod tests {
             &client, "agent/seat", "current", &dir, &mut end_seen,
         ).await.unwrap());
         assert!(dir.join("pending").exists());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        tokio::time::advance(Duration::from_secs(59)).await;
         assert!(remove_confirmed_ended_channel_todo_outbox(
             &client, "agent/seat", "current", &dir, &mut end_seen,
         ).await.unwrap());
+        assert!(!dir.exists());
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("pending"), b"unpublished EOF todo").unwrap();
+        end_seen = None;
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        let first_seen = end_seen.unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        clock_guard.abort();
+        let _ = clock_guard.await;
+        assert!(finish_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        assert!(first_seen.elapsed() >= CHANNEL_TODO_END_CONFIRMATION_GAP);
         assert!(!dir.exists());
         server.abort();
         let _ = server.await;
@@ -20831,6 +20949,59 @@ mod tests {
         // A handoff failure below the retry limit makes the message deliverable again.
         assert!(!resumed.accept_frame(r#"{"type":"failed","meta":{"messageId":"message/one"}}"#));
         assert!(!resumed.delivered.contains("message/one"));
+    }
+
+    #[test]
+    fn pi_family_channel_logs_unhandled_frames_without_claiming_or_panicking() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for frame_type in ["future_frame", "pre_compact", "timeline", "context", "turn"] {
+            let capture = Capture(Default::default());
+            let writer = capture.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let mut state = PiChannelResume::default();
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(
+                    !accept_managed_channel_frame(
+                        &mut state,
+                        &mut None,
+                        &json!({"type": frame_type, "private_payload": "not logged"}).to_string(),
+                    )
+                    .unwrap()
+                );
+            });
+            let output = String::from_utf8(
+                capture.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone(),
+            ).unwrap();
+            assert!(
+                output.contains("unhandled pi-family channel frame"),
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!("frame_type=\"{frame_type}\"")),
+                "{output}"
+            );
+            assert!(!output.contains("not logged"), "{output}");
+            assert!(state.pending.state.is_none());
+            assert!(state.pending.native_session.is_none());
+        }
     }
 
     #[tokio::test]

@@ -156,6 +156,11 @@ impl CompactionTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateLimits {
+    /// When these windows were observed, independently of context occupancy. A status-line
+    /// render can repeat cached limits; without a source timestamp, only a changed value,
+    /// reset or account establishes a new observation. Older records fall back to observedAtMs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
     #[serde(default)]
     pub five_hour: Option<f64>,
     #[serde(default)]
@@ -561,7 +566,7 @@ impl Writer {
         // is an observation and carrying the previous one forward would fabricate exactly what
         // HC-R03 forbids. The compaction counters belong to the seat rather than to any one
         // reading, so they carry forward across a reading that says nothing about them.
-        let (used_tokens, window_tokens, used_percent, model, cost_usd, session_total, limits) =
+        let (used_tokens, window_tokens, used_percent, model, cost_usd, session_total, mut limits) =
             match (&reading, current.as_ref()) {
                 (Some(reading), _) => (
                     reading.used_tokens,
@@ -588,6 +593,25 @@ impl Writer {
             (None, Some(current)) => (current.account.clone(), current.plan.clone()),
             (None, None) => (None, None),
         };
+        if limits.observed_at_ms.is_none()
+            && (limits.five_hour.is_some() || limits.seven_day.is_some())
+        {
+            limits.observed_at_ms = Some(
+                current
+                    .as_ref()
+                    .filter(|current| {
+                        let mut previous = current.rate_limits;
+                        previous.observed_at_ms = None;
+                        previous == limits && current.account == account
+                    })
+                    .map_or(now_ms, |current| {
+                        current
+                            .rate_limits
+                            .observed_at_ms
+                            .unwrap_or(current.observed_at_ms)
+                    }),
+            );
+        }
         let observed_at_ms = match (&reading, current.as_ref()) {
             // A compaction edge with no reading behind it does not re-stamp the reading: the
             // numbers are as old as they were, and saying otherwise would hide that.
@@ -724,7 +748,14 @@ pub struct Observed {
 impl Observed {
     /// Whether fresh provider evidence proves that this harness cannot currently progress.
     pub fn is_rate_limited(&self) -> bool {
-        !self.stale && proves_rate_limited(self.harness, self.rate_limits)
+        let now_ms = self.observed_at_ms.saturating_add(self.age_ms);
+        let limits_at = self
+            .rate_limits
+            .observed_at_ms
+            .unwrap_or(self.observed_at_ms);
+        !self.stale
+            && now_ms.saturating_sub(limits_at) < duration_ms(HARNESS_CONTEXT_STALE)
+            && proves_rate_limited(self.harness, self.rate_limits)
     }
 }
 
@@ -782,7 +813,10 @@ pub fn read_raw_at(raw: &[u8], now_ms: u64) -> Option<Observed> {
         );
         return None;
     }
-    if record.observed_at_ms > now_ms.saturating_add(duration_ms(HARNESS_CONTEXT_FUTURE_SKEW)) {
+    let future_bound = now_ms.saturating_add(duration_ms(HARNESS_CONTEXT_FUTURE_SKEW));
+    if record.observed_at_ms > future_bound
+        || record.rate_limits.observed_at_ms.is_some_and(|at| at > future_bound)
+    {
         tracing::warn!(
             "st harness-context: {} is stamped beyond the future-skew bound",
             "committed context event"
@@ -1067,6 +1101,81 @@ mod tests {
     }
 
     #[test]
+    fn context_refreshes_do_not_refresh_unchanged_account_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = catalog(tmp.path());
+        let mut writer = Writer::new(&agent_dir, "example-linux.worker", Harness::Claude).unwrap();
+        let path = harness_context_path(&agent_dir);
+        let limits = RateLimits {
+            seven_day: Some(45.0),
+            seven_day_resets_at_ms: Some(9_000),
+            ..Default::default()
+        };
+        writer
+            .observe(Reading {
+                rate_limits: limits,
+                ..reading(85_000, 33.0)
+            })
+            .unwrap();
+        // Age the source deterministically: another status-line render is not a quota fetch.
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let first = crate::message::now_ms() - 120_000;
+        record["observedAtMs"] = first.into();
+        record["rateLimits"]["observedAtMs"] = first.into();
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(
+            writer
+                .observe(Reading {
+                    rate_limits: limits,
+                    ..reading(90_000, 40.0)
+                })
+                .unwrap()
+        );
+        let record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(record["observedAtMs"].as_u64().unwrap() > first);
+        assert_eq!(record["rateLimits"]["observedAtMs"], first);
+        // An older context record has no separate quota time. Preserve its reading time
+        // on upgrade, rather than turning that old snapshot into a new quota observation.
+        let mut legacy = record;
+        legacy["observedAtMs"] = first.into();
+        legacy["rateLimits"]
+            .as_object_mut()
+            .unwrap()
+            .remove("observedAtMs");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            writer
+                .observe(Reading {
+                    rate_limits: limits,
+                    ..reading(95_000, 45.0)
+                })
+                .unwrap()
+        );
+        let record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["rateLimits"]["observedAtMs"], first);
+        assert!(
+            writer
+                .observe(Reading {
+                    rate_limits: RateLimits {
+                        seven_day: Some(46.0),
+                        ..limits
+                    },
+                    ..reading(95_000, 45.0)
+                })
+                .unwrap()
+        );
+        let record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(record["rateLimits"]["observedAtMs"].as_u64().unwrap() > first);
+        let quota_at = record["rateLimits"]["observedAtMs"].clone();
+        writer
+            .compacted(Compaction::new(CompactionTrigger::Manual))
+            .unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["rateLimits"]["observedAtMs"], quota_at);
+    }
+
+    #[test]
     fn each_whole_limit_percent_reset_and_account_lands_with_the_reading() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = catalog(tmp.path());
@@ -1171,6 +1280,25 @@ mod tests {
         );
         assert_ne!(fs::read(&path).unwrap(), exhausted);
         assert!(!read(&path).unwrap().is_rate_limited());
+    }
+
+    #[test]
+    fn fresh_context_does_not_make_old_quota_exhaustion_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = catalog(tmp.path());
+        let mut writer = Writer::new(&agent_dir, "example-linux.worker", Harness::Claude).unwrap();
+        let now = crate::message::now_ms();
+        writer.observe(Reading {
+            rate_limits: RateLimits {
+                seven_day: Some(100.0),
+                observed_at_ms: Some(now - duration_ms(HARNESS_CONTEXT_STALE) - 1_000),
+                ..Default::default()
+            },
+            ..reading(85_000, 33.0)
+        }).unwrap();
+        let observed = read(&harness_context_path(&agent_dir)).unwrap();
+        assert!(!observed.stale);
+        assert!(!observed.is_rate_limited());
     }
 
     /// The withheld case has its own bucket behaviour: `null` has no bucket, so withheld↔known is

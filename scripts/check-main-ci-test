@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""The main check must fail closed unless the exact queue SHA passed every required check."""
+import copy
+import importlib.machinery
+import importlib.util
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.dont_write_bytecode = True
+loader = importlib.machinery.SourceFileLoader('check_main_ci', str(ROOT / 'scripts/check-main-ci'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+run = dict(head_sha='a' * 40, event='merge_group', path='.github/workflows/fleet.yml',
+           conclusion='success', head_branch='gh-readonly-queue/main/pr-1-example',
+           check_suite_id=1, html_url='https://github.com/example/project/actions/runs/1')
+checks = [dict(name=name, conclusion='success') for name in module.REQUIRED]
+
+
+def check(name, runs, results, expected):
+    def api(path):
+        if '/actions/workflows/' in path:
+            assert 'event=merge_group&head_sha=' + 'a' * 40 in path
+            return [{'workflow_runs': []}, {'workflow_runs': runs}]
+        assert '/check-suites/1/check-runs' in path
+        return [{'check_runs': results[:2]}, {'check_runs': results[2:]}]
+    module.api = api
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ.update(GITHUB_REPOSITORY='example/project', GITHUB_SHA='a' * 40,
+                          GITHUB_STEP_SUMMARY=str(Path(tmp) / 'summary'))
+        assert module.main() == expected, name
+    print('passed:', name)
+
+
+check('exact SHA with successful checks across pages', [run], checks, 0)
+check('no queue run', [], checks, 1)
+for field, value in [('head_sha', 'b' * 40), ('event', 'pull_request'),
+                     ('path', '.github/workflows/other.yml'), ('conclusion', 'failure'),
+                     ('head_branch', 'gh-readonly-queue/other/pr-1-example')]:
+    check('reject ' + field, [{**run, field: value}], checks, 1)
+for status in ['failure', 'skipped', 'cancelled', None]:
+    failed = copy.deepcopy(checks)
+    failed[0]['conclusion'] = status
+    check('reject required check ' + str(status), [run], failed, 1)
+check('missing required check', [run], checks[:-1], 1)
+
+# This check is tied to successful merge-group runs, never a PR workflow_run with elevated secrets.
+fleet = (ROOT / '.github/workflows/fleet.yml').read_text()
+trigger = fleet.split('\non:\n', 1)[1].split('\npermissions:', 1)[0]
+assert 'push:' not in trigger and 'merge_group:' in trigger and 'pull_request:' in trigger
+
+# Any accidental test execution defeats deduplication. Exercise every cache-fill stage with
+# command stand-ins which reject cargo test without --no-run, and cargo run/nextest execution.
+with tempfile.TemporaryDirectory() as tmp:
+    scratch = Path(tmp)
+    bash = shutil.which('bash')
+    assert bash
+    for command in ['cargo', 'nix']:
+        stub = scratch / command
+        stub.write_text(f'''#!{bash}
+printf '%s\\n' "$*" >> "$COMMAND_LOG"
+if [ "${{1:-}}" = test ] && [[ " $* " != *" --no-run "* ]]; then exit 90; fi
+if [ "${{1:-}}" = run ] || [ "${{1:-}}" = nextest ]; then exit 91; fi
+''')
+        stub.chmod(0o755)
+    for stage in ['tests', 'clippy', 'fleet-compat']:
+        log = scratch / (stage + '.log')
+        subprocess.run([bash, str(ROOT / 'scripts/ci-cache-warm'), stage], cwd=ROOT, check=True,
+                       env={**os.environ, 'PATH': f'{scratch}:{os.environ["PATH"]}',
+                            'RUNNER_TEMP': tmp, 'COMMAND_LOG': str(log)})
+        assert log.read_text(), stage
+        print('passed: build-only cache fill', stage)

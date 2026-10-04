@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Ratchet regression proofs, including its command-line failure status."""
+import copy
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.dont_write_bytecode = True
+from clippy_ratchet import BASELINE, RUNS, check, counts_from_messages, validate_baseline
+
+SCRIPT = Path(__file__).with_name("clippy_ratchet.py")
+METADATA = {"workspace_members": ["local"], "packages": [{"id": "local", "name": "sample"}]}
+TOOLCHAIN = {"rustc": "rustc fixture", "clippy": "clippy fixture"}
+FINISHED = {"reason": "build-finished", "success": True}
+
+
+def warning(position=1, lint="clippy::collapsible_if", package="local"):
+    return {"reason": "compiler-message", "package_id": package, "message": {
+        "level": "warning", "code": {"code": lint}, "message": "fixture warning",
+        "spans": [{"file_name": "src/lib.rs", "byte_start": position,
+                   "byte_end": position + 1, "is_primary": True}],
+    }}
+
+
+def baseline(counts):
+    return {"version": 1, "toolchain": TOOLCHAIN, "counts": counts}
+
+
+class Ratchet(unittest.TestCase):
+    def test_repeated_targets_and_model_run_count_once(self):
+        runs = [[warning(), warning(), warning(package="dependency"), FINISHED],
+                [warning(), warning(2), FINISHED]]
+        self.assertEqual(counts_from_messages(METADATA, runs),
+                         {"sample": {"clippy::collapsible_if": 2}})
+
+    def test_rust_warnings_and_uncoded_warnings_also_count(self):
+        uncoded = warning(3)
+        uncoded["message"]["code"] = None
+        self.assertEqual(counts_from_messages(METADATA, [[warning(lint="dead_code"), uncoded, FINISHED]]),
+                         {"sample": {"dead_code": 1, "uncoded-warning": 1}})
+
+    def test_failed_or_truncated_run_cannot_pass(self):
+        for messages in ([], [warning()], [{"reason": "build-finished", "success": False}],
+                         [FINISHED, warning()]):
+            with self.subTest(messages=messages), self.assertRaises(ValueError):
+                counts_from_messages(METADATA, [messages])
+        error = warning()
+        error["message"]["level"] = "error"
+        with self.assertRaises(ValueError):
+            counts_from_messages(METADATA, [[error, FINISHED]])
+
+    def test_counts_cannot_move_between_lints_or_crates(self):
+        old = baseline({"sample": {"lint-a": 1}})
+        for counts in ({"sample": {"lint-a": 2}}, {"sample": {"lint-b": 1}},
+                       {"another-crate": {"lint-a": 1}}):
+            with self.subTest(counts=counts), self.assertRaisesRegex(ValueError, "new warning"):
+                check(baseline(counts), old)
+
+    def test_baseline_cannot_be_increased_to_hide_warning(self):
+        old = baseline({"sample": {"lint-a": 1}})
+        raised = baseline({"sample": {"lint-a": 2}})
+        with self.assertRaisesRegex(ValueError, "baseline increased"):
+            check(raised, raised, old)
+        with self.assertRaisesRegex(ValueError, "baseline increased"):
+            check(raised, raised, baseline({}))
+
+    def test_removed_warning_requires_lower_baseline(self):
+        old = baseline({"sample": {"lint-a": 2}})
+        lowered = baseline({"sample": {"lint-a": 1}})
+        with self.assertRaisesRegex(ValueError, "warnings removed"):
+            check(lowered, old)
+        check(lowered, lowered, old)
+        check(baseline({}), baseline({}), lowered)
+
+    def test_toolchain_mismatch_and_invalid_counts_fail(self):
+        changed = copy.deepcopy(baseline({}))
+        changed["toolchain"]["rustc"] = "different"
+        with self.assertRaisesRegex(ValueError, "toolchain differs"):
+            check(changed, baseline({}))
+        for count in (-1, 0, True, 1.5):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                validate_baseline(baseline({"sample": {"lint": count}}))
+
+    def test_cli_mutations_and_sorted_update(self):
+        with tempfile.TemporaryDirectory(prefix="clippy-ratchet-") as directory:
+            root = Path(directory)
+            (root / ".github").mkdir()
+            logs = root / "logs"
+            logs.mkdir()
+            (logs / "clippy-metadata.json").write_text(json.dumps(METADATA))
+            (logs / "clippy-rustc.txt").write_text(TOOLCHAIN["rustc"])
+            (logs / "clippy-version.txt").write_text(TOOLCHAIN["clippy"])
+
+            def write_runs(messages):
+                for name in RUNS:
+                    (logs / name).write_text("".join(json.dumps(m) + "\n" for m in messages))
+
+            def run(*args):
+                return subprocess.run([sys.executable, str(SCRIPT), "--logs", str(logs), *args],
+                                      cwd=root, capture_output=True, text=True)
+
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            # An empty tree is a valid rollout base; an unknown ref is never a valid base.
+            empty_tree = subprocess.run(["git", "hash-object", "-t", "tree", "--stdin", "-w"],
+                                        input="", cwd=root, capture_output=True, text=True, check=True).stdout.strip()
+            write_runs([warning(), FINISHED])
+            self.assertNotEqual(run().returncode, 0)  # baseline absent
+            self.assertEqual(run("--update", "--base-ref", empty_tree).returncode, 0)
+            original = (root / BASELINE).read_text()
+            self.assertEqual(run().returncode, 0)
+            subprocess.run(["git", "add", BASELINE], cwd=root, check=True)
+            base_tree = subprocess.run(["git", "write-tree"], cwd=root, check=True,
+                                       capture_output=True, text=True).stdout.strip()
+            write_runs([warning(), warning(2), FINISHED])
+            result = run()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("new warning", result.stderr)
+            self.assertNotEqual(run("--update").returncode, 0)
+            self.assertEqual((root / BASELINE).read_text(), original)
+            (root / BASELINE).write_text(json.dumps(baseline({"sample": {"clippy::collapsible_if": 2}})))
+            result = run("--base-ref", base_tree)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("baseline increased", result.stderr)
+            (root / BASELINE).write_text(original)
+            write_runs([FINISHED])
+            self.assertNotEqual(run().returncode, 0)  # baseline must drop
+            self.assertEqual(run("--update").returncode, 0)
+            self.assertEqual(json.loads((root / BASELINE).read_text())["counts"], {})
+            self.assertNotEqual(run("--base-ref", "missing-ref").returncode, 0)
+            (logs / RUNS[0]).write_text("not json\n")
+            self.assertNotEqual(run().returncode, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -6,8 +6,6 @@ name: Workspace CI
 on:
   pull_request: {}
   merge_group: {}
-  push:
-    branches: [main]
   workflow_dispatch: {}
 
 permissions:
@@ -113,7 +111,7 @@ jobs:
           summarize: true
       - name: Check runner selection and generated files
         shell: bash
-        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && genie --check'"
+        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/check-main-ci-test && genie --check'"
   typescript-client:
     name: typescript-client
     needs: [pick-runner, genie-freshness]
@@ -276,6 +274,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      CLIPPY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -327,7 +326,7 @@ jobs:
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Summarize tested revision
         run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
-      - name: Run clippy and the generated-client check
+      - name: Run the Clippy warning ratchet and generated-client check
         shell: bash
         run: nix develop -c bash scripts/ci-linux clippy
       - name: Save Nix outputs to the local Nix cache

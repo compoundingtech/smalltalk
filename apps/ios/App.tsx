@@ -13,7 +13,7 @@ import { IBMPlexMono_700Bold } from '@expo-google-fonts/ibm-plex-mono/700Bold';
 import { homeRows } from '@smalltalk/st3-views';
 import { FULL_SCREEN, navigationRef, ROOTS, type StackParams, type TabParams } from './navigation';
 import { StoreProvider, useStore } from './store';
-import { parseDevLink, tabNamed, type Tab } from './tabs';
+import { parseDevLink, tabLabel, tabNamed, type Tab } from './tabs';
 import { theme } from './theme';
 import { AgentsScreen, HistoryScreen } from './screens/Agents';
 import { ConversationScreen } from './screens/Conversation';
@@ -41,7 +41,7 @@ const navigationTheme = {
   colors: { ...DarkTheme.colors, primary: theme.accent, background: theme.base, card: theme.mantle, text: theme.text, border: theme.surface0, notification: theme.person },
 };
 
-const ICONS: Record<Tab, string> = { Home: 'house', Agents: 'person.2', Missions: 'point.3.connected.trianglepath.dotted', Fleet: 'server.rack' };
+const ICONS: Record<Tab, string> = { Home: 'bell', Agents: 'person.2', Missions: 'point.3.connected.trianglepath.dotted', Fleet: 'server.rack' };
 const ROOT_SCREENS = { HomeRoot: HomeScreen, AgentsRoot: AgentsScreen, MissionsRoot: MissionsScreen, FleetRoot: FleetScreen } as const;
 
 // Native header options only: the system font and look, tinted with the accent.
@@ -58,7 +58,7 @@ function TabStack({ tab }: { tab: Tab | 'Glasses' }) {
   return <Stack.Navigator screenOptions={stackOptions}>
     {tab === 'Glasses'
       ? <Stack.Screen name="GlassesRoot" component={GlassesScreen} options={{ title: 'Spaces' }} />
-      : <Stack.Screen name={ROOTS[tab] as keyof typeof ROOT_SCREENS} component={ROOT_SCREENS[ROOTS[tab] as keyof typeof ROOT_SCREENS]} options={{ title: tab }} />}
+      : <Stack.Screen name={ROOTS[tab] as keyof typeof ROOT_SCREENS} component={ROOT_SCREENS[ROOTS[tab] as keyof typeof ROOT_SCREENS]} options={{ title: tabLabel(tab) }} />}
     <Stack.Screen name="Space" component={SpaceScreen} options={{ title: 'Space' }} />
     <Stack.Screen name="Conversation" component={ConversationScreen} options={{ title: 'Conversation' }} />
     <Stack.Screen name="SelectText" component={SelectTextScreen} options={{ title: 'Select text', presentation: 'formSheet', sheetAllowedDetents: [0.6, 1], sheetGrabberVisible: true }} />
@@ -146,7 +146,7 @@ function Main() {
       key={tab}
       name={tab}
       component={TAB_COMPONENTS[tab]}
-      options={tab === 'Home' && homeCount ? { tabBarBadge: homeCount, tabBarBadgeStyle: { backgroundColor: theme.person, color: theme.crust } } : {}}
+      options={{ tabBarLabel: tabLabel(tab), title: tabLabel(tab), ...(tab === 'Home' && homeCount ? { tabBarBadge: homeCount, tabBarBadgeStyle: { backgroundColor: theme.person, color: theme.crust } } : {}) }}
     />)}
     {glassesOn ? <Tabs.Screen name="Glasses" component={GlassesTab} options={{ title: 'Spaces', tabBarLabel: 'Spaces' }} /> : null}
   </Tabs.Navigator>;

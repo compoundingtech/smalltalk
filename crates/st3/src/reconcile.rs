@@ -33,6 +33,8 @@ use crate::resource::{
 };
 use crate::store::Store;
 
+mod placement;
+
 /// The actor of every attention request the reconciler raises.
 const RECONCILER_ACTOR: &str = "agent/st3/reconciler";
 const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
@@ -2080,6 +2082,26 @@ impl<R: RuntimeControl> Reconciler<R> {
             if self.store.owned_desired_guard(subject).is_err() {
                 continue;
             }
+            // Retire this host's process even when the desired host or selected actual
+            // now belongs to a peer. This also runs for stop intents after a move.
+            if subject.subject.starts_with("agent/")
+                && matches!(subject.kind.as_str(), "agent" | "stop")
+                && subject.member.as_ref().is_none_or(|m| m.host != self.host)
+            {
+                let item = format!("away:{}", subject.subject);
+                stops.insert(item.clone());
+                if self.needs_item(&item, !skip_stops) || !skip_stops {
+                    let ((result, due), reads) = smallclaims::touched::record(|| {
+                        smallclaims::touched::record_due(|| {
+                            caught(|| self.reconcile_placement_away(subject, ptys.as_ref()))
+                        })
+                    });
+                    if result.is_ok() { self.incremental.evaluated(&item, reads, due); }
+                    if let Err(error) = self.record_member_reconcile_result(&subject.subject, result) {
+                        diagnostic_errors.push(format!("{}: placement-away: {error:#}", subject.subject));
+                    }
+                }
+            }
             if subject.kind == "stop" {
                 let _member_span = crate::profile::span("pass/member stop");
                 let item = format!("stop:{}", subject.subject);
@@ -2427,6 +2449,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         drop(members_span);
         self.incremental.retain("stop:", &stops);
+        self.incremental.retain("away:", &stops);
         self.incremental.retain("member:", &members);
         self.member_wakes
             .lock()
@@ -3794,7 +3817,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                     Some(member) => (Some(member.host.clone()), None),
                     None => {
                         let origin = self.store.selected_actual_origin(&subject.subject)?;
-                        let owner = match origin.clone() {
+                        let prior_host = self.store.declaration_ended_by_stop(&subject.subject)?
+                            .and_then(|ended| ended.declaration.member).map(|m| m.host);
+                        let owner = match prior_host.or(origin.clone()) {
                             Some(origin) => Some(origin),
                             None => self.store.selected_desired_origin(&subject.subject)?,
                         };
@@ -3874,9 +3899,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             Some(origin) => origin,
             None => self.store.selected_actual_origin(&subject.subject)?,
         };
-        let owner_host = subject
-            .member
-            .as_ref()
+        let prior_member = if subject.kind == "stop" && subject.member.is_none() {
+            self.store.declaration_ended_by_stop(&subject.subject)?
+                .and_then(|ended| ended.declaration.member)
+        } else { None };
+        let member = subject.member.as_ref().or(prior_member.as_ref());
+        let owner_host = member
             .map(|member| member.host.as_str())
             .or_else(|| fields.get("host").and_then(Value::as_str))
             .or(selected_origin.as_deref());
@@ -3886,13 +3914,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             // not evidence that the owner's process stopped.
             return Ok(());
         }
-        let Some(runtime_id) = fields.get("runtime_id").and_then(Value::as_str) else {
+        let Some(runtime_id) = member.map(|m| m.runtime_id.as_str())
+            .or_else(|| fields.get("runtime_id").and_then(Value::as_str)) else {
             return Ok(());
         };
-        let terminal = fields
-            .get("terminal")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let terminal = member.map(|m| m.terminal)
+            .or_else(|| fields.get("terminal").and_then(Value::as_bool)).unwrap_or(true);
         let observation = if terminal {
             smallclaims::touched::note_read(|| format!("pty:{runtime_id}"));
             // Without a snapshot the PTY may still run, so the stop waits for the next one.
@@ -3944,14 +3971,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             )?;
             return Ok(());
         }
-        let incarnation = observation
-            .as_ref()
-            .and_then(|value| value.incarnation_id.as_deref())
-            .or_else(|| fields.get("incarnation_id").and_then(Value::as_str));
-        let timeout = fields
-            .get("shutdown_timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(5_000);
+        let local_actual = self.store.runtime_observations_at(&subject.subject, u64::MAX)?
+            .remove(&self.host);
+        let incarnation = observation.as_ref().and_then(|o| o.incarnation_id.as_deref())
+            .or_else(|| local_actual.as_ref().and_then(|c| crate::placement::field(c, "incarnation_id")));
+        let timeout = member.map(|m| m.shutdown_timeout_ms)
+            .or_else(|| fields.get("shutdown_timeout_ms").and_then(Value::as_u64)).unwrap_or(5_000);
         self.reconcile_runtime_stop(
             &subject.subject,
             runtime_id,
@@ -4230,17 +4255,26 @@ impl<R: RuntimeControl> Reconciler<R> {
             // A harness that ended before the stop, or a stop that could not finish, can leave
             // processes in the runtime's work scope. They end with it.
             self.runtime.end_leftovers(runtime_id, terminal);
-            self.record_once(
-                subject,
-                "runtime.observed",
-                BTreeMap::from([
-                    ("status".into(), Value::String("stopped".into())),
-                    ("runtime_id".into(), Value::String(runtime_id.into())),
-                    ("terminal".into(), Value::Bool(terminal)),
-                    ("reachability".into(), Value::String("reachable".into())),
-                    ("reason".into(), Value::Null),
-                ]),
-            )?;
+            let mut fields = BTreeMap::from([
+                ("status".into(), Value::String("stopped".into())),
+                ("runtime_id".into(), Value::String(runtime_id.into())),
+                ("terminal".into(), Value::Bool(terminal)),
+                ("reachability".into(), Value::String("reachable".into())),
+                ("reason".into(), Value::Null),
+            ]);
+            if let Some(incarnation) = incarnation {
+                fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
+            }
+            // A confirmed explicit stop can fence a later move even while this host is offline.
+            // Stops for a restart of a still-live declaration cannot release a placement fence.
+            let mut evidence = Vec::new();
+            if let Some(token) = self.store.selected_desired_token(subject)?
+                && self.store.claim_by_id(&token)?.is_some_and(|c| c.body["kind"] == "stop")
+            {
+                evidence.push(token);
+            }
+            fields.insert("host".into(), Value::String(self.host.clone()));
+            self.record_once_with_evidence(subject, "runtime.observed", fields, evidence)?;
             return Ok(true);
         }
         let incarnation = incarnation.unwrap_or("unknown");
@@ -4371,6 +4405,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         reason: &str,
     ) -> Result<()> {
         self.store.owned_desired_guard(subject)?;
+        let placement_evidence = if subject.kind == "agent" {
+            let Some(evidence) = self.placement_start_evidence(&subject.subject)? else {
+                return Ok(());
+            };
+            evidence
+        } else { Vec::new() };
         // A member whose start keeps failing waits between attempts and then parks with one
         // attention request, instead of spawning again on every pass. A gate runner fails its gate.
         if matches!(subject.kind.as_str(), "agent" | "exec" | "pty")
@@ -4640,10 +4680,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             expected_subject: None,
             idempotency_key: None,
         })?;
-        self.record_once(
+        self.record_once_with_evidence(
             &subject.subject,
             "runtime.observed",
             member_fields(member, "starting", None, false),
+            placement_evidence,
         )?;
         self.record_once(
             &subject.subject,

@@ -763,6 +763,7 @@ fn codex_context_recomputes_the_captured_reading_and_pins_its_verified_version()
     assert_eq!(
         observed.rate_limits,
         harness_context::RateLimits {
+            observed_at_ms: observed.rate_limits.observed_at_ms,
             five_hour: None,
             seven_day: Some(44.0),
             seven_day_resets_at_ms: Some(1_788_452_803_000),
@@ -771,6 +772,17 @@ fn codex_context_recomputes_the_captured_reading_and_pins_its_verified_version()
     );
     assert_eq!(observed.compactions, 0);
     assert_eq!(observed.last_compaction_ms, None);
+
+    let quota_at = observed.rate_limits.observed_at_ms.unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(producer.observe(&frames[0], "thread-main").unwrap());
+    let later = context_record(&agent_dir).unwrap();
+    assert!(later.observed_at_ms > quota_at);
+    assert_eq!(later.rate_limits.observed_at_ms, Some(quota_at));
+    // A new quota notification, including one whose percentage stayed unchanged, is fresh.
+    assert!(!producer.observe(&frames[1], "thread-main").unwrap());
+    assert!(producer.observe(&frames[2], "thread-main").unwrap());
+    assert!(context_record(&agent_dir).unwrap().rate_limits.observed_at_ms.unwrap() > quota_at);
 
     // The trap, asserted rather than described: the cumulative session total is 2,235,329
     // against a 258,400-token window. A producer that used it as the numerator would publish a

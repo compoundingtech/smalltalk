@@ -337,6 +337,9 @@ impl CodexContextProducer {
                 && let Some(used) = snapshot.get("usedPercent").and_then(Value::as_f64)
             {
                 self.rate_limits.seven_day = Some(used);
+                // A quota notification is source evidence. Later token-usage notifications
+                // carry these windows without making them fresh again.
+                self.rate_limits.observed_at_ms = Some(crate::message::now_ms());
                 // Codex reports the reset in Unix seconds.
                 if let Some(resets_at) = snapshot.get("resetsAt").and_then(Value::as_u64) {
                     self.rate_limits.seven_day_resets_at_ms = Some(resets_at.saturating_mul(1000));

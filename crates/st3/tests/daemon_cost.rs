@@ -380,6 +380,19 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    post(
+        "POST /v1/agents/source-offline",
+        "/v1/agents/source-offline",
+        |fixture, attempt| {
+            json!({
+                "subject": "agent/bench/cost/mover",
+                "actor": "person/bench-operator",
+                "desired_token": fixture.items["placement_token"],
+                "sources": ["amber"],
+                "idempotency_key": format!("cost-source-offline-{attempt}"),
+            })
+        },
+    ),
     get("GET /v1/client/sets", "/v1/client/sets"),
     get(
         "GET /v1/client/sets/{*id}",
@@ -1281,6 +1294,39 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         store.append_claim(&running).unwrap();
     }
     let mut fixture = fixture(&person, &client, subjects).await;
+    // An offline source needs no live runtime: publish its exact departure before measuring
+    // the operator's recorded exception, against both generated store sizes.
+    for host in ["amber", "cobalt"] {
+        let kdl = format!(
+            "version 2\nagent \"bench/cost/mover\" {{\n host \"{host}\"\n workspace {:?}\n command \"sleep 1000\"\n restart always\n}}\n",
+            root.to_str().unwrap()
+        );
+        let intent = st3::parse_intent(&kdl, NODE).unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                st3::model::IntentInput {
+                    kdl,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                &format!("cost-placement-{host}"),
+                Some("person/bench-operator"),
+            )
+            .unwrap();
+    }
+    fixture.items.insert(
+        "placement_token",
+        store
+            .selected_desired_token("agent/bench/cost/mover")
+            .unwrap()
+            .unwrap(),
+    );
     client
         .post::<_, Value>("/v1/sets/apply", &owned_set_request("fixture"))
         .await

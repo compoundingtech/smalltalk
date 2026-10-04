@@ -873,7 +873,7 @@ pub(super) async fn usage_period(
             fields.retain(|_, value| value.as_str() != Some(""));
         }
     }
-    // Each account's freshest limits reading; what a harness did not report is left out.
+    // The shared account limits selection; what a harness did not report is left out.
     let limits = limits
         .into_iter()
         .map(|limit| {
@@ -5632,6 +5632,7 @@ fn remote_terminal_live_session(
     subject: &str,
     expected_incarnation: &str,
 ) -> Result<LiveSession, ApiError> {
+    let _span = crate::profile::span("terminal/live-fence");
     let status = state
         .store
         .status(Some(subject))
@@ -6519,37 +6520,22 @@ fn consume_terminal_attachment_mode(
     capability: Option<&str>,
     raw_mode: Option<&str>,
 ) -> Result<(), ApiError> {
+    let lookup_span = crate::profile::span("terminal/capability-lookup");
     let capability = capability
         .filter(|value| !value.is_empty())
         .ok_or_else(|| forbidden("a terminal stream capability is required"))?;
     let digest = credential_digest(capability);
-    let claims = state
+    let (attached, is_current) = state
         .store
-        .claims_page(None, None, 0, None, true, 100_000)
-        .map_err(ApiError::internal)?;
-    let attached = claims
-        .claims
-        .iter()
-        .find(|claim| {
-            claim.kind == "custom.client.terminal-attached"
-                && claim
-                    .body
-                    .pointer("/fields/capability_hash")
-                    .and_then(Value::as_str)
-                    == Some(digest.as_str())
-        })
+        .terminal_attachment_for_capability_hash(&digest)
+        .map_err(ApiError::internal)?
         .ok_or_else(|| forbidden("the terminal stream capability is unknown"))?;
-    let latest = claims
-        .claims
-        .iter()
-        .filter(|claim| claim.subject == attached.subject)
-        .max_by_key(|claim| claim.store_index)
-        .ok_or_else(|| ApiError::internal("the terminal attachment has no head"))?;
+    drop(lookup_span);
     let field = |name: &str| attached.body.pointer(&format!("/fields/{name}"));
     let raw_live = raw_mode.map(|_| {
         remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation)
     }).transpose()?;
-    let valid = latest.id == attached.id
+    let valid = is_current
         && attached.origin == state.store.origin()
         && field("session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
         && field("raw_mode").and_then(Value::as_str) == raw_mode
@@ -6584,6 +6570,7 @@ fn consume_terminal_attachment_mode(
         // A projected-screen capability is a lease and stays valid for more streams.
         return Ok(());
     }
+    let _span = crate::profile::span("terminal/capability-consume");
     state
         .store
         .append_claim(&ClaimInput {

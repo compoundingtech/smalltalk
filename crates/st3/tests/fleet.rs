@@ -673,9 +673,26 @@ mission "orchard/weekly" state="ready" {{
 /// A stopped origin's earlier running claims must not fence a seat placed on another host.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_seat_is_reachable_after_a_cross_host_move() {
+    cross_host_seat_move(SeatMove::Stopped).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn placement_handoff_moves_a_running_seat_between_real_daemons() {
+    cross_host_seat_move(SeatMove::Running).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn placement_handoff_source_offline_retires_the_returning_real_daemon_runtime() {
+    cross_host_seat_move(SeatMove::SourceOffline).await;
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SeatMove { Stopped, Running, SourceOffline }
+
+async fn cross_host_seat_move(mode: SeatMove) {
     const SUBJECT: &str = "agent/move/worker";
     let root = tempfile::tempdir().unwrap();
-    let a = anchor(root.path(), "amber").await;
+    let mut a = anchor(root.path(), "amber").await;
     let b = joined(root.path(), &a, "cobalt", &[]).await;
     let pty = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|directory| directory.join("pty"))
@@ -711,22 +728,71 @@ agent "move/worker" {
     })
     .await;
     let old_incarnation = status(&a)["actual"]["incarnation_id"].clone();
-    a.st_ok(&["agents", "stop", SUBJECT, "--as", PERSON]);
-    wait_until("amber's stop reaches both replicas", 30, || async {
-        [&a, &b]
-            .iter()
-            .all(|node| status(node)["actual"]["status"] == "stopped")
+    if mode == SeatMove::Stopped {
+        a.st_ok(&["agents", "stop", SUBJECT, "--as", PERSON]);
+        wait_until("amber's stop reaches both replicas", 30, || async {
+            [&a, &b]
+                .iter()
+                .all(|node| status(node)["actual"]["status"] == "stopped")
+        })
+        .await;
+    }
+    if mode == SeatMove::SourceOffline {
+        a.stop();
+        b.st_ok(&["agents", "start", SUBJECT, "--host", "cobalt", "--source-offline", "--as", PERSON]);
+    } else {
+        b.st_ok(&["agents", "start", SUBJECT, "--host", "cobalt", "--as", PERSON]);
+    }
+    wait_until("cobalt's running observation reaches both replicas", 30, || async {
+        let replicas = if mode == SeatMove::SourceOffline { vec![&b] } else { vec![&a, &b] };
+        for node in replicas {
+            if !node.claims().await.iter().any(|claim| {
+                claim["subject"] == SUBJECT
+                    && claim["kind"] == "runtime.observed"
+                    && claim["origin"] == "cobalt"
+                    && claim["body"]["fields"]["status"] == "running"
+                    && claim["body"]["fields"]["incarnation_id"] != old_incarnation
+            }) {
+                return false;
+            }
+        }
+        true
     })
     .await;
-    b.st_ok(&["agents", "start", SUBJECT, "--host", "cobalt", "--as", PERSON]);
-    wait_until("cobalt's running observation reaches both replicas", 30, || async {
+    if mode == SeatMove::SourceOffline {
+        let proof = b.claims().await.into_iter().find(|claim| {
+            claim["kind"] == "agent.placement.source-offline" && claim["subject"] == SUBJECT
+        }).expect("source-offline move records its exception");
+        assert_eq!(proof["actor"], PERSON);
+        let peek = b.st_ok(&["terminals", "peek", SUBJECT]);
+        assert!(peek.contains("moved-seat-ready"), "destination is reachable while source is offline: {peek}");
+        a.start().await;
+        wait_until("returning source retires its old incarnation", 30, || async {
+            b.claims().await.iter().any(|claim| {
+                claim["subject"] == SUBJECT && claim["origin"] == "amber"
+                    && claim["body"]["fields"]["reason"] == "placed-elsewhere"
+                    && claim["body"]["fields"]["incarnation_id"] == old_incarnation
+            })
+        }).await;
+    }
+    wait_until("both replicas report the destination incarnation", 30, || async {
         [&a, &b].iter().all(|node| {
             let view = status(node);
-            view["actual"]["status"] == "running"
-                && view["actual"]["host"] == "cobalt"
+            view["actual"]["host"] == "cobalt"
+                && view["actual"]["status"] == "running"
+                && view["actual"]["incarnation_id"] != old_incarnation
+                && view["reachability"] == "reachable"
         })
-    })
-    .await;
+    }).await;
+    let runtime_claims = b.claims().await.into_iter()
+        .filter(|claim| claim["subject"] == SUBJECT && claim["kind"] == "runtime.observed")
+        .collect::<Vec<_>>();
+    let source_stop = runtime_claims.iter().find(|claim| {
+        claim["kind"] == "runtime.observed"
+            && claim["origin"] == "amber"
+            && claim["body"]["fields"]["status"] == "stopped"
+            && claim["body"]["fields"]["reason"] == "placed-elsewhere"
+    });
     let moved = [&a, &b].map(status);
     let peek = b.st(&["terminals", "peek", SUBJECT]);
     let screen = b.st(&["terminals", "screen", SUBJECT]);
@@ -736,6 +802,13 @@ agent "move/worker" {
         status(&b)["actual"]["status"] == "stopped"
     })
     .await;
+    if mode != SeatMove::Stopped {
+        let stopped = source_stop.unwrap_or_else(|| {
+            panic!("destination received no source placement-away stop: {runtime_claims:#?}")
+        });
+        assert_eq!(stopped["body"]["fields"]["incarnation_id"], old_incarnation);
+        assert!(!stopped["body"]["evidence"].as_array().unwrap().is_empty());
+    }
     for (node, view) in [&a, &b].into_iter().zip(moved) {
         assert_eq!(view["reachability"], "reachable", "{view}\n{}", node.logs());
         assert_ne!(view["actual"]["incarnation_id"], old_incarnation);

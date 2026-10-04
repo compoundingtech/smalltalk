@@ -48,8 +48,8 @@ git -C "$work/pty" fetch --depth 1 origin "$pty_rev"
 git -C "$work/pty" checkout -q --detach FETCH_HEAD
 test "$(git -C "$work/pty" rev-parse HEAD)" = "$pty_rev"
 cargo build --release --locked --manifest-path "$work/pty/Cargo.toml" \
-  --target-dir "$work/pty-target" --target "$target" -p pty --bin pty
-install -m 0755 "$work/pty-target/$target/release/pty" "$work/$package/bin/pty"
+  --target-dir "$build_dir" --target "$target" -p pty --bin pty
+install -m 0755 "$build_dir/$target/release/pty" "$work/$package/bin/pty"
 if [[ $target == *apple* ]]; then
   # stui's speech helper needs Swift with the macOS 26 SDK; without one the release ships without
   # voice in stui, and says so.
@@ -102,7 +102,9 @@ python3 - "$work/version.json" <<'PY_VERSION'
 import json, subprocess, sys, tomllib
 base = tomllib.load(open('Cargo.toml', 'rb'))['package']['version']
 rev = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], text=True).strip()
-assert json.load(open(sys.argv[1]))['machine_version'] == f'{base}+local.{rev}'
+expected = f'{base}+local.{rev}'
+actual = json.load(open(sys.argv[1]))['machine_version']
+assert actual == expected, f'installed version {actual!r}, expected {expected!r}'
 PY_VERSION
 "$work/installed/st3" --version
 "$work/installed/st3" --help >/dev/null

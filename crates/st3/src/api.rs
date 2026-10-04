@@ -462,6 +462,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/agents/restart", post(restart_agent))
         .route("/v1/agents/rollout", post(rollout_agent))
         .route("/v1/agents/start", post(start_mission_seat))
+        .route("/v1/agents/source-offline", post(override_placement_source))
         .route("/v1/agents/suspend", post(suspend_agent))
         .route("/v1/agents/resume", post(resume_agent))
         .route("/v1/agents/native-session", post(report_native_session))
@@ -754,10 +755,16 @@ async fn response_envelope(
         let auth_state = state.clone();
         let transport = transport.as_str();
         let auth_profile = profile.clone();
+        let admission_queue = profile.as_ref().map(|op| op.wall_span("admission/queue"));
         let admitted = tokio::task::spawn_blocking(move || {
+            drop(admission_queue);
             let _entered = crate::profile::enter(auth_profile.as_ref());
+            let authentication_span = crate::profile::span("admission/authenticate");
             let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
+            drop(authentication_span);
+            let snapshot_span = crate::profile::span("admission/snapshot");
             let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
+            drop(snapshot_span);
             (authentication, snapshot)
         })
         .await;
@@ -788,7 +795,9 @@ async fn response_envelope(
             let handler_profile = profile.clone();
             let cpu_kind = request_route.clone();
             let cpu_client = caller.clone();
+            let handler_queue = profile.as_ref().map(|op| op.wall_span("handler/queue"));
             match tokio::task::spawn_blocking(move || {
+                drop(handler_queue);
                 if let Some(profile) = &handler_profile {
                     profile.queued();
                 }
@@ -2146,7 +2155,11 @@ fn client_agent_resources_uncached(
                 _ if subject.desired.is_some() => "desired",
                 _ => "stopped",
             };
-            let state = if fault.is_some() { "failed" } else { state };
+            let handoff = subject.desired_token.as_deref()
+                .map(|token| crate::placement::handoff(store, &subject.subject, token, snapshot_index))
+                .transpose()?.flatten();
+            let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
+            let state = if fault.is_some() { "failed" } else if moving { "waiting" } else { state };
             let suspension = crate::suspension::current(store, &subject.subject)?;
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
@@ -2161,6 +2174,7 @@ fn client_agent_resources_uncached(
                 .map(|runtime| vec![format!("runtime/{runtime}")])
                 .unwrap_or_default();
             let incarnation_id = fields
+                .filter(|_| !moving)
                 .and_then(|fields| fields.get("incarnation_id"))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
@@ -2231,6 +2245,7 @@ fn client_agent_resources_uncached(
                 })).collect::<Vec<_>>(),
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
+                "handoff": handoff,
                 "rollout": crate::rollout::status(store, &subject.subject)?,
             });
             Ok((name, value))
@@ -4805,6 +4820,7 @@ async fn guard_bound_request(
         "/v1/agents/restart",
         "/v1/agents/rollout",
         "/v1/agents/start",
+        "/v1/agents/source-offline",
         "/v1/agents/suspend",
         "/v1/agents/resume",
         "/v1/agents/native-session",
@@ -8719,6 +8735,22 @@ struct MissionSeatStartRequest {
     #[serde(default)]
     expected: Option<String>,
     idempotency_key: String,
+}
+
+/// Record an operator's source-offline exception for one exact placement.
+async fn override_placement_source(
+    State(state): State<AppState>,
+    Json(mut request): Json<crate::placement::SourceOfflineRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    request.actor = person_or_agent_actor(&request.actor, "invalid-source-offline-actor")?;
+    request.subject = agent_subject(request.subject);
+    let store = state.store.clone();
+    let (claim, appended) = blocking_action(move || {
+        let input = crate::placement::source_offline_input(&store, request)?;
+        store.append_claim_outcome(&input)
+    }).await?;
+    if appended { signal_claim_changed(&state, crate::placement::SOURCE_OFFLINE_KIND); }
+    Ok(Json(claim))
 }
 
 /// Start a stopped mission seat on the declaration its run gave it, as `st agents start` does.

@@ -180,6 +180,9 @@ WHERE json_extract(body,'$.owned_set') IS NOT NULL;
 CREATE INDEX IF NOT EXISTS claims_terminal_history_index ON claims(store_index)
 WHERE kind IN ('mission-run.state','step-run.state','work.failed')
   AND json_extract(body,'$.fields.status') IN ('failed','cancelled','completed');
+CREATE INDEX IF NOT EXISTS claims_terminal_capability_hash_index
+ON claims(json_extract(body, '$.fields.capability_hash'), store_index)
+WHERE kind='custom.client.terminal-attached';
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -11843,10 +11846,11 @@ impl Store {
             "normal" => 2,
             _ => 3,
         };
+        // Most urgent first, and within that the newest first (Nathan, 2026-10-04).
         live.sort_by(|left, right| {
             priority(left)
                 .cmp(&priority(right))
-                .then_with(|| left.requested_at_unix_ms.cmp(&right.requested_at_unix_ms))
+                .then_with(|| right.requested_at_unix_ms.cmp(&left.requested_at_unix_ms))
                 .then_with(|| left.subject.cmp(&right.subject))
                 .then_with(|| left.person.cmp(&right.person))
                 .then_with(|| left.episode.cmp(&right.episode))
@@ -13679,6 +13683,31 @@ impl Store {
         Ok(result)
     }
 
+    /// Resolve a terminal capability and its current-head fence with two indexed seeks, in
+    /// one SQLite snapshot. Unrelated fleet history cannot hide an unexpired capability.
+    pub fn terminal_attachment_for_capability_hash(
+        &self,
+        digest: &str,
+    ) -> Result<Option<(ClaimRecord, bool)>> {
+        let connection = self.readers.get();
+        Ok(connection
+            .prepare_cached(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                        predecessors, accepted_at_unix_ms,
+                        NOT EXISTS (
+                            SELECT 1 FROM claims AS newer
+                            WHERE newer.subject=claims.subject
+                              AND newer.store_index>claims.store_index
+                        )
+                 FROM claims
+                 WHERE kind='custom.client.terminal-attached'
+                   AND json_extract(body, '$.fields.capability_hash')=?1
+                 ORDER BY store_index DESC LIMIT 1",
+            )?
+            .query_row([digest], |row| Ok((claim_from_row(row)?, row.get(10)?)))
+            .optional()?)
+    }
+
     /// Bounded claim history for one subject/kind projection, backed by the composite index.
     pub fn claims_for_subject_kind_at(
         &self,
@@ -14010,6 +14039,48 @@ impl Store {
                 "SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1 AND kind=?2",
             )?
             .query_row(params![subject, kind], |row| row.get(0))?)
+    }
+
+    pub(crate) fn cached_placement_fence(
+        &self,
+        token: &str,
+        build: impl FnOnce() -> Result<Option<crate::placement::Fence>>,
+    ) -> Result<Option<Arc<crate::placement::Fence>>> {
+        if let Some(fence) = self.smalltalk.placement_cache.lock()
+            .unwrap_or_else(PoisonError::into_inner).get(token) {
+            return Ok(fence.clone());
+        }
+        let fence = build()?.map(Arc::new);
+        let mut cache = self.smalltalk.placement_cache.lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if cache.len() >= ACTUAL_CACHE_LIMIT { cache.clear(); }
+        cache.insert(token.to_owned(), fence.clone());
+        Ok(fence)
+    }
+
+    /// Read just the newest runtime body of each origin in canonical order at a snapshot.
+    pub(crate) fn runtime_observations_at(
+        &self, subject: &str, at: u64,
+    ) -> Result<BTreeMap<String, ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject,
+                    claims.kind, claims.origin, claims.actor, claims.body,
+                    claims.predecessors, claims.accepted_at_unix_ms
+             FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND claims.kind='runtime.observed' AND claims.store_index<=?2
+             ORDER BY {CANONICAL_ORDER_DESC}"
+        ))?;
+        let mut rows = statement.query(params![subject, at.min(i64::MAX as u64)])?;
+        let mut latest = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let origin: String = row.get(5)?;
+            if let std::collections::btree_map::Entry::Vacant(entry) = latest.entry(origin) {
+                entry.insert(claim_from_row(row)?);
+            }
+        }
+        Ok(latest)
     }
 
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
@@ -28250,6 +28321,40 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn terminal_capability_lookup_fences_the_subject_head_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graph.db");
+        let store = Store::open(&path, "node").unwrap();
+        let append = |subject: &str, kind: &str| {
+            store.append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: None,
+                fields: BTreeMap::from([("capability_hash".into(), json!("secret-digest"))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap()
+        };
+        let attached = append("custom/client/attachment-a", "custom.client.terminal-attached");
+        append("custom/client/decoy", "custom.client.other");
+        assert_eq!(
+            store.terminal_attachment_for_capability_hash("secret-digest").unwrap()
+                .map(|(claim, current)| (claim.id, current)),
+            Some((attached.id.clone(), true)),
+        );
+        assert!(store.terminal_attachment_for_capability_hash("unknown").unwrap().is_none());
+        append("custom/client/attachment-a", "custom.client.terminal-consumed");
+        drop(store);
+        let reopened = Store::open(&path, "node").unwrap();
+        assert_eq!(
+            reopened.terminal_attachment_for_capability_hash("secret-digest").unwrap()
+                .map(|(claim, current)| (claim.id, current)),
+            Some((attached.id, false)),
+        );
+    }
 
     mod mailbox_fence_tests {
         use super::*;
@@ -46518,6 +46623,16 @@ fn append_claim_with_fences(
                     .with_detail("current_head", json!(actual)));
                 }
             }
+            if input.kind == crate::placement::SOURCE_OFFLINE_KIND {
+                let current: Option<String> = transaction.query_row(
+                    "SELECT claim_id FROM desired WHERE subject=?1 AND kind='agent'",
+                    [&input.subject], |row| row.get(0),
+                ).optional().map_err(internal)?;
+                if current.as_deref() != input.fields.get("desired_token").and_then(Value::as_str) {
+                    return Err(St3Error::new("stale-placement",
+                        "placement changed; read the current handoff before overriding its sources"));
+                }
+            }
             let mut stored_fields = normalize_resource_observation(transaction, input)?;
             if let Some(fields) = glasses::prepare(transaction, input)? {
                 stored_fields = Some(fields);
@@ -46559,7 +46674,36 @@ fn append_claim_with_fences(
             }
             let predecessor =
                 latest_claim_id_tx(transaction, &input.subject).map_err(internal)?;
-            let predecessors = predecessor.into_iter().collect::<Vec<_>>();
+            let mut predecessors = predecessor.into_iter().collect::<Vec<_>>();
+            // A placement handoff explicitly cites its local runtime and peer stop proof.
+            // Keep same-subject evidence as causal links even when a newer declaration
+            // displaced the runtime branch from the selected subject head.
+            if input.kind == "runtime.observed" || input.kind == crate::placement::SOURCE_OFFLINE_KIND {
+                for evidence in &input.evidence {
+                    if claim_by_id_tx(transaction, evidence).map_err(internal)?
+                        .is_some_and(|claim| claim.subject == input.subject)
+                    {
+                        predecessors.push(evidence.clone());
+                    }
+                }
+                if input.kind == crate::placement::SOURCE_OFFLINE_KIND {
+                    // The operator explicitly supersedes these sources' known runtime records.
+                    // Retain those branches so destination routing is usable while sources are
+                    // offline. Choose them under the writer lock; idempotent retries keep the
+                    // original claim rather than changing the request with newer observations.
+                    for source in input.fields.get("sources").and_then(Value::as_array)
+                        .into_iter().flatten().filter_map(Value::as_str) {
+                        let prior: Option<String> = transaction.query_row(&format!(
+                            "SELECT claims.id FROM claims JOIN batches ON batches.id=claims.batch_id
+                             WHERE claims.subject=?1 AND claims.kind='runtime.observed' AND claims.origin=?2
+                             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+                        ), params![input.subject, source], |row| row.get(0)).optional().map_err(internal)?;
+                        predecessors.extend(prior);
+                    }
+                }
+                predecessors.sort();
+                predecessors.dedup();
+            }
             let mut body = json!({
                 "fields": stored_fields.as_ref().unwrap_or(&input.fields),
                 "evidence": input.evidence,

@@ -715,15 +715,15 @@ impl Ui {
                 Pane::Machine(Some(format!("machine/{}", machine.name))),
             );
         }
-        // Home, over the glass.
+        // Now (what `st now` shows), over the glass.
         choices.insert(
             0,
             Choice {
                 section: 0,
-                glyph: ("⌂", theme::ACCENT),
-                label: "Home".into(),
+                glyph: ("◆", theme::PERSON),
+                label: "Now".into(),
                 detail: "what needs you".into(),
-                search: "home".into(),
+                search: "now home".into(),
                 action: Action::Home,
             },
         );
@@ -1641,7 +1641,7 @@ impl Ui {
         buf.set_stringn(
             rect.x + 2,
             rect.y,
-            " ⌂ Home · esc closes ",
+            " Now · esc closes ",
             rect.width.saturating_sub(4) as usize,
             theme::strong(theme::ACCENT).bg(theme::BASE),
         );
@@ -1834,29 +1834,8 @@ impl Ui {
             format!("{glyph} {word}"),
             bar(theme::fg(color)),
         ));
-        // Home lives here, opening over the glass, rather than squeezed into a split.
-        spans.push(Span::styled(" · ", bar(theme::dim())));
-        let x = area.x + Line::from(spans.clone()).width() as u16;
-        let home = self.glasses.as_ref().is_some_and(|glasses| glasses.home);
-        spans.push(Span::styled(
-            " ⌂ ",
-            if home {
-                Style::default()
-                    .fg(theme::CRUST)
-                    .bg(theme::ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                bar(theme::strong(theme::ACCENT))
-            },
-        ));
-        self.hit(
-            Rect {
-                x,
-                width: 3,
-                ..area
-            },
-            Hit::Home,
-        );
+        // Now opens over the glass from its count, "need you" (Nathan, 2026-10-04: one way in,
+        // named as `st now` is).
         let need = self
             .world
             .attention
@@ -3523,7 +3502,7 @@ mod tests {
             first.contains("need you") && first.contains("working") && first.contains("main"),
             "{first}"
         );
-        assert!(first.contains("⌂") && first.contains("active"), "{first}");
+        assert!(!first.contains("⌂") && first.contains("active"), "{first}");
         // A glass with nothing open shows Home, under a bar for starting things.
         assert!(shown.contains("New agent ctrl+n"), "{shown}");
         assert!(shown.contains("ctrl+k open"));
@@ -3582,9 +3561,9 @@ mod tests {
         assert_eq!(tabs(&ui).2[0], [ATLAS, WEEKLY, "machine:machine/harbor"]);
         ctrl(&mut ui, 'w');
 
-        // Home opens over the glass from ⌂, with Home's keys; Esc puts the tab back in charge.
+        // Now opens over the glass from "need you", with its keys; Esc puts the tab back in charge.
         ui.open_home();
-        assert!(screen(&ui).contains("⌂ Home · esc closes"));
+        assert!(screen(&ui).contains("Now · esc closes"));
         assert_eq!(ui.tab, 0);
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         assert!(!ui.home_open());

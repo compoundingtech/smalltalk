@@ -1,0 +1,78 @@
+{
+  "counts": {
+    "smallclaims": {
+      "clippy::empty_line_after_doc_comments": 1,
+      "clippy::filter_next": 1,
+      "clippy::needless_range_loop": 1
+    },
+    "st-drivers": {
+      "clippy::cloned_ref_to_slice_refs": 1,
+      "clippy::collapsible_if": 7,
+      "clippy::items_after_test_module": 2,
+      "clippy::needless_borrow": 2,
+      "clippy::too_many_arguments": 12,
+      "clippy::useless_format": 1,
+      "clippy::while_let_loop": 1
+    },
+    "st2": {
+      "clippy::obfuscated_if_else": 1,
+      "clippy::too_many_arguments": 2
+    },
+    "st3": {
+      "clippy::cloned_ref_to_slice_refs": 5,
+      "clippy::collapsible_if": 30,
+      "clippy::collapsible_match": 1,
+      "clippy::derivable_impls": 1,
+      "clippy::double_ended_iterator_last": 1,
+      "clippy::empty_line_after_doc_comments": 2,
+      "clippy::manual_is_multiple_of": 4,
+      "clippy::manual_next_back": 1,
+      "clippy::needless_borrow": 3,
+      "clippy::needless_borrows_for_generic_args": 1,
+      "clippy::needless_question_mark": 1,
+      "clippy::needless_return": 2,
+      "clippy::redundant_closure": 1,
+      "clippy::too_many_arguments": 3,
+      "clippy::type_complexity": 10,
+      "clippy::unnecessary_get_then_check": 1,
+      "clippy::unnecessary_lazy_evaluations": 1,
+      "clippy::useless_format": 1,
+      "clippy::while_let_loop": 1
+    },
+    "st3-client": {
+      "clippy::large_enum_variant": 1,
+      "clippy::manual_is_multiple_of": 1,
+      "unused_imports": 3
+    },
+    "st3-client-codegen": {
+      "clippy::useless_format": 2,
+      "unused_variables": 1
+    },
+    "st3-feed": {
+      "clippy::filter_map_bool_then": 1,
+      "clippy::if_same_then_else": 1,
+      "clippy::too_many_arguments": 1
+    },
+    "st3-ui-model": {
+      "clippy::field_reassign_with_default": 4
+    },
+    "stui": {
+      "clippy::cloned_ref_to_slice_refs": 2,
+      "clippy::collapsible_if": 1,
+      "clippy::double_ended_iterator_last": 1,
+      "clippy::if_same_then_else": 1,
+      "clippy::int_plus_one": 1,
+      "clippy::items_after_test_module": 1,
+      "clippy::manual_checked_ops": 1,
+      "clippy::too_many_arguments": 1,
+      "clippy::type_complexity": 1,
+      "dead_code": 4,
+      "unused_assignments": 1
+    }
+  },
+  "toolchain": {
+    "clippy": "clippy 0.1.97",
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07) (built from a source tarball)"
+  },
+  "version": 1
+}

@@ -68,7 +68,7 @@ impl Store {
         Ok(())
     }
 
-    /// What each account in `accounts` has left, from the freshest reading of its seats. A weekly
+    /// What each account in `accounts` has left, from the shared account limits selection. A weekly
     /// window that has reset since the reading counts as unused.
     fn candidates(&self, accounts: &[&AccountDecl], now: u128) -> Result<Vec<Candidate>> {
         let limits = self.account_limits()?;

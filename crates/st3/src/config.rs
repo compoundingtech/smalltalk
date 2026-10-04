@@ -67,7 +67,7 @@ impl CheckpointConfig {
     }
 }
 
-/// `[limits]`: when an account's freshest weekly reading reaches `stop_at_weekly_percent`, this
+/// `[limits]`: when an account's selected weekly reading reaches `stop_at_weekly_percent`, this
 /// node stops the seats it hosts that use that account, except those in `keep`, once per weekly
 /// window, and notifies the operations agent in `notify`. A seat a person starts again stays up
 /// until the next window. Every node that hosts seats needs the same settings.

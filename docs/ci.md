@@ -2,10 +2,13 @@
 
 ## GitHub Actions on Namespace
 
-Every push to `main` runs both `Workspace CI` and `macOS CI` on Namespace. Each non-PR run
-uses its own `github.run_id` in the concurrency group, so successive pushes can run concurrently
-without cancelling running checks or replacing pending runs. PR updates still cancel stale
-checks for that PR; macOS checks on PRs require the `macos-ci` label.
+Workspace CI runs on pull requests, merge groups and manual dispatch. The merge queue tests the
+exact commit that lands on `main`; its successful checks stay attached to that SHA, so a main push
+does not repeat the workspace gate. `Main upkeep` verifies those four checks, runs `perf-cost`
+(which the queue skips), and fills missing main-scope caches on Namespace. `macOS CI` still runs
+on main pushes. Each non-PR run uses its own `github.run_id` in the concurrency group, so
+successive pushes do not cancel checks or cache saves. PR updates still cancel stale checks;
+macOS checks on PRs require the `macos-ci` label.
 
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
 (`.github/workflows/macos.yml`) replace the fleet's former Linux `st/ci` and optional `st/ci-macos`
@@ -33,11 +36,21 @@ limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
   builds the selected test executables with dev/test debug info and incremental compilation
   disabled, then runs `bash scripts/ci-nextest run` on every CPU, selected
   by the profile's default filter (see [gate scope](#gate-scope));
-- `linux-clippy`: `cargo clippy --workspace --all-targets --locked`, then
+- `linux-clippy`: `cargo clippy --workspace --all-targets --locked`, the standalone conversation
+  model check, the [warning ratchet](#clippy-warning-ratchet), then
   `cargo run --locked -p st3-client-codegen -- --check`;
 - `linux-fleet-compat`: the fleet compatibility test against `.github/fleet-compat-baseline.json`'s
   pinned older st3. Building that baseline also runs the pinned pty's own unit tests, two of which
   are timing-sensitive, so the build is retried up to three times.
+
+Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
+or restoring build archives. When both entries exist it stops after the probes. A miss is flagged
+as P0 and fills the missing entries with builds only: selected test executables, Clippy artifacts,
+or the fleet baseline and integration binary. Workspace tests and the isolation VM run only in
+the queue. The TypeScript dependency cache is also kept on main without repeating its tests.
+Merge-group and PR caches have their own ref scope; they cannot replace these main-scope saves,
+which all PRs and Namespace overflow runs can restore. Manual Workspace CI dispatch on main
+remains available for a full run. Release and deployment workflows keep their own push triggers.
 
 Each stage restores a job-keyed `actions/cache` entry (Namespace serves it from its accelerated
 backend) holding Cargo's registry and the workspace `target/` directory, keyed on `Cargo.lock` and
@@ -104,6 +117,43 @@ its claim trace and the stand-in's receipts under `target/boot-canaries/`, which
 The Codex stand-in's schema files are generated from the protocol gate's own fixture; when the
 required Codex methods change, `ST_REGENERATE_CODEX_STUB_SCHEMAS=1 cargo test -p st-drivers
 the_boot_canary_codex_stub_schemas` rewrites them.
+
+### Clippy warning ratchet
+
+`linux-clippy` reuses JSON diagnostics from its existing workspace and standalone
+`st3-conversation-ui` Clippy runs. `.github/clippy-baseline.json` records warning counts per
+workspace crate and lint, with sorted keys and the compiler/Clippy versions supplied by the
+`flake.lock`-pinned devShell. It includes Rust warnings as well as Clippy warnings, ignores
+dependencies outside the workspace, and counts each source diagnostic once when Cargo repeats
+it for library/test targets or the standalone model run. A cached Cargo run replays diagnostics.
+Errors and deny-level lints still fail Cargo; a failed, truncated or malformed diagnostic stream
+cannot pass the ratchet.
+
+Any crate/lint count above its baseline fails, including a newly introduced crate or lint.
+Removing warnings also requires lowering the baseline in the same pull request, so a later
+change cannot spend the removed warnings. CI checks that the committed counts do not increase
+relative to the event's immutable base SHA (PR base, merge-group base, or preceding main commit).
+The first rollout permits a base without the file. There is no new required check:
+`linux-gate` already requires `linux-clippy`.
+
+To check locally and lower the baseline after fixing warnings:
+
+```sh
+export RUNNER_TEMP=$(mktemp -d)
+export GITHUB_STEP_SUMMARY="$RUNNER_TEMP/summary.md"
+nix develop -c bash scripts/ci-linux clippy
+# If the stage reports removed warnings, use its saved diagnostics without rebuilding:
+python3 scripts/clippy_ratchet.py --logs "$RUNNER_TEMP/ci-logs" --update
+git add .github/clippy-baseline.json
+nix develop -c bash scripts/ci-linux clippy
+```
+
+`--update` refuses to increase any existing count. The job retains the diagnostic streams,
+metadata and toolchain versions in its `linux-clippy-logs` artifact; the failure message gives
+the same update command. When updating `flake.lock`'s Rust toolchain, regenerate the version
+metadata using fresh diagnostics in the new pinned shell and fix any new warnings; counts
+still cannot increase. Run the ratchet's focused regression proofs with
+`python3 scripts/clippy-ratchet-test` (CI runs them in the same stage).
 
 ### Gate scope
 
@@ -181,7 +231,8 @@ records the KVM probe and each phase's elapsed time.
 
 ### TypeScript client
 
-`typescript-client` runs on every PR, merge-group entry and main push. It installs Node 24.18.0
+`typescript-client` runs on every PR and merge-group entry. Main retains the queue check;
+Main upkeep preserves the dependency cache. It installs Node 24.18.0
 (the workspace uses Node 24), the client's pinned TypeScript 6.0.3 and
 `effect@4.0.0-rc.118` development dependencies from its own lockfile. Both `node_modules`
 directories are cached together, keyed by both lockfiles and the Node version; a miss runs `npm ci --ignore-scripts` in each package.
@@ -394,7 +445,8 @@ Namespace limits CPU and memory per platform; a workflow run is not a fixed unit
 With the current 8x16 stage runners, a merge-queue Workspace CI group initially starts three
 8-vCPU/16-GiB stage jobs and two 8-vCPU/16-GiB profile jobs: 40 vCPUs and 80 GiB at peak.
 The TypeScript client job follows generator freshness and reuses its runner slot.
-PR and main runs also start `perf-cost`, taking their initial peak to 48 vCPUs and 96 GiB.
+PR runs also start `perf-cost`, taking their initial peak to 48 vCPUs and 96 GiB. Main upkeep
+runs that check separately; its three cache-fill jobs normally finish after their lookup-only probes.
 Five complete merge-queue groups need 200 vCPUs and 400 GiB, within the Linux pool limit;
 `max_entries_to_build` remains 5 in both the generated and live main rulesets.
 PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources

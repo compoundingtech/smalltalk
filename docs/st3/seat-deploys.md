@@ -41,8 +41,10 @@ and the current owner reconnects and replays after one second without creating a
 OMP todo observation does not own delivery's lifetime. If the local PTY incarnation is ahead of
 the graph, the channel retains the latest validated todo snapshot while delivery continues. Its
 minute check activates the todo spool and publishes that snapshot once the graph catches up.
-Todo liveness cleanup requires two consecutive terminal or superseded observations; a healthy,
-missing, or failed read resets confirmation, so a single transient reading cannot end the channel.
+Todo liveness cleanup requires two consecutive terminal or superseded observations at least
+60 seconds apart, matching the normal check period rather than wall-clock minute boundaries.
+A healthy, missing, or failed read resets confirmation. EOF waits out any remaining gap and
+rechecks before removing the spool; a single transient reading cannot confirm termination.
 The drain separates captured account metadata from producer facts, then promotes it only for
 accounting claims. Todo retries use normalized prepared claims; rebuilding a rejected claim
 retires its malformed slot atomically without discarding the underlying pending snapshot.

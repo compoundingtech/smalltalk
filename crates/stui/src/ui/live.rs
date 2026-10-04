@@ -1771,7 +1771,7 @@ async fn perform(
                 )
                 .await?;
             Ok((
-                "Launch created; the planner's proposal will appear on Home".into(),
+                "Launch created; the planner's proposal will appear in Now".into(),
                 None,
             ))
         }
