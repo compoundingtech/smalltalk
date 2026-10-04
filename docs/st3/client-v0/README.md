@@ -161,7 +161,9 @@ so they offer one additional `st3.bearer.<credential>` subprotocol alongside the
 protocol (and `st3.cap.<capability>` for terminals). Authentication completes before upgrade,
 using the same expiry, revocation, actor and scopes as native bearers. The server selects and
 echoes only the normal stream protocol, never the credential. An explicit Authorization header
-retains precedence. Redact this credential protocol from reverse-proxy handshake logs.
+is selected before parsing the fallback, even if that fallback is empty or duplicated. Invalid
+explicit Authorization never falls back to another credential. Redact the credential protocol
+from reverse-proxy handshake logs.
 
 The gateway sends this CSP on bundle responses, including HEAD, SPA fallbacks and errors:
 
@@ -184,12 +186,15 @@ At startup the gateway parses every installed HTML document, rejects external, m
 script/style references and base overrides, and computes SHA384 `integrity` attributes on script,
 stylesheet, script/style preload and modulepreload tags. Asset URLs become mount-absolute paths
 so deep SPA routes retain the same resolution. Every built `.js`/`.mjs` chunk receives an
-integrity-bearing modulepreload before entry execution. This eagerly fetches chunks and requires
-native modulepreload support. Bundle CSS must be flattened, and module imports must use ordinary
-built chunk paths without runtime-added query variants: browsers cannot apply HTML SRI metadata
-to arbitrary runtime-created loads or CSS `@import` subrequests. HTML is cached with these pinned
-hashes until daemon restart; changing an asset in place then fails browser integrity checks.
-Deploy the directory as a complete immutable build and restart to regenerate security metadata.
+integrity-bearing modulepreload as browser defense in depth. Independently, the server pins each
+registered executable's SHA384 hash at startup and verifies the exact response bytes before
+serving them, including on HEAD and query-variant requests. Changed or newly added executables
+return `404` until daemon restart; verification does not reopen the file before sending it.
+This boundary does not depend on preload ordering or discovery of descendant integrity links.
+Bundle CSS must be flattened: HTML SRI does not cover CSS `@import` subrequests. HTML is cached
+with pinned integrity metadata until daemon restart; modified styles fail browser SRI checks.
+Deploy the directory as a complete immutable build and restart to register its new assets and
+regenerate security metadata.
 
 The two usage GET relays are `/v1/client/usage/quota` and `/v1/client/usage/history?account=ACCOUNT`.
 Only `/api/v1/quota` and `/api/v1/lens/usage_over_time` on the configured upstream are contacted;

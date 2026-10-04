@@ -153,6 +153,63 @@ mod gateway_tests {
     }
 
     #[tokio::test]
+    async fn websocket_authorization_precedes_malformed_fallback_without_downgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        paired_device(&state, "native-secret", "native");
+        paired_device(&state, "fallback-secret", "fallback");
+        let (address, server) = serve(crate::api::fabric_router(state)).await;
+        for fallback in [
+            format!("{BEARER_PROTOCOL_PREFIX}"),
+            format!("{BEARER_PROTOCOL_PREFIX}unknown, {BEARER_PROTOCOL_PREFIX}fallback-secret"),
+            format!("{BEARER_PROTOCOL_PREFIX}fallback-secret"),
+        ] {
+            for authorization in ["Bearer native-secret", "Bearer unknown", "Basic native-secret"] {
+                let mut request = format!("ws://{address}/v1/client/collections/stream")
+                    .into_client_request()
+                    .unwrap();
+                request.headers_mut().insert(
+                    SEC_WEBSOCKET_PROTOCOL,
+                    format!("{COLLECTION_SUBPROTOCOL}, {fallback}")
+                        .parse()
+                        .unwrap(),
+                );
+                request
+                    .headers_mut()
+                    .insert(AUTHORIZATION, authorization.parse().unwrap());
+                let result = tokio_tungstenite::connect_async(request).await;
+                if authorization == "Bearer native-secret" {
+                    let (mut socket, response) = result.unwrap();
+                    assert_eq!(
+                        response.headers()[SEC_WEBSOCKET_PROTOCOL],
+                        COLLECTION_SUBPROTOCOL
+                    );
+                    socket
+                        .send(Message::Text(
+                            json!({"kind": "subscribe", "id": "native-agents", "collection": "agents"})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    let snapshot = next_json(&mut socket).await;
+                    assert_eq!(snapshot["kind"], "snapshot");
+                    assert_eq!(snapshot["id"], "native-agents");
+                    socket.close(None).await.unwrap();
+                } else {
+                    assert!(matches!(
+                        result.unwrap_err(),
+                        tokio_tungstenite::tungstenite::Error::Http(response)
+                            if response.status() == StatusCode::FORBIDDEN
+                                && !response.headers().contains_key(SEC_WEBSOCKET_PROTOCOL)
+                    ));
+                }
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn websocket_bearer_authenticates_before_upgrade_and_is_never_echoed() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());

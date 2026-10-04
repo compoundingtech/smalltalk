@@ -1365,7 +1365,6 @@ pub(super) fn authenticate(
 ) -> Result<ClientSession, ApiError> {
     // Authenticate at the handshake, before accepting subscriptions. The credential protocol
     // is never selected or echoed; native Authorization headers retain precedence.
-    let websocket_bearer = websocket_credential(request)?;
     let pairing_completion = request.method() == axum::http::Method::POST
         && request.uri().path().starts_with("/v1/client/pairings/")
         && request.uri().path().ends_with("/complete");
@@ -1376,7 +1375,7 @@ pub(super) fn authenticate(
             .strip_prefix("Bearer ")
             .filter(|value| !value.is_empty())
             .ok_or_else(|| forbidden("the client authorization scheme must be Bearer"))?
-    } else if let Some(bearer) = websocket_bearer {
+    } else if let Some(bearer) = websocket_credential(request)? {
         bearer
     } else {
         if transport == "unix" {
