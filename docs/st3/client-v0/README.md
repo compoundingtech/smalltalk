@@ -1182,6 +1182,8 @@ Restriction belongs to the upstream principals/grants system, not an arrangement
 opt-in or ACL. Anonymous access is refused. A paired person selects only their own
 collection; a trusted local fleet agent explicitly selects a fleet person.
 
+Generic status views omit arrangements, like glasses; current arrangement reads use the dedicated client routes, and later arrangement edits do not invalidate historical status frontiers.
+
 Read `GET /v1/client/arrangements?person=person%2FNAME` (ordinary cursor/limit pagination)
 or `GET /v1/client/arrangements/{person_name}/{uuid}`. The owner selector is mandatory:
 an agent identity is not an implicit collection owner. Lists contain typed `Arrangement`
@@ -1201,6 +1203,8 @@ type ArrangementBody = {
   placements: Record<string, Register<{ folder: string | null; key: string }>>;
 };
 ```
+
+Existing phone pairings lack `read.arrangements` and must be re-paired to read arrangements.
 
 Folder IDs are stable lowercase UUIDv7. Placement keys are graph subjects, never PTY or
 session IDs. An optional `resolved: {parents, folders}` supplies effective folder parents
