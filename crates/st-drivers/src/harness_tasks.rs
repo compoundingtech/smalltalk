@@ -35,8 +35,11 @@ pub fn observe_claude(agent_dir: &Path, event: &str, payload: &Value, runtime: &
     };
     // Prefer the native successful response. A present malformed response must not be replaced
     // with plausible input; absence alone permits the documented full replacement input.
-    let source = payload.pointer("/tool_response/newTodos")
-        .or_else(|| payload.pointer("/tool_input/todos"));
+    let source = if payload.get("tool_response").is_some() {
+        payload.pointer("/tool_response/newTodos")
+    } else {
+        payload.pointer("/tool_input/todos")
+    };
     let Some(source) = source else {
         return Ok(());
     };
@@ -251,6 +254,13 @@ mod tests {
         let before = crate::harness_events::read_snapshot(root.path(), "harness-todo").unwrap();
         let stored: Value = serde_json::from_slice(before.as_ref().unwrap()).unwrap();
         assert_eq!(stored["phases"][0]["tasks"][0], json!({"content":"Actual","status":"completed"}));
+        for response in [json!({}), Value::Null, json!("incomplete")] {
+            payload["tool_input"]["todos"] = json!([]);
+            payload["tool_response"] = response;
+            observe_claude(root.path(), "PostToolUse", &payload, "provider-runtime").unwrap();
+            assert_eq!(crate::harness_events::read_snapshot(root.path(), "harness-todo").unwrap(), before);
+        }
+        payload["tool_response"] = json!({"newTodos": []});
         let mut entries = vec![json!({"content":"Work", "status":"pending"}); 100];
         entries.push(json!({"content":"Invalid", "status":"unknown"}));
         observe_claude(root.path(), "PostToolUse", &claude(json!(entries)), "provider-runtime").unwrap_err();

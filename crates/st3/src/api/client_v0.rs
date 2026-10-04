@@ -733,8 +733,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && !dirty.is_empty() => {
                 refresh.extend(dirty.iter().cloned());
             }
-            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "agents")) => {
-                refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "agents")).map(|(id, _)| id.clone()));
+            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "agents" | "harness")) => {
+                refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "agents" | "harness")).map(|(id, _)| id.clone()));
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
@@ -2979,7 +2979,10 @@ fn harness_value(store: &Store, subject: &str, index: u64) -> anyhow::Result<Opt
     let incarnation = actual.filter(|_| !moving)
         .and_then(|fields| fields["incarnation_id"].as_str());
     let observations = store.harness_snapshots_at(subject, index)?;
-    let session = observations.get("harness.session-file");
+    let session = observations.get("harness.session-file").filter(|claim| {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        fields["incarnation_id"].as_str().is_none_or(|bound| Some(bound) == incarnation)
+    });
     let native = session.and_then(|claim| claim.body.get("fields").unwrap_or(&claim.body)["session_id"].as_str());
     let todo = agent_todo_value(observations.get("harness.todo.observed"), session, incarnation);
     let plan = observations.get("harness.plan.observed").and_then(|claim| {
@@ -2991,15 +2994,16 @@ fn harness_value(store: &Store, subject: &str, index: u64) -> anyhow::Result<Opt
                     "accepted_at": client_timestamp(claim.accepted_at_unix_ms), "stale": stale})
             })
     });
+    let harness = store.observed_harness_at(subject, index)?;
     let mut value = json!({
         "id": subject, "kind": "harness-state", "schema": "harness-state.v1",
         "agent_id": subject, "incarnation_id": incarnation, "session_id": native,
-        "state": status.harness.as_ref().map(|harness| harness.state.as_str()),
-        "driver": status.harness.as_ref().and_then(|harness| harness.driver.as_deref()),
+        "state": harness.as_ref().map(|harness| harness.state.as_str()),
+        "driver": harness.as_ref().and_then(|harness| harness.driver.as_deref()),
         "todo": todo, "plan": plan,
         "usage": store.usage_summary_at(subject, None, Some(index))?,
         "updated_at": observations.values().map(|claim| claim.accepted_at_unix_ms)
-            .chain(status.harness.as_ref().map(|harness| harness.observed_at_unix_ms))
+            .chain(harness.as_ref().map(|harness| harness.observed_at_unix_ms))
             .max().map(client_timestamp).unwrap_or_else(|| client_timestamp(0)),
     });
     overlay_subagents(store, std::slice::from_mut(&mut value))?;
@@ -9367,10 +9371,20 @@ mod tests {
             claim
         };
         append("runtime.observed", json!({"status":"running","runtime_id":"focused-runtime","incarnation_id":"one"}));
-        append("harness.session-file", json!({"harness":"codex","agent":subject,"session_id":"native-one","path":"/tmp/focused"}));
+        append("harness.session-file", json!({"harness":"codex","agent":subject,"session_id":"native-one","incarnation_id":"one","path":"/tmp/focused"}));
+        state.store.append_claim(&ClaimInput {
+            subject: "step-run/focused/read".into(), kind: "work.claimed".into(),
+            actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"attempt":1,"status":"claimed","summary":"fixture",
+                "worker_reported":false,"claimant":subject,"claim_incarnation":"one",
+                "claim_expires_at_unix_ms":1,"readiness_epoch":1})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
         let unobserved = harness_value(&state.store, subject, state.store.index().unwrap()).unwrap().unwrap();
         assert!(unobserved["todo"].is_null());
         assert!(unobserved["plan"].is_null());
+        assert!(unobserved["state"].is_null());
+        assert!(unobserved["driver"].is_null());
         let response = super::super::router(state.clone()).oneshot(
             Request::builder().uri(format!("/v1/client/harness/{subject}"))
                 .body(Body::empty()).unwrap(),
@@ -9451,6 +9465,7 @@ mod tests {
         let reset = reset.expect("focused subscription reset");
         assert_eq!(reset["kind"], "snapshot");
         assert_eq!(reset["items"][0]["incarnation_id"], "two");
+        assert!(reset["items"][0]["session_id"].is_null());
         assert_eq!(reset["items"][0]["plan"]["stale"], true);
         assert_collection_frame_conforms(&reset);
         socket.close(None).await.unwrap();
