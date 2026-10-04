@@ -9304,10 +9304,31 @@ impl<R: RuntimeControl> Reconciler<R> {
         let source = crate::mission::interpolate_kdl(source, &variables)?;
         let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
         if assigned_agents_only {
-            intent.subjects.retain(|subject, desired| {
+            let selected_agent = |subject: &str, desired: &DesiredSubject| {
                 desired.kind == "agent"
-                    && (view.assigned_to.as_deref() == Some(subject.as_str())
+                    && (view.assigned_to.as_deref() == Some(subject)
                         || view.available_to.iter().any(|agent| agent == subject))
+            };
+            // Publish a selected agent's synthesized targets before it can start, without
+            // bringing forward other agents, resources, or execution declarations.
+            let uri_targets = intent.subjects.iter()
+                .filter(|(subject, desired)| selected_agent(subject, desired))
+                .flat_map(|(_, desired)| {
+                    desired.desired.get("resources").and_then(Value::as_array)
+                        .into_iter().flatten()
+                })
+                .filter(|edge| edge["kind"] == "uri")
+                .filter_map(|edge| edge["subject"].as_str().map(str::to_owned))
+                .collect::<BTreeSet<_>>();
+            intent.subjects.retain(|subject, desired| {
+                selected_agent(subject, desired)
+                    || (uri_targets.contains(subject)
+                        && desired.kind == "resource"
+                        && subject.starts_with("resource/uri/")
+                        && desired.owner_run.is_none()
+                        && desired.owner_generation.is_none()
+                        && desired.owner_step.is_none()
+                        && crate::graph::declared_uri(&desired.desired).is_some())
             });
         }
         self.keep_stops_by_hand(&mut intent, run)?;
@@ -17099,7 +17120,18 @@ mission "self-assigned" state="ready" {
   goal "Bring up the judge before offering its work."
   step "judge" {
     assigned-to "agent/${ST_MISSION_RUN}/judge"
-    agent "judge" { workspace "/tmp"; command "true"; restart "never" }
+    agent "judge" {
+      workspace "/tmp"
+      command "true"
+      restart "never"
+      resource "judge" uri="urn:example:assigned" reason="judge"
+      resource "agent/judge" uri="urn:example:assigned-two" reason="agent/judge"
+    }
+    agent "bystander" {
+      workspace "/tmp"
+      command "true"
+      resource "unrelated" uri="urn:example:unrelated"
+    }
   }
 }
 "#,
@@ -17132,6 +17164,18 @@ mission "self-assigned" state="ready" {
         assert!(store.desired_subjects().unwrap().iter().any(|desired| {
             desired.subject == format!("agent/{}/judge", run.id)
                 && desired.owner_step.as_deref() == Some(judge.subject.as_str())
+        }));
+        let (_, desired) = store.agent_declaration(&format!("agent/{}/judge", run.id), None)
+            .unwrap().unwrap();
+        let edges = crate::graph::declared_resources(&desired);
+        let uris = store.declared_resource_uris(&edges).unwrap();
+        assert_eq!(uris[&edges[0].subject], "urn:example:assigned");
+        assert_eq!(uris[&edges[1].subject], "urn:example:assigned-two");
+        let published = store.desired_subjects().unwrap();
+        assert!(published.iter().all(|subject| {
+            subject.subject != format!("agent/{}/bystander", run.id)
+                && crate::graph::declared_uri(&subject.desired).as_deref()
+                    != Some("urn:example:unrelated")
         }));
     }
 

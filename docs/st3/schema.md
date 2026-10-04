@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `cc5ebb114240ac1b9b8a5cc14ed5d46cca00a45ee52add8d61276839cd793241`
+Digest: `3e1455cc7fa71cff04535c10fc2efd14aa74d28f2eb3c3432fba45a5048a3b33`
 
 ## Subject families
 
