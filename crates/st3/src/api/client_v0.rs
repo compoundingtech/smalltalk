@@ -4334,30 +4334,38 @@ pub(super) fn timeline_value(
             .filter_map(|item| item["sequence"].as_u64())
             .max()
             .unwrap_or(0);
+        // The replicated snapshot clock can precede newer local observations.
+        // A projection notice belongs after the materialized entries in both orders.
+        let notice_timestamp = items
+            .iter()
+            .filter_map(|item| item["timestamp"].as_str())
+            .max()
+            .unwrap_or(&snapshot.created_at);
         let mut notice = |code: &str, message: &str, details: Value| {
             notice_sequence = notice_sequence.saturating_add(1);
-            items.push(json!({
+            json!({
                 "id": format!("timeline-entry/{session_leaf}/{code}"),
                 "sequence": notice_sequence,
-                "revision": 1, "timestamp": snapshot.created_at,
+                "revision": 1, "timestamp": notice_timestamp,
                 "role": "system", "type": "error", "final": true,
                 "body": {"code":code, "message":message, "retryable":false, "details":details}
-            }));
+            })
         };
-        if has_older_timeline {
+        let query_notice = has_older_timeline.then(|| {
             notice(
                 "timeline-query-limited",
                 "Only the newest 4096 stored transcript operations are available in this view. Older operations and entries updated across that boundary are not included; page cursors cover only this view.",
                 json!({"operation_limit":4096, "omitted_updated_entries":omitted_updates.len()}),
-            );
-        }
-        if prefix_unavailable {
+            )
+        });
+        let prefix_notice = prefix_unavailable.then(|| {
             notice(
                 "timeline-history-incomplete",
                 "Earlier transcript history is unavailable: the physical retained prefix has no covering truncation interval.",
                 json!({"retained_history_incomplete":true, "full_resync":false}),
-            );
-        }
+            )
+        });
+        items.extend([query_notice, prefix_notice].into_iter().flatten());
     }
     items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
     // A conversation opens at its newest bounded window. The cursor walks toward older
@@ -13706,6 +13714,11 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: Some("timeline-retention-runtime".into()),
             })
             .unwrap();
+        // Local observations can advance time without changing the replicated snapshot clock.
+        let local_observed_at = u64::try_from(
+            chrono::DateTime::parse_from_rfc3339(&new_client_snapshot(&state).created_at)
+                .unwrap().timestamp_millis(),
+        ).unwrap() + 1_000;
         let entry = |sequence: u64, entry_type: &str, body: Value| ClaimInput {
             subject: subject.into(),
             kind: "harness.timeline".into(),
@@ -13724,6 +13737,7 @@ mission "example/zero-run" state="ready" {
                 ("body".into(), body),
                 ("driver".into(), Value::String("codex".into())),
                 ("incarnation_id".into(), Value::String(incarnation.into())),
+                ("observed_at_unix_ms".into(), json!(local_observed_at)),
             ]),
             evidence: Vec::new(),
             expected_subject: None,
@@ -13780,6 +13794,13 @@ mission "example/zero-run" state="ready" {
         assert!(page["items"].as_array().unwrap().iter().any(|item| {
             item["body"]["code"] == "timeline-query-limited"
         }));
+        let entries = page["items"].as_array().unwrap();
+        let notice = entries.iter().find(|item| {
+            item["body"]["code"] == "timeline-query-limited"
+        }).unwrap();
+        assert!(entries.iter().all(|item| {
+            item["timestamp"].as_str() <= notice["timestamp"].as_str()
+        }), "a projection notice cannot become the oldest scroll-back boundary");
         assert!(page["items"].as_array().unwrap().iter().any(|item| {
             item["id"] == "timeline-entry/retention-4097"
         }));
