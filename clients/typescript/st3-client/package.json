@@ -17,5 +17,8 @@
     "effect": {
       "optional": true
     }
+  },
+  "devDependencies": {
+    "effect": "4.0.0-rc.118"
   }
 }
