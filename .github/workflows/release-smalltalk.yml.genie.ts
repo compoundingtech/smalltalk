@@ -101,7 +101,6 @@ export default githubWorkflow(auditCaches({
       "env": {
         "MACOSX_DEPLOYMENT_TARGET": "15.0",
         CI_NATIVE_SNAPSHOT: '1',
-        CI_ZIG_CACHE_DIR: '${{ runner.tool_cache }}/zig/0.15.2',
         "RELEASE_TAG": "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
       },
       "steps": [
@@ -114,6 +113,7 @@ export default githubWorkflow(auditCaches({
         {
           "uses": "dtolnay/rust-toolchain@stable"
         },
+        { name: 'Name the pinned compiler cache', run: `printf 'CI_ZIG_CACHE_DIR=%s/zig/0.15.2\\n' \"$RUNNER_TOOL_CACHE\" >> \"$GITHUB_ENV\"` },
         buildSnapshotRestore,
         {
           if: "env.CI_BUILD_SNAPSHOT_HIT != '1'",
