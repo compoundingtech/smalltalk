@@ -359,6 +359,18 @@ export type CollectionCommand = ({
 } | {
   id: string;
   kind: "unsubscribe";
+} | {
+  follow: string;
+  id: string;
+  kind: "input-open";
+} | {
+  data: TerminalInputData;
+  id: string;
+  kind: "input";
+  seq: number;
+} | {
+  id: string;
+  kind: "input-close";
 });
 
 export type CollectionFrame = ({
@@ -406,6 +418,20 @@ export type CollectionFrame = ({
   kind: "error";
   message: string;
   retryable?: boolean;
+} | {
+  follow: string;
+  id: string;
+  kind: "input-opened";
+  next_seq: number;
+} | {
+  id: string;
+  kind: "input-ack";
+  seq: number;
+} | {
+  id: string;
+  kind: "input-closed";
+  message: string;
+  reason: TerminalInputClosedReason;
 });
 
 export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses";
@@ -1296,6 +1322,14 @@ export type TerminalFacts = {
 };
 
 export type TerminalId = string;
+
+export type TerminalInputClosedReason = "incarnation-changed" | "revoked" | "detached" | "gap" | "rejected";
+
+export type TerminalInputData = ({
+  text: string;
+} | {
+  bytes_b64: string;
+});
 
 export type TerminalLine = {
   redacted: boolean;
