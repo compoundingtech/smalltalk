@@ -9,6 +9,9 @@ const SHARED_TABLES: &[(&str, &[&str])] = &[
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),
+    ("custom_registrations", &[]),
+    ("custom_sources", &[]),
+    ("custom_dependencies", &[]),
     ("mission_revisions", &["created_index"]),
     ("mission_definitions", &[]),
     ("mission_runs", &[]),
@@ -59,6 +62,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_resource_projection_pending",
         "local_glass_head_pending",
         "local_glass_head_dirty",
+        "local_custom_dirty",
         "graph_generation",
         "projection_digest_state",
         "projection_digest_generation",
@@ -491,6 +495,19 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
 }
 
 fn write_audit_history(source: &Store) {
+    source.register_custom_kind(&custom::RegistrationRequest {
+        manifest: serde_json::from_str(include_str!("../../../../examples/st3/custom-review.json")).unwrap(),
+        actor: "agent/garden/seed".into(),
+    }).unwrap();
+    source.put_document("doc/garden/audit", b"Immutable audit context", &None, "garden-audit-context").unwrap();
+    source.append_claim(&ClaimInput {
+        subject: "custom/garden/review/v1/audit".into(),
+        kind: "custom.garden.review.v1.requested".into(),
+        actor: Some("agent/garden/seed".into()),
+        fields: serde_json::from_value(json!({"title":"Retain the seed history?","detail":"Choose Keep or Discard.","recipient":"person/fern","context":format!("doc/garden/audit@{}",hex::encode(Sha256::digest(b"Immutable audit context")))})).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+
     publish_takeover(
         source,
         &format!(
@@ -1168,7 +1185,7 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
         for (column, kind) in columns {
             let before_generation = projection_digest::generation(&connection).unwrap();
             let transaction = connection.transaction().unwrap();
-            let expression = if *table == "claims" && column == "body" {
+            let expression = if matches!(*table, "claims" | "custom_sources") && column == "body" {
                 // JSON expression indexes require valid JSON even for deliberate corruption.
                 "json_set(body, '$.fields.__canonical_audit', 'changed')".to_owned()
             } else if *table == "operations" && column == "state" {

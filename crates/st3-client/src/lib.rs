@@ -1138,6 +1138,25 @@ impl Client {
         .await
     }
 
+    pub async fn custom_subjects_list(
+        &self,
+        kind: Option<&str>,
+        version: Option<u32>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<Page>, ClientError> {
+        let version = version.map(|v| v.to_string());
+        let values = [("kind", kind), ("version", version.as_deref())];
+        let filters = values
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect::<Vec<_>>();
+        self.list_internal_with_filters("custom-subjects", cursor, limit, false, &filters)
+            .await
+    }
+    pub async fn custom_subjects_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.resource_internal("custom-subjects", id).await
+    }
     pub async fn host_repositories(
         &self,
         host: &str,
@@ -1590,6 +1609,17 @@ impl Client {
         parameters: AttentionResolveParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::attention_resolve(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn custom_reply(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: CustomReplyParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::custom_reply(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }

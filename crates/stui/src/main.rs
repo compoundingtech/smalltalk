@@ -54,6 +54,7 @@ fn mission_display_label(mission: &st3_client::Mission) -> String {
 }
 fn action_label(action: &str) -> String {
     match action {
+        "custom.reply" => "Reply with the declared fields".into(),
         "work.done" => "Complete step [c]".into(),
         "review.approve" | "launch.approve" => "Approve [a]".into(),
         "review.reject" => "Reject [j]".into(),
@@ -474,6 +475,17 @@ async fn act_on_card(
     }
     let (id, idem) = action_pair();
     let result = match action {
+        "custom.reply" => {
+            let text = reason.ok_or_else(|| anyhow::anyhow!("enter a reply"))?;
+            let fields = custom_form_input(attention.custom_form.as_ref(), &text)?;
+            let mut parameters: st3_client::CustomReplyParameters = serde_json::from_value({
+                let mut p = attention.action_parameters["custom.reply"].clone();
+                p["fields"] = serde_json::json!({});
+                p
+            })?;
+            parameters.fields = fields;
+            client.custom_reply(id, idem, fence, parameters).await?
+        }
         "work.done" => {
             let summary = reason
                 .filter(|summary| !summary.trim().is_empty())
@@ -1452,5 +1464,98 @@ mission "release" state="ready" {
             error.contains("no longer asked") && error.contains("completed"),
             "{error}"
         );
+    }
+}
+
+fn custom_form_hint(form: Option<&serde_json::Value>) -> String {
+    let Some(fields) = form.and_then(|f| f["fields"].as_object()) else {
+        return "Open the source to reply.".into();
+    };
+    fields
+        .iter()
+        .map(|(name, f)| {
+            let choices = f["values"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                })
+                .unwrap_or_default();
+            let required = if f["required"] == true {
+                "required"
+            } else {
+                "optional"
+            };
+            format!(
+                "{} ({}{})",
+                name,
+                required,
+                if choices.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {choices}")
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+        + ". Enter a value for the single required field, or a JSON object for several fields."
+}
+fn custom_form_input(
+    form: Option<&serde_json::Value>,
+    text: &str,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
+    if let Ok(fields) =
+        serde_json::from_str::<std::collections::BTreeMap<String, serde_json::Value>>(text)
+    {
+        return Ok(fields);
+    }
+    let fields = form
+        .and_then(|f| f["fields"].as_object())
+        .ok_or_else(|| anyhow::anyhow!("this source has no reply form"))?;
+    let required = fields
+        .iter()
+        .filter(|(_, f)| f["required"] == true)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        required.len() == 1,
+        "reply with a JSON object containing the displayed fields"
+    );
+    let (name, f) = required[0];
+    let value = if f["value_type"] == "string" || f["value_type"] == "subject-reference" {
+        serde_json::json!(text.trim())
+    } else {
+        serde_json::from_str(text)
+            .map_err(|_| anyhow::anyhow!("enter a value of the displayed field's type"))?
+    };
+    Ok(std::collections::BTreeMap::from([(name.clone(), value)]))
+}
+
+#[cfg(test)]
+mod custom_form_tests {
+    use super::*;
+    #[test]
+    fn custom_forms_preserve_declared_values_multiple_choices_and_reframes() {
+        let form = serde_json::json!({"fields":{"selection":{"required":true,"value_type":"string","values":["keep","discard"]},"text":{"value_type":"string"}}});
+        assert_eq!(
+            custom_form_input(Some(&form), "keep").unwrap()["selection"],
+            "keep"
+        );
+        assert!(custom_form_hint(Some(&form)).contains("keep / discard"));
+        let multi = serde_json::json!({"fields":{"selection":{"required":true,"value_type":"array"},"text":{"value_type":"string"}}});
+        let fields = custom_form_input(
+            Some(&multi),
+            r#"{"selection":[],"text":"Reframe the question"}"#,
+        )
+        .unwrap();
+        assert_eq!(fields["selection"], serde_json::json!([]));
+        assert_eq!(fields["text"], "Reframe the question");
+        assert_eq!(
+            custom_form_input(Some(&multi), r#"["keep","discard"]"#).unwrap()["selection"],
+            serde_json::json!(["keep", "discard"])
+        );
+        assert!(custom_form_input(Some(&multi), "keep").is_err());
     }
 }

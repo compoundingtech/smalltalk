@@ -1,5 +1,6 @@
 //! The authoritative st3 subject, resource, and claim registry.
 
+pub mod custom;
 pub mod glasses;
 pub mod owned_terminals;
 

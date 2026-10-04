@@ -4240,6 +4240,7 @@ impl Store {
                 )
                 .map_err(internal)?;
                 select_replicated_document(transaction, &record, record.store_index)?;
+                self.runtime.after_projection(transaction)?;
                 let version = DocumentVersion {
                     name: name.into(),
                     hash,

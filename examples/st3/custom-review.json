@@ -1,0 +1,138 @@
+{
+  "kind": "garden.review",
+  "namespace": "garden",
+  "version": 1,
+  "language": "custom-projection.v1",
+  "subject_prefix": "custom/garden/review/v1/",
+  "creation_kind": "custom.garden.review.v1.requested",
+  "claims": {
+    "custom.garden.review.v1.requested": {
+      "authority": "creator",
+      "fields": {
+        "title": {
+          "value_type": "string",
+          "required": true,
+          "max_bytes": 512
+        },
+        "detail": {
+          "value_type": "string",
+          "required": true,
+          "max_bytes": 8192
+        },
+        "recipient": {
+          "value_type": "subject-reference",
+          "required": true,
+          "reference_families": [
+            "person"
+          ]
+        },
+        "context": {
+          "value_type": "string",
+          "document": true
+        }
+      }
+    },
+    "custom.garden.review.v1.answered": {
+      "authority": "recipient",
+      "fields": {
+        "request": {
+          "value_type": "string",
+          "required": true,
+          "claim": true
+        },
+        "selection": {
+          "value_type": "string",
+          "required": true,
+          "values": [
+            "keep",
+            "discard"
+          ]
+        },
+        "text": {
+          "value_type": "string",
+          "required": false,
+          "max_bytes": 8192
+        }
+      }
+    }
+  },
+  "slots": {
+    "request": {
+      "kind": "custom.garden.review.v1.requested",
+      "select": "first"
+    },
+    "answer": {
+      "kind": "custom.garden.review.v1.answered",
+      "select": "last"
+    }
+  },
+  "fields": {
+    "question": {
+      "op": "field",
+      "slot": "request",
+      "field": "title"
+    },
+    "selection": {
+      "op": "field",
+      "slot": "answer",
+      "field": "selection"
+    }
+  },
+  "attention": {
+    "when": {
+      "op": "all",
+      "args": [
+        {
+          "op": "exists",
+          "slot": "request"
+        },
+        {
+          "op": "not",
+          "arg": {
+            "op": "exists",
+            "slot": "answer"
+          }
+        }
+      ]
+    },
+    "recipient_field": "recipient",
+    "title": {
+      "op": "field",
+      "slot": "request",
+      "field": "title"
+    },
+    "detail": {
+      "op": "field",
+      "slot": "request",
+      "field": "detail"
+    },
+    "episode": {
+      "op": "claim-id",
+      "slot": "request"
+    },
+    "reply": {
+      "kind": "custom.garden.review.v1.answered",
+      "fields": {
+        "selection": {
+          "value_type": "string",
+          "required": true,
+          "values": [
+            "keep",
+            "discard"
+          ]
+        },
+        "text": {
+          "value_type": "string",
+          "required": false,
+          "max_bytes": 8192
+        }
+      },
+      "bindings": {
+        "request": {
+          "op": "claim-id",
+          "slot": "request"
+        }
+      }
+    }
+  }
+}

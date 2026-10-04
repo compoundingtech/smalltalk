@@ -1007,6 +1007,7 @@ const ACTIONS: &[&str] = &[
     "mission.cancel",
     "session.import",
     "work.ask",
+    "custom.reply",
     "work.done",
     "work.cancel-ask",
     "work.claim",
@@ -1042,6 +1043,7 @@ const ACTIONS: &[&str] = &[
     "pairing.revoke",
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
+    "custom.reply",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -1187,6 +1189,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
@@ -1221,7 +1224,7 @@ pub(super) fn fabric_boundary_forbidden() -> ApiError {
     forbidden("the client gateway exposes only the authenticated client-v0 boundary")
 }
 
-fn validation(message: impl Into<String>) -> ApiError {
+pub(super) fn validation(message: impl Into<String>) -> ApiError {
     ApiError {
         status: StatusCode::UNPROCESSABLE_ENTITY,
         code: "validation-failed".into(),
@@ -5092,6 +5095,20 @@ fn client_session_id(owner: &str, incarnation: &str) -> String {
 }
 
 fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec<String>, Value) {
+    if record.subject.starts_with("custom/")
+        && state
+            .store
+            .custom_subject(&record.subject)
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        return (
+            "attention.changed".into(),
+            vec![record.subject.clone()],
+            json!({"reason":"registered-custom-source-changed"}),
+        );
+    }
     let fields = record.body.get("fields").unwrap_or(&record.body);
     if record.kind == "harness.timeline" {
         let resource_ids = fields
@@ -6867,7 +6884,7 @@ fn action_scope(action: &str) -> Option<&'static str> {
     ) {
         return Some("control.runtimes");
     }
-    if action == "work.done" {
+    if matches!(action, "work.done" | "custom.reply") {
         return Some("control.attention");
     }
     Some(match action.split_once('.')?.0 {
@@ -7562,6 +7579,27 @@ async fn dispatch_action(
             "attention-migrated",
             "attention is a view; complete or remedy its source",
         ))),
+        "custom.reply" => {
+            let result = state
+                .store
+                .reply_custom_subject(&crate::store::custom::ReplyRequest {
+                    subject: parameter_string(p, "target_id")?,
+                    registration: parameter_string(p, "registration")?,
+                    revision: parameter_string(p, "revision")?,
+                    episode: parameter_string(p, "episode")?,
+                    fields: serde_json::from_value(
+                        p.get("fields")
+                            .cloned()
+                            .ok_or_else(|| validation("reply requires fields"))?,
+                    )
+                    .map_err(|_| validation("reply fields must be an object"))?,
+                    actor: authority_actor.clone(),
+                    idempotency_key: request.idempotency_key.clone(),
+                })
+                .map_err(ApiError::bad)?;
+            signal_changed(state);
+            Ok(vec![result.subject])
+        }
         "work.ask" => {
             if let Some(step) = p.get("step_id").and_then(Value::as_str) {
                 validate_work_fence(state, step, &request.fence)?;
