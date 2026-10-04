@@ -654,7 +654,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "fault": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Current member reconcile failure; cleared by a successful pass." }),
   /** Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes. */
   "handoff": Schema.OptionFromOptionalNullOr(AgentHandoff, NULL_NONE).annotate({ description: "Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes." }),
-  "harness_state": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  /** Observed harness state; stale idle is indeterminate. Desired state and declared work status remain separate. */
+  "harness_state": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Observed harness state; stale idle is indeterminate. Desired state and declared work status remain separate." }),
   "host_id": Schema.OptionFromOptionalNullOr(HostId, NULL_NONE),
   "id": AgentId,
   "incarnation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -663,6 +664,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "name": Schema.String,
   "next_work": Schema.OptionFromOptionalNullOr(WorkLabel, NULL_NONE),
   "next_work_id": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),
+  /** Stale after 90 seconds without a new observation; missing when this runtime has no observation. */
+  "observation": optionalKey(Schema.Literals(["current","stale","missing"])).annotate({ description: "Stale after 90 seconds without a new observation; missing when this runtime has no observation." }),
   "operational": optionalKey(Operational),
   "owner_run_id": Schema.OptionFromOptionalNullOr(MissionRunId, NULL_NONE),
   "queued_work_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
@@ -674,6 +677,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "rollout": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE).annotate({ description: "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." }),
   "runtime_ids": Schema.Array(RuntimeId),
   "silent_since": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
+  /** When this observed state began in this runtime incarnation. Same-state observations never reset it. */
+  "since": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "When this observed state began in this runtime incarnation. Same-state observations never reset it." }),
   "state": AgentState,
   /** The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field. */
   "subagents": optionalKey(Schema.Array(AgentSubagent)).annotate({ description: "The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field." }),
@@ -1979,6 +1984,27 @@ export const ResourcesPage = /*#__PURE__*/ (() => Schema.Struct({
 export type ResourcesPage = typeof ResourcesPage.Type
 export type ResourcesPageEncoded = typeof ResourcesPage.Encoded
 
+export const StatusTransition = /*#__PURE__*/ (() => Schema.Struct({
+  "observed_at": Timestamp,
+  /** An incarnation starts here. A runtime reset without a harness observation has a null state. */
+  "reset": Schema.Boolean.annotate({ description: "An incarnation starts here. A runtime reset without a harness observation has a null state." }),
+  "runtime_incarnation": Schema.String,
+  "seat": AgentId,
+  "state": Schema.OptionFromNullOr(Schema.String)
+}).annotate({ identifier: "StatusTransition" }))()
+export type StatusTransition = typeof StatusTransition.Type
+export type StatusTransitionEncoded = typeof StatusTransition.Encoded
+
+export const StatusHistory = /*#__PURE__*/ (() => Schema.Struct({
+  "complete": Schema.Boolean,
+  "items": Schema.Array(StatusTransition).check(Schema.isMaxLength(200)),
+  "kind": Schema.Literal("status-history"),
+  "retained_from": Timestamp,
+  "seat": AgentId
+}).annotate({ identifier: "StatusHistory" }))()
+export type StatusHistory = typeof StatusHistory.Type
+export type StatusHistoryEncoded = typeof StatusHistory.Encoded
+
 export const SubjectDefinition = /*#__PURE__*/ (() => Schema.Struct({
   "conflicts": Schema.Array(Schema.String),
   "desired": Schema.suspend(() => CanonicalNode),
@@ -2051,7 +2077,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, AgentQueue, UsagePeriod], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded

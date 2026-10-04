@@ -46,6 +46,7 @@ export type Agent = ResourceHeader & {
   name: string;
   next_work?: (WorkLabel | null);
   next_work_id?: (Id | null);
+  observation?: "current" | "stale" | "missing";
   owner_run_id?: (MissionRunId | null);
   queued_work_count?: number;
   reachability: AgentReachability;
@@ -55,6 +56,7 @@ export type Agent = ResourceHeader & {
 } | null;
   runtime_ids: Array<RuntimeId>;
   silent_since?: (Timestamp | null);
+  since?: (Timestamp | null);
   state: AgentState;
   subagents?: Array<AgentSubagent>;
   suspension?: (AgentSuspension | null);
@@ -493,7 +495,7 @@ export type Envelope = {
   api_version: "st3.client.v0";
   request_id: RequestId;
   snapshot: Snapshot;
-  value: (Capabilities | DocumentContent | SubjectDefinition | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | AgentQueue | UsagePeriod);
+  value: (Capabilities | DocumentContent | SubjectDefinition | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod);
 };
 
 export type ErrorCode = ("attention-migrated" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
@@ -1153,6 +1155,22 @@ export type Snapshot = {
 };
 
 export type SnapshotId = string;
+
+export type StatusHistory = {
+  complete: boolean;
+  items: Array<StatusTransition>;
+  kind: "status-history";
+  retained_from: Timestamp;
+  seat: AgentId;
+};
+
+export type StatusTransition = {
+  observed_at: Timestamp;
+  reset: boolean;
+  runtime_incarnation: string;
+  seat: AgentId;
+  state: string | null;
+};
 
 export type StepRunId = string;
 
