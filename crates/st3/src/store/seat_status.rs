@@ -81,6 +81,34 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
     entries
 }
 
+pub(super) fn state_run_since(
+    connection: &Connection,
+    subject: &str,
+    incarnation: &str,
+    state: &str,
+    index: u64,
+) -> Result<Option<u128>> {
+    let mut statement = connection.prepare_cached(&harness_observations_of_incarnation_query())?;
+    let mut rows = statement.query(params![subject, index, incarnation])?;
+    let mut since = None;
+    while let Some(row) = rows.next()? {
+        let body: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        if fields.get("state").and_then(Value::as_str) != Some(state) {
+            break;
+        }
+        let accepted: u128 = row.get::<_, String>(2)?.parse()?;
+        since = Some(
+            fields
+                .get("observed_at_ms")
+                .and_then(Value::as_u64)
+                .map_or(accepted, u128::from)
+                .min(accepted),
+        );
+    }
+    Ok(since)
+}
+
 pub(super) fn enrich_harness(
     connection: &Connection,
     subject: &str,
@@ -106,22 +134,14 @@ pub(super) fn enrich_harness(
         .as_ref()
         .is_some_and(|claim| claim.kind == "harness.observed")
     {
-        let mut statement =
-            connection.prepare_cached(&harness_observations_of_incarnation_query())?;
-        let mut rows = statement.query(params![subject, index, view.incarnation_id])?;
-        while let Some(row) = rows.next()? {
-            let body: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
-            let fields = body.get("fields").unwrap_or(&body);
-            if fields.get("state").and_then(Value::as_str) != Some(view.state.as_str()) {
-                break;
-            }
-            let accepted: u128 = row.get::<_, String>(2)?.parse()?;
-            view.since_unix_ms = fields
-                .get("observed_at_ms")
-                .and_then(Value::as_u64)
-                .map_or(accepted, u128::from)
-                .min(accepted);
-        }
+        view.since_unix_ms = state_run_since(
+            connection,
+            subject,
+            &view.incarnation_id,
+            &view.state,
+            index,
+        )?
+        .unwrap_or(view.since_unix_ms);
     }
     let has_prompt: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='harness.diagnostic'
@@ -400,6 +420,23 @@ mod tests {
                 .since_unix_ms
                 == at + 4
         );
+    }
+
+    #[test]
+    fn status_upgrade_preserves_since_from_legacy_observations() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms() - 1_000;
+        let first = observe(&store, "one", "idle", at, "ready");
+        store.connection.lock().unwrap().execute(
+            "UPDATE claims SET body=json_remove(body, '$.fields.observed_since_ms', '$.fields.status_transition') WHERE id=?1",
+            [first.id],
+        ).unwrap();
+        let before = store.current_harness("agent/cedar").unwrap().unwrap();
+        observe(&store, "one", "idle", at + 1, "waiting");
+        let after = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(before.since_unix_ms, at);
+        assert_eq!(after.since_unix_ms, before.since_unix_ms);
     }
 
     #[test]

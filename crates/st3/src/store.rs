@@ -17208,8 +17208,14 @@ fn publish_changed_harness_state_tx(
             && claim.body["fields"].get("incarnation_id") == fields.get("incarnation_id")
     });
     let since = if same_state {
-        latest.as_ref().and_then(|claim| claim.body["fields"]["observed_since_ms"].as_u64())
-            .map(u128::from).unwrap_or_else(|| latest.as_ref().unwrap().accepted_at_unix_ms)
+        let previous = latest.as_ref().unwrap();
+        match previous.body["fields"]["observed_since_ms"].as_u64() {
+            Some(since) => u128::from(since),
+            None => seat_status::state_run_since(transaction, &input.subject,
+                fields.get("incarnation_id").and_then(Value::as_str).unwrap_or_default(),
+                fields.get("state").and_then(Value::as_str).unwrap_or_default(), i64::MAX as u64).map_err(internal)?
+                .unwrap_or_else(|| seat_status::observation_time(previous)),
+        }
     } else {
         observed_at
     };
