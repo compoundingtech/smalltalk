@@ -1147,15 +1147,13 @@ impl Store {
     /// Hold every read connection the pool has, as a burst of long reads does, so a read
     /// inside has to open another.
     pub(crate) fn hold_read_connections_for_test(&self, hold: impl FnOnce()) {
-        let guards: Vec<_> = std::iter::from_fn(|| Some(self.readers.get()))
-            .take(
-                self.readers
-                    .idle
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .len(),
-            )
-            .collect();
+        let idle_count = self
+            .readers
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let guards: Vec<_> = (0..idle_count).map(|_| self.readers.get()).collect();
         hold();
         drop(guards);
     }
@@ -28562,9 +28560,9 @@ agent "test/empty" { command "true" }
         }
         release.send(()).unwrap();
         holder.join().unwrap();
-        // The pool keeps the connections it opened, up to `max_read_connections()`.
+        // Idle retention does not bound concurrently open connections.
         assert!(
-            store.readers.idle.lock().unwrap().len() <= max_read_connections()
+            store.readers.idle.lock().unwrap().len() <= max_idle_read_connections()
         );
     }
 

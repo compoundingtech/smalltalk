@@ -18,15 +18,16 @@ use crate::store::current_index;
 /// (`sqlite3Init`), which under the daemon's read pattern cost more CPU than the reads
 /// themselves (issue #946: 55% of daemon CPU was `ReadPool::get` reopening connections the
 /// pool had just closed), so the pool keeps every connection it opened, up to this many.
-pub const MAX_READ_CONNECTIONS: usize = 128;
+pub const MAX_IDLE_READ_CONNECTIONS: usize = 128;
 
-/// `MAX_READ_CONNECTIONS`, or `SMALLCLAIMS_MAX_READ_CONNECTIONS` when that parses.
-pub fn max_read_connections() -> usize {
+/// Idle retention ceiling, not a limit on concurrent reads or open connections.
+/// `MAX_IDLE_READ_CONNECTIONS`, or `SMALLCLAIMS_MAX_IDLE_READ_CONNECTIONS` when that parses.
+pub fn max_idle_read_connections() -> usize {
     static MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("SMALLCLAIMS_MAX_READ_CONNECTIONS")
+        std::env::var("SMALLCLAIMS_MAX_IDLE_READ_CONNECTIONS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(MAX_READ_CONNECTIONS)
+            .unwrap_or(MAX_IDLE_READ_CONNECTIONS)
     });
     *MAX
 }
@@ -383,8 +384,9 @@ impl Drop for WriterGuard<'_> {
 
 /// Read connections. A read takes an idle connection, or opens another when every one is busy,
 /// so a read never waits for another read to finish: the pool holds as many connections as reads
-/// ever ran at once and keeps them all, up to `max_read_connections()`, closing the rest with
-/// the store. Reads see the last committed state and, in WAL mode, never wait for the writer.
+/// ever ran at once, retains up to `max_idle_read_connections()` between reads, and closes
+/// excess idle connections. Reads see the last committed state and, in WAL mode, never wait
+/// for the writer. The retention ceiling does not bound concurrent connections.
 pub struct ReadPool {
     pub idle: Mutex<Vec<Connection>>,
     /// Wakes a read waiting for an idle connection, which happens only when the operating system
@@ -392,6 +394,8 @@ pub struct ReadPool {
     pub returned: Condvar,
     pub path: PathBuf,
     pub shared_memory: bool,
+    #[cfg(test)]
+    connections_opened: std::sync::atomic::AtomicUsize,
 }
 
 pub struct ReadGuard<'a> {
@@ -444,6 +448,8 @@ impl ReadPool {
             returned: Condvar::new(),
             path: path.to_path_buf(),
             shared_memory,
+            #[cfg(test)]
+            connections_opened: std::sync::atomic::AtomicUsize::new(1),
         };
         // Open one now, so a store that cannot be read fails to open.
         let connection = open_read_connection(&pool.path, pool.shared_memory)?;
@@ -479,6 +485,8 @@ impl ReadPool {
             Some(connection) => connection,
             None => match open_read_connection(&self.path, self.shared_memory) {
                 Ok(connection) => {
+                    #[cfg(test)]
+                    self.connections_opened.fetch_add(1, Ordering::Relaxed);
                     crate::profile::note("read connection opened");
                     connection
                 }
@@ -508,10 +516,10 @@ impl ReadPool {
     }
 
     /// Keep `connection` for the next read, or close it when the pool already holds
-    /// `max_read_connections()` of them.
+    /// `max_idle_read_connections()` of them.
     pub fn release(&self, connection: Connection) {
         let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
-        if idle.len() < max_read_connections() {
+        if idle.len() < max_idle_read_connections() {
             idle.push(connection);
             self.returned.notify_one();
         }
@@ -677,8 +685,6 @@ pub mod work {
 }
 
 pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connection> {
-    #[cfg(any(test, feature = "test-support"))]
-    READ_CONNECTIONS_OPENED.fetch_add(1, Ordering::Relaxed);
     let flags = if shared_memory {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
     } else {
@@ -703,11 +709,6 @@ thread_local! {
     pub static STATEMENTS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Read connections opened since the process started, so a test can see that the pool reuses
-/// them instead of reopening (`#946`).
-#[cfg(any(test, feature = "test-support"))]
-pub static READ_CONNECTIONS_OPENED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 mod tests {
@@ -720,25 +721,17 @@ mod tests {
         // A read-only open needs the file to exist.
         rusqlite::Connection::open(&path).unwrap();
         let pool = ReadPool::new(&path, false).unwrap();
-        let opened = || READ_CONNECTIONS_OPENED.load(Ordering::Relaxed);
-        let before = opened();
+        let opened = || pool.connections_opened.load(Ordering::Relaxed);
         let burst = |pool: &ReadPool| {
-            let guards: Vec<_> = (0..8).map(|_| pool.get()).collect();
+            let guards: Vec<_> = (0..40).map(|_| pool.get()).collect();
             drop(guards);
         };
         burst(&pool);
-        // The first burst needed one connection per concurrent read (the pool's opening
-        // connection covered the first); the second reused all of them. Opening a connection
-        // parses the schema, which is what most of the #946 daemon CPU was.
-        assert_eq!(opened() - before, 7);
-        assert_eq!(
-            pool.idle
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .len(),
-            8
-        );
+        // Forty simultaneous reads exceed the old 32-reader retention ceiling.
+        // The first wave opens 39 connections besides the seed; the second must
+        // reuse them rather than parse the schema under SQLite's allocator mutex.
+        assert_eq!(opened(), 40);
         burst(&pool);
-        assert_eq!(opened() - before, 7);
+        assert_eq!(opened(), 40, "the second wave must not open connections");
     }
 }
