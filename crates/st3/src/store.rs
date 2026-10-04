@@ -11890,6 +11890,15 @@ impl Store {
         launch_lineage_tx(&connection, subject)
     }
 
+    /// Agent launch ancestry selected at a client snapshot; stopped declarations have none.
+    pub fn agent_launch_lineage_at(&self, subject: &str, at: Option<u64>) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        let Some(row) = desired_row_at(&connection, subject, at)?.filter(|row| row.kind == "agent") else {
+            return Ok(Vec::new());
+        };
+        launch_lineage_for_claim_tx(&connection, subject, row.claim_id)
+    }
+
     /// `selected_desired_token` of each of `subjects` that has a declaration, in one statement.
     pub fn selected_desired_tokens(&self, subjects: &[&str]) -> Result<BTreeMap<String, String>> {
         let connection = self.readers.get();
@@ -14313,6 +14322,17 @@ impl Store {
         smallclaims::touched::note_read(|| format!("actor:{subject}"));
         let connection = self.readers.get();
         current_harness_at(&connection, subject, None)
+    }
+
+    /// Incarnation-bound terminal evidence at the same snapshot as the client projection.
+    pub fn terminal_harness_at(
+        &self,
+        subject: &str,
+        at_index: u64,
+    ) -> Result<Option<crate::model::CurrentHarnessView>> {
+        let connection = self.readers.get();
+        Ok(harness_for_runtime_at(&connection, subject, Some(at_index), true)?
+            .filter(|harness| harness.state == "ended"))
     }
 
     pub fn harness_was_ready(&self, subject: &str, incarnation: &str) -> Result<bool> {
@@ -17582,8 +17602,12 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
     let Some(row) = current_desired_row(connection, subject)? else {
         return Ok(Vec::new());
     };
-    let mut lineage = vec![row.claim_id.clone()];
-    let mut current = row.claim_id;
+    launch_lineage_for_claim_tx(connection, subject, row.claim_id)
+}
+
+fn launch_lineage_for_claim_tx(connection: &Connection, subject: &str, claim_id: String) -> Result<Vec<String>> {
+    let mut lineage = vec![claim_id.clone()];
+    let mut current = claim_id;
     while let Some(claim) = claim_by_id_tx(connection, &current)? {
         // A claim that merges concurrent revisions has one predecessor per fork; follow the
         // first one that is still the same launch.
@@ -18920,6 +18944,15 @@ fn current_harness_at(
     subject: &str,
     at_index: Option<u64>,
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
+    harness_for_runtime_at(connection, subject, at_index, false)
+}
+
+fn harness_for_runtime_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    terminal: bool,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let runtime = connection
         .prepare_cached(&format!(
@@ -18936,71 +18969,70 @@ fn current_harness_at(
     let runtime_key = canonical::claim_key(connection, &runtime_claim)?;
     let runtime_body: Value = serde_json::from_str(&runtime_body)?;
     let runtime_fields = runtime_body.get("fields").unwrap_or(&runtime_body);
-    if runtime_fields.get("status").and_then(Value::as_str) != Some("running") {
+    let status = runtime_fields.get("status").and_then(Value::as_str);
+    let matches_runtime = if terminal { matches!(status, Some("exited" | "stopped")) } else { status == Some("running") };
+    if !matches_runtime {
         return Ok(None);
     }
     let Some(incarnation_id) = runtime_fields.get("incarnation_id").and_then(Value::as_str) else {
         return Ok(None);
     };
 
-    // A terminal modal holds even if a parallel native channel reports idle or work progress.
-    // Only a successful subsequent screen observation or a new runtime lifts this fence.
-    if let Some(harness) = update_prompt_fence(connection, subject, incarnation_id, at_index)? {
-        return Ok(Some(harness));
-    }
-
-    // A login prompt or a workspace trust prompt is positive evidence that the current Claude
-    // incarnation cannot accept work. Neither has a hook edge, and channel initialization or work
-    // activity can otherwise overwrite a one-off blocked observation. Fence the entire incarnation
-    // instead.
-    let prompt_rejection = connection
-        .prepare_cached(&format!(
-            "SELECT claims.id, claims.accepted_at_unix_ms, json_extract(claims.body, '$.fields.code'), claims.body
-             FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE claims.subject=?1 AND claims.kind='harness.diagnostic'
-               AND claims.store_index<=?2
-               AND json_extract(claims.body, '$.fields.code')
-                   IN ('provider-auth-expired', 'provider-auth-restored', 'provider-trust-prompt')
-               AND json_extract(claims.body, '$.fields.incarnation_id')=?3
-             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
-        ))?
-        .query_row(
-            params![subject, at_index, incarnation_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()?;
-    // A lifted login fence no longer holds the incarnation.
-    if let Some((claim, observed_at_unix_ms, code, body)) = prompt_rejection
-        && code != "provider-auth-restored"
-    {
-        let (state, reason) = if code == "provider-trust-prompt" {
-            ("blocked", "providerTrustPrompt")
-        } else {
-            ("unauthenticated", "providerAuth")
-        };
-        let body: Value = serde_json::from_str(&body)?;
-        let fields = &body["fields"];
-        let driver = fields["driver"].as_str().unwrap_or("claude");
-        return Ok(Some(crate::model::CurrentHarnessView {
-            state: state.into(),
-            driver: Some(driver.into()),
-            incarnation_id: incarnation_id.to_owned(),
-            transport: Some(if driver == "claude" { "claude-channel" } else { "native" }.into()),
-            reason: Some(reason.into()),
-            blocked_on: Some("human".into()),
-            ask: None,
-            input_buffer: None,
-            exit: None,
-            claim,
-            observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
-        }));
+    if !terminal {
+        // Live prompt fences are not terminal evidence.
+        if let Some(harness) = update_prompt_fence(connection, subject, incarnation_id, at_index)? {
+            return Ok(Some(harness));
+        }
+        // A provider login or workspace trust rejection fences the live incarnation.
+        let prompt_rejection = connection
+            .prepare_cached(&format!(
+                "SELECT claims.id, claims.accepted_at_unix_ms, json_extract(claims.body, '$.fields.code'), claims.body
+                 FROM claims JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=?1 AND claims.kind='harness.diagnostic'
+                   AND claims.store_index<=?2
+                   AND json_extract(claims.body, '$.fields.code')
+                       IN ('provider-auth-expired', 'provider-auth-restored', 'provider-trust-prompt')
+                   AND json_extract(claims.body, '$.fields.incarnation_id')=?3
+                 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+            ))?
+            .query_row(
+                params![subject, at_index, incarnation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        // A lifted login fence no longer holds the incarnation.
+        if let Some((claim, observed_at_unix_ms, code, body)) = prompt_rejection
+            && code != "provider-auth-restored"
+        {
+            let (state, reason) = if code == "provider-trust-prompt" {
+                ("blocked", "providerTrustPrompt")
+            } else {
+                ("unauthenticated", "providerAuth")
+            };
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = &body["fields"];
+            let driver = fields["driver"].as_str().unwrap_or("claude");
+            return Ok(Some(crate::model::CurrentHarnessView {
+                state: state.into(),
+                driver: Some(driver.into()),
+                incarnation_id: incarnation_id.to_owned(),
+                transport: Some(if driver == "claude" { "claude-channel" } else { "native" }.into()),
+                reason: Some(reason.into()),
+                blocked_on: Some("human".into()),
+                ask: None,
+                input_buffer: None,
+                exit: None,
+                claim,
+                observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
+            }));
+        }
     }
 
     // The observations of this runtime epoch, newest first in canonical order, so every node that

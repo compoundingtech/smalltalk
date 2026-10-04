@@ -11,6 +11,20 @@
     { "$ref": "#/$defs/PairingComplete" }
   ],
   "$defs": {
+    "AgentEndReason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ended_at"],
+      "properties": {
+        "kind": {"enum": ["completed", "stopped-by-person", "stopped-by-agent", "crashed", "harness-exited", "host-lost", "retired"]},
+        "actor": {"type": "string"},
+        "reason": {"type": "string"},
+        "exit_code": {"type": "integer"},
+        "exit_signal": {"type": "string"},
+        "diagnostic": {"type": "string"},
+        "ended_at": {"$ref": "#/$defs/Timestamp"}
+      }
+    },
     "ConversationSearchHit": {"type": "object", "additionalProperties": false, "required": ["conversation_id", "entry_id", "agent_id", "timestamp", "entry_type", "excerpt"], "properties": {"conversation_id": {"$ref": "#/$defs/Id"}, "entry_id": {"$ref": "#/$defs/Id"}, "agent_id": {"type": ["string", "null"]}, "timestamp": {"$ref": "#/$defs/Timestamp"}, "entry_type": {"type": "string"}, "excerpt": {"type": "string", "maxLength": 512}}},
     "ConversationSearch": {"type": "object", "additionalProperties": false, "required": ["kind", "items", "page", "indexed_at", "host_id", "incomplete_sources", "refreshing"], "properties": {"kind": {"const": "conversation-search"}, "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/ConversationSearchHit"}}, "page": {"$ref": "#/$defs/PageInfo"}, "indexed_at": {"$ref": "#/$defs/Timestamp"}, "host_id": {"$ref": "#/$defs/Id"}, "incomplete_sources": {"type": "array", "items": {"type": "string"}}, "refreshing": {"type": "boolean"}}},
 
@@ -778,6 +792,7 @@
             "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/MissionRunId" }, { "type": "null" }] },
             "driver": { "type": ["string", "null"] },
             "harness_state": { "type": ["string", "null"] },
+            "end_reason": {"oneOf": [{"$ref": "#/$defs/AgentEndReason"}, {"type": "null"}], "description": "Derived terminal reason; absent when evidence is missing or stale. Never infer completion from absence."},
             "blocked_on": { "type": ["string", "null"], "description": "Current incarnation's harness blocking axis; human means a person must answer before it continues." },
             "ask": { "type": ["string", "null"], "description": "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." },
             "reason": { "type": ["string", "null"], "description": "Diagnostic harness reason, not a machine-readable verdict." },

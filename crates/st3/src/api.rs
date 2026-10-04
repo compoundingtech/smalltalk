@@ -63,6 +63,7 @@ mod client_presence;
 mod client_v0;
 mod delivery_presence;
 mod delivery_probes;
+mod end_reason;
 mod github_watch;
 mod harness_events;
 mod mailbox;
@@ -2024,6 +2025,7 @@ fn client_agent_resources_uncached(
         .collect::<BTreeMap<_, _>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
+    let retired_subjects = store.retired_owned_subjects_at(snapshot_index)?;
     let queued_steps = work_queues
         .values()
         .flat_map(|queue| {
@@ -2160,7 +2162,7 @@ fn client_agent_resources_uncached(
                 .transpose()?.flatten();
             let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
             let state = if fault.is_some() { "failed" } else if moving { "waiting" } else { state };
-            let suspension = crate::suspension::current(store, &subject.subject)?;
+            let suspension = crate::suspension::current_at(store, &subject.subject, Some(snapshot_index))?;
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
                 Some("suspended") if fault.is_none() => "suspended",
@@ -2196,6 +2198,20 @@ fn client_agent_resources_uncached(
                     })
                 })
                 .unwrap_or_default();
+            let desired_claim = subject.desired_token.as_deref()
+                .filter(|_| subject.kind.as_deref() == Some("stop"))
+                .map(|claim| store.claim_by_id(claim)).transpose()?.flatten();
+            let terminal_harness = if subject.harness.is_none()
+                && matches!(fields.and_then(|fields| fields.get("status")).and_then(Value::as_str), Some("exited" | "stopped"))
+            {
+                store.terminal_harness_at(&subject.subject, snapshot_index)?
+            } else { None };
+            let original_suspend = suspension.as_ref()
+                .filter(|state| state.action == "resume" && state.phase == "suspended")
+                .and_then(|state| state.suspend_operation_id.as_deref())
+                .map(|request| crate::suspension::completed_suspend_at(store, request, snapshot_index))
+                .transpose()?.flatten();
+            let end_reason = end_reason::project(&subject, terminal_harness.as_ref(), original_suspend.as_ref().or(suspension.as_ref()), desired_claim.as_ref(), retired_subjects.contains(&subject.subject), &updated_at);
             let name = crate::model::effective_agent_name(
                 &subject.subject, subject.desired.as_ref(),
             ).to_owned();
@@ -2221,6 +2237,7 @@ fn client_agent_resources_uncached(
                 "owner_run_id": subject.owner_run,
                 "driver": driver,
                 "harness_state": harness_state,
+                "end_reason": end_reason,
                 "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
                 "ask": subject.harness.as_ref().and_then(|harness| harness.ask.as_deref()),
                 "reason": subject.harness.as_ref().and_then(|harness| harness.reason.as_deref()),
