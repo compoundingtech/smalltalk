@@ -66,6 +66,7 @@ mod delivery_probes;
 mod github_watch;
 mod harness_events;
 mod mailbox;
+mod mail_backlog;
 mod owned_sets;
 mod terminal_view;
 
@@ -333,6 +334,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/documents/content", get(client_v0::document_get))
         .route("/v1/client/usage", get(client_v0::usage_period))
+        .route("/v1/client/mail-backlog", get(mail_backlog::get))
         .route("/v1/client/clients", get(client_v0::clients_list))
         .route(
             "/v1/client/subject-definition",
@@ -530,6 +532,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/page", get(list_messages_page))
+        .route("/v1/messages/cleanup", post(mail_backlog::cleanup))
         .route("/v1/mailbox", get(mailbox::subscribe))
         .route("/v1/harness-events", post(harness_events::publish))
         .route("/v1/mailbox/bind", post(mailbox::bind))
@@ -6136,6 +6139,14 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             status: "warn".into(),
             message: error.to_string(),
         }),
+    }
+    match mail_backlog::report(&state.store, client_now_ms()) {
+        Ok(backlog) => checks.push(DoctorCheck {
+            name: "mail-backlog".into(),
+            status: if backlog.count == 0 { "pass" } else { "warn" }.into(),
+            message: format!("{} undelivered messages older than 1h; close them with `{}`", backlog.count, backlog.cleanup_command),
+        }),
+        Err(error) => checks.push(DoctorCheck { name: "mail-backlog".into(), status: "warn".into(), message: error.to_string() }),
     }
     match delivery_probes::check(
         &state.store,

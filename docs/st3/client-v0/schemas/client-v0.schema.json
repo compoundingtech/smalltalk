@@ -122,7 +122,8 @@
             { "$ref": "#/$defs/TerminalScreen" },
             { "$ref": "#/$defs/StatusHistory" },
             { "$ref": "#/$defs/AgentQueue" },
-            { "$ref": "#/$defs/UsagePeriod" }
+            { "$ref": "#/$defs/UsagePeriod" },
+            { "$ref": "#/$defs/MailBacklog" }
           ]
         }
       }
@@ -551,6 +552,15 @@
         "incarnation_count": { "type": "integer", "minimum": 0 },
         "aggregation": { "const": "cumulative-per-incarnation-else-response-deltas" },
         "context": { "$ref": "#/$defs/UsageContext" }
+      }
+    },
+    "MailBacklog": {
+      "type": "object", "additionalProperties": false,
+      "required": ["count", "threshold_ms", "cleanup_command"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "threshold_ms": { "type": "integer", "minimum": 1 },
+        "cleanup_command": { "type": "string" }
       }
     },
     "UsagePeriod": {

@@ -3805,6 +3805,18 @@ enum MessageCommand {
     Reply(MessageReplyArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
+    /// Archive undelivered mail past an age threshold as each recipient.
+    Cleanup {
+        #[arg(long, conflicts_with = "actor", required_unless_present = "actor")]
+        all: bool,
+        #[arg(long = "as", conflicts_with = "all", required_unless_present = "all")]
+        actor: Option<String>,
+        #[arg(long, default_value = "1h")]
+        older_than: String,
+        /// Show the matching message IDs without archiving them.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Render the bounded conversation thread around one message.
     Thread(MessageReferenceArgs),
     /// List normalized harness sessions available for native conversation views.
@@ -14540,6 +14552,31 @@ async fn run_message(
                 return Ok(());
             };
             print_message_receipt(&receipt, json_output)
+        }
+        MessageCommand::Cleanup { all, actor, older_than, dry_run } => {
+            if let Some(actor) = actor.as_deref() {
+                reject_foreign_agent_actor(actor)?;
+            }
+            let older_than_ms = st3::graph::parse_duration(&older_than, true)?;
+            let result: Value = client
+                .post("/v1/messages/cleanup", &json!({
+                    "older_than_ms": older_than_ms, "to": actor, "all": all, "dry_run": dry_run,
+                }))
+                .await?;
+            sync_message_projection(client).await?;
+            if json_output {
+                print_value(&result, true)
+            } else {
+                println!("{} {} undelivered messages older than {}", if dry_run { "Would archive" } else { "Archived" }, result["count"], older_than);
+                if dry_run {
+                    for id in result["messages"].as_array().into_iter().flatten() {
+                        if let Some(id) = id.as_str() {
+                            println!("{id}");
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
         MessageCommand::Archive(args) => {
             let actor = args

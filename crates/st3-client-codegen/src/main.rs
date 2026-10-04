@@ -216,6 +216,8 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn clients_list(&self) -> Result<Envelope<ClientConnections>, ClientError> {{ self.get(\"/v1/client/clients\").await }}"
             )?;
+        } else if id == "mail-backlog.summary" {
+            writeln!(out, "    pub async fn mail_backlog_summary(&self) -> Result<Envelope<MailBacklog>, ClientError> {{ self.get(\"/v1/client/mail-backlog\").await }}")?;
         } else if id == "usage.period" {
             writeln!(
                 out,
@@ -338,6 +340,8 @@ fn swift_operation_methods(
                 out,
                 "    public func clientsList() async throws -> Envelope<ClientConnections> {{ try await get(\"v1/client/clients\") }}"
             )?;
+        } else if id == "mail-backlog.summary" {
+            writeln!(out, "    public func mailBacklogSummary() async throws -> Envelope<MailBacklog> {{ try await get(\"v1/client/mail-backlog\") }}")?;
         } else if id == "usage.period" {
             writeln!(
                 out,
@@ -583,6 +587,7 @@ fn validate_surfaces(
         "CanonicalNode",
         "SubjectDefinition",
         "UsagePeriod",
+        "MailBacklog",
         "UsageRow",
         "ClientConnections",
         "ClientConnection",
@@ -1114,6 +1119,8 @@ fn typescript_operation_methods(
                 out,
                 "    async {method}(): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}'); }}"
             )?;
+        } else if id == "mail-backlog.summary" {
+            writeln!(out, "    async mailBacklogSummary(): Promise<EnvelopeOf<MailBacklog>> {{ return this.get('/v1/client/mail-backlog'); }}")?;
         } else if id == "usage.period" {
             writeln!(
                 out,

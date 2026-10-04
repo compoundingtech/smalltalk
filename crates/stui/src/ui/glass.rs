@@ -1854,6 +1854,14 @@ impl Ui {
             format!("{glyph} {word}"),
             bar(theme::fg(color)),
         ));
+        if let Load::Ready(backlog) = &self.world.mail_backlog {
+            if backlog.count > 0 {
+                spans.push(Span::styled(format!(" · {} undelivered >1h", backlog.count), bar(theme::fg(theme::YELLOW))));
+            }
+        }
+        if let Load::Failed(_) = &self.world.mail_backlog {
+            spans.push(Span::styled(" · mail backlog unavailable", bar(theme::fg(theme::YELLOW))));
+        }
         // Now opens over the glass from its count, "need you" (Nathan, 2026-10-04: one way in,
         // named as `st now` is).
         let need = self
@@ -3537,6 +3545,23 @@ mod tests {
         assert!(shown.contains("ctrl+k open"));
         let plain = screen(&Ui::new(demo::world()));
         assert!(!plain.contains("ctrl+k") && !plain.lines().next().unwrap().contains("need you"));
+    }
+
+    #[test]
+    fn mail_backlog_remains_visible_in_both_layouts_and_clears_after_cleanup() {
+        let mut ui = glass();
+        let backlog = st3_client::MailBacklog {
+            count: 37, threshold_ms: 3_600_000,
+            cleanup_command: "st conversations cleanup --all --older-than 1h".into(),
+        };
+        ui.world.mail_backlog = Load::Ready(backlog.clone());
+        assert!(screen(&ui).contains("37 undelivered >1h"));
+        ui.glasses = None;
+        let shown = screen(&ui);
+        assert!(shown.contains("37 undelivered >1h"));
+        assert!(shown.contains(&backlog.cleanup_command));
+        ui.world.mail_backlog = Load::Ready(st3_client::MailBacklog { count: 0, ..backlog });
+        assert!(!screen(&ui).contains("undelivered >1h"));
     }
 
     #[test]
