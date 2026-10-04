@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt as _;
 
 #[derive(Default, Deserialize, Serialize)]
@@ -16,6 +16,8 @@ struct State {
     fence: Fence,
     attempted: BTreeSet<String>,
     confirmed: BTreeSet<String>,
+    #[serde(default)]
+    accepted: BTreeSet<String>,
     lines: st_drivers::reexec::LineBuffer,
 }
 #[derive(Default, Deserialize, Serialize)]
@@ -23,6 +25,8 @@ struct Handoffs {
     incarnation: String,
     attempted: BTreeSet<String>,
     confirmed: BTreeSet<String>,
+    #[serde(default)]
+    accepted: BTreeSet<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -36,6 +40,7 @@ pub async fn run(
 ) -> Result<()> {
     let agent_dir = &paths.agent_dir;
     let ledger_path = agent_dir.join("native-channel-handoffs.json");
+    let mut replay_delivered = BTreeSet::new();
     let mut state = if let Some(path) =
         st_drivers::reexec::resume_path(st_drivers::reexec::CHANNEL_RESUME_ENV)
     {
@@ -47,13 +52,18 @@ pub async fn run(
             .ok()
             .map(|bytes| serde_json::from_slice::<Handoffs>(&bytes))
             .transpose()?;
-        let ledger = ledger
-            .filter(|ledger| ledger.incarnation == incarnation)
-            .unwrap_or_default();
+        // Keep uncertain native handoffs across a seat restart. Proof is recovered
+        // before any new offer; absence of proof gets a typed diagnostic, never an
+        // unconditional replay of instructions whose consumption is uncertain.
+        let ledger = ledger.unwrap_or_default();
+        if ledger.incarnation != incarnation {
+            replay_delivered = ledger.attempted.clone();
+        }
         State {
             fence: Fence::new(subject, incarnation, "delivery"),
             attempted: ledger.attempted,
             confirmed: ledger.confirmed,
+            accepted: ledger.accepted,
             ..State::default()
         }
     };
@@ -81,6 +91,9 @@ pub async fn run(
     let mut content = BTreeMap::<String, String>::new();
     let mut transcript = Transcript::default();
     let wrapper = std::env::var(st_drivers::claude_session::SESSION_ENV).unwrap_or_default();
+    let mut retries = BTreeMap::<String, Retry>::new();
+    let mut unconfirmed_since = BTreeMap::<String, Instant>::new();
+    let mut diagnostics = BTreeSet::<String>::new();
     loop {
         tokio::select! {
             frame = subscription.receiver.recv() => match frame {
@@ -121,54 +134,121 @@ pub async fn run(
                 if state.initialized && replayed {
                     for message in &messages {
                         if !matches!(message.status.as_str(), "sent" | "staged" | "delivered") { continue; }
-                        if !state.attempted.contains(&message.subject)
-                            && !prepare_handoff(client, &state.fence, message).await.unwrap_or(false) { continue; }
-                        let envelope = if let Some(envelope) = content.get(&message.subject) { envelope.clone() } else {
-                            let Ok(body) = body(client, message).await else { continue; };
-                            // The image files come first: a message that names a file is delivered
-                            // once the file is here, never without it.
-                            let Ok(attachments) = crate::blobs::materialize_for_seat(client, subject, &agent_dir.join("attachments"), message).await else { continue; };
-                            let envelope = st_drivers::ding::with_dictation_notice(st_drivers::ding::st3_notification_with_attachments(&message.subject, &message.from, &message.to,
-                                message.title.as_deref(), &body, &st_drivers::ding::st3_body_sha256(&body), &attachments), &message.tags);
-                            // A body can become available after reexec has already scanned the native
-                            // transcript for other messages. Revisit retained proof once for this identity.
-                            transcript.body_available(state.attempted.contains(&message.subject));
-                            content.insert(message.subject.clone(), envelope.clone());
-                            envelope
-                        };
-                        if state.attempted.contains(&message.subject) { continue; }
-                        // Before the handoff, persist its stable identity. A broken stdout or channel
-                        // restart cannot authorize repeating an uncertain native notification.
+                        let previous_attempt = replay_delivered.remove(&message.subject);
+                        if message.status == "delivered" && previous_attempt
+                            && !state.confirmed.contains(&message.subject) {
+                            state.attempted.remove(&message.subject);
+                        }
+                        if content.contains_key(&message.subject) || !retry_ready(&retries, &message.subject) { continue; }
+                        let prepared = async {
+                            if !state.attempted.contains(&message.subject)
+                                && !prepare_handoff(client, &state.fence, message).await? {
+                                return Ok(None);
+                            }
+                            let body = body(client, message).await?;
+                            let attachments = crate::blobs::materialize_for_seat(client, subject, &agent_dir.join("attachments"), message).await?;
+                            Ok::<_, anyhow::Error>(Some(st_drivers::ding::with_dictation_notice(
+                                st_drivers::ding::st3_notification_with_attachments(&message.subject, &message.from, &message.to,
+                                    message.title.as_deref(), &body, &st_drivers::ding::st3_body_sha256(&body), &attachments), &message.tags)))
+                        }.await;
+                        match prepared {
+                            Ok(Some(envelope)) => {
+                                // Proof may predate this incarnation or arrive while a body is
+                                // unavailable. Inspect it before authorizing another notification.
+                                transcript.body_available(state.attempted.contains(&message.subject) || message.status != "sent");
+                                content.insert(message.subject.clone(), envelope);
+                                retries.remove(&message.subject);
+                            },
+                            Ok(None) => {},
+                            Err(error) => {
+                                retry_failed(&mut retries, &message.subject);
+                                diagnostic(client, &state.fence, &message.subject, "claude-message-unforwarded",
+                                    &format!("{message}: preparation failed; retrying with backoff up to 30s: {error:#}", message=message.subject),
+                                    &mut diagnostics).await;
+                            },
+                        }
+                    }
+                    // User meta records and explicit mid-turn absorption are native
+                    // consumption proof. An enqueue or writing stdout is not a receipt.
+                    let mut dirty = false;
+                    if !content.is_empty() && retry_ready(&retries, "transcript") {
+                        let records = (|| {
+                            let path = st_drivers::claude_session::channel_transcript_recovering(paths, identity, runtime_id, &wrapper)?
+                                .context("Claude has not bound this wrapper to a native transcript")?;
+                            transcript.appended(&path)
+                        })();
+                        match records {
+                            Ok(records) => {
+                                retries.remove("transcript");
+                                for record in records {
+                                    for (message, envelope) in &content {
+                                        if native_receipt(&record, envelope) {
+                                            dirty |= state.confirmed.insert(message.clone());
+                                            dirty |= state.accepted.insert(message.clone());
+                                            dirty |= state.attempted.insert(message.clone());
+                                        } else if native_acceptance(&record, envelope) {
+                                            dirty |= state.accepted.insert(message.clone());
+                                            dirty |= state.attempted.insert(message.clone());
+                                        }
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                retry_failed(&mut retries, "transcript");
+                                diagnostic(client, &state.fence, "transcript", "claude-receipt-unavailable",
+                                    &format!("Native receipt lookup failed; retrying with backoff up to 30s: {error:#}"),
+                                    &mut diagnostics).await;
+                            },
+                        }
+                    }
+                    for message in &messages {
+                        let Some(envelope) = content.get(&message.subject) else { continue; };
+                        if state.attempted.contains(&message.subject) {
+                            let since = unconfirmed_since.entry(message.subject.clone()).or_insert_with(Instant::now);
+                            if !state.confirmed.contains(&message.subject) && message.status != "delivered" && since.elapsed() >= Duration::from_secs(30) {
+                                diagnostic(client, &state.fence, &message.subject, "claude-handoff-unconfirmed",
+                                    &format!("{} was offered to Claude but has no native consumption proof after 30s; retaining staged mail and checking receipts with bounded backoff. Repeating an uncertain notification is held to avoid duplicate instructions.", message.subject),
+                                    &mut diagnostics).await;
+                            }
+                            continue;
+                        }
+                        // Persist the handoff before stdout. A broken pipe cannot authorize
+                        // repeating an uncertain notification. Restart first checks native proof.
                         state.attempted.insert(message.subject.clone());
                         save_handoffs(&ledger_path, &state)?;
+                        unconfirmed_since.insert(message.subject.clone(), Instant::now());
                         write(&mut stdout, &json!({"jsonrpc":"2.0","method":"notifications/claude/channel",
                             "params":{"content":envelope,"meta":{"from":message.from,"messageId":message.subject,
                             "threadId":message.in_reply_to.as_ref().unwrap_or(&message.subject),"identity":identity}}})).await?;
-                    }
-                    // The bound native transcript is the receipt. Writing notification bytes is
-                    // not delivery or read, and a daemon outage creates neither fact.
-                    let mut dirty = false;
-                    if !content.is_empty()
-                        && let Ok(Some(path)) = st_drivers::claude_session::channel_transcript_paths(&paths.session_dir, identity, runtime_id, &wrapper)
-                        && let Ok(records) = transcript.appended(&path) {
-                        for record in records {
-                            for (message, envelope) in &content {
-                                if state.attempted.contains(message) && native_receipt(&record, envelope) {
-                                    dirty |= state.confirmed.insert(message.clone());
-                                }
-                            }
-                        }
                     }
                     // Persist native proof before trying receipts: a lost daemon acknowledgement
                     // must retry the receipt, never the notification.
                     if dirty { save_handoffs(&ledger_path, &state)?; }
                     dirty = false;
-                    for message in state.confirmed.clone() {
-                        if receipt(client, &state.fence, &message, "delivered").await.is_ok()
-                            && receipt(client, &state.fence, &message, "read").await.is_ok() {
-                            state.confirmed.remove(&message);
-                            content.remove(&message);
-                            dirty = true;
+                    for message in state.accepted.union(&state.confirmed).cloned().collect::<Vec<_>>() {
+                        let key = format!("receipt:{message}");
+                        if !retry_ready(&retries, &key) { continue; }
+                        let result = async {
+                            receipt(client, &state.fence, &message, "delivered").await?;
+                            if state.confirmed.contains(&message) {
+                                receipt(client, &state.fence, &message, "read").await?;
+                            }
+                            Ok::<_, anyhow::Error>(())
+                        }.await;
+                        match result {
+                            Ok(()) => {
+                                state.accepted.remove(&message);
+                                if state.confirmed.remove(&message) { content.remove(&message); }
+                                retries.remove(&key);
+                                unconfirmed_since.remove(&message);
+                                dirty = true;
+                            },
+                            Err(error) => {
+                                retry_failed(&mut retries, &key);
+                                diagnostic(client, &state.fence, &message, "claude-receipt-unsettled",
+                                    &format!("{message} has durable native proof but publishing its receipt failed; retrying with backoff up to 30s: {error:#}"),
+                                    &mut diagnostics).await;
+                            },
                         }
                     }
                     // Closed graph messages are also durable proof, including a receipt applied
@@ -177,7 +257,9 @@ pub async fn run(
                     let before = state.attempted.len();
                     state.attempted.retain(|message| active.contains(message));
                     state.confirmed.retain(|message| active.contains(message));
+                    state.accepted.retain(|message| active.contains(message));
                     content.retain(|message, _| active.contains(message));
+                    unconfirmed_since.retain(|message, _| active.contains(message));
                     dirty |= before != state.attempted.len();
                     if dirty { save_handoffs(&ledger_path, &state)?; }
                 }
@@ -205,6 +287,59 @@ pub async fn run(
     }
 }
 
+#[derive(Default)]
+struct Retry {
+    failures: u32,
+    due: Option<Instant>,
+}
+fn retry_ready(retries: &BTreeMap<String, Retry>, key: &str) -> bool {
+    retries
+        .get(key)
+        .is_none_or(|retry| retry.due.is_none_or(|due| Instant::now() >= due))
+}
+fn retry_failed(retries: &mut BTreeMap<String, Retry>, key: &str) {
+    let retry = retries.entry(key.into()).or_default();
+    retry.failures = retry.failures.saturating_add(1);
+    let seconds = (1_u64 << retry.failures.saturating_sub(1).min(5)).min(30);
+    retry.due = Some(Instant::now() + Duration::from_secs(seconds));
+}
+async fn diagnostic(
+    client: &Client,
+    fence: &Fence,
+    message: &str,
+    code: &str,
+    reason: &str,
+    recorded: &mut BTreeSet<String>,
+) {
+    let key = format!("{code}:{}:{}:{message}", fence.subject, fence.incarnation);
+    if recorded.contains(&key) {
+        return;
+    }
+    let result: Result<ClaimRecord> = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: fence.subject.clone(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(fence.subject.clone()),
+                fields: BTreeMap::from([
+                    ("severity".into(), json!("warning")),
+                    ("status".into(), json!("waiting")),
+                    ("code".into(), json!(code)),
+                    ("reason".into(), json!(reason)),
+                    ("incarnation_id".into(), json!(fence.incarnation)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(key.clone()),
+            },
+        )
+        .await;
+    if result.is_ok() {
+        recorded.insert(key);
+    }
+}
+
 fn save_handoffs(path: &Path, state: &State) -> Result<()> {
     use std::io::Write as _;
     let mut file =
@@ -215,6 +350,7 @@ fn save_handoffs(path: &Path, state: &State) -> Result<()> {
             incarnation: state.fence.incarnation.clone(),
             attempted: state.attempted.clone(),
             confirmed: state.confirmed.clone(),
+            accepted: state.accepted.clone(),
         },
     )?;
     file.flush()?;
@@ -258,10 +394,30 @@ impl Transcript {
         Ok(records)
     }
 }
+fn native_acceptance(record: &Value, envelope: &str) -> bool {
+    record["type"] == "queue-operation"
+        && record["operation"] == "enqueue"
+        && record["content"]
+            .as_str()
+            .is_some_and(|text| text.contains(envelope))
+}
+
 fn native_receipt(record: &Value, envelope: &str) -> bool {
-    record["type"] == "user"
+    (record["type"] == "user"
         && record.pointer("/message/role").and_then(Value::as_str) == Some("user")
-        && user_text(record).iter().any(|text| text.contains(envelope))
+        && user_text(record).iter().any(|text| text.contains(envelope)))
+        || (record["type"] == "queue-operation"
+            && record["operation"] == "remove"
+            && record["reason"] == "absorbed_mid_turn"
+            && record["commandUuid"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+            && record["deliveryId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+            && record["content"]
+                .as_str()
+                .is_some_and(|text| text.contains(envelope)))
 }
 
 fn user_text(record: &Value) -> Vec<&str> {
@@ -291,8 +447,8 @@ async fn body(client: &Client, message: &MessageView) -> Result<String> {
         Ok(message.content.clone())
     }
 }
-// Only read/closed settles graph mail. A new incarnation must reoffer delivered-unread mail;
-// the incarnation-scoped attempted ledger prevents repeating a handoff in the same channel.
+// Only read/closed settles graph mail. Delivered-unread mail remains eligible;
+// native handoff proof decides whether this channel needs to offer it again.
 async fn prepare_handoff(client: &Client, fence: &Fence, message: &MessageView) -> Result<bool> {
     match message.status.as_str() {
         "sent" => Ok(receipt(client, fence, &message.subject, "staged")
@@ -354,11 +510,29 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
+    #[test]
+    fn claude_receipt_state_accepts_ledgers_written_before_native_acceptance_tracking() {
+        let mut state = serde_json::to_value(State::default()).unwrap();
+        state.as_object_mut().unwrap().remove("accepted");
+        assert!(
+            serde_json::from_value::<State>(state)
+                .unwrap()
+                .accepted
+                .is_empty()
+        );
+        let handoffs: Handoffs = serde_json::from_value(json!({
+            "incarnation":"previous", "attempted":["message/quartz"], "confirmed":[],
+        }))
+        .unwrap();
+        assert!(handoffs.accepted.is_empty());
+        assert!(handoffs.attempted.contains("message/quartz"));
+    }
+
     #[tokio::test]
     async fn claude_unread_replay_needs_no_backward_receipt_and_read_or_closed_mail_is_final() {
-        let client = Client::new(crate::client::Endpoint::Unix(
-            std::path::PathBuf::from("/absent-st889-daemon.sock"),
-        ));
+        let client = Client::new(crate::client::Endpoint::Unix(std::path::PathBuf::from(
+            "/absent-st889-daemon.sock",
+        )));
         let fence = Fence::new("agent/eval.worker", "new-incarnation", "delivery");
         for (status, expected) in [
             ("staged", true),
@@ -408,6 +582,17 @@ mod tests {
             &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":envelope}]}}),
             &envelope
         ));
+        let enqueue = json!({"type":"queue-operation","operation":"enqueue","content":envelope});
+        assert!(native_acceptance(&enqueue, &envelope));
+        assert!(!native_receipt(&enqueue, &envelope));
+        let mut remove = json!({"type":"queue-operation","operation":"remove", "reason":"absorbed_mid_turn",
+            "content":envelope,"commandUuid":"native-command","deliveryId":"native-delivery"});
+        assert!(native_receipt(&remove, &envelope));
+        remove["reason"] = json!("cancelled");
+        assert!(!native_receipt(&remove, &envelope));
+        remove["reason"] = json!("absorbed_mid_turn");
+        remove["content"] = json!("QUARTZ SIGNAL");
+        assert!(!native_receipt(&remove, &envelope));
     }
 
     #[test]
@@ -450,7 +635,8 @@ mod tests {
         // A different available message caused the initial scan after reexec.
         transcript.appended(&path).unwrap();
         assert!(transcript.appended(&path).unwrap().is_empty());
-        transcript.body_available(true);
+        transcript
+            .body_available(state.attempted.contains(&message.subject) || message.status != "sent");
         assert!(native_receipt(
             &transcript.appended(&path).unwrap()[0],
             &envelope
