@@ -956,6 +956,7 @@ export type PairingBegin = {
   device_name: string;
   full_control?: boolean;
   person_id: string;
+  scopes?: Array<"read.projections" | "read.glasses" | "control.glasses" | "terminal.read" | "control.attention" | "control.launches">;
 };
 
 export type PairingChallenge = {

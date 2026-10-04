@@ -2463,6 +2463,9 @@ pub struct PairingBegin {
     pub person_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_control: Option<bool>,
+    /// Narrows the default limited grant to these limited pairing scopes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PairingChallenge {

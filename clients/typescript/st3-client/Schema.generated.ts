@@ -2102,7 +2102,9 @@ export const PairingBegin = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "device_name": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(120)),
   "full_control": optionalKey(Schema.Boolean),
-  "person_id": Schema.String.check(Schema.isPattern(new RegExp("^person/[^/]+$", "u")))
+  "person_id": Schema.String.check(Schema.isPattern(new RegExp("^person/[^/]+$", "u"))),
+  /** Narrows the default limited grant. Must not be combined with full_control. */
+  "scopes": optionalKey(Schema.Array(Schema.Literals(["read.projections","read.glasses","control.glasses","terminal.read","control.attention","control.launches"])).check(Schema.isMinLength(1)).check(Schema.isUnique())).annotate({ description: "Narrows the default limited grant. Must not be combined with full_control." })
 }).annotate({ identifier: "PairingBegin" }))()
 export type PairingBegin = typeof PairingBegin.Type
 export type PairingBeginEncoded = typeof PairingBegin.Encoded
