@@ -4728,9 +4728,9 @@ fn guard_mutating_cli_actor(
             _ => None,
         },
         Command::Work { command } => match command {
-            WorkCommand::Start(args) => Some(&args.actor),
-            WorkCommand::Handoff(args) => Some(&args.actor),
-            WorkCommand::Acknowledge(args) => Some(&args.actor),
+            WorkCommand::Start(args) => Some(args.actor.as_str()),
+            WorkCommand::Handoff(args) => Some(args.actor.as_str()),
+            WorkCommand::Acknowledge(args) => Some(args.actor.as_str()),
             WorkCommand::Claim(args) | WorkCommand::Renew(args) | WorkCommand::Progress(args)
             | WorkCommand::Complete(args) | WorkCommand::Fail(args) | WorkCommand::Release(args) => args.actor.as_deref(),
             WorkCommand::Wake(args) => args.actor.as_deref(),
