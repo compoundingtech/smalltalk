@@ -27965,6 +27965,7 @@ fn mission_run_header_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Miss
         updated_at_unix_ms: updated.parse().unwrap_or(0),
         steps: Vec::new(),
         loops: Vec::new(),
+        stuck_gates: Vec::new(),
     })
 }
 

@@ -162,6 +162,9 @@ pub(crate) fn render_mission_run(
     if let Some(deadline) = selected.deadline_at_unix_ms {
         let _ = writeln!(output, "DEADLINE  {}", relative_time(deadline, now_unix_ms));
     }
+    for run in &visible_runs {
+        append_named_list(&mut output, "STUCK GATES", &run.stuck_gates, style);
+    }
     if !selected.inputs.is_empty() {
         let _ = writeln!(output);
         let _ = writeln!(output, "{}", style.heading("INPUTS"));
@@ -1475,6 +1478,7 @@ mod tests {
             updated_at_unix_ms: 2_000,
             steps,
             loops: Vec::new(),
+            stuck_gates: Vec::new(),
         }
     }
 
