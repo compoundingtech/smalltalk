@@ -1,0 +1,4 @@
+{"type":"session","id":"managed-stop-canary"}
+{"type":"custom","customType":"tool_execution_start","data":{"toolCallId":"toolu_0179rsQAbpQmnqiZKiU8WRaA","toolName":"ask","intent":"Asking canary color"}}
+{"type":"custom","customType":"session_exit","data":{"reason":"sigterm","kind":"signal","pendingToolCalls":[{"toolName":"ask","toolCallId":"toolu_0179rsQAbpQmnqiZKiU8WRaA","args":{"questions":[{"id":"color","question":"Heal canary: which color?","options":[{"label":"Red"},{"label":"Blue"}],"multi":false}]}}]}}
+{"type":"message","message":{"role":"toolResult","toolCallId":"toolu_0179rsQAbpQmnqiZKiU8WRaA","toolName":"ask","content":[{"type":"text","text":"Ask input was cancelled"}],"details":{},"isError":true}}
