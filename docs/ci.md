@@ -203,7 +203,7 @@ warm caches kept on the machine. GitHub has no overflow between runner labels, s
 starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
 through the API and picks one pool for the whole run:
 
-- `ci1` when at least `CI1_MIN_IDLE` (default 6, the jobs a run starts at once) runners with that
+- `ci1` when at least `CI1_MIN_IDLE` (default 5, the jobs a run starts at once) runners with that
   label are online and idle; merge-group runs ask for `ci1-merge`, which a runner reserved for the
   merge queue also carries, so queued merges never wait behind pull request pushes;
 - Namespace otherwise, exactly as above: when ci1 is busy or offline, when the runner list is
@@ -376,9 +376,10 @@ on 2026-10-01 recorded the workspace limits with `nsc workspace concurrency --ou
 
 Namespace limits CPU and memory per platform; a workflow run is not a fixed unit of capacity.
 With the current 8x16 stage runners, a merge-queue Workspace CI group initially starts three
-8-vCPU/16-GiB stage jobs and three 8-vCPU/16-GiB profile jobs: 48 vCPUs and 96 GiB at peak.
-PR and main runs also start `perf-cost`, taking their initial peak to 56 vCPUs and 112 GiB.
-Five complete merge-queue groups need 240 vCPUs and 480 GiB, within the Linux pool limit;
+8-vCPU/16-GiB stage jobs and two 8-vCPU/16-GiB profile jobs: 40 vCPUs and 80 GiB at peak.
+The TypeScript client job follows generator freshness and reuses its runner slot.
+PR and main runs also start `perf-cost`, taking their initial peak to 48 vCPUs and 96 GiB.
+Five complete merge-queue groups need 200 vCPUs and 400 GiB, within the Linux pool limit;
 `max_entries_to_build` remains 5 in both the generated and live main rulesets.
 PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
 are available. The `linux-gate` aggregate starts after the three stage jobs finish, so it does

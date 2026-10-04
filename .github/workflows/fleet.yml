@@ -35,7 +35,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           OWNER: ${{ github.repository_owner }}
-          NEED: ${{ vars.CI1_MIN_IDLE || '6' }}
+          NEED: ${{ vars.CI1_MIN_IDLE || '5' }}
         run: |
           namespace() {
             echo "$1: Namespace"
@@ -116,8 +116,8 @@ jobs:
         run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && genie --check'"
   typescript-client:
     name: typescript-client
-    needs: [pick-runner]
-    if: ${{ !cancelled() }}
+    needs: [pick-runner, genie-freshness]
+    if: ${{ !cancelled() && needs.genie-freshness.result == 'success' }}
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["namespace-profile-linux-x86-64","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 10
     defaults:

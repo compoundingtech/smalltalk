@@ -151,7 +151,9 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
     // Start non-required; apply the staged ruleset change only after this check passes on main.
     'typescript-client': {
       name: 'typescript-client',
-      ...afterPickRunner,
+      // Reuse freshness's slot so the five general ci1 runners can cover the initial fan-out.
+      needs: ['pick-runner', 'genie-freshness'],
+      if: "${{ !cancelled() && needs.genie-freshness.result == 'success' }}",
       'runs-on': linuxRunsOn,
       'timeout-minutes': 10,
       defaults: { run: { shell: 'bash' } },
