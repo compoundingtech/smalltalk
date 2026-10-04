@@ -5,6 +5,7 @@
 
 mod action_coverage;
 mod agents_restart;
+mod authored_resume;
 mod backup;
 mod boot_canaries;
 mod broken_gates;

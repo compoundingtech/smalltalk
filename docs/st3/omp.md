@@ -23,6 +23,17 @@ assistant turn identify the selected provider and model. omp's Python `eval` too
 environment; run st commands from its shell tool so `ST_AGENT`, `ST3_BIN`, and `ST3_ENDPOINT` are
 available.
 
+An authored `args "--resume" "/absolute/path/<time>_<uuid>.jsonl"` (or `--resume=…`) keeps its
+original argv and transcript. On a fresh native omp/pi driver start, st links an absent or empty
+managed `provider-sessions` directory to the transcript's parent after checking the filename UUID
+against the session header in the first two lines. It never copies the transcript: omp continues
+appending to the authored path, and the channel must see those same bytes to publish its native
+session binding. Already-correct links and inventories containing the same inode are left alone.
+Relative or missing paths, invalid filenames or headers, non-empty inventories and foreign
+(including dangling) directory links are left untouched; the driver log records a typed
+`authored_resume_link_skipped` reason. A legacy directory may contain several sessions; the channel
+still looks up the reported UUID. This does not backfill an already-running driver's binding.
+
 Messages delivered during a running turn are held until the current tool batch returns. A tool call
 that runs longer than the hold limit can still be backgrounded. Read the exact graph message with
 `st conversations read` before acting on it, and archive it after the related action completes.
