@@ -672,6 +672,49 @@ mod tests {
     }
 
     #[test]
+    fn a_null_auth_successor_through_publication_keeps_the_login_episode() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms() - 1_000;
+        let publish = |auth: Value, sequence: u64, time: u128| {
+            store
+                .append_latest_observation(
+                    &input(
+                        "harness.observed",
+                        json!({
+                            "incarnation_id":"one", "driver":"claude", "state":"idle",
+                            "provider_auth":auth, "provider_auth_sequence":sequence,
+                            "ownership_sequence":1, "observed_at_ms":time as u64
+                        }),
+                    ),
+                    time,
+                )
+                .unwrap()
+                .0
+        };
+        publish(json!(false), 1, at);
+        let successor = publish(Value::Null, 1, at + 1);
+        assert!(local_observation_position(&successor).is_none());
+        let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(blocked.state, "needs-login");
+        assert_eq!(blocked.since_unix_ms, at);
+        let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
+        assert_eq!(
+            history["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["state"] == "unauthenticated")
+                .count(),
+            1
+        );
+        publish(json!(true), 2, at + 2);
+        let recovered = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(recovered.state, "idle");
+        assert_eq!(recovered.since_unix_ms, at + 2);
+    }
+
+    #[test]
     fn native_login_since_survives_activity_until_successful_recovery() {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
