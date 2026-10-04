@@ -25,7 +25,20 @@ const hello = () => process.stdout.write(JSON.stringify({ type: "hello", protoco
 if (fs.existsSync(${JSON.stringify(delayedHelloPath)})) setTimeout(hello, 6000);
 else hello();
 process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => fs.appendFileSync(${JSON.stringify(framesPath)}, chunk));
+let pending = "";
+const record = (chunk) => {
+  pending += chunk;
+  const boundary = pending.lastIndexOf("\\n");
+  if (boundary < 0) return;
+  fs.appendFileSync(${JSON.stringify(framesPath)}, pending.slice(0, boundary + 1));
+  pending = pending.slice(boundary + 1);
+};
+// Pipe chunks can end inside JSON. Exercise that boundary deliberately and publish only
+// complete frames, so an assertion cannot read a half-written transport chunk.
+process.stdin.on("data", (chunk) => {
+  record(chunk.slice(0, 7));
+  record(chunk.slice(7));
+});
 process.stdin.on("end", () => process.exit(0));
 let sent = 0;
 setInterval(() => {
@@ -43,11 +56,20 @@ setInterval(() => {
 `,
   { mode: 0o755 },
 );
-const readFrames = () =>
-  (fs.existsSync(framesPath) ? fs.readFileSync(framesPath, "utf8") : "")
+const completeFrames = (snapshot) =>
+  // A live file snapshot can also stop inside an append. Parse only terminated frames;
+  // the next snapshot includes the remainder. Invalid terminated JSON must still fail.
+  snapshot.slice(0, snapshot.lastIndexOf("\n") + 1)
     .split("\n")
     .filter((line) => line.trim())
     .map((line) => JSON.parse(line));
+assert.deepStrictEqual(completeFrames('{"type":"ready"}\n{"type":"con'), [{ type: "ready" }]);
+assert.deepStrictEqual(completeFrames('{"type":"ready"}\n{"type":"context"}\n'),
+  [{ type: "ready" }, { type: "context" }]);
+assert.throws(() => completeFrames('{broken}\n'), SyntaxError);
+const readFrames = () => completeFrames(
+  fs.existsSync(framesPath) ? fs.readFileSync(framesPath, "utf8") : "",
+);
 
 process.env.ST_OMP_CHANNEL_BIN = recorder;
 process.env.ST_OMP_CHANNEL_CATALOG = "/tmp/st2-smoke-catalog";
@@ -760,6 +782,7 @@ assert.strictEqual(
 
 // Give the recorder a moment to drain, then assert the wire the Rust decoder reads.
 await new Promise((resolve) => setTimeout(resolve, 500));
+assert.ok(fs.readFileSync(framesPath, "utf8").endsWith("\n"), "the drained recorder has no partial frame");
 const frames = readFrames();
 assert.ok(
   frames.some(
