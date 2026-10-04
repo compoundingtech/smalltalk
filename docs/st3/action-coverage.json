@@ -51,6 +51,9 @@
         "crates/st3/src/api/client_v0/arrangements.rs::arrangement_actions_accept_current_projected_launch_fences_and_refuse_stale_ones",
         "crates/st3/src/api/client_v0/arrangements.rs::arrangement_retire_fences_refuse_concurrent_edits_and_replay_receipts",
         "crates/st3/src/api/client_v0/arrangements.rs::arrangement_fenced_retire_recovers_receipt_gap",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_create_race_returns_typed_exists_and_exact_retry_receipt",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_folder_race_and_validation_refusals_stay_typed",
+        "crates/st3/src/api/client_v0/arrangements.rs::selected_arrangement_survives_byte_window_edits_and_retirement",
         "crates/st3/src/store/arrangements_tests.rs::owner_admission_real_agent_and_atomic_identity_fences",
         "crates/st3/src/store/arrangements_tests.rs::heads_survive_reopen_and_an_upgrade_backfills_once"
       ],
