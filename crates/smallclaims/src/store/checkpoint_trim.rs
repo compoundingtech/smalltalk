@@ -340,13 +340,50 @@ impl Store {
         &self,
         manifest: &CheckpointManifest,
     ) -> Result<Vec<CheckpointAction>, St3Error> {
+        self.adopt_checkpoint_checked(manifest, true)
+    }
+
+    /// Initialize checkpoint history in a fresh offline restore after admitting its claim log.
+    /// The source may have learned a newer certificate without applying it yet; its recorded
+    /// tombstones still belong to the older certified manifest. This never replaces existing
+    /// checkpoint state, and verifies the manifest through the same certificate path as sync.
+    pub fn restore_checkpoint_history(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<Vec<CheckpointAction>, St3Error> {
+        let occupied: bool = self
+            .readers
+            .get()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM checkpoints)
+                 OR EXISTS(SELECT 1 FROM checkpoint_envelopes)
+                 OR EXISTS(SELECT 1 FROM checkpoint_claims)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if occupied {
+            return Err(St3Error::new(
+                "checkpoint-history-exists",
+                "checkpoint restore requires empty checkpoint state",
+            ));
+        }
+        self.adopt_checkpoint_checked(manifest, false)
+    }
+
+    fn adopt_checkpoint_checked(
+        &self,
+        manifest: &CheckpointManifest,
+        require_newest: bool,
+    ) -> Result<Vec<CheckpointAction>, St3Error> {
         let claims = self.checkpoint_claims().map_err(internal)?;
         // Adoption replaces every tombstone this node holds, so only the newest stable
         // checkpoint may be adopted: an older manifest lacks the newer drops.
-        if stable_checkpoints(&claims)
-            .keys()
-            .next_back()
-            .is_some_and(|newest| *newest > manifest.cut_unix_ms)
+        if require_newest
+            && stable_checkpoints(&claims)
+                .keys()
+                .next_back()
+                .is_some_and(|newest| *newest > manifest.cut_unix_ms)
         {
             return Err(St3Error::new(
                 "checkpoint-superseded",

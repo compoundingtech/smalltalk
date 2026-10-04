@@ -87,6 +87,7 @@ pub use smallclaims::store::{
 
 mod accounts;
 mod attention_snapshot;
+mod backup;
 mod checkpoint_rules;
 mod limits;
 mod person_work;
@@ -172,6 +173,9 @@ const MAX_STEP_EXTENSION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// smalltalk's projection tables, and the indexes its folds read the claim log through. The
 /// graph creates its own tables first; see `smallclaims::store::SCHEMA`.
 const SCHEMA: &str = r#"
+-- An unmanaged member's staging check needs tagged claims, not its runtime history.
+CREATE INDEX IF NOT EXISTS claims_owned_set_subject_index ON claims(subject)
+WHERE json_extract(body,'$.owned_set') IS NOT NULL;
 CREATE INDEX IF NOT EXISTS claims_terminal_history_index ON claims(store_index)
 WHERE kind IN ('mission-run.state','step-run.state','work.failed')
   AND json_extract(body,'$.fields.status') IN ('failed','cancelled','completed');

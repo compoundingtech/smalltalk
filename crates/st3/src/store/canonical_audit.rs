@@ -1087,6 +1087,10 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
             let transaction = connection.transaction().unwrap();
             let expression = if *table == "operations" && column == "state" {
                 "CASE state WHEN 'active' THEN 'conflict' ELSE 'active' END".to_owned()
+            } else if *table == "desired" && column == "member" {
+                // The host index requires valid JSON; concatenate to keep ordinary TEXT,
+                // as bound reducer values are, rather than SQLite's transient JSON subtype.
+                "json_set(COALESCE(member,'{}'),'$.__digest_audit',1)||''".to_owned()
             } else if kind == "INTEGER" {
                 format!("COALESCE({column},0)+1")
             } else if kind == "BLOB" {

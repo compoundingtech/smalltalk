@@ -2,7 +2,7 @@
 
 The inventory covers every offered CLI command, every typed client action, every stui daemon effect, and the palette and local controls. It distinguishes real CLI/Unix transport tests, the live stui adapter, local reducer tests, and shared implementations. A test reference describes its actual layer; a shared implementation test alone is not a claim that the entire interactive UI was driven.
 
-`action-coverage.json` is the machine-readable source. Tests compare its 183 CLI rows with Clap's offered command tree, its 52 typed actions with the generated client contract and real dispatch builders, and its 18 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
+`action-coverage.json` is the machine-readable source. Tests compare its 185 CLI rows with Clap's offered command tree, its 52 typed actions with the generated client contract and real dispatch builders, and its 18 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
 
 ## Restart and stale-state model
 

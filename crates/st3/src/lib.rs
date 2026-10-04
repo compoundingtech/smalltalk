@@ -3,6 +3,7 @@
 pub mod accounts;
 pub mod api;
 pub mod archive;
+pub mod backup;
 pub mod blobs;
 pub mod boot;
 pub(crate) mod checkout;

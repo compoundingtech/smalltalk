@@ -223,8 +223,13 @@ impl Store {
         limit: usize,
     ) -> Result<CheckpointManifestPage> {
         let connection = self.readers.get();
-        // One snapshot for the page, so a trim that commits meanwhile cannot tear it.
-        let transaction = connection.unchecked_transaction()?;
+        // Join a pinned backup snapshot, or start a snapshot for this page alone.
+        let transaction = if connection.is_autocommit() {
+            Some(connection.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let transaction = transaction.as_deref().unwrap_or(&connection);
         let mut page = CheckpointManifestPage {
             checkpoint: request.checkpoint.clone(),
             cut_unix_ms: request.cut_unix_ms,

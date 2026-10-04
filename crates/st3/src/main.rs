@@ -178,6 +178,11 @@ enum Command {
         #[command(subcommand)]
         command: FleetCommand,
     },
+    /// Save or restore the signed claim log.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
     /// Inspect and repair fleet replication.
     Replication {
         #[command(subcommand)]
@@ -2381,6 +2386,22 @@ enum ClaudeChannelCommand {
 }
 
 #[derive(Subcommand)]
+enum BackupCommand {
+    /// Save one live snapshot to a new file. --database exports an offline copy instead.
+    Create {
+        file: PathBuf,
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
+    /// Restore offline into an empty database, using a fresh writer identity.
+    Restore {
+        file: PathBuf,
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ReplicationCommand {
     /// Show fleet receipt, validation, projection, and peer health.
     Status,
@@ -4158,6 +4179,52 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Doctor(args) => run_doctor(&immediate, args, cli.json).await,
         Command::Recorder { command } => run_recorder(command, &config, cli.json),
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
+        Command::Backup { command } => match command {
+            BackupCommand::Create {
+                file,
+                database: None,
+            } => {
+                st3::backup::create(&endpoint, &file).await?;
+                if cli.json {
+                    println!("{}", json!({"file":file}));
+                } else {
+                    println!("Backup saved to {}", file.display());
+                }
+                Ok(())
+            }
+            BackupCommand::Create {
+                file,
+                database: Some(database),
+            } => {
+                let header = st3::backup::create_from_database(&database, &file)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string(&header)?);
+                } else {
+                    println!(
+                        "Backup saved to {} (graph {})",
+                        file.display(),
+                        header.graph_digest
+                    );
+                }
+                Ok(())
+            }
+            BackupCommand::Restore { file, database } => {
+                let database = database.unwrap_or_else(|| config.state_dir.join("claims.sqlite3"));
+                let report = st3::backup::restore(&file, &database)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string(&report)?);
+                } else {
+                    println!(
+                        "Restored {} envelopes to {}\nGraph {}\nConfigure node = \"{}\" before starting this database.",
+                        report.envelopes,
+                        database.display(),
+                        report.graph_digest,
+                        report.writer
+                    );
+                }
+                Ok(())
+            }
+        },
         Command::Replication { command } => {
             run_replication(&client, &config, command, cli.json).await
         }
