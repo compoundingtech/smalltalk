@@ -14210,6 +14210,33 @@ impl Store {
         check_mailbox_fence(&self.readers.get(), fence)
     }
 
+    /// First observation of the current boot, including its index to distinguish messages
+    /// accepted within the same millisecond. Late replicas must also pass the time boundary.
+    pub(crate) fn native_mail_boot_floor(&self, subject: &str) -> Result<Option<(u128, u64)>> {
+        let runtime = self.latest_claim(subject, Some("runtime.observed"))?;
+        let Some(incarnation) = runtime.as_ref().and_then(|claim| {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            fields["incarnation_id"].as_str()
+        }) else {
+            return Ok(None);
+        };
+        self.readers
+            .get()
+            .prepare_cached(&canonical_sql(&format!(
+                "SELECT accepted_at_unix_ms, store_index
+             FROM claims INDEXED BY claims_incarnation_accepted_index
+             WHERE subject=?1 AND {INCARNATION_OF_CLAIM}=?2
+             ORDER BY CANONICAL_ASC(claims)
+             LIMIT 1"
+            )))?
+            .query_row(params![subject, incarnation], |row| {
+                let time: String = row.get(0)?;
+                Ok((time.parse::<u128>().unwrap_or(u128::MAX), row.get(1)?))
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// What a mailbox stream's snapshot can depend on, read before the snapshot is taken. A change
     /// after it to any of that brings a new snapshot; see [`Store::mailbox_changed_since`].
     pub(crate) fn mailbox_watermark(

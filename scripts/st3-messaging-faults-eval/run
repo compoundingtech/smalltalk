@@ -21,6 +21,9 @@ HERE = Path(__file__).resolve().parent
 CASES = ("baseline", "daemon-restart", "binary-swap", "path-deploy", "link-seconds", "link-minutes",
          "receiver-down", "harness-restart", "channel-killed", "old-channel", "handoff-failed")
 
+HELD_CASES = ("daemon-restart", "binary-swap", "path-deploy", "receiver-down",
+              "harness-restart", "channel-killed")
+
 
 def now_ms():
     return time.time_ns() // 1_000_000
@@ -339,6 +342,11 @@ def judge(proof):
         for field in ("failed_path_visible", "failed_doctor_visible", "failed_sender_visible"):
             if not proof.get(field):
                 failures.append(f"blocked handoff was not visible: {field}")
+    if proof["case"] in HELD_CASES:
+        if proof["held_received_copies"] or proof["held_read_claims"]:
+            failures.append("mail from before boot/reconnect reached the provider")
+        if proof["held_sender_status"] != "sent" or proof["held_recipient_status"] != "sent":
+            failures.append("held mail did not remain unchanged in both mailboxes")
     delivery = proof["delivery_after"]
     expected_delivery = "legacy" if proof["case"] == "old-channel" else "current"
     if delivery.get("state") != expected_delivery:
@@ -506,12 +514,14 @@ agent "fault-probe" {{
             result["failed_sender_visible"] = (blocked_sender or {}).get("delivery", {}).get("state") == "waiting"
             (target.root / "ws/handoff-blocked").unlink()
         elif case == "channel-killed":
+            link.drop()
             channels = [row for row in before if " driver omp-channel " in row["argv"]]
             if len(channels) != 1:
                 raise RuntimeError(f"expected one channel, got {len(channels)}")
             os.kill(channels[0]["pid"], signal.SIGKILL)
             subject = await send(source, case)
         elif case == "harness-restart":
+            link.drop()
             if len(initial) != 1:
                 raise RuntimeError("expected exactly one provider")
             os.kill(initial[0], signal.SIGKILL)
@@ -530,6 +540,28 @@ agent "fault-probe" {{
         # Fixed tail: a first successful read does not end duplicate observation.
         # Also wait beyond delivery-presence's startup grace, including old channels.
         await asyncio.sleep(args.observe_seconds)
+        if case in HELD_CASES:
+            # The observation tail checks for old offers while the actual driver recovers.
+            # Only mail sent on the recovered live channel should arrive automatically.
+            async def recovered_channel():
+                card = await agent(target)
+                return card if card.get("delivery", {}).get("state") == "current" else None
+            await until(recovered_channel, args.ready_seconds)
+            link.enabled = True
+            held_subject = subject
+            cleared = now_ms()
+            subject = await send(source, case + "-fresh")
+            result.update(held_message=held_subject, message=subject, fresh_sent_at_unix_ms=cleared)
+            await asyncio.sleep(args.observe_seconds)
+            held_rows = [row for row in receipts(target) if row.get("subject") == held_subject]
+            held_trace = await target.cli("trace", "show", held_subject, "--json", "--limit", "100")
+            held_claims = [json.loads(line) for line in held_trace.splitlines() if line]
+            held_source = await source.api("/v1/messages/read/" + held_subject)
+            held_target = await target.api("/v1/messages/read/" + held_subject)
+            result.update(held_received_copies=sum(row["event"] == "received" for row in held_rows),
+                          held_read_claims=sum(row.get("kind") == "message.read" for row in held_claims),
+                          held_sender_status=(held_source or {}).get("status"),
+                          held_recipient_status=(held_target or {}).get("status"))
         after = target.seats()
         after_card = await agent(target)
         all_receipts = receipts(target)

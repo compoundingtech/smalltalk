@@ -97,6 +97,26 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         await self.monitor.route(self.target)
         self.assertEqual(sum(path == "/v1/work/ask" for path, _ in self.monitor.api.posts), 1)
 
+    async def test_overdue_accepted_probe_refreshes_without_clearing_its_attention(self):
+        await self.monitor.route(self.target)
+        original = self.monitor.state["routes"][self.target]
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        self.assertEqual(original["status"], "overdue")
+        original["started_at_unix_ms"] -= self.monitor.interval
+        await self.monitor.route(self.target)
+        fresh = self.monitor.state["routes"][self.target]
+        self.assertNotEqual(fresh["message"], original["message"])
+        self.assertEqual(fresh["attention"], original["attention"])
+        self.assertEqual(fresh["status"], "pending")
+        self.assertNotIn("previous_read", fresh)
+        self.assertFalse(any(path == "/v1/work/cancel-ask" for path, _ in self.monitor.api.posts))
+        self.monitor.api.records = [{"kind": "message.read", "actor": self.target,
+                                     "accepted_at_unix_ms": 3}]
+        await self.monitor.route(self.target)
+        self.assertEqual(fresh["status"], "read")
+        self.assertNotIn("attention", fresh)
+
     async def test_routes_share_one_replication_status_read_while_it_is_fresh(self):
         reads = []
         get = self.monitor.api.get
@@ -298,12 +318,14 @@ agent "probe/{node.name}" {{
 
             async def recovered():
                 row = await route(nodes[0])
-                return row if row and row["message"] == blocked["message"] and row["status"] == "read" and not row.get("attention") else None
+                return row if row and row["message"] != blocked["message"] and row["status"] == "read" and not row.get("attention") else None
 
             recovered_row = await faults.until(recovered, 20)
-            self.assertTrue(recovered_row["late"])
-            self.assertGreater(recovered_row["latency_ms"], 3000)
+            self.assertFalse(recovered_row["late"])
+            self.assertLess(recovered_row["latency_ms"], 3000)
             claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": blocked["message"]}))
+            self.assertEqual(sum(claim["kind"] == "message.read" for claim in claims["claims"]), 0)
+            claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": recovered_row["message"]}))
             self.assertEqual(sum(claim["kind"] == "message.read" for claim in claims["claims"]), 1)
             # No provider binary was launched: only Python and the real native channel.
             for node in nodes:

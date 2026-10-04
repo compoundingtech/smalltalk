@@ -24,6 +24,7 @@ struct Daemon {
     root: PathBuf,
     socket: PathBuf,
     store: Arc<Store>,
+    event_notify: watch::Sender<u64>,
     server: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -33,6 +34,7 @@ impl Daemon {
             root: root.to_path_buf(),
             socket: root.join("st3.sock"),
             store: Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap()),
+            event_notify: watch::channel(0_u64).0,
             server: None,
         }
     }
@@ -45,7 +47,7 @@ impl Daemon {
         let state = AppState {
             store: self.store.clone(),
             notify: Arc::new(Notify::new()),
-            event_notify: watch::channel(0_u64).0,
+            event_notify: self.event_notify.clone(),
             node: "restart-node".into(),
             state_dir: self.root.join("daemon"),
             pty_root: self.root.join("pty"),
@@ -99,6 +101,7 @@ impl Daemon {
                 idempotency_key: None,
             })
             .unwrap();
+        self.event_notify.send_modify(|value| *value = value.wrapping_add(1));
     }
 
     /// The runtime observation the reconciler recorded before the restart.
@@ -786,10 +789,17 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
             daemon.observe_running(seat, "same-incarnation");
             daemon.start_with_binding(true).await;
-            daemon.send("message/consumed", seat, "CONSUMED SIGNAL");
 
             let socket = daemon.socket.clone();
-            let open_channel = || {
+            daemon.send("message/ready-probe", seat, "READINESS PROBE");
+            for lifecycle in ["delivered", "read", "closed"] {
+                daemon.store.append_claim(&ClaimInput {
+                    subject: "message/ready-probe".into(), kind: format!("message.{lifecycle}"),
+                    actor: Some(seat.into()), fields: BTreeMap::from([("status".into(), json!(lifecycle))]),
+                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+                }).unwrap();
+            }
+            let open_channel = || async {
                 let mut channel = seat_command(root, &socket)
                     .env("ST_AGENT", seat)
                     .env("ST3_MAILBOX_TRANSPORT", transport)
@@ -823,9 +833,22 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
                 );
                 writeln!(input, "{}", json!({"type":"state", "state":"idle"})).unwrap();
                 input.flush().unwrap();
+                let client = st3::client::Client::new(st3::client::Endpoint::Unix(socket.clone()));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let status: Value = client.get("/v1/messages/delivery/ready-probe").await.unwrap();
+                    let delivery = &status["delivery"]["recipient_delivery"];
+                    let ready = matches!(delivery["state"].as_str(), Some("current" | "outdated" | "legacy"));
+                    let own_pid = delivery["state"] == "current" || delivery["reason"].as_str()
+                        .is_some_and(|reason| reason.contains(&format!("pid {}", channel.id())));
+                    if ready && own_pid { break; }
+                    assert!(Instant::now() < deadline, "{driver}/{transport}: channel not ready: {status}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 (channel, input, received)
             };
-            let (channel, mut input, received) = open_channel();
+            let (channel, mut input, received) = open_channel().await;
+            daemon.send("message/consumed", seat, "CONSUMED SIGNAL");
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 let frame = received
@@ -867,8 +890,8 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             daemon.stop().await;
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
             daemon.start_with_binding(true).await;
+            let (channel, _input, received) = open_channel().await;
             daemon.send("message/unread", seat, "UNREAD SIGNAL");
-            let (channel, _input, received) = open_channel();
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut offered = Vec::new();
             while let Ok(frame) =
@@ -912,7 +935,7 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delivered_unread_mail_replays_after_seat_restart_without_repeating_settled_mail() {
+async fn delivered_unread_mail_stays_in_the_mailbox_after_seat_restart() {
     for driver in ["omp", "pi"] {
         for transport in ["push", "poll"] {
             let root = tempfile::tempdir().unwrap();
@@ -971,27 +994,7 @@ async fn delivered_unread_mail_replays_after_seat_restart_without_repeating_sett
             assert_eq!(received.recv_timeout(Duration::from_secs(10)).unwrap()["type"], "hello");
             writeln!(input, "{}", json!({"type":"state", "state":"idle"})).unwrap();
             input.flush().unwrap();
-            let mut replayed = Vec::new();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while replayed.len() < 2 {
-                match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(frame) if frame["type"] == "message" => {
-                        replayed.push(frame["meta"]["messageId"].as_str().unwrap().to_owned());
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        let stderr = stop(channel);
-                        panic!("{driver}/{transport}: delivered-unread mail did not replay: {error}; {stderr}");
-                    }
-                }
-            }
-            replayed.sort();
-            assert_eq!(replayed, ["message/unread-one", "message/unread-two"], "{driver}/{transport}");
-            // Several mailbox ticks and a delivered receipt must not reinject into this channel.
-            writeln!(input, "{}", json!({
-                "type":"delivered", "meta":{"messageId":"message/unread-one"},
-            })).unwrap();
-            input.flush().unwrap();
+            // Several mailbox ticks must not reoffer old mail, regardless of native receipts.
             let deadline = Instant::now() + Duration::from_millis(2_200);
             while let Ok(frame) = received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 assert_ne!(frame["type"], "message", "{driver}/{transport}: duplicate or settled mail: {frame}");

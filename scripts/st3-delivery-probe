@@ -252,8 +252,16 @@ class Probe:
                 route.pop("previous_read", None)
                 self.measuring[target] = time.monotonic_ns()
             self.persist()
-        if route is None or route.get("status") == "unstarted" or (route.get("status") == "read" and now_ms() >= route["next_at_unix_ms"]):
-            previous_read = {key: route[key] for key in ("message", "latency_ms", "late") if key in route} if route else None
+        # A recipient that boots or reconnects holds all earlier mail. An accepted overdue
+        # probe cannot prove recovery; send a fresh probe while retaining the original alert.
+        refresh_overdue = (route and route.get("status") == "overdue"
+                           and now_ms() - route["started_at_unix_ms"] >= max(self.interval, self.deadline))
+        if route is None or route.get("status") == "unstarted" or refresh_overdue or (route.get("status") == "read" and now_ms() >= route["next_at_unix_ms"]):
+            previous_read = None
+            if route:
+                previous_read = ({key: route[key] for key in ("message", "latency_ms", "late")}
+                                 if route.get("status") == "read" else route.get("previous_read"))
+            attention = route.get("attention") if route else None
             nonce = str(uuid.uuid4())
             key = f"delivery-probe:{self.actor}:{target}:{nonce}"
             # Persist the send intent BEFORE a request that might commit then time
@@ -261,6 +269,8 @@ class Probe:
             route = {"target": self.peers[target], "to": target, "nonce": nonce,
                      "idempotency_key": key, "message": "message/" + hashlib.sha256(key.encode()).hexdigest()[:16],
                      "started_at_unix_ms": now_ms(), "status": "sending"}
+            if attention:
+                route["attention"] = attention
             if previous_read:
                 route["previous_read"] = previous_read
             self.state["routes"][target] = route
@@ -316,7 +326,7 @@ class Probe:
                     "actor": self.actor, "person": self.config["reviewer"],
                     "new_run": f"delivery-probe-{route['nonce']}",
                     "title": f"Delivery probe {self.source} → {self.peers[target]} has no read receipt",
-                    "reason": f"{route['message']} was not read within {self.deadline // 1000}s. The native probe keeps watching; a real read cancels this person step automatically. Inspect the node's probe seat, replication and daemon.",
+                    "reason": f"{route['message']} was not read within {self.deadline // 1000}s. The native probe sends fresh probes after its interval; a real read cancels this person step automatically. Inspect the node's probe seat, replication and daemon.",
                     "idempotency_key": f"delivery-probe-overdue:{route['message']}:{route['started_at_unix_ms']}",
                 })
                 route["attention"] = attention["subject"]
