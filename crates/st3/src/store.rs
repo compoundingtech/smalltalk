@@ -46963,6 +46963,11 @@ fn append_latest_observation_fenced(
                 )?),
                 _ => None,
             };
+            if input.kind == "harness.observed" && event_runtime.is_some() {
+                // Native acknowledgements echo the admitted producer event, including on
+                // replay. Derived history metadata belongs to its replicated publication.
+                return Ok((local, true));
+            }
             if input.kind == "harness.observed" {
                 let source = match published.as_ref() {
                     Some(claim) => Some(claim.clone()),
