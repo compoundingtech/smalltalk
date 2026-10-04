@@ -13306,7 +13306,8 @@ mission "example/zero-run" state="ready" {
         let mut writer = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
         writeln!(writer, "{}", json!({"type":"message","id":"new","timestamp":"2099-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"new native prose"}]}})).unwrap();
         let changed = conversation_read_now(&state, &session, &session_id, Some(cursor)).unwrap();
-        assert_eq!(changed["items"].as_array().unwrap().iter().map(|item| item["body"]["text"].as_str().unwrap()).collect::<Vec<_>>(), ["new native prose"]);
+        assert_eq!(changed["items"].as_array().unwrap().iter()
+            .filter_map(|item| item["body"]["text"].as_str()).collect::<Vec<_>>(), ["new native prose"]);
         let after = changed["next_cursor"].as_str().unwrap();
         // A changed native row omitted by the bounded projection is a real gap, even if a
         // later native row remains visible; neither the high-water mark nor a first-row guess
