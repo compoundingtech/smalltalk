@@ -199,6 +199,8 @@ fn generated_resource_union_decodes_all_kinds() {
             _ => None,
         })
         .unwrap();
+    assert_eq!(agent.workspace.as_deref(), Some("/srv/example/release"));
+    assert_eq!(agent.checkout.as_ref().unwrap().branch, "release");
     assert_eq!(agent.current_work_ids, ["step-run/release/build"]);
     assert_eq!(
         agent.next_work_id.as_deref(),

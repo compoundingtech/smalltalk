@@ -185,6 +185,10 @@ pub enum Effect {
         effort: Option<String>,
         host: Option<String>,
         message: Option<String>,
+        repo: Option<String>,
+        branch: Option<String>,
+        base: Option<String>,
+        workspace: Option<String>,
     },
     /// Send a failed or unconfirmed message again, as the same request.
     Resend {
@@ -194,6 +198,25 @@ pub enum Effect {
     Forget {
         entry: String,
     },
+}
+
+pub(crate) fn agent_parameters(
+    form: &screens::AgentForm,
+    host: Option<String>,
+) -> st3_client::AgentCreateParameters {
+    st3_client::AgentCreateParameters {
+        name: form.name.trim().to_owned(),
+        harness: form.harness().to_owned(),
+        host,
+        model: form.model().map(str::to_owned),
+        effort: form.effort().map(str::to_owned),
+        message: (!form.task.trim().is_empty()).then(|| form.task.trim().to_owned()),
+        repo: (!form.repository.trim().is_empty()).then(|| form.repository.trim().to_owned()),
+        branch: (!form.repository.trim().is_empty()).then(|| form.branch()),
+        base: (!form.repository.trim().is_empty()).then(|| form.base().to_owned()),
+        workspace: (!form.workspace.trim().is_empty()).then(|| form.workspace.trim().to_owned()),
+        ..Default::default()
+    }
 }
 
 /// An agent's live terminal screen, drawn in place of its conversation.
@@ -322,6 +345,8 @@ pub struct Ui {
     find: Option<Find>,
     /// The new agent form, kept while the person looks elsewhere.
     new_agent: Option<screens::AgentForm>,
+    agent_repositories: Option<(String, view::Load<Vec<String>>)>,
+    agent_form_focus: Cell<Option<usize>>,
     /// The Agents tab shows the new agent form rather than the selected agent.
     agent_form: bool,
     /// An agent just started from here, to select once st lists it.
@@ -416,6 +441,8 @@ impl Ui {
             details_here: HashSet::new(),
             find: None,
             new_agent: None,
+            agent_repositories: None,
+            agent_form_focus: Cell::new(None),
             agent_form: false,
             started: None,
             attachments: HashMap::new(),
@@ -724,6 +751,27 @@ impl Ui {
             return;
         }
         if self.paste_into_palette(&first) {
+            return;
+        }
+        if self.agent_form
+            && self.tab == 1
+            && let Some(form) = self.new_agent.as_mut()
+        {
+            let (value, input) = match form.focus {
+                0 => (&mut form.task, "agent:task"),
+                1 => (&mut form.name, "agent:name"),
+                6 => (&mut form.repository, "agent:repository"),
+                7 => (&mut form.branch, "agent:branch"),
+                8 => (&mut form.base, "agent:base"),
+                9 => (&mut form.workspace, "agent:workspace"),
+                _ => return,
+            };
+            edit::insert(
+                value,
+                &self.cursor,
+                input,
+                if form.focus == 0 { &text } else { &first },
+            );
             return;
         }
         if self.mission_form_focused()
@@ -1648,7 +1696,16 @@ impl Ui {
                     [
                         self.cursor.at("agent:task", &form.task),
                         self.cursor.at("agent:name", &form.name),
+                        self.cursor.at("agent:repository", &form.repository),
+                        self.cursor.at("agent:branch", &form.branch),
+                        self.cursor.at("agent:base", &form.base),
+                        self.cursor.at("agent:workspace", &form.workspace),
                     ],
+                    self.agent_repositories
+                        .as_ref()
+                        .filter(|(host, _)| Some(host) == self.agent_repository_host().as_ref())
+                        .map(|(_, load)| load)
+                        .unwrap_or(&view::Load::Loading),
                     width,
                 )
             }
@@ -2098,6 +2155,29 @@ impl Ui {
                 state.top = start.saturating_add_signed(anchor.offset);
             }
             state.reconcile(total, height);
+            if key == Pane::NewAgent.key()
+                && let Some(form) = &self.new_agent
+                && self.agent_form_focus.replace(Some(form.focus)) != Some(form.focus)
+            {
+                let mut lines = doc
+                    .targets
+                    .iter()
+                    .filter(|target| target.hit == Hit::Field(form.focus))
+                    .map(|target| target.line);
+                if let Some(first) = lines.next() {
+                    let last = lines
+                        .last()
+                        .unwrap_or(first)
+                        .min(first + height.saturating_sub(1));
+                    if first < state.top {
+                        state.top = first;
+                    }
+                    if last >= state.top + height {
+                        state.top = last.saturating_sub(height.saturating_sub(1));
+                    }
+                    state.follow = false;
+                }
+            }
             // The note about earlier entries stays first while they load above it, so the
             // place is kept by the first entry read instead.
             let entries = || {
@@ -3569,6 +3649,7 @@ impl Ui {
     /// Open the new agent form: in a new tab of the focused split in a glass, on the Agents
     /// tab otherwise. `task` fills in what it should do.
     pub(crate) fn open_new_agent(&mut self, task: Option<String>) {
+        self.agent_form_focus.set(None);
         match self.new_agent.as_mut() {
             Some(form) => {
                 if let Some(task) = task {
@@ -3594,7 +3675,29 @@ impl Ui {
         }
     }
 
+    fn agent_repository_host(&self) -> Option<String> {
+        let form = self.new_agent.as_ref()?;
+        Some(
+            form.host
+                .checked_sub(1)
+                .and_then(|index| self.other_hosts().get(index).cloned())
+                .unwrap_or_else(|| {
+                    if self.world.host == "this machine" {
+                        "local".into()
+                    } else {
+                        self.world.host.clone()
+                    }
+                }),
+        )
+    }
+
     fn agent_form_key(&mut self, key: KeyEvent) {
+        let suggestions = self
+            .agent_repositories
+            .as_ref()
+            .filter(|(host, _)| Some(host) == self.agent_repository_host().as_ref())
+            .map(|(_, load)| load.items().to_vec())
+            .unwrap_or_default();
         let hosts = self.other_hosts().len();
         let Some(form) = self.new_agent.as_mut() else {
             return;
@@ -3604,14 +3707,36 @@ impl Ui {
             .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => self.cancel_agent_form(),
-            KeyCode::Tab | KeyCode::Down if form.focus >= 2 || key.code == KeyCode::Tab => {
+            KeyCode::Char(choice @ ('n' | 'p'))
+                if form.focus == 6 && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if !suggestions.is_empty() {
+                    let index = suggestions
+                        .iter()
+                        .position(|path| path == &form.repository)
+                        .map(|index| {
+                            if choice == 'n' {
+                                (index + 1) % suggestions.len()
+                            } else {
+                                (index + suggestions.len() - 1) % suggestions.len()
+                            }
+                        })
+                        .unwrap_or(if choice == 'n' {
+                            0
+                        } else {
+                            suggestions.len() - 1
+                        });
+                    form.repository = suggestions[index].clone();
+                }
+            }
+            KeyCode::Tab | KeyCode::Down if form.choice() || key.code == KeyCode::Tab => {
                 form.focus = (form.focus + 1) % screens::AgentForm::FIELDS;
             }
-            KeyCode::BackTab | KeyCode::Up if form.focus >= 2 || key.code == KeyCode::BackTab => {
+            KeyCode::BackTab | KeyCode::Up if form.choice() || key.code == KeyCode::BackTab => {
                 form.focus =
                     (form.focus + screens::AgentForm::FIELDS - 1) % screens::AgentForm::FIELDS;
             }
-            KeyCode::Left | KeyCode::Right if form.focus >= 2 => {
+            KeyCode::Left | KeyCode::Right if form.choice() => {
                 form.cycle(key.code == KeyCode::Right, hosts);
             }
             KeyCode::Enter if shifted && form.focus == 0 => {
@@ -3632,6 +3757,18 @@ impl Ui {
                     }
                     edit::edit(&mut form.name, &self.cursor, "agent:name", key);
                 }
+                6 => {
+                    edit::edit(&mut form.repository, &self.cursor, "agent:repository", key);
+                }
+                7 => {
+                    edit::edit(&mut form.branch, &self.cursor, "agent:branch", key);
+                }
+                8 => {
+                    edit::edit(&mut form.base, &self.cursor, "agent:base", key);
+                }
+                9 => {
+                    edit::edit(&mut form.workspace, &self.cursor, "agent:workspace", key);
+                }
                 _ => {}
             },
         }
@@ -3649,19 +3786,23 @@ impl Ui {
             self.flash("Give it a name");
             return;
         }
-        let message = Some(form.task.trim().to_owned()).filter(|task| !task.is_empty());
         let host = form
             .host
             .checked_sub(1)
             .and_then(|index| hosts.get(index).cloned());
         if self.live {
+            let parameters = agent_parameters(&form, host);
             self.effects.push(Effect::CreateAgent {
-                name: form.name.trim().to_owned(),
-                harness: form.harness().to_owned(),
-                model: form.model().map(str::to_owned),
-                effort: form.effort().map(str::to_owned),
-                host,
-                message,
+                name: parameters.name,
+                harness: parameters.harness,
+                model: parameters.model,
+                effort: parameters.effort,
+                host: parameters.host,
+                message: parameters.message,
+                repo: parameters.repo,
+                branch: parameters.branch,
+                base: parameters.base,
+                workspace: parameters.workspace,
             });
             self.flash(format!("Starting {}…", form.name.trim()));
         } else {
@@ -4553,6 +4694,12 @@ impl Ui {
                 self.start_voice();
             }
             Hit::Open(id) => self.open(&id),
+            Hit::Repository(path) => {
+                if let Some(form) = self.new_agent.as_mut() {
+                    form.repository = path;
+                    form.focus = 6;
+                }
+            }
             Hit::Field(index) if self.agent_form => {
                 if let Some(form) = self.new_agent.as_mut() {
                     form.focus = index;
