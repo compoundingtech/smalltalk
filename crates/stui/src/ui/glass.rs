@@ -322,6 +322,14 @@ impl Glasses {
             .any(|tab| matches!(Pane::parse(&tab.pane), Some(Pane::Usage(_))))
     }
 
+    /// Whether a machine shows, which lists the clients connected to this member.
+    pub(crate) fn shows_machine(&self) -> bool {
+        let glass = self.glass();
+        (0..glass.layout.groups().len())
+            .filter_map(|index| glass.shown(index))
+            .any(|tab| matches!(Pane::parse(&tab.pane), Some(Pane::Machine(_))))
+    }
+
     pub(crate) fn shown_agents(&self) -> Vec<String> {
         let glass = self.glass();
         let count = glass.layout.groups().len();

@@ -2143,8 +2143,71 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
     }
     doc.card("agents here", theme::OVERLAY1, false, agents, width);
     if machine.you_are_here {
+        doc.append(clients_card(world, width), 0);
         doc.append(devices_card(world, width), 0);
     }
+    doc
+}
+
+// ------------------------------------------------------------------ clients
+
+/// Who is connected to this member: each client as it describes itself, who it acts for, how
+/// it came in, since when, and what it follows. A build older than the member's own carries a
+/// quiet note, nothing more.
+pub fn clients_card(world: &World, width: usize) -> Doc {
+    let mut inner = Doc::new();
+    match &world.clients {
+        Load::Loading => inner.line(Line::from(span("Loading connected clients…", theme::dim()))),
+        Load::Failed(error) => inner.wrap(
+            &[run(
+                format!("Could not read connected clients: {error}"),
+                theme::fg(theme::RED),
+            )],
+            width.saturating_sub(4),
+        ),
+        Load::Ready(clients) if clients.is_empty() => {
+            inner.line(Line::from(span("No clients connected.", theme::dim())))
+        }
+        Load::Ready(clients) => {
+            for item in clients {
+                let name = if item.client.is_empty() {
+                    "unnamed client"
+                } else {
+                    item.client.as_str()
+                };
+                let who = match &item.device {
+                    Some(device) => format!("{} · {device}", item.who),
+                    None => item.who.clone(),
+                };
+                let mut head = vec![
+                    span(
+                        if item.connected { "● " } else { "○ " },
+                        theme::fg(if item.connected {
+                            theme::GREEN
+                        } else {
+                            theme::QUIET
+                        }),
+                    ),
+                    span(format!("{name}  "), theme::text()),
+                    span(who, theme::soft()),
+                ];
+                if item.older {
+                    head.push(span("  older than this member", theme::dim()));
+                }
+                inner.line(Line::from(head));
+                let mut about = vec![item.via.clone(), item.member.clone(), item.when.clone()];
+                if !item.follows.is_empty() {
+                    about.push(format!("follows {}", item.follows.join(", ")));
+                }
+                inner.wrap(
+                    &[run(about.join(" · "), theme::dim())],
+                    width.saturating_sub(4),
+                );
+            }
+        }
+    }
+    let mut doc = Doc::new();
+    doc.card("connected clients", theme::OVERLAY1, false, inner, width);
     doc
 }
 

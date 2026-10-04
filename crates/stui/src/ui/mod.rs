@@ -568,6 +568,14 @@ impl Ui {
     }
 
     /// The period to read usage over while something on screen shows it, or `None`.
+    /// Whether the clients connected to this member show: the Fleet tab or a machine pane.
+    pub(crate) fn clients_wanted(&self) -> bool {
+        match &self.glasses {
+            Some(glasses) => glasses.shows_machine() || self.tab == 3,
+            None => self.tab == 3,
+        }
+    }
+
     pub(crate) fn usage_wanted(&self) -> Option<u64> {
         let shown = match &self.glasses {
             Some(glasses) => glasses.shows_usage(),

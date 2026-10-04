@@ -120,6 +120,8 @@ struct Following {
 
 /// How often usage on screen is read again.
 const USAGE_EVERY: Duration = Duration::from_secs(60);
+/// How often the connected clients are read again while the fleet shows.
+const CLIENTS_EVERY: Duration = Duration::from_secs(10);
 
 /// Why usage could not be read, saying so plainly when the daemon predates the read.
 fn usage_error(error: &st3_client::ClientError) -> String {
@@ -154,6 +156,11 @@ enum Fetched {
     Machines(Collection),
     /// Token spend over a period of this many hours, or why st could not say.
     Usage(u64, Result<st3_client::UsagePeriod, String>),
+    /// The clients connected to this member, or why they could not be read.
+    Clients(
+        Result<st3_client::ClientConnections, String>,
+        Option<String>,
+    ),
     /// st's conversation search for the palette's query, or why st could not say.
     Said(String, Result<st3_client::ConversationSearch, String>),
     Devices(Collection),
@@ -311,6 +318,9 @@ pub fn run(context: Context) -> Result<()> {
     let mut shown_tab = usize::MAX;
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
+    // When the connected clients were last read, while the fleet shows, and whether a read is out.
+    let mut clients_read: Option<Instant> = None;
+    let mut clients_reading = false;
     let mut usage_reading = false;
     // The palette's conversation search: what st was last asked, and what is typed since when.
     let mut said_asked: Option<String> = None;
@@ -551,6 +561,13 @@ pub fn run(context: Context) -> Result<()> {
                     ui.said = Some((query, outcome));
                     changed = true;
                 }
+                Fetched::Clients(outcome, member_build) => {
+                    clients_reading = false;
+                    model.clients = Some(outcome);
+                    if member_build.is_some() {
+                        model.member_build = member_build;
+                    }
+                }
                 Fetched::Usage(hours, outcome) => {
                     usage_reading = false;
                     if hours == ui.usage_hours {
@@ -707,6 +724,38 @@ pub fn run(context: Context) -> Result<()> {
                 said_typed = None;
             }
             _ => {}
+        }
+        // Who is connected has no stream either: read while the fleet shows, every few seconds,
+        // since clients come and go.
+        if ui.clients_wanted() && extras.live {
+            let due = clients_read.is_none_or(|at| at.elapsed() >= CLIENTS_EVERY);
+            if due && !clients_reading {
+                clients_read = Some(Instant::now());
+                clients_reading = true;
+                let client = client.clone();
+                let tx = fetched_tx.clone();
+                runtime.spawn(async move {
+                    let member_build = client
+                        .capabilities()
+                        .await
+                        .ok()
+                        .and_then(|envelope| envelope.value.machine_version);
+                    let outcome = client
+                        .clients_list()
+                        .await
+                        .map(|envelope| envelope.value)
+                        .map_err(|error| match &error {
+                            ClientError::Api(st3_client::ErrorCode::NotFound, ..) => {
+                                "this st does not list its clients yet: its daemon needs an update"
+                                    .to_owned()
+                            }
+                            _ => error.plain(),
+                        });
+                    let _ = tx.send(Fetched::Clients(outcome, member_build));
+                });
+            }
+        } else {
+            clients_read = None;
         }
         // Usage has no stream: it is read while something shows it, again each minute, and at
         // once over a new period.

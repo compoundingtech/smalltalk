@@ -76,6 +76,13 @@ pub struct Model {
     /// Token spend over the Usage tab's period, read while something shows it, or why not.
     #[serde(skip)]
     pub usage: Option<std::result::Result<st3_client::UsagePeriod, String>>,
+    /// The clients connected to this member now and those seen lately, read while the fleet
+    /// shows, or why not.
+    #[serde(skip)]
+    pub clients: Option<std::result::Result<st3_client::ClientConnections, String>>,
+    /// The build this member's daemon reports, read with its clients.
+    #[serde(skip)]
+    pub member_build: Option<String>,
 }
 
 impl Model {
