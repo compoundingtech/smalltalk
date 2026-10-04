@@ -107,6 +107,13 @@ starts at zero. Never resend bytes whose earlier acknowledgement was lost.
 `input-close` ends an input without a frame. An input ID held again replaces
 the earlier input; callers must send fresh bytes, not replay an uncertain batch.
 
+These commands and frames are defined by `CollectionCommand` and `CollectionFrame`
+in `client-v0.schema.json`. TypeScript exposes `openInput`, `sendInput`, and
+`closeInput`; Rust exposes `open_input`, `send_input`, and `close_input`, with
+typed `InputOpened`, `InputAck`, and `InputClosed` events. Swift's glasses-only
+stream does not expose terminal input. Input sessions are socket-local; their
+frames are never broadcast to another socket.
+
 ## Conversations
 
 A conversation is one more subscription too. Name an agent or a session:
