@@ -71,6 +71,7 @@ with tempfile.TemporaryDirectory() as tmp:
     downloads = []
     candidates = []
     previous = pr_run
+    missing_previous_artifacts = False
 
     def api(path):
         if '/pulls/1/commits?' in path:
@@ -82,6 +83,8 @@ with tempfile.TemporaryDirectory() as tmp:
         if '/workflows/' in path:
             return dict(workflow_runs=runs)
         assert '/runs/9/' not in path
+        if missing_previous_artifacts and '/runs/10/' in path:
+            return dict(artifacts=[])
         return dict(artifacts=[dict(name=name, expired=False) for name in
                               ('build-recipe', 'stores-recipe', 'perf-load-logs')])
 
@@ -115,6 +118,15 @@ with tempfile.TemporaryDirectory() as tmp:
         module.restore()
     assert downloads[:2] == [(10, 'build-recipe'), (10, 'stores-recipe')]
     assert downloads[2:] == [(i, 'perf-load-logs') for i in range(8, 3, -1)]
+    # GitHub can expose the successful attempt while hiding all of its artifacts on rerun.
+    # That must restore main's snapshots and actual main reports, rather than become cold.
+    missing_previous_artifacts = True
+    downloads.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.restore()
+    assert downloads[:2] == [(8, 'build-recipe'), (8, 'stores-recipe')]
+    assert downloads[2:] == [(i, 'perf-load-logs') for i in range(8, 3, -1)]
+    missing_previous_artifacts = False
     # Main must not promote PR snapshots, even when a same-PR cache exists.
     os.environ['GITHUB_EVENT_NAME'] = 'push'
     candidates.append(pr_run)

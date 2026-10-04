@@ -94,6 +94,7 @@ def restore():
 
     # PR snapshots can be reused only by that same PR, never by main or another PR.
     # A rerun changes the current run's status: verify its previous successful attempt directly.
+    # GitHub may hide that attempt's artifacts; main remains the durable fallback.
     if os.environ['GITHUB_EVENT_NAME'] == 'pull_request':
         number = int(os.environ['PERF_PR_NUMBER'])
         branch = os.environ['GITHUB_HEAD_REF']
