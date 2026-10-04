@@ -2953,7 +2953,7 @@ pub(super) async fn harness(
     Extension(_snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
     require_scope(&session, "read.projections")?;
     let subject = client_detail_id("agent", &id);
     let (snapshot, value) = super::blocking_store(move || {
@@ -2962,7 +2962,7 @@ pub(super) async fn harness(
         })
     }).await?;
     let value = value.ok_or_else(|| ApiError::not_found("agent not found"))?;
-    Ok(Json(json!({"snapshot": snapshot, "value": value})))
+    Ok((Extension(snapshot), Json(value)))
 }
 
 fn harness_value(store: &Store, subject: &str, index: u64) -> anyhow::Result<Option<Value>> {
@@ -9371,9 +9371,17 @@ mod tests {
         let unobserved = harness_value(&state.store, subject, state.store.index().unwrap()).unwrap().unwrap();
         assert!(unobserved["todo"].is_null());
         assert!(unobserved["plan"].is_null());
-        let Json(read) = harness(State(state.clone()), Extension(new_client_snapshot(&state)),
-            Extension(ClientSession::local(None).unwrap()), AxumPath(subject.into())).await.unwrap();
-        let typed: st3_client::HarnessState = serde_json::from_value(read["value"].clone()).unwrap();
+        let response = super::super::router(state.clone()).oneshot(
+            Request::builder().uri(format!("/v1/client/harness/{subject}"))
+                .body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap();
+        let read: st3_client::Envelope<st3_client::Resource> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(read.snapshot.store_index, state.store.index().unwrap());
+        let st3_client::Resource::HarnessState(typed) = read.value else {
+            panic!("focused read did not return a harness resource");
+        };
         assert_eq!(typed.agent_id, subject);
         assert_eq!(typed.incarnation_id.as_deref(), Some("one"));
 
