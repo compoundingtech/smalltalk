@@ -130,6 +130,21 @@ for (const ctx of [bareCtx, fullCtx, throwingCtx]) {
   await handlers.get("session_shutdown")({ reason: "smoke" }, ctx);
 }
 
+// Native completion fields reach Rust; assistant content and aborted turns do not.
+await handlers.get("session_start")({}, bareCtx);
+await new Promise((resolve) => setTimeout(resolve, 150));
+const turnStart = readFrames().filter((frame) => frame.type === "turn").length;
+await handlers.get("agent_end")({ messages: [{ role: "assistant", stopReason: "error", errorMessage: "No API key found for anthropic." }] }, bareCtx);
+await handlers.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop", content: "Please run /login" }] }, bareCtx);
+await handlers.get("agent_end")({ messages: [{ role: "assistant", stopReason: "aborted" }] }, bareCtx);
+await new Promise((resolve) => setTimeout(resolve, 150));
+const turns = readFrames().filter((frame) => frame.type === "turn").slice(turnStart);
+assert.equal(turns.length, 2);
+assert.equal(turns[0].error.driver, "pi");
+assert.equal(turns[0].error.reason, "No API key found for anthropic.");
+assert.equal(turns[1].error, undefined);
+await handlers.get("session_shutdown")({ reason: "smoke" }, bareCtx);
+
 // A killed channel reconnects without a provider restart or synthetic model turn.
 await handlers.get("session_start")({}, bareCtx);
 await new Promise((resolve) => setTimeout(resolve, 150));

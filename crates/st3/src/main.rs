@@ -16666,6 +16666,17 @@ async fn publish_harness_activity(
     let status = harness_activity_state(observed.state);
     let mut fields = BTreeMap::from([
         ("state".into(), Value::String(status.into())),
+        (
+            "provider_auth".into(),
+            observed
+                .provider_auth
+                .map(Value::Bool)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "provider_auth_sequence".into(),
+            Value::from(observed.provider_auth_sequence),
+        ),
         ("driver".into(), Value::String(driver.into())),
         ("transport".into(), Value::String(transport.into())),
         (

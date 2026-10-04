@@ -2143,7 +2143,7 @@ fn client_agent_resources_uncached(
                 (
                     Some("running" | "ready" | "working" | "idle"),
                     Some(_),
-                    Some("indeterminate" | "unknown" | "unauthenticated" | "blocked"),
+                    Some("indeterminate" | "unknown" | "unauthenticated" | "needs-login" | "blocked"),
                     _,
                 ) => "waiting",
                 (Some("running" | "ready" | "working" | "idle"), Some(_), _, _) => "starting",
@@ -19302,7 +19302,7 @@ mission "agent-auth" state="ready" {
         }
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
-        assert_eq!(resources[0]["harness_state"], "unauthenticated");
+        assert_eq!(resources[0]["harness_state"], "needs-login");
         assert_eq!(resources[0]["state"], "waiting");
     }
 

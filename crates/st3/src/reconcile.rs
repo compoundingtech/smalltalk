@@ -248,11 +248,21 @@ fn calendar_occurrence(
 /// at most after a status glyph, so a line that only quotes the phrase, such as source code or
 /// grep output a session prints, does not match.
 fn claude_login_expired(screen: &str) -> Option<&str> {
-    screen.lines().map(str::trim).find(|line| {
-        let text = line.trim_start_matches(['●', '⎿']).trim_start();
-        text.starts_with("Login expired · Please run /login")
-            || text.starts_with("Not logged in · Run /login")
-    })
+    let mut matched = None;
+    let mut assistant_block = false;
+    for line in screen.lines().map(str::trim) {
+        if let Some(reply) = line.strip_prefix('●') {
+            // A newer assistant/tool block supersedes a login line in scrollback.
+            assistant_block = true;
+            matched = st_drivers::claude_session::claude_login_reply(reply.trim()).then_some(line);
+        } else if !assistant_block {
+            let text = line.trim_start_matches('⎿').trim_start();
+            if st_drivers::claude_session::claude_login_reply(text) {
+                matched = Some(line);
+            }
+        }
+    }
+    matched
 }
 
 /// Claude's workspace trust dialog as `pty peek --plain` renders it. Every phrase must be present,
@@ -2255,7 +2265,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     )?;
                                     return Ok(());
                                 }
-                                self.reconcile_claude_auth_screen(subject, member, &observation)?;
+                                self.reconcile_harness_authentication(
+                                    subject,
+                                    member,
+                                    &observation,
+                                )?;
                                 self.reconcile_claude_trust_screen(
                                     subject,
                                     member,
@@ -2818,9 +2832,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .current_harness(&subject.subject)?
             .is_some_and(|harness| harness.incarnation_id == incarnation && harness.is_ready());
         if harness_ready {
-            if driver == "claude" {
-                self.resolve_superseded_claude_auth_attention(&subject.subject, incarnation)?;
-            }
+            self.resolve_superseded_harness_auth_attention(&subject.subject, incarnation)?;
             self.resolve_recovered_seat_attention(&subject.subject, incarnation)?;
             self.resolve_pending_alert(
                 &attention_key,
@@ -2918,7 +2930,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    fn resolve_superseded_claude_auth_attention(
+    fn resolve_superseded_harness_auth_attention(
         &self,
         subject: &str,
         current_incarnation: &str,
@@ -2940,8 +2952,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 continue;
             }
             self.resolve_pending_alert(
-                &format!("claude-auth-expired:{subject}:{old_incarnation}"),
-                "a new Claude runtime incarnation became ready",
+                claim.body["fields"]["auth_attention_key"]
+                    .as_str()
+                    .unwrap_or(&format!("claude-auth-expired:{subject}:{old_incarnation}")),
+                "a new runtime incarnation became ready",
             )?;
         }
         Ok(())
@@ -3004,29 +3018,54 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(screen)
     }
 
-    fn reconcile_claude_auth_screen(
+    fn reconcile_harness_authentication(
         &self,
         subject: &DesiredSubject,
         member: &MemberSpec,
         observation: &RuntimeObservation,
     ) -> Result<()> {
-        if subject.kind != "agent" || member.driver.as_deref() != Some("claude") || !member.terminal
-        {
+        if subject.kind != "agent" {
             return Ok(());
         }
         let Some(incarnation) = observation.incarnation_id.as_deref() else {
             return Ok(());
         };
-        // Claude's login prompt does not emit a StopFailure hook. The initialized MCP channel
-        // remains alive, so hook-only observation incorrectly reports this session as ready.
-        let Ok(screen) = self.member_screen(&member.runtime_id) else {
-            return Ok(());
+        let driver = member.driver.as_deref().unwrap_or("unknown");
+        let auth = self
+            .store
+            .harness_auth_evidence(&subject.subject, incarnation)?;
+        let auth_accepted = auth.as_ref().and_then(|v| v["provider_auth"].as_bool());
+        let auth_sequence = auth
+            .as_ref()
+            .and_then(|v| v["provider_auth_sequence"].as_u64())
+            .unwrap_or(0);
+        let matched_line = if member.terminal && auth_accepted.is_none() {
+            self.member_screen(&member.runtime_id)
+                .ok()
+                .and_then(|screen| match driver {
+                    "claude" => claude_login_expired(&screen).map(str::to_owned),
+                    "pi" => screen
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| {
+                            line.strip_prefix("Error: ")
+                                .is_some_and(st_drivers::pi_channel::pi_login_reply)
+                        })
+                        .map(str::to_owned),
+                    _ => None,
+                })
+        } else {
+            None
         };
-        let (fence, key) = self.claude_auth_fence(&subject.subject, incarnation)?;
-        let Some(matched_line) = claude_login_expired(&screen) else {
-            // The prompt is gone: a person ran /login, or the match was false. Either way the
-            // incarnation can take work again, so its fence and the person's request end.
-            if let Some(fence) = fence {
+        let (fence, key) = self.harness_auth_fence(&subject.subject, incarnation)?;
+        if let Some(fence) = fence {
+            let prior_sequence = self
+                .store
+                .claim_by_id(&fence)?
+                .and_then(|claim| claim.body["fields"]["provider_auth_sequence"].as_u64())
+                .unwrap_or(0);
+            // Losing a screen line or seeing ordinary activity is not authentication proof.
+            if auth_accepted == Some(true) && auth_sequence > prior_sequence {
                 self.store.append_claim(&ClaimInput {
                     subject: subject.subject.clone(),
                     kind: "harness.diagnostic".into(),
@@ -3039,7 +3078,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                         ),
                         (
                             "reason".into(),
-                            Value::String("Claude no longer shows its expired-login prompt".into()),
+                            Value::String(
+                                "A successful authenticated turn restored this harness".into(),
+                            ),
                         ),
                         ("incarnation_id".into(), Value::String(incarnation.into())),
                     ]),
@@ -3049,57 +3090,50 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })?;
                 self.resolve_pending_alert(
                     &key,
-                    "Claude no longer shows its expired-login prompt",
+                    "a successful authenticated turn restored this harness",
                 )?;
                 self.signal_changed();
             }
             return Ok(());
-        };
-        if fence.is_some() {
-            return Ok(());
         }
-        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-        let attention_subject = format!("attention/{}", &digest[..32]);
-        if self
-            .store
-            .operational_failure(&attention_subject)?
-            .is_some()
-        {
+        if auth_accepted != Some(false) && matched_line.is_none() {
             return Ok(());
         }
         self.store.append_claim(&ClaimInput {
-                subject: subject.subject.clone(),
-                kind: "harness.diagnostic".into(),
-                actor: Some(subject.subject.clone()),
-                fields: BTreeMap::from([
-                    ("severity".into(), Value::String("error".into())),
-                    ("status".into(), Value::String("unauthenticated".into())),
-                    ("code".into(), Value::String("provider-auth-expired".into())),
-                    ("reason".into(), Value::String("Claude reports an expired login; a person must run /login in this terminal and restart the harness".into())),
-                    ("incarnation_id".into(), Value::String(incarnation.into())),
-                    ("matched_line".into(), Value::String(matched_line.into())),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some(key.clone()),
+            subject: subject.subject.clone(),
+            kind: "harness.diagnostic".into(),
+            actor: Some(subject.subject.clone()),
+            fields: BTreeMap::from([
+                ("severity".into(), Value::String("error".into())),
+                ("status".into(), Value::String("needs-login".into())),
+                ("code".into(), Value::String("provider-auth-expired".into())),
+                (
+                    "reason".into(),
+                    Value::String(format!(
+                        "{driver} reports missing or expired authentication"
+                    )),
+                ),
+                ("driver".into(), Value::String(driver.into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+                ("provider_auth_sequence".into(), Value::from(auth_sequence)),
+                ("auth_attention_key".into(), Value::String(key.clone())),
+                (
+                    "matched_line".into(),
+                    matched_line.map(Value::String).unwrap_or(Value::Null),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(key.clone()),
         })?;
-        self.store.record_runtime_failure(&attention_subject, &AttentionRequest {
-                reviewer: "person/alex".into(),
-                title: "Claude login expired".into(),
-                reason: format!("{} on {} is unauthenticated. Run /login in its terminal, then restart this harness; work delivery is held until a new authenticated incarnation.", subject.subject, self.host),
-                severity: "error".into(),
-                targets: vec![subject.subject.clone()],
-                actor: "agent/st3/reconciler".into(),
-                idempotency_key: format!("{key}:attention"),
-        }, "provider-auth")?;
         self.signal_changed();
         Ok(())
     }
 
-    /// The login fence of one Claude incarnation: the claim that fences it, if it is fenced now,
+    /// The login fence of one harness incarnation: the claim that fences it, if it is fenced now,
     /// and the key of that fence, or of the next one. A fence lifted once can fence the same
     /// incarnation again, so a fence after a lift is keyed by that lift.
-    fn claude_auth_fence(
+    fn harness_auth_fence(
         &self,
         subject: &str,
         incarnation: &str,
@@ -14632,6 +14666,8 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
     #[test]
     fn claude_login_screen_ignores_quoted_source_and_grep_output() {
         for screen in [
+            "● Bash(cat log)\n  ⎿ Login expired · Please run /login",
+            "● Login expired · Please run /login\n● A successful response",
             r#"37:    screen.contains("Login expired · Please run /login")"#,
             r#"  ⎿  37:    screen.contains("Login expired · Please run /login")"#,
             r#"● The detector matches "Not logged in · Run /login" anywhere."#,
@@ -31852,6 +31888,114 @@ version 2
         );
     }
 
+    #[test]
+    fn native_login_failure_routes_once_to_its_person_and_recovers_then_repeats() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"seat\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &plan.subject_tokens,
+                "auth-owned-seat",
+                Some("person/avery"),
+            )
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        *runtime.ptys.lock().unwrap() = vec![claude_seat_pty("seat", "running", "one")];
+        let publish = |accepted: bool, sequence: u64, epoch: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "agent/node.seat".into(),
+                    kind: "harness.observed".into(),
+                    actor: Some("agent/node.seat".into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String("idle".into())),
+                        ("incarnation_id".into(), Value::String(epoch.into())),
+                        ("provider_auth".into(), Value::Bool(accepted)),
+                        ("provider_auth_sequence".into(), Value::from(sequence)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        publish(false, 1, "one");
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store
+                .current_harness("agent/node.seat")
+                .unwrap()
+                .unwrap()
+                .state,
+            "needs-login"
+        );
+        assert_eq!(
+            store.attention_items(Some("person/avery")).unwrap().len(),
+            1
+        );
+        assert!(
+            store
+                .attention_items(Some("person/alex"))
+                .unwrap()
+                .is_empty()
+        );
+        publish(true, 9, "stale");
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store
+                .current_harness("agent/node.seat")
+                .unwrap()
+                .unwrap()
+                .state,
+            "needs-login"
+        );
+        publish(true, 2, "one");
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .current_harness("agent/node.seat")
+                .unwrap()
+                .unwrap()
+                .is_ready()
+        );
+        assert!(
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .is_empty()
+        );
+        publish(false, 3, "one");
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store.attention_items(Some("person/avery")).unwrap().len(),
+            1
+        );
+        assert!(runtime.keys.lock().unwrap().is_empty());
+    }
+
     /// A seat whose screen shows the detector's own source, as a builder's grep output did on
     /// 2026-09-27, stays authenticated. A seat that shows Claude's login prompt is fenced, and its
     /// diagnostic records the exact screen line that matched.
@@ -31916,12 +32060,14 @@ version 2
         let harness = store.current_harness("agent/node.seat-b").unwrap().unwrap();
         assert_eq!(harness.reason.as_deref(), Some("providerAuth"));
         let attention = store.fault_items(Some("person/alex")).unwrap();
-        assert_eq!(attention.len(), 1);
-        assert_eq!(attention[0].targets, ["agent/node.seat-b"]);
+        assert!(
+            attention.is_empty(),
+            "an unowned seat must not alert a fixed person"
+        );
     }
 
     #[test]
-    fn a_claude_login_fence_lifts_when_the_prompt_leaves_the_screen() {
+    fn a_claude_login_fence_lifts_only_after_an_authenticated_turn() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = format!(
@@ -31955,13 +32101,31 @@ version 2
         show("> Work.\n\n● Login expired · Please run /login\n");
         reconciler.reconcile_once().unwrap();
         assert!(fenced());
-        assert_eq!(
-            store.fault_items(Some("person/alex")).unwrap().len(),
-            1
-        );
+        assert_eq!(store.fault_items(Some("person/alex")).unwrap().len(), 0);
 
-        // The prompt is gone, so the same incarnation takes work again.
+        // Disappearance alone is insufficient; a successful native turn lifts the fence.
         show("> Work.\n\n● Done.\n");
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            fenced(),
+            "screen disappearance alone is not positive authentication evidence"
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.seat".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/node.seat".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("incarnation_id".into(), Value::String("seat-one".into())),
+                    ("provider_auth".into(), Value::Bool(true)),
+                    ("provider_auth_sequence".into(), Value::from(1)),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         reconciler.reconcile_once().unwrap();
         assert!(!fenced());
         assert!(
@@ -31985,14 +32149,30 @@ version 2
             .collect::<Vec<_>>();
         assert_eq!(codes, ["provider-auth-expired", "provider-auth-restored"]);
 
-        // The prompt returns: the incarnation is fenced again, with a new request.
+        // Old screen content cannot refence a successfully authenticated native turn.
         show("> Work.\n\n● Login expired · Please run /login\n");
         reconciler.reconcile_once().unwrap();
+        assert!(!fenced());
+        // A fresh explicit refusal starts a new episode on this same incarnation.
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.seat".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/node.seat".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("incarnation_id".into(), Value::String("seat-one".into())),
+                    ("provider_auth".into(), Value::Bool(false)),
+                    ("provider_auth_sequence".into(), Value::from(2)),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
         assert!(fenced());
-        assert_eq!(
-            store.fault_items(Some("person/alex")).unwrap().len(),
-            1
-        );
+        assert_eq!(store.fault_items(Some("person/alex")).unwrap().len(), 0);
     }
 
     #[test]

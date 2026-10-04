@@ -285,6 +285,14 @@ WHERE kind='harness.observed'
     AND json_type(body, CASE WHEN json_type(body, '$.fields') IS NULL
         THEN '$.state' ELSE '$.fields.state' END)='text';
 
+-- Credential evidence is sparse on older drivers. A partial index prevents an unknown
+-- credential state from scanning every activity observation in a long-lived incarnation.
+CREATE INDEX IF NOT EXISTS claims_harness_auth_incarnation_index
+ON claims(subject, json_extract(body, '$.fields.incarnation_id'),
+    length(accepted_at_unix_ms), accepted_at_unix_ms)
+WHERE kind='harness.observed'
+    AND json_type(body, '$.fields.provider_auth') IN ('true','false');
+
 CREATE TABLE IF NOT EXISTS desired (
     subject TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -11715,6 +11723,7 @@ impl Store {
     ) -> Result<Vec<AttentionItemView>> {
         let mut items = self.mission_run_attention_items(person)?;
         items.extend(self.person_attention_items(person, as_of)?);
+        items.extend(self.harness_login_attention_items(person)?);
         // A person who published a broken gate is the one to correct it.
         items.extend(
             self.broken_gate_items(person, as_of)?
@@ -14275,6 +14284,138 @@ impl Store {
             )
             .map_err(internal)?;
         Ok(changed != 0 || mailbox_owner_key(&connection, fence)? != mark.owner)
+    }
+
+    /// A login is work only the seat's person can do. Project it from the current canonical
+    /// condition, rather than raising an agent-owned fault or a legacy attention request.
+    fn harness_login_attention_items(
+        &self,
+        person: Option<&str>,
+    ) -> Result<Vec<AttentionItemView>> {
+        let mut items = Vec::new();
+        for desired in self
+            .desired_subjects()?
+            .into_iter()
+            .filter(|d| d.kind == "agent")
+        {
+            if !person_work::declaration_live(&self.readers.get(), &desired.subject)? {
+                continue;
+            }
+            let Some(harness) = self.current_harness(&desired.subject)? else {
+                continue;
+            };
+            if harness.state != "needs-login" {
+                continue;
+            }
+            let Some(owner) = self.agent_person(&desired.subject)? else {
+                continue;
+            };
+            if person.is_some_and(|person| person != owner) {
+                continue;
+            }
+            let driver = desired
+                .member
+                .as_ref()
+                .and_then(|m| m.driver.as_deref())
+                .unwrap_or("harness");
+            let host = desired
+                .member
+                .as_ref()
+                .map(|m| m.host.as_str())
+                .unwrap_or("unknown");
+            let login = match driver {
+                "claude" | "pi" | "omp" => "run /login",
+                "codex" => "run codex login with this seat's account configuration",
+                "opencode" => "run opencode auth login with this seat's account configuration",
+                _ => "use this harness's login command",
+            };
+            let connection = self.readers.get();
+            let episode: Option<(String, String, String)> = connection.query_row(&canonical_sql(
+                "SELECT id, body, accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='harness.diagnostic'
+                 AND json_extract(body, '$.fields.incarnation_id')=?2
+                 AND json_extract(body, '$.fields.code') IN ('provider-auth-expired','provider-auth-restored')
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1"), params![desired.subject, harness.incarnation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
+            let mut requested_at = harness.observed_at_unix_ms;
+            let mut key = format!(
+                "claude-auth-expired:{}:{}",
+                desired.subject, harness.incarnation_id
+            );
+            if let Some((id, body, time)) = episode {
+                requested_at = time.parse()?;
+                let body: Value = serde_json::from_str(&body)?;
+                if body["fields"]["code"] == "provider-auth-restored" {
+                    key = format!("{key}:{id}");
+                } else if let Some(stored) = body["fields"]["auth_attention_key"].as_str() {
+                    key = stored.to_owned();
+                }
+            }
+            items.push(AttentionItemView {
+                episode: key, priority: "high".into(), kind: "harness-login".into(), review_mode: None,
+                subject: desired.subject.clone(), person: owner, requester_id: None, launch_id: None,
+                variant_id: None, message_id: None,
+                title: format!("{} on {host} needs you to log in", desired.subject),
+                detail: format!("{} on {host} needs you to log in: attach (Ctrl+] in stui) and {login}. A successful authenticated turn clears this item automatically.", desired.subject),
+                request: None, mission: None, mission_run: None, step: None,
+                targets: vec![desired.subject.clone()], requested_at_unix_ms: requested_at,
+                actions: vec![crate::model::AttentionActionView { label: "Attach to log in".into(),
+                    argv: vec!["st".into(), "terminals".into(), "attach".into(), desired.subject] }],
+            });
+        }
+        Ok(items)
+    }
+
+    /// Explicit credential evidence from the currently running native epoch only.
+    pub(crate) fn harness_auth_evidence(
+        &self,
+        subject: &str,
+        incarnation: &str,
+    ) -> Result<Option<Value>> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                &canonical_sql(
+                    "SELECT body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
+             AND json_extract(body, '$.fields.incarnation_id')=?2
+             AND json_type(body, '$.fields.provider_auth') IN ('true','false')
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ),
+                params![subject, incarnation],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|body| Ok(serde_json::from_str::<Value>(&body)?["fields"].clone()))
+            .transpose()
+    }
+
+    /// Follow declaration authors and mission requesters to their concrete person.
+    /// Missing or cyclic ownership remains unknown; it never selects a global operator.
+    pub(crate) fn agent_person(&self, agent: &str) -> Result<Option<String>> {
+        let mut actor = agent.to_owned();
+        let mut seen = BTreeSet::new();
+        for _ in 0..16 {
+            if actor.starts_with("person/") {
+                return Ok(Some(actor));
+            }
+            if !seen.insert(actor.clone()) {
+                return Ok(None);
+            }
+            let Some((desired, writer)) = self.desired_subject_with_writer(&actor)? else {
+                return Ok(None);
+            };
+            let requester = desired
+                .owner_run
+                .as_deref()
+                .map(|run| self.mission_run(run))
+                .transpose()?
+                .flatten()
+                .map(|run| run.requester);
+            let Some(next) = requester.or(writer) else {
+                return Ok(None);
+            };
+            actor = next;
+        }
+        Ok(None)
     }
 
     pub fn current_harness(
@@ -18872,6 +19013,34 @@ fn current_harness_at(
         return Ok(None);
     };
 
+    // A native credential refusal is independent of activity, and work claims cannot erase it.
+    let auth = connection.query_row(&canonical_sql(
+        "SELECT id, accepted_at_unix_ms, body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
+         AND +store_index<=?2 AND json_extract(body, '$.fields.incarnation_id')=?3
+         AND json_type(body, '$.fields.provider_auth') IN ('true','false')
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1"), params![subject, at_index, incarnation_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+        .optional()?;
+    if let Some((claim, time, body)) = auth {
+        let body: Value = serde_json::from_str(&body)?;
+        let fields = &body["fields"];
+        if fields["provider_auth"] == false {
+            return Ok(Some(crate::model::CurrentHarnessView {
+                state: "needs-login".into(),
+                driver: fields["driver"].as_str().map(str::to_owned),
+                incarnation_id: incarnation_id.into(),
+                transport: fields["transport"].as_str().map(str::to_owned),
+                reason: Some("providerAuth".into()),
+                blocked_on: Some("human".into()),
+                ask: None,
+                input_buffer: None,
+                exit: None,
+                claim,
+                observed_at_unix_ms: time.parse()?,
+            }));
+        }
+    }
+
     // A login prompt or a workspace trust prompt is positive evidence that the current Claude
     // incarnation cannot accept work. Neither has a hook edge, and channel initialization or work
     // activity can otherwise overwrite a one-off blocked observation. Fence the entire incarnation
@@ -18905,13 +19074,16 @@ fn current_harness_at(
         let (state, reason) = if code == "provider-trust-prompt" {
             ("blocked", "providerTrustPrompt")
         } else {
-            ("unauthenticated", "providerAuth")
+            ("needs-login", "providerAuth")
         };
         return Ok(Some(crate::model::CurrentHarnessView {
             state: state.into(),
-            driver: Some("claude".into()),
+            driver: runtime_fields
+                .get("driver")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             incarnation_id: incarnation_id.to_owned(),
-            transport: Some("claude-channel".into()),
+            transport: None,
             reason: Some(reason.into()),
             blocked_on: Some("human".into()),
             ask: None,
@@ -19049,9 +19221,12 @@ fn current_harness_at(
             observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
         }));
     }
-    let Some((state, claim, observed_at_unix_ms, _)) = current else {
+    let Some((mut state, claim, observed_at_unix_ms, _)) = current else {
         return Ok(None);
     };
+    if optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
+        state = "needs-login".into();
+    }
     Ok(Some(crate::model::CurrentHarnessView {
         state,
         driver: optional.remove("driver").flatten(),
@@ -46161,7 +46336,7 @@ message "human-attention" {
             ]),
         );
         let blocked = store.current_harness(subject).unwrap().unwrap();
-        assert_eq!(blocked.state, "unauthenticated");
+        assert_eq!(blocked.state, "needs-login");
         assert_eq!(blocked.reason.as_deref(), Some("providerAuth"));
         assert!(!blocked.is_ready());
         append(

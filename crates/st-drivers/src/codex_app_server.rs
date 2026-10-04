@@ -460,7 +460,14 @@ impl CodexObservedState {
                 reason: CodexTerminalError::ProviderCapacity,
             } => Some(observation(Activity::Idle, BlockedOn::None).with_reason("providerCapacity")),
             CodexObservedState::TerminalError { reason } => Some(
-                observation(Activity::Ended, BlockedOn::None).with_reason(match reason {
+                {
+                    let mut o = observation(Activity::Ended, BlockedOn::None);
+                    if *reason == CodexTerminalError::ProviderAuthRejected {
+                        o.provider_auth = Some(false);
+                    }
+                    o
+                }
+                .with_reason(match reason {
                     CodexTerminalError::SystemError => "systemError",
                     CodexTerminalError::ProviderAuthRejected => "providerAuth",
                     CodexTerminalError::ProviderCapacity => unreachable!(),
@@ -728,6 +735,7 @@ struct CodexInboxDelivery {
     diagnostics: driver_diagnostic::Publisher,
     /// Failure reported for the turn, retained until observed recovery.
     turn_error: Option<CodexTurnError>,
+    provider_auth_edge: Option<bool>,
     safe_fallback_active: Arc<AtomicBool>,
     safe_fallback_diagnostic_published: bool,
 }
@@ -882,6 +890,7 @@ impl CodexInboxDelivery {
             account_read: AccountRead::Due,
             diagnostics,
             turn_error: None,
+            provider_auth_edge: None,
             safe_fallback_active,
             safe_fallback_diagnostic_published,
         })
@@ -945,7 +954,13 @@ impl CodexInboxDelivery {
     /// contradiction of the latest observation.
     fn observe_harness(&mut self, observed: &CodexObservedState) {
         match observed.harness_observation() {
-            Some(observation) => self.publish_observation(self.name_turn_error(observation)),
+            Some(mut observation) => {
+                if let Some(accepted) = self.provider_auth_edge.take() {
+                    observation.provider_auth = Some(accepted);
+                    self.harness_writer.interrupt();
+                }
+                self.publish_observation(self.name_turn_error(observation));
+            }
             None => {
                 // Evidence lost: stop heartbeating, drop anything pending (it predates the gap),
                 // and mark the stream discontinuous so a state restated after the gap opens a
@@ -1085,7 +1100,13 @@ impl CodexInboxDelivery {
         {
             return;
         }
-        match codex_turn_outcome(message.pointer("/params/turn")) {
+        let outcome = codex_turn_outcome(message.pointer("/params/turn"));
+        self.provider_auth_edge = match outcome {
+            CodexTurnOutcome::ProviderAuthRejected => Some(false),
+            CodexTurnOutcome::Accepted => Some(true),
+            _ => None,
+        };
+        match outcome {
             CodexTurnOutcome::ProviderAuthRejected => self.diagnostics.publish(
                 driver_diagnostic::Stage::ProviderAuth,
                 driver_diagnostic::Reason::ProviderAuthRejected,
@@ -2265,6 +2286,16 @@ impl CodexControlState {
                 reason: CodexTerminalError::ProviderCapacity,
             };
             return;
+        }
+        if outcome == CodexTurnOutcome::Accepted
+            && matches!(
+                self.observed,
+                CodexObservedState::TerminalError {
+                    reason: CodexTerminalError::ProviderAuthRejected
+                }
+            )
+        {
+            self.observed = CodexObservedState::Idle;
         }
         self.observed = match &self.observed {
             CodexObservedState::Idle => CodexObservedState::Idle,
@@ -4966,7 +4997,11 @@ fn pump_control(
                     delivery.observe_harness(&state.observed);
                 }
                 let _ = events.send(ControlEvent::Observed);
-            } else if turn_error_changed {
+            } else if turn_error_changed
+                || delivery
+                    .as_ref()
+                    .is_some_and(|d| d.provider_auth_edge.is_some())
+            {
                 // The delivery-relevant state is unchanged and the reason is not. That is the
                 // exact shape of the overnight stall: Codex kept reporting a live turn while the
                 // provider refused every attempt, so nothing here changed and nothing was
