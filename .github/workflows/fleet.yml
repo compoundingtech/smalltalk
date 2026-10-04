@@ -1,6 +1,11 @@
 name: ci1 runtime smoke
 on:
   workflow_dispatch:
+    inputs:
+      phase:
+        type: choice
+        options: [first, second]
+        default: first
 permissions:
   contents: read
 jobs:
@@ -13,6 +18,18 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+      - name: Verify isolated persistent tool cache
+        env:
+          PHASE: ${{ inputs.phase }}
+        run: |
+          test "$(node --version)" = v24.18.0
+          test "$RUNNER_TOOL_CACHE" = /run/ci-cache/tools
+          marker="$RUNNER_TOOL_CACHE/ci1-toolcache-proof-$RUNNER_NAME"
+          if [ "$PHASE" = second ]; then test -f "$marker"; fi
+          printf '%s\n' "$RUNNER_NAME" > "$marker"
       - name: Prepare digest fixture
         run: printf 'runtime regression\n' > ci1-lock.json
       - name: Evaluate real Actions hashFiles expressions
