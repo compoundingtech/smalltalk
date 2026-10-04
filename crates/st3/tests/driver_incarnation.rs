@@ -73,7 +73,10 @@ async fn provider_incarnation(
     let home = root.path().to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
         let mut command = st3::test_support::command(env!("CARGO_BIN_EXE_st3-fixture"));
-        command.env_clear().env("HOME", home);
+        command
+            .env_clear()
+            .env("PTY_ROOT", home.join("pty"))
+            .env("HOME", home);
         if let Some(incarnation) = inherited {
             command.env("ST3_INCARNATION", incarnation);
         }

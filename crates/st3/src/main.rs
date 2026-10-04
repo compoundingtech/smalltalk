@@ -3973,8 +3973,14 @@ fn driver_environment_incarnation(cli: &Cli) -> Result<Option<String>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    // Exec seats share the daemon's environment but do not have a PTY entry.
+    let use_local_pty_registry = args.driver != "exec" && has_local_pty_registry();
     runtime
-        .block_on(wait_for_agent_incarnation(&Client::new(endpoint), subject))
+        .block_on(wait_for_agent_incarnation_from(
+            &Client::new(endpoint),
+            subject,
+            use_local_pty_registry,
+        ))
         .map(Some)
 }
 
@@ -13760,17 +13766,27 @@ fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
     Ok(pty_observation_incarnation(actor, &observations))
 }
 
+fn has_local_pty_registry() -> bool {
+    std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty())
+}
+
 async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<String> {
+    wait_for_agent_incarnation_from(client, actor, has_local_pty_registry()).await
+}
+
+async fn wait_for_agent_incarnation_from(
+    client: &Client,
+    actor: &str,
+    use_local_pty_registry: bool,
+) -> Result<String> {
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut outage_logged = false;
-    let has_local_pty_registry =
-        std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty());
     loop {
         // A restarted provider process can begin before the reconciler has projected its new PTY
         // observation. Reading the graph immediately would then bind this new driver to the old
         // incarnation forever. The local registry already contains the process executing us and
         // is the exact source from which the reconciler will derive the graph incarnation.
-        if has_local_pty_registry {
+        if use_local_pty_registry {
             if let Some(incarnation) = current_local_pty_incarnation(actor)? {
                 return Ok(incarnation);
             }
