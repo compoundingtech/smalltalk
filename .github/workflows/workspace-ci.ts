@@ -39,7 +39,7 @@ export const pickRunnerJob = {
   // GitHub-hosted, so the choice never waits for either pool it chooses between.
   'runs-on': 'ubuntu-latest',
   'timeout-minutes': 3,
-  permissions: {},
+  permissions: { 'pull-requests': 'read' },
   outputs: { ci1: '${{ steps.pick.outputs.ci1 }}' },
   steps: [
     {
@@ -52,6 +52,8 @@ export const pickRunnerJob = {
         REPOSITORY: '${{ github.repository }}',
         HEAD_REPOSITORY: '${{ github.event.pull_request.head.repo.full_name }}',
         PR_LABELS: '${{ toJSON(github.event.pull_request.labels.*.name) }}',
+        QUEUE_REF: '${{ github.event.merge_group.head_ref }}',
+        GH_REPO_TOKEN: '${{ github.token }}',
         OWNER: '${{ github.repository_owner }}',
         NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1MinIdle}' }}`,
       },
@@ -70,9 +72,17 @@ if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_
   exit 0
 fi
 if [ "$EVENT" = merge_group ]; then
-  printf 'ci1=["ci1-merge"]\\n' >> "$GITHUB_OUTPUT"
-  echo "merge queue: reserved ci1-merge runners"
-  printf 'Runner: **ci1** (ci1-merge, reserved merge-queue capacity)\\n' >> "$GITHUB_STEP_SUMMARY"
+  label=ci1-merge
+  # A queue entry for an urgent PR uses the priority pool too, including when its PR checks passed.
+  if [ -n "$GH_REPO_TOKEN" ] && [[ "$QUEUE_REF" =~ ^refs/heads/gh-readonly-queue/main/pr-([0-9]+)-[0-9a-f]{40}$ ]]; then
+    queue_pr=\${BASH_REMATCH[1]}
+    if labels=$(GH_TOKEN="$GH_REPO_TOKEN" timeout 20s gh api "repos/$REPOSITORY/pulls/$queue_pr" --jq '.labels | map(.name)' 2>/dev/null) && jq -e 'index("ci-priority") != null' <<< "$labels" >/dev/null 2>&1; then
+      label=ci1-priority
+    fi
+  fi
+  printf 'ci1=["%s"]\\n' "$label" >> "$GITHUB_OUTPUT"
+  echo "merge queue: reserved $label runners"
+  printf 'Runner: **ci1** (%s, reserved merge-queue capacity)\\n' "$label" >> "$GITHUB_STEP_SUMMARY"
   exit 0
 fi
 label=ci1

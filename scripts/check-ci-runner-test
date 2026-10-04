@@ -41,6 +41,8 @@ def check(name, pages, expected=None, api=True, **overrides):
             "HEAD_REPOSITORY": "example/project",
             "OWNER": "example",
             "PR_LABELS": "[]",
+            "QUEUE_REF": "",
+            "GH_REPO_TOKEN": "",
             "NEED": "1",
             "GITHUB_OUTPUT": str(output),
             "GITHUB_STEP_SUMMARY": str(summary),
@@ -81,3 +83,8 @@ check("priority PR needs no status token", [], "ci1-priority", PR_LABELS='["ci-p
 check("priority cannot bypass the fork boundary", idle, PR_LABELS='["ci-priority"]', HEAD_REPOSITORY="fork/project", api=False)
 check("unrelated labels preserve normal routing", idle, "ci1", PR_LABELS='["area:ci"]')
 check("malformed labels preserve normal routing", idle, "ci1", PR_LABELS='invalid')
+
+check("priority merge group uses the urgent pool", [], "ci1-priority", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_RESPONSE='["ci-priority"]')
+check("ordinary merge group retains reserved merge capacity", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_RESPONSE='["area:ci"]')
+check("merge-label API failure retains reserved capacity", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_EXIT="1")
+check("malformed queue ref never requests a PR", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/unrelated", api=False)

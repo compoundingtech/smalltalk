@@ -274,7 +274,9 @@ through the API and picks one pool for the whole run:
 - `ci1-priority` for trusted PRs labelled `ci-priority`, without an idle-count or token dependency.
   Pending urgent checks get the next free general runners; one slot stays reserved for priority
   and merge work after urgent checks finish;
-- `ci1-merge` for every merge-group run while ci1 is enabled. These jobs wait for their reserved
+- `ci1-priority` for a merge-group entry whose PR is labelled `ci-priority`, including after its
+  PR checks passed. A read-only PR-label lookup identifies the entry from its queue ref;
+- `ci1-merge` for other merge-group runs while ci1 is enabled. These jobs wait for their reserved
   pool even when its runners are currently busy, and do not query the status API;
 - Namespace otherwise, exactly as above: when ci1 is busy or offline, when the runner list is
   unavailable, and always for a pull request from a fork. The repository is public and a self-hosted
@@ -297,7 +299,7 @@ The switch is the repository variable `CI1_RUNNERS`: unset (the default), `pick-
 and every run goes to Namespace with no extra job. `on` turns the choice on, and unsetting it turns
 it off again without a pull request. `pick-runner` reads the runners with the
 `CI1_RUNNERS_READ_TOKEN` secret, a token that may only read the organization's self-hosted runners;
-without it non-queue runs go to Namespace. Merge-group runs need no status token.
+without it non-queue runs go to Namespace. Merge-group runs need no organization status token; a failed PR-label lookup retains merge capacity.
 
 On ci1 each runner is ephemeral: it takes one job, runs it as its own user in a fresh work directory
 with its own `/tmp`, and nothing the job started outlives it. The runner names a Cargo home in
