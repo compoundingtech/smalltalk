@@ -12,6 +12,15 @@ use std::path::{Path, PathBuf};
 
 const MAX_BYTES: usize = 1_048_576;
 
+// Leave room for duplicated URI/fence metadata and the client snapshot envelope.
+fn fits_client_response(markdown: &str) -> bool {
+    markdown.len() <= MAX_BYTES && markdown.bytes().map(|byte| match byte {
+        b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
+        0..=31 => 6,
+        _ => 1,
+    }).sum::<usize>() <= MAX_BYTES - 16_384
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Authority {
     pub person: Option<String>,
@@ -120,6 +129,9 @@ impl Authority {
         let snapshot = fs::read_carrier(&resolved.directory, MAX_BYTES).map_err(io)?;
         let fence = NotesFence { carrier_generation: resolved.generation, revision: snapshot.revision };
         let markdown = String::from_utf8(snapshot.bytes.unwrap_or_default()).map_err(|_| refusal("validation-failed", "notes carrier must be UTF-8"))?;
+        if !fits_client_response(&markdown) {
+            return Err(refusal("validation-failed", "notes exceed the encoded client response limit"));
+        }
         Ok(Notes { uri: uri.to_string(), markdown, fence })
     }
     pub fn bind_source(&self, node: &str, state_dir: &Path, uri: &str, agent: &str, incarnation: &str) -> Result<String, St3Error> {
@@ -127,7 +139,8 @@ impl Authority {
         let resolved = self.resolve(node, &uri)?;
         let _lock = fs::local_lock(&state_dir.join("private-notes.lock")).map_err(io)?;
         ledger(state_dir)?.execute("INSERT INTO notes_sources(uri, agent, incarnation, generation) VALUES(?1,?2,?3,?4)
-            ON CONFLICT(uri) DO UPDATE SET agent=excluded.agent, incarnation=excluded.incarnation, generation=excluded.generation",
+            ON CONFLICT(uri) DO UPDATE SET agent=excluded.agent, incarnation=excluded.incarnation, generation=excluded.generation
+            WHERE notes_sources.agent<>excluded.agent OR notes_sources.incarnation<>excluded.incarnation OR notes_sources.generation<>excluded.generation",
             params![uri.as_str(), agent, incarnation, resolved.generation]).map_err(database_error)?;
         Ok(resolved.generation)
     }
@@ -145,7 +158,7 @@ impl Authority {
 
 
     pub fn write(&self, node: &str, state_dir: &Path, actor: &str, key: &str, write: &NotesWrite) -> Result<serde_json::Value, St3Error> {
-        if write.markdown.len() > MAX_BYTES { return Err(refusal("validation-failed", "notes exceed the client payload limit")); }
+        if !fits_client_response(&write.markdown) { return Err(refusal("validation-failed", "notes exceed the encoded client response limit")); }
         let uri = PrivateNotesUri::parse(&write.uri).map_err(|error| refusal("validation-failed", &error.message))?;
         // A cross-process owner-local lock coordinates both ledger transitions and all supported writers.
         let _lock = fs::local_lock(&state_dir.join("private-notes.lock")).map_err(io)?;
@@ -203,7 +216,9 @@ impl Authority {
                 params![operation, write.uri, request_digest, resolved.generation, current]).map_err(database_error)?;
             replace()?;
         }
-        let result = serde_json::json!({"kind":"action-result", "operation_id":format!("operation/private-notes-{}", &operation[..24]), "status":"completed", "affected_ids":[write.uri]});
+        let successor = fs::read_carrier(&resolved.directory, MAX_BYTES).map_err(io)?;
+        let fence = NotesFence { carrier_generation: resolved.generation, revision: successor.revision };
+        let result = serde_json::json!({"kind":"action-result", "operation_id":format!("operation/private-notes-{}", &operation[..24]), "status":"completed", "affected_ids":[], "private_notes":fence});
         connection.execute("UPDATE notes_operations SET result=?1 WHERE operation=?2", params![result.to_string(), operation]).map_err(database_error)?;
         Ok(result)
     }

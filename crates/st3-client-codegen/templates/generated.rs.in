@@ -66,6 +66,9 @@ pub enum ErrorCode {
     BlobQuotaExceeded,
     BlobNotFound,
     BlobExpired,
+    PrivateNotesCarrierConflict,
+    PrivateNotesUnreachable,
+    PrivateNotesIndeterminate,
     Internal,
     #[serde(other)]
     Unknown,
@@ -2499,6 +2502,8 @@ pub struct ActionResult {
     pub snapshot_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_attachment: Option<TerminalAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_notes: Option<PrivateNotesFence>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

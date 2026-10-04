@@ -68,3 +68,48 @@ fn symlink_and_shared_write_permission_never_supply_or_replace_private_bytes() {
     assert_eq!(fixture.authority.read("node", &fixture.uri).unwrap_err().code, "forbidden");
     assert_eq!(fixture.authority.read("other-node", &fixture.uri).unwrap_err().code, "forbidden");
 }
+
+#[test]
+fn simultaneous_editors_have_one_winner_and_the_loser_cannot_replace_it() {
+    let fixture = Fixture::new();
+    let initial = fixture.authority.read("node", &fixture.uri).unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let outcomes = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            barrier.wait();
+            fixture.write("editor-one", &NotesWrite { uri: fixture.uri.clone(), markdown: "one\n".into(), fence: initial.fence.clone() })
+        });
+        let second = scope.spawn(|| {
+            barrier.wait();
+            fixture.write("editor-two", &NotesWrite { uri: fixture.uri.clone(), markdown: "two\n".into(), fence: initial.fence.clone() })
+        });
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+    match (&outcomes[0], &outcomes[1]) {
+        (Ok(receipt), Err(error)) => {
+            assert_eq!(error.code, "stale-fence");
+            assert_eq!(fs::read_to_string(fixture.carrier()).unwrap(), "one\n");
+            assert_eq!(receipt["private_notes"]["revision"], fixture.authority.read("node", &fixture.uri).unwrap().fence.revision);
+        }
+        (Err(error), Ok(receipt)) => {
+            assert_eq!(error.code, "stale-fence");
+            assert_eq!(fs::read_to_string(fixture.carrier()).unwrap(), "two\n");
+            assert_eq!(receipt["private_notes"]["revision"], fixture.authority.read("node", &fixture.uri).unwrap().fence.revision);
+        }
+        other => panic!("exactly one editor must complete: {other:?}"),
+    }
+    assert_eq!(fs::metadata(fixture.carrier()).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn encoded_response_limit_refuses_unreadable_writes_without_changing_the_carrier() {
+    let fixture = Fixture::new();
+    let empty = fixture.authority.read("node", &fixture.uri).unwrap();
+    let allowed = NotesWrite { uri: fixture.uri.clone(), markdown: "\n".repeat((1_048_576 - 16_384) / 2), fence: empty.fence };
+    fixture.write("at-boundary", &allowed).unwrap();
+    let current = fixture.authority.read("node", &fixture.uri).unwrap();
+    assert_eq!(current.markdown, allowed.markdown);
+    let oversized = NotesWrite { markdown: format!("{}\n", allowed.markdown), fence: current.fence, ..allowed };
+    assert_eq!(fixture.write("over-boundary", &oversized).unwrap_err().code, "validation-failed");
+    assert_eq!(fs::read_to_string(fixture.carrier()).unwrap(), oversized.markdown[..oversized.markdown.len() - 1]);
+}
