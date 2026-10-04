@@ -127,10 +127,9 @@ fn resource(subject: &str, owner: &str, revision: &str, time: u128, heads: &BTre
     let mut folders = serde_json::Map::new();
     let mut placements = serde_json::Map::new();
     for (key,head) in heads {
-        if let Some(id) = key.strip_prefix("folder/").and_then(|tail| tail.strip_suffix("/name")) {
-            if let Some(position) = heads.get(&format!("folder/{id}/position")) {
-                folders.insert(id.into(),json!({"name":register(head),"position":register(position),"tombstone":heads.get(&format!("folder/{id}/tombstone")).map(register)}));
-            }
+        if let Some(id) = key.strip_prefix("folder/").and_then(|tail| tail.strip_suffix("/name"))
+            && let Some(position) = heads.get(&format!("folder/{id}/position")) {
+            folders.insert(id.into(),json!({"name":register(head),"position":register(position),"tombstone":heads.get(&format!("folder/{id}/tombstone")).map(register)}));
         }
         if let Some(subject) = key.strip_prefix("placement/") { placements.insert(subject.into(),register(head)); }
     }

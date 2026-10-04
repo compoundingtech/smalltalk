@@ -108,6 +108,8 @@ enum Touched<'a> {
     Retired,
 }
 
+type OperationRegisters<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>, [Option<Touched<'a>>; 2]);
+
 pub fn operations(subject: &str, fields: &BTreeMap<String, Value>) -> Result<Vec<Operation>, ValidationError> {
     if fields.get("owner").and_then(Value::as_str) != Some(owner(subject)?) {
         return Err(error("arrangement-owner-forbidden", "owner must match the immutable person in the arrangement subject"));
@@ -137,7 +139,7 @@ pub fn operations(subject: &str, fields: &BTreeMap<String, Value>) -> Result<Vec
     }
     let mut touched = BTreeSet::new();
     for op in &operations {
-        let (id, name, target, key, registers): (Option<&str>, Option<&str>, Option<&str>, Option<&str>, [Option<Touched<'_>>; 2]) = match op {
+        let (id, name, target, key, registers): OperationRegisters<'_> = match op {
             Operation::Create { name } | Operation::Rename { name } => (None, Some(name), None, None, [Some(Touched::Name), None]),
             Operation::FolderCreate { id, name, parent, key } => (Some(id), Some(name), parent.as_deref(), Some(key), [Some(Touched::FolderName(id)), Some(Touched::FolderPosition(id))]),
             Operation::FolderRename { id, name } => (Some(id), Some(name), None, None, [Some(Touched::FolderName(id)), None]),
