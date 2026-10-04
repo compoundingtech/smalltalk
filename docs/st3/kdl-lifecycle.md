@@ -295,6 +295,8 @@ immediate declarations, including an explicit declaration of the same URI target
 Run materialization preserves the complete authored resource metadata: names, reasons, and
 explicit subject targets are not run-local aliases. For example, `worker` and `agent/worker`
 remain distinct resource names even when the mission declares a local agent named `worker`.
+An assigned step-local agent's URI targets are published with its declaration before member
+startup; this early phase does not publish other agents' targets or unrelated execution state.
 
 To inspect incoming edges, run `st subject show RESOURCE --references` (add the global
 `--json` flag for JSON), or request `GET /v1/resource-references/{subject}`. Each incoming
