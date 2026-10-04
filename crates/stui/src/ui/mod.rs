@@ -297,7 +297,7 @@ pub struct Ui {
     /// What the Usage tab groups by, and over how many hours.
     usage_by: usage::By,
     pub(crate) usage_hours: u64,
-    /// Simplified conversations here (Shift+O): this device's choice, kept in prefs.json.
+    /// Simplified conversations here (Ctrl+P; the default): this device's choice, kept in prefs.json.
     pub(crate) simple: bool,
     /// An attached terminal shown in place of the conversation.
     pub(crate) terminal: Option<TerminalView>,
@@ -480,7 +480,9 @@ impl Ui {
     /// This device's remembered choices, read once when stui starts.
     pub(crate) fn load_prefs(&mut self) {
         if let Some(path) = prefs::path() {
-            self.simple = prefs::load(&path).simple == Some(true);
+            // Simplified is the default, as on the phone (Nathan, 2026-10-04); a device that
+            // chose the full view keeps it.
+            self.simple = simplified(&prefs::load(&path));
         }
     }
 
@@ -507,9 +509,9 @@ impl Ui {
             );
         }
         self.flash(if self.simple {
-            "Simplified conversations · Shift+O for the full view"
+            "Simplified: each tool call is one line, a run of them one line · ctrl+p for everything"
         } else {
-            "Full conversations · Shift+O to simplify"
+            "Full: every tool call with its output · ctrl+p to simplify"
         });
     }
 
@@ -2658,7 +2660,7 @@ impl Ui {
                 ("ctrl+e", "expand or collapse tool output"),
                 (
                     "ctrl+p",
-                    "simplified view: tool calls fold to a line (this device)",
+                    "simplified (the default: a tool call is one line, a run of them one) or full (every call and its output); this device",
                 ),
                 (
                     "ctrl+d",
@@ -4817,6 +4819,11 @@ fn scrollbar(buf: &mut Buffer, area: Rect, top: usize, total: usize) {
     }
 }
 
+/// Whether conversations are simplified on this device: yes unless it chose the full view.
+fn simplified(prefs: &prefs::Prefs) -> bool {
+    prefs.simple != Some(false)
+}
+
 /// Copy through OSC 52, which kitty, iTerm2, WezTerm and tmux (with set-clipboard) accept.
 fn copy(text: &str) {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -5827,6 +5834,13 @@ mod tests {
                 .join("\n")
                 .contains("a reply arrives below")
         );
+    }
+
+    #[test]
+    fn conversations_are_simplified_unless_this_device_chose_the_full_view() {
+        assert!(simplified(&prefs::Prefs::default()));
+        assert!(simplified(&prefs::Prefs { simple: Some(true) }));
+        assert!(!simplified(&prefs::Prefs { simple: Some(false) }));
     }
 
     #[test]
