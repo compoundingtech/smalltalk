@@ -48,6 +48,7 @@ const linuxStageJob = ({
   setup,
   description,
   env = {},
+  before = [],
   extraLogs = '',
 }: {
   name: string
@@ -55,6 +56,7 @@ const linuxStageJob = ({
   setup: readonly unknown[]
   description?: string
   env?: Record<string, string>
+  before?: readonly unknown[]
   extraLogs?: string
 }) => ({
   name,
@@ -69,6 +71,7 @@ const linuxStageJob = ({
       name: 'Summarize tested revision',
       run: `printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' "$(git rev-parse HEAD)" "$(nproc)" "$(free -h | awk '/^Mem:/ {print $2 " memory"}')" >> "$GITHUB_STEP_SUMMARY"`,
     },
+    ...before,
     nixDevelopStep({ name: description ?? 'Run nextest', command: ['bash', 'scripts/ci-linux', stage] }),
     {
       name: 'Save Nix outputs to the local Nix cache',
@@ -219,7 +222,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
     },
     // The Linux gate runs as three jobs on separate runners, each with its own caches.
     // `linux-gate` below is the single required check that collects them.
-    'linux-tests': linuxStageJob({
+    'linux-tests': { ...linuxStageJob({
       name: 'linux-tests',
       stage: 'tests',
       setup: workspacePreparationSteps,
@@ -227,7 +230,11 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       // boot canary's evidence under target/boot-canaries.
       env: { CI_RUN_ID: '${{ github.run_id }}' },
       extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
-    }),
+      before: [{
+        ...nixDevelopStep({ name: 'Require every harness to hold old mail across boot and reconnect', command: ['python3', 'scripts/ci-mail-redelivery-canaries'] }),
+        id: 'mail-redelivery-canaries',
+      }],
+    }), outputs: { mail_redelivery: '${{ steps.mail-redelivery-canaries.outcome }}' } },
     'linux-clippy': linuxStageJob({
       name: 'linux-clippy',
       stage: 'clippy',
@@ -242,9 +249,21 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       setup: commonSetupSteps,
       description: 'Run fleet compatibility against the pinned older st3',
     }),
+    'mail-redelivery-canaries': {
+      name: 'mail-redelivery-canaries',
+      needs: ['linux-tests'],
+      if: 'always()',
+      'runs-on': 'ubuntu-latest',
+      'timeout-minutes': 3,
+      steps: [{
+        name: 'Require the explicit zero-redelivery canaries to pass',
+        env: { RESULT: '${{ needs.linux-tests.outputs.mail_redelivery }}' },
+        run: '[ "$RESULT" = success ]',
+      }],
+    },
     'linux-gate': {
       name: 'linux-gate',
-      needs: [pickRunnerJobId, 'linux-tests', 'linux-clippy', 'linux-fleet-compat'],
+      needs: [pickRunnerJobId, 'linux-tests', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries'],
       // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
       if: 'always()',
       // Aggregation needs no build caches and must not queue behind the work it summarizes.
@@ -254,7 +273,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         {
           name: 'Require every Linux stage to pass',
           // The stages only: pick-runner is skipped whenever ci1 is off.
-          env: { RESULTS: '${{ needs.linux-tests.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }}' },
+          env: { RESULTS: '${{ needs.linux-tests.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}' },
           run: `echo "stage results: $RESULTS"
 for result in $RESULTS; do
   [ "$result" = success ] || exit 1
