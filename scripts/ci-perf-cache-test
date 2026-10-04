@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 
 sys.dont_write_bytecode = True
 root = Path(__file__).resolve().parent.parent
@@ -72,6 +73,8 @@ with tempfile.TemporaryDirectory() as tmp:
     candidates = []
     previous = pr_run
     missing_previous_artifacts = False
+    overlap_probe = True
+    archive_downloads = threading.Barrier(2)
 
     def api(path):
         if '/pulls/1/commits?' in path:
@@ -93,6 +96,9 @@ with tempfile.TemporaryDirectory() as tmp:
         assert module.trusted(selected) or module.own_pr(selected, 1, repo, 'example-branch', commits)
         if name == 'perf-load-logs':
             assert module.trusted(selected), 'PR reports must never become baselines'
+        elif overlap_probe:
+            # Both archives must be in flight before either can finish downloading.
+            archive_downloads.wait(timeout=5)
         downloads.append((selected['id'], name))
         dest.mkdir(parents=True)
         if name == 'perf-load-logs':
@@ -107,6 +113,7 @@ with tempfile.TemporaryDirectory() as tmp:
     module.unpack = unpack
     with contextlib.redirect_stdout(io.StringIO()):
         module.restore()
+    overlap_probe = False
     assert len(downloads) == 7  # two snapshots, five newest real reports
     assert sorted(p.name for p in (temp / 'perf-baseline').iterdir()) == [f'load-{i}.json' for i in range(4, 9)]
     assert (work / 'target/cached').read_text() == 'snapshot'
@@ -116,7 +123,7 @@ with tempfile.TemporaryDirectory() as tmp:
     downloads.clear()
     with contextlib.redirect_stdout(io.StringIO()):
         module.restore()
-    assert downloads[:2] == [(10, 'build-recipe'), (10, 'stores-recipe')]
+    assert set(downloads[:2]) == {(10, 'build-recipe'), (10, 'stores-recipe')}
     assert downloads[2:] == [(i, 'perf-load-logs') for i in range(8, 3, -1)]
     # GitHub can expose the successful attempt while hiding all of its artifacts on rerun.
     # That must restore main's snapshots and actual main reports, rather than become cold.
@@ -124,7 +131,7 @@ with tempfile.TemporaryDirectory() as tmp:
     downloads.clear()
     with contextlib.redirect_stdout(io.StringIO()):
         module.restore()
-    assert downloads[:2] == [(8, 'build-recipe'), (8, 'stores-recipe')]
+    assert set(downloads[:2]) == {(8, 'build-recipe'), (8, 'stores-recipe')}
     assert downloads[2:] == [(i, 'perf-load-logs') for i in range(8, 3, -1)]
     missing_previous_artifacts = False
     # Main must not promote PR snapshots, even when a same-PR cache exists.

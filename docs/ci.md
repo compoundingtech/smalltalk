@@ -364,7 +364,10 @@ baseline. A rerun checks the previous successful attempt explicitly, since the c
 in progress, but GitHub may no longer expose that attempt's artifacts. If they are unavailable,
 restore another successful run of the same PR or main's snapshots. Main snapshots are the durable
 fallback; retrying the only PR seed before main has published can still be cold.
+Prefer `gh run rerun RUN_ID --job JOB_ID` for retrying only Performance (use the API job ID).
+The measured targeted retry retained its preceding artifacts; the full workflow retry did not.
 Cargo and sccache validate source changes, preserving each build's real source identity.
+Build and store archives download and extract concurrently; the log records each one's timing.
 PR snapshots also remain for seven days, outside the shared dependency-cache pool.
 The compiler-cache server stays alive during cold store generation; publication does not require
 stopping it after the workload has finished writing compiler outputs.

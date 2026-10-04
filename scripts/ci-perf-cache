@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 
 def api(path):
@@ -72,21 +74,34 @@ def restore():
     found = set()
     reports = 0
     def snapshots(run, names, dest, origin):
-        for kind, name in wanted.items():
-            if kind in found or name not in names:
-                continue
-            download(repo, run, name, dest / kind)
+        def fetch(kind, name):
+            start = time.monotonic()
+            directory = dest / kind
+            download(repo, run, name, directory)
+            downloaded = time.monotonic()
             roots = ('target', 'cargo-home', 'perf-sccache', 'st-ci-cache') if kind == 'build' else ('st-bench',)
-            unpack(dest / kind / f'{kind}.tar.zst', dest, roots)
+            extracted = directory / 'extracted'
+            extracted.mkdir()
+            unpack(directory / f'{kind}.tar.zst', extracted, roots)
             for root in roots:
-                source = dest / root
-                if not source.is_dir():
+                if not (extracted / root).is_dir():
                     raise ValueError(f'incomplete {kind} snapshot: missing {root}')
-                target = (work if root == 'target' else temp) / root
-                shutil.rmtree(target, ignore_errors=True)
-                shutil.move(source, target)
-            found.add(kind)
-            print(f"Performance {kind} cache HIT: {origin} run {run['id']}", flush=True)
+            return extracted, roots, downloaded - start, time.monotonic() - downloaded
+
+        # Download and extract the independent archives together. Keep installation and HIT
+        # reporting on this thread, after validating every required root of that snapshot.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pending = [(kind, pool.submit(fetch, kind, name)) for kind, name in wanted.items()
+                       if kind not in found and name in names]
+            for kind, future in pending:
+                extracted, roots, downloaded, unpacked = future.result()
+                for root in roots:
+                    target = (work if root == 'target' else temp) / root
+                    shutil.rmtree(target, ignore_errors=True)
+                    shutil.move(extracted / root, target)
+                found.add(kind)
+                print(f"Performance {kind} cache HIT: {origin} run {run['id']} "
+                      f"(download {downloaded:.1f}s, extract {unpacked:.1f}s)", flush=True)
 
     def artifact_names(run):
         artifacts = api(f"repos/{repo}/actions/runs/{run['id']}/artifacts?per_page=100")
