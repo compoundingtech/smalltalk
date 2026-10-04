@@ -2,6 +2,8 @@
 
 Your machines can share one fleet: each daemon keeps a local replica of the graph and catches up when it reconnects. This connects **your own machines**; each person currently runs their own fleet.
 
+If either machine has a populated v0.3.4 store, preserve its raw state and keys and follow the [founder signing audit](st3/founder-signing-audit.md) before installation, doctor, restart, or fleet creation/join. The v0.3.4 rehearsal found [unsigned grants](https://github.com/compoundingtech/smalltalk/issues/1228) after standalone restart. v0.3.5's source contains the prevention fix; upgrading cannot repair already-sealed unsigned history.
+
 Finish [getting started](getting-started.md) on the first machine. Install Small Talk, set `person = "person/ada"`, and start its user service on the second machine too. Harnesses and their logins are needed only on machines that will run seats.
 
 ## Join over SSH
@@ -63,7 +65,7 @@ st doctor
 
 The same declared worker and first mission should appear. `replication status` reports the last successful exchange, backlog, authority digest, graph digest, and table digests. After both members have caught up and writes settle, matching authority digests mean they hold the same replicated history. With matching builds and no waiting claims, matching graph and table digests also confirm the same shared projections. During an upgrade, a reader may hold claims that need a newer build; update it before comparing projections.
 
-The v0.3.4 fresh-machine rehearsal found [invalid claim-signature warnings](https://github.com/compoundingtech/smalltalk/issues/1228): a standalone restart can seal grants unsigned, and later fleet claims depend on them. If doctor reports that warning, retain the report and follow the issue; matching replication digests alone do not establish valid claim signatures.
+If doctor reports invalid claim-signature warnings, retain the report and follow the [operator guidance](st3/founder-signing-audit.md); matching replication digests alone do not establish valid claim signatures.
 
 To show that a write travels back from beacon, send a message **on beacon**:
 
