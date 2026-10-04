@@ -70,9 +70,9 @@ async fn selected_use_is_sequenced_out_of_band_and_server_text_becomes_eof() {
                 .unwrap();
             // Keep the server socket open until the client closes in response to text.
             // That makes EOF proof of the SDK boundary rather than server socket teardown.
-            while let Some(message) = websocket.next().await {
+            if let Some(message) = websocket.next().await {
                 match message {
-                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(Message::Close(_)) | Err(_) => {}
                     other => panic!("unexpected client message after lease error: {other:?}"),
                 }
             }
