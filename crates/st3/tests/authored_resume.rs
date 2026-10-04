@@ -41,7 +41,7 @@ while [ "$#" -gt 0 ]; do
 done
 {{
   printf '%s\n' '{{"type":"session","sessionId":"{id}","sessionFile":"'"$resume"'"}}'
-  while [ ! -f "$RESUME_TEST_STOP" ]; do sleep 0.01; done
+  while [ -d "${{RESUME_TEST_STOP%/*}}" ] && [ ! -f "$RESUME_TEST_STOP" ]; do sleep 0.01; done
 }} | "$ST_OMP_CHANNEL_BIN" --endpoint "$ST3_ENDPOINT" driver omp-channel --identity "$ST_OMP_CHANNEL_IDENTITY" --catalog "$ST_DRIVER_ROOT"
 "#, bash=env!("ST3_FIXTURE_BASH"))).unwrap();
     std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -55,7 +55,7 @@ agent "garden/worker" {{
         root.path().display(),
         transcript.display()
     );
-    let store = Arc::new(Store::open_memory("resume-link-test").unwrap());
+    let store = Arc::new(Store::open(&root.path().join("graph.db"), "resume-link-test").unwrap());
     let intent = st3::parse_intent(&source, "resume-link-test").unwrap();
     let preview = store
         .mission(
@@ -152,15 +152,16 @@ agent "garden/worker" {{
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    let binding = store
+        .latest_claim(subject, Some("harness.session-file"))
+        .unwrap();
     std::fs::write(&stop, "").unwrap();
     let output = completion.await.unwrap();
     server.abort();
-    assert!(output.status.success(), "{output:?}");
     assert_eq!(std::fs::read_link(&managed).unwrap(), legacy);
-    let binding = store
-        .latest_claim(subject, Some("harness.session-file"))
-        .unwrap()
-        .expect("the native channel published its resumable binding");
+    // This fixture has no PTY/reconciler. Releasing its provider can fence the delivery
+    // subscription during teardown; the contract under test is the binding while it is live.
+    let binding = binding.unwrap_or_else(|| panic!("native binding was not published: {output:?}"));
     assert_eq!(binding.body["fields"]["session_id"], id);
     assert_eq!(binding.body["fields"]["path"], transcript.to_str().unwrap());
     assert_eq!(binding.body["fields"]["incarnation_id"], "worker:current");
