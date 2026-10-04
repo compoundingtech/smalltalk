@@ -10,6 +10,56 @@ pub const API_VERSION: &str = "st3.client.v0";
 pub const ERROR_VERSION: &str = "st3.client.error.v0";
 pub const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputSessionEvent { Opened, Checkpoint, Closed, Interrupted }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputSessionCloseReason {
+    ClientClose, SocketDisconnected, Replaced, Gap, Rejected, Detached,
+    IncarnationChanged, Revoked, AuditUnavailable, OwnerRestarted,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalInputAuditRecord {
+    pub version: u32,
+    pub ordinal: u64,
+    pub event: InputSessionEvent,
+    pub session_id: String,
+    pub owner: String,
+    pub owner_epoch: String,
+    pub terminal: String,
+    pub incarnation: String,
+    pub attachment: String,
+    pub attachment_claim: String,
+    pub device_id: Option<String>,
+    pub device_actor: String,
+    pub authority_actor: String,
+    pub person: Option<String>,
+    pub pairing_claim: Option<String>,
+    pub opened_at_unix_ms: u64,
+    pub observed_at_unix_ms: u64,
+    pub successful_send_bytes: u64,
+    pub successful_batches: u64,
+    pub uncertain_handoff: bool,
+    pub reason: Option<InputSessionCloseReason>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalInputAuditHistory {
+    pub api_version: String,
+    pub kind: String,
+    pub terminal: String,
+    pub items: Vec<TerminalInputAuditRecord>,
+    pub retained_from: u64,
+    pub complete: bool,
+    pub next_cursor: Option<String>,
+    pub owner_coverage: Vec<String>,
+}
+
 /// Exactly one representation of a terminal input batch.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged, deny_unknown_fields)]
@@ -2744,4 +2794,48 @@ pub struct AgentRepository {
     pub path: String,
     pub workspaces: Vec<String>,
     pub agent_ids: Vec<String>,
+}
+
+#[cfg(test)]
+mod terminal_input_audit_tests {
+    use super::*;
+
+    #[test]
+    fn audit_history_decodes_latest_snapshot_and_preserves_nullable_metadata() {
+        let wire = serde_json::json!({
+            "api_version": API_VERSION, "kind": "terminal-input-audit",
+            "terminal": "terminal/shell", "retained_from": 100, "complete": false,
+            "next_cursor": null, "owner_coverage": ["node-a"],
+            "items": [{
+                "version": 1, "ordinal": 2, "event": "interrupted",
+                "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "owner": "node-a", "owner_epoch": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "terminal": "terminal/shell", "incarnation": "incarnation-a",
+                "attachment": "viewer/a", "attachment_claim": "claim/viewer-a",
+                "device_id": null, "device_actor": "agent/worker",
+                "authority_actor": "agent/worker", "person": null, "pairing_claim": null,
+                "opened_at_unix_ms": 100, "observed_at_unix_ms": 200,
+                "successful_send_bytes": 9, "successful_batches": 2,
+                "uncertain_handoff": true, "reason": "owner-restarted"
+            }]
+        });
+        let history: TerminalInputAuditHistory = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(history.items[0].event, InputSessionEvent::Interrupted);
+        assert_eq!(history.items[0].reason, Some(InputSessionCloseReason::OwnerRestarted));
+        assert_eq!(history.items[0].successful_send_bytes, 9);
+        assert_eq!(serde_json::to_value(history).unwrap(), wire);
+    }
+
+    #[test]
+    fn audit_response_rejects_unknown_fields_and_event_values() {
+        let wire = serde_json::json!({
+            "api_version": API_VERSION, "kind": "terminal-input-audit",
+            "terminal": "terminal/shell", "items": [], "retained_from": 100,
+            "complete": false, "next_cursor": null, "owner_coverage": [],
+            "raw_input": "must not be accepted"
+        });
+        assert!(serde_json::from_value::<TerminalInputAuditHistory>(wire).is_err());
+        assert!(serde_json::from_value::<InputSessionEvent>(serde_json::json!("replayed")).is_err());
+        assert!(serde_json::from_value::<InputSessionCloseReason>(serde_json::json!("consumed")).is_err());
+    }
 }

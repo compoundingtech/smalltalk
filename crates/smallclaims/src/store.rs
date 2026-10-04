@@ -1066,7 +1066,7 @@ pub fn claims_page_query(subject: bool, descending: bool) -> String {
     let order = if descending { "DESC" } else { "ASC" };
     format!(
         "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-         FROM claims WHERE subject NOT LIKE 'glass/%' AND {subject_filter}store_index>?1 AND (?2 IS NULL OR store_index<?2)
+         FROM claims WHERE subject NOT LIKE 'glass/%' AND subject NOT LIKE 'input-session/%' AND {subject_filter}store_index>?1 AND (?2 IS NULL OR store_index<?2)
          ORDER BY store_index {order} LIMIT ?4"
     )
 }
@@ -4588,7 +4588,10 @@ impl Store {
     pub fn expire_blob_uploads(&self, ttl_ms: u64) -> Result<usize> {
         let cutoff = (now_ms() as u64).saturating_sub(ttl_ms);
         let connection = self.connection.write();
-        Ok(connection.execute("DELETE FROM local_blob_uploads WHERE uploaded_ms<?1", [cutoff])?)
+        Ok(connection.execute(
+            "DELETE FROM local_blob_uploads WHERE uploaded_ms<?1",
+            [cutoff],
+        )?)
     }
 
     pub fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {
@@ -5548,7 +5551,10 @@ impl Store {
 
     /// Force an admission or deferral after the final index read, before clearing its state.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn project_replication_backlog_before_clear(&self, before_clear: impl FnMut()) -> Result<bool> {
+    pub fn project_replication_backlog_before_clear(
+        &self,
+        before_clear: impl FnMut(),
+    ) -> Result<bool> {
         self.project_replication_backlog_chunks(|| {}, before_clear)
     }
 

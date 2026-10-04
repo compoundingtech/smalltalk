@@ -400,6 +400,7 @@ export class St3Client {
     async conversationChanges(id: string, options: { after?: string; wait_ms?: number } = {}): Promise<EnvelopeOf<ConversationChanges>> { return this.get(`/v1/client/conversations/${encodeURIComponent(routedId(id))}/changes` + query(options)); }
     async eventsList(options: EventOptions = {}): Promise<EnvelopeOf<EventPage>> { return this.get('/v1/client/events' + query(options), 'events'); }
     async terminalScreen(id: string): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`); }
+    async terminalInputAuditGet(terminal: string, options: PageOptions = {}): Promise<EnvelopeOf<TerminalInputAuditHistory>> { return this.get('/v1/client/terminal-input-audit' + query({ terminal, ...options })); }
     async glassesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/glasses' + query(options)); }
     async glassesGet(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(routedId(id))}`); }
     async agentCreate(input: Omit<ActionOf<'agent.create'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.create' } as ActionOf<'agent.create'>); }

@@ -48,6 +48,33 @@ impl fmt::Display for PtySpawnTimeout {
 
 impl std::error::Error for PtySpawnTimeout {}
 
+/// Whether a refused raw input batch could have reached the PTY.
+#[derive(Debug)]
+pub enum PtySendError {
+    /// Runtime validation refused the batch before invoking the send transport.
+    Preflight(anyhow::Error),
+    /// The send transport failed; a partial Unix-socket write cannot be ruled out.
+    PossiblyDispatched(anyhow::Error),
+}
+
+impl fmt::Display for PtySendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preflight(error) | Self::PossiblyDispatched(error) => {
+                fmt::Display::fmt(error, formatter)
+            }
+        }
+    }
+}
+
+impl std::error::Error for PtySendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Preflight(error) | Self::PossiblyDispatched(error) => Some(error.as_ref()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Launch {
     Shell(String),
@@ -267,27 +294,28 @@ impl PtyRuntime {
                 .find(|observation| observation.name == id);
         }
         if let Some((predecessor, operation)) = cutover
-            && let Some(observed) = before.as_ref() {
+            && let Some(observed) = before.as_ref()
+        {
+            anyhow::ensure!(
+                observed.status != "unknown",
+                "rollout cannot spawn while the PTY identity is unknown"
+            );
+            if observation_is_live(observed) {
                 anyhow::ensure!(
-                    observed.status != "unknown",
-                    "rollout cannot spawn while the PTY identity is unknown"
+                    observed.tags.get("st3.rollout").map(String::as_str) == Some(operation)
+                        && observation_incarnation(observed)
+                            .as_deref()
+                            .is_some_and(|inc| inc != predecessor),
+                    "rollout cannot adopt another live PTY incarnation"
                 );
-                if observation_is_live(observed) {
-                    anyhow::ensure!(
-                        observed.tags.get("st3.rollout").map(String::as_str) == Some(operation)
-                            && observation_incarnation(observed)
-                                .as_deref()
-                                .is_some_and(|inc| inc != predecessor),
-                        "rollout cannot adopt another live PTY incarnation"
-                    );
-                } else {
-                    let same = observation_incarnation(observed).as_deref() == Some(predecessor)
-                        || (observed.pid.is_none()
-                            && predecessor.split_once(':').is_some_and(|(_, created)| {
-                                observed.created_at.as_deref() == Some(created)
-                            }));
-                    anyhow::ensure!(same, "rollout predecessor changed before spawn");
-                }
+            } else {
+                let same = observation_incarnation(observed).as_deref() == Some(predecessor)
+                    || (observed.pid.is_none()
+                        && predecessor.split_once(':').is_some_and(|(_, created)| {
+                            observed.created_at.as_deref() == Some(created)
+                        }));
+                anyhow::ensure!(same, "rollout predecessor changed before spawn");
+            }
         }
         if before.as_ref().is_some_and(observation_is_live) {
             return Ok(());
@@ -764,22 +792,27 @@ impl PtyRuntime {
         self.send(id, &[text.as_bytes(), b"\r"])
     }
 
-    pub fn send_raw(&self, id: &str, bytes: &[u8]) -> Result<()> {
+    pub fn send_raw(&self, id: &str, bytes: &[u8]) -> std::result::Result<(), PtySendError> {
         self.send_raw_if(id, bytes, None)
     }
 
+    /// A preflight refusal proves zero handoff. Once the transport is invoked, its errors
+    /// conservatively allow a partial write; callers must not retry an uncertain batch.
     pub fn send_raw_if(
         &self,
         id: &str,
         bytes: &[u8],
         expected_incarnation: Option<&str>,
-    ) -> Result<()> {
-        self.require_incarnation(id, expected_incarnation)?;
-        anyhow::ensure!(
-            !bytes.contains(&0),
-            "terminal input cannot contain a NUL byte"
-        );
+    ) -> std::result::Result<(), PtySendError> {
+        self.require_incarnation(id, expected_incarnation)
+            .map_err(PtySendError::Preflight)?;
+        if bytes.contains(&0) {
+            return Err(PtySendError::Preflight(anyhow::anyhow!(
+                "terminal input cannot contain a NUL byte"
+            )));
+        }
         self.send(id, &[bytes])
+            .map_err(PtySendError::PossiblyDispatched)
     }
 
     pub fn send_key(&self, id: &str, key: &str) -> Result<()> {
@@ -1249,6 +1282,52 @@ exit 0
         fs::write(&registry, b"not a directory").unwrap();
         let error = PtyRuntime::new(registry).snapshot().unwrap_err();
         assert!(error.to_string().starts_with("list PTYs in "), "{error:#}");
+    }
+
+    #[test]
+    fn raw_input_preflight_refusals_prove_no_handoff() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        write_record(&registry, "work", serde_json::json!({ "createdAt": "now" }));
+        write_pid(&registry, "work", std::process::id());
+        // If validation reaches the transport, this non-socket produces a different error.
+        fs::write(registry.join("work.sock"), "").unwrap();
+        let runtime = PtyRuntime::new(registry);
+        let incarnation = format!("{}:now", std::process::id());
+
+        for (id, bytes, expected) in [
+            ("missing", b"hello".as_slice(), incarnation.as_str()),
+            ("work", b"hello".as_slice(), "41:old"),
+            ("work", b"hello\0".as_slice(), incarnation.as_str()),
+        ] {
+            assert!(matches!(
+                runtime.send_raw_if(id, bytes, Some(expected)).unwrap_err(),
+                PtySendError::Preflight(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn raw_input_transport_failure_is_conservatively_uncertain() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        write_record(&registry, "work", serde_json::json!({ "createdAt": "now" }));
+        write_pid(&registry, "work", std::process::id());
+        // The registry sees the live generation, but connecting to this non-socket fails.
+        // Transport errors carry no proof of how much another failing send could write.
+        fs::write(registry.join("work.sock"), "").unwrap();
+        let runtime = PtyRuntime::new(registry);
+        let incarnation = format!("{}:now", std::process::id());
+        runtime
+            .require_incarnation("work", Some(&incarnation))
+            .unwrap();
+
+        assert!(matches!(
+            runtime
+                .send_raw_if("work", b"hello", Some(&incarnation))
+                .unwrap_err(),
+            PtySendError::PossiblyDispatched(_)
+        ));
     }
 
     #[test]

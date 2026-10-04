@@ -787,9 +787,10 @@ device-session actor, and granted scopes.
 Pairing codes expire after five minutes and reveal no fleet secret. The remote device cannot
 request its own actor or scopes. By default the trusted local begin grants projection reads,
 glasses reads and control, terminal reads, attention control, and launch control. The begin
-request may narrow that default with `scopes`, a non-empty subset of exactly those limited
+request may select an explicit grant with `scopes`, a non-empty subset of the limited
 scopes (`read.projections`, `read.glasses`, `control.glasses`, `terminal.read`,
-`control.attention`, `control.launches`); any other scope, or `scopes` combined with
+`control.attention`, `control.launches`) plus the opt-in fleet auditor scope
+`terminal.audit.read`; any other scope, or `scopes` combined with
 `full_control`, is rejected with a validation error. `st devices --as person/alex pair
 --read-only "Wall display"` requests `read.projections`, `read.glasses`, and `terminal.read`, so
 the device can observe but every attention, launch, and other action returns `403`. For an
@@ -818,6 +819,60 @@ desired state, not a recovery of authored whitespace or comments.
 Read-only scope permits snapshots, details, timelines, and event feeds. `terminal.control` adds
 terminal input and resize; other control scopes are action-family-specific. A capabilities response
 must distinguish unavailable, ungranted, and unsupported features.
+
+## Durable terminal input session audit
+
+`GET /v1/client/terminal-input-audit?terminal=TERMINAL&cursor=CURSOR&limit=LIMIT`
+returns `Envelope<TerminalInputAuditHistory>`. `terminal` is required; the opaque
+`cursor` and `limit` (at most 200) are optional. Items are the latest metadata snapshot
+for each session, newest sessions first, not every checkpoint or individual input batch.
+Rust exposes `terminal_input_audit_get(terminal, cursor, limit)`; Swift exposes
+`terminalInputAuditGet(terminal:cursor:limit:)`; TypeScript exposes
+`terminalInputAuditGet(terminal, { cursor, limit })`. All use existing transport,
+credential, query escaping, and safe error conventions.
+
+The terminal-owner daemon durably records ordered collection-socket sessions only.
+It records session/owner epoch, terminal incarnation, attachment and consumed claim,
+device/session actor, concrete authority actor, nullable delegated person and pairing
+claim, timestamps, cumulative successful-send byte and batch counts, event and close
+reason. Local agent authority has a null person; paired browser sessions have their
+concrete delegated person. There are no raw bytes, text, content digests, or replay.
+`successful_send_bytes` counts bytes whose PTY send returned successfully; it does
+not prove PTY consumption or execution. An uncertain dispatched handoff is explicit.
+All audit integers are bounded by 9,007,199,254,740,991, preserving the existing
+JSON-safe integer contract without lossy numbers. A session that would exhaust its
+counter or ordinal range is rejected before input dispatch, never rounded or wrapped.
+
+Ordinary reads require `terminal.read` and `read.projections` and expose only the
+authenticated delegating person's sessions. Explicit `terminal.audit.read` authorizes
+fleet-wide audit reads; it is never included in limited, full-control, or free-mode
+defaults and must be deliberately granted through trusted local pairing `scopes`.
+Trusted graph replicas may serve the durable records; `owner_coverage` names covered
+owners, not a claim that absent records prove fleet-wide zero input.
+Generic claim list/detail, status, history, and client event reads exclude the
+private `input-session/` namespace, including its subjects and timestamps. They
+cannot bypass person authorization or expose physically retained expired sessions.
+Trusted signed replication and internal graph/checkpoint readers remain available.
+
+Opening is persisted before input-opened; audit failure rejects new input. Sparse
+cumulative checkpoints run at most once per second, not a guaranteed one-second loss
+bound. Clean close without `uncertain_handoff` can prove exact successful-send-return
+totals. Live opened/checkpoint records and interrupted sessions are incomplete.
+Restart recovery records `interrupted`/`owner-restarted` with the last proven counters
+and recovery observation time, never a fabricated exact crash close. `observed_at_unix_ms`
+is the latest observation (including close/interruption), while `opened_at_unix_ms`
+retains opening time. All nullable record fields remain present in the wire schema.
+After a dispatched batch, checkpoint or close persistence failure removes the
+socket's input authority without retrying bytes. The last durable snapshot remains
+incomplete; owner restart marks it interrupted with lower-bound counters. Idle
+credentials are rechecked on the socket's one-second maintenance clock, independently
+of new input or graph changes; this clock is not a hard real-time scheduling guarantee.
+
+Closed history is eligible for reads and trimming for 30 days; this is not guaranteed
+hard erasure. `retained_from` is the Unix-millisecond read cutoff, `complete` explicitly
+describes completeness within the retained read scope, and `next_cursor` is null at
+the end. Missing or truncated history must not be interpreted as definitive zero.
+
 
 ## Conversation stream
 
