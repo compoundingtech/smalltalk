@@ -107,6 +107,17 @@ starts at zero. Never resend bytes whose earlier acknowledgement was lost.
 `input-close` ends an input without a frame. An input ID held again replaces
 the earlier input; callers must send fresh bytes, not replay an uncertain batch.
 
+The terminal owner commits a typed graph opening before `input-opened`; unavailable
+audit storage rejects the open. The graph records attribution, fenced target,
+lifecycle, and cumulative successful send-return totals, never input text, bytes,
+or their hashes. Repeats do not increase totals. Clean closure commits exact totals;
+a restarted owner labels unmatched older sessions interrupted with the last durable
+lower bound. Sparse checkpoints are rate-capped, not a guaranteed crash-loss window.
+Idle device revocation or expiry also closes input without requiring another batch.
+The [durable audit read](README.md#durable-terminal-input-session-audit) is a
+person-scoped or explicitly fleet-authorized projection, distinct from terminal output
+history and from socket-local authority.
+
 These commands and frames are defined by `CollectionCommand` and `CollectionFrame`
 in `client-v0.schema.json`. TypeScript exposes `openInput`, `sendInput`, and
 `closeInput`; Rust exposes `open_input`, `send_input`, and `close_input`, with

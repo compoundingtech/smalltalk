@@ -1559,6 +1559,25 @@ impl Client {
     ) -> Result<Envelope<TerminalScreen>, ClientError> {
         self.terminal_screen_internal(terminal_id).await
     }
+    pub async fn terminal_input_audit_get(
+        &self,
+        terminal: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<TerminalInputAuditHistory>, ClientError> {
+        let mut query = vec![format!("terminal={}", percent_encode(terminal))];
+        if let Some(cursor) = cursor {
+            query.push(format!("cursor={}", percent_encode(cursor)));
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        self.get(&format!(
+            "/v1/client/terminal-input-audit?{}",
+            query.join("&")
+        ))
+        .await
+    }
     pub async fn glasses_list(
         &self,
         cursor: Option<&str>,

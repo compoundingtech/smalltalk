@@ -82,6 +82,13 @@ impl Default for ClientSubscriptionLimit {
     }
 }
 
+/// Process provenance for socket audit recovery; never a runtime-incarnation replacement.
+pub fn input_session_epoch() -> &'static str {
+    static EPOCH: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| uuid::Uuid::now_v7().to_string());
+    &EPOCH
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
@@ -403,7 +410,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
         .route("/v1/client/history", get(client_history))
         .route("/v1/client/history/{*id}", get(client_history_detail))
-        .route("/v1/client/conversations/search", get(client_v0::search::search))
+        .route(
+            "/v1/client/conversations/search",
+            get(client_v0::search::search),
+        )
         .route("/v1/client/sessions", get(client_sessions))
         .route("/v1/client/sessions/{*id}", get(client_sessions_detail))
         .route(
@@ -430,6 +440,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::subscription_detail),
         )
         .route("/v1/client/terminals", get(client_v0::terminals))
+        .route(
+            "/v1/client/terminal-input-audit",
+            get(client_v0::terminal_input_audit),
+        )
         .route("/v1/client/operations", get(client_v0::operations))
         .route(
             "/v1/client/operations/{*id}",
@@ -449,7 +463,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/actions", post(client_v0::action))
         .route(
             "/v1/client/blobs",
-            post(client_blobs::upload).layer(DefaultBodyLimit::max(client_blobs::UPLOAD_BODY_LIMIT)),
+            post(client_blobs::upload)
+                .layer(DefaultBodyLimit::max(client_blobs::UPLOAD_BODY_LIMIT)),
         )
         .route("/v1/client/blobs/{id}", get(client_blobs::get))
         .route("/v1/client/blobs/{id}/chunk", get(client_blobs::chunk))
@@ -1928,7 +1943,9 @@ fn client_agent_resources(
 ) -> anyhow::Result<Vec<Value>> {
     let mut items = store.cached_agent_resources(snapshot_index, history, || {
         let mut items = client_agent_resources_uncached(store, history, snapshot_index)?;
-        let subjects = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))
+        let subjects = items
+            .iter()
+            .filter_map(|item| item["id"].as_str().map(str::to_owned))
             .collect::<Vec<_>>();
         let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
         for item in &mut items {
@@ -5005,12 +5022,15 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
     let mut report = tokio::task::spawn_blocking(move || {
         // This node's claims are signed as their batches are sealed; seal and judge them so
         // the signature counts cover everything written so far.
-        state.store.replication_snapshot().map_err(ApiError::internal)?;
+        state
+            .store
+            .replication_snapshot()
+            .map_err(ApiError::internal)?;
         doctor_report(&state)
     })
-        .await
-        .map_err(ApiError::internal)??
-        .0;
+    .await
+    .map_err(ApiError::internal)??
+    .0;
     if let Some(build_tools) = build_tools {
         report.checks.push(build_tools_check(
             &build_tools.await.map_err(ApiError::internal)?,
@@ -8762,7 +8782,10 @@ async fn restart_agent(
     } else {
         format!("agent/{}", request.subject)
     };
-    state.store.owned_member_guard(&subject).map_err(ApiError::bad)?;
+    state
+        .store
+        .owned_member_guard(&subject)
+        .map_err(ApiError::bad)?;
     let key = format!("agent-restart:{subject}:{}", request.idempotency_key);
     if let Some(prior) = state
         .store
@@ -8893,8 +8916,11 @@ async fn override_placement_source(
     let (claim, appended) = blocking_action(move || {
         let input = crate::placement::source_offline_input(&store, request)?;
         store.append_claim_outcome(&input)
-    }).await?;
-    if appended { signal_claim_changed(&state, crate::placement::SOURCE_OFFLINE_KIND); }
+    })
+    .await?;
+    if appended {
+        signal_claim_changed(&state, crate::placement::SOURCE_OFFLINE_KIND);
+    }
     Ok(Json(claim))
 }
 
@@ -9792,6 +9818,11 @@ async fn post_harness_diagnostic(
     Ok(Json(record))
 }
 
+/// Private claim namespaces have dedicated projections, never generic client/raw reads.
+fn private_claim_subject(subject: &str) -> bool {
+    subject.starts_with("glass/") || subject.starts_with("input-session/")
+}
+
 async fn get_claim(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -9800,7 +9831,7 @@ async fn get_claim(
     let id_for_read = id.clone();
     blocking_store(move || store.claim_by_id(&id_for_read))
         .await?
-        .filter(|claim| !claim.subject.starts_with("glass/"))
+        .filter(|claim| !private_claim_subject(&claim.subject))
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("claim `{id}` does not exist")))
 }
@@ -10874,19 +10905,26 @@ async fn status(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let store = state.store.clone();
     blocking_store(move || {
-        if query.history {
+        let mut status = if query.history {
             store.status_history(
                 query.subject.as_deref(),
                 query.owner_run.as_deref(),
                 query.at_index,
-            )
+            )?
         } else {
             store.status_at(
                 query.subject.as_deref(),
                 query.owner_run.as_deref(),
                 query.at_index,
-            )
-        }
+            )?
+        };
+        status
+            .subjects
+            .retain(|subject| !private_claim_subject(&subject.subject));
+        status
+            .pending_actions
+            .retain(|action| !private_claim_subject(&action.subject));
+        Ok(status)
     })
     .await
     .map(Json)
@@ -10928,7 +10966,13 @@ async fn events(
         let owner_run = query.owner_run.clone();
         async move {
             blocking_store(move || {
-                store.events_after_filtered(query.after, subject.as_deref(), owner_run.as_deref())
+                let mut records = store.events_after_filtered(
+                    query.after,
+                    subject.as_deref(),
+                    owner_run.as_deref(),
+                )?;
+                records.retain(|record| !private_claim_subject(&record.subject));
+                Ok(records)
             })
             .await
         }
@@ -12727,9 +12771,9 @@ async fn input_session_as(
             &request.value,
             Some(&session.incarnation_id),
         ),
-        SessionInputMode::Raw => {
-            runtime.send_raw_if(&session.runtime_id, &bytes, Some(&session.incarnation_id))
-        }
+        SessionInputMode::Raw => runtime
+            .send_raw_if(&session.runtime_id, &bytes, Some(&session.incarnation_id))
+            .map_err(anyhow::Error::from),
         SessionInputMode::Key => runtime.send_key_if(
             &session.runtime_id,
             &request.value,
@@ -14321,7 +14365,10 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 let response = app.oneshot(request).await.unwrap();
                 let status = response.status();
                 let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-                (status, serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null))
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+                )
             }
         };
         // Inside its namespace nothing is logged; outside, the write proceeds and is logged.
@@ -14352,7 +14399,13 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let (status, refused) = publish("doc/team/api/later").await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
         assert_eq!(refused["code"], "rule-denied", "{refused}");
-        assert!(state.store.claims_for("doc/team/api/later", None).unwrap().is_empty());
+        assert!(
+            state
+                .store
+                .claims_for("doc/team/api/later", None)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(publish("doc/team/web/later").await.0, StatusCode::OK);
 
         // Only a person sets rules.
@@ -20310,6 +20363,179 @@ version 2
             .expect("attempt-bound mission output");
         assert_eq!(bound.revision, revision);
         assert_eq!(bound.claim_id, output["claim_id"]);
+    }
+
+    #[tokio::test]
+    async fn input_audit_is_private_to_typed_history_and_graph_readers() {
+        use st3_schema::input_sessions::{InputSessionEvent, InputSessionRecord};
+
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let visible = |subject: &str| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "transport.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), json!("up"))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let first = visible("host/one");
+        let mut record = InputSessionRecord {
+            version: 1,
+            ordinal: 0,
+            event: InputSessionEvent::Opened,
+            session_id: "00000000-0000-4000-8000-000000000001".into(),
+            owner: "node".into(),
+            owner_epoch: "00000000-0000-4000-8000-000000000002".into(),
+            terminal: "agent/private-input".into(),
+            incarnation: "incarnation-private".into(),
+            attachment: "custom/client/terminal-attachment-private-input".into(),
+            attachment_claim: "private-attachment-claim".into(),
+            device_id: None,
+            device_actor: "agent/private-input".into(),
+            authority_actor: "agent/private-input".into(),
+            person: None,
+            pairing_claim: None,
+            opened_at_unix_ms: 100,
+            observed_at_unix_ms: 100,
+            successful_send_bytes: 0,
+            successful_batches: 0,
+            uncertain_handoff: false,
+            reason: None,
+        };
+        let opened = state.store.append_input_session(&record).unwrap();
+        let second = visible("host/two");
+        record.ordinal = 1;
+        record.event = InputSessionEvent::Checkpoint;
+        record.observed_at_unix_ms = 200;
+        record.successful_send_bytes = 5;
+        record.successful_batches = 1;
+        state.store.append_input_session(&record).unwrap();
+        let subject = record.subject();
+
+        // Graph/lifecycle readers and the dedicated projection keep the full durable record.
+        assert_eq!(
+            state
+                .store
+                .claim_by_id(&opened.id)
+                .unwrap()
+                .unwrap()
+                .subject,
+            subject
+        );
+        assert_eq!(state.store.claims_for(&subject, None).unwrap().len(), 2);
+        assert_eq!(
+            state.store.events_after(0, Some(&subject)).unwrap().len(),
+            2
+        );
+        let typed = state
+            .store
+            .input_session_history(&record.terminal, None, None, 200, 200)
+            .unwrap();
+        assert_eq!(typed["items"], json!([record]));
+
+        let app = router(state);
+        for path in [
+            format!("/v1/claims/by-id/{}", opened.id),
+            format!("/v1/client/history/{}", opened.store_index),
+            "/v1/client/events?limit=1".into(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(&path)
+                        .header("x-st3-person", "agent/private-input")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let wire: Value = serde_json::from_slice(&bytes).unwrap();
+            if path == "/v1/client/events?limit=1" {
+                assert_eq!(status, StatusCode::OK, "{wire}");
+                assert_eq!(wire["value"]["items"][0]["sequence"], second.store_index);
+            } else {
+                assert_eq!(status, StatusCode::NOT_FOUND, "{wire}");
+            }
+        }
+        let (status, found) =
+            get_request(app.clone(), &format!("/v1/claims/by-id/{}", first.id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(found["subject"], "host/one");
+        let (_, page) = get_request(app.clone(), "/v1/claims?limit=1").await;
+        assert_eq!(page["claims"][0]["id"], first.id);
+        assert_eq!(page["next_cursor"], first.store_index);
+        let (_, page) = get_request(
+            app.clone(),
+            &format!("/v1/claims?limit=1&after_index={}", first.store_index),
+        )
+        .await;
+        assert_eq!(page["claims"][0]["id"], second.id);
+        assert!(page["next_cursor"].is_null());
+        let (_, page) = get_request(app.clone(), "/v1/claims?limit=1&order=desc").await;
+        assert_eq!(page["claims"][0]["id"], second.id);
+        let (_, page) = get_request(
+            app.clone(),
+            &format!("/v1/claims?subject={subject}&limit=1"),
+        )
+        .await;
+        assert_eq!(page["claims"], json!([]));
+        assert!(page["next_cursor"].is_null());
+        let (_, history) = get_request(app.clone(), "/v1/client/history?limit=1").await;
+        assert_eq!(history["items"][0]["revision"], second.id);
+        assert_eq!(history["page"]["has_more"], true);
+        let (_, detail) = get_request(
+            app.clone(),
+            &format!("/v1/client/history/{}", first.store_index),
+        )
+        .await;
+        assert_eq!(detail["revision"], first.id);
+
+        for path in [
+            "/v1/status?history=true".to_owned(),
+            format!("/v1/status?history=true&subject={subject}"),
+            "/v1/events?wait=false".to_owned(),
+            format!("/v1/events?wait=false&subject={subject}"),
+            "/v1/client/events?after=event-cursor/node/0&limit=1".to_owned(),
+            "/v1/client/events?limit=1".to_owned(),
+        ] {
+            let (status, value) = get_request(app.clone(), &path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {value}");
+            let wire = serde_json::to_string(&value).unwrap();
+            assert!(!wire.contains("input-session/"), "{path}: {wire}");
+            assert!(!wire.contains("terminal.input-session"), "{path}: {wire}");
+            if path == "/v1/client/events?limit=1" {
+                assert_eq!(value["items"][0]["sequence"], second.store_index);
+                assert_eq!(value["has_more"], false);
+            } else if path == "/v1/client/events?after=event-cursor/node/0&limit=1" {
+                assert_eq!(value["items"][0]["sequence"], first.store_index);
+                assert_eq!(value["has_more"], true);
+            } else if path == "/v1/events?wait=false" {
+                assert_eq!(
+                    value
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|item| item["subject"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["host/one", "host/two"]
+                );
+            } else if path.starts_with("/v1/events?wait=false&subject=") {
+                assert_eq!(value, json!([]));
+            } else if path.starts_with("/v1/status?history=true&subject=") {
+                assert_eq!(value["subjects"], json!([]));
+            }
+        }
     }
 
     #[tokio::test]

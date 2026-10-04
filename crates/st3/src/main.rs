@@ -2970,9 +2970,7 @@ enum OwnedSetsCommand {
     /// List selected owned sets and their source receipts.
     Ls,
     /// Show a set's live membership, retirements and blockers.
-    Show {
-        name: String,
-    },
+    Show { name: String },
     /// Inspect publication and rollout for one source commit.
     Status {
         name: String,
@@ -4072,8 +4070,8 @@ fn main() -> ExitCode {
     // Cargo bakes the target name into each executable. The installed st3 binary cannot
     // enable this with an argument, environment variable, or a different filename.
     #[cfg(feature = "test-support")]
-    let _fixture_shell = (env!("CARGO_BIN_NAME") == "st3-fixture")
-        .then(st3::test_support::initialize_fixture);
+    let _fixture_shell =
+        (env!("CARGO_BIN_NAME") == "st3-fixture").then(st3::test_support::initialize_fixture);
     // SAFETY: no other thread exists yet; the async runtime starts after this returns.
     unsafe { st_drivers::reexec::take_resume_environment() };
     if st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV).is_some() {
@@ -5123,6 +5121,15 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::profile::task("startup apply-replication-repairs", || {
         store.apply_replication_repairs()
     })?;
+    st3::profile::task("startup recover-input-audits", || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        store
+            .recover_input_sessions(st3::api::input_session_epoch(), now)
+            .map_err(anyhow::Error::from)
+    })?;
     for run in st3::profile::task("startup settle-runs", || {
         store.settle_runs_for_canonical_replay()
     })? {
@@ -5203,17 +5210,20 @@ async fn run_up(args: UpArgs) -> Result<()> {
         planner_default: config.planner.clone(),
     };
     st3::gate_check::set_endpoint(config.socket.display().to_string());
-    let reconciler = Arc::new(Reconciler::native(
-        store.clone(),
-        &config.state_dir,
-        Some(&pty_root),
-        &pty_binary,
-        config.node.clone(),
-        config.socket.display().to_string(),
-        notify.clone(),
-        event_notify.clone(),
-        recorder.map(|installation| installation.directory),
-    )?.with_schedule_peers(state.configured_peers.clone()));
+    let reconciler = Arc::new(
+        Reconciler::native(
+            store.clone(),
+            &config.state_dir,
+            Some(&pty_root),
+            &pty_binary,
+            config.node.clone(),
+            config.socket.display().to_string(),
+            notify.clone(),
+            event_notify.clone(),
+            recorder.map(|installation| installation.directory),
+        )?
+        .with_schedule_peers(state.configured_peers.clone()),
+    );
     tokio::spawn(reconciler.supervise());
     // A start no longer rebuilds the operation projection; check it once the API serves.
     tokio::spawn({
@@ -7652,7 +7662,11 @@ async fn run_devices(
             );
             print!(
                 "{}",
-                with_device_presence(&rendered, clients.as_ref().map(|found| &found.value), now_ms())
+                with_device_presence(
+                    &rendered,
+                    clients.as_ref().map(|found| &found.value),
+                    now_ms()
+                )
             );
             note_partial_page(&response.value);
             Ok(())
@@ -7720,7 +7734,9 @@ fn ago(timestamp: &str, now_ms: u128) -> String {
     let Ok(then) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
         return timestamp.to_owned();
     };
-    let seconds = (now_ms as i64 / 1_000).saturating_sub(then.timestamp()).max(0);
+    let seconds = (now_ms as i64 / 1_000)
+        .saturating_sub(then.timestamp())
+        .max(0);
     match seconds {
         0..60 => "just now".into(),
         60..3_600 => format!("{}m ago", seconds / 60),
@@ -10498,9 +10514,9 @@ async fn run_rules(
 ) -> Result<()> {
     use smallclaims::rules::{Mode, NamedRule};
     let person = |actor: Option<String>| -> Result<String> {
-        actor
-            .or_else(|| config.person.clone())
-            .context("rules are set by a person: set person in config.toml or pass --as person/NAME")
+        actor.or_else(|| config.person.clone()).context(
+            "rules are set by a person: set person in config.toml or pass --as person/NAME",
+        )
     };
     let set = |actor: &str, name: &str, rule: smallclaims::rules::Rule| {
         let request = st3::api::RuleSetRequest {
@@ -10520,7 +10536,9 @@ async fn run_rules(
                 return print_value(&rules, true);
             }
             if rules.is_empty() {
-                println!("no rules: every principal may write what its person may (st rules lockdown sets the presets)");
+                println!(
+                    "no rules: every principal may write what its person may (st rules lockdown sets the presets)"
+                );
             }
             for rule in rules {
                 println!(
@@ -11009,18 +11027,22 @@ async fn run_agents(
             Ok(())
         }
         AgentsCommand::Rename(args) => {
-            let actor = args.actor.as_deref().or(configured_person).context(
-                "st3 agents rename needs --as ACTOR or a configured person",
-            )?;
-            let response: Value = cli_client(endpoint).post(
-                "/v1/agents/rename",
-                &json!({
-                    "subject": normalize_agent_subject(&args.subject),
-                    "name": args.label,
-                    "actor": actor,
-                    "idempotency_key": uuid::Uuid::now_v7().to_string(),
-                }),
-            ).await?;
+            let actor = args
+                .actor
+                .as_deref()
+                .or(configured_person)
+                .context("st3 agents rename needs --as ACTOR or a configured person")?;
+            let response: Value = cli_client(endpoint)
+                .post(
+                    "/v1/agents/rename",
+                    &json!({
+                        "subject": normalize_agent_subject(&args.subject),
+                        "name": args.label,
+                        "actor": actor,
+                        "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                    }),
+                )
+                .await?;
             print_value(&response, json_output)
         }
         AgentsCommand::Queue(args) => {
@@ -11058,8 +11080,10 @@ async fn run_agents(
             let client = cli_client(endpoint);
             let (subject, tokens, existing, mission) =
                 agent_start_declaration(&client, &args).await?;
-            anyhow::ensure!(!args.source_offline || existing.is_some(),
-                "--source-offline needs an existing seat with a pending placement handoff");
+            anyhow::ensure!(
+                !args.source_offline || existing.is_some(),
+                "--source-offline needs an existing seat with a pending placement handoff"
+            );
             let response = if let Some(mission) = mission {
                 anyhow::ensure!(
                     args.harness.is_none()
@@ -11075,7 +11099,9 @@ async fn run_agents(
                 if let MissionSeatStart::Declared(run) = mission {
                     if args.source_offline {
                         let agent = agent_start_status(endpoint, &client, &subject, &args).await?;
-                        if json_output { return print_value(&agent, true); }
+                        if json_output {
+                            return print_value(&agent, true);
+                        }
                         print!("{}", render_client_agent(&agent, &[], current_unix_ms()?));
                         return Ok(());
                     }
@@ -11120,17 +11146,28 @@ async fn run_agents(
                 if let Some(handoff) = &agent.handoff {
                     println!("{subject}: {} → {}", handoff.phase, handoff.destination);
                     if !handoff.pending_sources.is_empty() {
-                        println!("Waiting for source stop: {}", handoff.pending_sources.join(", "));
+                        println!(
+                            "Waiting for source stop: {}",
+                            handoff.pending_sources.join(", ")
+                        );
                     }
                     if !handoff.overridden_sources.is_empty() {
-                        println!("Source-offline override recorded: {}", handoff.overridden_sources.join(", "));
+                        println!(
+                            "Source-offline override recorded: {}",
+                            handoff.overridden_sources.join(", ")
+                        );
                     }
                 } else {
                     let state = cli_help::agent_state(
-                        &agent.state, agent.harness_state.as_deref(),
-                        agent.fault.as_deref(), &agent.reachability,
+                        &agent.state,
+                        agent.harness_state.as_deref(),
+                        agent.fault.as_deref(),
+                        &agent.reachability,
                     );
-                    print!("{}", cli_help::agent_next_steps(&subject, &args.actor, &state));
+                    print!(
+                        "{}",
+                        cli_help::agent_next_steps(&subject, &args.actor, &state)
+                    );
                 }
             }
             Ok(())
@@ -11373,16 +11410,23 @@ async fn agent_start_status(
         anyhow::bail!("`{subject}` is not an agent");
     };
     if args.source_offline {
-        let handoff = agent.handoff.as_ref()
+        let handoff = agent
+            .handoff
+            .as_ref()
             .context("--source-offline needs a placement handoff with former source hosts")?;
         if !handoff.pending_sources.is_empty() {
-            client.post::<_, st3::model::ClaimRecord>("/v1/agents/source-offline", &json!({
-                "subject": subject,
-                "actor": args.actor,
-                "desired_token": handoff.desired_token,
-                "sources": handoff.pending_sources,
-                "idempotency_key": format!("source-offline:{}", uuid::Uuid::now_v7()),
-            })).await?;
+            client
+                .post::<_, st3::model::ClaimRecord>(
+                    "/v1/agents/source-offline",
+                    &json!({
+                        "subject": subject,
+                        "actor": args.actor,
+                        "desired_token": handoff.desired_token,
+                        "sources": handoff.pending_sources,
+                        "idempotency_key": format!("source-offline:{}", uuid::Uuid::now_v7()),
+                    }),
+                )
+                .await?;
             let ClientResource::Agent(updated) = generated.agents_get(subject).await?.value else {
                 anyhow::bail!("`{subject}` is not an agent");
             };
@@ -12734,12 +12778,15 @@ fn push_todo_terminal_text(output: &mut String, text: &str) {
             match introducer {
                 Some('[') => {
                     for next in characters.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&next) { break; }
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
                     }
                 }
                 Some(']') => {
                     while let Some(next) = characters.next() {
-                        if next == '\u{7}' || (next == '\u{1b}' && characters.next() == Some('\\')) {
+                        if next == '\u{7}' || (next == '\u{1b}' && characters.next() == Some('\\'))
+                        {
                             break;
                         }
                     }
@@ -12751,7 +12798,9 @@ fn push_todo_terminal_text(output: &mut String, text: &str) {
         if character.is_whitespace() {
             space = written;
         } else if !character.is_control() {
-            if space { output.push(' '); }
+            if space {
+                output.push(' ');
+            }
             output.push(character);
             written = true;
             space = false;
@@ -12780,7 +12829,10 @@ fn render_client_agent(
     if let Some(todo) = &agent.todo {
         let snapshot = &todo.snapshot;
         let _ = write!(output, "Todo         ");
-        if let Some(active) = snapshot.phases.iter().flat_map(|phase| &phase.tasks)
+        if let Some(active) = snapshot
+            .phases
+            .iter()
+            .flat_map(|phase| &phase.tasks)
             .find(|task| task.status == st3_client::HarnessTaskStatus::InProgress)
         {
             output.push_str("▶ ");
@@ -12788,9 +12840,15 @@ fn render_client_agent(
             output.push_str(" · ");
         }
         let totals = &snapshot.totals;
-        let total = u128::from(totals.pending) + u128::from(totals.in_progress)
-            + u128::from(totals.completed) + u128::from(totals.blocked);
-        let _ = write!(output, "{}/{total} done · {} blocked", totals.completed, totals.blocked);
+        let total = u128::from(totals.pending)
+            + u128::from(totals.in_progress)
+            + u128::from(totals.completed)
+            + u128::from(totals.blocked);
+        let _ = write!(
+            output,
+            "{}/{total} done · {} blocked",
+            totals.completed, totals.blocked
+        );
         if totals.abandoned > 0 {
             let _ = write!(output, " · {} abandoned", totals.abandoned);
         }
@@ -12807,11 +12865,22 @@ fn render_client_agent(
         let _ = writeln!(output, "FAULT        {fault}");
     }
     if let Some(handoff) = &agent.handoff {
-        let pending = if handoff.pending_sources.is_empty() { String::new() }
-            else { format!(" · waiting for {}", handoff.pending_sources.join(", ")) };
-        let _ = writeln!(output, "HANDOFF      {} → {}{pending}", handoff.phase, handoff.destination);
+        let pending = if handoff.pending_sources.is_empty() {
+            String::new()
+        } else {
+            format!(" · waiting for {}", handoff.pending_sources.join(", "))
+        };
+        let _ = writeln!(
+            output,
+            "HANDOFF      {} → {}{pending}",
+            handoff.phase, handoff.destination
+        );
         if !handoff.overridden_sources.is_empty() {
-            let _ = writeln!(output, "SOURCE OFFLINE {} · override recorded", handoff.overridden_sources.join(", "));
+            let _ = writeln!(
+                output,
+                "SOURCE OFFLINE {} · override recorded",
+                handoff.overridden_sources.join(", ")
+            );
         }
     }
     if let Some(suspension) = &agent.suspension {
@@ -15455,7 +15524,8 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         if let Some(drivers) = std::env::var_os("ST3_DRIVER_STATE_DIR") {
             st_drivers::run::use_harness_state_root(PathBuf::from(drivers).join("sessions"));
         }
-        if let Some(state) = st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV) {
+        if let Some(state) = st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV)
+        {
             return resume_native_driver(client, subject, &args.driver, argv, &state).await;
         }
         if let (Some(message), Some(id)) = (&args.initial_message, &args.initial_message_id) {
@@ -15645,7 +15715,9 @@ async fn run_st2_native_driver(
             match st3::omp_ask_resume::heal(
                 &argv[0],
                 &sessions,
-                selected_session.as_deref().expect("pending ask has a selected session"),
+                selected_session
+                    .as_deref()
+                    .expect("pending ask has a selected session"),
             )
             .await
             {
@@ -15654,7 +15726,11 @@ async fn run_st2_native_driver(
                     provider_environment.push(("ST3_OMP_PENDING_ASK".into(), tool_call_id));
                 }
                 Err(error) => {
-                    let _ = write_driver_log(subject, &json!({"type":"omp_pending_ask_heal_failed","error":format!("{error:#}")}).to_string());
+                    let _ = write_driver_log(
+                        subject,
+                        &json!({"type":"omp_pending_ask_heal_failed","error":format!("{error:#}")})
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -16619,7 +16695,8 @@ fn harness_activity_state(activity: st_drivers::harness_state::Activity) -> &'st
     match activity {
         st_drivers::harness_state::Activity::Ready => "ready",
         st_drivers::harness_state::Activity::Idle => "idle",
-        st_drivers::harness_state::Activity::Active | st_drivers::harness_state::Activity::Child => "working",
+        st_drivers::harness_state::Activity::Active
+        | st_drivers::harness_state::Activity::Child => "working",
         st_drivers::harness_state::Activity::Ended => "ended",
         st_drivers::harness_state::Activity::Unknown => "indeterminate",
     }
@@ -16726,11 +16803,18 @@ impl NativeObservations {
         for event in &mut events {
             // Account binding is outbox metadata, not part of the producer's observation.
             // Preserve it separately for the accounting claim builders below.
-            let account_ref = event.payload.as_object_mut()
+            let account_ref = event
+                .payload
+                .as_object_mut()
                 .and_then(|fields| fields.remove("account_ref"));
             let publisher = ObservationClient {
                 client,
-                event: Some((&self.runtime, event.sequence, &self.dir, account_ref.as_ref().and_then(Value::as_str))),
+                event: Some((
+                    &self.runtime,
+                    event.sequence,
+                    &self.dir,
+                    account_ref.as_ref().and_then(Value::as_str),
+                )),
             };
             let raw = serde_json::to_vec(&event.payload)?;
             let source_driver = event.payload["harness"]
@@ -16837,21 +16921,27 @@ impl NativeObservations {
                     let mut fields: BTreeMap<String, Value> =
                         serde_json::from_value(event.payload.clone())?;
                     fields.remove("incarnation");
-                    fields.insert("incarnation_id".into(), event.runtime_incarnation.clone().into());
-                    let _: ClaimRecord = publisher.post(
-                        "/v1/claims",
-                        &ClaimInput {
-                            subject: subject.into(),
-                            kind: "harness.todo.observed".into(),
-                            actor: Some(subject.into()),
-                            fields,
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: Some(format!(
-                                "harness-todo:{subject}:{}:{}", event.runtime_incarnation, event.sequence,
-                            )),
-                        },
-                    ).await?;
+                    fields.insert(
+                        "incarnation_id".into(),
+                        event.runtime_incarnation.clone().into(),
+                    );
+                    let _: ClaimRecord = publisher
+                        .post(
+                            "/v1/claims",
+                            &ClaimInput {
+                                subject: subject.into(),
+                                kind: "harness.todo.observed".into(),
+                                actor: Some(subject.into()),
+                                fields,
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: Some(format!(
+                                    "harness-todo:{subject}:{}:{}",
+                                    event.runtime_incarnation, event.sequence,
+                                )),
+                            },
+                        )
+                        .await?;
                 }
                 "harness-timeline" => {
                     let operation: st_drivers::harness_timeline::Operation =
@@ -16916,7 +17006,11 @@ impl ObservationClient<'_> {
                     .fields
                     .get("semantics")
                     .and_then(Value::as_str)
-                    .unwrap_or(if claim.kind == "harness.todo.observed" { "normalized" } else { "" })
+                    .unwrap_or(if claim.kind == "harness.todo.observed" {
+                        "normalized"
+                    } else {
+                        ""
+                    })
             );
             let claim = serde_json::from_value(st_drivers::harness_events::prepare_publication(
                 dir,
@@ -16993,7 +17087,13 @@ async fn publish_harness_activity(
             Value::String(observed.blocked_on.as_str().into()),
         ),
         ("ask".into(), Value::String(observed.ask.as_str().into())),
-        ("background_jobs".into(), observed.background_jobs.map(Value::from).unwrap_or(Value::Null)),
+        (
+            "background_jobs".into(),
+            observed
+                .background_jobs
+                .map(Value::from)
+                .unwrap_or(Value::Null),
+        ),
         (
             "input_buffer".into(),
             Value::String(observed.input_buffer.as_str().into()),
@@ -17327,20 +17427,23 @@ async fn publish_harness_timeline(
         // its snapshot index and overwrites attribution on every explicit usage entry.
         let fields = timeline_claim_fields(operation, incarnation);
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
-        let _: ClaimRecord = ObservationClient { client, event: None }
-            .post(
-                "/v1/claims",
-                &ClaimInput {
-                    subject: subject.into(),
-                    kind: "harness.timeline".into(),
-                    actor: Some(subject.into()),
-                    fields,
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("harness-timeline:{subject}:{digest}")),
-                },
-            )
-            .await?;
+        let _: ClaimRecord = ObservationClient {
+            client,
+            event: None,
+        }
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: subject.into(),
+                kind: "harness.timeline".into(),
+                actor: Some(subject.into()),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("harness-timeline:{subject}:{digest}")),
+            },
+        )
+        .await?;
         published.insert(publication);
     }
     // The producer is bounded to the same order of magnitude. Forget publications no longer in
@@ -17436,7 +17539,8 @@ async fn refuse_native_resume(
     {
         let _ = write_driver_log(
             subject,
-            &json!({"type":"native_resume_refusal_unrecorded","error":format!("{error:#}")}).to_string(),
+            &json!({"type":"native_resume_refusal_unrecorded","error":format!("{error:#}")})
+                .to_string(),
         );
     }
     anyhow::anyhow!(
@@ -17491,7 +17595,8 @@ async fn skip_native_continue(
     {
         let _ = write_driver_log(
             subject,
-            &json!({"type":"native_continue_skip_unrecorded","error":format!("{error:#}")}).to_string(),
+            &json!({"type":"native_continue_skip_unrecorded","error":format!("{error:#}")})
+                .to_string(),
         );
     }
 }
@@ -17626,7 +17731,10 @@ fn accept_managed_channel_frame(
     // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 ) -> Result<bool> {
     if let Ok(frame) = serde_json::from_str::<Value>(line) {
-        let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("unknown");
+        let frame_type = frame
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         let handled = match frame_type {
             "state" | "session" | "ready" | "delivered" | "read" | "failed" | "todo" => true,
             "timeline" | "context" | "turn" => observer.is_some(),
@@ -17690,12 +17798,19 @@ fn prepare_channel_todo_outbox(root: &Path, subject: &str, incarnation: &str) ->
 
 fn todo_runtime_has_ended(actual: &Value, incarnation: &str) -> bool {
     let fields = actual.get("fields").unwrap_or(actual);
-    fields["incarnation_id"].as_str().is_some_and(|current| current != incarnation)
-        || matches!(fields["status"].as_str(), Some("absent" | "stopped" | "exited" | "vanished"))
+    fields["incarnation_id"]
+        .as_str()
+        .is_some_and(|current| current != incarnation)
+        || matches!(
+            fields["status"].as_str(),
+            Some("absent" | "stopped" | "exited" | "vanished")
+        )
 }
 
 fn activate_channel_todo_observations(
-    catalog: &Path, subject: &str, state: &mut PiChannelResume,
+    catalog: &Path,
+    subject: &str,
+    state: &mut PiChannelResume,
 ) -> Result<NativeObservations> {
     let dir = prepare_channel_todo_outbox(catalog, subject, &state.incarnation)?;
     st_drivers::harness_events::enable(&dir, &state.incarnation)?;
@@ -17709,12 +17824,18 @@ fn activate_channel_todo_observations(
 const CHANNEL_TODO_END_CONFIRMATION_GAP: Duration = Duration::from_secs(60);
 
 async fn remove_confirmed_ended_channel_todo_outbox(
-    client: &Client, subject: &str, incarnation: &str, dir: &Path,
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    dir: &Path,
     end_seen: &mut Option<tokio::time::Instant>,
 ) -> Result<bool> {
-    let status: Result<StatusResponse> = client.get(&format!(
-        "/v1/status?subject={}", urlencoding::encode(subject),
-    )).await;
+    let status: Result<StatusResponse> = client
+        .get(&format!(
+            "/v1/status?subject={}",
+            urlencoding::encode(subject),
+        ))
+        .await;
     let status = match status {
         Ok(status) => status,
         Err(error) => {
@@ -17722,7 +17843,10 @@ async fn remove_confirmed_ended_channel_todo_outbox(
             return Err(error);
         }
     };
-    let ended = status.subjects.first().and_then(|seat| seat.actual.as_ref())
+    let ended = status
+        .subjects
+        .first()
+        .and_then(|seat| seat.actual.as_ref())
         .is_some_and(|actual| todo_runtime_has_ended(actual, incarnation));
     if !ended {
         *end_seen = None;
@@ -17737,16 +17861,21 @@ async fn remove_confirmed_ended_channel_todo_outbox(
 }
 
 async fn finish_channel_todo_outbox(
-    client: &Client, subject: &str, incarnation: &str, dir: &Path,
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    dir: &Path,
     end_seen: &mut Option<tokio::time::Instant>,
 ) -> Result<bool> {
     loop {
-        if remove_confirmed_ended_channel_todo_outbox(
-            client, subject, incarnation, dir, end_seen,
-        ).await? {
+        if remove_confirmed_ended_channel_todo_outbox(client, subject, incarnation, dir, end_seen)
+            .await?
+        {
             return Ok(true);
         }
-        let Some(first_seen) = *end_seen else { return Ok(false); };
+        let Some(first_seen) = *end_seen else {
+            return Ok(false);
+        };
         // EOF is not an independent liveness confirmation until the same gap has elapsed.
         tokio::time::sleep_until(first_seen + CHANNEL_TODO_END_CONFIRMATION_GAP).await;
     }
@@ -17841,25 +17970,36 @@ async fn run_pi_channel(
             .parse()?;
         let runtime = st_drivers::contracts::env(runtime_env)
             .context("managed channel has no provider runtime")?;
-        Some(st_drivers::pi_channel::EventObserver::new(
-            &paths.agent_dir,
-            identity,
-            driver_name,
-            &session,
-            seq,
-            &runtime,
-        )?.with_native_session(state.native_session.clone()))
+        Some(
+            st_drivers::pi_channel::EventObserver::new(
+                &paths.agent_dir,
+                identity,
+                driver_name,
+                &session,
+                seq,
+                &runtime,
+            )?
+            .with_native_session(state.native_session.clone()),
+        )
     } else {
         None
     };
-    let mut todo_observations = if driver == "omp" && observer.is_none()
+    let mut todo_observations = if driver == "omp"
+        && observer.is_none()
         && retry_while_daemon_unreachable(subject, || current_agent_incarnation(client, subject))
-            .await?.as_deref() == Some(&incarnation)
+            .await?
+            .as_deref()
+            == Some(&incarnation)
     {
-        Some(activate_channel_todo_observations(catalog, subject, &mut state)?)
+        Some(activate_channel_todo_observations(
+            catalog, subject, &mut state,
+        )?)
     } else {
         if driver == "omp" && observer.is_none() {
-            let _ = write_driver_log(subject, "todo publishing suspended until the graph incarnation catches up");
+            let _ = write_driver_log(
+                subject,
+                "todo publishing suspended until the graph incarnation catches up",
+            );
         }
         state.todo_outbox = None;
         None
@@ -17868,7 +18008,9 @@ async fn run_pi_channel(
     if push_mailbox_enabled() && state.pending.fence.is_none() {
         state.pending.fence = Some(st3::mailbox::Fence::new(subject, &incarnation, "delivery"));
     }
-    if let Some(fence) = &mut state.pending.fence { fence.bind(client).await?; }
+    if let Some(fence) = &mut state.pending.fence {
+        fence.bind(client).await?;
+    }
     let mut subscription = state.pending.fence.as_ref().map(|fence| {
         let mut report: Value =
             serde_json::from_str(&native_delivery_report(&transport, None)).unwrap_or_default();
@@ -17877,9 +18019,10 @@ async fn run_pi_channel(
     });
     let mut pushed_messages: Vec<MessageView> = Vec::new();
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
-    let spawn_reader = |sender: tokio::sync::mpsc::UnboundedSender<st_drivers::reexec::StdinChunk>| {
-        st_drivers::reexec::StdinReader::spawn(move |chunk| sender.send(chunk).is_ok())
-    };
+    let spawn_reader =
+        |sender: tokio::sync::mpsc::UnboundedSender<st_drivers::reexec::StdinChunk>| {
+            st_drivers::reexec::StdinReader::spawn(move |chunk| sender.send(chunk).is_ok())
+        };
     let mut reader = Some(spawn_reader(input_tx.clone()));
     let mut watch = st_drivers::reexec::ReplacementWatch::for_current_process();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -18292,18 +18435,28 @@ impl PiChannelResume {
     }
 
     fn apply_ask_bridge_frame(&mut self, subject: &str, line: &str) {
-        let Ok(frame) = serde_json::from_str::<Value>(line) else { return };
+        let Ok(frame) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
         let expected = std::env::var("ST3_OMP_PENDING_ASK").ok();
         if let Some(id) = self.take_pending_ask_retry(&frame, expected.as_deref()) {
             let sent = (|| -> Result<()> {
-                let root = std::env::var_os("PTY_ROOT").context("pending ask retry has no PTY_ROOT")?;
-                let session = std::env::var("PTY_SESSION").context("pending ask retry has no PTY_SESSION")?;
-                st_runtime::PtyRuntime::new(root.into()).send_raw_if(&session, b"\x1b[15~", None)?;
+                let root =
+                    std::env::var_os("PTY_ROOT").context("pending ask retry has no PTY_ROOT")?;
+                let session =
+                    std::env::var("PTY_SESSION").context("pending ask retry has no PTY_SESSION")?;
+                st_runtime::PtyRuntime::new(root.into()).send_raw_if(
+                    &session,
+                    b"\x1b[15~",
+                    None,
+                )?;
                 Ok(())
             })();
             let record = match sent {
                 Ok(()) => json!({"type":"omp_pending_ask_retry","toolCallId":id}),
-                Err(error) => json!({"type":"omp_pending_ask_retry_failed","toolCallId":id,"error":format!("{error:#}")}),
+                Err(error) => {
+                    json!({"type":"omp_pending_ask_retry_failed","toolCallId":id,"error":format!("{error:#}")})
+                }
             };
             let _ = write_driver_log(subject, &record.to_string());
         }
@@ -18320,7 +18473,10 @@ impl PiChannelResume {
         match frame.get("type").and_then(Value::as_str) {
             Some("todo") => {
                 let Some(fields) = st_drivers::pi_channel::todo_observation(
-                    &frame, "omp", self.native_session.as_deref(), &self.incarnation,
+                    &frame,
+                    "omp",
+                    self.native_session.as_deref(),
+                    &self.incarnation,
                 ) else {
                     return false;
                 };
@@ -18519,7 +18675,10 @@ impl PiFamilyReports {
                                     .map(Value::String)
                                     .unwrap_or(Value::Null),
                             ),
-                            ("background_jobs".into(), self.background_jobs.map(Value::from).unwrap_or(Value::Null)),
+                            (
+                                "background_jobs".into(),
+                                self.background_jobs.map(Value::from).unwrap_or(Value::Null),
+                            ),
                             ("input_buffer".into(), Value::Null),
                             ("exit".into(), Value::Null),
                         ])),
@@ -18544,24 +18703,37 @@ impl PiFamilyReports {
             match &self.fence {
                 Some(fence) => mailbox_receipt(client, fence, &message, "read").await?,
                 None => {
-                    let _: ClaimRecord = client.post(
-                        &format!("/v1/messages/{}/claims", urlencoding::encode(message.trim_start_matches("message/"))),
-                        &MessageLifecycleRequest {
-                            lifecycle: "read".into(),
-                            actor: Some(subject.into()),
-                            transport: None,
-                            runtime_id: None,
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: format!("pi-read:{subject}:{message}"),
-                        },
-                    ).await?;
+                    let _: ClaimRecord = client
+                        .post(
+                            &format!(
+                                "/v1/messages/{}/claims",
+                                urlencoding::encode(message.trim_start_matches("message/"))
+                            ),
+                            &MessageLifecycleRequest {
+                                lifecycle: "read".into(),
+                                actor: Some(subject.into()),
+                                transport: None,
+                                runtime_id: None,
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: format!("pi-read:{subject}:{message}"),
+                            },
+                        )
+                        .await?;
                 }
             }
             // Both transports retain the native receipt until the graph acknowledges it.
             use tokio::io::AsyncWriteExt as _;
             let mut stdout = tokio::io::stdout();
-            stdout.write_all(format!("{}\n", json!({"type":"settled","meta":{"messageId":message}})).as_bytes()).await?;
+            stdout
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"type":"settled","meta":{"messageId":message}})
+                    )
+                    .as_bytes(),
+                )
+                .await?;
             stdout.flush().await?;
             self.reads.remove(&message);
         }
@@ -18880,22 +19052,28 @@ async fn drive_codex_native(
     start: ProviderStart,
     mut loop_state: NativeLoopState,
 ) -> Result<()> {
-    let mut paths = if matches!(start, ProviderStart::Launch(
-        _,
-        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
-        _,
-        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
-    )) {
+    let mut paths = if matches!(
+        start,
+        ProviderStart::Launch(
+            _,
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            _,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        )
+    ) {
         NativePaths::prepare(subject, "codex")?
     } else {
         NativePaths::resumed(subject, "codex", loop_state.paths.clone())?
     };
-    if matches!(start, ProviderStart::Launch(
-        _,
-        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
-        _,
-        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
-    )) {
+    if matches!(
+        start,
+        ProviderStart::Launch(
+            _,
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            _,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        )
+    ) {
         st_drivers::harness_events::enable(&paths.agent_dir, &incarnation)?;
     }
     loop_state.paths = Some(paths.resolved());
@@ -18908,12 +19086,15 @@ async fn drive_codex_native(
     let root = paths.state_root();
     let state_dir = paths.session_dir.clone();
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
-    if matches!(start, ProviderStart::Launch(
-        _,
-        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
-        _,
-        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
-    )) {
+    if matches!(
+        start,
+        ProviderStart::Launch(
+            _,
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            _,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        )
+    ) {
         // The path can still hold the predecessor's terminal record. It is the predecessor's, never
         // this incarnation's: only a byte change after this point is the new wrapper's claim.
         loop_state.predecessor_harness_record = fs::read(&harness_state_path).ok();
@@ -18934,14 +19115,17 @@ async fn drive_codex_native(
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
     // The thread this launch continues; a refusal of it ends the wrapper before it binds.
-    let continued = matches!(start, ProviderStart::Launch(
-        _,
-        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
-        _,
-        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
-    ))
-        .then(|| codex_continued_thread(&argv))
-        .flatten();
+    let continued = matches!(
+        start,
+        ProviderStart::Launch(
+            _,
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            _,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        )
+    )
+    .then(|| codex_continued_thread(&argv))
+    .flatten();
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
     let mut reported_session = None;
     // The Codex control pump keeps the subagent ledger; this driver records it on the seat.
@@ -20019,10 +20203,7 @@ async fn mailbox_receipt_claim(
 }
 
 fn seat_label(seat: &st3::model::DesiredSubject) -> String {
-    st3::mailbox::seat_label(
-        seat,
-        std::env::var("AGENT_PERSONA_SHORT").ok().as_deref(),
-    )
+    st3::mailbox::seat_label(seat, std::env::var("AGENT_PERSONA_SHORT").ok().as_deref())
 }
 fn update_native_title(seat: &st3::model::DesiredSubject, runtime_id: &str) -> Result<()> {
     let label = seat_label(seat);
@@ -20188,7 +20369,9 @@ async fn forward_projected_messages_reporting(
             state_dir,
             identity,
             runtime_id,
-        } => st_drivers::codex_app_server::consumed_delivery_filenames(state_dir, identity, runtime_id),
+        } => st_drivers::codex_app_server::consumed_delivery_filenames(
+            state_dir, identity, runtime_id,
+        ),
         NativeDeliveryReceipts::ClaudeChannel {
             agent_dir,
             incarnation,
@@ -20706,8 +20889,15 @@ mod tests {
         let frame = json!({"type":"retry_pending_ask","toolCallId":"X"});
         assert!(state.take_pending_ask_retry(&frame, None).is_none());
         assert!(state.take_pending_ask_retry(&frame, Some("Y")).is_none());
-        assert!(state.take_pending_ask_retry(&json!({"type":"state","toolCallId":"X"}), Some("X")).is_none());
-        assert_eq!(state.take_pending_ask_retry(&frame, Some("X")).as_deref(), Some("X"));
+        assert!(
+            state
+                .take_pending_ask_retry(&json!({"type":"state","toolCallId":"X"}), Some("X"))
+                .is_none()
+        );
+        assert_eq!(
+            state.take_pending_ask_retry(&frame, Some("X")).as_deref(),
+            Some("X")
+        );
         assert!(state.take_pending_ask_retry(&frame, Some("X")).is_none());
         let mut restored: PiChannelResume =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
@@ -20717,13 +20907,22 @@ mod tests {
     #[test]
     fn omp_delivery_readiness_does_not_clear_the_reopened_human_block() {
         let mut state = PiChannelResume::default();
-        assert!(state.accept_frame(r#"{"type":"state","state":"active","blockedOn":"human","ask":"question"}"#));
+        assert!(state.accept_frame(
+            r#"{"type":"state","state":"active","blockedOn":"human","ask":"question"}"#
+        ));
         assert!(!state.first_idle_seen);
         assert!(!state.accept_frame(r#"{"type":"delivery_ready"}"#));
         assert!(state.first_idle_seen);
         assert_eq!(state.pending.blocked_on.as_deref(), Some("human"));
         assert_eq!(state.pending.ask.as_deref(), Some("question"));
-        assert_eq!(state.pending.state.as_ref().map(|(status, _)| status.as_str()), Some("working"));
+        assert_eq!(
+            state
+                .pending
+                .state
+                .as_ref()
+                .map(|(status, _)| status.as_str()),
+            Some("working")
+        );
         assert!(state.accept_frame(r#"{"type":"state","state":"idle"}"#));
         assert!(state.pending.blocked_on.is_none());
     }
@@ -20750,11 +20949,20 @@ mod tests {
         let shown = render_clients(&found, now);
         assert!(shown.contains("CLIENTS  2 on host/example"), "{shown}");
         assert!(shown.contains("smalltalk-ios 1.0 (42)  person/avery (Pocket)  via gateway  connected now, since 2m ago"), "{shown}");
-        assert!(shown.contains("  follows: agents, conversation:agent/example/harbor"), "{shown}");
-        assert!(shown.contains("(unnamed client)  person/avery  via local  last seen 3m ago"), "{shown}");
+        assert!(
+            shown.contains("  follows: agents, conversation:agent/example/harbor"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("(unnamed client)  person/avery  via local  last seen 3m ago"),
+            "{shown}"
+        );
         let devices = "DEVICES\ndevice/001122  active  person/avery/session/0011  scopes 4\n  action: st devices --as person/avery revoke device/001122\n";
         let marked = with_device_presence(devices, Some(&found), now);
-        assert!(marked.contains("scopes 4  · connected now · smalltalk-ios 1.0 (42)"), "{marked}");
+        assert!(
+            marked.contains("scopes 4  · connected now · smalltalk-ios 1.0 (42)"),
+            "{marked}"
+        );
         assert_eq!(with_device_presence(devices, None, now), devices);
     }
 
@@ -20772,7 +20980,8 @@ mod tests {
             "observed_at":"2026-10-03T15:00:00Z","phases":[],
             "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0},
             "truncated":false
-        }).to_string();
+        })
+        .to_string();
         assert!(!state.accept_frame(&frame));
         assert!(state.accept_frame(r#"{"type":"ready","sessionId":"native-a"}"#));
         assert!(state.accept_frame(&frame));
@@ -20783,7 +20992,12 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert!(resumed.accept_frame(r#"{"type":"session","sessionId":"native-b"}"#));
         assert!(!resumed.accept_frame(&frame));
-        assert_eq!(st_drivers::harness_events::pending(root.path(), 100).unwrap().len(), 1);
+        assert_eq!(
+            st_drivers::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -20807,9 +21021,18 @@ mod tests {
         prepare_channel_todo_outbox(root.path(), "agent/one", "runtime-c").unwrap();
         assert!(!current.exists());
         assert!(unrelated.exists());
-        assert!(!todo_runtime_has_ended(&json!({"incarnation_id":"a","status":"running"}), "a"));
-        assert!(todo_runtime_has_ended(&json!({"incarnation_id":"a","status":"exited"}), "a"));
-        assert!(todo_runtime_has_ended(&json!({"incarnation_id":"b","status":"running"}), "a"));
+        assert!(!todo_runtime_has_ended(
+            &json!({"incarnation_id":"a","status":"running"}),
+            "a"
+        ));
+        assert!(todo_runtime_has_ended(
+            &json!({"incarnation_id":"a","status":"exited"}),
+            "a"
+        ));
+        assert!(todo_runtime_has_ended(
+            &json!({"incarnation_id":"b","status":"running"}),
+            "a"
+        ));
         assert!(!todo_runtime_has_ended(&json!({}), "a"));
     }
 
@@ -20821,95 +21044,214 @@ mod tests {
         fs::write(dir.join("pending"), b"unpublished todo").unwrap();
         let store = std::sync::Arc::new(Store::open_memory("todo-liveness").unwrap());
         let observe = |status: &str| {
-            store.append_claim(&ClaimInput {
-                subject: "agent/seat".into(), kind: "runtime.observed".into(), actor: None,
-                fields: serde_json::from_value(json!({
-                    "incarnation_id":"current", "status":status,
-                })).unwrap(),
-                evidence: vec![], expected_subject: None, idempotency_key: None,
-            }).unwrap();
+            store
+                .append_claim(&ClaimInput {
+                    subject: "agent/seat".into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: serde_json::from_value(json!({
+                        "incarnation_id":"current", "status":status,
+                    }))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
         };
         let state = st3::api::AppState {
-            store: store.clone(), notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            store: store.clone(),
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             event_notify: tokio::sync::watch::channel(0).0,
-            node: "todo-liveness".into(), state_dir: root.path().into(),
-            pty_root: root.path().join("pty"), pty_binary: "pty".into(),
-            fleet_id: None, configured_peers: vec![], client_relay: None,
-            native_session_home: None, planner_default: Default::default(),
+            node: "todo-liveness".into(),
+            state_dir: root.path().into(),
+            pty_root: root.path().join("pty"),
+            pty_binary: "pty".into(),
+            fleet_id: None,
+            configured_peers: vec![],
+            client_relay: None,
+            native_session_home: None,
+            planner_default: Default::default(),
         };
         let path = root.path().join("api.sock");
         let socket = path.clone();
         let server = tokio::spawn(async move {
-            st3::api::serve_unix(&socket, st3::api::router(state)).await.unwrap();
+            st3::api::serve_unix(&socket, st3::api::router(state))
+                .await
+                .unwrap();
         });
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !path.exists() { tokio::task::yield_now().await; }
-        }).await.unwrap();
+            while !path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let client = Client::unix(&path);
         tokio::time::pause();
         // Keep socket I/O from automatically advancing the paused clock to unrelated timers.
         let clock_guard = tokio::spawn(async {
-            loop { tokio::task::yield_now().await; }
+            loop {
+                tokio::task::yield_now().await;
+            }
         });
         let mut end_seen = None;
         observe("vanished");
-        assert!(!remove_confirmed_ended_channel_todo_outbox(
-            &client, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.unwrap());
+        assert!(
+            !remove_confirmed_ended_channel_todo_outbox(
+                &client,
+                "agent/seat",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(fs::read(dir.join("pending")).unwrap(), b"unpublished todo");
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(!remove_confirmed_ended_channel_todo_outbox(
-            &client, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.unwrap());
+        assert!(
+            !remove_confirmed_ended_channel_todo_outbox(
+                &client,
+                "agent/seat",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .unwrap()
+        );
         tokio::time::advance(Duration::from_secs(58)).await;
-        assert!(!remove_confirmed_ended_channel_todo_outbox(
-            &client, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.unwrap());
+        assert!(
+            !remove_confirmed_ended_channel_todo_outbox(
+                &client,
+                "agent/seat",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .unwrap()
+        );
         assert!(dir.join("pending").exists());
         observe("running");
-        assert!(!remove_confirmed_ended_channel_todo_outbox(
-            &client, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.unwrap());
+        assert!(
+            !remove_confirmed_ended_channel_todo_outbox(
+                &client,
+                "agent/seat",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .unwrap()
+        );
         observe("stopped");
-        assert!(!remove_confirmed_ended_channel_todo_outbox(
-            &client, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.unwrap());
-        assert!(!remove_confirmed_ended_channel_todo_outbox(
-            &client, "agent/missing", "current", &dir, &mut end_seen,
-        ).await.unwrap());
-        assert!(!remove_confirmed_ended_channel_todo_outbox(
-            &client, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.unwrap());
+        assert!(
+            !remove_confirmed_ended_channel_todo_outbox(
+                &client,
+                "agent/seat",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !remove_confirmed_ended_channel_todo_outbox(
+                &client,
+                "agent/missing",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !remove_confirmed_ended_channel_todo_outbox(
+                &client,
+                "agent/seat",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .unwrap()
+        );
         let unavailable = Client::unix(&root.path().join("unavailable.sock"));
-        assert!(remove_confirmed_ended_channel_todo_outbox(
-            &unavailable, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.is_err());
-        assert!(!remove_confirmed_ended_channel_todo_outbox(
-            &client, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.unwrap());
+        assert!(
+            remove_confirmed_ended_channel_todo_outbox(
+                &unavailable,
+                "agent/seat",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            !remove_confirmed_ended_channel_todo_outbox(
+                &client,
+                "agent/seat",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .unwrap()
+        );
         assert!(dir.join("pending").exists());
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(!remove_confirmed_ended_channel_todo_outbox(
-            &client, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.unwrap());
+        assert!(
+            !remove_confirmed_ended_channel_todo_outbox(
+                &client,
+                "agent/seat",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .unwrap()
+        );
         tokio::time::advance(Duration::from_secs(59)).await;
-        assert!(remove_confirmed_ended_channel_todo_outbox(
-            &client, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.unwrap());
+        assert!(
+            remove_confirmed_ended_channel_todo_outbox(
+                &client,
+                "agent/seat",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .unwrap()
+        );
         assert!(!dir.exists());
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("pending"), b"unpublished EOF todo").unwrap();
         end_seen = None;
-        assert!(!remove_confirmed_ended_channel_todo_outbox(
-            &client, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.unwrap());
+        assert!(
+            !remove_confirmed_ended_channel_todo_outbox(
+                &client,
+                "agent/seat",
+                "current",
+                &dir,
+                &mut end_seen,
+            )
+            .await
+            .unwrap()
+        );
         let first_seen = end_seen.unwrap();
         tokio::time::advance(Duration::from_secs(1)).await;
         clock_guard.abort();
         let _ = clock_guard.await;
-        assert!(finish_channel_todo_outbox(
-            &client, "agent/seat", "current", &dir, &mut end_seen,
-        ).await.unwrap());
+        assert!(
+            finish_channel_todo_outbox(&client, "agent/seat", "current", &dir, &mut end_seen,)
+                .await
+                .unwrap()
+        );
         assert!(first_seen.elapsed() >= CHANNEL_TODO_END_CONFIRMATION_GAP);
         assert!(!dir.exists());
         server.abort();
@@ -21120,14 +21462,20 @@ mod tests {
             false,
             st3_conversation_ui::Density::Full,
         );
-        assert!(pretty.starts_with("CONVERSATION  session/example"), "{pretty}");
+        assert!(
+            pretty.starts_with("CONVERSATION  session/example"),
+            "{pretty}"
+        );
         assert!(pretty.contains("Please check why the n"), "{pretty}");
         // The harness's own wrappers are cleaned away, as in stui; no escapes without colour.
         for noise in ["<task-notification>", "<channel", "<command-name>", "\x1b["] {
             assert!(!pretty.contains(noise), "{noise}: {pretty}");
         }
         let raw = timeline_entries_text("session/example", &items);
-        assert!(raw.contains("<task-notification>"), "raw keeps what was stored");
+        assert!(
+            raw.contains("<task-notification>"),
+            "raw keeps what was stored"
+        );
     }
 
     #[test]
@@ -21512,8 +21860,13 @@ mod tests {
                 );
             });
             let output = String::from_utf8(
-                capture.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone(),
-            ).unwrap();
+                capture
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )
+            .unwrap();
             assert!(
                 output.contains("unhandled pi-family channel frame"),
                 "{output}"
@@ -21529,8 +21882,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_mailbox_replays_delivered_unread_but_never_queues_read_or_closed_mail()
-    {
+    async fn native_mailbox_replays_delivered_unread_but_never_queues_read_or_closed_mail() {
         // The two providers share this pump but load their own native receipt ledgers.
         for driver in ["codex", "opencode"] {
             let root = tempfile::tempdir().unwrap();
@@ -21588,7 +21940,10 @@ mod tests {
                     &agent_dir.join("resources/inbox"),
                 )
                 .unwrap();
-                let mut ids = queued.iter().map(|message| message.filename.as_str()).collect::<Vec<_>>();
+                let mut ids = queued
+                    .iter()
+                    .map(|message| message.filename.as_str())
+                    .collect::<Vec<_>>();
                 ids.sort_unstable();
                 assert_eq!(ids, ["message/legacy", "message/pending"], "{driver}");
             }
@@ -21632,7 +21987,8 @@ mod tests {
             assert!(state.pending.acknowledgements.contains("message/native"));
             let resume_path =
                 st_drivers::reexec::write_state(root.path(), "channel-resume", &state).unwrap();
-            let mut resumed: PiChannelResume = st_drivers::reexec::read_state(&resume_path).unwrap();
+            let mut resumed: PiChannelResume =
+                st_drivers::reexec::read_state(&resume_path).unwrap();
             assert_eq!(
                 serde_json::to_value(&resumed.pending.fence).unwrap(),
                 serde_json::to_value(fenced.then_some(&fence)).unwrap()
@@ -21667,7 +22023,8 @@ mod tests {
                 async move {
                     let lifecycle = receipt["lifecycle"].as_str().unwrap().to_owned();
                     let (message, actor) = if fenced {
-                        let receipt: st3::mailbox::Receipt = serde_json::from_value(receipt).unwrap();
+                        let receipt: st3::mailbox::Receipt =
+                            serde_json::from_value(receipt).unwrap();
                         assert_eq!(serde_json::to_value(&receipt.fence).unwrap(), expected);
                         (receipt.message, receipt.fence.subject)
                     } else {
@@ -21735,7 +22092,10 @@ mod tests {
         assert_eq!(resumed.pending.state, Some(("working".into(), 1)));
         assert_eq!(resumed.pending.blocked_on.as_deref(), Some("human"));
         assert_eq!(resumed.pending.ask.as_deref(), Some("question"));
-        assert_eq!(resumed.pending.reason.as_deref(), Some("Which deployment target?"));
+        assert_eq!(
+            resumed.pending.reason.as_deref(),
+            Some("Which deployment target?")
+        );
         // The extension only emits an unblocked state for the matching ask's result.
         // An unrelated tool result is timeline data, not a new harness observation.
         assert!(!resumed.accept_frame(
@@ -21838,28 +22198,43 @@ mod tests {
                     "truncated":true
                 }
             }
-        })).unwrap();
+        }))
+        .unwrap();
         let card = render_client_agent(&agent, &[], 0);
         assert!(card.contains("Todo         ▶ Compile · 3/10 done · 1 blocked · truncated\n"));
         assert!(!card.contains("▶ Later"));
         let value = serde_json::to_value(&agent).unwrap();
-        assert_eq!(value["todo"]["snapshot"]["phases"][0]["tasks"][1]["blocker"], "Approval");
+        assert_eq!(
+            value["todo"]["snapshot"]["phases"][0]["tasks"][1]["blocker"],
+            "Approval"
+        );
         assert_eq!(value["todo"]["claim_id"], "claim/todo");
         agent.todo.as_mut().unwrap().snapshot.phases[0].tasks[0].content =
             "\u{1b}[31mCompile\u{1b}[0m\nnext\tstep\u{1b}]0;spoofed title\u{7}\u{8}".into();
-        assert!(render_client_agent(&agent, &[], 0)
-            .contains("Todo         ▶ Compile next step · 3/10 done · 1 blocked · truncated\n"));
+        assert!(
+            render_client_agent(&agent, &[], 0)
+                .contains("Todo         ▶ Compile next step · 3/10 done · 1 blocked · truncated\n")
+        );
         agent.todo.as_mut().unwrap().snapshot.totals.abandoned = 2;
-        assert!(render_client_agent(&agent, &[], 0)
-            .contains("3/10 done · 1 blocked · 2 abandoned · truncated"));
+        assert!(
+            render_client_agent(&agent, &[], 0)
+                .contains("3/10 done · 1 blocked · 2 abandoned · truncated")
+        );
         let todo = agent.todo.as_mut().unwrap();
         todo.stale = true;
         todo.snapshot.phases.clear();
         todo.snapshot.truncated = false;
         todo.snapshot.totals = st3_client::HarnessTodoTotals {
-            pending: 0, in_progress: 0, completed: 0, blocked: 0, abandoned: 0,
+            pending: 0,
+            in_progress: 0,
+            completed: 0,
+            blocked: 0,
+            abandoned: 0,
         };
-        assert!(render_client_agent(&agent, &[], 0).contains("Todo         0/0 done · 0 blocked · stale\n"));
+        assert!(
+            render_client_agent(&agent, &[], 0)
+                .contains("Todo         0/0 done · 0 blocked · stale\n")
+        );
         agent.todo = None;
         assert!(!render_client_agent(&agent, &[], 0).contains("Todo"));
         assert!(serde_json::to_value(agent).unwrap()["todo"].is_null());
@@ -24276,7 +24651,11 @@ mod tests {
         };
         let kdl = agent_start_document(&args, None).unwrap();
         let intent = st3::parse_intent(&kdl, "node").unwrap();
-        assert!(intent.subjects.contains_key("agent/example/cos/standing/cos"));
+        assert!(
+            intent
+                .subjects
+                .contains_key("agent/example/cos/standing/cos")
+        );
         assert!(
             intent.subjects["agent/example/cos/standing/cos"]
                 .owner_run
@@ -24349,10 +24728,7 @@ mod tests {
         let document: KdlDocument = source.parse().unwrap();
         let body = document.get("agent").unwrap().children().unwrap();
         let checkout = body.get("checkout").unwrap();
-        assert_eq!(
-            checkout.get(0).unwrap().as_string(),
-            Some("/work/repo")
-        );
+        assert_eq!(checkout.get(0).unwrap().as_string(), Some("/work/repo"));
         assert_eq!(
             checkout.get("branch").unwrap().as_string(),
             Some("example/parser")
@@ -24869,8 +25245,7 @@ mission "review" state="ready" {
 
     #[test]
     fn review_commands_parse_a_filter_and_an_owner_target() {
-        let list =
-            Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/alex"]).unwrap();
+        let list = Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/alex"]).unwrap();
         let Command::Attention {
             command: AttentionCommand::Ls { actor, .. },
         } = list.command
@@ -24899,8 +25274,7 @@ mission "review" state="ready" {
 
     #[test]
     fn attention_commands_parse_list_request_and_resolution() {
-        let list =
-            Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/alex"]).unwrap();
+        let list = Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/alex"]).unwrap();
         let Command::Attention {
             command: AttentionCommand::Ls { actor, .. },
         } = list.command
@@ -25413,14 +25787,26 @@ mission "review" state="ready" {
             assert_eq!(subjects, ["message/delivered"]);
             let filename = &messages[0].filename;
             if let Some(first) = &first_filename {
-                assert_eq!(filename, first, "replay must retain the native handoff identity");
+                assert_eq!(
+                    filename, first,
+                    "replay must retain the native handoff identity"
+                );
             } else {
                 first_filename = Some(filename.clone());
             }
         }
-        assert_eq!(store.message("message/delivered").unwrap().unwrap().status, "delivered");
-        assert_eq!(store.message("message/read").unwrap().unwrap().status, "read");
-        assert_eq!(store.message("message/closed").unwrap().unwrap().status, "closed");
+        assert_eq!(
+            store.message("message/delivered").unwrap().unwrap().status,
+            "delivered"
+        );
+        assert_eq!(
+            store.message("message/read").unwrap().unwrap().status,
+            "read"
+        );
+        assert_eq!(
+            store.message("message/closed").unwrap().unwrap().status,
+            "closed"
+        );
         server.abort();
     }
 
@@ -26164,11 +26550,19 @@ mission "review" state="ready" {
                 .await
                 .is_err()
         );
-        st_drivers::harness_events::write_channel_todo(root.path(), "runtime", &json!({
-            "harness":"omp", "session_id":"native", "incarnation_id":"runtime",
-            "observed_at":"2026-10-03T15:00:00Z", "source_op":"hydrate", "phases":[],
-            "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0}, "truncated":false,
-        })).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), observations.recv()).await.unwrap().unwrap();
+        st_drivers::harness_events::write_channel_todo(
+            root.path(),
+            "runtime",
+            &json!({
+                "harness":"omp", "session_id":"native", "incarnation_id":"runtime",
+                "observed_at":"2026-10-03T15:00:00Z", "source_op":"hydrate", "phases":[],
+                "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0}, "truncated":false,
+            }),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), observations.recv())
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

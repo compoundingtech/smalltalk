@@ -114,9 +114,13 @@ const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
-    if collection == "glasses" { return !kind.starts_with("glass."); }
-    matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
-        || (kind == "harness.usage" && collection != "agents")
+    if collection == "glasses" {
+        return !kind.starts_with("glass.");
+    }
+    matches!(
+        kind,
+        "daemon.diagnostic" | "transport.observed" | "workspace.observed"
+    ) || (kind == "harness.usage" && collection != "agents")
 }
 
 pub(super) async fn collection_stream(
@@ -139,7 +143,12 @@ pub(super) async fn collection_stream(
             "the collection WebSocket requires exactly st3.client.collections.v0",
         ));
     }
-    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
+    let presence = super::client_presence::open_stream(
+        &state.node,
+        &session,
+        &headers,
+        super::client_now_ms(),
+    );
     if let Some(trace) = &trace {
         super::client_web::record_span(
             web.as_ref(),
@@ -343,7 +352,13 @@ async fn open_terminal_subscription(
     state: &AppState,
     session: &ClientSession,
     request: &CollectionSubscribe,
-) -> Result<(watch::Receiver<TerminalFrame>, Option<terminal_input::InputTarget>), ApiError> {
+) -> Result<
+    (
+        watch::Receiver<TerminalFrame>,
+        Option<terminal_input::InputTarget>,
+    ),
+    ApiError,
+> {
     let id = request
         .terminal
         .as_deref()
@@ -674,6 +689,9 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     let mut weighed = state.store.index().unwrap_or_default();
     let mut reread_due = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
+    let mut audit_clock = tokio::time::interval(Duration::from_secs(1));
+    audit_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    async {
     loop {
         // The subscriptions to read after this wake-up.
         let mut refresh = Vec::<String>::new();
@@ -709,7 +727,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             terminals.remove(&request.id);
                             conversations.stop(&request.id);
                             traced.remove(&request.id);
-                            if let Some(frame) = inputs.end_follow(&request.id, None)
+                            if let Some(frame) = inputs.end_follow(&state, &request.id, None).await
                                 && !send_collection(&mut socket, frame).await { return; }
                             break 'command;
                         }
@@ -735,7 +753,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         terminals.remove(&request.id);
                         conversations.stop(&request.id);
                         traced.remove(&request.id);
-                        if let Some(frame) = inputs.end_follow(&request.id, None)
+                        if let Some(frame) = inputs.end_follow(&state, &request.id, None).await
                             && !send_collection(&mut socket, frame).await { return; }
                         if request.collection == "conversation" {
                             let target = request.conversation.as_deref().unwrap_or_default();
@@ -781,6 +799,11 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             }
             result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
+                if inputs.has_open() {
+                    for frame in inputs.maintain(&state, &session).await {
+                        if !send_collection(&mut socket, frame).await { return; }
+                    }
+                }
                 // Weigh only the commits since the last look: a reread is due when one of them
                 // can change a held window.
                 let index = state.store.index().unwrap_or(weighed);
@@ -801,6 +824,11 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "agents")) => {
                 refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "agents")).map(|(id, _)| id.clone()));
             }
+            _ = audit_clock.tick(), if !command_waiting && inputs.has_open() => {
+                for frame in inputs.maintain(&state, &session).await {
+                    if !send_collection(&mut socket, frame).await { return; }
+                }
+            }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
                 if !conversations.0.contains_key(&id) { continue; }
@@ -814,12 +842,12 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                     Some(TerminalFrame::Screen(envelope)) => (json!({"kind":"screen", "id":id, "collection":"terminal", "snapshot":envelope["snapshot"], "value":envelope["value"]}), None),
                     Some(TerminalFrame::Ended(error)) => {
                         terminals.remove(&id);
-                        let ended = inputs.end_follow(&id, error["code"].as_str());
+                        let ended = inputs.end_follow(&state, &id, error["code"].as_str()).await;
                         (json!({"kind":"error", "id":id, "collection":"terminal", "code":error["code"], "message":error["message"], "retryable":error["retryable"]}), ended)
                     }
                     None => {
                         terminals.remove(&id);
-                        (json!({"kind":"error", "id":id, "collection":"terminal", "code":"internal", "message":"the terminal stream stopped"}), inputs.end_follow(&id, None))
+                        (json!({"kind":"error", "id":id, "collection":"terminal", "code":"internal", "message":"the terminal stream stopped"}), inputs.end_follow(&state, &id, None).await)
                     }
                 };
                 if !send_collection(&mut socket, message).await { return; }
@@ -883,6 +911,55 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             }
         }
     }
+    }.await;
+    inputs.finish_all(&state).await;
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TerminalInputAuditQuery {
+    terminal: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+pub(super) async fn terminal_input_audit(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<TerminalInputAuditQuery>,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    require_scope(&session, "read.projections")?;
+    require_scope(&session, "terminal.read")?;
+    let person = if session.scopes.contains(AUDIT_READ_SCOPE) {
+        None
+    } else if session.authority_actor.starts_with("person/")
+        && session.authority_actor.matches('/').count() == 1
+    {
+        Some(session.authority_actor)
+    } else {
+        return Err(forbidden(
+            "terminal input audit requires a delegating person or explicit fleet-auditor grant",
+        ));
+    };
+    let terminal = terminal_subject(&query.terminal);
+    if terminal.is_empty() || terminal.len() > 512 || terminal.chars().any(char::is_whitespace) {
+        return Err(validation("the input audit requires one terminal identity"));
+    }
+    let store = state.store.clone();
+    let (snapshot, history) = blocking_store(move || {
+        store.read_snapshot(|index| {
+            let history = store.input_session_history(
+                &terminal,
+                person.as_deref(),
+                query.cursor.as_deref(),
+                query.limit.unwrap_or(200),
+                client_now_ms() as u64,
+            )?;
+            Ok((client_snapshot_at(&state, index), history))
+        })
+    })
+    .await?;
+    Ok((Extension(snapshot), Json(history)))
 }
 
 #[derive(Deserialize)]
@@ -1114,6 +1191,8 @@ const ALL_SCOPES: &[&str] = &[
     "control.runtimes",
     "control.pairing",
 ];
+/// Fleet-wide audit is opt-in, never inherited from default full/limited control.
+const AUDIT_READ_SCOPE: &str = "terminal.audit.read";
 const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "read.projections",
     "read.glasses",
@@ -1243,6 +1322,8 @@ pub(super) struct ClientSession {
 #[derive(Clone, Debug)]
 struct PairedCredential {
     subject: String,
+    completed_claim: String,
+    device_id: Option<String>,
     paired_at: u64,
     expires_at_unix_ms: u128,
 }
@@ -1355,6 +1436,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         .collect::<Vec<_>>();
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
+    capabilities.push(json!({"id":AUDIT_READ_SCOPE, "version":1, "state":if session.scopes.contains(AUDIT_READ_SCOPE) {"granted"} else {"ungranted"}}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
@@ -1457,6 +1539,12 @@ pub(super) fn authenticate(
     };
     let pairing = PairedCredential {
         subject: paired.subject.clone(),
+        completed_claim: paired.id.clone(),
+        device_id: paired
+            .body
+            .pointer("/fields/device_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         paired_at: paired.store_index,
         expires_at_unix_ms: paired
             .body
@@ -3418,7 +3506,11 @@ pub(super) async fn clients_list(
     // A paired phone acts as person/NAME/session/ID: name its device.
     let people = items
         .iter()
-        .filter(|item| item["actor"].as_str().is_some_and(|actor| actor.contains("/session/")))
+        .filter(|item| {
+            item["actor"]
+                .as_str()
+                .is_some_and(|actor| actor.contains("/session/"))
+        })
         .filter_map(|item| item["person"].as_str().map(str::to_owned))
         .filter(|person| person.starts_with("person/"))
         .collect::<BTreeSet<_>>();
@@ -3426,7 +3518,10 @@ pub(super) async fn clients_list(
     for person in people {
         for device in device_resources(&state, &snapshot, &person)? {
             if let Some(actor) = device["session_actor"].as_str() {
-                devices.insert(actor.to_owned(), (device["id"].clone(), device["name"].clone()));
+                devices.insert(
+                    actor.to_owned(),
+                    (device["id"].clone(), device["name"].clone()),
+                );
             }
         }
     }
@@ -4806,10 +4901,15 @@ type TranscriptSeen = Option<(u64, std::time::SystemTime)>;
 type HashMap<K, V> = std::collections::HashMap<K, V>;
 const ISSUED_CURSORS: usize = 4096;
 
-fn issued_cursors()
--> &'static std::sync::Mutex<(std::collections::VecDeque<String>, HashMap<String, TranscriptSeen>)> {
+fn issued_cursors() -> &'static std::sync::Mutex<(
+    std::collections::VecDeque<String>,
+    HashMap<String, TranscriptSeen>,
+)> {
     static ISSUED: std::sync::OnceLock<
-        std::sync::Mutex<(std::collections::VecDeque<String>, HashMap<String, TranscriptSeen>)>,
+        std::sync::Mutex<(
+            std::collections::VecDeque<String>,
+            HashMap<String, TranscriptSeen>,
+        )>,
     > = std::sync::OnceLock::new();
     ISSUED.get_or_init(Default::default)
 }
@@ -4955,7 +5055,9 @@ async fn conversation_changes_local(
         };
         if !since.changed(state)? {
             mark = since;
-            quiet = Some(json!({"kind":"conversation-changes", "session_id":session_id, "items":[], "next_cursor":cursor}));
+            quiet = Some(
+                json!({"kind":"conversation-changes", "session_id":session_id, "items":[], "next_cursor":cursor}),
+            );
         }
     }
     loop {
@@ -5102,7 +5204,12 @@ pub(super) async fn conversation_stream(
     } else {
         conversation_read_now(&state, &session, &session_id, query.after.as_deref())?;
     }
-    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
+    let presence = super::client_presence::open_stream(
+        &state.node,
+        &session,
+        &headers,
+        super::client_now_ms(),
+    );
     presence.follow("conversation", format!("conversation:{id}"));
     if let Some(trace) = super::client_web::traceparent_query(uri.query()) {
         super::client_web::record_span(
@@ -5117,7 +5224,8 @@ pub(super) async fn conversation_stream(
         .protocols([CONVERSATION_SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
             let _presence = presence;
-            conversation_stream_socket(socket, state, session, session_id, query.after, remote).await
+            conversation_stream_socket(socket, state, session, session_id, query.after, remote)
+                .await
         }))
 }
 
@@ -5509,12 +5617,14 @@ fn feed_events_after(
     let mut events = store
         .events_after_bounded(after.claim, limit)?
         .into_iter()
+        .filter(|record| !private_claim_subject(&record.subject))
         .map(|record| (record, None))
         .collect::<Vec<_>>();
     events.extend(
         store
             .local_observations_after(local_after, limit)?
             .into_iter()
+            .filter(|record| !private_claim_subject(&record.subject))
             .map(local_feed_event),
     );
     events.sort_by_key(feed_order);
@@ -5527,12 +5637,14 @@ fn feed_events_tail(store: &Store, limit: usize) -> anyhow::Result<Vec<FeedEvent
     let mut events = store
         .events_tail_bounded(limit)?
         .into_iter()
+        .filter(|record| !private_claim_subject(&record.subject))
         .map(|record| (record, None))
         .collect::<Vec<_>>();
     events.extend(
         store
             .local_observations_tail(limit)?
             .into_iter()
+            .filter(|record| !private_claim_subject(&record.subject))
             .map(local_feed_event),
     );
     events.sort_by_key(feed_order);
@@ -5548,7 +5660,7 @@ pub(super) struct PairingBegin {
     device_name: String,
     person_id: String,
     full_control: Option<bool>,
-    /// Narrows the default device grant; every entry must be a limited pairing scope.
+    /// Explicit limited scopes, optionally including the separate fleet-auditor grant.
     scopes: Option<Vec<String>>,
 }
 
@@ -5598,21 +5710,24 @@ pub(super) async fn pairing_begin(
         (true, None) => ALL_SCOPES.to_vec(),
         (false, None) => LIMITED_PAIRING_SCOPES.to_vec(),
         (false, Some(requested)) => {
-            if let Some(unknown) = requested
-                .iter()
-                .find(|scope| !LIMITED_PAIRING_SCOPES.contains(&scope.as_str()))
-            {
+            if let Some(unknown) = requested.iter().find(|scope| {
+                !LIMITED_PAIRING_SCOPES.contains(&scope.as_str())
+                    && scope.as_str() != AUDIT_READ_SCOPE
+            }) {
                 return Err(validation(format!(
-                    "the pairing scope `{unknown}` is not one of the limited pairing scopes: {}",
+                    "the pairing scope `{unknown}` is not one of the explicit pairing scopes: {}, {AUDIT_READ_SCOPE}",
                     LIMITED_PAIRING_SCOPES.join(", ")
                 )));
             }
             if requested.is_empty() {
-                return Err(validation("the pairing request must name at least one scope"));
+                return Err(validation(
+                    "the pairing request must name at least one scope",
+                ));
             }
             // Canonical order, duplicates dropped.
             LIMITED_PAIRING_SCOPES
                 .iter()
+                .chain(std::iter::once(&AUDIT_READ_SCOPE))
                 .copied()
                 .filter(|scope| requested.iter().any(|requested| requested == scope))
                 .collect()
@@ -5742,7 +5857,11 @@ pub(super) async fn pairing_complete(
     let scopes = match begun.body.pointer("/fields/scopes") {
         Some(Value::Array(values)) => values
             .iter()
-            .map(|value| value.as_str().filter(|scope| ALL_SCOPES.contains(scope)))
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|scope| ALL_SCOPES.contains(scope) || *scope == AUDIT_READ_SCOPE)
+            })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| validation("the pairing has invalid delegated scopes"))?,
         None => LIMITED_PAIRING_SCOPES.to_vec(),
@@ -6163,7 +6282,12 @@ pub(super) async fn terminal_stream(
         query.incarnation.as_deref(),
         stream_capability,
     )?;
-    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
+    let presence = super::client_presence::open_stream(
+        &state.node,
+        &session,
+        &headers,
+        super::client_now_ms(),
+    );
     presence.follow("terminal", format!("terminal:{id}"));
     if let Some(trace) = super::client_web::traceparent_query(uri.query()) {
         super::client_web::record_span(
@@ -6178,7 +6302,9 @@ pub(super) async fn terminal_stream(
         .protocols([TERMINAL_SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
             let _presence = presence;
-            follow.run(state, TerminalSink::Socket(Box::new(socket))).await
+            follow
+                .run(state, TerminalSink::Socket(Box::new(socket)))
+                .await
         }))
 }
 
@@ -7942,8 +8068,14 @@ async fn dispatch_action(
                     from: authority_actor.clone(),
                     to,
                     // An attachment may travel alone; text is then optional.
-                    content: if p.get("attachments").is_some_and(|value| value.as_array().is_some_and(|list| !list.is_empty())) {
-                        p.get("content").and_then(Value::as_str).unwrap_or_default().to_owned()
+                    content: if p
+                        .get("attachments")
+                        .is_some_and(|value| value.as_array().is_some_and(|list| !list.is_empty()))
+                    {
+                        p.get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned()
                     } else {
                         parameter_string(p, "content")?
                     },
@@ -8732,8 +8864,16 @@ async fn dispatch_action(
                 })
                 .map_err(ApiError::bad)?;
             // A revoked device's key signs nothing more, on every member.
-            let field = |name: &str| paired.body.pointer(&format!("/fields/{name}")).and_then(Value::as_str);
-            if let (Some(key), Some(person)) = (field("device_public_key").and_then(device_signing_key), field("person_id")) {
+            let field = |name: &str| {
+                paired
+                    .body
+                    .pointer(&format!("/fields/{name}"))
+                    .and_then(Value::as_str)
+            };
+            if let (Some(key), Some(person)) = (
+                field("device_public_key").and_then(device_signing_key),
+                field("person_id"),
+            ) {
                 state
                     .store
                     .revoke_device_key(person, key, &format!("pairing of {device} revoked"))
@@ -9152,22 +9292,49 @@ mod tests {
         let state = test_state(root.path());
         let subject = "agent/todo-worker";
         let append = |kind: &str, fields: Value| {
-            state.store.append_claim(&ClaimInput {
-                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
-                fields: fields.as_object().unwrap().iter()
-                    .map(|(key, value)| (key.clone(), value.clone())).collect(),
-                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-            }).unwrap()
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields: fields
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
         };
-        assert!(agent_todo(&state.store, subject, Some("one"), state.store.index().unwrap()).unwrap().is_null());
-        append("runtime.observed", json!({
-            "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
-        }));
-        append("harness.session-file", json!({
-            "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/session"
-        }));
+        assert!(
+            agent_todo(
+                &state.store,
+                subject,
+                Some("one"),
+                state.store.index().unwrap()
+            )
+            .unwrap()
+            .is_null()
+        );
+        append(
+            "runtime.observed",
+            json!({
+                "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
+            }),
+        );
+        append(
+            "harness.session-file",
+            json!({
+                "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/session"
+            }),
+        );
         let before = state.store.index().unwrap();
-        let cached = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        let cached =
+            client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
         assert!(cached.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
         let snapshot = json!({
             "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
@@ -9178,31 +9345,60 @@ mod tests {
         let first = append("harness.todo.observed", snapshot.clone());
         assert!(crate::store::local_observation_position(&first).is_none());
         assert!(state.store.index().unwrap() > before);
-        let old = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        let old =
+            client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
         assert!(old.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
-        let refreshed = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", first.store_index).unwrap();
-        assert_eq!(refreshed.iter().find(|agent| agent["id"] == subject).unwrap()["todo"]["snapshot"], snapshot);
-        let first_value = agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap();
+        let refreshed = client_agent_resources(
+            &state.store,
+            true,
+            "2026-10-03T09:00:00Z",
+            first.store_index,
+        )
+        .unwrap();
+        assert_eq!(
+            refreshed
+                .iter()
+                .find(|agent| agent["id"] == subject)
+                .unwrap()["todo"]["snapshot"],
+            snapshot
+        );
+        let first_value =
+            agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap();
         assert_eq!(first_value["snapshot"], snapshot);
         assert_eq!(first_value["claim_id"], first.id);
         assert_eq!(first_value["stale"], false);
-        assert_eq!(agent_todo(&state.store, subject, Some("two"), first.store_index).unwrap()["stale"], true);
+        assert_eq!(
+            agent_todo(&state.store, subject, Some("two"), first.store_index).unwrap()["stale"],
+            true
+        );
         let mut empty = snapshot;
         empty["phases"] = json!([]);
         empty["totals"]["blocked"] = json!(0);
         empty["truncated"] = json!(true);
-        append("harness.session-file", json!({
-            "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/fence"
-        }));
+        append(
+            "harness.session-file",
+            json!({
+                "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/fence"
+            }),
+        );
         let second = append("harness.todo.observed", empty.clone());
         let latest = agent_todo(&state.store, subject, Some("one"), second.store_index).unwrap();
         assert_eq!(latest["snapshot"], empty);
         assert_eq!(latest["claim_id"], second.id);
-        assert_eq!(agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap()["claim_id"], first.id);
-        let changed = append("harness.session-file", json!({
-            "harness":"omp", "agent":subject, "session_id":"native-two", "path":"/tmp/session"
-        }));
-        assert_eq!(agent_todo(&state.store, subject, Some("one"), changed.store_index).unwrap()["stale"], true);
+        assert_eq!(
+            agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap()["claim_id"],
+            first.id
+        );
+        let changed = append(
+            "harness.session-file",
+            json!({
+                "harness":"omp", "agent":subject, "session_id":"native-two", "path":"/tmp/session"
+            }),
+        );
+        assert_eq!(
+            agent_todo(&state.store, subject, Some("one"), changed.store_index).unwrap()["stale"],
+            true
+        );
     }
 
     #[test]
@@ -9211,30 +9407,49 @@ mod tests {
         let state = test_state(root.path());
         let subject = "agent/malformed-todo";
         let append = |kind: &str, fields: Value| {
-            state.store.append_claim(&ClaimInput {
-                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
-                fields: serde_json::from_value(fields).unwrap(),
-                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-            }).unwrap()
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
         };
-        append("runtime.observed", json!({
-            "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
-        }));
-        let claim = append("harness.todo.observed", json!({
-            "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
-            "observed_at":"2026-10-03T09:00:00Z", "source_op":"clear",
-            "phases":[], "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0},
-            "truncated":false
-        }));
+        append(
+            "runtime.observed",
+            json!({
+                "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
+            }),
+        );
+        let claim = append(
+            "harness.todo.observed",
+            json!({
+                "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
+                "observed_at":"2026-10-03T09:00:00Z", "source_op":"clear",
+                "phases":[], "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0},
+                "truncated":false
+            }),
+        );
         // Simulate an older or corrupt replicated record beyond the typed writer boundary.
         let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
-        connection.execute(
-            "UPDATE claims SET body=json_set(body, '$.fields.unrecognized', 1) WHERE id=?1",
-            [&claim.id],
-        ).unwrap();
+        connection
+            .execute(
+                "UPDATE claims SET body=json_set(body, '$.fields.unrecognized', 1) WHERE id=?1",
+                [&claim.id],
+            )
+            .unwrap();
         let items = client_agent_resources(
-            &state.store, true, "2026-10-03T09:00:00Z", state.store.index().unwrap(),
-        ).unwrap();
+            &state.store,
+            true,
+            "2026-10-03T09:00:00Z",
+            state.store.index().unwrap(),
+        )
+        .unwrap();
         assert!(items.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
     }
 
@@ -9431,10 +9646,19 @@ mod tests {
         let state = test_state(root.path());
         let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
         image.extend([7; 32]);
-        let hash = crate::blobs::BlobDir::under(root.path()).put(&image).unwrap();
+        let hash = crate::blobs::BlobDir::under(root.path())
+            .put(&image)
+            .unwrap();
         state
             .store
-            .record_blob_upload("person/alex", &hash, "image/png", image.len() as u64, 1 << 20, 60_000)
+            .record_blob_upload(
+                "person/alex",
+                &hash,
+                "image/png",
+                image.len() as u64,
+                1 << 20,
+                60_000,
+            )
             .unwrap();
         let sent = accept_message(
             &state,
@@ -9503,72 +9727,142 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
         let observe = |subject: &str, kind: &str, facts: Value| {
-            state.store.append_client_claim(&crate::model::ClaimInput {
-                subject: subject.into(),
-                kind: "resource.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([("kind".into(), json!(kind)), ("facts".into(), facts)]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            }).unwrap();
+            state
+                .store
+                .append_client_claim(&crate::model::ClaimInput {
+                    subject: subject.into(),
+                    kind: "resource.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("kind".into(), json!(kind)), ("facts".into(), facts)]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
         };
-        observe("resource/github/a", "vcs.pull-request", json!({"title":"Old", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}));
-        observe("resource/github/b", "vcs.pull-request", json!({"title":"Second", "opened_by":"agent/alice", "opened_by_run":"mission-run/two"}));
-        observe("resource/github/c", "vcs.pull-request", json!({"title":"Other", "opened_by":"agent/bob"}));
-        observe("resource/repository", "vcs.repository", json!({"url":"https://example.org/repository"}));
-        observe("resource/github/a", "vcs.pull-request", json!({"title":"New", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}));
+        observe(
+            "resource/github/a",
+            "vcs.pull-request",
+            json!({"title":"Old", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}),
+        );
+        observe(
+            "resource/github/b",
+            "vcs.pull-request",
+            json!({"title":"Second", "opened_by":"agent/alice", "opened_by_run":"mission-run/two"}),
+        );
+        observe(
+            "resource/github/c",
+            "vcs.pull-request",
+            json!({"title":"Other", "opened_by":"agent/bob"}),
+        );
+        observe(
+            "resource/repository",
+            "vcs.repository",
+            json!({"url":"https://example.org/repository"}),
+        );
+        observe(
+            "resource/github/a",
+            "vcs.pull-request",
+            json!({"title":"New", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}),
+        );
         let app = super::super::router(state.clone());
         let read = |uri: String| {
             let app = app.clone();
             async move {
-                let response = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
                 let status = response.status();
-                let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap();
+                let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
                 (status, serde_json::from_slice::<Value>(&body).unwrap())
             }
         };
         let (status, all) = read("/v1/client/resources".into()).await;
         assert_eq!(status, StatusCode::OK, "{all}");
-        assert_eq!(all["value"]["items"].as_array().unwrap().iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(),
-            ["resource/github/a", "resource/github/b", "resource/github/c", "resource/repository"]);
+        assert_eq!(
+            all["value"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "resource/github/a",
+                "resource/github/b",
+                "resource/github/c",
+                "resource/repository"
+            ]
+        );
         assert_eq!(all["value"]["items"][0]["facts"]["title"], "New");
         assert_eq!(all["value"]["items"][0]["opened_by"], "agent/alice");
         assert_eq!(all["value"]["items"][0]["opened_by_run"], "mission-run/one");
-        chrono::DateTime::parse_from_rfc3339(all["value"]["items"][0]["observed_at"].as_str().unwrap()).unwrap();
+        chrono::DateTime::parse_from_rfc3339(
+            all["value"]["items"][0]["observed_at"].as_str().unwrap(),
+        )
+        .unwrap();
         assert_eq!(all["value"]["items"][3]["opened_by"], Value::Null);
-        let (status, run) = read("/v1/client/resources?opened_by=mission-run%2Fone&kind=vcs.pull-request".into()).await;
+        let (status, run) =
+            read("/v1/client/resources?opened_by=mission-run%2Fone&kind=vcs.pull-request".into())
+                .await;
         assert_eq!(status, StatusCode::OK, "{run}");
-        assert_eq!(run["value"]["items"], json!([all["value"]["items"][0].clone()]));
+        assert_eq!(
+            run["value"]["items"],
+            json!([all["value"]["items"][0].clone()])
+        );
         let (status, repository) = read("/v1/client/resources?kind=vcs.repository".into()).await;
         assert_eq!(status, StatusCode::OK, "{repository}");
-        assert_eq!(repository["value"]["items"], json!([all["value"]["items"][3].clone()]));
+        assert_eq!(
+            repository["value"]["items"],
+            json!([all["value"]["items"][3].clone()])
+        );
         let filters = "opened_by=agent%2Falice&kind=vcs.pull-request&subject_prefix=resource%2Fgithub%2F&limit=1";
         let (status, first) = read(format!("/v1/client/resources?{filters}")).await;
         assert_eq!(status, StatusCode::OK, "{first}");
-        assert_eq!(first["value"]["filters"], json!({"opened_by":"agent/alice", "kind":"vcs.pull-request", "subject_prefix":"resource/github/"}));
-        assert_eq!(first["value"]["items"], json!([all["value"]["items"][0].clone()]));
+        assert_eq!(
+            first["value"]["filters"],
+            json!({"opened_by":"agent/alice", "kind":"vcs.pull-request", "subject_prefix":"resource/github/"})
+        );
+        assert_eq!(
+            first["value"]["items"],
+            json!([all["value"]["items"][0].clone()])
+        );
         assert_eq!(first["value"]["page"]["has_more"], true);
         let cursor = urlencoding::encode(first["value"]["page"]["next_cursor"].as_str().unwrap());
         let continuation = format!("/v1/client/resources?{filters}&cursor={cursor}");
-        state.store.append_claim(&ClaimInput {
-            subject: "custom/test/unrelated".into(),
-            kind: "custom.test.marker".into(),
-            actor: None,
-            fields: BTreeMap::new(),
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: None,
-        }).unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/test/unrelated".into(),
+                kind: "custom.test.marker".into(),
+                actor: None,
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         let (status, second) = read(continuation.clone()).await;
         assert_eq!(status, StatusCode::OK, "{second}");
         assert_eq!(second["snapshot"], first["snapshot"]);
-        assert_eq!(second["value"]["items"], json!([all["value"]["items"][1].clone()]));
+        assert_eq!(
+            second["value"]["items"],
+            json!([all["value"]["items"][1].clone()])
+        );
         assert_eq!(second["value"]["page"]["has_more"], false);
-        let (status, changed_filter) = read(format!("/v1/client/resources?opened_by=agent%2Fbob&cursor={cursor}")).await;
+        let (status, changed_filter) = read(format!(
+            "/v1/client/resources?opened_by=agent%2Fbob&cursor={cursor}"
+        ))
+        .await;
         assert_eq!(status, StatusCode::GONE, "{changed_filter}");
         assert_eq!(changed_filter["code"], "page-cursor-expired");
-        observe("resource/github/a", "vcs.pull-request", json!({"title":"Reassigned", "opened_by":"agent/bob"}));
+        observe(
+            "resource/github/a",
+            "vcs.pull-request",
+            json!({"title":"Reassigned", "opened_by":"agent/bob"}),
+        );
         let (status, expired) = read(continuation).await;
         assert_eq!(status, StatusCode::GONE, "{expired}");
         assert_eq!(expired["code"], "page-cursor-expired");
@@ -9596,26 +9890,45 @@ mod tests {
         let state = test_state(root.path());
         let credential = "resources-reader";
         let app = super::super::fabric_router(state.clone());
-        for (scopes, expected) in [(json!([]), StatusCode::FORBIDDEN), (json!(["read.projections"]), StatusCode::OK)] {
-            state.store.append_claim(&ClaimInput {
-                subject: "custom/client/resources-reader".into(),
-                kind: "custom.client.pairing-completed".into(),
-                actor: Some("person/ada".into()),
-                fields: BTreeMap::from([
-                    ("credential_hash".into(), json!(credential_digest(credential))),
-                    ("session_actor".into(), json!("client/resources-reader")),
-                    ("person_id".into(), json!("person/ada")),
-                    ("scopes".into(), scopes),
-                    ("expires_at_unix_ms".into(), json!(client_now_ms() as u64 + 60_000)),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            }).unwrap();
-            let response = app.clone().oneshot(Request::builder()
-                .uri("/v1/client/resources")
-                .header(AUTHORIZATION, format!("Bearer {credential}"))
-                .body(Body::empty()).unwrap()).await.unwrap();
+        for (scopes, expected) in [
+            (json!([]), StatusCode::FORBIDDEN),
+            (json!(["read.projections"]), StatusCode::OK),
+        ] {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "custom/client/resources-reader".into(),
+                    kind: "custom.client.pairing-completed".into(),
+                    actor: Some("person/ada".into()),
+                    fields: BTreeMap::from([
+                        (
+                            "credential_hash".into(),
+                            json!(credential_digest(credential)),
+                        ),
+                        ("session_actor".into(), json!("client/resources-reader")),
+                        ("person_id".into(), json!("person/ada")),
+                        ("scopes".into(), scopes),
+                        (
+                            "expires_at_unix_ms".into(),
+                            json!(client_now_ms() as u64 + 60_000),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/client/resources")
+                        .header(AUTHORIZATION, format!("Bearer {credential}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(response.status(), expected);
         }
     }
@@ -12371,10 +12684,9 @@ mission "example/zero-run" state="ready" {
                     idempotency_key: None,
                 })
                 .unwrap();
-            let idle =
-                conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 50)
-                    .await
-                    .unwrap();
+            let idle = conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 50)
+                .await
+                .unwrap();
             assert!(idle["items"].as_array().unwrap().is_empty());
             cursor = idle["next_cursor"].as_str().unwrap().to_owned();
         }
@@ -12401,7 +12713,10 @@ mission "example/zero-run" state="ready" {
         let changed = conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 50)
             .await
             .unwrap();
-        assert!(!changed["items"].as_array().unwrap().is_empty(), "{changed}");
+        assert!(
+            !changed["items"].as_array().unwrap().is_empty(),
+            "{changed}"
+        );
         assert_eq!(rebuilds(), 2);
         // A cursor this member did not give out (another member's, or one from before a
         // restart) is read as before.

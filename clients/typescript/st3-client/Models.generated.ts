@@ -521,7 +521,7 @@ export type Envelope = {
   api_version: "st3.client.v0";
   request_id: RequestId;
   snapshot: Snapshot;
-  value: (Capabilities | DocumentContent | SubjectDefinition | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod);
+  value: (Capabilities | DocumentContent | SubjectDefinition | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | TerminalInputAuditHistory | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod);
 };
 
 export type ErrorCode = ("attention-migrated" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
@@ -646,6 +646,10 @@ export type HostRepositories = {
 };
 
 export type Id = string;
+
+export type InputSessionCloseReason = "client-close" | "socket-disconnected" | "replaced" | "gap" | "rejected" | "detached" | "incarnation-changed" | "revoked" | "audit-unavailable" | "owner-restarted";
+
+export type InputSessionEvent = "opened" | "checkpoint" | "closed" | "interrupted";
 
 export type Lane = ResourceHeader & {
   approver_id: (Id | null);
@@ -984,7 +988,7 @@ export type PairingBegin = {
   device_name: string;
   full_control?: boolean;
   person_id: string;
-  scopes?: Array<"read.projections" | "read.glasses" | "control.glasses" | "terminal.read" | "control.attention" | "control.launches">;
+  scopes?: Array<"read.projections" | "read.glasses" | "control.glasses" | "terminal.read" | "control.attention" | "control.launches" | "terminal.audit.read">;
 };
 
 export type PairingChallenge = {
@@ -1322,6 +1326,41 @@ export type TerminalFacts = {
 };
 
 export type TerminalId = string;
+
+export type TerminalInputAuditHistory = {
+  api_version: "st3.client.v0";
+  complete: boolean;
+  items: Array<TerminalInputAuditRecord>;
+  kind: "terminal-input-audit";
+  next_cursor: string | null;
+  owner_coverage: Array<string>;
+  retained_from: number;
+  terminal: string;
+};
+
+export type TerminalInputAuditRecord = {
+  attachment: string;
+  attachment_claim: string;
+  authority_actor: string;
+  device_actor: string;
+  device_id: string | null;
+  event: InputSessionEvent;
+  incarnation: string;
+  observed_at_unix_ms: number;
+  opened_at_unix_ms: number;
+  ordinal: number;
+  owner: string;
+  owner_epoch: string;
+  pairing_claim: string | null;
+  person: string | null;
+  reason: (InputSessionCloseReason | null);
+  session_id: string;
+  successful_batches: number;
+  successful_send_bytes: number;
+  terminal: string;
+  uncertain_handoff: boolean;
+  version: 1;
+};
 
 export type TerminalInputClosedReason = "incarnation-changed" | "revoked" | "detached" | "gap" | "rejected";
 

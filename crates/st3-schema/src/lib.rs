@@ -1,6 +1,7 @@
 //! The authoritative st3 subject, resource, and claim registry.
 
 pub mod glasses;
+pub mod input_sessions;
 pub mod owned_terminals;
 
 use std::collections::BTreeMap;
@@ -311,6 +312,9 @@ impl Registry {
                 "a subject needs a non-empty path after its registered family",
             ));
         }
+        if spec.family == "input-session" {
+            input_sessions::validate_subject(subject)?;
+        }
         if spec.family == "custom" {
             let parts = subject.split('/').collect::<Vec<_>>();
             if parts.len() < 3 || !parts[1..].iter().all(|part| valid_identifier_part(part)) {
@@ -416,6 +420,15 @@ impl Registry {
         }
         if kind == "harness.todo.observed" {
             validate_harness_todo(fields)?;
+        }
+        if subject_spec.family == "input-session" {
+            if kind != "terminal.input-session" {
+                return Err(error(
+                    "claim-write-forbidden",
+                    "an input session requires its dedicated owner audit claim",
+                ));
+            }
+            input_sessions::validate_fields(subject, fields)?;
         }
         if subject_spec.family == "glass" {
             glasses::owner(subject)?;
@@ -697,6 +710,12 @@ fn build_registry() -> Registry {
             false,
         ),
         ("host", "host/NAME", "A graph host.", false),
+        (
+            "input-session",
+            "input-session/OWNER/UUID",
+            "A terminal owner's metadata-only ordered input session audit.",
+            false,
+        ),
         (
             "lane",
             "lane/RUN/LOCAL_ID",
@@ -1035,6 +1054,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
 
     let mut claims = BTreeMap::new();
     let definitions: &[ClaimDefinition<'_>] = &[
+        (
+            "terminal.input-session",
+            &["input-session"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
+        ),
         (
             "harness.todo.observed",
             &["agent"],
@@ -2318,6 +2346,49 @@ fn claim_retention(kind: &str) -> Retention {
 
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
     let names: &[(&str, FieldSpec)] = match kind {
+        "terminal.input-session" => &[
+            ("version", required_integer()),
+            ("ordinal", required_integer()),
+            (
+                "event",
+                required_enum(&["opened", "checkpoint", "closed", "interrupted"]),
+            ),
+            ("session_id", required_string()),
+            ("owner", required_string()),
+            ("owner_epoch", required_string()),
+            ("terminal", required_reference()),
+            ("incarnation", required_string()),
+            ("attachment", required_reference()),
+            ("attachment_claim", required_string()),
+            ("device_id", string()),
+            ("device_actor", required_string()),
+            (
+                "authority_actor",
+                required_reference_to(&["person", "agent"]),
+            ),
+            ("person", reference_to(&["person"])),
+            ("pairing_claim", string()),
+            ("opened_at_unix_ms", required_integer()),
+            ("observed_at_unix_ms", required_integer()),
+            ("successful_send_bytes", required_integer()),
+            ("successful_batches", required_integer()),
+            ("uncertain_handoff", required_boolean()),
+            (
+                "reason",
+                enumeration(&[
+                    "client-close",
+                    "socket-disconnected",
+                    "replaced",
+                    "gap",
+                    "rejected",
+                    "detached",
+                    "incarnation-changed",
+                    "revoked",
+                    "audit-unavailable",
+                    "owner-restarted",
+                ]),
+            ),
+        ],
         "workspace.observed" => &[
             ("host", required_string()),
             ("workspace", required_string()),
@@ -2370,10 +2441,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("size", integer()),
             ("executable", boolean()),
         ],
-        "owned-set.revised" => &[
-            ("revision", required_string()),
-            ("body", required_object()),
-        ],
+        "owned-set.revised" => &[("revision", required_string()), ("body", required_object())],
         "mission.published" => &[
             ("revision", string()),
             ("state", string()),
@@ -2737,15 +2805,15 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         ],
         "principal.key-granted" => &[
             ("key", required_string()),
-            ("role", required_enum(&["root", "device", "agent", "plugin"])),
+            (
+                "role",
+                required_enum(&["root", "device", "agent", "plugin"]),
+            ),
             ("issuer", required_string()),
             ("issuer_key", required_string()),
             ("label", string()),
         ],
-        "principal.key-revoked" => &[
-            ("key", required_string()),
-            ("reason", string()),
-        ],
+        "principal.key-revoked" => &[("key", required_string()), ("reason", string())],
         "transport.observed" => &[
             ("status", required_enum(&["up", "down", "unknown"])),
             ("reason", string()),
@@ -3264,13 +3332,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         "subscription.watch-ended" => &[
             (
                 "reason",
-                required_enum(&[
-                    "closed",
-                    "merged",
-                    "deadline",
-                    "unwatched",
-                    "seat-ended",
-                ]),
+                required_enum(&["closed", "merged", "deadline", "unwatched", "seat-ended"]),
             ),
             ("since_unix_ms", required_string()),
             ("message", reference_to(&["message"])),
@@ -3506,13 +3568,31 @@ fn validate_harness_todo(fields: &BTreeMap<String, Value>) -> Result<(), Validat
     }
     serde_json::to_writer(BoundedWriter(0), fields)
         .map_err(|_| error("invalid-harness-todo", "todo fields exceed 64 KiB"))?;
-    let invalid = || error("invalid-harness-todo", "invalid todo shape, bounds or totals");
-    for name in ["harness", "session_id", "incarnation_id", "observed_at", "source_op"] {
-        if fields.get(name).and_then(Value::as_str).is_none_or(str::is_empty) {
+    let invalid = || {
+        error(
+            "invalid-harness-todo",
+            "invalid todo shape, bounds or totals",
+        )
+    };
+    for name in [
+        "harness",
+        "session_id",
+        "incarnation_id",
+        "observed_at",
+        "source_op",
+    ] {
+        if fields
+            .get(name)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
             return Err(invalid());
         }
     }
-    let phases = fields.get("phases").and_then(Value::as_array).ok_or_else(invalid)?;
+    let phases = fields
+        .get("phases")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid)?;
     if phases.len() > HARNESS_TODO_MAX_PHASES {
         return Err(invalid());
     }
@@ -3522,43 +3602,73 @@ fn validate_harness_todo(fields: &BTreeMap<String, Value>) -> Result<(), Validat
     for phase in phases {
         let phase = phase.as_object().ok_or_else(invalid)?;
         if phase.len() != 2
-            || phase.get("name").and_then(Value::as_str)
+            || phase
+                .get("name")
+                .and_then(Value::as_str)
                 .is_none_or(|name| name.len() > HARNESS_TODO_MAX_PHASE_BYTES)
         {
             return Err(invalid());
         }
-        let tasks = phase.get("tasks").and_then(Value::as_array).ok_or_else(invalid)?;
+        let tasks = phase
+            .get("tasks")
+            .and_then(Value::as_array)
+            .ok_or_else(invalid)?;
         task_count += tasks.len();
         if task_count > HARNESS_TODO_MAX_TASKS {
             return Err(invalid());
         }
         for task in tasks {
             let task = task.as_object().ok_or_else(invalid)?;
-            if task.keys().any(|key| !matches!(key.as_str(), "content" | "status" | "blocker"))
-                || task.get("content").and_then(Value::as_str)
+            if task
+                .keys()
+                .any(|key| !matches!(key.as_str(), "content" | "status" | "blocker"))
+                || task
+                    .get("content")
+                    .and_then(Value::as_str)
                     .is_none_or(|content| content.len() > HARNESS_TODO_MAX_TEXT_BYTES)
             {
                 return Err(invalid());
             }
             if let Some(blocker) = task.get("blocker")
-                && blocker.as_str().is_none_or(|text| text.len() > HARNESS_TODO_MAX_TEXT_BYTES)
+                && blocker
+                    .as_str()
+                    .is_none_or(|text| text.len() > HARNESS_TODO_MAX_TEXT_BYTES)
             {
                 return Err(invalid());
             }
-            let status = task.get("status").and_then(Value::as_str).ok_or_else(invalid)?;
-            let index = statuses.iter().position(|candidate| *candidate == status).ok_or_else(invalid)?;
+            let status = task
+                .get("status")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid)?;
+            let index = statuses
+                .iter()
+                .position(|candidate| *candidate == status)
+                .ok_or_else(invalid)?;
             visible[index] += 1;
         }
     }
-    let totals = fields.get("totals").and_then(Value::as_object).ok_or_else(invalid)?;
-    let truncated = fields.get("truncated").and_then(Value::as_bool).ok_or_else(invalid)?;
-    if totals.keys().any(|key| !statuses.contains(&key.as_str()) && key != "abandoned")
-        || totals.get("abandoned").is_some_and(|value| value.as_u64().is_none())
+    let totals = fields
+        .get("totals")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    let truncated = fields
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .ok_or_else(invalid)?;
+    if totals
+        .keys()
+        .any(|key| !statuses.contains(&key.as_str()) && key != "abandoned")
+        || totals
+            .get("abandoned")
+            .is_some_and(|value| value.as_u64().is_none())
     {
         return Err(invalid());
     }
     for (index, status) in statuses.iter().enumerate() {
-        let total = totals.get(*status).and_then(Value::as_u64).ok_or_else(invalid)?;
+        let total = totals
+            .get(*status)
+            .and_then(Value::as_u64)
+            .ok_or_else(invalid)?;
         if total < visible[index] || (!truncated && total != visible[index]) {
             return Err(invalid());
         }
@@ -3576,7 +3686,8 @@ mod tests {
             "observed_at": "2026-10-03T14:00:00Z", "source_op": "hydrate",
             "phases": [], "totals": {"pending": 0, "in_progress": 0, "completed": 0, "blocked": 0},
             "truncated": false
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn validate_todo(fields: &BTreeMap<String, Value>) -> Result<&ClaimSpec, ValidationError> {
@@ -3586,23 +3697,44 @@ mod tests {
     #[test]
     fn harness_todo_accepts_known_empty_and_fences_the_writer() {
         let fields = todo_fields();
-        let spec = registry().validate_public_claim(
-            "agent/run/worker", "harness.todo.observed", &fields, Some("agent/run/worker"),
-        ).unwrap();
+        let spec = registry()
+            .validate_public_claim(
+                "agent/run/worker",
+                "harness.todo.observed",
+                &fields,
+                Some("agent/run/worker"),
+            )
+            .unwrap();
         assert_eq!(spec.retention, Retention::Latest);
         assert_eq!(spec.cardinality, Cardinality::Append);
-        assert_eq!(registry().validate_public_claim(
-            "agent/run/worker", "harness.todo.observed", &fields, Some("agent/run/other"),
-        ).unwrap_err().code, "claim-write-forbidden");
-        assert!(registry().validate_claim("resource/example", "harness.todo.observed", &fields).is_err());
+        assert_eq!(
+            registry()
+                .validate_public_claim(
+                    "agent/run/worker",
+                    "harness.todo.observed",
+                    &fields,
+                    Some("agent/run/other"),
+                )
+                .unwrap_err()
+                .code,
+            "claim-write-forbidden"
+        );
+        assert!(
+            registry()
+                .validate_claim("resource/example", "harness.todo.observed", &fields)
+                .is_err()
+        );
     }
 
     #[test]
     fn harness_todo_validates_nested_shape_and_full_source_totals() {
         let mut fields = todo_fields();
-        fields.insert("phases".into(), serde_json::json!([{"name": "", "tasks": [
-            {"content": "work", "status": "blocked", "blocker": "approval"}
-        ]}]));
+        fields.insert(
+            "phases".into(),
+            serde_json::json!([{"name": "", "tasks": [
+                {"content": "work", "status": "blocked", "blocker": "approval"}
+            ]}]),
+        );
         fields.get_mut("totals").unwrap()["blocked"] = Value::from(1);
         validate_todo(&fields).unwrap();
         for task in [
@@ -3639,7 +3771,12 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&fields).unwrap()).unwrap();
         assert_eq!(snapshot.totals.abandoned, 3);
         assert!(!snapshot.truncated);
-        for count in [Value::from(-1), Value::from(1.5), Value::Null, Value::from("3")] {
+        for count in [
+            Value::from(-1),
+            Value::from(1.5),
+            Value::Null,
+            Value::from("3"),
+        ] {
             let mut invalid = fields.clone();
             invalid.get_mut("totals").unwrap()["abandoned"] = count;
             assert!(validate_todo(&invalid).is_err());
@@ -3647,21 +3784,32 @@ mod tests {
         let mut unknown = fields.clone();
         unknown.get_mut("totals").unwrap()["dropped"] = Value::from(3);
         assert!(validate_todo(&unknown).is_err());
-        fields.get_mut("totals").unwrap().as_object_mut().unwrap().remove("pending");
+        fields
+            .get_mut("totals")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("pending");
         assert!(validate_todo(&fields).is_err());
         let mut task_status = todo_fields();
-        task_status.insert("phases".into(), serde_json::json!([{"name":"Dropped","tasks":[
-            {"content":"Dropped task","status":"abandoned"}
-        ]}]));
+        task_status.insert(
+            "phases".into(),
+            serde_json::json!([{"name":"Dropped","tasks":[
+                {"content":"Dropped task","status":"abandoned"}
+            ]}]),
+        );
         assert!(validate_todo(&task_status).is_err());
     }
 
     #[test]
     fn harness_todo_enforces_utf8_collection_and_escaped_size_bounds() {
         let mut fields = todo_fields();
-        fields.insert("phases".into(), serde_json::json!([{"name": "é".repeat(64), "tasks": [
-            {"content": "é".repeat(256), "status": "pending", "blocker": "é".repeat(256)}
-        ]}]));
+        fields.insert(
+            "phases".into(),
+            serde_json::json!([{"name": "é".repeat(64), "tasks": [
+                {"content": "é".repeat(256), "status": "pending", "blocker": "é".repeat(256)}
+            ]}]),
+        );
         fields.get_mut("totals").unwrap()["pending"] = Value::from(1);
         validate_todo(&fields).unwrap();
         for (key, oversized) in [("content", "é".repeat(257)), ("blocker", "é".repeat(257))] {
@@ -3672,26 +3820,43 @@ mod tests {
         let mut invalid = fields.clone();
         invalid.get_mut("phases").unwrap()[0]["name"] = Value::String("é".repeat(65));
         assert!(validate_todo(&invalid).is_err());
-        fields.insert("phases".into(), serde_json::json!(
-            vec![serde_json::json!({"name": "", "tasks": []}); 16]
-        ));
+        fields.insert(
+            "phases".into(),
+            serde_json::json!(vec![serde_json::json!({"name": "", "tasks": []}); 16]),
+        );
         fields.get_mut("totals").unwrap()["pending"] = Value::from(0);
         validate_todo(&fields).unwrap();
-        fields.get_mut("phases").unwrap().as_array_mut().unwrap()
+        fields
+            .get_mut("phases")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
             .push(serde_json::json!({"name": "", "tasks": []}));
         assert!(validate_todo(&fields).is_err());
         let task = serde_json::json!({"content": "x", "status": "pending"});
-        fields.insert("phases".into(), serde_json::json!([{"name": "", "tasks": vec![task.clone(); 100]}]));
+        fields.insert(
+            "phases".into(),
+            serde_json::json!([{"name": "", "tasks": vec![task.clone(); 100]}]),
+        );
         fields.get_mut("totals").unwrap()["pending"] = Value::from(100);
         validate_todo(&fields).unwrap();
-        fields.get_mut("phases").unwrap()[0]["tasks"].as_array_mut().unwrap().push(task);
+        fields.get_mut("phases").unwrap()[0]["tasks"]
+            .as_array_mut()
+            .unwrap()
+            .push(task);
         assert!(validate_todo(&fields).is_err());
         let escaped = serde_json::json!({"content": "\u{0001}".repeat(512), "status": "pending"});
-        fields.insert("phases".into(), serde_json::json!([{"name": "", "tasks": vec![escaped; 100]}]));
+        fields.insert(
+            "phases".into(),
+            serde_json::json!([{"name": "", "tasks": vec![escaped; 100]}]),
+        );
         // Each string fits its byte bound, but JSON escaping exceeds the fields cap.
         assert!(validate_todo(&fields).is_err());
         fields = todo_fields();
-        fields.insert("session_id".into(), Value::String("x".repeat(HARNESS_TODO_MAX_FIELDS_BYTES)));
+        fields.insert(
+            "session_id".into(),
+            Value::String("x".repeat(HARNESS_TODO_MAX_FIELDS_BYTES)),
+        );
         assert!(validate_todo(&fields).is_err());
     }
 
@@ -3700,9 +3865,10 @@ mod tests {
         let mut fields = todo_fields();
         let size = serde_json::to_vec(&fields).unwrap().len();
         let session_size = fields["session_id"].as_str().unwrap().len();
-        fields.insert("session_id".into(), Value::String(
-            "x".repeat(HARNESS_TODO_MAX_FIELDS_BYTES - size + session_size),
-        ));
+        fields.insert(
+            "session_id".into(),
+            Value::String("x".repeat(HARNESS_TODO_MAX_FIELDS_BYTES - size + session_size)),
+        );
         validate_todo(&fields).unwrap();
         let mut session = fields["session_id"].as_str().unwrap().to_owned();
         session.push('x');
@@ -4213,10 +4379,18 @@ mod tests {
             .validate_resource_facts("vcs.issue", &BTreeMap::new())
             .unwrap();
         let facts = BTreeMap::from([
-            ("opened_by".into(), Value::String("agent/node.author".into())),
-            ("opened_by_run".into(), Value::String("mission-run/author".into())),
+            (
+                "opened_by".into(),
+                Value::String("agent/node.author".into()),
+            ),
+            (
+                "opened_by_run".into(),
+                Value::String("mission-run/author".into()),
+            ),
         ]);
-        registry().validate_resource_facts("vcs.issue", &facts).unwrap();
+        registry()
+            .validate_resource_facts("vcs.issue", &facts)
+            .unwrap();
         registry()
             .validate_public_claim(
                 "resource/github/acme/demo/issue/8",
@@ -4231,7 +4405,11 @@ mod tests {
         for name in ["opened_by", "opened_by_run"] {
             let mut invalid = facts.clone();
             invalid.insert(name.into(), Value::String("not-a-subject".into()));
-            assert!(registry().validate_resource_facts("vcs.issue", &invalid).is_err());
+            assert!(
+                registry()
+                    .validate_resource_facts("vcs.issue", &invalid)
+                    .is_err()
+            );
         }
     }
 

@@ -61,6 +61,7 @@
     { "id": "conversation.changes", "method": "GET", "path": "/v1/client/conversations/{id}/changes", "response": "ConversationChanges" },
     { "id": "events.list", "method": "GET", "path": "/v1/client/events", "response": "EventPage" },
     { "id": "terminal.screen", "method": "GET", "path": "/v1/client/terminals/{id}/screen", "response": "TerminalScreen" },
+    { "id": "terminal-input-audit.get", "method": "GET", "path": "/v1/client/terminal-input-audit", "response": "TerminalInputAuditHistory" },
     {"id": "glasses.list", "method": "GET", "path": "/v1/client/glasses", "response": "Page", "scope": "read.glasses"},
     {"id": "glasses.get", "method": "GET", "path": "/v1/client/glasses/{id}", "response": "Glass", "scope": "read.glasses"}
   ],

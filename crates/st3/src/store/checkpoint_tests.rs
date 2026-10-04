@@ -1787,3 +1787,57 @@ fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
     assert_eq!(after["complete"], false);
     assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().since_unix_ms, since);
 }
+
+#[test]
+fn input_audit_expiry_is_session_atomic_and_respects_protected_claims() {
+    let mut sealed = Sealed::default();
+    let subject = "input-session/alder/00000000-0000-0000-0000-000000000001";
+    let snapshot = |ordinal, event, at| {
+        draft(
+            "terminal.input-session",
+            subject,
+            json!({"ordinal": ordinal, "event": event, "observed_at_unix_ms": at}),
+        )
+    };
+    let opening = sealed.add("alder", 1, snapshot(0, "opened", 1));
+    let checkpoint = sealed.add("alder", 2, snapshot(1, "checkpoint", 2));
+    let closure = sealed.add("alder", 3, snapshot(2, "closed", 3));
+    let mut sealed = sealed.build();
+    sealed.cut_unix_ms = 40 * DAY_MS;
+    assert_eq!(
+        dropped(&plan_drops(&sealed)),
+        ids([&opening, &checkpoint, &closure])
+    );
+    sealed
+        .claims
+        .iter_mut()
+        .find(|claim| claim.claim.id == opening)
+        .unwrap()
+        .protected = true;
+    assert!(
+        dropped(&plan_drops(&sealed)).is_empty(),
+        "a protected opening must not lose its closure"
+    );
+}
+
+#[test]
+fn input_audit_retains_live_opening_and_highest_ordinal_not_last_arrival_or_source_time() {
+    let mut sealed = Sealed::default();
+    let subject = "input-session/alder/00000000-0000-0000-0000-000000000002";
+    let snapshot = |ordinal| {
+        draft(
+            "terminal.input-session",
+            subject,
+            json!({"ordinal": ordinal, "event": if ordinal == 0 { "opened" } else { "checkpoint" },
+            "observed_at_unix_ms": ordinal + 1}),
+        )
+    };
+    let opening = sealed.add("alder", 1, snapshot(0));
+    let head = sealed.add("alder", 2, snapshot(2));
+    let older = sealed.add("alder", 3, snapshot(1));
+    let mut sealed = sealed.build();
+    sealed.cut_unix_ms = 40 * DAY_MS;
+    assert_eq!(dropped(&plan_drops(&sealed)), ids([&older]));
+    assert!(!dropped(&plan_drops(&sealed)).contains(&opening));
+    assert!(!dropped(&plan_drops(&sealed)).contains(&head));
+}

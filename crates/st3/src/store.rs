@@ -92,6 +92,9 @@ mod accounts;
 mod attention_snapshot;
 mod backup;
 mod checkpoint_rules;
+mod input_sessions;
+#[cfg(test)]
+mod input_sessions_tests;
 mod limits;
 mod person_work;
 mod subagents;
@@ -185,6 +188,12 @@ WHERE kind IN ('mission-run.state','step-run.state','work.failed')
 CREATE INDEX IF NOT EXISTS claims_terminal_capability_hash_index
 ON claims(json_extract(body, '$.fields.capability_hash'), store_index)
 WHERE kind='custom.client.terminal-attached';
+CREATE INDEX IF NOT EXISTS claims_input_session_ordinal_index
+ON claims(subject, json_extract(body,'$.fields.ordinal'))
+WHERE kind='terminal.input-session';
+CREATE INDEX IF NOT EXISTS claims_input_session_terminal_index
+ON claims(json_extract(body,'$.fields.terminal'), json_extract(body,'$.fields.person'), subject)
+WHERE kind='terminal.input-session';
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -1204,13 +1213,34 @@ struct ChildMissionContext {
     default_selector: Option<WorkSelector>,
 }
 
-fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str) -> Result<Option<String>> {
-    let Some(requested) = claim_by_id_tx(connection, discovery)?.filter(|claim|
-        claim.subject == resource && claim.body.pointer("/fields/kind").and_then(Value::as_str) == Some("vcs.ref")) else { return Ok(None); };
-    let Some(current) = latest_actual(connection, resource)?.and_then(|actual| actual.get("facts").cloned()) else { return Ok(None); };
-    let requested_head = requested.body.pointer("/fields/facts/head").and_then(Value::as_str);
-    if let Some((requested, current)) = requested_head.zip(current.get("head").and_then(Value::as_str))
-        && requested != current { return Ok(Some(format!("ref {resource} moved from head {requested} to {current}"))); }
+fn stale_ref_request_tx(
+    connection: &Connection,
+    resource: &str,
+    discovery: &str,
+) -> Result<Option<String>> {
+    let Some(requested) = claim_by_id_tx(connection, discovery)?.filter(|claim| {
+        claim.subject == resource
+            && claim.body.pointer("/fields/kind").and_then(Value::as_str) == Some("vcs.ref")
+    }) else {
+        return Ok(None);
+    };
+    let Some(current) =
+        latest_actual(connection, resource)?.and_then(|actual| actual.get("facts").cloned())
+    else {
+        return Ok(None);
+    };
+    let requested_head = requested
+        .body
+        .pointer("/fields/facts/head")
+        .and_then(Value::as_str);
+    if let Some((requested, current)) =
+        requested_head.zip(current.get("head").and_then(Value::as_str))
+        && requested != current
+    {
+        return Ok(Some(format!(
+            "ref {resource} moved from head {requested} to {current}"
+        )));
+    }
     Ok(None)
 }
 
@@ -3201,13 +3231,22 @@ impl Store {
         self.create_mission_run_inner(request, child, Some(&subject), None)
     }
 
-    pub fn create_subscription_mission_run(&self, request: &MissionRunRequest,
-        parent: Option<&MissionRunView>, subscription: &str, resource: &str, discovery: &str,
+    pub fn create_subscription_mission_run(
+        &self,
+        request: &MissionRunRequest,
+        parent: Option<&MissionRunView>,
+        subscription: &str,
+        resource: &str,
+        discovery: &str,
     ) -> Result<MissionRunView, St3Error> {
         let child = parent.map(|parent| ChildMissionContext {
             root_revision: parent.root_revision.clone(),
-            root_run_id: parent.root_mission_run.trim_start_matches("mission-run/").into(),
-            parent_step_run: normalize_step_run(subscription), default_selector: None,
+            root_run_id: parent
+                .root_mission_run
+                .trim_start_matches("mission-run/")
+                .into(),
+            parent_step_run: normalize_step_run(subscription),
+            default_selector: None,
         });
         self.create_mission_run_inner(request, child, None, Some((resource, discovery)))
     }
@@ -3298,7 +3337,9 @@ impl Store {
         let transaction = connection.transaction().map_err(internal)?;
         owned_sets::guard_mission_start(&transaction, mission_id)?;
         if let Some((resource, discovery)) = latest_ref
-            && let Some(reason) = stale_ref_request_tx(&transaction, resource, discovery).map_err(internal)? {
+            && let Some(reason) =
+                stale_ref_request_tx(&transaction, resource, discovery).map_err(internal)?
+        {
             return Err(St3Error::new("stale-ref-head", reason));
         }
         let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
@@ -8722,7 +8763,10 @@ impl Store {
             || publication.runtime_incarnation.is_empty()
             || !matches!(
                 input.kind.as_str(),
-                "harness.observed" | "harness.usage" | "harness.limits" | "harness.timeline"
+                "harness.observed"
+                    | "harness.usage"
+                    | "harness.limits"
+                    | "harness.timeline"
                     | "harness.todo.observed"
             )
             || input.actor.as_deref() != Some(input.subject.as_str())
@@ -9845,11 +9889,12 @@ impl Store {
         self.events_after_filtered(after, subject, None)
     }
 
+    /// Generic client activity excludes audit records; graph event readers remain unrestricted.
     pub fn events_after_bounded(&self, after: u64, limit: usize) -> Result<Vec<EventRecord>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT store_index, kind, subject, body FROM events
-             WHERE store_index > ?1 ORDER BY store_index LIMIT ?2",
+             WHERE subject NOT LIKE 'input-session/%' AND store_index > ?1 ORDER BY store_index LIMIT ?2",
         )?;
         let rows =
             statement.query_map(params![after, limit.min(i64::MAX as usize) as i64], |row| {
@@ -9869,7 +9914,7 @@ impl Store {
         let mut statement = connection.prepare(
             "SELECT store_index, kind, subject, body FROM (
                  SELECT store_index, kind, subject, body FROM events
-                 ORDER BY store_index DESC LIMIT ?1
+                 WHERE subject NOT LIKE 'input-session/%' ORDER BY store_index DESC LIMIT ?1
              ) ORDER BY store_index",
         )?;
         let rows = statement.query_map([limit.min(i64::MAX as usize) as i64], |row| {
@@ -10045,7 +10090,10 @@ impl Store {
         idempotency_key: &str,
     ) -> Result<ApplyResponse, St3Error> {
         if name == Some("") {
-            return Err(St3Error::new("invalid-agent-name", "a seat label must be a non-empty string"));
+            return Err(St3Error::new(
+                "invalid-agent-name",
+                "a seat label must be a non-empty string",
+            ));
         }
         let (mut desired, heads, writer) = {
             let connection = self.readers.get();
@@ -10690,7 +10738,11 @@ impl Store {
 
     /// Search refreshes only a person's private message texts, using the same endpoint
     /// indexes as the mailbox. Other fleet writes do not invalidate this source.
-    pub(crate) fn conversation_search_mail_stamp(&self, person: &str, through: u64) -> Result<String> {
+    pub(crate) fn conversation_search_mail_stamp(
+        &self,
+        person: &str,
+        through: u64,
+    ) -> Result<String> {
         let connection = self.readers.get();
         let (count, newest): (u64, u64) = connection.query_row(
             "WITH sent AS (
@@ -10705,22 +10757,37 @@ impl Store {
         Ok(format!("{count}:{newest}"))
     }
 
-    pub(crate) fn conversation_search_timeline_stamp(&self, agent: &str, incarnation: &str, through: u64) -> Result<String> {
+    pub(crate) fn conversation_search_timeline_stamp(
+        &self,
+        agent: &str,
+        incarnation: &str,
+        through: u64,
+    ) -> Result<String> {
         let connection = self.readers.get();
-        let (local_count, local_newest): (u64,u64) = connection.query_row(
+        let (local_count, local_newest): (u64, u64) = connection.query_row(
             "SELECT COUNT(*),COALESCE(MAX(id),0) FROM local_observations
              WHERE subject=?1 AND kind='harness.timeline'
-               AND json_extract(body,'$.fields.incarnation_id')=?2 AND after_store_index<=?3", params![agent,incarnation,through],
-            |row| Ok((row.get(0)?,row.get(1)?)))?;
-        let (legacy_count, legacy_newest): (u64,u64) = connection.query_row(
+               AND json_extract(body,'$.fields.incarnation_id')=?2 AND after_store_index<=?3",
+            params![agent, incarnation, through],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (legacy_count, legacy_newest): (u64, u64) = connection.query_row(
             "SELECT COUNT(*),COALESCE(MAX(store_index),0) FROM claims
              WHERE subject=?1 AND kind='harness.timeline'
-               AND json_extract(body,'$.fields.incarnation_id')=?2 AND store_index<=?3", params![agent,incarnation,through],
-            |row| Ok((row.get(0)?,row.get(1)?)))?;
-        Ok(format!("{local_count}:{local_newest}:{legacy_count}:{legacy_newest}"))
+               AND json_extract(body,'$.fields.incarnation_id')=?2 AND store_index<=?3",
+            params![agent, incarnation, through],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(format!(
+            "{local_count}:{local_newest}:{legacy_count}:{legacy_newest}"
+        ))
     }
 
-    pub(crate) fn conversation_search_messages(&self, person: &str, through: u64) -> Result<Vec<MessageView>> {
+    pub(crate) fn conversation_search_messages(
+        &self,
+        person: &str,
+        through: u64,
+    ) -> Result<Vec<MessageView>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(&canonical_sql(
             "WITH candidates AS (
@@ -10735,7 +10802,7 @@ impl Store {
                 FROM claims JOIN candidates ON candidates.id=claims.id
             ) SELECT sent.subject,sent.created_index FROM ranked AS sent
               WHERE ordinal=1 ORDER BY CANONICAL_DESC(sent) LIMIT 50001"))?;
-        let rows = statement.query_map(params![person,through], |row| {
+        let rows = statement.query_map(params![person, through], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
         })?;
         let mut messages = Vec::new();
@@ -11142,13 +11209,18 @@ impl Store {
              JOIN batches ON batches.id=claims.batch_id"
         ))?;
         let rows = statement.query_map(
-            params![serde_json::to_string(subjects)?, at_index.min(i64::MAX as u64)],
+            params![
+                serde_json::to_string(subjects)?,
+                at_index.min(i64::MAX as u64)
+            ],
             claim_from_row,
         )?;
         let mut observations = BTreeMap::<String, BTreeMap<String, ClaimRecord>>::new();
         for claim in rows {
             let claim = claim?;
-            observations.entry(claim.subject.clone()).or_default()
+            observations
+                .entry(claim.subject.clone())
+                .or_default()
                 .insert(claim.kind.clone(), claim);
         }
         Ok(observations)
@@ -11598,7 +11670,10 @@ impl Store {
     pub fn human_attention_runs(&self) -> Result<BTreeSet<String>> {
         let mut items = self.mission_run_attention_items(None)?;
         items.extend(self.person_attention_items(None, now_ms())?);
-        Ok(items.into_iter().filter_map(|item| item.mission_run).collect())
+        Ok(items
+            .into_iter()
+            .filter_map(|item| item.mission_run)
+            .collect())
     }
 
     /// The attention items that belong to a mission run: gate reviews, launch approvals and
@@ -14064,21 +14139,33 @@ impl Store {
         token: &str,
         build: impl FnOnce() -> Result<Option<crate::placement::Fence>>,
     ) -> Result<Option<Arc<crate::placement::Fence>>> {
-        if let Some(fence) = self.smalltalk.placement_cache.lock()
-            .unwrap_or_else(PoisonError::into_inner).get(token) {
+        if let Some(fence) = self
+            .smalltalk
+            .placement_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(token)
+        {
             return Ok(fence.clone());
         }
         let fence = build()?.map(Arc::new);
-        let mut cache = self.smalltalk.placement_cache.lock()
+        let mut cache = self
+            .smalltalk
+            .placement_cache
+            .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if cache.len() >= ACTUAL_CACHE_LIMIT { cache.clear(); }
+        if cache.len() >= ACTUAL_CACHE_LIMIT {
+            cache.clear();
+        }
         cache.insert(token.to_owned(), fence.clone());
         Ok(fence)
     }
 
     /// Read just the newest runtime body of each origin in canonical order at a snapshot.
     pub(crate) fn runtime_observations_at(
-        &self, subject: &str, at: u64,
+        &self,
+        subject: &str,
+        at: u64,
     ) -> Result<BTreeMap<String, ClaimRecord>> {
         smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
@@ -16288,7 +16375,10 @@ fn desired_row_at(
     let Some(at_index) = at_index else {
         return current_desired_row(connection, subject);
     };
-    if owned_sets::owner(connection, subject, Some(at_index)).map_err(anyhow::Error::new)?.is_some() {
+    if owned_sets::owner(connection, subject, Some(at_index))
+        .map_err(anyhow::Error::new)?
+        .is_some()
+    {
         return owned_sets::desired_at(connection, subject, at_index);
     }
     let mut statement = connection.prepare_cached(&canonical_sql(
@@ -16738,7 +16828,10 @@ fn normalize_resource_observation(
     let mut fields = input.fields.clone();
     if carries_opener(&kind) {
         if fields.contains_key("facts") {
-            fields.insert("facts".into(), serde_json::to_value(facts).map_err(internal)?);
+            fields.insert(
+                "facts".into(),
+                serde_json::to_value(facts).map_err(internal)?,
+            );
         } else {
             fields.extend(facts);
         }
@@ -18086,8 +18179,13 @@ fn validate_message_transition(
     ) && input.actor.is_some()
     {
         let index: Option<u64> = transaction
-            .query_row("SELECT created_index FROM message_index WHERE subject=?1", [&input.subject], |row| row.get(0))
-            .optional().map_err(internal)?;
+            .query_row(
+                "SELECT created_index FROM message_index WHERE subject=?1",
+                [&input.subject],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
         if let Some(index) = index {
             let message = message_view_tx(transaction, &input.subject, index).map_err(internal)?;
             if !message.to.is_empty() && input.actor.as_deref() == Some(message.to.as_str()) {
@@ -18170,8 +18268,26 @@ fn append_claim_tx(
     st3_schema::owned_terminals::validate_declaration_owner(subject, kind, actor)
         .map_err(anyhow::Error::new)?;
     st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
-    if kind == "owned-set.revised" { owned_sets::validate_receipt(subject, body).map_err(anyhow::Error::new)?; }
+    if kind == "owned-set.revised" {
+        owned_sets::validate_receipt(subject, body).map_err(anyhow::Error::new)?;
+    }
     let fields = schema_fields_for_body(kind, body)?;
+    if kind == input_sessions::KIND {
+        if let Some(existing) =
+            input_sessions::check_tx(transaction, origin, subject, actor, &fields)
+                .map_err(anyhow::Error::new)?
+        {
+            return Ok(existing);
+        }
+        if let Some(head) = input_sessions::latest(transaction, subject)?
+            && !predecessors.contains(&head.id)
+        {
+            return Err(anyhow::Error::new(St3Error::new(
+                "stale-input-session",
+                "publication must cite the durable session head",
+            )));
+        }
+    }
     let claim_spec = st3_schema::registry()
         .validate_claim(subject, kind, &fields)
         .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
@@ -18707,8 +18823,8 @@ fn check_mailbox_incarnation(
     // A runtime observation that does not name this incarnation describes something older: a
     // predecessor, or the daemon's own "exited" for a seat that died while no daemon watched,
     // which names no incarnation at all. Only an observation of this very incarnation is final.
-    let describes_another = fields.get("incarnation_id").and_then(Value::as_str)
-        != Some(fence.incarnation.as_str());
+    let describes_another =
+        fields.get("incarnation_id").and_then(Value::as_str) != Some(fence.incarnation.as_str());
     if !live
         && (describes_another
             || matches!(
@@ -18743,8 +18859,13 @@ fn check_mailbox_incarnation(
         }
     }
     if !live
-        || mailbox_harness_ended(connection, &fence.subject, &fence.incarnation, &runtime_claim)
-            .map_err(internal)?
+        || mailbox_harness_ended(
+            connection,
+            &fence.subject,
+            &fence.incarnation,
+            &runtime_claim,
+        )
+        .map_err(internal)?
     {
         return Err(St3Error::new(
             "stale-mailbox-session",
@@ -21578,7 +21699,11 @@ mod fleet_admission_tests {
             ("unknown", None, true),
             ("invalid", Some("harness.limits"), true),
         ] {
-            assert_eq!(replica_record_bears_authority(state, kind), bears, "{state} {kind:?}");
+            assert_eq!(
+                replica_record_bears_authority(state, kind),
+                bears,
+                "{state} {kind:?}"
+            );
         }
     }
 
@@ -22963,7 +23088,9 @@ fn classify_replicated_claim_with_registry(
             ),
         ));
     }
-    if claim.kind == "owned-set.revised" { owned_sets::validate_receipt(&claim.subject, &claim.body)?; }
+    if claim.kind == "owned-set.revised" {
+        owned_sets::validate_receipt(&claim.subject, &claim.body)?;
+    }
     st3_schema::owned_terminals::validate_declaration_owner(
         &claim.subject,
         &claim.kind,
@@ -22972,6 +23099,15 @@ fn classify_replicated_claim_with_registry(
     .map_err(|e| St3Error::new(e.code, e.message))?;
     st3_schema::glasses::validate_owner(&claim.subject, claim.actor.as_deref())
         .map_err(|e| St3Error::new(e.code, e.message))?;
+    if claim.kind == input_sessions::KIND {
+        st3_schema::input_sessions::validate_origin(
+            &claim.subject,
+            &claim.origin,
+            claim.actor.as_deref(),
+            &fields,
+        )
+        .map_err(|e| St3Error::new(e.code, e.message))?;
+    }
     if claim.subject.starts_with("glass/")
         && (!fields.contains_key("base_revision") || !fields.contains_key("replaced_revision"))
     {
@@ -23077,7 +23213,10 @@ enum Aggregate {
 /// Whether claims of `kind` belong to a mission run tree.
 fn run_tree_kind(kind: &str) -> bool {
     replay_projects_kind(kind)
-        && !matches!(kind, "intent.desired" | "owned-set.revised" | "doc.bound" | "mission.published")
+        && !matches!(
+            kind,
+            "intent.desired" | "owned-set.revised" | "doc.bound" | "mission.published"
+        )
         && !kind.starts_with("planning-session.")
 }
 
@@ -23127,9 +23266,11 @@ fn generation_run_tx(
     }
     let asked = transaction
         .query_row(
-            &canonical_sql("SELECT json_extract(body, '$.fields.run') FROM claims
+            &canonical_sql(
+                "SELECT json_extract(body, '$.fields.run') FROM claims
              WHERE kind='work.person-asked' AND json_extract(body, '$.fields.generation')=?1
-             ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
+             ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+            ),
             [&subject],
             |row| row.get::<_, Option<String>>(0),
         )
@@ -23224,9 +23365,11 @@ fn run_tree_of_tx(
         Some(root) => Some(root),
         None => transaction
             .query_row(
-                &canonical_sql("SELECT json_extract(body, '$.fields.owner_run') FROM claims
+                &canonical_sql(
+                    "SELECT json_extract(body, '$.fields.owner_run') FROM claims
                  WHERE kind='work.person-asked' AND json_extract(body, '$.fields.run')=?1
-                 ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
+                 ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+                ),
                 [format!("mission-run/{run}")],
                 |row| row.get::<_, Option<String>>(0),
             )
@@ -24198,7 +24341,9 @@ fn select_replicated_desired(
     claim: &ClaimRecord,
     desired: &DesiredSubject,
 ) -> Result<(), St3Error> {
-    if claim.body.get("owned_set").is_some() || owned_sets::owner(transaction, &claim.subject, None)?.is_some() {
+    if claim.body.get("owned_set").is_some()
+        || owned_sets::owner(transaction, &claim.subject, None)?.is_some()
+    {
         return Ok(());
     }
     let current = current_desired_row_tx(transaction, &claim.subject).map_err(internal)?;
@@ -25246,7 +25391,9 @@ fn select_replicated_mission(
             )
             .map_err(internal)?;
     }
-    if claim.body.get("owned_set").is_some() || owned_sets::owner(transaction, &claim.subject, None)?.is_some() {
+    if claim.body.get("owned_set").is_some()
+        || owned_sets::owner(transaction, &claim.subject, None)?.is_some()
+    {
         return Ok(());
     }
     let current: Option<(String, String)> = transaction
@@ -28506,29 +28653,46 @@ mod tests {
         let path = directory.path().join("graph.db");
         let store = Store::open(&path, "node").unwrap();
         let append = |subject: &str, kind: &str| {
-            store.append_claim(&ClaimInput {
-                subject: subject.into(),
-                kind: kind.into(),
-                actor: None,
-                fields: BTreeMap::from([("capability_hash".into(), json!("secret-digest"))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            }).unwrap()
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: None,
+                    fields: BTreeMap::from([("capability_hash".into(), json!("secret-digest"))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
         };
-        let attached = append("custom/client/attachment-a", "custom.client.terminal-attached");
+        let attached = append(
+            "custom/client/attachment-a",
+            "custom.client.terminal-attached",
+        );
         append("custom/client/decoy", "custom.client.other");
         assert_eq!(
-            store.terminal_attachment_for_capability_hash("secret-digest").unwrap()
+            store
+                .terminal_attachment_for_capability_hash("secret-digest")
+                .unwrap()
                 .map(|(claim, current)| (claim.id, current)),
             Some((attached.id.clone(), true)),
         );
-        assert!(store.terminal_attachment_for_capability_hash("unknown").unwrap().is_none());
-        append("custom/client/attachment-a", "custom.client.terminal-consumed");
+        assert!(
+            store
+                .terminal_attachment_for_capability_hash("unknown")
+                .unwrap()
+                .is_none()
+        );
+        append(
+            "custom/client/attachment-a",
+            "custom.client.terminal-consumed",
+        );
         drop(store);
         let reopened = Store::open(&path, "node").unwrap();
         assert_eq!(
-            reopened.terminal_attachment_for_capability_hash("secret-digest").unwrap()
+            reopened
+                .terminal_attachment_for_capability_hash("secret-digest")
+                .unwrap()
                 .map(|(claim, current)| (claim.id, current)),
             Some((attached.id, false)),
         );
@@ -28550,28 +28714,65 @@ mod tests {
         let path = directory.path().join("state.sqlite3");
         let original = {
             let store = Store::open(&path, "node").unwrap();
-            let intent = parse_intent(r#"version 2
+            let intent = parse_intent(
+                r#"version 2
 agent "test/worker" { workspace "."; command "true"; name "Initial" }
-"#, "node").unwrap();
-            let preview = store.mission(&intent, IntentInput {
-                kdl: String::new(), source_name: None,
-            }).unwrap();
-            store.apply_as(&intent, &preview.subject_tokens, "initial", Some("person/operator")).unwrap();
-            let original = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap();
-            store.rename_agent("agent/test/worker", Some("Renamed"), "rename").unwrap();
+"#,
+                "node",
+            )
+            .unwrap();
+            let preview = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: String::new(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    "initial",
+                    Some("person/operator"),
+                )
+                .unwrap();
+            let original = store
+                .desired_subject_with_writer("agent/test/worker")
+                .unwrap()
+                .unwrap();
+            store
+                .rename_agent("agent/test/worker", Some("Renamed"), "rename")
+                .unwrap();
             original
         };
         let store = Store::open(&path, "node").unwrap();
-        let (mut renamed, writer) = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap();
+        let (mut renamed, writer) = store
+            .desired_subject_with_writer("agent/test/worker")
+            .unwrap()
+            .unwrap();
         assert_eq!(writer, original.1);
-        assert_eq!(renamed.member.as_ref().unwrap().display_name.as_deref(), Some("Renamed"));
+        assert_eq!(
+            renamed.member.as_ref().unwrap().display_name.as_deref(),
+            Some("Renamed")
+        );
         renamed.set_display_name(Some("Initial")).unwrap();
         assert_eq!(renamed, original.0);
-        store.rename_agent("agent/test/worker", None, "clear").unwrap();
+        store
+            .rename_agent("agent/test/worker", None, "clear")
+            .unwrap();
         drop(store);
         let store = Store::open(&path, "node").unwrap();
-        let cleared = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap().0;
-        assert_eq!(crate::model::effective_agent_name("agent/test/worker", Some(&cleared.desired)), "test/worker");
+        let cleared = store
+            .desired_subject_with_writer("agent/test/worker")
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(
+            crate::model::effective_agent_name("agent/test/worker", Some(&cleared.desired)),
+            "test/worker"
+        );
         assert_eq!(cleared.member.unwrap().display_name, None);
     }
 
@@ -28579,23 +28780,62 @@ agent "test/worker" { workspace "."; command "true"; name "Initial" }
     fn a_rename_that_merges_concurrent_renames_keeps_the_launch_revision() {
         let left = Store::open_memory("left").unwrap();
         let right = Store::open_memory("right").unwrap();
-        let intent = parse_intent(r#"version 2
+        let intent = parse_intent(
+            r#"version 2
 agent "test/worker" { command "true"; name "A" }
-"#, "left").unwrap();
-        let preview = left.mission(&intent, IntentInput {
-            kdl: String::new(), source_name: None,
-        }).unwrap();
+"#,
+            "left",
+        )
+        .unwrap();
+        let preview = left
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
         left.apply(&intent, &preview.subject_tokens, "a").unwrap();
-        let launch = left.selected_desired_token("agent/test/worker").unwrap().unwrap();
-        receive_and_project(&right, "left", &exchange_from(&left, &ReplicationInventory::default()));
+        let launch = left
+            .selected_desired_token("agent/test/worker")
+            .unwrap()
+            .unwrap();
+        receive_and_project(
+            &right,
+            "left",
+            &exchange_from(&left, &ReplicationInventory::default()),
+        );
         // Two hosts relabel the same seat concurrently, then one relabels the merged fork.
-        left.rename_agent("agent/test/worker", Some("R1"), "r1").unwrap();
-        right.rename_agent("agent/test/worker", Some("R2"), "r2").unwrap();
-        receive_and_project(&right, "left", &exchange_from(&left, &right.replication_inventory().unwrap()));
-        receive_and_project(&left, "right", &exchange_from(&right, &left.replication_inventory().unwrap()));
-        left.rename_agent("agent/test/worker", Some("R3"), "r3").unwrap();
-        let merged = left.selected_desired_token("agent/test/worker").unwrap().unwrap();
-        assert_eq!(left.claim_by_id(&merged).unwrap().unwrap().predecessors.len(), 2);
+        left.rename_agent("agent/test/worker", Some("R1"), "r1")
+            .unwrap();
+        right
+            .rename_agent("agent/test/worker", Some("R2"), "r2")
+            .unwrap();
+        receive_and_project(
+            &right,
+            "left",
+            &exchange_from(&left, &right.replication_inventory().unwrap()),
+        );
+        receive_and_project(
+            &left,
+            "right",
+            &exchange_from(&right, &left.replication_inventory().unwrap()),
+        );
+        left.rename_agent("agent/test/worker", Some("R3"), "r3")
+            .unwrap();
+        let merged = left
+            .selected_desired_token("agent/test/worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            left.claim_by_id(&merged)
+                .unwrap()
+                .unwrap()
+                .predecessors
+                .len(),
+            2
+        );
         let lineage = left.launch_lineage("agent/test/worker").unwrap();
         assert_eq!(lineage.first(), Some(&merged));
         assert_eq!(lineage.last(), Some(&launch), "{lineage:?}");
@@ -28604,28 +28844,53 @@ agent "test/worker" { command "true"; name "A" }
     #[test]
     fn seat_rename_refuses_an_unreadable_member_and_an_empty_label() {
         let store = Store::open_memory("node").unwrap();
-        let intent = parse_intent(r#"version 2
+        let intent = parse_intent(
+            r#"version 2
 agent "test/worker" { command "true"; name "Initial" }
-"#, "node").unwrap();
-        let preview = store.mission(&intent, IntentInput {
-            kdl: String::new(), source_name: None,
-        }).unwrap();
-        store.apply(&intent, &preview.subject_tokens, "initial").unwrap();
+"#,
+            "node",
+        )
+        .unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "initial")
+            .unwrap();
         let before = store.selected_desired_token("agent/test/worker").unwrap();
         assert_eq!(
-            store.rename_agent("agent/test/worker", Some(""), "empty").unwrap_err().code,
+            store
+                .rename_agent("agent/test/worker", Some(""), "empty")
+                .unwrap_err()
+                .code,
             "invalid-agent-name"
         );
         // A launch published by a newer peer stays until a build that can read it takes it up.
         store.replace_desired_member_for_test("agent/test/worker", r#"{"future":true}"#);
         assert_eq!(
-            store.rename_agent("agent/test/worker", Some("Renamed"), "unreadable").unwrap_err().code,
+            store
+                .rename_agent("agent/test/worker", Some("Renamed"), "unreadable")
+                .unwrap_err()
+                .code,
             "unreadable-agent-member"
         );
-        assert_eq!(store.selected_desired_token("agent/test/worker").unwrap(), before);
+        assert_eq!(
+            store.selected_desired_token("agent/test/worker").unwrap(),
+            before
+        );
         let connection = store.readers.get();
         let member: String = connection
-            .query_row("SELECT member FROM desired WHERE subject='agent/test/worker'", [], |row| row.get(0))
+            .query_row(
+                "SELECT member FROM desired WHERE subject='agent/test/worker'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(member, r#"{"future":true}"#);
     }
@@ -28633,23 +28898,47 @@ agent "test/worker" { command "true"; name "Initial" }
     #[test]
     fn seat_rename_accepts_an_empty_body_and_rejects_a_non_array_body() {
         let store = Store::open_memory("node").unwrap();
-        let mut intent = parse_intent(r#"version 2
+        let mut intent = parse_intent(
+            r#"version 2
 agent "test/empty" { command "true" }
-"#, "node").unwrap();
+"#,
+            "node",
+        )
+        .unwrap();
         // An empty canonical KDL body has no children key. Exercise that stored shape
         // independently of launch validation, which requires a command for new seats.
         let empty = intent.subjects.get_mut("agent/test/empty").unwrap();
         empty.desired.as_object_mut().unwrap().remove("children");
         empty.member = None;
-        let preview = store.mission(&intent, IntentInput {
-            kdl: String::new(), source_name: None,
-        }).unwrap();
-        store.apply(&intent, &preview.subject_tokens, "empty").unwrap();
-        store.rename_agent("agent/test/empty", Some("Empty seat"), "rename-empty").unwrap();
-        let mut desired = store.desired_subject_with_writer("agent/test/empty").unwrap().unwrap().0;
-        assert_eq!(crate::model::effective_agent_name("agent/test/empty", Some(&desired.desired)), "Empty seat");
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "empty")
+            .unwrap();
+        store
+            .rename_agent("agent/test/empty", Some("Empty seat"), "rename-empty")
+            .unwrap();
+        let mut desired = store
+            .desired_subject_with_writer("agent/test/empty")
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(
+            crate::model::effective_agent_name("agent/test/empty", Some(&desired.desired)),
+            "Empty seat"
+        );
         desired.desired["children"] = json!({});
-        assert_eq!(desired.set_display_name(Some("Invalid")).unwrap_err().code, "invalid-agent-declaration");
+        assert_eq!(
+            desired.set_display_name(Some("Invalid")).unwrap_err().code,
+            "invalid-agent-declaration"
+        );
     }
 
     #[test]
@@ -28775,9 +29064,7 @@ agent "test/empty" { command "true" }
         release.send(()).unwrap();
         holder.join().unwrap();
         // Idle retention does not bound concurrently open connections.
-        assert!(
-            store.readers.idle.lock().unwrap().len() <= max_idle_read_connections()
-        );
+        assert!(store.readers.idle.lock().unwrap().len() <= max_idle_read_connections());
     }
 
     #[test]
@@ -32139,15 +32426,20 @@ version 2
             observe(&left, terminal_status, "left");
             // The new owner has no causal path through the old owner's runtime branch.
             let selected = observe(&right, "running", "right");
-            right.import_replication("left", &left.export_replication(0).unwrap())
+            right
+                .import_replication("left", &left.export_replication(0).unwrap())
                 .unwrap();
             let view = right.status(Some(subject)).unwrap().subjects.remove(0);
             assert_eq!(view.actual_claim.as_deref(), Some(selected.id.as_str()));
-            assert_eq!(view.reachability, "reachable", "{terminal_status}: {view:?}");
+            assert_eq!(
+                view.reachability, "reachable",
+                "{terminal_status}: {view:?}"
+            );
             // A later live rival is not hidden by its previous terminal observation.
             left.set_write_clock_at(1_800_000_000_002).unwrap();
             observe(&left, "running", "left");
-            right.import_replication("left", &left.export_replication(0).unwrap())
+            right
+                .import_replication("left", &left.export_replication(0).unwrap())
                 .unwrap();
             assert_eq!(
                 right.status(Some(subject)).unwrap().subjects[0].reachability,
@@ -33781,7 +34073,8 @@ version 2
                 let mut connection = controller.connection.lock().unwrap();
                 let transaction = connection.transaction().unwrap();
                 assert!(
-                    try_project_all_simple_replication_tx(&transaction, &controller.origin).unwrap(),
+                    try_project_all_simple_replication_tx(&transaction, &controller.origin)
+                        .unwrap(),
                     "a single routine work transition should use the bounded projection path"
                 );
                 transaction.rollback().unwrap();
@@ -44999,9 +45292,17 @@ observer "issue" {
 "#;
             let intent = parse_intent(source, "node").unwrap();
             let planned = store
-                .mission(&intent, IntentInput { kdl: source.into(), source_name: None })
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
                 .unwrap();
-            store.apply(&intent, &planned.subject_tokens, "publish-watch").unwrap();
+            store
+                .apply(&intent, &planned.subject_tokens, "publish-watch")
+                .unwrap();
             let subject = "resource/github/acme/demo/issue/8";
             let publish = |facts: Value| ClaimInput {
                 subject: subject.into(),
@@ -45015,15 +45316,28 @@ observer "issue" {
                 expected_subject: None,
                 idempotency_key: None,
             };
-            store.append_client_claim(&publish(attribution.clone())).unwrap();
-            store.append_client_claim(&publish(json!({
-                "opened_by_run": "mission-run/fixer", "state": "open"
-            }))).unwrap();
+            store
+                .append_client_claim(&publish(attribution.clone()))
+                .unwrap();
+            store
+                .append_client_claim(&publish(json!({
+                    "opened_by_run": "mission-run/fixer", "state": "open"
+                })))
+                .unwrap();
             let observe = |observer: &str, resource: &str, facts: Value| {
                 let revision = store.selected_desired_revision(observer).unwrap().unwrap();
-                store.record_resource_observation(
-                    observer, &revision, None, resource, None, &facts, 50, &[],
-                ).unwrap();
+                store
+                    .record_resource_observation(
+                        observer,
+                        &revision,
+                        None,
+                        resource,
+                        None,
+                        &facts,
+                        50,
+                        &[],
+                    )
+                    .unwrap();
             };
             observe("observer/issue", subject, json!({"state": "closed"}));
             let actual = store.latest_actual_value(subject).unwrap().unwrap();
@@ -45032,21 +45346,34 @@ observer "issue" {
             if let Some(opener) = attribution.get("opened_by") {
                 assert_eq!(&actual["facts"]["opened_by"], opener);
             }
-            observe("observer/repo", "resource/github/acme/demo", json!({"issues": []}));
-            observe("observer/repo", "resource/github/acme/demo", json!({
-                "issues": [{"number": 8, "state": "open", "title": "Updated issue"}]
-            }));
+            observe(
+                "observer/repo",
+                "resource/github/acme/demo",
+                json!({"issues": []}),
+            );
+            observe(
+                "observer/repo",
+                "resource/github/acme/demo",
+                json!({
+                    "issues": [{"number": 8, "state": "open", "title": "Updated issue"}]
+                }),
+            );
             let actual = store.latest_actual_value(subject).unwrap().unwrap();
             assert_eq!(actual["facts"]["state"], "open");
             assert_eq!(actual["facts"]["title"], "Updated issue");
             assert_eq!(actual["facts"]["opened_by_run"], "mission-run/author");
             if let Some(opener) = attribution.get("opened_by") {
                 assert_eq!(&actual["facts"]["opened_by"], opener);
-                let changed = store.append_client_claim(&publish(json!({
-                    "opened_by": "agent/node.fixer", "opened_by_run": "mission-run/fixer"
-                }))).unwrap();
+                let changed = store
+                    .append_client_claim(&publish(json!({
+                        "opened_by": "agent/node.fixer", "opened_by_run": "mission-run/fixer"
+                    })))
+                    .unwrap();
                 assert_eq!(&changed.body["fields"]["facts"]["opened_by"], opener);
-                assert_eq!(changed.body["fields"]["facts"]["opened_by_run"], "mission-run/author");
+                assert_eq!(
+                    changed.body["fields"]["facts"]["opened_by_run"],
+                    "mission-run/author"
+                );
             }
         }
     }
@@ -46779,6 +47106,13 @@ fn append_claim_with_fences(
             if let Some(existing) = subagents::check_subagent_claim_tx(transaction, input)? {
                 return Ok((existing, false));
             }
+            if input.kind == input_sessions::KIND
+                && let Some(existing) = input_sessions::check_tx(
+                    transaction, &graph.origin, &input.subject, input.actor.as_deref(), &input.fields,
+                )?
+            {
+                return Ok((existing, false));
+            }
             for evidence in &input.evidence {
                 // Evidence may cite a claim that a checkpoint has since dropped.
                 let exists = checkpoint::claim_or_tombstone_exists(transaction, evidence)
@@ -46852,8 +47186,11 @@ fn append_claim_with_fences(
                     })?;
                 return Ok((latest, false));
             }
-            let predecessor =
-                latest_claim_id_tx(transaction, &input.subject).map_err(internal)?;
+            let predecessor = if input.kind == input_sessions::KIND {
+                input_sessions::latest(transaction, &input.subject).map_err(internal)?.map(|head| head.id)
+            } else {
+                latest_claim_id_tx(transaction, &input.subject).map_err(internal)?
+            };
             let mut predecessors = predecessor.into_iter().collect::<Vec<_>>();
             // A placement handoff explicitly cites its local runtime and peer stop proof.
             // Keep same-subject evidence as causal links even when a newer declaration
@@ -47365,44 +47702,64 @@ mod harness_event_tests {
                 {"content":"Review claim","status":"blocked","blocker":"Await review"}
             ]}],"totals":{"pending":0,"in_progress":0,"completed":0,"blocked":1},
             "truncated":false
-        })).unwrap();
+        }))
+        .unwrap();
         let (first, changed) = store.append_harness_event(&input).unwrap();
         assert!(changed);
         let (replay, changed) = store.append_harness_event(&input).unwrap();
         assert!(!changed);
         assert_eq!(replay.body["fields"], first.body["fields"]);
         let original = input.claim.fields.clone();
-        input.claim.fields.insert("source_op".into(), json!("hydrate"));
-        assert_eq!(store.append_harness_event(&input).unwrap_err().code, "idempotency-mismatch");
+        input
+            .claim
+            .fields
+            .insert("source_op".into(), json!("hydrate"));
+        assert_eq!(
+            store.append_harness_event(&input).unwrap_err().code,
+            "idempotency-mismatch"
+        );
         input.claim.fields = original;
         input.sequence = 2;
         input.claim.fields.insert("phases".into(), json!([]));
-        input.claim.fields.insert("totals".into(), json!({
-            "pending":0,"in_progress":0,"completed":0,"blocked":0
-        }));
-        input.claim.fields.insert("source_op".into(), json!("clear"));
+        input.claim.fields.insert(
+            "totals".into(),
+            json!({
+                "pending":0,"in_progress":0,"completed":0,"blocked":0
+            }),
+        );
+        input
+            .claim
+            .fields
+            .insert("source_op".into(), json!("clear"));
         let (cleared, changed) = store.append_harness_event(&input).unwrap();
         assert!(changed);
         assert_eq!(cleared.body["fields"]["phases"], json!([]));
         runtime(&store, "runtime-b", "running");
         input.sequence = 3;
-        assert_eq!(store.append_harness_event(&input).unwrap_err().code, "stale-harness-event-session");
-        let current = store.latest_observation(SEAT, "harness.todo.observed").unwrap().unwrap();
+        assert_eq!(
+            store.append_harness_event(&input).unwrap_err().code,
+            "stale-harness-event-session"
+        );
+        let current = store
+            .latest_observation(SEAT, "harness.todo.observed")
+            .unwrap()
+            .unwrap();
         assert_eq!(current.body["fields"]["source_op"], "clear");
         const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
         let peer = Store::open_memory("blue").unwrap();
         store.bind_fleet(FLEET).unwrap();
         peer.bind_fleet(FLEET).unwrap();
-        let exchange = store.export_replication_exchange(
-            FLEET, &ReplicationInventory::default(),
-        ).unwrap();
-        peer.receive_replication_exchange("amber", FLEET, &exchange).unwrap();
+        let exchange = store
+            .export_replication_exchange(FLEET, &ReplicationInventory::default())
+            .unwrap();
+        peer.receive_replication_exchange("amber", FLEET, &exchange)
+            .unwrap();
         peer.validate_replication_backlog().unwrap();
         peer.apply_replication_repairs().unwrap();
         assert!(peer.project_replication_backlog().unwrap());
-        let remote = peer.agent_todo_observations_for(
-            &[SEAT.to_owned()], peer.index().unwrap(),
-        ).unwrap();
+        let remote = peer
+            .agent_todo_observations_for(&[SEAT.to_owned()], peer.index().unwrap())
+            .unwrap();
         let remote = &remote[SEAT]["harness.todo.observed"];
         assert_eq!(remote.id, cleared.id);
         assert_eq!(remote.body["fields"]["source_op"], "clear");
