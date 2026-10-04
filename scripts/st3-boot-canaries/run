@@ -91,10 +91,11 @@ class Node:
         # binary. A link, because a debug st3 is hundreds of megabytes and /tmp is a small tmpfs.
         self.binary = root / "bin/st3"
         self.binary.symlink_to(binary)
-        pty = shutil.which("pty")
-        if not pty:
-            raise SystemExit("pty must be on PATH")
-        (root / "bin/pty").symlink_to(pty)
+        for tool in ("pty", "git"):
+            executable = shutil.which(tool)
+            if not executable:
+                raise SystemExit(f"{tool} must be on PATH")
+            (root / "bin" / tool).symlink_to(executable)
         install_stub(root / "bin", harness)
         self.path = f"{root / 'bin'}:/usr/bin:/bin"
         self.endpoint = root / "run/st.sock"
@@ -603,7 +604,7 @@ def run(args, root, evidence):
         for letter in letters:
             terminal = node.pty("peek", "--plain", "--full", f"c1.seat-{letter}")
             (evidence / f"terminal-{letter}.txt").write_text(terminal.stdout + terminal.stderr)
-            if node.daemon.poll() is None:
+            if node.daemon is not None and node.daemon.poll() is None:
                 (evidence / f"trace-{letter}.jsonl").write_text(
                     node.cli("trace", "show", seat_subject(letter), "--json", "--limit", "500", check=False))
         for index, record in enumerate(sorted((root / "state").rglob("harness-state"))):

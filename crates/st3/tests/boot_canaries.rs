@@ -30,9 +30,9 @@ fn canary(harness: &str, scenario: &str) {
     let on_path =
         |program: &str| std::env::split_paths(&path).any(|dir| dir.join(program).is_file());
     let tools: &[&str] = if matches!(harness, "pi" | "omp") {
-        &["pty", "python3", "curl", "node"]
+        &["pty", "git", "python3", "curl", "node"]
     } else {
-        &["pty", "python3", "curl"]
+        &["pty", "git", "python3", "curl"]
     };
     let missing: Vec<_> = tools.iter().filter(|tool| !on_path(tool)).collect();
     if !missing.is_empty() {
