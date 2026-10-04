@@ -490,7 +490,9 @@ impl Store {
                 || origin.claimant.as_deref() != Some(input.actor.as_str())
                 || origin.claim_incarnation != input.incarnation
                 || origin.claim_expires_at_unix_ms.is_none_or(|expiry| expiry <= now_ms()))) {
-                return Err(St3Error::new("stale-work-ask", "only the current claimant and incarnation of live work can ask a person"));
+                return Err(St3Error::new("stale-work-ask", format!(
+                    "only the current claimant and incarnation of live work can ask a person; expected incarnation `{}`, given `{}`",
+                    origin.claim_incarnation.as_deref().unwrap_or("<none>"), input.incarnation.as_deref().unwrap_or("<none>"))));
             }
             let waiting_since = input.legacy_request.as_ref().map(|id| tx.query_row("SELECT accepted_at_unix_ms FROM claims WHERE id=?1 AND kind='attention.requested'", [id], |row| row.get::<_, String>(0))).transpose().map_err(internal)?;
             let evidence = input.legacy_request.iter().cloned().collect::<Vec<_>>();

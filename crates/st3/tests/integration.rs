@@ -20,6 +20,7 @@ mod daemon_cost;
 mod daemon_load;
 mod daemon_environment;
 mod daemon_restart;
+mod driver_incarnation;
 mod delivery_probe;
 mod examples;
 mod fault_isolation;
