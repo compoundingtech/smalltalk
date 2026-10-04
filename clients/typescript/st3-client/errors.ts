@@ -1,7 +1,7 @@
 // What st's errors mean to a person, and whether trying again may help. The Rust client has the
 // same rules (ClientError::plain and is_transient in crates/st3-client), so every client says
 // the same thing and retries the same things.
-import { ClientError } from './Client.generated';
+import { ClientError } from './Client.generated.ts';
 
 type Code = ClientError['response']['code'];
 

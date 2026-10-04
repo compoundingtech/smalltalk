@@ -8,7 +8,7 @@ const ts = require('typescript');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'st3-ts-client-'));
 for (const name of ['Models.generated', 'Client.generated', 'fetch-receiver.test']) {
     const source = fs.readFileSync(path.join(__dirname, `${name}.ts`), 'utf8');
-    const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+    const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, rewriteRelativeImportExtensions: true } }).outputText;
     fs.writeFileSync(path.join(temporary, `${name}.js`), output);
 }
 const { St3Client, ClientError, applyWindow } = require(path.join(temporary, 'Client.generated.js'));
