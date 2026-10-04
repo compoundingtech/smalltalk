@@ -51,6 +51,12 @@ fn run_case(case: &str) {
         tempfile::tempdir().unwrap()
     });
     let evidence = output_root.as_ref().unwrap().path().join("evidence");
+    // Debug executables can be hundreds of megabytes. Keep their per-case copies on Cargo's
+    // artifact filesystem while the Python fixture keeps its Unix sockets in a short /tmp root.
+    let scratch = tempfile::Builder::new()
+        .prefix("messaging-fault-scratch-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
     // Double-fork out of the CI seat's ancestry. A sender is person/eval; an st harness
     // must never impersonate that sender. Captured pipes stay open until the eval exits.
     let output = Command::new("setsid")
@@ -60,6 +66,8 @@ fn run_case(case: &str) {
         .arg(&evidence)
         .arg("--old-binary")
         .arg(old)
+        .arg("--scratch")
+        .arg(scratch.path())
         .args(["--cases", case])
         .output()
         .expect("run the isolated messaging fault eval");

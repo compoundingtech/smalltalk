@@ -78,6 +78,9 @@ Fixture command helpers clear inherited `ST_AGENT`/`ST3_*`; temporary-repository
 isolate global/system config, hooks, signing and author identity on each command. Real
 repository commits keep the host's Git policy. Run the same suite from an agent seat with
 `nix develop --command cargo nextest run -p st3 --locked --profile ci --retries 0`.
+Boot and messaging-fault fixtures put large executable copies in Cargo's target scratch
+directory, keeping their Unix sockets in short temporary paths. This avoids exhausting a
+host's temporary-filesystem quota when debug binaries are copied by parallel cases.
 
 The workspace suite still covers the token-free two-node messaging fault matrix. Its historical
 channel build remains independently pinned in `.github/messaging-compat-baseline.json`. Its
