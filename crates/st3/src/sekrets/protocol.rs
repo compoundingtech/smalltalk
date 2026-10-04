@@ -180,6 +180,9 @@ pub enum Reply {
     Started {
         profile: String,
         call: i64,
+        /// Something the caller should know, such as where the command runs.
+        #[serde(default)]
+        note: Option<String>,
     },
     Exited {
         #[serde(default)]

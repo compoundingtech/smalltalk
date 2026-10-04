@@ -125,7 +125,11 @@ impl Connection {
             bail!("the sekrets gateway closed the connection");
         };
         match reply {
-            Reply::Started { .. } => {}
+            Reply::Started { note, .. } => {
+                if let Some(note) = note {
+                    eprintln!("st sekrets: {note}");
+                }
+            }
             Reply::Refused { reason, .. } => bail!("refused: {reason}"),
             Reply::Error { message } => bail!("sekrets gateway: {message}"),
             other => bail!("unexpected reply from the gateway: {other:?}"),
