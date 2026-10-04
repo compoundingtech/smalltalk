@@ -746,6 +746,20 @@ export const AgentRepository = /*#__PURE__*/ (() => Schema.Struct({
 export type AgentRepository = typeof AgentRepository.Type
 export type AgentRepositoryEncoded = typeof AgentRepository.Encoded
 
+export const AgentWorkspace = /*#__PURE__*/ (() => Schema.Struct({
+  "agent_id": AgentId,
+  /** Agent declaration supplying the workspace; reached through unambiguous stop predecessors. */
+  "declaration_token": Schema.String.annotate({ description: "Agent declaration supplying the workspace; reached through unambiguous stop predecessors." }),
+  /** Selected desired claim, including a stop when the seat is retired. */
+  "desired_token": Schema.String.annotate({ description: "Selected desired claim, including a stop when the seat is retired." }),
+  "host_id": HostId,
+  "kind": Schema.Literal("agent-workspace"),
+  /** Declared workspace directory on host_id, not the API gateway's filesystem or the harness's internal state directory. */
+  "workspace": Schema.String.annotate({ description: "Declared workspace directory on host_id, not the API gateway's filesystem or the harness's internal state directory." })
+}).annotate({ identifier: "AgentWorkspace" }))()
+export type AgentWorkspace = typeof AgentWorkspace.Type
+export type AgentWorkspaceEncoded = typeof AgentWorkspace.Encoded
+
 export const Attachment = /*#__PURE__*/ (() => Schema.Struct({
   "blob": Schema.String.check(Schema.isPattern(new RegExp("^blob/[0-9a-f]{64}$", "u"))),
   "media_type": Schema.Literals(["image/png","image/jpeg","image/gif","image/webp"]),
@@ -2051,7 +2065,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, AgentQueue, UsagePeriod], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, AgentQueue, UsagePeriod], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded

@@ -93,6 +93,91 @@ fn value(output: &Output) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_workspace_cli_and_client_read_the_same_declaration_even_after_retirement() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let publish = |source: &str| {
+        let intent = st3::graph::parse_intent(source, store.origin()).unwrap();
+        store.apply_internal(&intent, source).unwrap();
+    };
+    let declare = |workspace: &str| {
+        format!(
+            "version 2\nagent \"garden/interactive\" {{ host \"distant\"; workspace {workspace:?}; harness \"omp\" {{}}; one-shot; env {{ TOKEN \"private-example\" }} }}\n"
+        )
+    };
+    publish(&declare("/work/interactive seat"));
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(state))
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let client = st3_client::Client::unix(&socket);
+    for workspace in ["/work/interactive seat", "/work/changed seat"] {
+        if workspace.ends_with("changed seat") {
+            publish(&declare(workspace));
+        }
+        let human = run_cli_human(&socket, &["agents", "workspace", "garden/interactive"]).await;
+        assert!(human.status.success(), "{human:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&human.stdout),
+            format!("{workspace}\n")
+        );
+        let json = value(
+            &run_cli(
+                &socket,
+                &["agents", "workspace", "agent/garden/interactive"],
+            )
+            .await,
+        );
+        assert_eq!(json["value"]["workspace"], workspace);
+        assert_eq!(json["value"]["host_id"], "host/distant");
+        assert!(!json.to_string().contains("private-example"));
+        let typed = client
+            .agent_workspace_get("garden/interactive")
+            .await
+            .unwrap();
+        assert_eq!(
+            typed.value,
+            serde_json::from_value(json["value"].clone()).unwrap()
+        );
+        assert_eq!(typed.value.desired_token, typed.value.declaration_token);
+    }
+    let before = client
+        .agent_workspace_get("agent/garden/interactive")
+        .await
+        .unwrap();
+    publish("version 2\nstop \"agent/garden/interactive\"\n");
+    let stopped = client
+        .agent_workspace_get("agent/garden/interactive")
+        .await
+        .unwrap();
+    assert_eq!(stopped.value.workspace, before.value.workspace);
+    assert_eq!(stopped.value.host_id, "host/distant");
+    assert_eq!(
+        stopped.value.declaration_token,
+        before.value.declaration_token
+    );
+    assert_ne!(stopped.value.desired_token, before.value.desired_token);
+    assert!(stopped.snapshot.store_index > before.snapshot.store_index);
+    let stopped_cli =
+        value(&run_cli(&socket, &["agents", "workspace", "garden/interactive"]).await);
+    assert_eq!(stopped_cli["value"]["workspace"], "/work/changed seat");
+    let unknown = run_cli_human(&socket, &["agents", "workspace", "garden/missing"]).await;
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("agent workspace not found"));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_policy() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");

@@ -2621,6 +2621,8 @@ enum AgentsCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Print one seat's declared workspace directory on its owning host, even when stopped.
+    Workspace { subject: String },
     /// Declare one new agent seat, start its harness, and wait until it is ready.
     ///
     /// The declaration is the one a person writes by hand, with the harness defaults of the
@@ -10736,6 +10738,16 @@ async fn run_agents(
             }
             Ok(())
         }
+        AgentsCommand::Workspace { subject } => {
+            let response = generated_client(endpoint, None)?
+                .agent_workspace_get(&normalize_agent_subject(&subject))
+                .await?;
+            if json_output {
+                return print_value(&response, true);
+            }
+            println!("{}", response.value.workspace);
+            Ok(())
+        }
         AgentsCommand::Apply(args) => {
             let client = cli_client(endpoint);
             let (kdl, source_name) = read_intent(Some(&args.file))?;
@@ -11670,6 +11682,7 @@ async fn run_agent_inspection(
             return Ok(());
         }
         AgentsCommand::New(_)
+        | AgentsCommand::Workspace { .. }
         | AgentsCommand::Repos { .. }
         | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)

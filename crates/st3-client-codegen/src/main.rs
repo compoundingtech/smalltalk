@@ -256,6 +256,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {{ self.agent_queue_internal(agent_id).await }}"
             )?;
+        } else if id == "agent-workspace.get" {
+            writeln!(
+                out,
+                "    pub async fn agent_workspace_get(&self, id: &str) -> Result<Envelope<AgentWorkspace>, ClientError> {{ self.get(&format!(\"/v1/client/agent-workspaces/{{}}\", percent_encode(id))).await }}"
+            )?;
         } else if id == "agent-declaration.get" {
             writeln!(
                 out,
@@ -345,6 +350,11 @@ fn swift_operation_methods(
             writeln!(
                 out,
                 "    public func documentGet(name: String) async throws -> Envelope<DocumentContent> {{ try await get(\"v1/client/documents/content\", query: [.init(name: \"name\", value: name)]) }}"
+            )?;
+        } else if id == "agent-workspace.get" {
+            writeln!(
+                out,
+                "    public func agentWorkspaceGet(id: String) async throws -> Envelope<AgentWorkspace> {{ try await get(\"v1/client/agent-workspaces/\\(id)\") }}"
             )?;
         } else if id == "agent-declaration.get" {
             writeln!(
@@ -572,6 +582,7 @@ fn validate_surfaces(
         "AttentionTargetState",
         "DocumentContent",
         "AgentDeclaration",
+        "AgentWorkspace",
         "AgentRepository",
         "HostRepositories",
         "CanonicalNode",
