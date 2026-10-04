@@ -16104,7 +16104,7 @@ agent "good" {{ workspace {:?}; command "true" }}
         let kdl = r#"version 2
 mission "review" state="ready" {
   goal "Review the candidate."
-  step "review" { assigned-to "person/example-reviewer" }
+  step "review" { assigned-to "person/reviewer" }
 }"#;
 
         let (preview, status, applied) = preview_and_apply(app, kdl).await;
@@ -16133,7 +16133,7 @@ agent "example/worker" { workspace "/tmp"; command "true" }"#,
 mission "review" state="ready" {
   goal "Review the candidate."
   step "review" {
-    available-to "person/example-reviewer"
+    available-to "person/reviewer"
     available-to "agent/example/worker"
   }
 }"#;
@@ -16172,7 +16172,7 @@ mission "work" state="ready" {
 
         let available = kdl.replace(
             "assigned-to \"agent/example/nobody\"",
-            "available-to \"person/example-reviewer\"; available-to \"agent/example/nobody\"",
+            "available-to \"person/reviewer\"; available-to \"agent/example/nobody\"",
         );
         let (preview, status, error) = preview_and_apply(app.clone(), &available).await;
         assert_eq!(preview["blockers"], json!([refusal]));
