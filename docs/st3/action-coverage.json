@@ -611,6 +611,14 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st clients",
+      "description": "The clients connected to this member now and those seen in the last few minutes",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
       "command": "st completions",
       "description": "Generate one shell completion script",
       "tests": [

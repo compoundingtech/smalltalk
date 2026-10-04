@@ -300,6 +300,27 @@ export type Capability = {
   version: number;
 };
 
+export type ClientConnection = {
+  actor: string;
+  client?: string | null;
+  connected: boolean;
+  device_id?: string;
+  device_name?: string;
+  follows: Array<string>;
+  last_seen: Timestamp;
+  member: string;
+  person: string;
+  since: Timestamp;
+  streams: number;
+  via: "local" | "gateway" | "tailscale";
+};
+
+export type ClientConnections = {
+  items: Array<ClientConnection>;
+  kind: "client-connections";
+  member: string;
+};
+
 export type CollectionCommand = ({
   actor?: string | null;
   collection: CollectionName;

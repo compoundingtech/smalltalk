@@ -10,6 +10,7 @@ mod boot_canaries;
 mod broken_gates;
 mod client_creation;
 mod client_glasses;
+mod client_presence;
 mod client_v0_cli;
 mod client_v0_contract;
 mod codex_bootstrap;

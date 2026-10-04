@@ -1539,6 +1539,7 @@ async fn cli_reads_preserve_operational_views_after_restart() {
         vec!["launch", "ls"],
         vec!["lanes", "ls"],
         vec!["devices", "ls"],
+        vec!["clients"],
         vec!["fleet", "status"],
         vec!["fleet", "invites"],
         vec!["replication", "status"],

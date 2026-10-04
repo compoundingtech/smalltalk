@@ -20,6 +20,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "launch",
             "lanes",
             "devices",
+            "clients",
         ],
     ),
     (

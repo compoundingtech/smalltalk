@@ -65,6 +65,7 @@ public enum ReadOperation: String, CaseIterable, Sendable {
     case documentGet = "document.get"
     case subjectDefinition = "subject.definition"
     case usagePeriod = "usage.period"
+    case clientsList = "clients.list"
     case nowList = "now.list"
     case machinesList = "machines.list"
     case devicesList = "devices.list"
@@ -118,6 +119,7 @@ public let st3ClientReadPaths: [ReadOperation: String] = [
     .documentGet: "/v1/client/documents/content",
     .subjectDefinition: "/v1/client/subject-definition",
     .usagePeriod: "/v1/client/usage",
+    .clientsList: "/v1/client/clients",
     .nowList: "/v1/client/now",
     .machinesList: "/v1/client/machines",
     .devicesList: "/v1/client/devices",
