@@ -183,4 +183,15 @@ final class St3ClientTests: XCTestCase {
         guard case .truncation = timeline.items[8].body else { return XCTFail("truncation lost") }
         guard case .error = timeline.items[9].body else { return XCTFail("error body lost") }
     }
+
+    func testAKindThisClientDoesNotKnowReadsAsUnknown() throws {
+        let json = #"{"kind":"example-arrangement","id":"example-arrangement/person/avery/1","revision":"r1","updated_at":"2026-10-04T08:00:00Z","name":"Pinned"}"#
+        let resource = try JSONDecoder().decode(Resource.self, from: Data(json.utf8))
+        guard case .unknown(let unknown) = resource else { return XCTFail("an unknown kind is kept as unknown") }
+        XCTAssertEqual(unknown.kind, "example-arrangement")
+        XCTAssertEqual(resource.id, "example-arrangement/person/avery/1")
+        XCTAssertEqual(unknown.fields["name"], .string("Pinned"))
+        let again = try JSONDecoder().decode(Resource.self, from: JSONEncoder().encode(resource))
+        XCTAssertEqual(again.id, resource.id)
+    }
 }

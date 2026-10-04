@@ -1364,6 +1364,73 @@ pub enum Resource {
     Session(Session),
     Glass(Glass),
     OwnedSet(OwnedSet),
+    /// A kind this client does not know, from a member newer than it. It keeps the header and
+    /// the whole resource as sent, so an older client skips it or shows it plainly instead of
+    /// failing the page it came in.
+    #[serde(untagged)]
+    Unknown(UnknownResource),
+}
+
+/// The resource kinds this client models; any other kind reads as [`Resource::Unknown`].
+pub const KNOWN_RESOURCE_KINDS: &[&str] = &[
+    "attention",
+    "message",
+    "launch",
+    "launch-variant",
+    "launch-decision",
+    "launch-approval",
+    "mission",
+    "work",
+    "agent",
+    "runtime",
+    "observer",
+    "subscription",
+    "lane",
+    "machine",
+    "device",
+    "operation",
+    "history",
+    "session",
+    "glass",
+    "owned-set",
+];
+
+/// A resource of a kind this client does not model.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct UnknownResource {
+    pub kind: String,
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    /// Every other field, as sent.
+    #[serde(flatten)]
+    pub fields: serde_json::Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for UnknownResource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut fields = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let kind = match fields.remove("kind") {
+            Some(Value::String(kind)) => kind,
+            _ => return Err(D::Error::missing_field("kind")),
+        };
+        // A known kind that failed its own model is an error, never an unknown resource.
+        if KNOWN_RESOURCE_KINDS.contains(&kind.as_str()) {
+            return Err(D::Error::custom(format!(
+                "a `{kind}` resource does not match its model"
+            )));
+        }
+        let header =
+            ResourceHeader::deserialize(Value::Object(fields.clone())).map_err(D::Error::custom)?;
+        for name in ["id", "revision", "updated_at", "operational"] {
+            fields.remove(name);
+        }
+        Ok(Self {
+            kind,
+            header,
+            fields,
+        })
+    }
 }
 
 impl Resource {
@@ -1389,6 +1456,7 @@ impl Resource {
             Self::Session(v) => &v.header,
             Self::Glass(v) => &v.header,
             Self::OwnedSet(v) => &v.header,
+            Self::Unknown(v) => &v.header,
         }
     }
 }

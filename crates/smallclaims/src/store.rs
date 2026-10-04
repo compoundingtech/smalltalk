@@ -333,6 +333,12 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     detail TEXT NOT NULL DEFAULT '{}',
     updated_at_unix_ms INTEGER NOT NULL
 );
+-- Backup seeks only admitted wire records and the newest recorded manifest.
+CREATE INDEX IF NOT EXISTS replica_envelopes_admitted
+ON replica_envelopes(writer, sequence, envelope_hash) WHERE batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS checkpoints_manifest_cut
+ON checkpoints(cut_unix_ms DESC)
+WHERE state IN ('trimming','trimmed') AND drop_digest IS NOT NULL;
 CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
 -- A trim reads each envelope's dropped claims.
 CREATE INDEX IF NOT EXISTS checkpoint_claims_envelope
@@ -407,6 +413,25 @@ impl Store {
         }
         let mut connection = Connection::open(path)
             .with_context(|| format!("open st database {}", path.display()))?;
+        let has_meta: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_meta
+            && let Some(writer) = connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key='backup_restore_writer'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        {
+            anyhow::ensure!(
+                origin == writer,
+                "restored database requires fresh writer `{writer}`; configure node to that identity before starting"
+            );
+        }
         projection_digest::register(&connection)?;
         crate::sqlite::observe(&mut connection);
         connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
@@ -486,7 +511,14 @@ impl Store {
         runtime: Arc<dyn Runtime>,
     ) -> Result<Self> {
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
-        let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
+        let index = current_index(&connection)?;
+        // Older stores have no admission watermark. Startup recovery projects this index
+        // before serving; subsequent admission chunks update it in their own transaction.
+        connection.execute(
+            "INSERT OR IGNORE INTO meta(key,value) VALUES('replication_admitted_index',?1)",
+            [index.to_string()],
+        )?;
+        let committed_index = Arc::new(AtomicU64::new(index));
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
@@ -5347,6 +5379,12 @@ impl Store {
                 }
                 if outcome.changed {
                     self.defer_replication_projection();
+                    // Persist with the admission commit: a backup reader in another process
+                    // must distinguish the admitted log from a projection still catching up.
+                    pass.execute(
+                        "INSERT OR REPLACE INTO meta(key,value) VALUES('replication_admitted_index',?1)",
+                        [current_index_tx(&pass)?.to_string()],
+                    )?;
                 }
                 pass.commit()?;
                 #[cfg(any(test, feature = "test-support"))]
