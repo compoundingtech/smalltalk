@@ -233,8 +233,8 @@ fn recording_pty(root: &Path) -> PathBuf {
 /// Run `st terminals attach` against `endpoint` with no terminal on stdin. This host's PTY root
 /// is `ROOT/state/st3/pty`, as `ConfiguredRegistry` writes it.
 async fn attach(root: &Path, endpoint: &str) -> (Output, u32) {
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
-    let mut command = std::process::Command::new(binary);
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
+    let mut command = st3::test_support::command(binary);
     // An operator command: the harness running the suite must not lend its seat identity, and
     // its own PTY session must not trip the nested-attach guard.
     command
@@ -262,8 +262,8 @@ async fn attach(root: &Path, endpoint: &str) -> (Output, u32) {
 /// `ROOT/run/st3.sock` and its PTY root `ROOT/state/st3/pty`. Returns the output, the CLI's pid,
 /// and how long it ran.
 async fn configured_attach(root: &Path, daemon_wait: &str) -> (Output, u32, Duration) {
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
-    let mut command = std::process::Command::new(binary);
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
+    let mut command = st3::test_support::command(binary);
     command
         .env_remove("ST_AGENT")
         .env_remove("ST_MISSION_RUN")
@@ -564,8 +564,8 @@ async fn waiting_on_a_daemon_that_does_not_answer_says_so() {
     let daemon = SilentDaemon::unix(&socket);
     // No PTY session of the subject runs on this host, so only the daemon can attach it.
     ConfiguredRegistry::new(root.path());
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
-    let mut child = std::process::Command::new(binary)
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
+    let mut child = st3::test_support::command(binary)
         .env_remove("ST_AGENT")
         .env_remove("ST_MISSION_RUN")
         .env_remove("PTY_SESSION")
@@ -697,7 +697,7 @@ fn fabric_shim(root: &Path, tunnel: Option<&Path>) {
 fn fabric_tunnel(socket: &Path, owner_pty_root: &Path) -> std::thread::JoinHandle<Option<u32>> {
     let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
     let pty_root = owner_pty_root.to_path_buf();
     std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -714,7 +714,7 @@ fn fabric_tunnel(socket: &Path, owner_pty_root: &Path) -> std::thread::JoinHandl
             }
         };
         tunnel.set_nonblocking(false).unwrap();
-        let mut serve = std::process::Command::new(binary)
+        let mut serve = st3::test_support::command(binary)
             .env_remove("ST_AGENT")
             .env_remove("PTY_SESSION")
             .args(["terminals", "serve-fabric", "--stdio", "--pty-root"])
@@ -732,8 +732,8 @@ fn fabric_tunnel(socket: &Path, owner_pty_root: &Path) -> std::thread::JoinHandl
 
 /// Run `st terminals attach` as a person against `endpoint`, with this test's config and state.
 async fn remote_attach(root: &Path, endpoint: &str) -> Output {
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
-    let mut command = std::process::Command::new(binary);
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
+    let mut command = st3::test_support::command(binary);
     command
         .env_remove("ST_AGENT")
         .env_remove("ST_MISSION_RUN")

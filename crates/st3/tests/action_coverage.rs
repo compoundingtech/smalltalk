@@ -364,7 +364,7 @@ impl Daemon {
     }
 
     fn cli_command(&self, actor: &str, args: &[&str]) -> tokio::process::Command {
-        let mut command = tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"));
+        let mut command = st3::test_support::async_command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
         command
             .args([
                 "--endpoint",
@@ -2528,10 +2528,10 @@ elif 'st3.service' in args:
     let run = |args: Vec<String>| {
         let mut command = if args.get(1).map(String::as_str) == Some("reset") {
             let mut command = tokio::process::Command::new("python3");
-            command.args(["-c", "import os,pty,subprocess,sys; master,slave=pty.openpty(); os.write(master,b'yes\\nfixture-service\\nerase st state\\n'); result=subprocess.run(sys.argv[1:],stdin=slave); os.close(master); os.close(slave); sys.exit(result.returncode)", assert_cmd::cargo::cargo_bin!("st3").to_str().unwrap()]);
+            command.args(["-c", "import os,pty,subprocess,sys; master,slave=pty.openpty(); os.write(master,b'yes\\nfixture-service\\nerase st state\\n'); result=subprocess.run(sys.argv[1:],stdin=slave); os.close(master); os.close(slave); sys.exit(result.returncode)", assert_cmd::cargo::cargo_bin!("st3-fixture").to_str().unwrap()]);
             command
         } else {
-            tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+            st3::test_support::async_command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         };
         command
             .env_clear()
@@ -2549,7 +2549,7 @@ elif 'st3.service' in args:
             .env("XDG_DATA_HOME", root.path().join("data"))
             .env("XDG_RUNTIME_DIR", root.path().join("run"))
             .env("ST3_COVERAGE_ROOT", root.path())
-            .env("ST3_COVERAGE_BINARY", assert_cmd::cargo::cargo_bin!("st3"))
+            .env("ST3_COVERAGE_BINARY", assert_cmd::cargo::cargo_bin!("st3-fixture"))
             .args(args);
         async move {
             tokio::time::timeout(Duration::from_secs(30), command.output())

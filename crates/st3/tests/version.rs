@@ -27,13 +27,13 @@ fn version(directory: &std::path::Path, args: &[&str]) -> String {
 fn version_is_baked_and_available_without_a_daemon() {
     let root = tempfile::tempdir().unwrap();
     // A different caller checkout must not change the version, even if it is dirty.
-    let git = Command::new("git")
+    let git = st3::test_support::git()
         .args(["init", "-q"])
         .current_dir(root.path())
         .output()
         .unwrap();
     assert!(git.status.success());
-    let commit = Command::new("git")
+    let commit = st3::test_support::git()
         .args([
             "-c",
             "user.name=Example",

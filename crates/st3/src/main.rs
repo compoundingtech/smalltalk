@@ -3874,6 +3874,11 @@ fn main() -> ExitCode {
     {
         return run_driver_hook();
     }
+    // Cargo bakes the target name into each executable. The installed st3 binary cannot
+    // enable this with an argument, environment variable, or a different filename.
+    #[cfg(feature = "test-support")]
+    let _fixture_shell = (env!("CARGO_BIN_NAME") == "st3-fixture")
+        .then(st3::test_support::initialize_fixture);
     // SAFETY: no other thread exists yet; the async runtime starts after this returns.
     unsafe { st_drivers::reexec::take_resume_environment() };
     if st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV).is_some() {

@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, watch};
 
 fn backup_cli(root: &Path, socket: &Path) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_st3"));
+    let mut command = st3::test_support::async_command(env!("CARGO_BIN_EXE_st3-fixture"));
     command.env("XDG_CONFIG_HOME", root.join("config"));
     command.env("XDG_STATE_HOME", root.join("state"));
     command.env("XDG_DATA_HOME", root.join("data"));

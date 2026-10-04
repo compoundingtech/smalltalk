@@ -6,8 +6,6 @@
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::process::Command;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -218,10 +216,9 @@ impl Checkout {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     pub(crate) fn git(directory: &Path, arguments: &[&str]) {
-        let status = Command::new("git")
+        let status = crate::test_support::git()
             .arg("-C")
             .arg(directory)
             .args(arguments)
@@ -321,7 +318,7 @@ mod tests {
             "second\n",
             "the worktree starts from the fetched base"
         );
-        let head = Command::new("git")
+        let head = crate::test_support::git()
             .arg("-C")
             .arg(&workspace)
             .args(["branch", "--show-current"])

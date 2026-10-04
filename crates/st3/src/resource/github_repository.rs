@@ -1295,12 +1295,16 @@ mod tests {
         async fn start() -> (Self, String) {
             let github = Self::default();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let base = format!("http://{}", listener.local_addr().unwrap());
+            // cargo test shares the production caches between tests. A recycled TCP port
+            // must not let a new fixture reuse another fixture's REST or GraphQL state.
+            let scope = format!("/fixture/{}", uuid::Uuid::now_v7());
+            let base = format!("http://{}{scope}", listener.local_addr().unwrap());
             let server = github.clone();
             tokio::spawn(async move {
                 loop {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let server = server.clone();
+                    let scope = scope.clone();
                     tokio::spawn(async move {
                         let mut request = Vec::new();
                         let mut chunk = [0_u8; 4096];
@@ -1316,7 +1320,9 @@ mod tests {
                                 return;
                             }
                         };
-                        let head = String::from_utf8_lossy(&request[..header_end]).to_string();
+                        // Route tables and request assertions use paths relative to this
+                        // fixture's API base; the client/cache still sees the unique scope.
+                        let head = String::from_utf8_lossy(&request[..header_end]).replacen(&scope, "", 1);
                         let length = head
                             .lines()
                             .find_map(|line| {
@@ -1428,7 +1434,7 @@ mod tests {
             cursor: cursor.map(str::to_owned),
             previous_facts: previous,
             // Each poll revalidates instead of reusing a cached response.
-            every_ms: Some(1),
+            every_ms: Some(0),
             refresh: false,
         }
     }
@@ -1663,7 +1669,9 @@ mod tests {
             .unwrap();
         assert!(
             spent.not_modified >= 4,
-            "unchanged listings revalidate for free"
+            "unchanged listings revalidate for free: not_modified={}, sent={}",
+            spent.not_modified,
+            spent.sent
         );
     }
 

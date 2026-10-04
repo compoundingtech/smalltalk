@@ -9,7 +9,7 @@
 use std::fs::File;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -34,10 +34,9 @@ impl Daemon {
             executable(&bin.join(name), source);
         }
         let log = File::create(root.join("daemon.log")).unwrap();
-        let child = Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        let child = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
             .env_clear()
             .env("HOME", root)
-            .env("SHELL", "/bin/bash")
             .env(
                 "PATH",
                 format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
@@ -84,7 +83,7 @@ impl Daemon {
     }
 
     fn run_cli(&self, args: &[&str]) -> std::process::Output {
-        Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
             .env_clear()
             .env("HOME", &self.root)
             .env("ST3_DAEMON_WAIT", "0")
@@ -352,7 +351,7 @@ mission "orchid/replay" state="ready" {
         health["message"].as_str().unwrap().contains(stuck),
         "{health}"
     );
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         .env_clear()
         .env("HOME", root.path())
         .env("ST3_DAEMON_WAIT", "0")
@@ -399,9 +398,9 @@ fn mission(root: &Path, fixed: bool) -> String {
     let tools = root.join("tools");
     let linker = root.join("linker");
     let path = if fixed {
-        format!("{}:{}:/usr/bin:/bin", tools.display(), linker.display())
+        format!("{}:{}", tools.display(), linker.display())
     } else {
-        format!("{}:/usr/bin:/bin", tools.display())
+        tools.display().to_string()
     };
     let suite = |name: &str| format!("export PATH={path}; cargo test -p orchid --test {name}");
     let threshold = if fixed { "8000000000" } else { "1200" };
@@ -455,6 +454,11 @@ fn replay_host(root: &Path) -> Daemon {
     // `cargo` needs the `mold` linker on PATH, as the gates' cargo builds did.
     std::fs::create_dir_all(root.join("tools")).unwrap();
     std::fs::create_dir_all(root.join("linker")).unwrap();
+    // Supply only the gate tools: mold must stay absent until the revision adds it.
+    for name in ["awk", "cat", "grep", "sh", "env"] {
+        let tool = st_runtime::resolve_executable(name, &std::env::vars().collect()).unwrap();
+        std::os::unix::fs::symlink(tool, root.join("tools").join(name)).unwrap();
+    }
     executable(
         &root.join("tools/cargo"),
         "#!/bin/sh\ncommand -v mold >/dev/null 2>&1 || { echo 'error: linker `mold` not found' >&2; exit 101; }\necho 'test result: ok. 12 passed'\n",
