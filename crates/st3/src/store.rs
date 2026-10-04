@@ -10315,6 +10315,7 @@ impl Store {
         &self,
         subject: &str,
     ) -> Result<Option<(DesiredSubject, Option<String>)>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         connection
             .query_row(

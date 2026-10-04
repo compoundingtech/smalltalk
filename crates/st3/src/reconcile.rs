@@ -3201,7 +3201,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .unwrap_or(0);
         let matched_line = if member.terminal {
             screen.and_then(|screen| {
-                let matched = st_drivers::blocking_screen::detect(driver, &screen)?;
+                let matched = st_drivers::blocking_screen::detect(driver, screen)?;
                 if matched.code != "provider-auth-expired" {
                     return None;
                 }
@@ -32087,9 +32087,12 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
                 Some("person/avery"),
             )
             .unwrap();
-        assert_eq!(
-            store.agent_person("agent/node.bound").unwrap().as_deref(),
-            Some("person/robin")
+        let (owner, reads) =
+            smallclaims::touched::record(|| store.agent_person("agent/node.bound").unwrap());
+        assert_eq!(owner.as_deref(), Some("person/robin"));
+        assert!(
+            reads.contains("account/shared"),
+            "an account owner edit must refresh the login person"
         );
         assert_eq!(
             store.agent_person("agent/node.pooled").unwrap().as_deref(),
