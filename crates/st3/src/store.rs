@@ -46803,6 +46803,22 @@ fn append_claim_with_fences(
                     .with_detail("current_head", json!(actual)));
                 }
             }
+            // A native session is a current binding, not an incarnation-wide operation ID:
+            // A -> B -> A must publish A again, while retries of the current A stay quiet.
+            if input.kind == "harness.session-file"
+                && input.idempotency_key.is_none()
+                && input.evidence.is_empty()
+                && let Some(existing) = latest_claim_of_kind_tx(
+                    transaction, &input.subject, "harness.session-file",
+                )?
+                && existing.actor == input.actor
+                && existing.body.get("fields").and_then(Value::as_object).is_some_and(|fields| {
+                    fields.len() == input.fields.len()
+                        && input.fields.iter().all(|(key, value)| fields.get(key) == Some(value))
+                })
+            {
+                return Ok((existing, false));
+            }
             if input.kind == crate::placement::SOURCE_OFFLINE_KIND {
                 let current: Option<String> = transaction.query_row(
                     "SELECT claim_id FROM desired WHERE subject=?1 AND kind='agent'",
