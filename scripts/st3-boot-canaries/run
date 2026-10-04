@@ -123,8 +123,8 @@ client_gateway_socket = "{root / 'run/client.sock'}"
 
     def start(self):
         if not (self.root / "ws/.git").exists():
-            subprocess.run(["git", "init", "-q", str(self.root / "ws")], check=True)
-            subprocess.run(["git", "-C", str(self.root / "ws"), "-c", "user.name=Canary", "-c", "user.email=canary@example.invalid", "commit", "--allow-empty", "-qm", "Canary workspace"], check=True)
+            subprocess.run(["git", "init", "-q", str(self.root / "ws")], env=self.env, check=True)
+            subprocess.run(["git", "-C", str(self.root / "ws"), "-c", "user.name=Canary", "-c", "user.email=canary@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "Canary workspace"], env=self.env, check=True)
         self.daemon = subprocess.Popen([str(self.binary), "up", "--config", str(self.root / "config.toml")],
                                        env=self.env, cwd=self.root / "ws", stdin=subprocess.DEVNULL,
                                        stdout=self.log, stderr=self.log, start_new_session=True)
