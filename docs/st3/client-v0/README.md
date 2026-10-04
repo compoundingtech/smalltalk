@@ -1239,15 +1239,21 @@ Each atomic edit may touch a register at most once; retirement must be its only 
 Creation declares the name and may atomically include folders and placements. Null
 placement folders unfile subjects; changing the key reorders them. Include any necessary
 rekeys in the same atomic edit. Only touched registers change: stale layout revisions
-merge rather than replace unrelated fields. The target arrangement's entry in
-`fence.subject_revisions` is a layout base, not a compare-and-swap precondition. The
-existing action ID, snapshot fence, and session-scoped idempotency key remain required;
+merge rather than replace unrelated fields. For layout edits, the target arrangement's
+entry in `fence.subject_revisions` is a layout base, not a compare-and-swap precondition.
+For `retire`, that entry instead requires the current arrangement revision to match in
+the writer transaction: a mismatch returns `stale-fence` and appends nothing. An unfenced
+retire is unconditional. To fold a duplicate losslessly, read it, fold its contents into
+the winner, then retire it fenced on the revision read; on refusal, reread and refold.
+The existing action ID, snapshot fence, and session-scoped idempotency key remain required;
 stale graph identity/authority and launch revision fences for other subjects refuse the edit
 atomically in the writer transaction. Attention episodes and external native-session revisions
 retain the existing projected preflight checks; external filesystem state is not governed by
 SQLite admission and cannot be made transactionally atomic with graph writes.
-Exact retry of the original input and key returns the saved receipt, even after later
-edits; changing any input with the same key returns `idempotency-conflict`. A completed
+Retry of the same action identity, parameters and key returns the saved receipt, even
+after later edits or retirement. Fences are excluded from request identity: they may
+be refreshed after refusal, and accepted retries replay before fence validation.
+Changing other input with the same key returns `idempotency-conflict`. A completed
 result's `affected_ids` names only the arrangement and `arrangement_revision` identifies
 the accepted claim, not a promise that its registers will remain winners.
 
@@ -1294,8 +1300,10 @@ typed operation unions, not arbitrary JSON bodies. Regenerate all clients with
 
 Fractal migration is client-owned: discover capability, pause legacy writers, fold old
 `custom.fractal.sidebar` HLC history once, and durably stage the snapshot, target ID,
-exact typed operations and idempotency key. Preserve stable IDs, keys, tombstones and
-placements. Retry that exact staged request until acknowledged and readable, then switch
+exact typed operations and idempotency key. Preserve stable IDs, import order (keys are
+re-derived), tombstones and placements. Fractal sorts legacy siblings by `(key, ID)` and
+deterministically derives canonical fractional keys for each folder and placement list.
+Retry that exact staged request until acknowledged and readable, then switch
 exclusively to arrangements. Old stamps remain provenance, not live ordering. Keep staged
 state on failure, leave immutable custom history, and never dual-write. There is no
 upstream Fractal-specific importer.

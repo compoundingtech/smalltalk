@@ -189,6 +189,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arrangement_retire_fences_refuse_concurrent_edits_and_replay_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "arrangement-retire-fences");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        let invoke = |request| action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session.clone()), Json(request));
+        let created = invoke(request(&state, "create-retire", json!([{"op":"create","name":"Sidebar"}]))).await.unwrap().0;
+        let mut retire = request(&state, "conditional-retire", json!([{"op":"retire"}]));
+        retire.fence.subject_revisions.insert(SUBJECT.into(), created["arrangement_revision"].as_str().unwrap().into());
+        let changed = invoke(request(&state, "concurrent-edit", json!([{
+            "op":"subject.place","subject":"agent/new-seat","folder":null,"key":"a0"
+        }]))).await.unwrap().0;
+        let index = state.store.index().unwrap();
+        let error = invoke(retire.clone()).await.unwrap_err();
+        assert_eq!(error.code, "stale-subject");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.details["subject"], SUBJECT);
+        assert_eq!(error.details["expected_head"], created["arrangement_revision"]);
+        assert_eq!(error.details["current_head"], changed["arrangement_revision"]);
+        assert_eq!(state.store.index().unwrap(), index);
+        assert_eq!(state.store.arrangement(SUBJECT, u64::MAX).unwrap().unwrap()["body"]["placements"]["agent/new-seat"]["value"],
+            json!({"folder":null,"key":"a0"}));
+        // A refusal consumes neither the operation key nor a receipt.
+        retire.fence.subject_revisions.insert(SUBJECT.into(), changed["arrangement_revision"].as_str().unwrap().into());
+        let accepted = invoke(retire.clone()).await.unwrap().0;
+        let index = state.store.index().unwrap();
+        let replay = invoke(retire.clone()).await.unwrap().0;
+        assert_eq!(replay["arrangement_revision"], accepted["arrangement_revision"]);
+        assert_eq!(replay["operation_id"], accepted["operation_id"]);
+        assert_eq!(state.store.index().unwrap(), index);
+        // Fences are not request identity: accepted retries replay before checking them.
+        retire.fence.subject_revisions.insert(SUBJECT.into(), "claim/different".into());
+        let refreshed = invoke(retire.clone()).await.unwrap().0;
+        assert_eq!(refreshed["arrangement_revision"], accepted["arrangement_revision"]);
+        assert_eq!(refreshed["operation_id"], accepted["operation_id"]);
+        let mut different = retire;
+        different.parameters["operations"] = json!([{"op":"rename","name":"Different"}]);
+        assert_eq!(invoke(different).await.unwrap_err().code, "idempotency-conflict");
+        assert_eq!(state.store.index().unwrap(), index);
+        assert!(state.store.arrangement(SUBJECT, u64::MAX).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn arrangement_fenced_retire_recovers_receipt_gap() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "arrangement-retire-receipt-gap");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        let created = edit(&state, &session, &request(&state, "create-gap", json!([{"op":"create","name":"Sidebar"}]))).await.unwrap();
+        let mut retire = request(&state, "retire-gap", json!([{"op":"retire"}]));
+        retire.fence.subject_revisions.insert(SUBJECT.into(), created.id);
+        let accepted = edit(&state, &session, &retire).await.unwrap();
+        let recovered = action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session), Json(retire)).await.unwrap().0;
+        assert_eq!(recovered["arrangement_revision"], accepted.id);
+        assert_eq!(state.store.claims_for(SUBJECT, Some("arrangement.edited")).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn arrangement_routes_and_collection_require_owner_and_remove_retired_ids() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "arrangement-reads");
