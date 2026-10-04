@@ -18,7 +18,7 @@ Build Debug for a simulator of your own. The script targets iOS 16.4, including 
 
 ## Isolated proof
 
-Use the installed `st` and **fabric 0.2.30+8bd9017** binaries. From the repository root, keep this helper running in its own terminal:
+Use the installed `st` and a pinned **fabric 0.2.30+8bd9017** binary, even if the host's default fabric has since been upgraded. From the repository root, keep this helper running in its own terminal:
 
 ```sh
 node apps/ios/modules/st-fabric/proof-member.mjs /path/to/st /path/to/fabric
@@ -32,7 +32,7 @@ node apps/ios/modules/st-fabric/proof-member.mjs grant /tmp/st-fabric-proof-exam
 
 Open the privately written `pair-link.txt` in the app. The temporary `St3Client` completes pairing and reads capabilities through fabric. Pairing uses its own temporary device key value, independent of the iroh identity; no action-signing key or bearer is reused as a transport key. Do not publish the link or put its code in logs. Use an isolated, localhost Metro server if injecting a pairing link through an environment variable.
 
-After verification, remove `demo-phone` using `fabric --home TEST_HOME remove demo-phone`, run `reload-peers`, and stop the helper. Removing the grant blocks future admission but does not close sessions already attached; stopping the app bridge and the isolated daemon closes those. The test daemon uses a 30 second detached-session TTL, while the pinned daemon's default is 15 minutes.
+After verification, remove `demo-phone` using `fabric --home TEST_HOME remove demo-phone`, run `reload-peers`, and stop the helper. At the pinned v0.2.30, removing the grant blocks future admission but does not close sessions already attached; stopping the app bridge and the isolated daemon closes those. Since [v0.2.31](https://github.com/compoundingtech/fabric/blob/v0.2.31/docs/tunnel-wire.md#trust-after-admission), a successful reload also ends admitted sessions whose grant or peer was removed, closing direct connections with code 403 and the corresponding admission refusal reason. Treat that as a refusal; a failed reload ends no sessions. The wire bytes are unchanged, and this proof remains pinned to v0.2.30. The test daemon uses a 30 second detached-session TTL, while the pinned daemon's default is 15 minutes.
 
 ## Wire and limits
 
