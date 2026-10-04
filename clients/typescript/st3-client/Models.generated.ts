@@ -36,6 +36,7 @@ export type Agent = ResourceHeader & {
   delivery?: (AgentDelivery | null);
   driver?: string | null;
   fault?: string | null;
+  handoff?: (AgentHandoff | null);
   harness_state?: string | null;
   host_id?: (HostId | null);
   id?: AgentId;
@@ -94,6 +95,15 @@ export type AgentDelivery = {
   reason?: string | null;
   state: "current" | "outdated" | "legacy" | "stale" | "unknown";
   transport?: string | null;
+};
+
+export type AgentHandoff = {
+  desired_token: string;
+  destination: string;
+  overridden_sources?: Array<string>;
+  pending_sources: Array<string>;
+  phase: "stopping-source" | "waiting-for-destination" | "starting" | "running";
+  sources: Array<string>;
 };
 
 export type AgentId = string;

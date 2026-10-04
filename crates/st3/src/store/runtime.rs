@@ -14,6 +14,8 @@ pub struct SmalltalkRuntime {
     #[cfg(test)]
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,
     pub(crate) actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
+    /// Immutable placement ancestry, keyed by the selected declaration claim.
+    pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::placement::Fence>>>>,
     /// Per-subject status reductions and current-view answers, until their claims change.
     pub(crate) subject_cache: Mutex<SubjectCache>,
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
