@@ -53,8 +53,9 @@ proof. Boot and reconnect never authorize a fresh offer of delivered-but-unread 
 retained mail for retired seats. Boot never clears that backlog. To deliberately archive it across
 all mailboxes, run `st conversations cleanup --all --older-than 1h`. Add `--dry-run` to list matching
 message IDs first, or replace `--all` with `--as AGENT` to clean one mailbox. Cleanup archives as each
-recipient, records explicit manual archival evidence, and can be repeated. Fresh messages and
-messages already delivered, read, or closed are left alone. An agent can still list and explicitly
+recipient, records manual archival through stable keys and linked claims, and can be repeated,
+including after an interrupted archival. Fresh messages and mail already delivered or read through
+other paths are left alone, as is closed mail. An agent can still list and explicitly
 read held mail instead of archiving it.
 
 Epochs are allocated by the daemon, independently of wall-clock time. An initial bind has a stable

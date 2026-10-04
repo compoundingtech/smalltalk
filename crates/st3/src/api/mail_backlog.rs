@@ -8,12 +8,15 @@ fn overdue(
     now: u128,
     threshold: u64,
     to: Option<&str>,
+    resume_archives: bool,
 ) -> anyhow::Result<Vec<MessageView>> {
     let mut result = Vec::new();
     // Include retained mail for retired seats: those are precisely the messages a current
     // agents projection would hide. Inspection never changes their lifecycle.
     for message in store.messages(to, false)? {
-        if !matches!(message.status.as_str(), "sent" | "staged") {
+        if !matches!(message.status.as_str(), "sent" | "staged")
+            && !(resume_archives && unfinished_archive(store, &message)?)
+        {
             continue;
         }
         let Some(sent) = store.latest_claim(&message.subject, Some("message.sent"))? else {
@@ -26,9 +29,20 @@ fn overdue(
     Ok(result)
 }
 
+fn archive_key(subject: &str, lifecycle: &str) -> String {
+    format!("mail-backlog-archive:{subject}:{lifecycle}")
+}
+
+fn unfinished_archive(store: &Store, message: &MessageView) -> anyhow::Result<bool> {
+    Ok(matches!(message.status.as_str(), "delivered" | "read")
+        && store
+            .operation_claim(&archive_key(&message.subject, "delivered"))?
+            .is_some())
+}
+
 pub(super) fn report(store: &Store, now: u128) -> anyhow::Result<st3_client::MailBacklog> {
     Ok(st3_client::MailBacklog {
-        count: overdue(store, now, THRESHOLD_MS, None)?.len() as u64,
+        count: overdue(store, now, THRESHOLD_MS, None, false)?.len() as u64,
         threshold_ms: THRESHOLD_MS,
         cleanup_command: CLEANUP_COMMAND.into(),
     })
@@ -74,6 +88,7 @@ pub(super) async fn cleanup(
             client_now_ms(),
             request.older_than_ms,
             to.as_deref(),
+            true,
         )
         .map_err(ApiError::internal)?;
         let mut archived = Vec::new();
@@ -85,14 +100,25 @@ pub(super) async fn cleanup(
                 // Fence against delivery racing the selection. Explicit archival follows the
                 // same recipient lifecycle as `conversations archive`, with keys identifying
                 // manual backlog archival and evidence linking each preceding claim.
-                let current = store
+                let mut current = store
                     .message(&message.subject)
                     .map_err(ApiError::internal)?
                     .unwrap();
-                if !matches!(current.status.as_str(), "sent" | "staged") {
+                if !matches!(current.status.as_str(), "sent" | "staged")
+                    && !unfinished_archive(&store, &current).map_err(ApiError::internal)?
+                {
                     continue;
                 }
                 for lifecycle in ["delivered", "read", "closed"] {
+                    let needed = match lifecycle {
+                        "delivered" => matches!(current.status.as_str(), "sent" | "staged"),
+                        "read" => current.status == "delivered",
+                        "closed" => current.status == "read",
+                        _ => unreachable!(),
+                    };
+                    if !needed {
+                        continue;
+                    }
                     let record = store
                         .append_claim(&ClaimInput {
                             subject: message.subject.clone(),
@@ -104,13 +130,11 @@ pub(super) async fn cleanup(
                                 .map(|claim| vec![claim.id.clone()])
                                 .unwrap_or_default(),
                             expected_subject: Some(head.as_ref().map(|claim| claim.id.clone())),
-                            idempotency_key: Some(format!(
-                                "mail-backlog-archive:{}:{lifecycle}",
-                                message.subject
-                            )),
+                            idempotency_key: Some(archive_key(&message.subject, lifecycle)),
                         })
                         .map_err(ApiError::bad)?;
                     head = Some(record);
+                    current.status = lifecycle.into();
                 }
             }
             archived.push(message.subject);
@@ -141,7 +165,6 @@ mod tests {
                 "staged",
                 now - 7_200_000,
             ),
-            ("fresh", "agent/example/retired", "sent", now),
             (
                 "accepted",
                 "agent/example/retired",
@@ -149,6 +172,13 @@ mod tests {
                 now - 7_200_000,
             ),
             ("read", "agent/example/retired", "read", now - 7_200_000),
+            (
+                "interrupted",
+                "agent/example/retired",
+                "delivered",
+                now - 7_200_000,
+            ),
+            ("fresh", "agent/example/retired", "sent", now),
         ] {
             state.store.set_write_clock_at(time).unwrap();
             let subject = format!("message/{id}");
@@ -185,7 +215,8 @@ mod tests {
                         fields: BTreeMap::from([("status".into(), json!(phase))]),
                         evidence: vec![],
                         expected_subject: None,
-                        idempotency_key: None,
+                        idempotency_key: (id == "interrupted")
+                            .then(|| archive_key(&subject, phase)),
                     })
                     .unwrap();
             }
@@ -210,7 +241,7 @@ mod tests {
         let Json(preview) = cleanup(State(state.clone()), Json(request(true, None)))
             .await
             .unwrap();
-        assert_eq!(preview["count"], 2);
+        assert_eq!(preview["count"], 3);
         assert_eq!(report(&state.store, now).unwrap().count, 2);
         let Json(selected) = cleanup(
             State(state.clone()),
@@ -218,7 +249,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(selected["count"], 1);
+        assert_eq!(selected["count"], 2);
         let Json(all) = cleanup(State(state.clone()), Json(request(false, None)))
             .await
             .unwrap();
@@ -244,6 +275,7 @@ mod tests {
             ("fresh", "sent"),
             ("accepted", "delivered"),
             ("read", "read"),
+            ("interrupted", "closed"),
         ] {
             assert_eq!(
                 state
@@ -255,7 +287,7 @@ mod tests {
                 expected
             );
         }
-        for id in ["old-sent", "old-staged"] {
+        for id in ["old-sent", "old-staged", "interrupted"] {
             let claims = state
                 .store
                 .claims_for(&format!("message/{id}"), Some("message.closed"))
@@ -263,12 +295,20 @@ mod tests {
             assert_eq!(claims.len(), 1);
             assert_eq!(
                 claims[0].actor.as_deref(),
-                Some(if id == "old-sent" {
-                    "agent/example/retired"
-                } else {
+                Some(if id == "old-staged" {
                     "agent/example/other"
+                } else {
+                    "agent/example/retired"
                 })
             );
         }
+        assert_eq!(
+            state
+                .store
+                .claims_for("message/interrupted", Some("message.delivered"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
