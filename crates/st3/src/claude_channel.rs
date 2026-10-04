@@ -647,8 +647,7 @@ mod tests {
         // A different available message caused the initial scan after reexec.
         transcript.appended(&path).unwrap();
         assert!(transcript.appended(&path).unwrap().is_empty());
-        transcript
-            .body_available(state.attempted.contains(&message.subject) || message.status != "sent");
+        transcript.body_available(true);
         assert!(native_receipt(
             &transcript.appended(&path).unwrap()[0],
             &envelope
