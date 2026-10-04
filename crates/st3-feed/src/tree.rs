@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -62,4 +63,14 @@ pub struct Seat {
     pub effort: Option<String>,
     pub state: String,
     pub harness_state: Option<String>,
+}
+
+impl MissionsTree {
+    pub fn from_response(response: serde_json::Value) -> Result<Self> {
+        let value = response
+            .get("value")
+            .cloned()
+            .context("missions tree response has no value")?;
+        serde_json::from_value(value).context("decode missions tree")
+    }
 }

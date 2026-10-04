@@ -1,3 +1,5 @@
+//! Private display snapshots, scoped to an endpoint and actor; never an offline action queue.
+
 use std::{
     collections::hash_map::DefaultHasher,
     fs::{self, OpenOptions},
@@ -25,6 +27,7 @@ struct CachedModel {
     model: Model,
 }
 
+/// The existing stui cache location, hashed by endpoint and actor. Requires an absolute cache home.
 pub fn path(endpoint: &Path, actor: &str) -> Option<PathBuf> {
     if actor.is_empty() {
         return None;
@@ -54,6 +57,8 @@ fn now_ms() -> Option<u128> {
     )
 }
 
+/// Read a private, matching snapshot no older than seven days, with transcript content removed.
+/// Cached fences are for display only; the caller must await live data before enabling actions.
 pub fn load(path: &Path, actor: &str) -> Option<Model> {
     let metadata = fs::metadata(path).ok()?;
     if metadata.len() > MAX_BYTES || metadata.permissions().mode() & 0o077 != 0 {
@@ -72,6 +77,7 @@ pub fn load(path: &Path, actor: &str) -> Option<Model> {
     Some(model)
 }
 
+/// Atomically save a private snapshot of at most 2 MiB, omitting the conversation timeline.
 pub fn save(path: &Path, actor: &str, model: &Model) -> std::io::Result<()> {
     let mut safe = model.clone();
     safe.timeline.clear();
@@ -128,12 +134,35 @@ mod tests {
         model.actor = "person/one".into();
         model.status = "Connected".into();
         model.event_cursor = "event/one".into();
+        model.timeline.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"entry/private", "sequence":1, "revision":1,
+                "timestamp":"2026-10-01T00:00:00Z", "role":"assistant", "final":true,
+                "type":"content", "body":{"media_type":"text/plain", "text":"Private transcript"}
+            }))
+            .unwrap(),
+        );
+        model.timeline_truncated = true;
         save(&path, "person/one", &model).unwrap();
+        assert_eq!(
+            model.timeline.len(),
+            1,
+            "saving leaves the live model intact"
+        );
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("Private transcript")
+        );
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
         let restored = load(&path, "person/one").unwrap();
         assert_eq!(restored.actor, "person/one");
         assert_eq!(restored.status, "Cached · refreshing…");
+        assert!(restored.timeline.is_empty());
+        assert!(!restored.timeline_truncated);
         assert!(load(&path, "person/two").is_none());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load(&path, "person/one").is_none());
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();
     }

@@ -1,11 +1,12 @@
-mod cache;
 mod connection;
-mod feed;
-mod model;
-mod tree;
 mod ui;
 mod version;
 mod voice;
+
+use st3_feed as feed;
+#[cfg(test)]
+use st3_feed::terminal_screen_fence;
+use st3_feed::{action_pair, cache, model, terminal_fence};
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -21,10 +22,6 @@ use std::{
     time::Duration,
 };
 
-fn action_pair() -> (String, String) {
-    let id = format!("action/{}", uuid::Uuid::now_v7());
-    (id.clone(), id)
-}
 fn mission_label(mission: &st3_client::Mission) -> String {
     let slug = mission.title.rsplit('/').next().unwrap_or(&mission.title);
     slug.split('-')
@@ -242,25 +239,6 @@ fn terminal_run_style(run: &st3_client::TerminalRun) -> Style {
     style
 }
 
-async fn terminal_fence(client: &Client, terminal_id: &str, incarnation: &str) -> Result<Fence> {
-    let screen = client.terminal_screen(terminal_id).await?;
-    terminal_screen_fence(&screen, incarnation)
-}
-fn terminal_screen_fence(
-    screen: &st3_client::Envelope<st3_client::TerminalScreen>,
-    incarnation: &str,
-) -> Result<Fence> {
-    anyhow::ensure!(
-        screen.value.runtime_incarnation == incarnation,
-        "terminal incarnation changed; reattach before sending input"
-    );
-    Ok(Fence {
-        snapshot_id: screen.snapshot.id.clone(),
-        runtime_incarnation: Some(incarnation.to_owned()),
-        terminal_sequence: Some(screen.value.next_sequence),
-        ..Fence::default()
-    })
-}
 /// Perform one attention action against fresh fences. Shared by the old and new screens.
 /// `seen` is the card as the person saw it, which names its source if st has since closed it.
 async fn attention_action(
