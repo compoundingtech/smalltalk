@@ -17170,6 +17170,36 @@ fn publish_latest_claim_tx(
     .map_err(claim_append_error)
 }
 
+fn latest_harness_of_incarnation_tx(
+    connection: &Transaction<'_>,
+    subject: &str,
+    incarnation: Option<&str>,
+) -> Result<Option<ClaimRecord>, St3Error> {
+    let latest = latest_claim_of_kind_tx(connection, subject, "harness.observed")?;
+    if latest.as_ref().is_none_or(|claim| {
+        claim.body.pointer("/fields/incarnation_id").and_then(Value::as_str) == incarnation
+    }) {
+        return Ok(latest);
+    }
+    let comparison = if incarnation.is_some() { "=?2" } else { "IS ?2" };
+    let indexed = if incarnation.is_some() {
+        " INDEXED BY claims_incarnation_accepted_index"
+    } else {
+        ""
+    };
+    connection
+        .prepare_cached(&format!(
+            "SELECT {CLAIM_COLUMNS} FROM claims{indexed}
+             JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND {INCARNATION_OF_CLAIM}{comparison} AND claims.kind='harness.observed'
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+        ))
+        .map_err(internal)?
+        .query_row(params![subject, incarnation], claim_from_row)
+        .optional()
+        .map_err(internal)
+}
+
 /// Publish a harness observation when any field other than its observation time differs
 /// from the subject's latest replicated observation. When the harness stops working, its
 /// usage that is still only local replicates too.
@@ -17188,7 +17218,11 @@ fn publish_changed_harness_state_tx(
             .map(|(name, value)| (name.as_str(), value))
             .collect()
     }
-    let latest = latest_claim_of_kind_tx(transaction, &input.subject, &input.kind)?;
+    let latest = latest_harness_of_incarnation_tx(
+        transaction,
+        &input.subject,
+        input.fields.get("incarnation_id").and_then(Value::as_str),
+    )?;
     let unchanged = latest.as_ref().is_some_and(|claim| {
         claim
             .body
@@ -46972,7 +47006,11 @@ fn append_latest_observation_fenced(
             if input.kind == "harness.observed" {
                 let source = match published.as_ref() {
                     Some(claim) => Some(claim.clone()),
-                    None => latest_claim_of_kind_tx(transaction, &input.subject, &input.kind)?,
+                    None => latest_harness_of_incarnation_tx(
+                        transaction,
+                        &input.subject,
+                        input.fields.get("incarnation_id").and_then(Value::as_str),
+                    )?,
                 };
                 if let Some(source) = source {
                     local.body["fields"]["observed_since_ms"] = source.body["fields"]["observed_since_ms"].clone();

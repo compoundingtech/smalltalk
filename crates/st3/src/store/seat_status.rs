@@ -25,68 +25,70 @@ pub(super) fn transition_positions(claims: &[&ClaimRecord]) -> Vec<usize> {
 }
 
 fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
-    let mut incarnation: Option<&str> = None;
-    let mut harness: Option<&str> = None;
-    let mut prompt: Option<&str> = None;
-    let mut update_prompt = false;
-    let mut state: Option<&str> = None;
+    #[derive(Default)]
+    struct Status<'a> {
+        harness: Option<&'a str>,
+        prompt: Option<&'a str>,
+        update_prompt: bool,
+        state: Option<&'a str>,
+    }
+    let mut runtime = None;
+    let mut statuses = BTreeMap::<&str, Status<'_>>::new();
     let mut entries = Vec::new();
     for (position, claim) in claims.iter().enumerate() {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
-        let Some(next_incarnation) = fields.get("incarnation_id").and_then(Value::as_str) else {
+        let Some(incarnation) = fields.get("incarnation_id").and_then(Value::as_str) else {
             continue;
         };
-        let reset = incarnation != Some(next_incarnation);
-        match claim.kind.as_str() {
-            "runtime.observed" if fields["status"] == "running" => {
-                if reset {
+        if claim.kind == "runtime.observed" && fields["status"] == "running" {
+            if runtime != Some(incarnation) {
+                if runtime.is_some() || !statuses.contains_key(incarnation) {
                     entries.push((position, None, true));
-                    incarnation = Some(next_incarnation);
-                    harness = None;
-                    prompt = None;
-                    update_prompt = false;
-                    state = None;
+                    statuses.insert(incarnation, Status::default());
                 }
-                continue;
+                runtime = Some(incarnation);
             }
+            continue;
+        }
+        let reset = runtime.is_none() && !statuses.contains_key(incarnation);
+        match claim.kind.as_str() {
             "harness.observed" => {
-                let Some(next_state) = fields.get("state").and_then(Value::as_str) else {
+                let Some(state) = fields.get("state").and_then(Value::as_str) else {
                     continue;
                 };
-                if reset {
-                    prompt = None;
-                    update_prompt = false;
-                }
-                harness = Some(next_state);
+                statuses.entry(incarnation).or_default().harness = Some(state);
             }
-            "harness.diagnostic" if !reset => match fields.get("code").and_then(Value::as_str) {
-                Some("provider-auth-expired") => prompt = Some("unauthenticated"),
-                Some("provider-trust-prompt") => prompt = Some("blocked"),
-                Some("provider-auth-restored") => prompt = None,
-                Some("provider-update-prompt") => update_prompt = true,
-                Some("provider-update-restored") => update_prompt = false,
-                _ => continue,
-            },
+            "harness.diagnostic" if statuses.contains_key(incarnation) => {
+                let status = statuses.get_mut(incarnation).unwrap();
+                match fields.get("code").and_then(Value::as_str) {
+                    Some("provider-auth-expired") => status.prompt = Some("unauthenticated"),
+                    Some("provider-trust-prompt") => status.prompt = Some("blocked"),
+                    Some("provider-auth-restored") => status.prompt = None,
+                    Some("provider-update-prompt") => status.update_prompt = true,
+                    Some("provider-update-restored") => status.update_prompt = false,
+                    _ => continue,
+                }
+            }
             _ => continue,
         }
-        let next = if update_prompt {
+        let status = statuses.get_mut(incarnation).unwrap();
+        let next = if status.update_prompt {
             Some("blocked")
         } else {
-            prompt.or(harness)
+            status.prompt.or(status.harness)
         };
-        // False marks server-authored same-state observations, so an older source's removal
-        // does not turn a heartbeat into an invented transition.
-        let same_state_observation = claim.kind == "harness.observed"
+        // Heartbeats never become transitions when a retained prefix disappears. A recorded
+        // transition remains one even if trimming removes an intervening state.
+        let heartbeat = claim.kind == "harness.observed"
             && fields.get("status_transition").and_then(Value::as_bool) == Some(false);
-        let recorded_transition = claim.kind == "harness.observed"
-            && prompt.is_none()
-            && !update_prompt
+        let recorded = claim.kind == "harness.observed"
+            && status.prompt.is_none()
+            && !status.update_prompt
             && fields.get("status_transition").and_then(Value::as_bool) == Some(true);
-        if (reset || state != next || recorded_transition) && !same_state_observation {
+        if (reset || status.state != next || recorded) && !heartbeat {
             entries.push((position, next.map(str::to_owned), reset));
         }
-        incarnation = Some(next_incarnation);
-        state = next;
+        status.state = next;
     }
     entries
 }
@@ -274,16 +276,33 @@ pub(super) fn history_at(
     index: u64,
 ) -> Result<Value> {
     let cutoff = now.saturating_sub(WINDOW_MS);
-    // Seek each kind by acceptance time. Read a single older baseline per kind, rather
+    // Seek each kind by acceptance time. Read a single older baseline per prompt channel, rather
     // than decoding a seat's lifetime observations on every history request.
     let mut keyed = Vec::new();
     let mut older = false;
-    for kind in ["harness.observed", "runtime.observed", "harness.diagnostic"] {
+    for (kind, codes) in [
+        ("harness.observed", ""),
+        ("runtime.observed", ""),
+        (
+            "harness.diagnostic",
+            "'provider-auth-expired','provider-trust-prompt','provider-auth-restored'",
+        ),
+        (
+            "harness.diagnostic",
+            "'provider-update-prompt','provider-update-restored'",
+        ),
+    ] {
         let columns = format!(
             "{CLAIM_COLUMNS}, batches.origin, batches.replica_sequence, {}",
             canonical::position_sql("claims")
         );
-        let query = newest_claims_of_kind_query(&columns, kind).replace(" ORDER BY", " AND (claims.kind!='harness.observed' OR json_extract(claims.body, '$.fields.status_transition') IS NOT 0) ORDER BY");
+        let filter = if codes.is_empty() {
+            " AND (claims.kind!='harness.observed' OR json_extract(claims.body, '$.fields.status_transition') IS NOT 0)".into()
+        } else {
+            format!(" AND json_extract(claims.body, '$.fields.code') IN ({codes})")
+        };
+        let query = newest_claims_of_kind_query(&columns, kind)
+            .replace(" ORDER BY", &format!("{filter} ORDER BY"));
         let mut statement = connection.prepare_cached(&query)?;
         let mut rows = statement.query(params![subject, index])?;
         while let Some(row) = rows.next()? {
@@ -297,7 +316,40 @@ pub(super) fn history_at(
             }
         }
     }
+    // Seed older baselines with their incarnation's first retained runtime observation, so
+    // a later running receipt does not hide a prompt that already held that same runtime.
+    let baseline_incarnations = keyed
+        .iter()
+        .filter(|(_, claim)| claim.accepted_at_unix_ms < cutoff)
+        .filter_map(|(_, claim)| {
+            claim
+                .body
+                .pointer("/fields/incarnation_id")
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let query = format!("SELECT {CLAIM_COLUMNS}, batches.origin, batches.replica_sequence, {}
+        FROM claims INDEXED BY claims_incarnation_accepted_index JOIN batches ON batches.id=claims.batch_id
+        WHERE claims.subject=?1 AND {INCARNATION_OF_CLAIM}=?2 AND +claims.store_index<=?3 AND claims.kind='runtime.observed'
+        AND json_extract(claims.body,'$.fields.status')='running' ORDER BY {CANONICAL_ORDER} LIMIT 1", canonical::position_sql("claims"));
+    for incarnation in baseline_incarnations {
+        let source = connection
+            .prepare_cached(&query)?
+            .query_row(params![subject, incarnation, index], |row| {
+                let claim = claim_from_row(row)?;
+                Ok((
+                    canonical::key_from_record(&claim, row.get(10)?, row.get(11)?, row.get(12)?),
+                    claim,
+                ))
+            })
+            .optional()?;
+        if let Some(source) = source {
+            keyed.push(source);
+        }
+    }
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.dedup_by(|a, b| a.1.id == b.1.id);
     let claims = keyed
         .into_iter()
         .map(|(_, claim)| claim)
@@ -515,6 +567,57 @@ mod tests {
             first.body["fields"]["observed_since_ms"]
         );
     }
+    #[test]
+    fn status_historical_observations_do_not_restart_the_current_runtime_since() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms() - 1_000;
+        observe(&store, "one", "idle", at, "ready");
+        runtime(&store, "two");
+        observe(&store, "two", "working", at + 1, "turn");
+        observe(&store, "one", "working", at + 2, "historical turn");
+        observe(&store, "two", "working", at + 3, "turn");
+        let current = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(current.since_unix_ms, at + 1);
+        let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
+        let resets = history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["reset"] == true)
+            .count();
+        assert_eq!(resets, 2, "only runtime replacements reset history");
+    }
+
+    #[test]
+    fn status_history_restores_the_auth_fence_that_predates_the_window() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        observe(&store, "one", "idle", now_ms(), "ready");
+        let diagnostic = |code| {
+            store.append_claim(&input("harness.diagnostic", json!({
+            "incarnation_id":"one", "code":code, "driver":"codex", "reason":"fixture", "severity":"warning"
+        }))).unwrap()
+        };
+        diagnostic("provider-auth-expired");
+        diagnostic("provider-update-prompt");
+        let restored = diagnostic("provider-update-restored");
+        let now = restored.accepted_at_unix_ms + WINDOW_MS + 1_000;
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                params![(now - 1).to_string(), restored.id],
+            )
+            .unwrap();
+        let history = store.seat_status_history("agent/cedar", now).unwrap();
+        assert_eq!(history["items"].as_array().unwrap().len(), 1);
+        assert_eq!(history["items"][0]["state"], "unauthenticated");
+        assert_eq!(history["complete"], false);
+    }
+
     #[test]
     fn status_update_prompt_has_priority_and_preserves_since_until_restored() {
         let store = Store::open_memory("cedar").unwrap();
