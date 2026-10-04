@@ -4420,7 +4420,7 @@ impl Ui {
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
             Hit::NewAgent => self.open_new_agent(None),
-            Hit::Home if self.home_open() => self.close_home(),
+            Hit::Home if self.home_open() && !self.usage_open() => self.close_home(),
             Hit::Home => self.open_home(),
             // The terminal may be on another machine than stui (over SSH or fabric): the
             // clipboard is the person's, so the link lands where their browser is.

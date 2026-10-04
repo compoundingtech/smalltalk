@@ -47,8 +47,10 @@ pub(crate) struct Glasses {
     /// The focused split fills the glass for now (Ctrl+O), as tmux zooms a pane; this window
     /// only, never stored.
     zoomed: bool,
-    /// Home is open over the glass (⌂ in the top bar).
+    /// Now (or Usage) is open over the glass, from the top bar's need-you count or `$ usage`.
     home: bool,
+    /// What floats over the glass is Usage rather than Now (Nathan, 2026-10-04).
+    usage: bool,
     /// The Ctrl+S sidebar: the old stui list beside the splits, to browse and open from.
     pub(crate) sidebar: Sidebar,
     /// A tab being dragged with the mouse, from its press until the button is let go.
@@ -96,13 +98,12 @@ enum Drop {
     },
 }
 
-/// The sidebar's Usage section.
-const USAGE_SECTION: usize = 4;
-/// The sidebar's sections, what the number keys were in the old stui.
-/// The sidebar's sections, by the tab whose list each shows. Home is not one: it opens from
-/// the status line's ⌂ and "need you", over the glass.
-pub(crate) const SIDEBAR_SECTIONS: [(usize, &str); 4] =
-    [(1, "Agents"), (2, "Missions"), (3, "Fleet"), (4, "Usage")];
+/// The old stui's Usage tab, which now floats over the glass as Now does.
+const USAGE_TAB: usize = 4;
+/// The sidebar's sections, by the tab whose list each shows. Now and Usage are not ones: they
+/// open from the top bar, over the glass.
+pub(crate) const SIDEBAR_SECTIONS: [(usize, &str); 3] =
+    [(1, "Agents"), (2, "Missions"), (3, "Fleet")];
 
 /// The section `step` places along from `section`, wrapping.
 fn sidebar_step(section: usize, step: isize) -> usize {
@@ -310,9 +311,9 @@ impl Glasses {
     }
     /// The agents whose conversations show in the shown glass: each group's shown tab, the
     /// focused group first.
-    /// Whether usage is on screen: the sidebar's Usage section or a usage tab in front.
+    /// Whether usage is on screen: floating over the glass, or a usage tab in front.
     pub(crate) fn shows_usage(&self) -> bool {
-        if self.sidebar.shown && self.sidebar.section == USAGE_SECTION {
+        if self.home && self.usage {
             return true;
         }
         let glass = self.glass();
@@ -379,6 +380,7 @@ impl Glasses {
             graph: false,
             zoomed: false,
             home: false,
+            usage: false,
             sidebar,
             drag: None,
             last_border: None,
@@ -1504,20 +1506,24 @@ impl Ui {
 
     /// Show the sidebar with the keys, or hide it when it has them (Ctrl+S).
     /// The top bar's usage slot: the sidebar at Usage, or hidden when Usage already shows.
+    /// The top bar's usage slot: Usage over the glass, or closed when it already shows.
     pub(crate) fn toggle_usage(&mut self) {
-        let Some(glasses) = self.glasses.as_mut() else {
+        if self.usage_open() {
+            self.close_home();
             return;
-        };
-        let sidebar = &mut glasses.sidebar;
-        if sidebar.shown && sidebar.section == USAGE_SECTION {
-            sidebar.shown = false;
-            sidebar.focused = false;
-        } else {
-            sidebar.shown = true;
-            sidebar.section = USAGE_SECTION;
-            sidebar.focused = true;
         }
-        glasses.save();
+        self.open_home();
+        if let Some(glasses) = self.glasses.as_mut() {
+            glasses.usage = true;
+        }
+        self.tab = USAGE_TAB;
+    }
+
+    /// Whether Usage floats over the glass.
+    pub(crate) fn usage_open(&self) -> bool {
+        self.glasses
+            .as_ref()
+            .is_some_and(|glasses| glasses.home && glasses.usage)
     }
 
     pub(crate) fn toggle_sidebar(&mut self) {
@@ -1584,11 +1590,9 @@ impl Ui {
             KeyCode::End if !control => *selected = count.saturating_sub(1),
             KeyCode::Left | KeyCode::BackTab => sidebar.section = sidebar_step(section, -1),
             KeyCode::Right | KeyCode::Tab => sidebar.section = sidebar_step(section, 1),
-            KeyCode::Char(digit @ '1'..='4') if !control => {
+            KeyCode::Char(digit @ '1'..='3') if !control => {
                 sidebar.section = SIDEBAR_SECTIONS[digit as usize - '1' as usize].0
             }
-            KeyCode::Char('b') if section == 4 && !control => self.usage_by_next(),
-            KeyCode::Char('p') if section == 4 && !control => self.usage_period_next(),
             KeyCode::Enter => self.open_from_sidebar(),
             // The glass's own keys (Ctrl+K, Ctrl+T...) still work; nothing else reaches a pane.
             _ if control => return false,
@@ -1641,7 +1645,11 @@ impl Ui {
         buf.set_stringn(
             rect.x + 2,
             rect.y,
-            " Now · esc closes ",
+            if self.usage_open() {
+                " Usage · b groups · p period · esc closes "
+            } else {
+                " Now · esc closes "
+            },
             rect.width.saturating_sub(4) as usize,
             theme::strong(theme::ACCENT).bg(theme::BASE),
         );
@@ -1943,15 +1951,13 @@ impl Ui {
                 Hit::PaletteSection(3),
             );
         }
-        // Usage beside the fleet: the sidebar's Usage, shown and hidden (Nathan, 2026-10-03).
+        // Usage beside the fleet, floating over the glass as Now does (Nathan, 2026-10-04).
         // The fleet's counts end in a space already.
         let gap = if machines_shown { "· " } else { " · " };
         spans.push(Span::styled(gap, bar(theme::dim())));
         let x = area.x + Line::from(spans.clone()).width() as u16;
         let usage_text = "$ usage";
-        let showing = self.glasses.as_ref().is_some_and(|glasses| {
-            glasses.sidebar.shown && glasses.sidebar.section == USAGE_SECTION
-        });
+        let showing = self.usage_open();
         spans.push(Span::styled(
             usage_text,
             bar(if showing {
@@ -2539,6 +2545,7 @@ impl Ui {
     pub(crate) fn open_home(&mut self) {
         if let Some(glasses) = self.glasses.as_mut() {
             glasses.home = true;
+            glasses.usage = false;
             glasses.palette = None;
         }
         // Home opens over the glass: an attached terminal stays attached under it, and has the
@@ -2552,6 +2559,7 @@ impl Ui {
     pub(crate) fn close_home(&mut self) {
         if let Some(glasses) = self.glasses.as_mut() {
             glasses.home = false;
+            glasses.usage = false;
         }
         self.show_focused();
     }
@@ -3846,39 +3854,41 @@ mod tests {
             .find(|(rect, _)| rect.y == 0 && rect.x <= column && column < rect.x + rect.width)
             .map(|(_, hit)| hit.clone());
         assert_eq!(hit, Some(Hit::Usage));
+        // Usage floats over the glass as Now does, with its own keys.
         ui.click(Hit::Usage);
-        assert!(ui.glasses.as_ref().unwrap().shows_usage());
-        assert!(ui.glasses.as_ref().unwrap().sidebar.focused);
+        assert!(ui.usage_open() && ui.glasses.as_ref().unwrap().shows_usage());
+        assert!(screen(&ui).contains("Usage · b groups · p period · esc closes"));
+        let by = ui.usage_by;
+        press(&mut ui, KeyCode::Char('b'), KeyModifiers::NONE);
+        assert_ne!(ui.usage_by, by, "b changes the grouping");
+        // The need-you count switches it to Now; the usage slot again closes it.
+        ui.click(Hit::Home);
+        assert!(ui.home_open() && !ui.usage_open());
+        assert!(screen(&ui).contains("Now · esc closes"));
         ui.click(Hit::Usage);
-        assert!(!ui.glasses.as_ref().unwrap().sidebar.shown);
+        assert!(ui.usage_open());
+        ui.click(Hit::Usage);
+        assert!(!ui.home_open());
+        // The sidebar has no Usage section any more.
+        assert!(SIDEBAR_SECTIONS.iter().all(|(_, name)| *name != "Usage"));
     }
 
     #[test]
-    fn a_usage_row_opens_its_spend_in_a_tab_whatever_the_list_groups_by() {
+    fn usage_floats_over_the_glass_and_a_row_shows_its_spend_whatever_the_list_groups_by() {
         let mut ui = glass();
         assert_eq!(ui.usage_wanted(), None, "nothing shows usage yet");
-        ctrl(&mut ui, 's');
-        press(&mut ui, KeyCode::Char('4'), KeyModifiers::NONE);
+        ui.click(Hit::Usage);
         assert_eq!(ui.usage_wanted(), Some(24));
         press(&mut ui, KeyCode::Char('b'), KeyModifiers::NONE);
-        // Past the two accounts to the first mission.
+        // Past the two accounts to the first mission: its spend shows beside the list.
         press(&mut ui, KeyCode::Down, KeyModifiers::NONE);
         press(&mut ui, KeyCode::Down, KeyModifiers::NONE);
-        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
-        let usage = "usage:mission/fleet/atlas/store-move";
-        assert!(
-            tabs(&ui).2.iter().flatten().any(|key| key == usage),
-            "{:?}",
-            tabs(&ui)
-        );
-        // Grouped by agent again, the tab still shows the mission it opened on.
-        ui.usage_by_next();
         let shown = screen(&ui);
         assert!(shown.contains("$58.20 API-equivalent"), "{shown}");
-        assert!(
-            ui.usage_wanted().is_some(),
-            "an open usage tab keeps usage read"
-        );
+        // Closed, nothing shows usage, so nothing reads it.
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!ui.home_open());
+        assert_eq!(ui.usage_wanted(), None);
     }
 
     #[test]
