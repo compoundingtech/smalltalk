@@ -269,9 +269,10 @@ warm caches kept on the machine. GitHub has no overflow between runner labels, s
 starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
 through the API and picks one pool for the whole run:
 
-- `ci1` when at least `CI1_MIN_IDLE` (default 5, the jobs a run starts at once) runners with that
-  label are online and idle; merge-group runs ask for `ci1-merge`, which a runner reserved for the
-  merge queue also carries, so queued merges never wait behind pull request pushes;
+- `ci1` when at least `CI1_MIN_IDLE` (default 1) general runners are online and idle. Work starts
+  on available capacity; the remaining jobs can wait briefly for a runner;
+- `ci1-merge` for every merge-group run while ci1 is enabled. These jobs wait for their reserved
+  pool even when its runners are currently busy, and do not query the status API;
 - Namespace otherwise, exactly as above: when ci1 is busy or offline, when the runner list is
   unavailable, and always for a pull request from a fork. The repository is public and a self-hosted
   runner runs whatever a job asks, so fork code never reaches ci1 (and forks receive no secrets).
@@ -286,7 +287,7 @@ The switch is the repository variable `CI1_RUNNERS`: unset (the default), `pick-
 and every run goes to Namespace with no extra job. `on` turns the choice on, and unsetting it turns
 it off again without a pull request. `pick-runner` reads the runners with the
 `CI1_RUNNERS_READ_TOKEN` secret, a token that may only read the organization's self-hosted runners;
-without it every run goes to Namespace.
+without it non-queue runs go to Namespace. Merge-group runs need no status token.
 
 On ci1 each runner is ephemeral: it takes one job, runs it as its own user in a fresh work directory
 with its own `/tmp`, and nothing the job started outlives it. The runner names a Cargo home in
