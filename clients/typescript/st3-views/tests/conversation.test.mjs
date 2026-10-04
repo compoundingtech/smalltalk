@@ -61,6 +61,19 @@ assert.equal(back.hasOlder, false);
 const skipped = applyConversation(back, window([content(9, 'x')], true));
 assert.deepEqual(texts(skipped), ['x']);
 assert.equal(skipped.hasOlder, true);
+
+// Projection notices have session-stable IDs but do not connect disconnected history windows.
+const notice = sequence => ({ id: 'timeline-entry/session/a/timeline-query-limited', revision: 1, sequence, type: 'error', role: 'system', body: { code: 'timeline-query-limited', message: 'Older operations are outside this view', retryable: false } });
+let withNotice = applyConversation(undefined, window([content(3, 'c'), content(4, 'd'), notice(6)], true));
+withNotice = applyOlderPage(withNotice, 'session/a', { items: [content(1, 'a'), content(2, 'b')], hasMore: false });
+withNotice = applyConversation(withNotice, window([content(4, 'd'), content(5, 'e'), notice(6)], true));
+assert.deepEqual(withNotice.entries.map(entry => entry.id), ['entry/1', 'entry/2', 'entry/3', 'entry/4', 'entry/5', notice(6).id]);
+assert.equal(withNotice.older.paged, true);
+withNotice = applyConversation(withNotice, window([content(9, 'x'), notice(10)], true));
+assert.deepEqual(withNotice.entries.map(entry => entry.id), ['entry/9', notice(10).id]);
+assert.equal(withNotice.older.paged, false);
+assert.equal(withNotice.hasOlder, true);
+
 // A page for another session is dropped; a failure says why.
 assert.deepEqual(texts(applyOlderPage(skipped, 'session/b', { items: [content(8, 'w')], hasMore: true })), ['x']);
 assert.match(olderNote(olderFailed(skipped, 'st did not answer')), /^Could not load earlier entries: st did not answer/);
