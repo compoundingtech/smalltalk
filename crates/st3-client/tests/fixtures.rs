@@ -13,6 +13,21 @@ fn decode<T: serde::de::DeserializeOwned>(name: &str) -> T {
 }
 
 #[test]
+fn terminal_input_data_rejects_ambiguous_or_missing_bytes() {
+    let text = serde_json::from_value::<TerminalInputData>(serde_json::json!({"text":"ls\r"})).unwrap();
+    assert_eq!(text, TerminalInputData::Text { text: "ls\r".into() });
+    let bytes = serde_json::from_value::<TerminalInputData>(serde_json::json!({"bytes_b64":"Aw=="})).unwrap();
+    assert_eq!(bytes, TerminalInputData::Bytes { bytes_b64: "Aw==".into() });
+    for invalid in [
+        serde_json::json!({}),
+        serde_json::json!({"text":"ls\r", "bytes_b64":"Aw=="}),
+        serde_json::json!({"text":"ls\r", "unexpected":true}),
+    ] {
+        assert!(serde_json::from_value::<TerminalInputData>(invalid).is_err());
+    }
+}
+
+#[test]
 fn search_fixture_preserves_result_targets_and_incomplete_history() {
     let search: Envelope<ConversationSearch> = decode("conversation-search.json");
     assert_eq!(search.value.items[0].entry_id, "timeline-entry/note");

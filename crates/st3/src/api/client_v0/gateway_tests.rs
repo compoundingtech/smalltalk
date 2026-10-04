@@ -902,6 +902,36 @@ mod gateway_tests {
         follow(&mut socket, "term3", &third).await;
         open(&mut socket, "in3", "term3").await;
         assert_eq!(input(&mut socket, "in3", 0, text("reconnected")).await, ack("in3", 0));
+        // Exercise the generated Rust API/parser against the same real PTY.
+        let client = st3_client::Client::fabric_loopback(format!("http://{address}"), "control-secret");
+        let mut rust = client.collection_stream().await.unwrap();
+        let fourth = attach("input-rust");
+        rust.subscribe_terminal(
+            "rust-term", "terminal/agent/input-test", Some(&incarnation),
+            fourth["stream_capability"].as_str().unwrap(),
+        ).await.unwrap();
+        while !matches!(rust.next_event().await.unwrap(), Some(st3_client::CollectionEvent::Screen { .. })) {}
+        let rust_input = async |stream: &mut st3_client::CollectionStream| {
+            loop {
+                match stream.next_event().await.unwrap().unwrap() {
+                    st3_client::CollectionEvent::Screen { .. } => {}
+                    event => return event,
+                }
+            }
+        };
+        rust.open_input("rust-in", "rust-term").await.unwrap();
+        assert!(matches!(rust_input(&mut rust).await,
+            st3_client::CollectionEvent::InputOpened { id, follow, next_seq: 0 }
+            if id == "rust-in" && follow == "rust-term"));
+        rust.send_input("rust-in", 0, &st3_client::TerminalInputData::Text { text: "rust\r".into() }).await.unwrap();
+        assert!(matches!(rust_input(&mut rust).await, st3_client::CollectionEvent::InputAck { seq: 0, .. }));
+        rust.send_input("rust-in", 0, &st3_client::TerminalInputData::Text { text: "rust-repeat\r".into() }).await.unwrap();
+        assert!(matches!(rust_input(&mut rust).await, st3_client::CollectionEvent::InputAck { seq: 0, .. }));
+        rust.send_input("rust-in", 2, &st3_client::TerminalInputData::Text { text: "rust-gap\r".into() }).await.unwrap();
+        assert!(matches!(rust_input(&mut rust).await,
+            st3_client::CollectionEvent::InputClosed { reason: st3_client::TerminalInputClosedReason::Gap, .. }));
+        rust.close_input("rust-in").await.unwrap();
+        rust.close().await;
         state
             .store
             .append_claim(&ClaimInput {
@@ -926,7 +956,7 @@ mod gateway_tests {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 let screen = runtime.screen("input-test").unwrap();
-                if screen.contains("accepted:reconnected") || std::time::Instant::now() > deadline {
+                if screen.contains("accepted:rust") || std::time::Instant::now() > deadline {
                     return screen;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -934,17 +964,17 @@ mod gateway_tests {
         })
         .await
         .unwrap();
-        for line in ["one", "two", "kept", "fresh", "reconnected"] {
+        for line in ["one", "two", "kept", "fresh", "reconnected", "rust"] {
             assert!(screen.contains(&format!("accepted:{line}")), "{line} missing: {screen}");
         }
-        for line in ["repeat", "gapped", "late", "detached", "replaced", "revoked", "replayed"] {
+        for line in ["repeat", "gapped", "late", "detached", "replaced", "revoked", "replayed", "rust-repeat", "rust-gap"] {
             assert!(!screen.contains(&format!("accepted:{line}")), "{line} written: {screen}");
         }
         let accepted: Vec<_> = screen
             .lines()
             .filter_map(|line| line.trim().strip_prefix("accepted:"))
             .collect();
-        assert_eq!(accepted, ["one", "two", "kept", "fresh", "reconnected"]);
+        assert_eq!(accepted, ["one", "two", "kept", "fresh", "reconnected", "rust"]);
         server.abort();
         let _ = server.await;
     }
