@@ -114,6 +114,11 @@ the same arrangement read answers. There is no new checkpoint drop rule, includi
 agent-authored edits. Effective tombstone ancestors and concurrent-cycle cuts derive from
 raw position heads deterministically without rewriting their registers.
 
+The canonical audit history includes a live arrangement with folder and placement registers.
+Both tables participate in shuffle/restart/checkpoint row comparisons and per-column
+incremental-digest mutation/rollback checks. Binary winner keys are serialized as hex in
+the independent row oracle, preserving their complete canonical bytes.
+
 ## Every store_index order
 
 Locations below refer to the audited commit, so later line-number changes do not invalidate the inventory. Shared rows must move to the canonical helper, including commutative enumerations whose returned ordering is observable. Local rows may retain arrival order only for the purpose stated.

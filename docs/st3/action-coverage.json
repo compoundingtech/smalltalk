@@ -44,6 +44,17 @@
       "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
     },
     {
+      "action": "arrangement.edit",
+      "tests": [
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_actions_merge_layout_fences_replay_receipts_and_preserve_owner",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_edit_recovers_receipt_gap_without_accepting_a_changed_action_id",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_actions_accept_current_projected_launch_fences_and_refuse_stale_ones",
+        "crates/st3/src/store/arrangements_tests.rs::owner_admission_real_agent_and_atomic_identity_fences",
+        "crates/st3/src/store/arrangements_tests.rs::heads_survive_reopen_and_an_upgrade_backfills_once"
+      ],
+      "behavior": "real API handler and store tests: stale layout fences merge; stale authority and launch fences refuse without edits; replay preserves receipts and rejects changed action identity; agent attribution preserves person ownership; projected heads survive reopen, upgrade backfill and replication"
+    },
+    {
       "action": "attention.resolve",
       "tests": [
         "crates/st3/tests/action_coverage.rs::unavailable_actions_refuse_before_and_after_restart_without_writes"
