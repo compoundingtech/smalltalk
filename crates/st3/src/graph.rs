@@ -1986,8 +1986,11 @@ fn rewrite_owned_references(subjects: &mut BTreeMap<String, DesiredSubject>, run
                 }
             }
             Value::Object(values) => {
-                for value in values.values_mut() {
-                    rewrite(value, aliases);
+                // Typed resource metadata is authored data, not run-local references.
+                for (key, value) in values {
+                    if key != "resources" {
+                        rewrite(value, aliases);
+                    }
                 }
             }
             _ => {}
@@ -2027,8 +2030,10 @@ fn rewrite_owned_references(subjects: &mut BTreeMap<String, DesiredSubject>, run
                         *value = Value::String(format!("agent/{run}/{local}"));
                     }
                 }
-                for value in values.values_mut() {
-                    rewrite_agent_parties(value, run);
+                for (key, value) in values {
+                    if key != "resources" {
+                        rewrite_agent_parties(value, run);
+                    }
                 }
             }
             _ => {}

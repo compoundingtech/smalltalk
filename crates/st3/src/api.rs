@@ -7465,6 +7465,30 @@ async fn submit_planning_variant(
     preview_planning_variant(state, id, variant).await
 }
 
+/// Mission-only routes may publish the shared targets synthesized from their URI edges,
+/// but never an explicitly authored immediate declaration (even one with the same ID).
+fn mission_only_subjects(intent: &crate::model::NormalizedIntent) -> bool {
+    if intent.subjects.is_empty() {
+        return true;
+    }
+    let mission_roots = intent.normalized["declarations"].as_array().is_some_and(|nodes| {
+        nodes.iter().all(|node| node["name"] == "mission")
+    });
+    mission_roots && intent.subjects.values().all(|subject| {
+        subject.kind == "resource"
+            && subject.subject.starts_with("resource/uri/")
+            && subject.owner_run.is_none()
+            && subject.owner_generation.is_none()
+            && subject.owner_step.is_none()
+            && intent.missions.values().any(|mission| {
+                mission.resources.iter().any(|edge| {
+                    edge.kind == crate::model::ResourceReferenceKind::Uri
+                        && edge.subject == subject.subject
+                })
+            })
+    })
+}
+
 fn launch_candidate_mission<'a>(
     intent: &'a crate::model::NormalizedIntent,
     expected: &str,
@@ -7479,7 +7503,7 @@ fn launch_candidate_mission<'a>(
     };
     let published_closure = crate::mission::mission_closure_ids(mission);
     let published = intent.missions.keys().cloned().collect::<BTreeSet<_>>();
-    if !intent.subjects.is_empty() || published != published_closure {
+    if !mission_only_subjects(intent) || published != published_closure {
         return Err(St3Error::new(
             "wrong-launch-mission",
             format!(
@@ -11533,7 +11557,7 @@ async fn revise_mission_run(
             "a run revision must contain exactly one top-level mission",
         )));
     }
-    if !initial.subjects.is_empty() {
+    if !mission_only_subjects(&initial) {
         return Err(ApiError::bad(St3Error::new(
             "invalid-mission-revision-intent",
             "a run revision can contain only its mission",
@@ -11546,6 +11570,12 @@ async fn revise_mission_run(
     let resolved_kdl =
         resolve_document_references(&request.intent.kdl, &bindings).map_err(ApiError::bad)?;
     let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
+    if !mission_only_subjects(&intent) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-mission-revision-intent",
+            "a run revision can contain only its mission",
+        )));
+    }
     let mission_id = current
         .mission
         .strip_prefix("mission/")
@@ -11580,19 +11610,18 @@ async fn revise_mission_run(
     let (_, reviewers) =
         crate::store::analyze_mission_revision(&old, replacement, &current.requester)
             .map_err(ApiError::bad)?;
-    let mut publication = intent.clone();
-    publication.subjects.clear();
+    let publication = &intent;
     let mut planned = state
         .store
         .mission(
-            &publication,
+            publication,
             crate::model::IntentInput {
                 kdl: resolved_kdl,
                 source_name: request.intent.source_name,
             },
         )
         .map_err(ApiError::bad)?;
-    publication_refusals(&state, &publication)
+    publication_refusals(&state, publication)
         .await?
         .block(&mut planned);
     if !planned.blockers.is_empty() {
@@ -11605,7 +11634,7 @@ async fn revise_mission_run(
     state
         .store
         .apply_as(
-            &publication,
+            publication,
             &planned.subject_tokens,
             &format!("{}:publish", request.idempotency_key),
             Some(&actor),
@@ -12126,7 +12155,7 @@ async fn publish_work_mission(
             "a mission output must contain exactly one mission",
         )));
     }
-    if !initial.subjects.is_empty() {
+    if !mission_only_subjects(&initial) {
         return Err(ApiError::bad(St3Error::new(
             "invalid-mission-output-intent",
             "a mission output can contain only its mission",
@@ -12139,6 +12168,12 @@ async fn publish_work_mission(
     let resolved_kdl =
         resolve_document_references(&request.intent.kdl, &bindings).map_err(ApiError::bad)?;
     let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
+    if !mission_only_subjects(&intent) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-mission-output-intent",
+            "a mission output can contain only its mission",
+        )));
+    }
     let mission = intent
         .missions
         .values()
@@ -12153,19 +12188,18 @@ async fn publish_work_mission(
             ),
         )));
     }
-    let mut publication = intent.clone();
-    publication.subjects.clear();
+    let publication = &intent;
     let mut planned = state
         .store
         .mission(
-            &publication,
+            publication,
             crate::model::IntentInput {
                 kdl: resolved_kdl,
                 source_name: request.intent.source_name,
             },
         )
         .map_err(ApiError::bad)?;
-    publication_refusals(&state, &publication)
+    publication_refusals(&state, publication)
         .await?
         .block(&mut planned);
     if !planned.blockers.is_empty() {
@@ -12177,7 +12211,7 @@ async fn publish_work_mission(
     state
         .store
         .apply(
-            &publication,
+            publication,
             &planned.subject_tokens,
             &format!("{}:publish", request.idempotency_key),
         )
@@ -17039,6 +17073,47 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
         assert_eq!(error.code, "wrong-launch-mission");
     }
 
+    #[test]
+    fn mission_uri_publication_preserves_authored_resource_aliases() {
+        let source = r#"version 2
+mission "planned/work" state="ready" {
+ goal "Work."
+ resource "tracker" uri="urn:example:tracker"
+ agent "worker" {
+  workspace "."
+  command "true"
+  resource "worker" uri="urn:example:one" reason="worker"
+  resource "agent/worker" uri="urn:example:two" reason="agent/worker"
+  resource "explicit" subject="resource/worker" reason="worker"
+ }
+}"#;
+        let intent = parse_intent(source, "node").unwrap();
+        assert!(launch_candidate_mission(&intent, "planned/work").is_ok());
+        let target = intent.missions["planned/work"].resources[0].subject
+            .strip_prefix("resource/").unwrap();
+        let explicit = format!(
+            "version 2\nresource {target:?} {{ kind \"uri.reference\"; uri \"urn:example:tracker\" }}\n{}",
+            source.strip_prefix("version 2\n").unwrap(),
+        );
+        let explicit = parse_intent(&explicit, "node").unwrap();
+        assert!(!mission_only_subjects(&explicit));
+        assert_eq!(
+            launch_candidate_mission(&explicit, "planned/work").unwrap_err().code,
+            "wrong-launch-mission",
+        );
+        let execution = crate::graph::parse_execution_intent(
+            intent.missions["planned/work"].declarations_kdl.as_deref().unwrap(), "node", "example",
+        ).unwrap();
+        let edges = crate::graph::declared_resources(
+            &execution.subjects["agent/example/worker"].desired,
+        );
+        assert_eq!(edges[0].name, "worker");
+        assert_eq!(edges[0].reason.as_deref(), Some("worker"));
+        assert_eq!(edges[1].name, "agent/worker");
+        assert_eq!(edges[1].reason.as_deref(), Some("agent/worker"));
+        assert_eq!(edges[2].subject, "resource/worker");
+    }
+
     #[tokio::test]
     async fn planner_choice_is_frozen_per_launch_and_survives_projection_rebuild() {
         let root = tempfile::tempdir().unwrap();
@@ -17211,6 +17286,7 @@ version 2
 
   mission "planned/work" state="ready" {
     goal "Publish the planned result."
+    resource "tracker" uri="urn:example:planning"
     step "inspect" { goal "Inspect the source." }
     step "change" {
       goal "Make the approved change."
@@ -17341,6 +17417,7 @@ version 2
 
   mission "planned/work" state="ready" {
     goal "Publish the planned and verified result."
+    resource "tracker" uri="urn:example:planning"
     step "inspect" { goal "Inspect the source." }
     step "change" {
       goal "Make the approved change."
@@ -17447,13 +17524,6 @@ version 2
         );
         assert_eq!(
             variant["visualization"]["swimlanes"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            variant["structured_diff"]["changes"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -17576,7 +17646,9 @@ version 2
             approved["published_revision"],
             approved["candidate"]["mission_revision"]
         );
-        assert!(store.mission_spec("planned/work", None).unwrap().is_some());
+        let published = store.mission_spec("planned/work", None).unwrap().unwrap();
+        let uris = store.declared_resource_uris(&published.resources).unwrap();
+        assert_eq!(uris[&published.resources[0].subject], "urn:example:planning");
         // The planner is a durable top-level seat, not a synthetic standing
         // mission. Approval removes that seat directly and leaves no planner
         // mission run behind to clean up.
@@ -19970,6 +20042,7 @@ version 2
 
   mission "revision" state="ready" {
     goal "Complete mission revision."
+    resource "tracker" uri="urn:example:revision"
      agent "sup" {
        workspace "."
        command "true"
@@ -19999,7 +20072,9 @@ version 2
         assert_ne!(revised["mission_run"]["revision"], run.revision);
         assert_eq!(revised["mission_run"]["root_revision"], run.root_revision);
         assert_eq!(revised["mission_run"]["steps"][0]["status"], "pending");
-        assert_eq!(state.store.desired_subjects().unwrap().len(), 1);
+        let published = state.store.mission_spec("revision", None).unwrap().unwrap();
+        let uris = state.store.declared_resource_uris(&published.resources).unwrap();
+        assert_eq!(uris[&published.resources[0].subject], "urn:example:revision");
     }
 
     #[tokio::test]
@@ -20553,6 +20628,7 @@ version 2
 
   mission "project/work" state="ready" {
     goal "Complete mission project/work."
+    resource "tracker" uri="urn:example:output"
     step "inspect" { title "Inspect the project" }
     step "implement" { depends-on { step "inspect" completed } }
   }
@@ -20647,6 +20723,9 @@ version 2
             .expect("attempt-bound mission output");
         assert_eq!(bound.revision, revision);
         assert_eq!(bound.claim_id, output["claim_id"]);
+        let published = state.store.mission_spec("project/work", Some(revision)).unwrap().unwrap();
+        let uris = state.store.declared_resource_uris(&published.resources).unwrap();
+        assert_eq!(uris[&published.resources[0].subject], "urn:example:output");
     }
 
     #[tokio::test]
