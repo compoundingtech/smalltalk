@@ -322,9 +322,19 @@ mod tests {
             ("parser", "parser"),
             ("agent/example.parser", "parser"),
             ("fleet/example/--parser.lock", "parser-lock"),
+            ("agent/example/HEAD", "head"),
             ("???", "agent"),
         ] {
             assert_eq!(agent_branch(name), branch);
+            let output = std::process::Command::new("git")
+                .args(["check-ref-format", "--branch", branch])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "Git rejected default branch {branch}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         let args = st3_client::AgentCreateParameters {
             branch: Some("parser".into()),
