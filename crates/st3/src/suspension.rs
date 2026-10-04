@@ -310,6 +310,13 @@ pub fn continue_session(
 /// rest is st's: a claimed step whose lease would lapse, and subagents st still records.
 pub fn blockers(store: &Store, subject: &str, incarnation: &str) -> Result<Vec<String>> {
     let mut blocking = Vec::new();
+    if let Some(harness) = store.current_harness(subject)?
+        && harness.incarnation_id == incarnation
+        && matches!(harness.state.as_str(), "unauthenticated" | "blocked")
+        && harness.blocked_on.as_deref() == Some("human")
+    {
+        blocking.push("pending-ask".into());
+    }
     let harness = store
         .latest_observation(subject, "harness.observed")?
         .filter(|claim| field(claim, "incarnation_id") == Some(incarnation));
