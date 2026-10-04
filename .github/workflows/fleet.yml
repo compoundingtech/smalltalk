@@ -245,6 +245,10 @@ jobs:
         run: nix develop -c bash scripts/ci-nextest run --no-run
       - name: Summarize tested revision
         run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
+      - name: Require every harness to hold old mail across boot and reconnect
+        shell: bash
+        run: nix develop -c python3 scripts/ci-mail-redelivery-canaries
+        id: mail-redelivery-canaries
       - name: Run nextest
         shell: bash
         run: nix develop -c bash scripts/ci-linux tests
@@ -261,6 +265,8 @@ jobs:
             target/messaging-faults/
             target/boot-canaries/
           if-no-files-found: ignore
+    outputs:
+      mail_redelivery: ${{ steps.mail-redelivery-canaries.outcome }}
   linux-clippy:
     name: linux-clippy
     needs: [pick-runner]
@@ -420,16 +426,27 @@ jobs:
             ${{ runner.temp }}/ci-logs/
 
           if-no-files-found: ignore
+  mail-redelivery-canaries:
+    name: mail-redelivery-canaries
+    needs: [linux-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Require the explicit zero-redelivery canaries to pass
+        env:
+          RESULT: ${{ needs.linux-tests.outputs.mail_redelivery }}
+        run: '[ "$RESULT" = success ]'
   linux-gate:
     name: linux-gate
-    needs: [pick-runner, linux-tests, linux-clippy, linux-fleet-compat]
+    needs: [pick-runner, linux-tests, linux-clippy, linux-fleet-compat, mail-redelivery-canaries]
     if: always()
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["namespace-profile-linux-x86-64","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 5
     steps:
       - name: Require every Linux stage to pass
         env:
-          RESULTS: "${{ needs.linux-tests.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }}"
+          RESULTS: "${{ needs.linux-tests.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}"
         run: |
           echo "stage results: $RESULTS"
           for result in $RESULTS; do
