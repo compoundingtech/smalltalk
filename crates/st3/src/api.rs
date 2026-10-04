@@ -382,6 +382,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::agent_declaration),
         )
         .route("/v1/client/agent-queues/{*id}", get(client_v0::agent_queue))
+        .route("/v1/client/status-history/{*id}", get(client_v0::status_history))
         .route("/v1/client/lanes", get(client_v0::lanes))
         .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
         .route("/v1/client/history", get(client_history))
@@ -995,7 +996,7 @@ fn client_now_ms() -> u128 {
         .as_millis()
 }
 
-fn client_timestamp(unix_ms: u128) -> String {
+pub(crate) fn client_timestamp(unix_ms: u128) -> String {
     let unix_ms = i64::try_from(unix_ms).unwrap_or(i64::MAX);
     chrono::DateTime::from_timestamp_millis(unix_ms)
         .unwrap_or(chrono::DateTime::UNIX_EPOCH)
@@ -1913,6 +1914,16 @@ fn client_agent_resources(
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
         }
+        let source = item.as_object_mut().unwrap().remove("_status_source").unwrap_or(Value::Null);
+        let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
+        let observation = store.seat_observation_at(
+            item["id"].as_str().unwrap_or_default(), harness.as_ref(), snapshot_index, client_now_ms(),
+        )?;
+        item["observation"] = json!(observation);
+        if observation == "stale" && item["harness_state"] == "idle" {
+            item["harness_state"] = json!("indeterminate");
+            if item["state"] == "running" { item["state"] = json!("waiting"); }
+        }
         overlay_delivery_presence(item, &local_host);
     }
     overlay_subagents(store, &mut items)?;
@@ -2059,7 +2070,8 @@ fn client_agent_resources_uncached(
             subject.subject.starts_with("agent/") || subject.kind.as_deref() == Some("agent")
         })
         .filter(|subject| history || subject.projection.layer == "current")
-        .map(|subject| -> anyhow::Result<(String, Value)> {
+        .map(|mut subject| -> anyhow::Result<(String, Value)> {
+            subject.harness = store.observed_harness_at(&subject.subject, snapshot_index)?;
             let fault = member_faults.get(&subject.subject);
             let fields = subject
                 .actual
@@ -2073,10 +2085,7 @@ fn client_agent_resources_uncached(
                 .as_ref()
                 .and_then(|harness| harness.driver.clone())
                 .or_else(|| subject.desired.as_ref().and_then(desired_harness_driver));
-            let harness_state = subject
-                .harness
-                .as_ref()
-                .map(|harness| harness.state.clone());
+            let harness_state = subject.harness.as_ref().map(|harness| harness.state.clone());
             let last_activity_at = store.agent_last_activity_at(
                 &subject.subject,
                 subject
@@ -2221,6 +2230,8 @@ fn client_agent_resources_uncached(
                 "owner_run_id": subject.owner_run,
                 "driver": driver,
                 "harness_state": harness_state,
+                "since": subject.harness.as_ref().map(|harness| client_timestamp(harness.since_unix_ms)),
+                "_status_source": subject.harness,
                 "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
                 "ask": subject.harness.as_ref().and_then(|harness| harness.ask.as_deref()),
                 "reason": subject.harness.as_ref().and_then(|harness| harness.reason.as_deref()),

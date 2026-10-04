@@ -9,7 +9,7 @@
 use super::adapt::{self, Extras};
 use super::glass::GlassWrite;
 use super::view::{Load, MissionPreview};
-use super::{Effect, Guard, Ui};
+use super::{AgentControl, Effect, Guard, Ui};
 use crate::feed::{self, Command, TerminalUpdate, Window};
 use crate::model::{self, Collection, Model};
 use anyhow::Result;
@@ -854,6 +854,17 @@ pub fn run(context: Context) -> Result<()> {
                     let runtime_ids = found
                         .map(|candidate| candidate.runtime_ids.clone())
                         .unwrap_or_default();
+                    // What st already said of the agent: its terminal is named after it, and its
+                    // incarnation is the one running, so the attach needs no runtime read first.
+                    let known = found.and_then(|candidate| {
+                        let name = candidate
+                            .runtime_ids
+                            .first()?
+                            .trim_start_matches("runtime/");
+                        candidate.incarnation_id.clone().map(|incarnation| {
+                            (name.to_owned(), format!("terminal/{agent}"), incarnation)
+                        })
+                    });
                     let name = found.map(crate::agent_label).unwrap_or_else(|| {
                         if agent.starts_with("terminal/") {
                             "shell".into()
@@ -869,7 +880,9 @@ pub fn run(context: Context) -> Result<()> {
                         let tx = fetched_tx.clone();
                         let agent = agent.clone();
                         runtime.spawn(async move {
-                            let attached = attach_direct(&client, &agent, &runtime_ids, None).await;
+                            let attached =
+                                attach_known_then_direct(&client, &agent, known, &runtime_ids)
+                                    .await;
                             let _ = tx.send(match attached {
                                 Ok(direct) => Fetched::Native { agent, direct },
                                 Err(reason) => Fetched::NativeFailed {
@@ -1501,6 +1514,78 @@ pub(crate) fn plain(error: &anyhow::Error) -> String {
         .unwrap_or_else(|| error.to_string())
 }
 
+/// One agent action, fenced to the seat's current declaration as st asks. A restart is a stop
+/// and then a start, each on the declaration st selects at that moment.
+async fn agent_control(client: &Client, agent: &str, control: AgentControl) -> Result<()> {
+    let fence = |definition: st3_client::Envelope<st3_client::SubjectDefinition>| Fence {
+        snapshot_id: definition.snapshot.id,
+        runtime_desired_revision: Some(definition.value.desired_token),
+        ..Fence::default()
+    };
+    let reason = Some("from stui's agent actions".to_owned());
+    let steps: &[AgentControl] = match control {
+        AgentControl::Restart => &[AgentControl::Retire, AgentControl::Start],
+        _ => std::slice::from_ref(&control),
+    };
+    for step in steps {
+        let fence = fence(client.subject_definition(agent, false).await?);
+        let (id, idem) = crate::action_pair();
+        match step {
+            AgentControl::Retire | AgentControl::Restart => {
+                client
+                    .agent_stop(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentStopParameters {
+                            agent: agent.to_owned(),
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            AgentControl::Start => {
+                client
+                    .agent_start(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentStartParameters {
+                            agent: agent.to_owned(),
+                        },
+                    )
+                    .await?;
+            }
+            AgentControl::Suspend => {
+                client
+                    .agent_suspend(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentSuspendParameters {
+                            agent: agent.to_owned(),
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            AgentControl::Resume => {
+                client
+                    .agent_resume(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentResumeParameters {
+                            agent: agent.to_owned(),
+                        },
+                    )
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn perform(
     client: &Client,
     person: &str,
@@ -1512,6 +1597,17 @@ async fn perform(
         // Glass writes and retries never reach here: the loop handles them itself.
         Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::Forget { .. } => {
             Ok((String::new(), None))
+        }
+        Effect::AgentControl { agent, control } => {
+            agent_control(client, &agent, control).await?;
+            Ok((
+                format!(
+                    "{} {}: asked st",
+                    control.verb(),
+                    agent.trim_start_matches("agent/")
+                ),
+                None,
+            ))
         }
         Effect::StopAgent { agent } => {
             let runtime = model
@@ -2687,6 +2783,24 @@ struct Direct {
 /// terminal's incarnation and routed to the host that owns it. `subject` is an agent (its
 /// terminal is the first of `runtime_ids` that has one) or a shell's terminal. With `expected`,
 /// only that incarnation: a terminal that restarted since is not quietly swapped in.
+/// Attach straight to the terminal st already named, the quick way (each runtime read is a full
+/// round trip to the daemon, a second or more on a busy one: Nathan, 2026-10-04, "attaching
+/// … feels kinda slow"); when that terminal is not there, find it through the agent's runtimes.
+async fn attach_known_then_direct(
+    client: &Client,
+    agent: &str,
+    known: Option<(String, String, String)>,
+    runtime_ids: &[String],
+) -> Result<Direct, String> {
+    if let Some((name, terminal, incarnation)) = known
+        && !agent.starts_with("terminal/")
+        && let Ok(direct) = attach_terminal(client, name, &terminal, incarnation).await
+    {
+        return Ok(direct);
+    }
+    attach_direct(client, agent, runtime_ids, None).await
+}
+
 async fn attach_direct(
     client: &Client,
     subject: &str,
@@ -2733,29 +2847,35 @@ async fn attach_direct(
             reason = "the terminal restarted; Ctrl+] attaches the new one".into();
             continue;
         }
-        let attachment = match client
-            .raw_terminal_attachment(&terminal, &incarnation, st3_client::RawTerminalMode::Attach)
-            .await
-        {
-            Ok(attachment) => attachment,
-            Err(error) => {
-                reason = error.plain();
-                continue;
-            }
-        };
-        match client.raw_terminal_stream(&attachment).await {
-            Ok(stream) => {
-                return stream
-                    .into_std()
-                    .map(|stream| Direct {
-                        name,
-                        incarnation,
-                        stream,
-                    })
-                    .map_err(|error| error.to_string());
-            }
-            Err(error) => reason = error.plain(),
+        match attach_terminal(client, name, &terminal, incarnation).await {
+            Ok(direct) => return Ok(direct),
+            Err(error) => reason = error,
         }
     }
     Err(reason)
+}
+
+/// A raw attachment to one terminal's PTY session at one incarnation, and its stream.
+async fn attach_terminal(
+    client: &Client,
+    name: String,
+    terminal: &str,
+    incarnation: String,
+) -> Result<Direct, String> {
+    let attachment = client
+        .raw_terminal_attachment(terminal, &incarnation, st3_client::RawTerminalMode::Attach)
+        .await
+        .map_err(|error| error.plain())?;
+    let stream = client
+        .raw_terminal_stream(&attachment)
+        .await
+        .map_err(|error| error.plain())?;
+    stream
+        .into_std()
+        .map(|stream| Direct {
+            name,
+            incarnation,
+            stream,
+        })
+        .map_err(|error| error.to_string())
 }

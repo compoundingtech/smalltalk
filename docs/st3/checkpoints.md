@@ -348,3 +348,11 @@ A new rule changes the rules digest, so it takes effect only once every particip
 adding one, list every reader of the kind, give each kept claim a reason in terms of a reader's
 answer, and add a test in `checkpoint_tests.rs` that names the dropped and the kept claims, as the
 examples above do.
+
+The observed seat status history rule (rules version 9) preserves the last 200 canonical
+transition and runtime reset sources per seat within seven days before the cut, across runtime
+incarnations. It also preserves the start of the current observed state, including idle or
+blocked states older than that window, so trimming cannot reset `since`. Existing operational
+witnesses can retain other claims; the client read independently enforces its seven-day/200-item
+bound. Checkpoint tombstones make unprovable completeness explicit instead of treating deleted
+observations as evidence of continuity.
