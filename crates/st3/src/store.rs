@@ -14325,8 +14325,12 @@ impl Store {
                 .unwrap_or("unknown");
             let login = match driver {
                 "claude" | "pi" | "omp" => "run /login",
-                "codex" => "run codex login with this seat's account configuration",
-                "opencode" => "run opencode auth login with this seat's account configuration",
+                "codex" => {
+                    "complete the sign-in prompt or run codex login in a shell using this seat's account configuration"
+                }
+                "opencode" => {
+                    "run opencode auth login in a shell using this seat's account configuration"
+                }
                 _ => "use this harness's login command",
             };
             let connection = self.readers.get();
@@ -18861,6 +18865,10 @@ fn mailbox_harness_ended(
         return Ok(false);
     }
 
+    if update_prompt_fence(connection, subject, incarnation, i64::MAX as u64)?.is_some() {
+        return Ok(false);
+    }
+
     // These positive prompt fences precede the harness state in the display fold. A restored
     // login removes the override. Read them only when they can change an ended decision.
     let diagnostic: Option<String> = connection
@@ -18985,6 +18993,46 @@ fn check_mailbox_fence(
     Ok(())
 }
 
+fn update_prompt_fence(
+    connection: &Connection,
+    subject: &str,
+    incarnation: &str,
+    at_index: u64,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
+    let claim = connection.prepare_cached(&format!(
+        "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.diagnostic' AND claims.store_index<=?2
+           AND json_extract(claims.body, '$.fields.incarnation_id')=?3
+           AND json_extract(claims.body, '$.fields.code') IN ('provider-update-prompt','provider-update-restored')
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    ))?.query_row(params![subject, at_index, incarnation], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    }).optional()?;
+    let Some((claim, body, at)) = claim else {
+        return Ok(None);
+    };
+    let body: Value = serde_json::from_str(&body)?;
+    let fields = &body["fields"];
+    if fields["code"] != "provider-update-prompt" {
+        return Ok(None);
+    }
+    let text = |name: &str| fields[name].as_str().map(str::to_owned);
+    Ok(Some(crate::model::CurrentHarnessView {
+        state: "blocked".into(),
+        driver: text("driver"),
+        incarnation_id: incarnation.into(),
+        transport: Some("native".into()),
+        reason: text("reason"),
+        blocked_on: Some("human".into()),
+        ask: None,
+        input_buffer: None,
+        exit: None,
+        claim,
+        observed_at_unix_ms: at.parse()?,
+    }))
+}
+
 fn current_harness_at(
     connection: &Connection,
     subject: &str,
@@ -19013,6 +19061,12 @@ fn current_harness_at(
         return Ok(None);
     };
 
+    // A terminal modal holds even if a parallel native channel reports idle or work progress.
+    // Only a successful subsequent screen observation or a new runtime lifts this fence.
+    if let Some(harness) = update_prompt_fence(connection, subject, incarnation_id, at_index)? {
+        return Ok(Some(harness));
+    }
+
     // A native credential refusal is independent of activity, and work claims cannot erase it.
     let auth = connection.query_row(&canonical_sql(
         "SELECT id, accepted_at_unix_ms, body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
@@ -19021,9 +19075,11 @@ fn current_harness_at(
          ORDER BY CANONICAL_DESC(claims) LIMIT 1"), params![subject, at_index, incarnation_id],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
         .optional()?;
+    let mut auth_restored = false;
     if let Some((claim, time, body)) = auth {
         let body: Value = serde_json::from_str(&body)?;
         let fields = &body["fields"];
+        auth_restored = fields["provider_auth"] == true;
         if fields["provider_auth"] == false {
             return Ok(Some(crate::model::CurrentHarnessView {
                 state: "needs-login".into(),
@@ -19047,7 +19103,7 @@ fn current_harness_at(
     // instead.
     let prompt_rejection = connection
         .prepare_cached(&format!(
-            "SELECT claims.id, claims.accepted_at_unix_ms, json_extract(claims.body, '$.fields.code')
+            "SELECT claims.id, claims.accepted_at_unix_ms, json_extract(claims.body, '$.fields.code'), claims.body
              FROM claims JOIN batches ON batches.id=claims.batch_id
              WHERE claims.subject=?1 AND claims.kind='harness.diagnostic'
                AND claims.store_index<=?2
@@ -19063,12 +19119,13 @@ fn current_harness_at(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()?;
     // A lifted login fence no longer holds the incarnation.
-    if let Some((claim, observed_at_unix_ms, code)) = prompt_rejection
+    if let Some((claim, observed_at_unix_ms, code, body)) = prompt_rejection
         && code != "provider-auth-restored"
     {
         let (state, reason) = if code == "provider-trust-prompt" {
@@ -19076,14 +19133,14 @@ fn current_harness_at(
         } else {
             ("needs-login", "providerAuth")
         };
+        let body: Value = serde_json::from_str(&body)?;
+        let fields = &body["fields"];
+        let driver = fields["driver"].as_str().unwrap_or("claude");
         return Ok(Some(crate::model::CurrentHarnessView {
             state: state.into(),
-            driver: runtime_fields
-                .get("driver")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            driver: Some(driver.into()),
             incarnation_id: incarnation_id.to_owned(),
-            transport: None,
+            transport: Some(if driver == "claude" { "claude-channel" } else { "native" }.into()),
             reason: Some(reason.into()),
             blocked_on: Some("human".into()),
             ask: None,
@@ -19224,7 +19281,7 @@ fn current_harness_at(
     let Some((mut state, claim, observed_at_unix_ms, _)) = current else {
         return Ok(None);
     };
-    if optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
+    if !auth_restored && optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
         state = "needs-login".into();
     }
     Ok(Some(crate::model::CurrentHarnessView {

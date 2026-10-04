@@ -1,0 +1,18 @@
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /tmp/st-auth-capture-example/work
+
+
+❯ /login
+
+────────────────────────────────────────────────────────────────────────────────
+  Login
+
+  Browser didn't open? Use the url below to sign in (c to copy)
+
+https://example.invalid/oauth/authorize
+
+
+  Paste code here if prompted >
+
+  Esc to cancel

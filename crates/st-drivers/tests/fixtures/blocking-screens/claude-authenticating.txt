@@ -1,0 +1,13 @@
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /tmp/st-auth-capture-example/work
+
+
+❯ /login
+
+────────────────────────────────────────────────────────────────────────────────
+  Login
+
+  ✢ Opening browser to sign in…
+
+  Esc to cancel

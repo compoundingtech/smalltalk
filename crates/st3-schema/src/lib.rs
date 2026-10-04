@@ -2912,12 +2912,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("modified_at", string()),
         ],
         "harness.diagnostic" => &[
+            ("driver", string()),
             ("severity", enumeration(&["warning", "error"])),
             ("status", string()),
             ("code", string()),
             ("reason", string()),
             ("incarnation_id", string()),
-            ("driver", string()),
             ("provider_auth_sequence", integer()),
             ("auth_attention_key", string()),
             ("matched_line", string()),

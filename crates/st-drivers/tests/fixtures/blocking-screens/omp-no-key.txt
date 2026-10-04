@@ -1,0 +1,24 @@
+│                          │                                                 │
+│                          │                                                 │
+│                          │                                                 │
+╰──────────────────────────┴─────────────────────────────────────────────────╯
+ Tip: Need a cheap nested model call? Use `completion(x...)`. Have a big batch
+      of tasks? Ask clanker to use it!
+
+
+────────────────────────────────────────────────────────────────────────────────
+ Update Available
+ New version 18.6.0 is available. Run: omp update
+────────────────────────────────────────────────────────────────────────────────
+
+
+ hello
+
+
+ Error: No API key found for anthropic.
+
+ Use /login, set an API key environment variable, or create
+ /home/example/.omp/agent/agent.db
+
+ π > ◒ Opus 4.6 > 🗑 example/work ▶─0.3%──────────────────╎┃───1M─
+╰─

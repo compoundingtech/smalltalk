@@ -20,6 +20,8 @@ Use these documents for implementation details:
 - [Checkpoints and trimming](checkpoints.md) explains how every node of a fleet agrees to delete old
   claims together: when a checkpoint is due, seal, verify and trim, which claims a rule may drop and
   why, excusing an unreachable member, and what the first real trim taught.
+- [Shell completion](cli-completion/spec.md) defines live entity candidates, their descriptions,
+  and short-name resolution; [requirements](cli-completion/requirements.md).
 - [Lanes](lanes.md) defines the ordered lanes a mission run works through, such as the merge
   train, and `st lanes`.
 - [Attachments](attachments.md) defines the images a message carries between machines: where the

@@ -2999,9 +2999,26 @@ async fn cli_local_skill_completions_holds_and_repairs_use_private_files() {
             .join("home/.agents/skills/st/SKILL.md")
             .is_file()
     );
-    let completed = daemon.cli(PERSON, &["completions", "bash"]).await;
-    assert!(completed.status.success());
-    assert!(String::from_utf8_lossy(&completed.stdout).contains("missions"));
+    let completed = daemon
+        .cli_command(PERSON, &["--", "st", ""])
+        .env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "1")
+        .env("_CLAP_COMPLETE_COMP_TYPE", "9")
+        .env("_CLAP_COMPLETE_SPACE", "false")
+        .env("_CLAP_IFS", "\n")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&completed.stdout)
+            .split_whitespace()
+            .any(|candidate| candidate == "missions")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
