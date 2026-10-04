@@ -983,7 +983,8 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn incoming_resumes(&self, desired: &[DesiredSubject]) -> Result<()> {
-        for subject in desired {
+        let targets = self.store.cross_host_resume_targets(&self.host)?;
+        for subject in desired.iter().filter(|subject| targets.contains(&subject.subject)) {
             let Some(member) = &subject.member else {
                 continue;
             };

@@ -191,6 +191,9 @@ WHERE kind='message.sent';
 CREATE INDEX IF NOT EXISTS claims_message_from_index
 ON claims(json_extract(body, '$.fields.from'), store_index)
 WHERE kind='message.sent';
+CREATE INDEX IF NOT EXISTS claims_resume_host_index
+ON claims(json_extract(body, '$.fields.host'), subject)
+WHERE kind='runtime.action.requested' AND json_extract(body,'$.fields.action')='resume';
 CREATE INDEX IF NOT EXISTS claims_actor_progress_index
 ON claims(actor, store_index)
 WHERE kind IN ('work.progress', 'work.submitted');
@@ -11889,6 +11892,17 @@ impl Store {
     pub fn launch_lineage(&self, subject: &str) -> Result<Vec<String>> {
         let connection = self.readers.get();
         launch_lineage_tx(&connection, subject)
+    }
+
+    /// Only seats whose durable resume requests name this host need transfer reconciliation.
+    pub(crate) fn cross_host_resume_targets(&self, host: &str) -> Result<BTreeSet<String>> {
+        smallclaims::touched::note_read(|| "kind:runtime.action.requested".to_owned());
+        let connection = self.readers.get();
+        let mut query = connection.prepare_cached(
+            "SELECT DISTINCT subject FROM claims INDEXED BY claims_resume_host_index WHERE kind='runtime.action.requested'
+             AND json_extract(body,'$.fields.action')='resume' AND json_extract(body,'$.fields.host')=?1")?;
+        let rows = query.query_map([host], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<BTreeSet<_>>>()?)
     }
 
     /// Commit one restored move against the exact declaration its resume request named.

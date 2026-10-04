@@ -1,5 +1,5 @@
-//! Host-local suspension payloads. Only the manifest digest travels in claims; peers pull
-//! bounded chunks on demand. Git's normal index, branch and working tree are never changed.
+//! Host-local suspension payloads, pulled in bounded chunks on demand. Transcript contents
+//! never enter claims. Git's normal index, branch and working tree are never changed.
 use crate::{
     model::{MemberSpec, St3Error},
     store::Store,
@@ -210,6 +210,14 @@ pub fn seal(
                 "the suspended native transcript is missing",
             )
         })?;
+    if fs::metadata(&transcript)?.len() > MAX_BYTES
+        || fs::metadata(dir.join("workspace.bundle"))?.len() > MAX_BYTES
+    {
+        return Err(refusal(
+            "snapshot-too-large",
+            "snapshot content exceeds 256 MiB",
+        ));
+    }
     let filename = transcript
         .file_name()
         .context("transcript has no filename")?
