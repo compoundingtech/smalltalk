@@ -80,7 +80,11 @@ The gateway runs each command as the sekrets user inside bubblewrap:
 - The caller's working directory, and in a git checkout its git directories, arrive as directory
   descriptors the caller opened and passed over the socket, and are bound read-only at the paths
   the kernel gives them, which must lie under a checkout root. The gateway never opens a path the
-  caller names, and nothing about the caller's home changes: no ACL, no group, no wider mode.
+  caller names. bubblewrap binds a descriptor by the path it resolves to, so the sekrets user must
+  be able to pass through the directories above the checkout: setup grants it search, never read
+  or list, on each person's home (`setfacl -m u:sekrets:x HOME`). A seat can read nothing more,
+  and the command sees no home but the checkout. From a directory the gateway cannot reach or does
+  not serve, the command runs in the profile's home, and the caller is told so.
 - A repository's own configuration can run programs (`core.fsmonitor`, `filter.*.clean`,
   `pager.*`, hooks, `credential.helper`, `url.*.insteadOf`, includes). Inside the sandbox each git
   directory's `config` and `config.worktree` are replaced by a copy that keeps only data
