@@ -46831,7 +46831,13 @@ fn append_claim_with_subject_fences(
             }
             if let Some(expected_subjects) = expected_subjects {
                 for (subject, expected) in expected_subjects {
-                    if subject == &input.subject { continue; }
+                    // Layout edits merge, but retiring a folded duplicate must not lose
+                    // an edit accepted after the client read it.
+                    if subject == &input.subject
+                        && !(input.kind == "arrangement.edited"
+                            && input.fields.get("operations").and_then(Value::as_array)
+                                .is_some_and(|operations| operations.iter().any(|operation| operation["op"] == "retire")))
+                    { continue; }
                     let actual = if let Some(id) = subject.strip_prefix("launch/") {
                         transaction.query_row(
                             "SELECT updated_at_unix_ms FROM planning_sessions WHERE id=?1",

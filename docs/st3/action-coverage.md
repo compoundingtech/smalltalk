@@ -40,7 +40,11 @@ Real-process fleet tests require a process ancestry without an inherited st agen
 
 ## Typed client actions
 
-The accepted/refused result and replay invariants above apply to the restart-matrix rows. `arrangement.edit` instead references focused real API-handler and store regression tests: stale layout fences intentionally merge, stale authority and launch fences refuse without edits, receipts replay and recover a dispatch gap without accepting changed action identity, agent attribution retains person ownership, and projected heads survive store reopen, upgrade backfill and replication. These tests do not claim full CLI/Unix transport restart coverage.
+The accepted/refused result and replay invariants above apply to the restart-matrix rows. `arrangement.edit` instead references focused real API-handler and store regression tests: stale layout fences intentionally merge; fenced retirement compares the current revision and refuses concurrent edits without writes, while unfenced retirement remains unconditional; stale authority and launch fences refuse without edits; receipts replay and recover a dispatch gap without accepting changed action identity, including fenced retirement; agent attribution retains person ownership; and projected heads survive store reopen, upgrade backfill and replication. These tests do not claim full CLI/Unix transport restart coverage.
+
+Conditional-retirement evidence: `arrangement_retire_fences_refuse_concurrent_edits_and_replay_receipts`
+and `arrangement_fenced_retire_recovers_receipt_gap` in
+[`crates/st3/src/api/client_v0/arrangements.rs`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/src/api/client_v0/arrangements.rs).
 
 | Action | Test evidence |
 | --- | --- |

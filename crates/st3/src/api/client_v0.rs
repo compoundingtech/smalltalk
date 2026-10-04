@@ -8697,9 +8697,9 @@ pub(super) async fn action(
     let mut reconciled_attachment = None;
     let mut checked_fence = request.fence.clone();
     if request.action_type == "arrangement.edit" {
-        // Layout revisions merge. Graph/launch identity revisions are checked in the writer
-        // transaction; attention episodes and external filesystem sessions keep their existing
-        // projected preflight semantics (external state is not governed by SQLite).
+        // Layout revisions merge; fenced retirement and graph/launch identity revisions
+        // are checked in the writer transaction. Attention episodes and external filesystem
+        // sessions retain projected preflight checks (external state is outside SQLite).
         checked_fence.subject_revisions.retain(|subject, _| {
             subject.starts_with("attention/") || subject.starts_with("session/external-")
         });
