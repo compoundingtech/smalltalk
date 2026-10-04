@@ -6,12 +6,13 @@ const path = require('node:path');
 const ts = require('typescript');
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'st3-ts-client-'));
-for (const name of ['Models.generated', 'Client.generated']) {
+for (const name of ['Models.generated', 'Client.generated', 'fetch-receiver.test']) {
     const source = fs.readFileSync(path.join(__dirname, `${name}.ts`), 'utf8');
     const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
     fs.writeFileSync(path.join(temporary, `${name}.js`), output);
 }
 const { St3Client, ClientError, applyWindow } = require(path.join(temporary, 'Client.generated.js'));
+require(path.join(temporary, 'fetch-receiver.test.js'));
 fs.rmSync(temporary, { recursive: true, force: true });
 
 const snapshot = { id: 'snapshot/test', host_id: 'host/test', store_index: 1, projection_version: 'client-projection.v0', created_at: '2026-09-20T00:00:00Z' };
