@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fill Namespace's main-scope caches without rerunning the queue's workspace tests.
 set -euo pipefail
-case "${1:?usage: scripts/ci-cache-warm tests|clippy|fleet-compat}" in
+case "${1:?usage: scripts/ci-cache-warm tests|clippy|fleet-compat|genie|isolation-vm}" in
   # workspacePreparationSteps already builds the selected nextest targets.
   tests) cargo test -p st3-conversation-ui --no-default-features --locked --no-run ;;
   clippy)
@@ -18,6 +18,11 @@ case "${1:?usage: scripts/ci-cache-warm tests|clippy|fleet-compat}" in
       [ "$attempt" -lt 3 ] || exit 1
     done
     cargo test -p st3 --locked --test integration --no-run
+    ;;
+  genie) true ;; # nix develop .#genie has already populated the shell.
+  isolation-vm)
+    cargo nextest archive --locked -p st2 --test integration --archive-file "$RUNNER_TEMP/isolation.tar.zst"
+    nix build --print-build-logs --out-link "$RUNNER_TEMP/vm-driver" .#legacyPackages.x86_64-linux.transport-isolation-vm.driver
     ;;
   *) exit 2 ;;
 esac
