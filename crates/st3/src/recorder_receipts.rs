@@ -5,7 +5,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -59,7 +59,8 @@ fn spool_watcher(directory: &Path, wake: Arc<Notify>) -> Result<notify::Recommen
 }
 
 /// Imports completed JSON files, returning how many new claims were appended.
-/// Invalid receipts are discarded; failed appends get five attempts, then a dead letter.
+/// Invalid receipts are discarded; failed appends retry after 1, 2, 4, and 8 seconds,
+/// then dead-letter on the fifth failure. Retry file modification times persist not-before deadlines.
 /// A committed receipt is safe to replay if deletion fails: URL and actor identify its claim.
 pub fn ingest_once(store: &Store, directory: &Path) -> Result<usize> {
     let entries = match fs::read_dir(directory) {
@@ -85,6 +86,13 @@ pub fn ingest_once(store: &Store, directory: &Path) -> Result<usize> {
     files.sort();
     let mut appended = 0;
     for path in files {
+        let stem = path.file_stem().unwrap().to_string_lossy();
+        let (base, attempts) = stem.rsplit_once(".attempt-")
+            .and_then(|(base, attempt)| attempt.parse::<u32>().ok().map(|attempt| (base, attempt)))
+            .unwrap_or((&stem, 0));
+        if attempts > 0 && fs::metadata(&path)?.modified()? > SystemTime::now() {
+            continue;
+        }
         let result = (|| -> Result<bool> {
             let bytes = fs::read(&path)?;
             let input = serde_json::from_slice::<Receipt>(&bytes)
@@ -113,14 +121,15 @@ pub fn ingest_once(store: &Store, directory: &Path) -> Result<usize> {
                 }
             }
             Err(error) => {
-                let stem = path.file_stem().unwrap().to_string_lossy();
-                let (base, attempts) = stem.rsplit_once(".attempt-")
-                    .and_then(|(base, attempt)| attempt.parse::<u32>().ok().map(|attempt| (base, attempt)))
-                    .unwrap_or((&stem, 0));
                 let attempts = attempts.saturating_add(1);
                 let destination = if attempts >= 5 {
                     path.with_file_name(format!("{base}.dead-letter"))
                 } else {
+                    // Persist the deadline before renaming, so watcher events cannot retry early.
+                    let not_before = SystemTime::now() + Duration::from_secs(1 << (attempts - 1));
+                    fs::File::options().write(true).open(&path)?
+                        .set_times(fs::FileTimes::new().set_modified(not_before))
+                        .context("schedule failed recorder receipt retry")?;
                     path.with_file_name(format!("{base}.attempt-{attempts}.json"))
                 };
                 fs::rename(&path, &destination).context("retain failed recorder receipt")?;
@@ -173,6 +182,7 @@ fn claim_input(receipt: Receipt) -> Result<ClaimInput> {
         fields: BTreeMap::from([
             ("kind".into(), Value::String(kind.into())),
             ("facts".into(), serde_json::to_value(facts)?),
+            ("attribution_only".into(), Value::Bool(true)),
         ]),
         evidence: Vec::new(),
         expected_subject: None,
@@ -222,13 +232,66 @@ mod tests {
             &receipt("https://github.com/acme/demo/issues/9", "agent/builder", None)
         ).unwrap()).unwrap();
         for attempt in 1..=5 {
+            if attempt > 1 {
+                fs::File::options().write(true)
+                    .open(spool.path().join(format!("1-1.attempt-{}.json", attempt - 1))).unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(
+                        std::time::SystemTime::now() - Duration::from_secs(1)
+                    )).unwrap();
+            }
+            let failed_at = std::time::SystemTime::now();
             assert_eq!(ingest_once(&store, spool.path()).unwrap(), 0);
             let name = if attempt == 5 { "1-1.dead-letter".into() }
                 else { format!("1-1.attempt-{attempt}.json") };
-            assert!(spool.path().join(name).exists());
+            let path = spool.path().join(name);
+            assert!(path.exists());
+            if attempt < 5 {
+                assert!(fs::metadata(&path).unwrap().modified().unwrap()
+                    >= failed_at + Duration::from_secs(1 << (attempt - 1)));
+            }
         }
         assert_eq!(ingest_once(&store, spool.path()).unwrap(), 0);
         assert!(spool.path().join("1-1.dead-letter").exists());
+    }
+
+    #[test]
+    fn pending_retry_survives_repeated_scans_and_retries_when_due() {
+        let store = Store::open_memory("receipt-node").unwrap();
+        store.append_claim(&ClaimInput {
+            subject: "resource/github/acme/demo/issue/9".into(),
+            kind: "resource.observed".into(), actor: None,
+            fields: BTreeMap::from([
+                ("kind".into(), json!("vcs.pull-request")),
+                ("facts".into(), json!({"number": 99})),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        fs::write(spool.path().join("1-1.json"), serde_json::to_vec(
+            &receipt("https://github.com/acme/demo/issues/9", "agent/builder", None)
+        ).unwrap()).unwrap();
+        assert_eq!(ingest_once(&store, spool.path()).unwrap(), 0);
+        let retry = spool.path().join("1-1.attempt-1.json");
+        fs::File::options().write(true).open(&retry).unwrap().set_times(
+            fs::FileTimes::new().set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+        ).unwrap();
+        for _ in 0..10 {
+            assert_eq!(ingest_once(&store, spool.path()).unwrap(), 0);
+            assert!(retry.exists(), "an early scan consumed a retry attempt");
+        }
+        drop(store);
+        let restarted_store = Store::open_memory("receipt-node").unwrap();
+        assert_eq!(ingest_once(&restarted_store, spool.path()).unwrap(), 0);
+        assert!(restarted_store.claims_page(
+            Some("resource/github/acme/demo/issue/9"), None, 0, None, false, 100
+        ).unwrap().claims.is_empty());
+        fs::File::options().write(true).open(&retry).unwrap().set_times(
+            fs::FileTimes::new().set_modified(std::time::SystemTime::now() - Duration::from_secs(1))
+        ).unwrap();
+        assert_eq!(ingest_once(&restarted_store, spool.path()).unwrap(), 1);
+        assert!(!retry.exists());
+        assert_eq!(restarted_store.claims_page(
+            Some("resource/github/acme/demo/issue/9"), None, 0, None, false, 100
+        ).unwrap().claims.len(), 1);
     }
 
     #[test]
@@ -305,37 +368,18 @@ mod tests {
     }
 
     #[test]
-    fn late_receipt_does_not_reassert_observer_snapshot_and_keeps_first_opener() {
-        for (path, kind, segment) in [("issues", "vcs.issue", "issue"), ("pull", "vcs.pull-request", "pull-request")] {
-            let store = Store::open_memory("receipt-node").unwrap();
-            let url = format!("https://github.com/acme/demo/{path}/9");
-            let subject = format!("resource/github/acme/demo/{segment}/9");
-            let mut observed = json!({"state": "closed", "title": "Latest title", "number": 9});
-            if kind == "vcs.pull-request" {
-                observed["checks"] = json!([{"name": "build", "conclusion": "success"}]);
-            }
-            store.append_claim(&ClaimInput {
-                subject: subject.clone(), kind: "resource.observed".into(), actor: None,
-                fields: BTreeMap::from([
-                    ("kind".into(), json!(kind)),
-                    ("facts".into(), observed.clone()),
-                ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-            }).unwrap();
-            store.append_claim(&claim_input(receipt(&url, "agent/first", Some("first"))).unwrap()).unwrap();
-            store.append_claim(&claim_input(receipt(&url, "agent/second", Some("second"))).unwrap()).unwrap();
-            let facts = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
-            assert!(facts.get("state").is_none());
-            assert!(facts.get("title").is_none());
-            assert!(facts.get("checks").is_none());
-            let claims = store.claims_page(Some(&subject), None, 0, None, false, 100).unwrap().claims;
-            for claim in claims.iter().filter(|claim| claim.body["fields"]["facts"]["opened_by"] == "agent/first") {
-                assert!(claim.body["fields"]["facts"].get("state").is_none());
-                assert!(claim.body["fields"]["facts"].get("title").is_none());
-            }
-            assert_eq!(facts["opened_by"], "agent/first");
-            assert_eq!(facts["opened_by_run"], "mission-run/first");
-        }
+    fn second_receipt_from_another_agent_appends_nothing() {
+        let store = Store::open_memory("receipt-node").unwrap();
+        let first = claim_input(receipt("https://github.com/acme/demo/pull/9", "agent/first", Some("first"))).unwrap();
+        store.append_claim(&first).unwrap();
+        let before = store.latest_actual_value(&first.subject).unwrap();
+        let second = claim_input(receipt("https://github.com/acme/demo/pull/9", "agent/second", Some("second"))).unwrap();
+        let (_, inserted) = store.append_claim_outcome(&second).unwrap();
+        assert!(!inserted, "an opener already recorded must make a second receipt a no-op");
+        assert_eq!(store.claims_page(Some(&first.subject), None, 0, None, false, 100).unwrap().claims.len(), 1);
+        assert_eq!(store.latest_actual_value(&first.subject).unwrap(), before);
     }
+
 
     #[test]
     fn receipt_preserves_a_mission_run_only_opener_without_taking_ownership() {
@@ -361,14 +405,13 @@ mod tests {
                 expected_subject: None,
                 idempotency_key: None,
             }).unwrap();
-            store.append_claim(
+            let (_, inserted) = store.append_claim_outcome(
                 &claim_input(receipt(&url, "agent/later", Some("later"))).unwrap(),
             ).unwrap();
+            assert!(!inserted);
             let facts = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
-            assert_eq!(facts["opened_by_run"], prior["opened_by_run"]);
-            assert!(facts.get("opened_by").is_none());
-            assert!(facts.get("state").is_none());
-            assert!(facts.get("title").is_none());
+            assert_eq!(facts, prior);
+            assert_eq!(store.claims_page(Some(&subject), None, 0, None, false, 100).unwrap().claims.len(), 1);
         }
     }
 }

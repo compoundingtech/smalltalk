@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `463e52d4592b805f0b41d7ad2a0ec80e212caf4bd7ed402494d3efa7989f0621`
+Digest: `a8ff4c9fedd3f6620d8d08e29b887985cb1c72da0681a90cc2ab016b316aeff7`
 
 ## Subject families
 
@@ -140,7 +140,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `record.repaired` | `repair` | `ordinary-client` | `once` | `durable` | `reason!:string`, `record!:string`, `replacement!:string` | `repair` |
 | `render.applied` | `agent`, `exec`, `pty` | `system-only` | `append` | `local` | `warnings:array`, `writes:array` |  |
 | `repair.applied` | `repair` | `system-only` | `once` | `durable` | `affected_subjects:array`, `item_count:integer`, `reason!:string`, `token!:string` |  |
-| `resource.observed` | `resource` | `ordinary-client` | `append` | `durable` | `kind:string`, `observed_at:integer`, `state:any` | `resource` |
+| `resource.observed` | `resource` | `ordinary-client` | `append` | `durable` | `attribution_only:boolean`, `kind:string`, `observed_at:integer`, `state:any` | `resource` |
 | `revision-proposal.applied` | `revision-proposal` | `system-only` | `once` | `durable` | `reason:string`, `status:string`, `successor_generation:subject-reference` |  |
 | `revision-proposal.approved` | `revision-proposal` | `authorized-requester` | `once-per-actor` | `durable` | `all_approved:boolean`, `preview_hash:string`, `reviewer:subject-reference` |  |
 | `revision-proposal.cancelled` | `revision-proposal` | `authorized-requester` | `once` | `durable` | `reason:string`, `status:string` |  |
