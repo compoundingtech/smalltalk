@@ -15,12 +15,14 @@ use sha2::{Digest as _, Sha256, Sha384};
 
 pub(super) struct BundleSecurity {
     pub html: HashMap<PathBuf, Bytes>,
+    executable_hashes: HashMap<PathBuf, [u8; 48]>,
     style_sources: String,
 }
 
 impl BundleSecurity {
     pub fn load(root: &Path, mount: &str) -> Result<Self> {
         let mut html = HashMap::new();
+        let mut executable_hashes = HashMap::new();
         let mut styles = BTreeSet::new();
         let integrity = RefCell::new(HashMap::new());
         let mut documents = Vec::new();
@@ -43,11 +45,12 @@ impl BundleSecurity {
             if extension == Some("html") {
                 documents.push((path, source));
             } else {
+                let digest = Sha384::digest(source.as_bytes());
                 let hash = format!(
                     "sha384-{}",
-                    base64::engine::general_purpose::STANDARD
-                        .encode(Sha384::digest(source.as_bytes()))
+                    base64::engine::general_purpose::STANDARD.encode(digest)
                 );
+                executable_hashes.insert(path.clone(), digest.into());
                 integrity.borrow_mut().insert(path.clone(), hash.clone());
                 let relative = entry
                     .path()
@@ -67,9 +70,9 @@ impl BundleSecurity {
                 }
             }
         }
-        // Eagerly populate the module map with integrity-checked built chunks before
-        // entry execution. Native modulepreload support and ordinary .js/.mjs chunk
-        // URLs (without runtime-added queries) are part of the supported build contract.
+        // Preloads and per-link SRI remain browser defense in depth. Recursive module
+        // fetching can precede discovery of a child's integrity link, so the server
+        // independently verifies executable bytes against the startup hashes.
         let modules: String = modules.into_iter().collect();
         for (path, source) in documents {
             let inserted = Cell::new(false);
@@ -187,8 +190,15 @@ impl BundleSecurity {
         }
         Ok(Self {
             html,
+            executable_hashes,
             style_sources: styles.into_iter().collect(),
         })
+    }
+
+    pub fn accepts_executable(&self, path: &Path, bytes: &[u8]) -> bool {
+        self.executable_hashes
+            .get(path)
+            .is_some_and(|expected| expected == &<[u8; 48]>::from(Sha384::digest(bytes)))
     }
 
     pub fn csp(&self, authority: Option<&str>) -> HeaderValue {

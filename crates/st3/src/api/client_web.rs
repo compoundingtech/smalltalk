@@ -364,6 +364,9 @@ async fn serve_static(web: &ClientWeb, relative: &str, head: bool) -> Response {
         .security
         .as_ref()
         .and_then(|security| security.html.get(&file));
+    let executable = file
+        .extension()
+        .is_some_and(|value| value == "js" || value == "mjs");
     let (length, mut response) = if file.extension().is_some_and(|value| value == "html") {
         // HTML added after startup has not passed the build security boundary.
         let Some(document) = document else {
@@ -377,7 +380,7 @@ async fn serve_static(web: &ClientWeb, relative: &str, head: bool) -> Response {
                 document.clone().into_response()
             },
         )
-    } else if head {
+    } else if head && !executable {
         let meta = match tokio::fs::metadata(&file).await {
             Ok(meta) if meta.is_file() => meta,
             _ => return StatusCode::NOT_FOUND.into_response(),
@@ -388,7 +391,25 @@ async fn serve_static(web: &ClientWeb, relative: &str, head: bool) -> Response {
             Ok(bytes) => bytes,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
         };
-        (bytes.len() as u64, bytes.into_response())
+        // Validate the exact buffer sent below; never check a file then reopen it.
+        // This also refuses new chunks and changed executables on HEAD requests.
+        if executable
+            && !web
+                .security
+                .as_ref()
+                .expect("installed bundle security")
+                .accepts_executable(&file, &bytes)
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        (
+            bytes.len() as u64,
+            if head {
+                StatusCode::OK.into_response()
+            } else {
+                bytes.into_response()
+            },
+        )
     };
     response
         .headers_mut()
@@ -1018,6 +1039,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executable_assets_refuse_changed_or_unregistered_bytes_until_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let entry = "import './lazy.js';";
+        let original = "globalThis.chunk = 'original';";
+        let tampered = "globalThis.chunk = 'tampered';";
+        std::fs::write(root.path().join("entry.js"), entry).unwrap();
+        std::fs::write(root.path().join("lazy.js"), original).unwrap();
+        std::fs::write(root.path().join("worker.mjs"), original).unwrap();
+        // An early preload can recursively fetch the child before any later integrity link.
+        std::fs::write(
+            root.path().join("index.html"),
+            format!(
+                "<link rel=modulepreload href='./entry.js'>{}<script type=module src='./entry.js'></script>",
+                " ".repeat(64 * 1024)
+            ),
+        )
+        .unwrap();
+        let config = ClientWebConfig {
+            static_dir: Some(root.path().into()),
+            ..Default::default()
+        };
+        let gateway = server(wrap(Router::new(), web(config.clone(), None))).await;
+        let client = reqwest::Client::new();
+        let url = |path: &str| format!("{}/app/{path}", gateway.endpoint);
+        let document = client.get(url("")).send().await.unwrap();
+        assert_eq!(document.status(), StatusCode::OK);
+        let policy = document.headers()[CONTENT_SECURITY_POLICY].clone();
+        assert!(asset_loads(&document.text().await.unwrap()).contains(&(
+            "link".into(),
+            "/app/lazy.js".into(),
+            sri(original.as_bytes()),
+        )));
+        for path in ["entry.js", "lazy.js", "worker.mjs"] {
+            let response = client.get(url(path)).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.text().await.unwrap(),
+                if path == "entry.js" { entry } else { original }
+            );
+        }
+        std::fs::write(root.path().join("lazy.js"), tampered).unwrap();
+        std::fs::write(root.path().join("worker.mjs"), tampered).unwrap();
+        std::fs::write(root.path().join("new.js"), tampered).unwrap();
+        std::fs::write(root.path().join("new.mjs"), tampered).unwrap();
+        for path in ["lazy.js", "lazy.js?early=1", "worker.mjs", "new.js", "new.mjs"] {
+            for method in [Method::GET, Method::HEAD] {
+                let response = client
+                    .request(method, url(path))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+                assert_eq!(response.headers()[CONTENT_SECURITY_POLICY], policy);
+                assert_ne!(response.text().await.unwrap(), tampered);
+            }
+        }
+        // Restart pins the replacement build; nothing rereads unverified executable bytes.
+        let restarted = server(wrap(Router::new(), web(config, None))).await;
+        for path in ["lazy.js", "worker.mjs", "new.js", "new.mjs"] {
+            let response = client
+                .get(format!("{}/app/{path}", restarted.endpoint))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.text().await.unwrap(), tampered);
+        }
+    }
+
+    #[tokio::test]
     async fn mounted_bundle_emits_integrity_and_gateway_only_csp_for_get_head_and_spa() {
         use base64::Engine as _;
         use sha2::{Digest as _, Sha256};
@@ -1122,22 +1213,6 @@ mod tests {
         }
         let html = std::str::from_utf8(document.as_ref().unwrap()).unwrap();
         let loads = asset_loads(html);
-        assert_eq!(
-            loads[0],
-            (
-                "link".into(),
-                "/client/assets/lazy.mjs".into(),
-                sri(chunk.as_bytes())
-            )
-        );
-        assert_eq!(
-            loads[1],
-            (
-                "link".into(),
-                "/client/assets/main.js".into(),
-                sri(main.as_bytes())
-            )
-        );
         assert!(loads.contains(&(
             "script".into(),
             "/client/assets/main.js?x=1&y=2".into(),
@@ -1200,8 +1275,7 @@ mod tests {
                 policy
             );
         }
-        // A changed on-disk asset cannot silently receive a new trusted hash in
-        // the installed document. The browser will reject its stale SRI.
+        // A changed executable is refused even without browser integrity metadata.
         std::fs::write(
             root.path().join("assets/main.js"),
             "export const changed = true;",
@@ -1216,7 +1290,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_ne!(sri(&body(response).await), sri(main.as_bytes()));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
