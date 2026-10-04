@@ -65,6 +65,8 @@ const CLAUDE_TRUST_RECOVERY_ATTEMPTS: usize = 3;
 const CLAUDE_TRUST_RECOVERY_WINDOW_MS: u128 = 10 * 60_000;
 // A failed checkout fetch or worktree command waits this long before Git runs again.
 const CHECKOUT_RETRY_MS: u128 = 30_000;
+// Workspace errors hold one schedule, without retrying filesystem I/O on every pass.
+const SCHEDULE_WORKSPACE_RETRY_MS: u128 = 30_000;
 // A deadline source that could not be read is read again this soon, so the deadlines it holds
 // are late by at most this much.
 const DEADLINE_SOURCE_RETRY_MS: u128 = 5_000;
@@ -85,6 +87,17 @@ const SEAT_RETENTION_CHECK_MS: u128 = 60_000;
 // Run cleanup ends this long after it began even if an owned runtime never reports stopped.
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const DECLARED_CHECKOUT_LIMIT: usize = 4096;
+
+/// `local` is the declaration's origin, not the member interpreting a replicated declaration.
+fn owned_schedule_spec(
+    store: &Store,
+    schedule: &DesiredSubject,
+) -> Result<Option<crate::model::ScheduleSpec>> {
+    let Some(origin) = store.selected_desired_origin(&schedule.subject)? else {
+        return Ok(None);
+    };
+    Ok(crate::graph::schedule_spec(&schedule.desired, &origin))
+}
 
 /// On a fleet member's cold start, occurrence history may still be elsewhere. Require a fresh
 /// complete exchange before admitting schedules, then hold while known history is missing.
@@ -700,6 +713,9 @@ pub struct Reconciler<R = NativeRuntime> {
     event_notify: watch::Sender<u64>,
     armed_schedules: Arc<Mutex<std::collections::HashSet<String>>>,
     schedule_peers: Vec<String>,
+    /// The request and deadline of a failed workspace attempt, by schedule. Local retry state
+    /// never enters the replicated graph; durable diagnostic dedupe survives a restart.
+    schedule_workspace_retries: Mutex<HashMap<String, (String, u128)>>,
     started_at_unix_ms: u128,
     armed_observers: Arc<Mutex<std::collections::HashSet<String>>>,
     gate_poll_armed: Arc<AtomicBool>,
@@ -841,6 +857,7 @@ impl Reconciler<NativeRuntime> {
             event_notify,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_peers: Vec::new(),
+            schedule_workspace_retries: Mutex::new(HashMap::new()),
             started_at_unix_ms: now_ms(),
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             gate_poll_armed: Arc::new(AtomicBool::new(false)),
@@ -904,6 +921,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             event_notify: watch::channel(0_u64).0,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_peers: Vec::new(),
+            schedule_workspace_retries: Mutex::new(HashMap::new()),
             started_at_unix_ms: now_ms(),
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             gate_poll_armed: Arc::new(AtomicBool::new(false)),
@@ -5753,6 +5771,43 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.record_once_with_evidence(&subject.subject, "runtime.observed", fields, evidence)
     }
 
+    /// An unchanged diagnostic is one durable operation per affected subject and code, even
+    /// when other subjects alternate failures or the daemon restarts. Keep the existing wire
+    /// fields so older peers can still admit these claims. Changed reasons remain visible.
+    fn record_diagnostic_once(
+        &self,
+        affected: &str,
+        fields: BTreeMap<String, Value>,
+    ) -> Result<()> {
+        let code = fields
+            .get("code")
+            .and_then(Value::as_str)
+            .context("diagnostic has no code")?;
+        let key = format!(
+            "daemon-diagnostic:{}",
+            smallclaims::hash::canonical_hash(&(&self.host, affected, code, &fields))?
+        );
+        if self.store.operation_claim(&key)?.is_some() {
+            return Ok(());
+        }
+        match self.store.append_claim_outcome(&ClaimInput {
+            subject: format!("daemon/{}", self.host),
+            kind: "daemon.diagnostic".into(),
+            actor: None,
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(key),
+        }) {
+            Ok((_, true)) => self.signal_changed(),
+            Ok((_, false)) => {}
+            // A retained operation tombstone still proves this diagnostic was recorded.
+            Err(error) if error.code == "claim-checkpointed" => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     fn record_once(
         &self,
         subject: &str,
@@ -10192,7 +10247,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.store
             .owned_desired_guard(schedule)
             .map_err(anyhow::Error::new)?;
-        let Some(spec) = crate::graph::schedule_spec(&schedule.desired, &self.host) else {
+        let Some(spec) = owned_schedule_spec(&self.store, schedule)? else {
             return Ok(());
         };
         if spec.stopped || spec.host != self.host {
@@ -10339,6 +10394,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let event_notify = self.event_notify.clone();
         let armed = self.armed_schedules.clone();
         let schedule_subject = schedule.subject.clone();
+        let schedule_declaration = schedule.clone();
         let schedule_peers = self.schedule_peers.clone();
         let host = self.host.clone();
         let started_at = self.started_at_unix_ms;
@@ -10379,7 +10435,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 // A timer can outlive a replication catch-up or another armed wake. Check at
                 // admission as well as arming, including reached facts from older revisions.
                 let ready = schedule_admission_ready(&store, &host, &schedule_peers, started_at)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    && owned_schedule_spec(&store, &schedule_declaration)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|spec| !spec.stopped && spec.host == host);
                 let already_reached = store
                     .claims_for(&schedule_subject, Some("schedule.occurrence-reached"))
                     .map(|claims| {
@@ -10508,6 +10568,15 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_scheduled_work(&self, desired: &[DesiredSubject]) -> Result<()> {
+        let schedules = desired
+            .iter()
+            .filter(|item| item.kind == "schedule")
+            .map(|item| item.subject.as_str())
+            .collect::<HashSet<_>>();
+        self.schedule_workspace_retries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|subject, _| schedules.contains(subject.as_str()));
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
             self.isolate("schedule-work", &schedule.subject, || {
                 self.reconcile_schedule_work(schedule)
@@ -10523,14 +10592,26 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.store
             .owned_desired_guard(schedule)
             .map_err(anyhow::Error::new)?;
-        // Every peer replicates the same requests. Only the host that requested the work starts it.
+        let Some(spec) = owned_schedule_spec(&self.store, schedule)? else {
+            return Ok(());
+        };
+        if spec.host != self.host {
+            self.schedule_workspace_retries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&schedule.subject);
+            return Ok(());
+        }
+        // Requests replicate. Only the schedule's owner starts them, including requests that
+        // an older non-owning daemon mistakenly emitted before ownership was checked.
         let requests = self
             .store
-            .pending_schedule_work_requests(&schedule.subject)?
-            .into_iter()
-            .filter(|request| request.origin == self.host)
-            .collect::<Vec<_>>();
+            .pending_schedule_work_requests(&schedule.subject)?;
         if requests.is_empty() {
+            self.schedule_workspace_retries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&schedule.subject);
             return Ok(());
         }
         if !self.schedules_caught_up()? {
@@ -10539,7 +10620,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         // A stopped schedule's queued work is cancelled, so declaring the schedule again does not
         // start work that was requested before it stopped.
-        if intake_is_stopped(schedule, &self.host) {
+        if spec.stopped {
+            self.schedule_workspace_retries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&schedule.subject);
             for request in requests {
                 self.fail_schedule_work(
                     schedule,
@@ -10578,14 +10663,32 @@ impl<R: RuntimeControl> Reconciler<R> {
                 )?;
                 continue;
             };
+            let retry = self
+                .schedule_workspace_retries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&schedule.subject)
+                .cloned();
+            if let Some((pending, until)) = retry
+                && pending == request.id
+                && until > now_ms()
+            {
+                self.arm_restart(&format!("schedule-workspace:{}", schedule.subject), until);
+                break;
+            }
             let occurrence_subject =
                 Store::scheduled_mission_run_subject(&schedule.subject, occurrence);
             let suffix = &occurrence_subject.trim_start_matches("mission-run/")[..16];
             let workspace = Path::new(root).join(suffix);
             if let Err(error) = fs::create_dir_all(&workspace) {
-                self.record_once(
-                    &format!("daemon/{}", self.host),
-                    "daemon.diagnostic",
+                let until = now_ms().saturating_add(SCHEDULE_WORKSPACE_RETRY_MS);
+                self.schedule_workspace_retries
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(schedule.subject.clone(), (request.id.clone(), until));
+                self.arm_restart(&format!("schedule-workspace:{}", schedule.subject), until);
+                self.record_diagnostic_once(
+                    &schedule.subject,
                     BTreeMap::from([
                         ("severity".into(), Value::String("error".into())),
                         ("status".into(), Value::String("unavailable".into())),
@@ -10600,8 +10703,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                         ),
                     ]),
                 )?;
-                continue;
+                break;
             }
+            self.schedule_workspace_retries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&schedule.subject);
             let inputs = serde_json::from_value(fields.get("inputs").cloned().unwrap_or_default())
                 .unwrap_or_default();
             let request_value = MissionRunRequest {
@@ -20775,8 +20882,8 @@ schedule "cycle" {{
         let jade = Arc::new(Store::open_memory("jade").unwrap());
         jade.import_replication("ivory", &ivory.export_replication(0).unwrap())
             .unwrap();
-        // Both members admit the same tick while apart. The later request selects a different
-        // child definition, so convergence must also avoid steps from the losing definition.
+        // Both members own a local declaration and admit the same tick while apart. The later
+        // request selects a different child definition; losing steps must not survive convergence.
         apply_source(
             &jade,
             r#"version 2
@@ -20792,6 +20899,18 @@ mission "scheduled-cycle" state="ready" {
             .unwrap()
             .unwrap()
             .revision;
+        apply_source(
+            &jade,
+            &format!(
+                r#"version 2
+schedule "cycle" {{
+  every "7d"; anchor "2030-01-01T00:00:00Z"; catch-up "latest"
+  work {{ mission "scheduled-cycle@{other}"; workspace "{}" }}
+}}"#,
+                root.path().display()
+            ),
+            "jade-cycle",
+        );
         let mut runs = Vec::new();
         for (store, revision, host) in [(&ivory, revision, "ivory"), (&jade, other, "jade")] {
             store
@@ -21516,6 +21635,374 @@ schedule "unready" {{
         );
     }
 
+    fn request_test_schedule_work(store: &Store, schedule: &str, revision: &str, root: &Path) {
+        store
+            .append_claim(&ClaimInput {
+                subject: schedule.into(),
+                kind: "schedule.work-requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("revision".into(), Value::String("test-occurrence".into())),
+                    ("occurrence".into(), Value::from(0)),
+                    (
+                        "mission".into(),
+                        Value::String("mission/scheduled-cycle".into()),
+                    ),
+                    ("mission_revision".into(), Value::String(revision.into())),
+                    (
+                        "workspace".into(),
+                        Value::String(root.to_string_lossy().into_owned()),
+                    ),
+                    ("inputs".into(), serde_json::json!({})),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreign_schedules_do_not_materialize_workspaces_or_flood_diagnostics() {
+        let root = tempfile::tempdir().unwrap();
+        let ivory = Arc::new(Store::open_memory("ivory").unwrap());
+        let revision = scheduled_mission_revision(&ivory);
+        let blocked = [root.path().join("first"), root.path().join("second")];
+        for (name, placement, workspace) in [
+            ("first", "", &blocked[0]),
+            ("second", "host \"local\";", &blocked[1]),
+        ] {
+            fs::write(workspace, "not a directory").unwrap();
+            apply_source(
+                &ivory,
+                &format!(
+                    r#"version 2
+schedule "{name}" {{
+  {placement} every "7d"; anchor "2030-01-01T00:00:00Z"
+  work {{ mission "scheduled-cycle@{revision}"; workspace {:?} }}
+}}"#,
+                    workspace.display().to_string()
+                ),
+                name,
+            );
+        }
+        let jade = Arc::new(Store::open_memory("jade").unwrap());
+        jade.import_replication("ivory", &ivory.export_replication(0).unwrap())
+            .unwrap();
+        let reconciler = Reconciler::new(
+            jade.clone(),
+            Arc::new(FakeRuntime::default()),
+            "jade".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..10 {
+            reconciler.reconcile_once().unwrap();
+        }
+        for name in ["first", "second"] {
+            assert!(
+                jade.claims_for(
+                    &format!("schedule/{name}"),
+                    Some("schedule.occurrence-scheduled")
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        // Older peers already requested foreign work locally. Origin alone must not admit it.
+        for (name, workspace) in [("first", &blocked[0]), ("second", &blocked[1])] {
+            request_test_schedule_work(&jade, &format!("schedule/{name}"), &revision, workspace);
+        }
+        for _ in 0..100 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert!(
+            jade.claims_for("daemon/jade", Some("daemon.diagnostic"))
+                .unwrap()
+                .is_empty(),
+            "a non-owning member attempted both failing workspaces"
+        );
+        // With the blockers gone, a foreign member must still create neither workspaces nor runs.
+        for workspace in &blocked {
+            fs::remove_file(workspace).unwrap();
+        }
+        for _ in 0..10 {
+            reconciler.reconcile_once().unwrap();
+        }
+        for (name, workspace) in [("first", &blocked[0]), ("second", &blocked[1])] {
+            assert!(!workspace.exists());
+            for kind in ["schedule.work-started", "schedule.occurrence-scheduled"] {
+                assert!(
+                    jade.claims_for(&format!("schedule/{name}"), Some(kind))
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+        ivory
+            .import_replication("jade", &jade.export_replication(0).unwrap())
+            .unwrap();
+        let owner = Reconciler::new(
+            ivory.clone(),
+            Arc::new(FakeRuntime::default()),
+            "ivory".into(),
+            Arc::new(Notify::new()),
+        );
+        // The default local run capacity admits one child at a time. Let each finish.
+        for _ in 0..10 {
+            owner.reconcile_once().unwrap();
+        }
+        for name in ["first", "second"] {
+            assert_eq!(
+                ivory
+                    .claims_for(&format!("schedule/{name}"), Some("schedule.work-started"))
+                    .unwrap()
+                    .len(),
+                1,
+                "schedule claims: {:#?}; daemon claims: {:#?}",
+                ivory.claims_for(&format!("schedule/{name}"), None).unwrap(),
+                ivory.claims_for("daemon/ivory", None).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_owned_schedules_resolve_local_from_the_declaration_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let ivory = Arc::new(Store::open_memory("ivory").unwrap());
+        let revision = scheduled_mission_revision(&ivory);
+        apply_source(
+            &ivory,
+            &format!(
+                r#"version 2
+    mission "parent" state="ready" {{
+      goal "Keep the schedule's owning host stable."
+      step "hold" {{ goal "Keep the parent active." }}
+      schedule "implicit" {{
+        every "7d"; anchor "2030-01-01T00:00:00Z"
+        work {{ mission "scheduled-cycle@{revision}"; workspace {:?} }}
+      }}
+      schedule "local" {{
+        host "local"; every "7d"; anchor "2030-01-01T00:00:00Z"
+        work {{ mission "scheduled-cycle@{revision}"; workspace {:?} }}
+      }}
+      schedule "placed" {{
+        host "jade"; every "7d"; anchor "2030-01-01T00:00:00Z"
+        work {{ mission "scheduled-cycle@{revision}"; workspace {:?} }}
+      }}
+    }}"#,
+                root.path().display().to_string(),
+                root.path().display().to_string(),
+                root.path().display().to_string()
+            ),
+            "parent",
+        );
+        let parent_revision = ivory
+            .mission_spec("parent", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let parent = ivory
+            .create_mission_run(&MissionRunRequest {
+                mission: "parent".into(),
+                revision: Some(parent_revision),
+                workspace: root.path().to_string_lossy().into_owned(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "parent-run".into(),
+            })
+            .unwrap();
+        let owner = Reconciler::new(
+            ivory.clone(),
+            Arc::new(FakeRuntime::default()),
+            "ivory".into(),
+            Arc::new(Notify::new()),
+        );
+        owner.reconcile_once().unwrap();
+        owner.reconcile_once().unwrap();
+        let jade = Arc::new(Store::open_memory("jade").unwrap());
+        jade.import_replication("ivory", &ivory.export_replication(0).unwrap())
+            .unwrap();
+        let replica = Reconciler::new(
+            jade.clone(),
+            Arc::new(FakeRuntime::default()),
+            "jade".into(),
+            Arc::new(Notify::new()),
+        );
+        replica.reconcile_once().unwrap();
+        for (name, host) in [
+            ("implicit", "ivory"),
+            ("local", "ivory"),
+            ("placed", "jade"),
+        ] {
+            let subject = format!("schedule/{}/{name}", parent.id);
+            let desired = jade
+                .desired_subjects_named(std::slice::from_ref(&subject))
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(desired.owner_run.as_deref(), Some(parent.subject.as_str()));
+            assert_eq!(
+                owned_schedule_spec(&jade, &desired).unwrap().unwrap().host,
+                host
+            );
+            let armed = jade
+                .claims_for(&subject, Some("schedule.occurrence-scheduled"))
+                .unwrap();
+            assert_eq!(armed.len(), 1);
+            assert_eq!(
+                armed[0].origin, host,
+                "only the owning member may arm an occurrence"
+            );
+        }
+    }
+
+    #[test]
+    fn owning_schedules_dedupe_alternating_workspace_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_memory("ivory").unwrap());
+        let revision = scheduled_mission_revision(&store);
+        for name in ["first", "second"] {
+            let workspace = root.path().join(name);
+            fs::write(&workspace, "not a directory").unwrap();
+            apply_source(
+                &store,
+                &format!(
+                    r#"version 2
+schedule "{name}" {{
+  every "7d"; anchor "2030-01-01T00:00:00Z"
+  work {{ mission "scheduled-cycle@{revision}"; workspace {:?} }}
+}}"#,
+                    workspace.display().to_string()
+                ),
+                name,
+            );
+            request_test_schedule_work(&store, &format!("schedule/{name}"), &revision, &workspace);
+        }
+        // Reconstructing the reconciler must not forget the diagnostic dedupe.
+        for _ in 0..3 {
+            let reconciler = Reconciler::new(
+                store.clone(),
+                Arc::new(FakeRuntime::default()),
+                "ivory".into(),
+                Arc::new(Notify::new()),
+            );
+            reconciler.reconcile_once().unwrap();
+            let deadlines = reconciler
+                .schedule_workspace_retries
+                .lock()
+                .unwrap()
+                .clone();
+            for _ in 0..100 {
+                reconciler.reconcile_once().unwrap();
+            }
+            assert_eq!(
+                *reconciler.schedule_workspace_retries.lock().unwrap(),
+                deadlines,
+                "passes before the deadline must not attempt I/O or slide the retry time"
+            );
+            // Exercise repeated actual retries without a wall-clock sleep. Dedupe is durable,
+            // independent of backoff, and still applies after each deadline expires.
+            for _ in 0..10 {
+                for (_, until) in reconciler
+                    .schedule_workspace_retries
+                    .lock()
+                    .unwrap()
+                    .values_mut()
+                {
+                    *until = 0;
+                }
+                reconciler.reconcile_once().unwrap();
+            }
+        }
+        let diagnostics = store
+            .claims_for("daemon/ivory", Some("daemon.diagnostic"))
+            .unwrap();
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "alternating failures must each surface once"
+        );
+        assert_ne!(
+            diagnostics[0].body["fields"]["reason"],
+            diagnostics[1].body["fields"]["reason"]
+        );
+        let jade = Store::open_memory("jade").unwrap();
+        jade.import_replication("ivory", &store.export_replication(0).unwrap())
+            .unwrap();
+        for member in [&*store, &jade] {
+            let digest = member.replication_snapshot().unwrap().graph_digest.clone();
+            member.replay_replication_graph().unwrap();
+            assert_eq!(member.replication_snapshot().unwrap().graph_digest, digest);
+        }
+        assert_eq!(
+            store.replication_snapshot().unwrap().graph_digest,
+            jade.replication_snapshot().unwrap().graph_digest
+        );
+        let restarted = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "ivory".into(),
+            Arc::new(Notify::new()),
+        );
+        restarted.reconcile_once().unwrap();
+        assert_eq!(
+            store
+                .claims_for("daemon/ivory", Some("daemon.diagnostic"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn workspace_diagnostics_distinguish_subject_code_and_changed_reasons() {
+        let store = Arc::new(Store::open_memory("ivory").unwrap());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "ivory".into(),
+            Arc::new(Notify::new()),
+        );
+        let fields = |code: &str, reason: &str| {
+            BTreeMap::from([
+                ("severity".into(), Value::String("error".into())),
+                ("code".into(), Value::String(code.into())),
+                ("reason".into(), Value::String(reason.into())),
+            ])
+        };
+        for _ in 0..10 {
+            reconciler
+                .record_diagnostic_once(
+                    "schedule/first",
+                    fields("workspace-unavailable", "blocked"),
+                )
+                .unwrap();
+            reconciler
+                .record_diagnostic_once(
+                    "schedule/second",
+                    fields("workspace-unavailable", "blocked"),
+                )
+                .unwrap();
+            reconciler
+                .record_diagnostic_once(
+                    "schedule/first",
+                    fields("workspace-unavailable", "permission denied"),
+                )
+                .unwrap();
+            reconciler
+                .record_diagnostic_once("schedule/first", fields("other-error", "blocked"))
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .claims_for("daemon/ivory", Some("daemon.diagnostic"))
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
     #[tokio::test]
     async fn scheduled_work_waits_for_an_available_workspace() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -21557,6 +22044,24 @@ schedule "unready" {{
         }));
 
         fs::remove_file(&workspace_root).unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .claims_for("schedule/cycle", Some("schedule.work-started"))
+                .unwrap()
+                .is_empty(),
+            "workspace recovery must wait for the retry deadline"
+        );
+        let (_, until) =
+            reconciler.schedule_workspace_retries.lock().unwrap()["schedule/cycle"].clone();
+        assert!(until > now_ms());
+        reconciler
+            .schedule_workspace_retries
+            .lock()
+            .unwrap()
+            .get_mut("schedule/cycle")
+            .unwrap()
+            .1 = 0;
         reconciler.reconcile_once().unwrap();
         let started = store
             .claims_for("schedule/cycle", Some("schedule.work-started"))
