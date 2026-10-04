@@ -9848,7 +9848,7 @@ impl Store {
         let mut subjects = Vec::new();
         let mut pending_actions = Vec::new();
         for subject in subject_names {
-            if subject.starts_with("glass/") {
+            if subject.starts_with("glass/") || subject.starts_with("arrangement/") {
                 continue;
             }
             let reduced = match newest {
