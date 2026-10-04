@@ -326,7 +326,8 @@ async fn disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirm
         let socket = amber.client.socket_path().unwrap().to_path_buf();
         let previous = previous.clone();
         tokio::task::spawn_blocking(move || {
-            let mut command = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+            let mut command =
+                st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
             command
                 .env_remove("ST_AGENT")
                 .env_remove("ST_MISSION_RUN")
@@ -630,7 +631,7 @@ async fn manual_rollout_publishes_with_automatic_member_and_only_moves_on_explic
         for (name, held) in [("orchard", manual_policy), ("meadow", false)] {
             let workspace = root.path().join(name);
             std::fs::create_dir_all(&workspace).unwrap();
-            source.push_str(&format!("agent \"garden/{name}\" {{ host \"amber\"; workspace {:?}; {} harness \"claude\" {{ model {model:?}; }} render {{ file \"active-model\" {model:?}; }} }}\n",
+            source.push_str(&format!("agent \"garden/{name}\" {{ host \"amber\"; workspace {:?}; {} harness \"claude\" {{ model {model:?}; }}; render {{ file \"active-model\" {model:?}; }} }}\n",
                 workspace.display().to_string(), if held {"rollout \"manual\";"} else {""}));
         }
         source
@@ -707,7 +708,9 @@ async fn manual_rollout_publishes_with_automatic_member_and_only_moves_on_explic
         .unwrap();
     for _ in 0..8 {
         reconciler.reconcile_once().unwrap();
-        if let Some(operation) = d.store.rollout(automatic).unwrap() {
+        if let Some(operation) = d.store.rollout(automatic).unwrap()
+            && operation.drain_ack.is_none()
+        {
             st3::rollout::phase(&d.store, automatic, &operation, "drain-ack", None, &[]).unwrap();
         }
         for observation in runtime.snapshot_ptys().unwrap() {
@@ -842,7 +845,9 @@ async fn manual_rollout_publishes_with_automatic_member_and_only_moves_on_explic
     for _ in 0..8 {
         reconciler.reconcile_once().unwrap();
         let operation = d.store.rollout(manual).unwrap().unwrap();
-        st3::rollout::phase(&d.store, manual, &operation, "drain-ack", None, &[]).unwrap();
+        if operation.drain_ack.is_none() {
+            st3::rollout::phase(&d.store, manual, &operation, "drain-ack", None, &[]).unwrap();
+        }
         if let Some(incarnation) = operation.replacement_incarnation {
             native_observation(&d.store, manual, &incarnation);
         }
