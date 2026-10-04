@@ -216,8 +216,13 @@ impl CollectionStream {
         id: &str,
         person: &str,
         limit: usize,
+        subject: Option<&str>,
     ) -> Result<(), ClientError> {
-        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":"arrangements", "person":person, "limit":limit})).await
+        let mut command = serde_json::json!({"kind":"subscribe", "id":id, "collection":"arrangements", "person":person, "limit":limit});
+        if let Some(subject) = subject {
+            command["subject"] = serde_json::json!(subject);
+        }
+        self.send(&command).await
     }
     pub async fn subscribe(
         &mut self,
@@ -569,6 +574,21 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::ValidationFailed
         | ErrorCode::AttentionMigrated
         | ErrorCode::RuntimeNotLocal
+        | ErrorCode::ArrangementExists
+        | ErrorCode::ArrangementFolderExists
+        | ErrorCode::ArrangementRetired
+        | ErrorCode::ArrangementLimit
+        | ErrorCode::ArrangementFolderDeleted
+        | ErrorCode::ArrangementCycle
+        | ErrorCode::ArrangementBodyTooLarge
+        | ErrorCode::ArrangementOwnerForbidden
+        | ErrorCode::InvalidArrangementSubject
+        | ErrorCode::InvalidArrangementAction
+        | ErrorCode::InvalidArrangementOperations
+        | ErrorCode::InvalidArrangementFolder
+        | ErrorCode::InvalidArrangementName
+        | ErrorCode::InvalidArrangementKey
+        | ErrorCode::InvalidSubjectReference
         | ErrorCode::Unknown => message.to_owned(),
     }
 }

@@ -1259,6 +1259,19 @@ the accepted claim, not a promise that its registers will remain winners.
 A second `create` for an existing arrangement under a different idempotency key returns
 typed `arrangement-exists` with `retryable: false`; clients can distinguish a create
 race from an internal failure. Exact retries of the original create return its receipt.
+Folder creation reusing a live or tombstoned ID returns `arrangement-folder-exists`.
+Generated clients preserve the following admission/validation codes as typed,
+non-retryable refusals rather than `internal`; callers do not parse error wording:
+
+| Category | Codes |
+| --- | --- |
+| Create race | `arrangement-exists`, `arrangement-folder-exists` |
+| Lifecycle/structure | `arrangement-retired`, `arrangement-folder-deleted`, `arrangement-cycle` |
+| Bounds/authority | `arrangement-limit`, `arrangement-body-too-large`, `arrangement-owner-forbidden` |
+| Validation | `invalid-arrangement-subject`, `invalid-arrangement-action`, `invalid-arrangement-operations`, `invalid-arrangement-folder`, `invalid-arrangement-name`, `invalid-arrangement-key`, `invalid-subject-reference` |
+
+The ordinary `not-found`, `forbidden`, `stale-fence` and `idempotency-conflict` codes
+retain their existing meanings.
 
 `arrangement.edited` claims are durable. Each register uses canonical maximum
 `(accepted_at_unix_ms, batch origin, replica_sequence, batch_id, record position, claim_id)`,

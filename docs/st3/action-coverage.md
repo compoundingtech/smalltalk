@@ -46,6 +46,14 @@ Conditional-retirement evidence: `arrangement_retire_fences_refuse_concurrent_ed
 and `arrangement_fenced_retire_recovers_receipt_gap` in
 [`crates/st3/src/api/client_v0/arrangements.rs`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/src/api/client_v0/arrangements.rs).
 
+Create/folder races return typed non-retryable refusals rather than internal errors:
+`arrangement_create_race_returns_typed_exists_and_exact_retry_receipt` and
+`arrangement_folder_race_and_validation_refusals_stay_typed` exercise the actual
+HTTP error envelope, rejected-write atomicity and receipt replay.
+`selected_arrangement_survives_byte_window_edits_and_retirement` verifies the selected
+stream window stays outside owner-prefix truncation, rejects wrong owners, follows
+edits and removes retired subjects without changing unfiltered reads.
+
 | Action | Test evidence |
 | --- | --- |
 | `agent.create` | [`creation_and_declaration_actions_survive_stale_fences_and_restarts`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |

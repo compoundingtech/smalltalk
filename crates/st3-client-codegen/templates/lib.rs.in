@@ -561,6 +561,21 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::ValidationFailed
         | ErrorCode::AttentionMigrated
         | ErrorCode::RuntimeNotLocal
+        | ErrorCode::ArrangementExists
+        | ErrorCode::ArrangementFolderExists
+        | ErrorCode::ArrangementRetired
+        | ErrorCode::ArrangementLimit
+        | ErrorCode::ArrangementFolderDeleted
+        | ErrorCode::ArrangementCycle
+        | ErrorCode::ArrangementBodyTooLarge
+        | ErrorCode::ArrangementOwnerForbidden
+        | ErrorCode::InvalidArrangementSubject
+        | ErrorCode::InvalidArrangementAction
+        | ErrorCode::InvalidArrangementOperations
+        | ErrorCode::InvalidArrangementFolder
+        | ErrorCode::InvalidArrangementName
+        | ErrorCode::InvalidArrangementKey
+        | ErrorCode::InvalidSubjectReference
         | ErrorCode::Unknown => message.to_owned(),
     }
 }
