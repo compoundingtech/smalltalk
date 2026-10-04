@@ -9468,6 +9468,28 @@ mod tests {
         assert!(reset["items"][0]["session_id"].is_null());
         assert_eq!(reset["items"][0]["plan"]["stale"], true);
         assert_collection_frame_conforms(&reset);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        append("subagent.appeared", json!({"subagent_id":"leased-child","driver":"claude",
+            "incarnation_id":"two","lease_expires_at_unix_ms":now + 5_000}));
+        let focused = async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if frame["id"] == "focus" { break frame; }
+            }
+        };
+        let appeared = tokio::time::timeout(Duration::from_secs(4), focused).await.unwrap();
+        assert_eq!(appeared["upserts"][0]["subagents"][0]["subagent_id"], "leased-child");
+        let expired = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if frame["id"] == "focus" && frame["upserts"][0]["subagents"] == json!([]) {
+                    break frame;
+                }
+            }
+        }).await.unwrap();
+        assert_collection_frame_conforms(&expired);
         socket.close(None).await.unwrap();
         server.abort();
     }
