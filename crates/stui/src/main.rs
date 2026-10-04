@@ -161,7 +161,7 @@ fn watch_terminal_hangup() {
 fn agent_label(agent: &st3_client::Agent) -> String {
     let slug = agent.name.rsplit('/').next().unwrap_or(&agent.name);
     // `st agents new NAME` names a seat HOST.NAME; the host shows beside it, so the label is
-    // NAME ("bluey.image-duder" reads as Image Duder).
+    // NAME ("harbor.image-sorter" reads as Image Sorter).
     let host = agent
         .host_id
         .as_deref()
