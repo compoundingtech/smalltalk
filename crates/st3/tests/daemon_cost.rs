@@ -56,9 +56,8 @@ const SLACK: u64 = 5_000;
 /// much worse unnoticed. Each breaks the daemon's rule that no query's cost grows with the whole
 /// store and is owed a fix. A fixed one fails the check until it leaves this list.
 const KNOWN_GROWTH: &[(&str, f64)] = &[
-    // Attention and the mission detail read every person ask (11.8x full-scan steps).
+    // Attention reads every person ask (11.8x full-scan steps).
     ("GET /v1/attention", 18.0),
-    ("GET /v1/client/missions/{*id}", 18.0),
     // Checkpoint status walks the sealed set (9.8x).
     ("GET /v1/checkpoint/status", 15.0),
     // Runtimes read every runtime observation (3.8x for the list, 9.0x for one runtime).
@@ -974,9 +973,9 @@ mission "cost/history" state="ready" {
         store.append_claim(&st3::model::ClaimInput {
             subject: format!("message/cost-history-{message}"),
             kind: "message.sent".into(),
-            actor: Some("person/cost-operator".into()),
+            actor: Some("person/bench-operator".into()),
             fields: BTreeMap::from([
-                ("from".into(), json!("person/cost-operator")),
+                ("from".into(), json!("person/bench-operator")),
                 ("to".into(), json!("agent/cost-worker")),
                 ("content".into(), json!("Historical message")),
                 ("status".into(), json!("sent")),
@@ -1001,7 +1000,7 @@ mission "cost/history" state="ready" {
         let view = store.create_mission_run(&st3::model::MissionRunRequest {
             mission: "cost/history".into(), revision: None,
             workspace: root.path().display().to_string(),
-            requester: Some("person/cost-operator".into()), mode: None,
+            requester: Some("person/bench-operator".into()), mode: None,
             inputs: BTreeMap::new(), idempotency_key: format!("cost-history-{run}"),
         }).unwrap();
         store.set_mission_run_state(&view.id, "cancelled", "terminal", None).unwrap();
