@@ -93,7 +93,7 @@ pub async fn run(
     let wrapper = std::env::var(st_drivers::claude_session::SESSION_ENV).unwrap_or_default();
     let mut retries = BTreeMap::<String, Retry>::new();
     let mut unconfirmed_since = BTreeMap::<String, Instant>::new();
-    let mut diagnostics = BTreeSet::<String>::new();
+    let mut diagnostics = BTreeMap::<String, DiagnosticReport>::new();
     loop {
         tokio::select! {
             frame = subscription.receiver.recv() => match frame {
@@ -303,16 +303,28 @@ fn retry_failed(retries: &mut BTreeMap<String, Retry>, key: &str) {
     let seconds = (1_u64 << retry.failures.saturating_sub(1).min(5)).min(30);
     retry.due = Some(Instant::now() + Duration::from_secs(seconds));
 }
+struct DiagnosticReport {
+    reason: String,
+    recorded: bool,
+}
 async fn diagnostic(
     client: &Client,
     fence: &Fence,
     message: &str,
     code: &str,
     reason: &str,
-    recorded: &mut BTreeSet<String>,
+    reports: &mut BTreeMap<String, DiagnosticReport>,
 ) {
     let key = format!("{code}:{}:{}:{message}", fence.subject, fence.incarnation);
-    if recorded.contains(&key) {
+    // A lost acknowledgement retries the same diagnostic payload, even when a
+    // later attempt encounters a different transient failure.
+    let report = reports
+        .entry(key.clone())
+        .or_insert_with(|| DiagnosticReport {
+            reason: reason.into(),
+            recorded: false,
+        });
+    if report.recorded {
         return;
     }
     let result: Result<ClaimRecord> = client
@@ -326,7 +338,7 @@ async fn diagnostic(
                     ("severity".into(), json!("warning")),
                     ("status".into(), json!("waiting")),
                     ("code".into(), json!(code)),
-                    ("reason".into(), json!(reason)),
+                    ("reason".into(), json!(report.reason)),
                     ("incarnation_id".into(), json!(fence.incarnation)),
                 ]),
                 evidence: Vec::new(),
@@ -336,7 +348,7 @@ async fn diagnostic(
         )
         .await;
     if result.is_ok() {
-        recorded.insert(key);
+        report.recorded = true;
     }
 }
 

@@ -1137,6 +1137,7 @@ async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receip
         daemon.send("message/idle", "agent/quartz", "QUARTZ IDLE SIGNAL");
         let frame = received.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(frame["method"], "notifications/claude/channel");
+        assert!(daemon.has_diagnostic("agent/quartz", "first", "claude-receipt-unavailable"));
         assert_eq!(
             daemon
                 .store
@@ -1352,5 +1353,74 @@ async fn claude_mail_staged_before_start_is_injected_once_and_keeps_receipts_thr
             1
         );
     }
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_delivered_unread_mail_reoffers_in_a_fresh_native_session_from_an_old_ledger() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    daemon.observe_running("agent/quartz", "replacement");
+    daemon.send("message/unread", "agent/quartz", "QUARTZ UNREAD SIGNAL");
+    daemon
+        .store
+        .append_claim(&ClaimInput {
+            subject: "message/unread".into(),
+            kind: "message.delivered".into(),
+            actor: Some("agent/quartz".into()),
+            fields: BTreeMap::from([("status".into(), json!("delivered"))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    daemon.start_with_binding(true).await;
+    let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-replacement");
+    fixture.append(
+        root,
+        json!({"type":"user","message":{"role":"user","content":"A fresh native session"}}),
+    );
+    // The old format lacks acceptance tracking. Its previous offer is neither
+    // consumption proof nor a reason to lose delivered-but-unread mail.
+    std::fs::write(
+        fixture.paths.agent_dir.join("native-channel-handoffs.json"),
+        json!({"incarnation":"previous","attempted":["message/unread"],"confirmed":[]}).to_string(),
+    )
+    .unwrap();
+    let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-replacement");
+    let frame = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(frame["params"]["meta"]["messageId"], "message/unread");
+    fixture.append(
+        root,
+        json!({"type":"user","isMeta":true,
+        "message":{"role":"user","content":frame["params"]["content"]}}),
+    );
+    wait_until(
+        "the replacement session consumes unread mail",
+        Duration::from_secs(6),
+        || {
+            daemon
+                .store
+                .message("message/unread")
+                .unwrap()
+                .unwrap()
+                .status
+                == "read"
+        },
+    )
+    .await;
+    for kind in ["message.delivered", "message.read"] {
+        assert_eq!(
+            daemon
+                .store
+                .claims_for("message/unread", Some(kind))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert!(stop(channel).is_empty());
     daemon.stop().await;
 }
