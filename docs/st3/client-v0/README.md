@@ -32,6 +32,47 @@ The collections socket's `CollectionCommand` and `CollectionFrame` definitions l
 schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
 command/frame definitions, and subscription bound; see [collections](collections.md).
 
+### Owner-local private notes
+
+`GET /v1/client/private-notes/{uri}` accepts one fully percent-encoded canonical
+`dev.schickling.agent-private-notes://HOST/IDENTITY` URI. The pure canonical URI
+contract lives in `st3-schema::private_notes`; clients never send a filesystem path or UID.
+The response is a `PrivateNotesSubject` envelope value with `ref`, `family`,
+`schema`, `data`, `actions`, and `live`. Its data contains the current Markdown and
+the carrier-generation/revision fence; `live` is null. Missing bytes are empty
+only when the declaration and owned resource directory already exist.
+
+The daemon's `private_notes_catalogs` configuration lists absolute owner-local
+catalog roots. Each source must declare the exact self URI in
+`agents/HOST/IDENTITY/agent.kdl`; its filesystem byte authority remains
+`resources/private-notes.md`. Resolution refuses divergent carriers, symlink
+traversal, foreign ownership, and group/world-writable sources or destinations.
+No Markdown, notes revision, content digest, or local recovery receipt enters
+fleet claims, collections, or replication.
+
+Only the daemon's configured `person` has principal notes entitlement.
+`notes.read` and `notes.write` are explicit requested pairing scopes; neither the
+implicit limited nor full-control pairing defaults includes them. The local
+person header is an identity selector, not authority: uncredentialed notes
+access and notes-scope delegation require positively inspected local OS-owner
+process ancestry. This admission currently supports Linux only; other platforms
+fail closed for uncredentialed notes access. Configured-person paired credentials
+with explicit notes scopes remain valid through the authenticated client surface.
+Native agents never write or delegate notes authority. The existing authenticated
+native harness producer binds only its declared self notes source to the current
+runtime incarnation; source failure does not block unrelated observation delivery.
+
+`private-notes.write` requires `notes.write`, the returned action fence, a stable
+idempotency key, the canonical URI, and complete Markdown. Supported writers must
+use this API: writes serialize across daemon processes, compare carrier generation
+and revision, then durably record intent before an atomic owned sibling replacement.
+Exact retries recover the private outcome without overwriting a newer edit.
+Changed key reuse conflicts; stale editors and replaced carriers are refused.
+An interrupted replacement remains `private-notes-indeterminate` until its exact
+key is reconciled. External filesystem editors are not coordinated writers;
+changes between operations invalidate the next revision fence.
+
+
 ### Agent activity and human blocking
 
 An agent's `harness_state` describes activity independently of its optional `blocked_on`, `ask`,

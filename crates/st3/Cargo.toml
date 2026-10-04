@@ -15,6 +15,7 @@ perf-load = []
 
 [dependencies]
 anyhow = "1"
+agent-spec = { path = "../agent-spec" }
 axum = { version = "0.8", features = ["json", "ws"] }
 base64 = "0.22"
 ciborium = "0.2"
@@ -68,7 +69,6 @@ walkdir = "2"
 st3 = { path = ".", features = ["test-support"] }
 smallclaims = { path = "../smallclaims", features = ["test-support"] }
 tokio = { version = "1", features = ["test-util"] }
-agent-spec = { path = "../agent-spec" }
 assert_cmd = "2"
 jsonschema = { version = "0.33", default-features = false }
 portable-pty = "0.9"

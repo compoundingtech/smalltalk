@@ -541,6 +541,7 @@ fn run(
         client_relay: None,
         native_session_home: Some(root.join("home")),
         planner_default: st3::model::PlannerSpec::default(),
+        private_notes: Default::default(),
     };
     let subjects = {
         let _entered = daemon.enter();

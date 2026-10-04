@@ -181,6 +181,7 @@ impl Daemon {
             client_relay: None,
             native_session_home: Some(root.join("native")),
             planner_default: Default::default(),
+            private_notes: Default::default(),
         }
     }
 

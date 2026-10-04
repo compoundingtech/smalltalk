@@ -2,6 +2,7 @@
 
 pub mod glasses;
 pub mod owned_terminals;
+pub mod private_notes;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;

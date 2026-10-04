@@ -22,6 +22,7 @@ fn state(root: &Path) -> AppState {
         client_relay: None,
         native_session_home: None,
         planner_default: Default::default(),
+        private_notes: Default::default(),
     }
 }
 async fn request(

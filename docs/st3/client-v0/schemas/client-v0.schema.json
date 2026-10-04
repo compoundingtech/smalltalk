@@ -33,7 +33,7 @@
     "AgentState": {"anyOf": [{"enum": ["desired", "starting", "running", "waiting", "stopped", "failed", "suspended"]}, {"type": "string"}], "description": "Desired/observed agent seat state. `suspended`: the seat was stopped at a quiet boundary and resumes its own native session; see `suspension`."},
     "AgentReachability": {"anyOf": [{"enum": ["local", "remote", "unreachable", "unknown", "reachable", "indeterminate"]}, {"type": "string"}], "description": "Whether the daemon can currently reach the agent runtime."},
     "TimelineStatus": {"anyOf": [{"enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Run status reported in a timeline `status` entry."},
-    "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`."},
+    "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "private-notes-unreachable", "private-notes-carrier-conflict", "private-notes-indeterminate", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`."},
     "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "owned-set"]}}}}]},
     "OwnedSet": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "claim", "receipt", "blockers", "members_status", "visibility"], "properties": {"kind": {"const": "owned-set"}, "claim": {"type": "string"}, "receipt": {"type": "object"}, "blockers": {"type": "array", "items": {"type": "string"}}, "members_status": {"type": "array", "items": {"type": "object"}}, "visibility": {"type": "object"}, "commit_status": {"type": ["object", "null"]}}}]},
     "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["tabs"], "properties": {"tabs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "ratio": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "First child share; absent means 0.5. Requires glasses capability version 2."}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
@@ -46,6 +46,30 @@
     "Timestamp": { "x-st-codec": "timestamp", "description": "RFC 3339 UTC instant; servers emit millisecond precision with `Z`.", "examples": ["2026-10-01T10:00:00.000Z"], "type": "string", "format": "date-time" },
     "Cursor": { "x-st-brand": "Cursor", "description": "Opaque, snapshot-bound page/event cursor.", "type": "string", "minLength": 8, "maxLength": 2048 },
     "Revision": { "x-st-brand": "Revision", "description": "Opaque per-subject revision; compare for equality, echo in fences.", "type": "string", "minLength": 1, "maxLength": 256 },
+    "PrivateNotesUri": { "x-st-brand": "PrivateNotesUri", "type": "string", "pattern": "^dev\\.schickling\\.agent-private-notes://[^/]+/[^/]+$", "description": "Canonical host-qualified notes URI; component spelling is validated by the public st3-schema profile." },
+    "PrivateNotesFence": {
+      "type": "object", "additionalProperties": false, "required": ["carrier_generation", "revision"],
+      "properties": { "carrier_generation": { "$ref": "#/$defs/Revision" }, "revision": { "$ref": "#/$defs/Revision" } }
+    },
+    "PrivateNotesData": {
+      "type": "object", "additionalProperties": false, "required": ["uri", "markdown", "fence"],
+      "properties": { "uri": { "$ref": "#/$defs/PrivateNotesUri" }, "markdown": { "type": "string" }, "fence": { "$ref": "#/$defs/PrivateNotesFence" } }
+    },
+    "PrivateNotesAction": {
+      "type": "object", "additionalProperties": false, "required": ["id", "fence"],
+      "properties": { "id": { "const": "private-notes.write" }, "fence": { "allOf": [{ "$ref": "#/$defs/Fence" }, { "required": ["private_notes"] }] } }
+    },
+    "PrivateNotesSubject": {
+      "type": "object", "additionalProperties": false, "required": ["ref", "family", "schema", "data", "actions", "live"],
+      "properties": {
+        "ref": { "$ref": "#/$defs/PrivateNotesUri" }, "family": { "const": "private-notes" }, "schema": { "const": "st3.private-notes@1" },
+        "data": { "$ref": "#/$defs/PrivateNotesData" }, "actions": { "type": "array", "maxItems": 1, "items": { "$ref": "#/$defs/PrivateNotesAction" } }, "live": { "type": "null" }
+      }
+    },
+    "PrivateNotesWriteParameters": {
+      "type": "object", "additionalProperties": false, "required": ["uri", "markdown"],
+      "properties": { "uri": { "$ref": "#/$defs/PrivateNotesUri" }, "markdown": { "type": "string" } }
+    },
     "Snapshot": {
       "description": "The complete projected state at one local store index and projection version.",
       "examples": [{"id": "snapshot/host-a/1842/2fc9", "host_id": "host/host-a", "store_index": 1842, "projection_version": "client-projection.v0", "created_at": "2026-09-20T12:00:00.000Z"}],
@@ -107,6 +131,7 @@
         "value": {
           "oneOf": [
             { "$ref": "#/$defs/Capabilities" },
+            { "$ref": "#/$defs/PrivateNotesSubject" },
             { "$ref": "#/$defs/DocumentContent" },
             { "$ref": "#/$defs/SubjectDefinition" },
             { "$ref": "#/$defs/Page" },
@@ -1575,7 +1600,8 @@
         "runtime_incarnation": { "type": "string" },
         "runtime_desired_revision": { "type": "string" },
         "terminal_sequence": { "type": "integer", "minimum": 0 },
-        "preview_token": { "x-st-brand": "PreviewToken", "type": "string", "pattern": "^lpv0:[0-9a-f]{64}$" }
+        "preview_token": { "x-st-brand": "PreviewToken", "type": "string", "pattern": "^lpv0:[0-9a-f]{64}$" },
+        "private_notes": { "$ref": "#/$defs/PrivateNotesFence" }
       }
     },
     "ActionCommon": {
@@ -1690,6 +1716,7 @@
     "ActionRequest": {
       "allOf": [{ "$ref": "#/$defs/ActionCommon" }],
       "oneOf": [
+        {"properties": {"type": {"const": "private-notes.write"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["private_notes"]}]}, "parameters": {"$ref": "#/$defs/PrivateNotesWriteParameters"}}},
         {"properties": {"type": {"const": "agent.create"}, "parameters": {"$ref": "#/$defs/AgentCreateParameters"}}},
         {"properties": {"type": {"const": "agent.stop"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["runtime_desired_revision"]}]}, "parameters": {"$ref": "#/$defs/AgentStopParameters"}}},
         {"properties": {"type": {"const": "agent.start"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["runtime_desired_revision"]}]}, "parameters": {"$ref": "#/$defs/AgentStartParameters"}}},
@@ -1953,8 +1980,8 @@
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "description": "Narrows the default limited grant. Must not be combined with full_control.",
-          "items": { "type": "string", "enum": ["read.projections", "read.glasses", "control.glasses", "terminal.read", "control.attention", "control.launches"] }
+          "description": "Explicitly selects requestable grants. Notes scopes require the configured owner person and are never included in implicit limited or full grants. Must not be combined with full_control.",
+          "items": { "type": "string", "enum": ["read.projections", "read.glasses", "control.glasses", "terminal.read", "control.attention", "control.launches", "notes.read", "notes.write"] }
         }
       }
     },

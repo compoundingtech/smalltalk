@@ -55,6 +55,7 @@ async fn daemon(root: &Path, name: &str, key: Arc<MemberKey>, anchor: &MemberKey
         client_relay: None,
         native_session_home: None,
         planner_default: Default::default(),
+        private_notes: Default::default(),
     };
     let server_socket = socket.clone();
     let server = tokio::spawn(async move {
