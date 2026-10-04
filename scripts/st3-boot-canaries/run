@@ -617,7 +617,44 @@ def run(args, root, evidence):
                 (evidence / path.name).write_text(path.read_text(errors="replace"))
 
 
+def private_root(make=tempfile.mkdtemp):
+    """A short, private directory for one canary's daemon, sockets and seats.
+
+    Short, because Unix socket paths are limited to about 100 bytes. And never named after st2: the
+    fresh-seat boundary check rejects any launch path that mentions it, and a random name contains
+    those three letters by chance (`/tmp/bc-0st2w5nz` did, and failed an unrelated PR's gate).
+    """
+    for _ in range(100):
+        root = Path(make(prefix="bc-", dir="/tmp"))
+        if "st2" not in root.name.lower():
+            return root
+        shutil.rmtree(root, ignore_errors=True)
+    raise RuntimeError("could not make a private directory whose name avoids st2")
+
+
+def self_test():
+    """The root name is redrawn until it avoids st2, and the rejected directories are removed."""
+    made = []
+    names = iter(["bc-0st2w5nz", "bc-ST2abcde", "bc-xSt2yzzz", "bc-fine1234"])
+
+    def make(prefix, dir):
+        path = Path(tempfile.mkdtemp(prefix="bc-selftest-", dir=dir)).rename(Path(dir) / next(names))
+        made.append(path)
+        return str(path)
+    try:
+        root = private_root(make)
+        assert root.name == "bc-fine1234", root
+        assert [path.exists() for path in made] == [False, False, False, True], made
+    finally:
+        for path in made:
+            shutil.rmtree(path, ignore_errors=True)
+    print("ok")
+    return 0
+
+
 def main():
+    if sys.argv[1:] == ["--self-test"]:
+        return self_test()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("binary", type=Path)
     parser.add_argument("evidence", type=Path)
@@ -633,8 +670,7 @@ def main():
     args.evidence.mkdir(parents=True, exist_ok=True)
     args.scratch = (args.scratch or args.evidence).resolve()
     args.scratch.mkdir(parents=True, exist_ok=True)
-    # Short, private paths: Unix socket paths are limited to about 100 bytes.
-    root = Path(tempfile.mkdtemp(prefix="bc-", dir="/tmp"))
+    root = private_root()
     try:
         result = run(args, root, args.evidence)
     finally:
