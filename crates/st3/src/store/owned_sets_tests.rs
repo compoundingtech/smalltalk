@@ -65,6 +65,42 @@ fn share(from: &Store, to: &Store) {
 }
 
 #[test]
+fn a_staged_owned_set_member_check_seeks_tagged_claims() {
+    let store = Store::open_memory("amber").unwrap();
+    let unmanaged = parse_intent(
+        "version 2\nagent \"garden/unmanaged\" { command \"true\" }",
+        "amber",
+    )
+    .unwrap();
+    direct(&store, &unmanaged, "unmanaged").unwrap();
+    apply(&store, &bundle("true", false), 10);
+    let connection = store.readers.get();
+    let query = "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND json_extract(body,'$.owned_set') IS NOT NULL)";
+    for (subject, expected) in [
+        ("agent/garden/orchard", true),
+        ("agent/garden/unmanaged", false),
+        ("agent/garden/absent", false),
+    ] {
+        let staged: bool = connection
+            .query_row(query, [subject], |row| row.get(0))
+            .unwrap();
+        assert_eq!(staged, expected, "{subject}");
+    }
+    let plan = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+        .unwrap()
+        .query_map(["agent/garden/unmanaged"], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("; ");
+    assert!(
+        plan.contains("claims_owned_set_subject_index (subject=?)"),
+        "{plan}"
+    );
+}
+
+#[test]
 fn stale_render_is_refused_even_with_fresh_set_and_member_heads() {
     let store = Store::open_memory("amber").unwrap();
     apply(&store, &bundle("new", false), 30);
