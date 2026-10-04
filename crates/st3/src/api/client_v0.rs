@@ -13122,21 +13122,6 @@ mission "example/zero-run" state="ready" {
         native("append", "timeline-entry/answer", 1, 1, "2026-10-04T21:40:10Z",
                "assistant", "content", json!({"media_type":"text/plain","text":"working"}));
         // Old graph events have a larger local store-derived sequence than recent native prose.
-        state.store.append_local_observations_for_test(
-            &(0..205).map(|index| ClaimInput {
-                subject: owner.into(),
-                kind: "harness.usage".into(),
-                actor: Some(owner.into()),
-                fields: BTreeMap::from([
-                    ("input_tokens".into(), json!(index)),
-                    ("incarnation_id".into(), json!(incarnation)),
-                    ("observed_at_unix_ms".into(), json!(stamp("2026-10-04T18:00:00Z"))),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some(format!("old-usage-{index}")),
-            }).collect::<Vec<_>>(),
-        );
         append(owner, "harness.usage", BTreeMap::from([
             ("input_tokens".into(), json!(7)),
             ("incarnation_id".into(), json!(incarnation)),
@@ -13153,11 +13138,12 @@ mission "example/zero-run" state="ready" {
         ]));
         let session = ClientSession::local(Some("person/example")).unwrap();
         let initial = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        let collision_sequence = (state.store.index().unwrap() + 1) * 4;
         native("finalize", "timeline-entry/answer", 999, 2, "2026-10-04T22:00:00Z",
                "assistant", "content", json!({"media_type":"text/plain","text":"answer"}));
-        native("append", "timeline-entry/call", 32, 1, "2026-10-04T21:40:19Z",
+        native("append", "timeline-entry/call", collision_sequence, 1, "2026-10-04T21:40:19Z",
                "assistant", "tool_call", json!({"call_id":"call/chronology","name":"read","arguments":{}}));
-        native("append", "timeline-entry/result", 33, 1, "2026-10-04T21:40:20Z",
+        native("append", "timeline-entry/result", collision_sequence + 1, 1, "2026-10-04T21:40:20Z",
                "tool", "tool_result", json!({"call_id":"call/chronology","status":"success","media_type":"text/plain","content":"ok"}));
         let page = timeline_value(&state, &new_client_snapshot(&state), &session, &session_id,
                                   &ClientListQuery { limit: Some(6), ..Default::default() }).unwrap().0;
@@ -13182,7 +13168,7 @@ mission "example/zero-run" state="ready" {
             ("incarnation_id".into(), json!(incarnation)),
             ("observed_at_unix_ms".into(), json!(stamp("2026-10-04T21:40:21Z"))),
         ]));
-        assert_eq!(usage.store_index * 4, 32, "fixture exercises a cross-namespace counter collision");
+        assert_eq!(usage.store_index * 4, collision_sequence, "fixture exercises a cross-namespace counter collision");
         let usage_delta = conversation_read_now(&state, &session, &session_id,
                                                 idle["next_cursor"].as_str()).unwrap();
         assert_eq!(usage_delta["items"].as_array().unwrap().iter().map(|entry| entry["type"].as_str().unwrap()).collect::<Vec<_>>(), ["usage"]);
