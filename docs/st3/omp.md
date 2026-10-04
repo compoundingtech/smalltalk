@@ -68,6 +68,11 @@ Structured resource observations retain their content and details in the same en
 `display: false` stays hidden; an absent `display` retains the native reader's visible behavior.
 The existing native-value byte bound applies separately to content and details; oversized
 fields become marked truncated text without corrupting the envelope's JSON.
+Timeline page limits are item-count upper bounds: a page can contain fewer entries to stay
+within the gateway response budget. Pagination preserves each complete envelope and advances
+the continuation cursor by the number actually returned; following it does not skip entries.
+Consumers must opt into this media type. Legacy conversation adapters may omit these system
+entries rather than render their JSON.
 Pi's existing plain custom-message projection is unchanged.
 
 The observed administrative entry types `model_usage`, `title_change`, `session_init`, and

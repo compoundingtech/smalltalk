@@ -22,8 +22,8 @@ pub(crate) const MAX_EXPOSED_HISTORY: usize = 2_000;
 const MAX_METADATA_LINES: usize = 64;
 const MAX_TIMELINE_LINES: usize = 4_096;
 const MAX_TIMELINE_BYTES: u64 = 32 * 1024 * 1024;
-// A maximum-size page must remain below the client gateway's one-megabyte response ceiling even
-// when every native entry contains a large tool payload.
+// Bound individual native values; timeline pagination separately budgets encoded entries and
+// response metadata against the gateway's one-megabyte response ceiling.
 const MAX_TIMELINE_VALUE_BYTES: usize = 8 * 1024;
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
 /// How long a saved-history request waits for a background transcript read before it answers
@@ -2802,7 +2802,7 @@ fn bounded_text(value: &str) -> String {
     if value.len() <= MAX_TIMELINE_VALUE_BYTES {
         return value.to_owned();
     }
-    // The bound is in bytes: it keeps a page under the gateway's response ceiling.
+    // Bound native values independently; pages retain complete encoded timeline entries.
     let mut output = truncate_at_char_boundary(value, MAX_TIMELINE_VALUE_BYTES).to_owned();
     output.push_str("\n[st truncated this native timeline value]");
     output
