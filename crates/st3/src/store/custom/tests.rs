@@ -15,7 +15,7 @@ fn registration(store: &Store) -> Value {
         .unwrap()
 }
 fn request(store: &Store, id: &str) -> ClaimRecord {
-    store.append_claim(&ClaimInput{subject:id.into(),kind:example().creation_kind,actor:Some("agent/garden/seed".into()),fields:serde_json::from_value(json!({"title":"Retain the seed history?","detail":"Choose Keep or Discard.","recipient":"person/fern"})).unwrap(),..empty_input()}).unwrap()
+    store.append_claim(&ClaimInput{subject:id.into(),kind:example().creation_kind,actor:Some("agent/garden/seed".into()),fields:serde_json::from_value(json!({"title":"Retain the seed history?","detail":"Choose Keep or Discard.","recipient":"person/lichen"})).unwrap(),..empty_input()}).unwrap()
 }
 fn reply(store: &Store, id: &str) -> ReplyRequest {
     let v = store.custom_subject(id).unwrap().unwrap();
@@ -25,7 +25,7 @@ fn reply(store: &Store, id: &str) -> ReplyRequest {
         revision: v["revision"].as_str().unwrap().into(),
         episode: v["attention"]["episode"].as_str().unwrap().into(),
         fields: serde_json::from_value(json!({"selection":"keep"})).unwrap(),
-        actor: "person/fern".into(),
+        actor: "person/lichen".into(),
         idempotency_key: "garden-review-answer-001".into(),
     }
 }
@@ -45,13 +45,13 @@ fn custom_round_trip_replicates_restarts_and_retains_human_actor() {
     let q = request(&a, id);
     legacy_sync(&a, &b);
     assert_eq!(a.custom_subject(id).unwrap(), b.custom_subject(id).unwrap());
-    let cards = b.attention_items(Some("person/fern")).unwrap();
+    let cards = b.attention_items(Some("person/lichen")).unwrap();
     assert_eq!(cards.len(), 1);
     assert_eq!(cards[0].episode, q.id);
     let r = reply(&b, id);
     let answer = b.reply_custom_subject(&r).unwrap();
-    assert_eq!(answer.actor.as_deref(), Some("person/fern"));
-    assert!(b.attention_items(Some("person/fern")).unwrap().is_empty());
+    assert_eq!(answer.actor.as_deref(), Some("person/lichen"));
+    assert!(b.attention_items(Some("person/lichen")).unwrap().is_empty());
     assert_eq!(b.reply_custom_subject(&r).unwrap().id, answer.id);
     let mut changed = r.clone();
     changed.fields.insert("selection".into(), json!("discard"));
@@ -76,7 +76,7 @@ fn custom_round_trip_replicates_restarts_and_retains_human_actor() {
         b.custom_subject(id).unwrap().unwrap()["fields"]["selection"],
         "keep"
     );
-    assert!(b.attention_items(Some("person/fern")).unwrap().is_empty());
+    assert!(b.attention_items(Some("person/lichen")).unwrap().is_empty());
     assert_eq!(b.claims_for(id, None).unwrap().len(), 2);
 }
 #[test]
@@ -93,7 +93,7 @@ fn custom_raw_writes_enforce_schema_namespace_and_human_authority() {
         ..empty_input()
     };
     assert!(s.append_claim(&input).is_err());
-    input.actor = Some("person/fern".into());
+    input.actor = Some("person/lichen".into());
     input.fields.insert("selection".into(), json!("bad"));
     assert!(s.append_claim(&input).is_err());
     input.kind = "custom.other.answered".into();
@@ -104,11 +104,11 @@ fn custom_raw_writes_enforce_schema_namespace_and_human_authority() {
         s.append_claim(&input).unwrap_err().code,
         "custom-registration-only"
     );
-    assert_eq!(s.attention_items(Some("person/fern")).unwrap().len(), 1);
+    assert_eq!(s.attention_items(Some("person/lichen")).unwrap().len(), 1);
     let mut r = reply(&s, id);
     r.actor = "agent/garden/seed".into();
     assert_eq!(s.reply_custom_subject(&r).unwrap_err().code, "forbidden");
-    r.actor = "person/fern".into();
+    r.actor = "person/lichen".into();
     r.revision = "obsolete".into();
     assert_eq!(s.reply_custom_subject(&r).unwrap_err().code, "stale-fence");
 }
@@ -129,7 +129,7 @@ fn custom_bad_projection_isolated_from_other_sources_and_core_reads() {
     let id = "custom/garden/review/v2/bad";
     request(&s, id);
     assert_eq!(s.custom_subject(id).unwrap().unwrap()["state"], "invalid");
-    assert_eq!(s.attention_items(Some("person/fern")).unwrap().len(), 1);
+    assert_eq!(s.attention_items(Some("person/lichen")).unwrap().len(), 1);
     s.status(None).unwrap();
     s.append_claim(&ClaimInput {
         subject: "custom/legacy/fact".into(),
@@ -260,16 +260,16 @@ fn custom_basis_invalidation_guard_revival_and_reframe_are_graph_facts() {
         s.append_claim(&ClaimInput{subject:child.into(),kind:derived.into(),actor:Some("agent/garden/seed".into()),fields:serde_json::from_value(json!({"status":status,"_basis":[{"subject":parent,"kinds":kinds,"revision":basis},{"subject":child,"kinds":kinds,"revision":s.custom_basis_revision(child,&kinds).unwrap()}]})).unwrap(),..empty_input()}).unwrap()
     };
     derive(&a, "pending");
-    assert_eq!(a.attention_items(Some("person/fern")).unwrap().len(), 1);
+    assert_eq!(a.attention_items(Some("person/lichen")).unwrap().len(), 1);
     let episode = a.custom_subject(child).unwrap().unwrap()["attention"]["episode"].clone();
     // The person's raw answer is preserved and invalidates the descendant's derived view.
-    a.append_claim(&ClaimInput{subject:parent.into(),kind:"custom.garden.review.v1.answered".into(),actor:Some("person/fern".into()),fields:serde_json::from_value(json!({"request":a.claims_for(parent,None).unwrap()[0].id,"selection":[],"text":"Reframe: retain only recent history"})).unwrap(),..empty_input()}).unwrap();
+    a.append_claim(&ClaimInput{subject:parent.into(),kind:"custom.garden.review.v1.answered".into(),actor:Some("person/lichen".into()),fields:serde_json::from_value(json!({"request":a.claims_for(parent,None).unwrap()[0].id,"selection":[],"text":"Reframe: retain only recent history"})).unwrap(),..empty_input()}).unwrap();
     assert_eq!(a.custom_subject(child).unwrap().unwrap()["state"], "stale");
-    assert!(a.attention_items(Some("person/fern")).unwrap().is_empty());
+    assert!(a.attention_items(Some("person/lichen")).unwrap().is_empty());
     derive(&a, "gated");
-    assert!(a.attention_items(Some("person/fern")).unwrap().is_empty());
+    assert!(a.attention_items(Some("person/lichen")).unwrap().is_empty());
     derive(&a, "pending");
-    assert_eq!(a.attention_items(Some("person/fern")).unwrap().len(), 1);
+    assert_eq!(a.attention_items(Some("person/lichen")).unwrap().len(), 1);
     assert_ne!(
         a.custom_subject(child).unwrap().unwrap()["attention"]["episode"],
         episode
@@ -287,10 +287,10 @@ fn custom_basis_invalidation_guard_revival_and_reframe_are_graph_facts() {
     answer.fields =
         serde_json::from_value(json!({"selection":[],"text":"Reframe the descendant"})).unwrap();
     let human = b.reply_custom_subject(&answer).unwrap();
-    assert_eq!(human.actor.as_deref(), Some("person/fern"));
+    assert_eq!(human.actor.as_deref(), Some("person/lichen"));
     assert_eq!(human.body["fields"]["selection"], json!([]));
     assert_eq!(b.custom_subject(child).unwrap().unwrap()["state"], "stale");
-    assert!(b.attention_items(Some("person/fern")).unwrap().is_empty());
+    assert!(b.attention_items(Some("person/lichen")).unwrap().is_empty());
 }
 
 fn empty_input() -> ClaimInput {
@@ -387,10 +387,10 @@ fn custom_signed_round_trip_late_manifest_partition_answers_and_checkpoint_repla
         b.custom_subject(id).unwrap().unwrap()["state"],
         "pending-dependencies"
     );
-    assert!(b.attention_items(Some("person/fern")).unwrap().is_empty());
+    assert!(b.attention_items(Some("person/lichen")).unwrap().is_empty());
     signed_sync(&a, &b);
     assert_eq!(a.custom_subject(id).unwrap(), b.custom_subject(id).unwrap());
-    assert_eq!(b.attention_items(Some("person/fern")).unwrap().len(), 1);
+    assert_eq!(b.attention_items(Some("person/lichen")).unwrap().len(), 1);
     // Both isolated members may accept the same current card. Preserve both answers.
     let ar = reply(&a, id);
     let mut br = reply(&b, id);
@@ -463,14 +463,14 @@ fn custom_offline_registration_conflicts_and_indexed_reads() {
     signed_sync(&a, &b);
     signed_sync(&b, &a);
     assert_eq!(a.custom_subject(id).unwrap().unwrap()["state"], "conflict");
-    assert!(a.attention_items(Some("person/fern")).unwrap().is_empty());
+    assert!(a.attention_items(Some("person/lichen")).unwrap().is_empty());
     assert_eq!(
         a.custom_registrations().unwrap(),
         b.custom_registrations().unwrap()
     );
     for sql in [
         "EXPLAIN QUERY PLAN SELECT body FROM custom_sources WHERE kind='garden.review' AND subject>'a' ORDER BY subject LIMIT 51",
-        "EXPLAIN QUERY PLAN SELECT body FROM custom_sources WHERE active=1 AND person='person/fern' ORDER BY subject",
+        "EXPLAIN QUERY PLAN SELECT body FROM custom_sources WHERE active=1 AND person='person/lichen' ORDER BY subject",
     ] {
         let plan = a
             .readers
@@ -494,7 +494,7 @@ fn custom_projection_row_bounds_and_invalid_replicated_facts_leave_core_healthy(
     request(&a, "custom/garden/review/v1/healthy");
     let bad = "custom/garden/review/v1/malformed";
     request(&a, bad);
-    a.connection.batched(|tx| append_claim_tx(tx,&a.origin,bad,"custom.garden.review.v1.answered",Some("person/fern"),&json!({"fields":{"_registration":registration_hash(tx,bad),"request":a_creation(tx,bad),"selection":17}}),&[],None)).unwrap().unwrap();
+    a.connection.batched(|tx| append_claim_tx(tx,&a.origin,bad,"custom.garden.review.v1.answered",Some("person/lichen"),&json!({"fields":{"_registration":registration_hash(tx,bad),"request":a_creation(tx,bad),"selection":17}}),&[],None)).unwrap().unwrap();
     assert_eq!(a.custom_subject(bad).unwrap().unwrap()["state"], "invalid");
     let mut m = example();
     m.version = 2;
@@ -521,14 +521,14 @@ fn custom_projection_row_bounds_and_invalid_replicated_facts_leave_core_healthy(
         kind: example().creation_kind,
         actor: Some("agent/garden/seed".into()),
         fields: serde_json::from_value(
-            json!({"title":"Large read","detail":"x".repeat(8000),"recipient":"person/fern"}),
+            json!({"title":"Large read","detail":"x".repeat(8000),"recipient":"person/lichen"}),
         )
         .unwrap(),
         ..empty_input()
     })
     .unwrap();
     assert_eq!(a.custom_subject(big).unwrap().unwrap()["state"], "invalid");
-    assert_eq!(a.attention_items(Some("person/fern")).unwrap().len(), 1);
+    assert_eq!(a.attention_items(Some("person/lichen")).unwrap().len(), 1);
     a.status(None).unwrap();
     let b = Store::open_memory("birch").unwrap();
     legacy_sync(&a, &b);
@@ -591,12 +591,12 @@ fn custom_late_document_recovers_only_its_source_and_cycles_are_invalid() {
         .as_str()
         .unwrap()
         .to_owned();
-    s.connection.batched(|tx|append_claim_tx(tx,&s.origin,id,&example().creation_kind,Some("agent/garden/seed"),&json!({"fields":{"_registration":registration,"title":"Review context","detail":"Read the immutable evidence.","recipient":"person/fern","context":format!("doc/garden/context@{hash}")}}),&[],None)).unwrap().unwrap();
+    s.connection.batched(|tx|append_claim_tx(tx,&s.origin,id,&example().creation_kind,Some("agent/garden/seed"),&json!({"fields":{"_registration":registration,"title":"Review context","detail":"Read the immutable evidence.","recipient":"person/lichen","context":format!("doc/garden/context@{hash}")}}),&[],None)).unwrap().unwrap();
     assert_eq!(
         s.custom_subject(id).unwrap().unwrap()["state"],
         "pending-dependencies"
     );
-    assert!(s.attention_items(Some("person/fern")).unwrap().is_empty());
+    assert!(s.attention_items(Some("person/lichen")).unwrap().is_empty());
     s.put_document_as(
         "doc/garden/context",
         content,
@@ -606,7 +606,7 @@ fn custom_late_document_recovers_only_its_source_and_cycles_are_invalid() {
     )
     .unwrap();
     assert_eq!(s.custom_subject(id).unwrap().unwrap()["state"], "ready");
-    assert_eq!(s.attention_items(Some("person/fern")).unwrap().len(), 1);
+    assert_eq!(s.attention_items(Some("person/lichen")).unwrap().len(), 1);
     let a = "custom/garden/review/v1/cycle-a";
     let b = "custom/garden/review/v1/cycle-b";
     request(&s, a);

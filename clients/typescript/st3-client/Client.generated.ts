@@ -144,7 +144,7 @@ export class St3Client {
 
     private async request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, idempotencyKey?: string, raw?: { contentType: string }): Promise<EnvelopeOf<T>> {
         const credential = await this.credential?.();
-        const headers: Record<string, string> = { Accept: 'application/json' };
+        const headers: Record<string, string> = { Accept: 'application/json', 'x-st3-features': 'custom-subjects.v1' };
         if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
@@ -244,7 +244,7 @@ export class St3Client {
         const url = new URL(`${this.baseUrl}/v1/client/terminals/${encodeURIComponent(routedId(id))}/stream`);
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         if (options.incarnation) url.searchParams.set('incarnation', options.incarnation);
-        const headers: Record<string, string> = {};
+        const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1' };
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [TERMINAL_SUBPROTOCOL, `st3.cap.${options.streamCapability}`], headers);
@@ -271,7 +271,7 @@ export class St3Client {
         const url = new URL(`${this.baseUrl}/v1/client/conversations/${encodeURIComponent(routedId(id))}/stream`);
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         if (options.after) url.searchParams.set('after', options.after);
-        const headers: Record<string, string> = {};
+        const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1' };
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [CONVERSATION_SUBPROTOCOL], headers);
@@ -296,7 +296,7 @@ export class St3Client {
         const credential = await this.credential?.();
         const url = new URL(`${this.baseUrl}/v1/client/collections/stream`);
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-        const headers: Record<string, string> = {};
+        const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1' };
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? (defaultTerminalSocket as unknown as CollectionSocketFactory))(url.toString(), [COLLECTIONS_SUBPROTOCOL], headers);

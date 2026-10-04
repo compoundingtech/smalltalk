@@ -14,12 +14,12 @@ st schema register examples/st3/custom-review.json --as agent/garden/seed
 st claim custom/garden/review/v1/review-001 custom.garden.review.v1.requested \
   --actor agent/garden/seed \
   --field 'title=Retain the seed history?' \
-  --field 'detail=Choose Keep or Discard.' --field recipient=person/fern
+  --field 'detail=Choose Keep or Discard.' --field recipient=person/lichen
 st subject show custom/garden/review/v1/review-001
-st attention ls --as person/fern
+st attention ls --as person/lichen
 ```
 
-The claim pins its registration hash automatically. One card appears for Fern. stui displays
+The claim pins its registration hash automatically. One card appears for Lichen. stui displays
 its declared fields and source ID. Open the reply box and enter `keep`, or enter a JSON object
 such as `{"selection":"keep","text":"Retain the provenance."}`. The generic client action
 is `custom.reply`; its parameters come from the card's `action_parameters` and `custom_form`.
@@ -31,10 +31,10 @@ write the reply fields to a JSON file, and run:
 ```sh
 st subject reply custom/garden/review/v1/review-001 \
   --registration HASH --revision REVISION --episode EPISODE \
-  --fields-file reply.json --idempotency-key garden-review-answer-001 --as person/fern
+  --fields-file reply.json --idempotency-key garden-review-answer-001 --as person/lichen
 ```
 
-The answer records Fern's actor and the immutable request claim ID, removes the card, and
+The answer records Lichen's actor and the immutable request claim ID, removes the card, and
 survives restart and replication. Stale card parameters write nothing. An exact retry returns
 its previous claim; changing the request under the same key is rejected. Concurrent answers on
 isolated members remain competing immutable facts, visible as `reply_conflicts` and in history.
@@ -90,7 +90,10 @@ retention rules, native actions, or contributed UI are accepted.
 client unknown-resource decoding. It includes the pinned registration, source revision,
 selected fields, provenance and `state`: `ready`, `stale`, `pending-dependencies`, `conflict`,
 or `invalid`. Custom attention adds optional metadata to the existing attention resource.
-Clients without generic forms can display the source/title/detail and ignore the new action.
+Updated clients send `x-st3-features: custom-subjects.v1` to receive namespaced attention and
+`custom.reply`. Without that opt-in, attention/Now pages and collection streams use the existing
+`agent-request` kind, no new action enum value, and an exact CLI reply hint. Older closed-enum
+clients keep reading their entire queue. Optional custom metadata remains available to renderers.
 
 Manifest documents, registry claims and typed facts use the existing signed envelope and blob
 replication. The three shared custom tables are rebuildable caches and participate in projection

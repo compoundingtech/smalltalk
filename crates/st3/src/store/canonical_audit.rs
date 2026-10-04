@@ -504,7 +504,7 @@ fn write_audit_history(source: &Store) {
         subject: "custom/garden/review/v1/audit".into(),
         kind: "custom.garden.review.v1.requested".into(),
         actor: Some("agent/garden/seed".into()),
-        fields: serde_json::from_value(json!({"title":"Retain the seed history?","detail":"Choose Keep or Discard.","recipient":"person/fern","context":format!("doc/garden/audit@{}",hex::encode(Sha256::digest(b"Immutable audit context")))})).unwrap(),
+        fields: serde_json::from_value(json!({"title":"Retain the seed history?","detail":"Choose Keep or Discard.","recipient":"person/lichen","context":format!("doc/garden/audit@{}",hex::encode(Sha256::digest(b"Immutable audit context")))})).unwrap(),
         evidence: vec![], expected_subject: None, idempotency_key: None,
     }).unwrap();
 

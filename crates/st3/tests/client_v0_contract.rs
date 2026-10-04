@@ -3782,7 +3782,7 @@ async fn custom_subject_contract_pagination_and_paired_person_reply() {
         })
         .unwrap();
     for name in ["one", "two"] {
-        state.store.append_claim(&st3::model::ClaimInput{subject:format!("custom/garden/review/v1/{name}"),kind:"custom.garden.review.v1.requested".into(),actor:Some("agent/garden/seed".into()),fields:serde_json::from_value(serde_json::json!({"title":"Retain the seed history?","detail":"Choose Keep or Discard.","recipient":"person/fern"})).unwrap(),evidence:vec![],expected_subject:None,idempotency_key:None}).unwrap();
+        state.store.append_claim(&st3::model::ClaimInput{subject:format!("custom/garden/review/v1/{name}"),kind:"custom.garden.review.v1.requested".into(),actor:Some("agent/garden/seed".into()),fields:serde_json::from_value(serde_json::json!({"title":"Retain the seed history?","detail":"Choose Keep or Discard.","recipient":"person/lichen"})).unwrap(),evidence:vec![],expected_subject:None,idempotency_key:None}).unwrap();
     }
     let local = st3::api::router(state.clone());
     let fabric = st3::api::fabric_router(state.clone());
@@ -3804,7 +3804,7 @@ async fn custom_subject_contract_pagination_and_paired_person_reply() {
         page["value"]["items"][0]["id"],
         next["value"]["items"][0]["id"]
     );
-    let (status,challenge)=client_post_json_person(local.clone(),"/v1/client/pairings","person/fern",serde_json::json!({"api_version":"st3.client.v0","device_name":"Fern's garden phone","person_id":"person/fern"})).await;
+    let (status,challenge)=client_post_json_person(local.clone(),"/v1/client/pairings","person/lichen",serde_json::json!({"api_version":"st3.client.v0","device_name":"Lichen's garden phone","person_id":"person/lichen"})).await;
     assert_eq!(status, StatusCode::OK, "{challenge}");
     let pairing = challenge["value"]["pairing_id"]
         .as_str()
@@ -3821,7 +3821,28 @@ async fn custom_subject_contract_pagination_and_paired_person_reply() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, cards) = client_json_auth(fabric.clone(), "/v1/client/attention", token).await;
+    let (status, legacy) = client_json_auth(fabric.clone(), "/v1/client/attention", token).await;
+    assert_eq!(status, StatusCode::OK, "{legacy}");
+    for card in legacy["value"]["items"].as_array().unwrap() {
+        assert_eq!(card["attention_kind"], "agent-request");
+        assert_eq!(card["actions"], serde_json::json!([]));
+        assert!(card["detail"].as_str().unwrap().contains("st subject reply"));
+    }
+    // Model the pre-extension closed enums: the entire page remains readable.
+    let mut old_schema = json(asset_root().join("schemas/client-v0.schema.json"));
+    let properties = &mut old_schema["$defs"]["Attention"]["allOf"][1]["properties"];
+    properties["attention_kind"] = serde_json::json!({"enum":["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault"]});
+    properties["actions"] = serde_json::json!({"type":"array","items":{"enum":["work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"]}});
+    old_schema["$ref"] = serde_json::json!("#/$defs/Envelope");
+    let old_validator = jsonschema::options().build(&old_schema).unwrap();
+    assert_conforms(&old_validator, "older custom attention fallback", &legacy);
+    let response = fabric.clone().oneshot(Request::builder()
+        .uri("/v1/client/attention")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-st3-features", "custom-subjects.v1")
+        .body(Body::empty()).unwrap()).await.unwrap();
+    let status = response.status();
+    let cards: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(status, StatusCode::OK, "{cards}");
     assert_conforms(&consumer_validator("Envelope"), "custom attention", &cards);
     let card = &cards["value"]["items"][0];
@@ -3842,7 +3863,7 @@ async fn custom_subject_contract_pagination_and_paired_person_reply() {
         .unwrap();
     assert_eq!(
         history.last().unwrap().actor.as_deref(),
-        Some("person/fern")
+        Some("person/lichen")
     );
     let (status, expired) = client_json(
         local,
