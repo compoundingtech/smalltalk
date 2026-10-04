@@ -1427,7 +1427,14 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
         span(agent.name.clone(), theme::bold()),
         span(format!("  {}", agent_word(agent.state)), theme::fg(color)),
     ];
-    let right = format!("{} · {} ", agent.harness.name(), agent.host);
+    // The model rides beside the harness, as the harness reported it.
+    let model = agent
+        .details
+        .model
+        .as_deref()
+        .map(|model| format!(" · {model}"))
+        .unwrap_or_default();
+    let right = format!("{}{model} · {} ", agent.harness.name(), agent.host);
     let used = first.iter().map(Span::width).sum::<usize>();
     first.push(span(
         " ".repeat(width.saturating_sub(used + text::width(&right))),
@@ -1437,7 +1444,7 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
         agent.harness.name(),
         theme::fg(harness_color(agent.harness)),
     ));
-    first.push(span(format!(" · {} ", agent.host), theme::dim()));
+    first.push(span(format!("{model} · {} ", agent.host), theme::dim()));
     doc.line(Line::from(first));
     let mut second = vec![span(format!("   {}", agent.id), theme::dim())];
     if let Some(tree) = &agent.worktree {
@@ -2725,6 +2732,7 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
         doc.line(Line::from(spans));
     };
     field(&mut doc, "harness", Some(agent.harness.name()));
+    field(&mut doc, "model", details.model.as_deref());
     field(&mut doc, "state", details.harness_state.as_deref());
     field(&mut doc, "runtime", details.runtime.as_deref());
     field(&mut doc, "host", Some(&agent.host));

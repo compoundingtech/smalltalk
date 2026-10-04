@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { compactFolders, agentName, agentRows, agentSections, agentState, agentTreeLines, filterAgentRows, UNMANAGED_GROUP } from './agentsView.ts';
+import { agentModel, compactFolders, agentName, agentRows, agentSections, agentState, agentTreeLines, filterAgentRows, UNMANAGED_GROUP } from './agentsView.ts';
 
 const now = Date.parse('2026-09-30T12:00:00Z');
 const agent = (id, extra = {}) => ({ id: `agent/${id}`, name: id, kind: 'agent', updated_at: '2026-09-30T11:00:00Z', state: 'running', harness_state: 'idle', driver: 'claude', runtime_ids: [], reachability: 'local', ...extra });
@@ -65,6 +65,13 @@ assert.deepEqual(compactFolders([
   'fleet/cos/standing/cos'.split('/'),
   ['solo'],
 ]), [['fleet', 'smalltalk', 'operations/2026-10-01'], ['fleet', 'smalltalk', 'ci'], ['fleet', 'cos/standing'], []]);
+
+// The model beside the harness is what the harness last reported, and nothing when st says none.
+assert.equal(agentModel({ usage: { context: { model: 'claude-sonnet-5-5' } } }), 'claude-sonnet-5-5');
+assert.equal(agentModel({ usage: { context: { model: ' ' } } }), null);
+assert.equal(agentModel({ usage: { context: null } }), null);
+assert.equal(agentModel({ usage: null }), null);
+assert.equal(agentModel({}), null);
 
 // Signed out of its provider: needs login, said how, and it clears once signed in again.
 import { agentState as stateOf, loginGuidance } from './agentsView.ts';

@@ -41,6 +41,11 @@ export function agentName(agent: Pick<Agent, 'id' | 'name'>): string {
   return label(slug);
 }
 
+// The model its harness last reported using, as reported ("claude-sonnet-5-5"); null when st says none.
+export function agentModel(agent: { usage?: { context?: { model?: string | null } | null } | null }): string | null {
+  return agent.usage?.context?.model?.trim() || null;
+}
+
 export function harnessName(driver: string | null | undefined): string {
   const value = driver ?? '';
   if (value.includes('claude')) return 'claude';
