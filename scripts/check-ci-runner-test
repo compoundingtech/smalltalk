@@ -40,6 +40,7 @@ def check(name, pages, expected=None, api=True, **overrides):
             "REPOSITORY": "example/project",
             "HEAD_REPOSITORY": "example/project",
             "OWNER": "example",
+            "PR_LABELS": "[]",
             "NEED": "1",
             "GITHUB_OUTPUT": str(output),
             "GITHUB_STEP_SUMMARY": str(summary),
@@ -74,3 +75,9 @@ check("API failure falls back", idle, API_EXIT="1")
 check("invalid API response falls back", idle, API_RESPONSE="not JSON")
 check("zero minimum fails closed", idle, api=False, NEED="0")
 check("invalid minimum fails closed", idle, api=False, NEED="invalid")
+
+check("priority PR uses reserved capacity even while all ordinary runners are busy", [], "ci1-priority", PR_LABELS='["ci-priority"]', api=False)
+check("priority PR needs no status token", [], "ci1-priority", PR_LABELS='["ci-priority"]', GH_TOKEN="", api=False)
+check("priority cannot bypass the fork boundary", idle, PR_LABELS='["ci-priority"]', HEAD_REPOSITORY="fork/project", api=False)
+check("unrelated labels preserve normal routing", idle, "ci1", PR_LABELS='["area:ci"]')
+check("malformed labels preserve normal routing", idle, "ci1", PR_LABELS='invalid')

@@ -20,7 +20,8 @@ export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-a
  * runs when no general runner is available. The other jobs may wait briefly on ci1. GitHub has no
  * overflow between runner labels, so the `pick-runner` job asks the
  * GitHub API how many ci1 runners are idle before the other jobs start, and their `runs-on` reads its
- * output. Merge-queue runs always use the reserved `ci1-merge` label and wait for that pool,
+ * output. Trusted PRs labelled `ci-priority` use the reserved `ci1-priority` lane.
+ * Merge-queue runs always use the reserved `ci1-merge` label and wait for that pool,
  * instead of moving to a busy Namespace pool when a reserved runner is occupied.
  *
  * Off unless the repository variable `CI1_RUNNERS` is `on`: then `pick-runner` is skipped, its output
@@ -42,7 +43,7 @@ export const pickRunnerJob = {
   outputs: { ci1: '${{ steps.pick.outputs.ci1 }}' },
   steps: [
     {
-      name: 'Use reserved ci1 for the queue; available ci1 for PRs',
+      name: 'Use reserved ci1 for priority PRs and the queue; available ci1 for PRs',
       id: 'pick',
       env: {
         // A token that may only read the organization's self-hosted runners. Forks never receive it.
@@ -50,6 +51,7 @@ export const pickRunnerJob = {
         EVENT: '${{ github.event_name }}',
         REPOSITORY: '${{ github.repository }}',
         HEAD_REPOSITORY: '${{ github.event.pull_request.head.repo.full_name }}',
+        PR_LABELS: '${{ toJSON(github.event.pull_request.labels.*.name) }}',
         OWNER: '${{ github.repository_owner }}',
         NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1MinIdle}' }}`,
       },
@@ -60,6 +62,12 @@ export const pickRunnerJob = {
 }
 if [ "$EVENT" = pull_request ] && [ "$HEAD_REPOSITORY" != "$REPOSITORY" ]; then
   namespace "a pull request from a fork never runs on ci1"
+fi
+if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_LABELS" >/dev/null 2>&1; then
+  printf 'ci1=["ci1-priority"]\\n' >> "$GITHUB_OUTPUT"
+  echo "priority PR: reserved ci1-priority capacity"
+  printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\\n' >> "$GITHUB_STEP_SUMMARY"
+  exit 0
 fi
 if [ "$EVENT" = merge_group ]; then
   printf 'ci1=["ci1-merge"]\\n' >> "$GITHUB_OUTPUT"

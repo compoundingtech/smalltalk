@@ -271,6 +271,9 @@ through the API and picks one pool for the whole run:
 
 - `ci1` when at least `CI1_MIN_IDLE` (default 1) general runners are online and idle. Work starts
   on available capacity; the remaining jobs can wait briefly for a runner;
+- `ci1-priority` for trusted PRs labelled `ci-priority`, without an idle-count or token dependency.
+  Pending urgent checks get the next free general runners; one slot stays reserved for priority
+  and merge work after urgent checks finish;
 - `ci1-merge` for every merge-group run while ci1 is enabled. These jobs wait for their reserved
   pool even when its runners are currently busy, and do not query the status API;
 - Namespace otherwise, exactly as above: when ci1 is busy or offline, when the runner list is
@@ -280,6 +283,13 @@ through the API and picks one pool for the whole run:
 Every other job's `runs-on` reads `pick-runner`'s output and falls back to its Namespace label when
 the output is empty. The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
 names its three stages instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
+Priority selection follows the fork boundary, so a fork label cannot reach a self-hosted runner.
+The private host controller keeps the priority slot out of the ordinary pool and removes its merge
+label while urgent required checks are pending. It also lends the other general runners to
+priority work during that interval, so queued ordinary work cannot take the next free slot.
+A guard applies labels after every ephemeral registration, before the runner accepts work.
+It changes labels without interrupting running jobs; the dedicated merge runner stays available.
+
 Two runs that pick at the same moment can both choose ci1; the later run's jobs then wait for
 runners on ci1.
 
