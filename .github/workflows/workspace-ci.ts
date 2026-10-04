@@ -1,3 +1,4 @@
+import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import {
   effectUtilsBinaryCaches,
   namespaceRunner,
@@ -103,7 +104,7 @@ export const buildEnv = { CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG
 export const cargoCacheStep = {
   name: 'Restore the Cargo target and registry',
   id: 'cargo-cache',
-  if: "env.CI_LOCAL_CACHES != '1'",
+  if: "env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'",
   uses: 'actions/cache@v4',
   with: {
     path: '${{ github.workspace }}/target\n${{ runner.temp }}/cargo-home/registry\n${{ runner.temp }}/cargo-home/git',
@@ -115,7 +116,7 @@ export const cargoCacheStep = {
 export const nixCacheStep = {
   name: 'Restore the local Nix cache',
   id: 'nix-cache',
-  if: "env.CI_LOCAL_CACHES != '1'",
+  if: "env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'",
   uses: 'actions/cache@v4',
   with: {
     path: '${{ runner.temp }}/st-ci-cache',
@@ -135,14 +136,17 @@ export const commonSetupSteps = [
   // the archives below there would only cost time.
   {
     name: 'Use the runner\'s own caches',
-    run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi',
+    run: `if [ -n "\${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
+printf 'CARGO_HOME=%s\\nCI_CACHE_DIR=%s\\n' "\${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"`,
   },
   // actions/cache is served by Namespace's accelerated cache backend and is keyed, not tied to a node.
   // Namespace cache volumes are per node and replicate in the background, so a job on another node
   // starts empty. /nix itself cannot be cached (see scripts/ci-nix-cache); RUNNER_TEMP/st-ci-cache holds a
   // local Nix binary cache instead. Linux only: the key names the job, so each stage keeps its own.
+  buildSnapshotRestore,
   cargoCacheStep,
   nixCacheStep,
+  buildSnapshotPrepare,
   ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
   {
     name: 'Isolate test home and XDG state',
@@ -231,6 +235,7 @@ export const linuxStageJob = ({
       if: 'success()',
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
+    ...buildSnapshotSave,
     {
       name: 'Retain stage logs and timings',
       uses: 'actions/upload-artifact@v4',
@@ -250,6 +255,7 @@ export const linuxStageJob = ({
  */
 export const perfStoresCache = (stage: string) => ({
   name: 'Restore the generated stores',
+  if: "env.CI_BUILD_SNAPSHOT_STORES_HIT != '1'",
   uses: 'actions/cache@v4',
   with: {
     path: '${{ runner.temp }}/st-bench',

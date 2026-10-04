@@ -10,7 +10,8 @@ def coverage(entries):
     for entry in entries:
         name = entry['name']
         if entry.get('outcome') == 'skipped':
-            state = 'SKIPPED (persistent runner store)' if os.environ.get('CI_LOCAL_CACHES') == '1' else 'SKIPPED (step condition)'
+            state = ('SKIPPED (persistent runner store)' if os.environ.get('CI_LOCAL_CACHES') == '1' else
+                     'SKIPPED (same-source snapshot HIT)' if os.environ.get('CI_BUILD_SNAPSHOT_HIT') == '1' else 'SKIPPED (step condition)')
         elif entry.get('outcome') != 'success':
             state = 'UNAVAILABLE'
             warnings.append(f'P0: {name} cache lookup/restore did not complete')
@@ -19,7 +20,11 @@ def coverage(entries):
         else:
             state = ('FALLBACK; exact key MISS' if entry.get('matched') else
                      'exact key MISS (fallback status not exposed)' if entry.get('opaqueFallback') else 'MISS')
-            warnings.append(f'P0: {name} cache {state}; check changed inputs, scope and eviction')
+            if entry.get('sourceOnly') and entry.get('avoidable') != 'true':
+                state = 'MISS (source needs a saved build)'
+                warnings.append(f'{name} cache MISS; dependency caches remain available')
+            else:
+                warnings.append(f'P0: {name} cache {state}; check changed inputs, scope and eviction')
         rows.append(f'| {name} | {state} |')
     return rows, warnings
 

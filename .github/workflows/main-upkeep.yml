@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: "main-upkeep-${{ github.run_id }}"
@@ -112,11 +113,20 @@ jobs:
           persist-credentials: false
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Use the runner's own caches
-        run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi'
+        run: |
+          if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - id: build-snapshot
+        name: Restore the exact-source build snapshot
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" restore'
       - name: Restore the Cargo target and registry
         id: cargo-cache
-        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1')
         uses: actions/cache@v4
         with:
           path: |
@@ -127,12 +137,15 @@ jobs:
           restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
       - name: Restore the local Nix cache
         id: nix-cache
-        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1')
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
           key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
           restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+      - name: Remember genuine source inputs before compiling
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -182,17 +195,33 @@ jobs:
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Build missing cache contents
         shell: bash
-        run: nix develop -c bash scripts/ci-cache-warm tests
+        run: nix develop . -c bash scripts/ci-cache-warm tests
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Save Nix outputs
         run: bash scripts/ci-nix-cache save
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - id: build-snapshot-save
+        name: Keep valid same-source build outputs
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled())
+        env:
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
+      - name: Retain the same-source build snapshot
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled() && steps.build-snapshot-save.outputs.publish == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
       - name: Report job cache coverage
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-probe.outcome }}","hit":"${{ steps.cargo-probe.outputs.cache-hit }}","matched":"${{ steps.cargo-probe.outputs.cache-matched-key }}","opaqueFallback":false,"lookup":true},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-probe.outcome }}","hit":"${{ steps.nix-probe.outputs.cache-hit }}","matched":"${{ steps.nix-probe.outputs.cache-matched-key }}","opaqueFallback":false,"lookup":true},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false}]'
-        run: python3 scripts/ci-cache-audit
+          CACHE_ENTRIES: '[{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-probe.outcome }}","hit":"${{ steps.cargo-probe.outputs.cache-hit }}","matched":"${{ steps.cargo-probe.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":true},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-probe.outcome }}","hit":"${{ steps.nix-probe.outputs.cache-hit }}","matched":"${{ steps.nix-probe.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":true},{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   linux-clippy:
     name: warm-clippy
     runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
@@ -244,11 +273,20 @@ jobs:
           persist-credentials: false
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Use the runner's own caches
-        run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi'
+        run: |
+          if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - id: build-snapshot
+        name: Restore the exact-source build snapshot
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" restore'
       - name: Restore the Cargo target and registry
         id: cargo-cache
-        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1')
         uses: actions/cache@v4
         with:
           path: |
@@ -259,12 +297,15 @@ jobs:
           restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
       - name: Restore the local Nix cache
         id: nix-cache
-        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1')
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
           key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
           restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+      - name: Remember genuine source inputs before compiling
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -292,17 +333,33 @@ jobs:
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Build missing cache contents
         shell: bash
-        run: nix develop -c bash scripts/ci-cache-warm clippy
+        run: nix develop . -c bash scripts/ci-cache-warm clippy
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Save Nix outputs
         run: bash scripts/ci-nix-cache save
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - id: build-snapshot-save
+        name: Keep valid same-source build outputs
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled())
+        env:
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
+      - name: Retain the same-source build snapshot
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled() && steps.build-snapshot-save.outputs.publish == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
       - name: Report job cache coverage
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-probe.outcome }}","hit":"${{ steps.cargo-probe.outputs.cache-hit }}","matched":"${{ steps.cargo-probe.outputs.cache-matched-key }}","opaqueFallback":false,"lookup":true},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-probe.outcome }}","hit":"${{ steps.nix-probe.outputs.cache-hit }}","matched":"${{ steps.nix-probe.outputs.cache-matched-key }}","opaqueFallback":false,"lookup":true},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false}]'
-        run: python3 scripts/ci-cache-audit
+          CACHE_ENTRIES: '[{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-probe.outcome }}","hit":"${{ steps.cargo-probe.outputs.cache-hit }}","matched":"${{ steps.cargo-probe.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":true},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-probe.outcome }}","hit":"${{ steps.nix-probe.outputs.cache-hit }}","matched":"${{ steps.nix-probe.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":true},{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   linux-fleet-compat:
     name: warm-fleet-compat
     runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
@@ -354,11 +411,20 @@ jobs:
           persist-credentials: false
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Use the runner's own caches
-        run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi'
+        run: |
+          if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - id: build-snapshot
+        name: Restore the exact-source build snapshot
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" restore'
       - name: Restore the Cargo target and registry
         id: cargo-cache
-        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1')
         uses: actions/cache@v4
         with:
           path: |
@@ -369,12 +435,15 @@ jobs:
           restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
       - name: Restore the local Nix cache
         id: nix-cache
-        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1')
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
           key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
           restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+      - name: Remember genuine source inputs before compiling
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -402,17 +471,286 @@ jobs:
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Build missing cache contents
         shell: bash
-        run: nix develop -c bash scripts/ci-cache-warm fleet-compat
+        run: nix develop . -c bash scripts/ci-cache-warm fleet-compat
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Save Nix outputs
         run: bash scripts/ci-nix-cache save
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - id: build-snapshot-save
+        name: Keep valid same-source build outputs
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled())
+        env:
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
+      - name: Retain the same-source build snapshot
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled() && steps.build-snapshot-save.outputs.publish == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
       - name: Report job cache coverage
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-probe.outcome }}","hit":"${{ steps.cargo-probe.outputs.cache-hit }}","matched":"${{ steps.cargo-probe.outputs.cache-matched-key }}","opaqueFallback":false,"lookup":true},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-probe.outcome }}","hit":"${{ steps.nix-probe.outputs.cache-hit }}","matched":"${{ steps.nix-probe.outputs.cache-matched-key }}","opaqueFallback":false,"lookup":true},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false}]'
-        run: python3 scripts/ci-cache-audit
+          CACHE_ENTRIES: '[{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-probe.outcome }}","hit":"${{ steps.cargo-probe.outputs.cache-hit }}","matched":"${{ steps.cargo-probe.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":true},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-probe.outcome }}","hit":"${{ steps.nix-probe.outputs.cache-hit }}","matched":"${{ steps.nix-probe.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":true},{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
+  genie-freshness:
+    name: warm-genie
+    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Restore the local Nix cache
+        id: nix-probe
+        if: success()
+        uses: actions/cache/restore@v4
+        with:
+          path: "${{ runner.temp }}/st-ci-cache"
+          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: ""
+          lookup-only: true
+      - name: Report cache coverage
+        env:
+          CARGO_HIT: not used
+          NIX_HIT: ${{ steps.nix-probe.outputs.cache-hit }}
+        run: |
+          printf 'Main cache coverage: Cargo=%s, Nix=%s\n' "$CARGO_HIT" "$NIX_HIT" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$NIX_HIT" != true ]; then
+            echo "::warning::P0: missing main-scope cache; filling it for Namespace overflow and pull requests"
+          fi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - name: Use the runner's own caches
+        run: |
+          if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - id: build-snapshot
+        name: Restore the exact-source build snapshot
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" restore'
+      - name: Restore the local Nix cache
+        id: nix-cache
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1')
+        uses: actions/cache@v4
+        with:
+          path: "${{ runner.temp }}/st-ci-cache"
+          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+      - name: Remember genuine source inputs before compiling
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - name: Isolate test home and XDG state
+        run: |
+          # Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
+          # and actions/cache expands a leading tilde against the HOME of the step that runs it.
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
+          home="$RUNNER_TEMP/test-home"
+          mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - name: Use the cached Nix outputs
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
+      - name: Build missing cache contents
+        shell: bash
+        run: "nix develop '.#genie' -c bash scripts/ci-cache-warm genie"
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - name: Save Nix outputs
+        run: bash scripts/ci-nix-cache save
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - id: build-snapshot-save
+        name: Keep valid same-source build outputs
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled())
+        env:
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
+      - name: Retain the same-source build snapshot
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled() && steps.build-snapshot-save.outputs.publish == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_ENTRIES: '[{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-probe.outcome }}","hit":"${{ steps.nix-probe.outputs.cache-hit }}","matched":"${{ steps.nix-probe.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":true},{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
+  isolation-vm:
+    name: warm-isolation-vm
+    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Restore the Cargo target and registry
+        id: cargo-probe
+        if: success()
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ runner.temp }}/cargo-home/registry
+            ${{ runner.temp }}/cargo-home/git
+          key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config.toml') }}"
+          restore-keys: ""
+          lookup-only: true
+      - name: Restore the local Nix cache
+        id: nix-probe
+        if: success()
+        uses: actions/cache/restore@v4
+        with:
+          path: "${{ runner.temp }}/st-ci-cache"
+          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: ""
+          lookup-only: true
+      - name: Report cache coverage
+        env:
+          CARGO_HIT: ${{ steps.cargo-probe.outputs.cache-hit }}
+          NIX_HIT: ${{ steps.nix-probe.outputs.cache-hit }}
+        run: |
+          printf 'Main cache coverage: Cargo=%s, Nix=%s\n' "$CARGO_HIT" "$NIX_HIT" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CARGO_HIT" != true ] || [ "$NIX_HIT" != true ]; then
+            echo "::warning::P0: missing main-scope cache; filling it for Namespace overflow and pull requests"
+          fi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - name: Use the runner's own caches
+        run: |
+          if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - id: build-snapshot
+        name: Restore the exact-source build snapshot
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" restore'
+      - name: Restore the Cargo target and registry
+        id: cargo-cache
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1')
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ runner.temp }}/cargo-home/registry
+            ${{ runner.temp }}/cargo-home/git
+          key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config.toml') }}"
+          restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
+      - name: Restore the local Nix cache
+        id: nix-cache
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1')
+        uses: actions/cache@v4
+        with:
+          path: "${{ runner.temp }}/st-ci-cache"
+          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+      - name: Remember genuine source inputs before compiling
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - name: Isolate test home and XDG state
+        run: |
+          # Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
+          # and actions/cache expands a leading tilde against the HOME of the step that runs it.
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
+          home="$RUNNER_TEMP/test-home"
+          mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - name: Use the cached Nix outputs
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
+        run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
+      - name: Build missing cache contents
+        shell: bash
+        run: nix develop . -c bash scripts/ci-cache-warm isolation-vm
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - name: Save Nix outputs
+        run: bash scripts/ci-nix-cache save
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - id: build-snapshot-save
+        name: Keep valid same-source build outputs
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled())
+        env:
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
+      - name: Retain the same-source build snapshot
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled() && steps.build-snapshot-save.outputs.publish == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_ENTRIES: '[{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-probe.outcome }}","hit":"${{ steps.cargo-probe.outputs.cache-hit }}","matched":"${{ steps.cargo-probe.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":true},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-probe.outcome }}","hit":"${{ steps.nix-probe.outputs.cache-hit }}","matched":"${{ steps.nix-probe.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":true},{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   typescript-cache:
     name: warm-typescript
     runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
@@ -448,8 +786,8 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Cache locked TypeScript dependencies","outcome":"${{ steps.typescript-cache.outcome }}","hit":"${{ steps.typescript-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false}]'
-        run: python3 scripts/ci-cache-audit
+          CACHE_ENTRIES: '[{"name":"Cache locked TypeScript dependencies","outcome":"${{ steps.typescript-cache.outcome }}","hit":"${{ steps.typescript-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   perf-cost:
     name: perf-cost
     runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
@@ -468,10 +806,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Use the runner's own caches
-        run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi'
+        run: |
+          if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
+      - id: build-snapshot
+        name: Restore the exact-source build snapshot
+        if: env.CI_LOCAL_CACHES != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" restore'
       - name: Restore the Cargo target and registry
         id: cargo-cache
-        if: env.CI_LOCAL_CACHES != '1'
+        if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
         uses: actions/cache@v4
         with:
           path: |
@@ -482,12 +829,14 @@ jobs:
           restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
       - name: Restore the local Nix cache
         id: nix-cache
-        if: env.CI_LOCAL_CACHES != '1'
+        if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
           key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
           restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+      - name: Remember genuine source inputs before compiling
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -514,17 +863,34 @@ jobs:
       - name: Summarize tested revision
         run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
       - name: Restore the generated stores
+        if: env.CI_BUILD_SNAPSHOT_STORES_HIT != '1'
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-bench"
           key: "perf-cost-stores-${{ hashFiles('crates/st3/tests/daemon_bench.rs', 'docs/st3/schema.md') }}"
-        id: cache-8
+        id: cache-10
       - name: Run the cost check
         shell: bash
         run: nix develop -c bash scripts/ci-perf cost
       - name: Save Nix outputs to the local Nix cache
         if: success()
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
+      - id: build-snapshot-save
+        name: Keep valid same-source build outputs
+        if: "!cancelled()"
+        env:
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
+      - name: Retain the same-source build snapshot
+        if: "!cancelled() && steps.build-snapshot-save.outputs.publish == 'true'"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
       - name: Retain stage logs and timings
         uses: actions/upload-artifact@v4
         if: always()
@@ -538,5 +904,5 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false},{"name":"Restore the generated stores","outcome":"${{ steps.cache-8.outcome }}","hit":"${{ steps.cache-8.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false}]'
-        run: python3 scripts/ci-cache-audit
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the generated stores","outcome":"${{ steps.cache-10.outcome }}","hit":"${{ steps.cache-10.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'

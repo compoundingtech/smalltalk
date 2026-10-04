@@ -1,3 +1,4 @@
+import { buildSnapshotSave } from './build-snapshot.ts'
 import { auditCaches } from './cache-audit.ts'
 import { defaultActionlintConfig, githubWorkflow, nixDevelopStep } from '../../repos/effect-utils/genie/external.ts'
 import {
@@ -12,15 +13,15 @@ import {
 } from './workspace-ci.ts'
 
 const missing = "steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true'"
-const whenMissing = (steps: readonly unknown[]) => steps.map((value) => {
+const whenMissing = (steps: readonly unknown[], conditionMissing = missing) => steps.map((value) => {
   const step = value as Record<string, unknown>
   const condition = String(step.if ?? 'success()').replace(/\$\{\{|\}\}/g, '')
-  return { ...step, if: `success() && (${missing}) && (${condition})` }
+  return { ...step, if: `success() && (${conditionMissing}) && (${condition})` }
 })
 
 // Cache scope includes the ref: merge-group saves cannot replace main's cache saves. Probe main's
 // exact entries before provisioning Nix or restoring gigabytes; fill only missing entries.
-const warmJob = (stage: string, setup: readonly unknown[]) => ({
+const warmJob = (stage: string, setup: readonly unknown[], nixOnly = false) => ({
   name: `warm-${stage}`,
   'runs-on': linuxStageRunner,
   'timeout-minutes': 120,
@@ -28,7 +29,7 @@ const warmJob = (stage: string, setup: readonly unknown[]) => ({
   env: buildEnv,
   steps: [
     { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
-    ...[cargoCacheStep, nixCacheStep].map((step) => ({
+    ...(nixOnly ? [nixCacheStep] : [cargoCacheStep, nixCacheStep]).map((step) => ({
       ...step,
       if: 'success()',
       id: step.id === 'cargo-cache' ? 'cargo-probe' : 'nix-probe',
@@ -37,24 +38,25 @@ const warmJob = (stage: string, setup: readonly unknown[]) => ({
     })),
     {
       name: 'Report cache coverage',
-      env: { CARGO_HIT: '${{ steps.cargo-probe.outputs.cache-hit }}', NIX_HIT: '${{ steps.nix-probe.outputs.cache-hit }}' },
+      env: { CARGO_HIT: nixOnly ? 'not used' : '${{ steps.cargo-probe.outputs.cache-hit }}', NIX_HIT: '${{ steps.nix-probe.outputs.cache-hit }}' },
       run: `printf 'Main cache coverage: Cargo=%s, Nix=%s\\n' "$CARGO_HIT" "$NIX_HIT" >> "$GITHUB_STEP_SUMMARY"
-if [ "$CARGO_HIT" != true ] || [ "$NIX_HIT" != true ]; then
+if ${nixOnly ? '[ \"$NIX_HIT\" != true ]' : '[ \"$CARGO_HIT\" != true ] || [ \"$NIX_HIT\" != true ]'}; then
   echo "::warning::P0: missing main-scope cache; filling it for Namespace overflow and pull requests"
 fi`,
     },
     ...whenMissing([
       ...setup,
-      nixDevelopStep({ name: 'Build missing cache contents', command: ['bash', 'scripts/ci-cache-warm', stage] }),
+      nixDevelopStep({ name: 'Build missing cache contents', flake: stage === 'genie' ? '.#genie' : '.', command: ['bash', 'scripts/ci-cache-warm', stage] }),
       { name: 'Save Nix outputs', run: 'bash scripts/ci-nix-cache save' },
-    ]),
+      ...buildSnapshotSave,
+    ], nixOnly ? "steps.nix-probe.outputs.cache-hit != 'true'" : missing),
   ],
 })
 
 export default githubWorkflow(auditCaches({
   name: 'Main upkeep',
   on: { push: { branches: ['main'] }, workflow_dispatch: {} },
-  permissions: { contents: 'read' },
+  permissions: { contents: 'read', actions: 'read' },
   // Every main SHA keeps its upkeep run; a later merge must not cancel cache saves or cost checks.
   concurrency: { group: 'main-upkeep-${{ github.run_id }}', 'cancel-in-progress': false },
   actionlint: {
@@ -87,6 +89,8 @@ export default githubWorkflow(auditCaches({
     'linux-tests': warmJob('tests', workspacePreparationSteps),
     'linux-clippy': warmJob('clippy', commonSetupSteps),
     'linux-fleet-compat': warmJob('fleet-compat', commonSetupSteps),
+    'genie-freshness': warmJob('genie', commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')), true),
+    'isolation-vm': warmJob('isolation-vm', commonSetupSteps),
     'typescript-cache': {
       name: 'warm-typescript',
       'runs-on': linuxStageRunner,

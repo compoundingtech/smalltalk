@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   linux-x86_64:
@@ -24,19 +25,39 @@ jobs:
     timeout-minutes: 30
     env:
       SOURCE_SHA: ${{ inputs.source_sha }}
+      CI_NATIVE_SNAPSHOT: "1"
       TAG: ${{ inputs.tag }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Keep the immutable workflow helpers before selecting accepted source
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-tools"
+          cp scripts/ci-cache-audit scripts/ci-build-snapshot scripts/ci-perf-cache "$RUNNER_TEMP/ci-tools/"
+          cp .github/workflows/release-portable.yml "$RUNNER_TEMP/ci-tools/pipeline.yml"
+          printf 'CI_SNAPSHOT_PIPELINE_FILE=%s/ci-tools/pipeline.yml\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'CI_CACHE_AUDIT_SCRIPT=%s/ci-cache-audit\nCI_BUILD_SNAPSHOT_SCRIPT=%s/ci-build-snapshot\n' "$RUNNER_TEMP/ci-tools" "$RUNNER_TEMP/ci-tools" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - name: Restore portable Cargo dependencies
+      - id: build-snapshot
+        name: Restore the exact-source build snapshot
+        if: env.CI_LOCAL_CACHES != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" restore'
+      - if: env.CI_BUILD_SNAPSHOT_HIT != '1'
+        name: Restore portable Cargo dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: portable-linux-x86-64
           cache-on-failure: true
-        id: cache-2
+        id: cache-5
       - name: Verify accepted immutable source
         run: |
           set -euo pipefail
@@ -47,20 +68,40 @@ jobs:
           SHORT_SHA="$(git rev-parse --short=7 HEAD)"
           echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
 
+      - name: Remember genuine source inputs before compiling
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
       - name: Build and verify portable binary
         run: |
           set -euo pipefail
-          cargo build --release --locked
-          ./target/release/st2 --version | tee st2.version.txt
-          grep -F "$SHORT_SHA" st2.version.txt
-          file target/release/st2 | tee st2.file.txt
-          grep -F "ELF 64-bit LSB" st2.file.txt
-          readelf --program-headers target/release/st2 | tee st2.program-headers.txt
-          ! grep -F "/nix/store/" st2.program-headers.txt
-          grep -E "Requesting program interpreter: /(lib64|lib/x86_64-linux-gnu)/" st2.program-headers.txt
-          ldd target/release/st2 | tee st2.ldd.txt
-          ! grep -F "not found" st2.ldd.txt
+          mkdir -p "$RUNNER_TEMP/portable-proof"
+          export CARGO_ENCODED_RUSTFLAGS=
+          if [ "${CI_BUILD_SNAPSHOT_HIT:-}" != 1 ]; then cargo build --release --locked; fi
+          ./target/release/st2 --version | tee "$RUNNER_TEMP/portable-proof/st2.version.txt"
+          grep -F "$SHORT_SHA" "$RUNNER_TEMP/portable-proof/st2.version.txt"
+          file target/release/st2 | tee "$RUNNER_TEMP/portable-proof/st2.file.txt"
+          grep -F "ELF 64-bit LSB" "$RUNNER_TEMP/portable-proof/st2.file.txt"
+          readelf --program-headers target/release/st2 | tee "$RUNNER_TEMP/portable-proof/st2.program-headers.txt"
+          ! grep -F "/nix/store/" "$RUNNER_TEMP/portable-proof/st2.program-headers.txt"
+          grep -E "Requesting program interpreter: /(lib64|lib/x86_64-linux-gnu)/" "$RUNNER_TEMP/portable-proof/st2.program-headers.txt"
+          ldd target/release/st2 | tee "$RUNNER_TEMP/portable-proof/st2.ldd.txt"
+          ! grep -F "not found" "$RUNNER_TEMP/portable-proof/st2.ldd.txt"
 
+      - id: build-snapshot-save
+        name: Keep valid same-source build outputs
+        if: "!cancelled()"
+        env:
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
+      - name: Retain the same-source build snapshot
+        if: "!cancelled() && steps.build-snapshot-save.outputs.publish == 'true'"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
       - name: Package and checksum
         run: |
           set -euo pipefail
@@ -105,5 +146,5 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore portable Cargo dependencies","outcome":"${{ steps.cache-2.outcome }}","hit":"${{ steps.cache-2.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false}]'
-        run: python3 scripts/ci-cache-audit
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore portable Cargo dependencies","outcome":"${{ steps.cache-5.outcome }}","hit":"${{ steps.cache-5.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'

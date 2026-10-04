@@ -83,9 +83,9 @@ def remember_sources():
         mtimes={str(path): (work / path).lstat().st_mtime_ns for path in source_paths(work)})))
 
 
-def restore_sources():
+def restore_sources(checkpoint=None):
     work = Path(os.environ['GITHUB_WORKSPACE'])
-    checkpoint = Path(os.environ['RUNNER_TEMP']) / 'st-ci-cache/perf-source-state.json'
+    checkpoint = checkpoint or Path(os.environ['RUNNER_TEMP']) / 'st-ci-cache/perf-source-state.json'
     if not checkpoint.exists():
         print('Performance source timestamps: no saved checkpoint', flush=True)
         return

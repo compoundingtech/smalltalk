@@ -35,6 +35,7 @@ fleet_compat() {
 }
 
 clippy_and_codegen() {
+  python3 scripts/ci-build-snapshot-test || return
   python3 scripts/clippy-ratchet-test || return
   cargo metadata --no-deps --format-version 1 --locked > "$logs/clippy-metadata.json" || return
   rustc --version > "$logs/clippy-rustc.txt" || return

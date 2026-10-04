@@ -1,3 +1,4 @@
+import { buildSnapshotSave } from './build-snapshot.ts'
 import { auditCaches } from './cache-audit.ts'
 import {
   defaultActionlintConfig,
@@ -72,6 +73,7 @@ const linuxStageJob = ({
       if: "success() && env.CI_LOCAL_CACHES != '1'",
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
+    ...buildSnapshotSave,
     {
       name: 'Retain stage logs and timings',
       uses: 'actions/upload-artifact@v4',
@@ -97,7 +99,7 @@ export default githubWorkflow(auditCaches({
     // preserves perf-cost and fills missing default-branch caches without repeating this gate.
     workflow_dispatch: {},
   },
-  permissions: { contents: 'read' },
+  permissions: { contents: 'read', actions: 'read' },
   concurrency: {
     // PR updates replace stale checks; every other run has its own group so pending pushes survive.
     group: 'workspace-${{ github.event.pull_request.number || github.run_id }}-${{ github.event_name }}',
@@ -148,6 +150,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
         ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
         nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
+        ...buildSnapshotSave,
       ],
     },
     // Check the shared client and its iOS consumer before merge.
@@ -302,6 +305,7 @@ jq -r '"| VM boot | \\(.boot_seconds)s |\\n| systemd-scope tests in VM (extract 
 printf '| VM test driver total | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
         },
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
+        ...buildSnapshotSave,
       ],
     },
   },

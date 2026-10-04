@@ -45,6 +45,9 @@ with tempfile.TemporaryDirectory() as tmp:
     rows, warnings = audit.coverage([dict(name='Cargo', outcome='success', hit='false', opaqueFallback=True)])
     assert 'fallback status not exposed' in rows[0] and len(warnings) == 1
 
+rows, warnings = audit.coverage([dict(name='Build', outcome='success', hit='false', sourceOnly=True, avoidable='true')])
+assert len(warnings) == 1 and warnings[0].startswith('P0:'), warnings
+
 caches = [dict(id=1, key='cargo-example', ref='refs/pull/1/merge'),
           dict(id=2, key='cargo-example', ref='refs/pull/2/merge'),
           dict(id=3, key='cargo-example', ref='refs/heads/main'),

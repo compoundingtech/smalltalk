@@ -16,6 +16,10 @@ on:
       - build.rs
       - crates/st-drivers/src/version.rs
       - scripts/release-smalltalk*
+      - scripts/ci-build-snapshot*
+      - scripts/ci-cache-audit*
+      - scripts/ci-perf-cache
+      - .github/workflows/build-snapshot.ts
       - scripts/install-release*
       - scripts/install-macos*
       - docs/st3/binary-releases.md
@@ -23,6 +27,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: "smalltalk-release-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}"
@@ -68,17 +73,26 @@ jobs:
     timeout-minutes: 90
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      CI_NATIVE_SNAPSHOT: "1"
       RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - id: build-snapshot
+        name: Restore the exact-source build snapshot
+        if: env.CI_LOCAL_CACHES != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" restore'
+      - if: env.CI_BUILD_SNAPSHOT_HIT != '1'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: "release-${{ matrix.target }}"
           cache-on-failure: true
-        id: cache-2
+        id: cache-3
       - name: Restore the stable Zig object cache
         uses: actions/cache@v4
         with:
@@ -88,11 +102,13 @@ jobs:
             .zig-cache
           key: "zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
           restore-keys: "zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-"
-        id: cache-3
+        id: cache-4
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
         with:
           version: 0.15.2
           use-cache: false
+      - name: Remember genuine source inputs before compiling
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
       - name: Test installer
         run: |
           scripts/install-release-test
@@ -101,6 +117,22 @@ jobs:
 
       - name: Build, package, and test extracted tools
         run: "scripts/release-smalltalk '${{ matrix.target }}' dist"
+      - id: build-snapshot-save
+        name: Keep valid same-source build outputs
+        if: "!cancelled()"
+        env:
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
+      - name: Retain the same-source build snapshot
+        if: "!cancelled() && steps.build-snapshot-save.outputs.publish == 'true'"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
       - uses: actions/upload-artifact@v4
         with:
           name: "release-${{ matrix.target }}"
@@ -111,8 +143,8 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Cargo release","outcome":"${{ steps.cache-2.outcome }}","hit":"${{ steps.cache-2.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false},{"name":"Restore the stable Zig object cache","outcome":"${{ steps.cache-3.outcome }}","hit":"${{ steps.cache-3.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false}]'
-        run: python3 scripts/ci-cache-audit
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Cargo release","outcome":"${{ steps.cache-3.outcome }}","hit":"${{ steps.cache-3.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the stable Zig object cache","outcome":"${{ steps.cache-4.outcome }}","hit":"${{ steps.cache-4.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   assemble:
     name: release-assemble
     needs: [build, installer]

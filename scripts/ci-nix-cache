@@ -52,6 +52,7 @@ case "$cmd" in
       xargs nix copy --to "$to" --no-check-sigs --no-recursive < "$cache.paths"
     fi
     roots=()
+    [ -e "$RUNNER_TEMP/vm-driver" ] && roots+=("$RUNNER_TEMP/vm-driver")
     # Performance keeps its small devShell closure as well as downloads, avoiding cold tool setup.
     [ -n "${CI_PERF_SHELL_ROOT:-}" ] && roots+=("$CI_PERF_SHELL_ROOT")
     [ -e "$RUNNER_TEMP/baseline" ] && roots+=("$RUNNER_TEMP/baseline")

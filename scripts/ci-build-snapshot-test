@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Restore real Cargo outputs; retain genuine identities and reject incompatible snapshots."""
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+from unittest.mock import patch
+
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parent.parent
+loader = importlib.machinery.SourceFileLoader('ci_build_snapshot', str(root / 'scripts/ci-build-snapshot'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+repo = 'example/project'
+run = dict(id=1, path='.github/workflows/fleet.yml', conclusion='success', event='pull_request',
+           head_sha='a' * 40, head_branch='example', head_repository=dict(full_name=repo), pull_requests=[dict(number=1)])
+event = dict(pull_request=dict(number=1, head=dict(sha='a' * 40, ref='example', repo=dict(full_name=repo))))
+assert module.trusted(run, event, repo)
+for key, value in [('head_sha', 'b' * 40), ('head_branch', 'other'), ('event', 'push'),
+                   ('path', '.github/workflows/other.yml'), ('head_repository', dict(full_name='other/project')),
+                   ('conclusion', 'cancelled'), ('pull_requests', [dict(number=2)])]:
+    assert not module.trusted(dict(run, **{key: value}), event, repo), key
+queue = dict(run, event='merge_group', head_branch='gh-readonly-queue/main/pr-1-example')
+assert module.trusted(queue, dict(merge_group=dict(head_sha='a' * 40)), repo)
+assert not module.trusted(queue, dict(merge_group=dict(head_sha='b' * 40)), repo)
+assert not module.trusted(dict(queue, head_branch='gh-readonly-queue/other/pr-1'), dict(merge_group=dict(head_sha='a' * 40)), repo)
+assert module.trusted(dict(run, event='push', head_branch='main'), {}, repo)
+assert not module.trusted(dict(run, event='pull_request', head_branch='main'), {}, repo)
+
+
+def command(*args, cwd, env=None):
+    result = subprocess.run(args, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode: raise AssertionError(result.stderr)
+    return result.stdout.strip(), result.stderr
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    base = Path(tmp)
+    work, temp, cargo = base / 'checkout', base / 'temp', base / 'cargo-home'
+    work.mkdir(); temp.mkdir(); cargo.mkdir()
+    (work / 'src').mkdir()
+    agent = work / 'crates/agent-spec'
+    (agent / 'src').mkdir(parents=True)
+    shutil.copy(root / 'build.rs', work / 'build.rs')
+    shutil.copy(root / 'crates/agent-spec/build.rs', agent / 'build.rs')
+    (work / '.gitignore').write_text('/target/\n')
+    (work / 'Cargo.toml').write_text('[package]\nname="snapshot-fixture"\nversion="0.1.0"\nedition="2024"\n[dependencies]\nagent-spec={path="crates/agent-spec"}\n[workspace]\nmembers=["crates/agent-spec"]\n')
+    (agent / 'Cargo.toml').write_text('[package]\nname="agent-spec"\nversion="0.1.0"\nedition="2024"\n')
+    (agent / 'src/lib.rs').write_text('pub const REV: &str = env!("AGENT_SPEC_REVISION");\n')
+    (work / 'src/main.rs').write_text('fn main() { println!("{}|{}", env!("ST_BUILD_STAMP_LOCAL"), agent_spec::REV); }\n')
+    command('git', 'init', '-q', cwd=work)
+    environment = {key: value for key, value in os.environ.items() if key not in ('RUSTC_WRAPPER', 'RUSTFLAGS', 'AGENT_SPEC_REVISION', 'CARGO_TARGET_DIR', 'CI_LOCAL_CACHES', 'CI_BUILD_SNAPSHOT_HIT', 'CI_NATIVE_SNAPSHOT', 'CI_SNAPSHOT_PIPELINE_FILE', 'CI_SNAPSHOT_PIPELINE', 'GITHUB_WORKFLOW_REF')}
+    environment.update(CARGO_HOME=str(cargo), CARGO_INCREMENTAL='0', CARGO_ENCODED_RUSTFLAGS='')
+    command('cargo', 'generate-lockfile', cwd=work, env=environment)
+    command('git', 'add', '.', cwd=work)
+    def commit():
+        command('git', '-c', 'user.name=Example', '-c', 'user.email=example@example.invalid',
+                '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '-qam', 'Fixture source', cwd=work)
+        return command('git', 'rev-parse', 'HEAD', cwd=work)[0]
+    head = commit()
+    env_file, output, summary = (temp / name for name in ('env', 'output', 'summary'))
+    event_path = temp / 'event.json'
+    actual_event = dict(pull_request=dict(number=1, head=dict(sha=head, ref='example', repo=dict(full_name=repo))))
+    event_path.write_text(json.dumps(actual_event))
+    environment.update(GITHUB_WORKSPACE=str(work), RUNNER_TEMP=str(temp), GITHUB_JOB='fixture',
+                       RUNNER_OS='Linux', RUNNER_ARCH='X64', GITHUB_ENV=str(env_file),
+                       GITHUB_OUTPUT=str(output), GITHUB_STEP_SUMMARY=str(summary),
+                       GITHUB_EVENT_PATH=str(event_path), GITHUB_REPOSITORY=repo,
+                       GITHUB_RUN_ID='1', GITHUB_RUN_ATTEMPT='2')
+    with patch.dict(os.environ, environment, clear=True):
+        module.prepare()
+        os.environ['AGENT_SPEC_REVISION'] = head
+        _, cold = command('cargo', 'build', '--locked', '-vv', cwd=work, env=dict(os.environ))
+        assert 'Compiling snapshot-fixture' in cold and 'Compiling agent-spec' in cold
+        binary = work / 'target/debug/snapshot-fixture'
+        stamp, revision = command(str(binary), cwd=base)[0].split('|')
+        assert json.loads(stamp)['dirty'] is False and revision == head
+        assert json.loads(stamp)['rev'] == command('git', 'rev-parse', '--short', 'HEAD', cwd=work)[0]
+        assert json.loads(stamp)['commitTs'] == int(command('git', 'log', '-1', '--format=%ct', cwd=work)[0])
+        name = module.fingerprint()
+        for key, value in [('RUNNER_ARCH', 'ARM64'), ('RUNNER_OS', 'macOS'), ('RUSTFLAGS', '-C opt-level=1'), ('CARGO_PROFILE_DEV_DEBUG', '0')]:
+            with patch.dict(os.environ, {key: value}): assert module.fingerprint() != name
+        pipeline = temp / 'pipeline.yml'; pipeline.write_text('pipeline one\n')
+        with patch.dict(os.environ, CI_SNAPSHOT_PIPELINE_FILE=str(pipeline)):
+            one = module.fingerprint()
+            pipeline.write_text('pipeline two\n')
+            assert module.fingerprint() != one
+        check_output = subprocess.check_output
+        with patch.dict(os.environ, CI_NATIVE_SNAPSHOT='1'):
+            def compiler(value):
+                return lambda args, **kwargs: value if args[0] in ('rustc', 'xcrun') else check_output(args, **kwargs)
+            with patch.object(subprocess, 'check_output', side_effect=compiler('compiler one')): one = module.fingerprint()
+            with patch.object(subprocess, 'check_output', side_effect=compiler('compiler two')): assert module.fingerprint() != one
+        # Archive actual Cargo fingerprints and outputs with PAX nanoseconds, then
+        # use the same restore path as a fresh Namespace runner / targeted rerun.
+        (temp / 'st-bench').mkdir(); (temp / 'perf').mkdir()
+        (temp / 'st-bench/generated-fixture').write_text('store fixture')
+        (temp / 'perf/cost.json').write_text(json.dumps(dict(failures=[])))
+        module.pack()
+        archive = temp / 'ci-build-snapshot/build.tar.zst'
+        saved = base / 'saved.tar.zst'; shutil.copy(archive, saved)
+        shutil.rmtree(work / 'target')
+        shutil.rmtree(cargo / 'registry'); shutil.rmtree(cargo / 'git')
+        shutil.rmtree(temp / 'st-ci-cache')
+        for path in module.source.source_paths(work):
+            os.utime(work / path, None, follow_symlinks=False)
+        index = work / '.git/index'
+        index_mtime = index.stat().st_mtime_ns
+        actual_run = dict(run, head_sha=head)
+        def api(path):
+            if '/artifacts?' in path:
+                return dict(artifacts=[dict(name=name, expired=False, workflow_run=dict(id=1))])
+            if path.endswith('/attempts/1'): return actual_run
+            return dict(actual_run, conclusion=None)
+        def download(repo, run, artifact, destination):
+            destination.mkdir(); shutil.copy(saved, destination / 'build.tar.zst')
+        with patch.object(module.source, 'api', side_effect=api), patch.object(module.source, 'download', side_effect=download):
+            module.restore()
+        assert index.stat().st_mtime_ns == index_mtime, 'source restoration must not restamp Git metadata'
+        assert 'CI_BUILD_SNAPSHOT_STORES_HIT=1' in env_file.read_text()
+        assert (temp / 'st-bench/generated-fixture').read_text() == 'store fixture'
+        module.prepare()
+        _, warm = command('cargo', 'build', '--locked', '-vv', cwd=work, env=dict(os.environ))
+        assert 'Fresh snapshot-fixture' in warm and 'Fresh agent-spec' in warm and 'Compiling ' not in warm, warm
+        assert command(str(binary), cwd=base)[0] == stamp + '|' + revision
+        # Actual dirty and changed source must rebuild and retain their real identities.
+        (work / 'src/main.rs').write_text((work / 'src/main.rs').read_text() + '// changed source\n')
+        os.environ.pop('AGENT_SPEC_REVISION')
+        module.prepare()
+        _, dirty = command('cargo', 'build', '--locked', '-vv', cwd=work, env=dict(os.environ))
+        assert 'Compiling snapshot-fixture' in dirty
+        dirty_stamp, dirty_revision = command(str(binary), cwd=base)[0].split('|')
+        assert json.loads(dirty_stamp)['dirty'] is True and dirty_revision == 'local-dirty.' + head
+        new_head = commit()
+        assert module.fingerprint() != name
+        source_mtime = (work / 'src/main.rs').stat().st_mtime_ns
+        module.source.restore_sources(work / 'target/.ci-source-state.json')
+        assert (work / 'src/main.rs').stat().st_mtime_ns == source_mtime
+        module.prepare(); os.environ['AGENT_SPEC_REVISION'] = new_head
+        _, changed = command('cargo', 'build', '--locked', '-vv', cwd=work, env=dict(os.environ))
+        assert 'Compiling snapshot-fixture' in changed and 'Compiling agent-spec' in changed
+        changed_stamp, changed_revision = command(str(binary), cwd=base)[0].split('|')
+        assert json.loads(changed_stamp)['dirty'] is False and changed_revision == new_head
+        assert 'cache-hit=true' in output.read_text() and 'cache HIT' in summary.read_text()
+
+print('Build snapshot tests passed: real Cargo cold/warm/dirty/new-SHA builds, provenance, flags/compiler/pipeline isolation, PAX restoration')

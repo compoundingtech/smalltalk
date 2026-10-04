@@ -1,3 +1,4 @@
+import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import { auditCaches } from './cache-audit.ts'
 import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
 
@@ -25,6 +26,10 @@ export default githubWorkflow(auditCaches({
         "build.rs",
         "crates/st-drivers/src/version.rs",
         "scripts/release-smalltalk*",
+        "scripts/ci-build-snapshot*",
+        "scripts/ci-cache-audit*",
+        "scripts/ci-perf-cache",
+        ".github/workflows/build-snapshot.ts",
         "scripts/install-release*",
         "scripts/install-macos*",
         "docs/st3/binary-releases.md",
@@ -33,7 +38,8 @@ export default githubWorkflow(auditCaches({
     }
   },
   "permissions": {
-    "contents": "read"
+    "contents": "read",
+    "actions": "read"
   },
   "concurrency": {
     "group": "smalltalk-release-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}",
@@ -94,6 +100,7 @@ export default githubWorkflow(auditCaches({
       "timeout-minutes": 90,
       "env": {
         "MACOSX_DEPLOYMENT_TARGET": "15.0",
+        CI_NATIVE_SNAPSHOT: '1',
         "RELEASE_TAG": "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
       },
       "steps": [
@@ -106,7 +113,9 @@ export default githubWorkflow(auditCaches({
         {
           "uses": "dtolnay/rust-toolchain@stable"
         },
+        buildSnapshotRestore,
         {
+          if: "env.CI_BUILD_SNAPSHOT_HIT != '1'",
           "uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
           "with": {
             "key": "release-${{ matrix.target }}",
@@ -129,6 +138,7 @@ export default githubWorkflow(auditCaches({
             "use-cache": false
           }
         },
+        buildSnapshotPrepare,
         {
           "name": "Test installer",
           "run": "scripts/install-release-test\npython3 scripts/install-macos-test\npython3 scripts/release-smalltalk-test\n"
@@ -137,6 +147,7 @@ export default githubWorkflow(auditCaches({
           "name": "Build, package, and test extracted tools",
           "run": "scripts/release-smalltalk '${{ matrix.target }}' dist"
         },
+        ...buildSnapshotSave,
         {
           "uses": "actions/upload-artifact@v4",
           "with": {

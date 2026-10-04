@@ -1,3 +1,4 @@
+import { buildSnapshotSave } from './build-snapshot.ts'
 import { auditCaches } from './cache-audit.ts'
 import {
   defaultActionlintConfig,
@@ -14,7 +15,7 @@ export default githubWorkflow(auditCaches({
     pull_request: { types: ['opened', 'synchronize', 'reopened', 'labeled'] },
     push: { branches: ['main'] },
   },
-  permissions: { contents: 'read' },
+  permissions: { contents: 'read', actions: 'read' },
   concurrency: {
     // Main pushes run independently, including while earlier runs are still pending.
     group: 'macos-${{ github.event.pull_request.number || github.run_id }}',
@@ -37,6 +38,7 @@ export default githubWorkflow(auditCaches({
         },
         nixDevelopStep({ name: 'Cargo clippy', command: ['cargo', 'clippy', '--workspace', '--all-targets', '--locked'] }),
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
+        ...buildSnapshotSave,
       ],
     },
   },
