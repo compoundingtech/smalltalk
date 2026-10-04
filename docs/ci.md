@@ -368,6 +368,13 @@ Prefer `gh run rerun RUN_ID --job JOB_ID` for retrying only Performance (use the
 The measured targeted retry retained its preceding artifacts; the full workflow retry did not.
 Cargo and sccache validate source changes, preserving each build's real source identity.
 Build and store archives download and extract concurrently; the log records each one's timing.
+Snapshots also retain the input timestamps from before compilation. Restore those timestamps
+only for the exact saved Git SHA with a clean checkout, so a retry does not rebuild and relink
+unchanged sources merely because checkout refreshed their timestamps. Changed or dirty sources
+still take Cargo's normal validation path; the embedded source revision remains real.
+For a clean checkout Performance passes its actual full SHA as `AGENT_SPEC_REVISION`.
+The build script tracks that explicit value instead of unrelated Git index/ref timestamps.
+Dirty checkouts continue to derive their identity from Git.
 PR snapshots also remain for seven days, outside the shared dependency-cache pool.
 The compiler-cache server stays alive during cold store generation; publication does not require
 stopping it after the workload has finished writing compiler outputs.

@@ -51,6 +51,55 @@ def download(repo, run, name, dest):
                     '--name', name, '--dir', str(dest)], check=True)
 
 
+def git(work, *args):
+    return subprocess.check_output(['git', '-C', str(work), *args], text=True,
+                                   env=dict(os.environ, GIT_OPTIONAL_LOCKS='0')).rstrip('\n')
+
+
+def source_paths(work):
+    paths = set()
+    for name in git(work, 'ls-files', '-z').split('\0'):
+        if name:
+            path = Path(name)
+            paths.add(path)
+            paths.update(path.parents)
+    return {path for path in paths if (work / path).exists() or (work / path).is_symlink()}
+
+
+def remember_sources():
+    work = Path(os.environ['GITHUB_WORKSPACE'])
+    checkpoint = Path(os.environ['RUNNER_TEMP']) / 'perf-source-state.json'
+    checkpoint.unlink(missing_ok=True)
+    if git(work, 'status', '--porcelain'):
+        print('Performance source timestamps: dirty checkout; Cargo validates it normally', flush=True)
+        return
+    checkpoint.write_text(json.dumps(dict(head=git(work, 'rev-parse', 'HEAD'),
+        mtimes={str(path): (work / path).lstat().st_mtime_ns for path in source_paths(work)})))
+
+
+def restore_sources():
+    work = Path(os.environ['GITHUB_WORKSPACE'])
+    checkpoint = Path(os.environ['RUNNER_TEMP']) / 'st-ci-cache/perf-source-state.json'
+    if not checkpoint.exists():
+        print('Performance source timestamps: no saved checkpoint', flush=True)
+        return
+    state = json.loads(checkpoint.read_text())
+    if not isinstance(state, dict):
+        raise ValueError('invalid source timestamp checkpoint')
+    if state.get('head') != git(work, 'rev-parse', 'HEAD') or git(work, 'status', '--porcelain'):
+        print('Performance source timestamps: source changed; Cargo validates the new checkout', flush=True)
+        return
+    allowed = source_paths(work)
+    mtimes = state.get('mtimes')
+    if (not isinstance(mtimes, dict) or set(mtimes) != {str(path) for path in allowed}
+            or any(type(stamp) is not int or stamp < 0 for stamp in mtimes.values())):
+        raise ValueError('invalid source timestamp checkpoint')
+    for name, stamp in mtimes.items():
+        path = work / name
+        os.utime(path, ns=(path.lstat().st_atime_ns, stamp), follow_symlinks=False)
+    print('Performance source timestamps: restored for the exact clean source SHA', flush=True)
+
+
 def unpack(archive, destination, names):
     # These are main's own archives, but refuse unexpected roots before extracting.
     listing = subprocess.check_output(['tar', '--zstd', '-tf', str(archive)], text=True)
@@ -161,6 +210,7 @@ def restore():
         print(f'::warning::P0: Performance {kind} cache MISS; seed this recipe on main', flush=True)
     if reports == 0 and os.environ['GITHUB_EVENT_NAME'] == 'pull_request':
         raise ValueError('P0: every PR requires a saved main baseline; run Performance on main first')
+    restore_sources()
     print(f'Performance baseline: {reports} real successful main reports', flush=True)
     with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
         summary.write(f'Performance caches: build **{"HIT" if "build" in found else "MISS (P0)"}**, '
@@ -173,6 +223,13 @@ def pack():
     temp = Path(os.environ['RUNNER_TEMP'])
     output = temp / 'perf-snapshots'
     output.mkdir(exist_ok=True)
+    checkpoint = temp / 'perf-source-state.json'
+    saved = temp / 'st-ci-cache/perf-source-state.json'
+    saved.unlink(missing_ok=True)
+    if checkpoint.exists():
+        state = json.loads(checkpoint.read_text())
+        if state['head'] == git(work, 'rev-parse', 'HEAD') and not git(work, 'status', '--porcelain'):
+            shutil.copyfile(checkpoint, saved)
     # Registry source/config files contain no runner credentials; never archive all of CARGO_HOME.
     subprocess.run(['tar', '-I', 'zstd -1 -T2', '-cf', str(output / 'build.tar.zst'),
                     '-C', str(work), 'target', '-C', str(temp),
@@ -183,7 +240,7 @@ def pack():
 
 def main():
     try:
-        {'restore': restore, 'pack': pack}[sys.argv[1]]()
+        {'restore': restore, 'pack': pack, 'remember-sources': remember_sources}[sys.argv[1]]()
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
         print(f'::error::P0: Performance cache/baseline operation failed: {error}', file=sys.stderr)
         return 1

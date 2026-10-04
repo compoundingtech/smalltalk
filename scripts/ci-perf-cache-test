@@ -31,6 +31,63 @@ for field, value in [('scale', 0.1), ('claims', 0), ('seconds', 5), ('long_poll_
                      ('daemon_cores', True), ('seconds', None)]:
     assert not module.valid_report(dict(report, **{field: value}))
 assert not module.valid_report([]) and not module.valid_report(None)
+
+with tempfile.TemporaryDirectory() as tmp:
+    temp = Path(tmp)
+    work = temp / 'work'
+    (work / 'src').mkdir(parents=True)
+    source = work / 'src/main.rs'
+    source.write_text('fn main() {}\n')
+    (work / '.gitignore').write_text('target/\n')
+    def git_command(*args):
+        module.subprocess.run(['git', '-C', str(work), *args], check=True,
+                              stdout=module.subprocess.DEVNULL, stderr=module.subprocess.DEVNULL)
+    git_command('init', '-b', 'main')
+    git_command('add', '.')
+    git_command('-c', 'user.name=Example Builder', '-c', 'user.email=builder@example.invalid',
+                '-c', 'commit.gpgSign=false', 'commit', '-m', 'initial fixture')
+    os.environ.update(GITHUB_WORKSPACE=str(work), RUNNER_TEMP=str(temp))
+    (temp / 'st-ci-cache').mkdir()
+    module.remember_sources()
+    checkpoint = temp / 'st-ci-cache/perf-source-state.json'
+    checkpoint.write_bytes((temp / 'perf-source-state.json').read_bytes())
+    before = source.stat().st_mtime_ns
+    source.touch()
+    (work / '.git/index').touch()
+    index_after = (work / '.git/index').stat().st_mtime_ns
+    module.restore_sources()
+    assert source.stat().st_mtime_ns == before
+    assert (work / '.git/index').stat().st_mtime_ns == index_after, 'never rewrite Git metadata'
+    # A dirty tree or another real revision must never borrow old compilation timestamps.
+    source.write_text('fn main() { println!("changed"); }\n')
+    dirty_mtime = source.stat().st_mtime_ns
+    module.restore_sources()
+    assert source.stat().st_mtime_ns == dirty_mtime
+    git_command('add', '.')
+    git_command('-c', 'user.name=Example Builder', '-c', 'user.email=builder@example.invalid',
+                '-c', 'commit.gpgSign=false', 'commit', '-m', 'changed fixture')
+    module.restore_sources()
+    assert source.stat().st_mtime_ns == dirty_mtime
+    module.remember_sources()
+    state = json.loads((temp / 'perf-source-state.json').read_text())
+    state['mtimes']['../outside'] = 1
+    checkpoint.write_text(json.dumps(state))
+    try:
+        module.restore_sources()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('timestamp checkpoint may only address the checkout inputs')
+    for name in ('cargo-home/registry', 'cargo-home/git', 'perf-sccache', 'st-bench'):
+        (temp / name).mkdir(parents=True)
+    (work / 'target').mkdir()
+    module.remember_sources()
+    module.pack()
+    assert json.loads(checkpoint.read_text())['head'] == module.git(work, 'rev-parse', 'HEAD')
+    (work / 'untracked-source').write_text('changed during the test')
+    module.pack()
+    assert not checkpoint.exists(), 'a dirty build must not retain an older clean checkpoint'
+
 pr_run = dict(run, id=10, event='pull_request', head_branch='example-branch',
               head_repository=dict(full_name='example/project'), head_sha='b' * 40,
               pull_requests=[])
