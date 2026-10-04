@@ -2175,11 +2175,7 @@ pub fn clients_card(world: &World, width: usize) -> Doc {
                 } else {
                     item.client.as_str()
                 };
-                let who = match &item.device {
-                    Some(device) => format!("{} · {device}", item.who),
-                    None => item.who.clone(),
-                };
-                let mut head = vec![
+                let head = vec![
                     span(
                         if item.connected { "● " } else { "○ " },
                         theme::fg(if item.connected {
@@ -2188,19 +2184,24 @@ pub fn clients_card(world: &World, width: usize) -> Doc {
                             theme::QUIET
                         }),
                     ),
-                    span(format!("{name}  "), theme::text()),
-                    span(who, theme::soft()),
+                    span(name.to_owned(), theme::text()),
                 ];
-                if item.older {
-                    head.push(span("  older than this member", theme::dim()));
-                }
                 inner.line(Line::from(head));
-                let mut about = vec![item.via.clone(), item.member.clone(), item.when.clone()];
+                // Who, how it came in, what it follows and the quiet "older" note wrap under the
+                // name, so nothing clips at the card's edge.
+                let mut about = vec![match &item.device {
+                    Some(device) => format!("{} · {device}", item.who),
+                    None => item.who.clone(),
+                }];
+                about.extend([item.via.clone(), item.member.clone(), item.when.clone()]);
                 if !item.follows.is_empty() {
                     about.push(format!("follows {}", item.follows.join(", ")));
                 }
+                if item.older {
+                    about.push("older than this member".to_owned());
+                }
                 inner.wrap(
-                    &[run(about.join(" · "), theme::dim())],
+                    &[run(format!("  {}", about.join(" · ")), theme::dim())],
                     width.saturating_sub(4),
                 );
             }
