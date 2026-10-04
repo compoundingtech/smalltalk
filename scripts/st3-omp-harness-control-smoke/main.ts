@@ -18,5 +18,5 @@ const deadline=setTimeout(()=>proc.kill(),30000);
 const stderr=new Response(proc.stderr).text();
 proc.stdin.write(JSON.stringify({type:'prompt',message:'/exercise-control',id:'exercise'})+'\n');proc.stdin.flush();
 let stopping=false;
-for await(const bytes of proc.stdout){const text=new TextDecoder().decode(bytes);result+=text;process.stdout.write(text);if(!stopping&&result.includes('CONTROL_SHUTDOWN_READY')){stopping=true;proc.stdin.end();}if(result.includes('CONTROL_SUCCESS'))success=true;}
-clearTimeout(deadline);await proc.exited;console.log(await stderr);server.stop();await rm(profile,{recursive:true,force:true});if(!success)throw Error('Native control smoke failed');
+for await(const bytes of proc.stdout){const text=new TextDecoder().decode(bytes);result+=text;process.stdout.write(text);if(!stopping&&result.includes('CONTROL_SHUTDOWN_READY')){stopping=true;proc.stdin.write(JSON.stringify({type:'get_state',id:'shutdown-drain'})+'\n');proc.stdin.flush();}if(result.includes('CONTROL_SUCCESS'))success=true;}
+const exitCode=await proc.exited;console.log(await stderr);server.stop();await rm(profile,{recursive:true,force:true});clearTimeout(deadline);if(exitCode!==0||!success)throw Error(`Native control smoke failed (exit ${exitCode})`);

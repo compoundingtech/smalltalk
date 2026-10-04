@@ -173,6 +173,24 @@ public actor St3Client {
         return try JSONDecoder().decode(T.self, from: data)
     }
 
+    /// Encode the complete opaque identifier as one RFC 3986 path segment.
+    static func encodedPathSegment(_ value: String) -> String {
+        let hex = Array("0123456789ABCDEF".utf8)
+        var encoded = [UInt8]()
+        encoded.reserveCapacity(value.utf8.count)
+        for byte in value.utf8 {
+            switch byte {
+            case 65...90, 97...122, 48...57, 45, 46, 95, 126:
+                encoded.append(byte)
+            default:
+                encoded.append(37)
+                encoded.append(hex[Int(byte >> 4)])
+                encoded.append(hex[Int(byte & 15)])
+            }
+        }
+        return String(decoding: encoded, as: UTF8.self)
+    }
+
     static func routedSessionID(_ value: String) -> String {
         let innerID = value.hasPrefix("session/") ? String(value.dropFirst("session/".count)) : value
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~"))

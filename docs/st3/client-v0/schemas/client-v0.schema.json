@@ -47,7 +47,7 @@
     "AgentState": {"anyOf": [{"enum": ["desired", "starting", "running", "waiting", "stopped", "failed", "suspended"]}, {"type": "string"}], "description": "Desired/observed agent seat state. `suspended`: the seat was stopped at a quiet boundary and resumes its own native session; see `suspension`."},
     "AgentReachability": {"anyOf": [{"enum": ["local", "remote", "unreachable", "unknown", "reachable", "indeterminate"]}, {"type": "string"}], "description": "Whether the daemon can currently reach the agent runtime."},
     "TimelineStatus": {"anyOf": [{"enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Run status reported in a timeline `status` entry."},
-    "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`."},
+    "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "stale-harness-control", "unsupported-harness-control", "missing-queue-entry", "already-dispatched", "invalid-queue-content", "invalid-idempotency-key", "stale-queue", "queue-full", "invalid-queue-move", "queue-revision-exhausted", "stale-queue-cursor", "queue-metadata-too-large", "queue-entry-too-large", "unsupported-harness-model", "stale-harness-model", "unavailable-harness-model", "unsupported-harness-effort", "harness-control-busy", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`."},
     "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "owned-set"]}}}}]},
     "OwnedSet": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "claim", "receipt", "blockers", "members_status", "visibility"], "properties": {"kind": {"const": "owned-set"}, "claim": {"type": "string"}, "receipt": {"type": "object"}, "blockers": {"type": "array", "items": {"type": "string"}}, "members_status": {"type": "array", "items": {"type": "object"}}, "visibility": {"type": "object"}, "commit_status": {"type": ["object", "null"]}}}]},
     "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["tabs"], "properties": {"tabs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "ratio": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "First child share; absent means 0.5. Requires glasses capability version 2."}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
@@ -134,6 +134,9 @@
             { "$ref": "#/$defs/ConversationSearch" },
             { "$ref": "#/$defs/EventPage" },
             { "$ref": "#/$defs/ActionResult" },
+            { "$ref": "#/$defs/HarnessQueueView" },
+            { "$ref": "#/$defs/HarnessModelCatalogPage" },
+            { "$ref": "#/$defs/HarnessControlOperationReceipt" },
             { "$ref": "#/$defs/PairingChallenge" },
             { "$ref": "#/$defs/PairedSession" },
             { "$ref": "#/$defs/TerminalScreen" },
@@ -1801,13 +1804,49 @@
         "api_version": { "const": "st3.client.v0" },
         "id": { "$ref": "#/$defs/Id" },
         "type": {
-          "enum": ["custom.reply", "attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.ask", "work.done", "work.cancel-ask", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.create", "agent.stop", "agent.start", "agent.suspend", "agent.resume", "terminal.create", "terminal.end", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
+          "enum": ["custom.reply", "harness.queue.mutate", "harness.model.set", "attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.ask", "work.done", "work.cancel-ask", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.create", "agent.stop", "agent.start", "agent.suspend", "agent.resume", "terminal.create", "terminal.end", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
         },
         "idempotency_key": { "x-st-brand": "IdempotencyKey", "type": "string", "minLength": 16, "maxLength": 256 },
         "fence": { "$ref": "#/$defs/Fence" },
         "parameters": { "type": "object" }
       }
     },
+    "HarnessBinding": {
+      "type": "object", "additionalProperties": false, "required": ["desired_revision", "incarnation_id", "session_id", "turn_id"],
+      "properties": {"desired_revision": {"type": "string"}, "incarnation_id": {"type": "string"}, "session_id": {"type": "string"}, "turn_id": {"type": ["string", "null"]}}
+    },
+    "HarnessQueueMutation": {
+      "oneOf": [
+        {"type":"object", "additionalProperties":false, "required":["type","content","lane"],"properties":{"type":{"const":"enqueue"},"content":{"type":"string","minLength":1,"maxLength":65536},"lane":{"enum":["follow_up","steer"]}}},
+        {"type":"object", "additionalProperties":false, "required":["type","entry_id"],"properties":{"type":{"const":"move"},"entry_id":{"type":"string"},"before_id":{"type":["string","null"]}}},
+        {"type":"object", "additionalProperties":false, "required":["type","entry_id"],"properties":{"type":{"enum":["cancel","promote"]},"entry_id":{"type":"string"}}},
+        {"type":"object", "additionalProperties":false, "required":["type","entry_id","content"],"properties":{"type":{"const":"replace"},"entry_id":{"type":"string"},"content":{"type":"string","minLength":1,"maxLength":65536}}}
+      ]
+    },
+    "HarnessQueueParameters": {
+      "type": "object", "additionalProperties": false, "required": ["subject","binding","queue_revision","mutation"],
+      "properties": {"subject":{"type":"string"},"binding":{"$ref":"#/$defs/HarnessBinding"},"queue_revision":{"type":"integer","minimum":0},"mutation":{"$ref":"#/$defs/HarnessQueueMutation"}}
+    },
+    "HarnessQueueView": {
+      "type":"object", "additionalProperties":false, "required":["schema","subject","queue","native","cursor","total"],
+      "properties":{"schema":{"const":"harness-queue.v1"},"subject":{"type":"string"},"queue":{"$ref":"#/$defs/HarnessQueue"},"native":{"oneOf":[{"$ref":"#/$defs/HarnessControlState"},{"type":"null"}]},"cursor":{"type":["string","null"]},"total":{"type":"integer","minimum":0,"description":"All owner-pending entries, not only the entries in this page."}}
+    },
+    "HarnessOutcome":{"enum":["accepted","dispatched","applied","rejected","indeterminate","cancelled"]},
+    "HarnessInputResult":{"type":"object","additionalProperties":false,"required":["native_event","turn_id"],"properties":{"native_event":{"enum":["message_start","message_end"]},"turn_id":{"type":["string","null"]}}},
+    "HarnessModelResult":{"type":"object","additionalProperties":false,"required":["provider","id","effective_effort","atomic_model_effort"],"properties":{"provider":{"type":["string","null"]},"id":{"type":["string","null"]},"effective_effort":{"type":["string","null"]},"atomic_model_effort":{"const":false}}},
+    "HarnessNativeResult":{"oneOf":[{"$ref":"#/$defs/HarnessInputResult"},{"$ref":"#/$defs/HarnessModelResult"}]},
+    "HarnessControlReceipt":{"type":"object","additionalProperties":false,"required":["operation_id","subject","binding","entry_id","status","queue_revision","reason","result"],"properties":{"operation_id":{"type":"string"},"subject":{"type":"string"},"binding":{"$ref":"#/$defs/HarnessBinding"},"entry_id":{"type":["string","null"]},"status":{"$ref":"#/$defs/HarnessOutcome"},"queue_revision":{"type":"integer","minimum":0},"reason":{"type":["string","null"]},"result":{"oneOf":[{"$ref":"#/$defs/HarnessNativeResult"},{"type":"null"}]}}},
+    "HarnessQueueEntry":{"type":"object","additionalProperties":false,"required":["id","actor","content","lane","binding","status","operation_id","reason","result"],"properties":{"id":{"type":"string"},"actor":{"type":"string"},"content":{"type":"string"},"lane":{"enum":["follow_up","steer"]},"binding":{"$ref":"#/$defs/HarnessBinding"},"status":{"$ref":"#/$defs/HarnessOutcome"},"operation_id":{"type":"string"},"reason":{"type":["string","null"]},"result":{"oneOf":[{"$ref":"#/$defs/HarnessNativeResult"},{"type":"null"}]}}},
+    "HarnessModelChoice":{"type":"object","additionalProperties":false,"required":["provider","id","reasoning","supported_efforts"],"properties":{"provider":{"type":"string"},"id":{"type":"string"},"reasoning":{"type":"boolean"},"supported_efforts":{"type":"array","items":{"type":"string"}}}},
+    "HarnessSelectedModel":{"type":"object","additionalProperties":false,"required":["provider","id","configured_effort","effective_effort"],"properties":{"provider":{"type":"string"},"id":{"type":"string"},"configured_effort":{"type":"string","description":"Configured policy as reported natively; unknown when native observation cannot establish it."},"effective_effort":{"type":["string","null"],"description":"Observed native effective effort; distinct from configured policy."}}},
+    "HarnessModelsSummary":{"type":"object","additionalProperties":false,"required":["selected","revision","atomic_model_effort","available","complete","source","catalog_path"],"properties":{"selected":{"oneOf":[{"$ref":"#/$defs/HarnessSelectedModel"},{"type":"null"}]},"atomic_model_effort":{"const":false},"revision":{"type":"string"},"available":{"type":"boolean"},"complete":{"type":"boolean"},"source":{"type":"string"},"catalog_path":{"type":"string"}}},
+    "HarnessApproval":{"type":"object","additionalProperties":false,"required":["supported","reason"],"properties":{"supported":{"const":false},"reason":{"const":"native-live-approval-api-unavailable"}}},
+    "HarnessControlState":{"type":"object","additionalProperties":false,"required":["subject","binding","idle","input_supported","models","approval","reason"],"properties":{"subject":{"type":"string"},"binding":{"$ref":"#/$defs/HarnessBinding"},"idle":{"type":"boolean"},"input_supported":{"type":"boolean"},"models":{"$ref":"#/$defs/HarnessModelsSummary"},"approval":{"$ref":"#/$defs/HarnessApproval"},"reason":{"type":["string","null"]}}},
+    "HarnessQueue":{"type":"object","additionalProperties":false,"required":["authority","revision","entries"],"properties":{"authority":{"const":"owner"},"revision":{"type":"integer","minimum":0},"entries":{"type":"array","maxItems":100,"items":{"$ref":"#/$defs/HarnessQueueEntry"},"description":"This bounded page of owner-pending inputs."}}},
+    "HarnessModelParameters":{"type":"object","additionalProperties":false,"required":["subject","binding","model_revision","provider","model_id"],"properties":{"subject":{"type":"string"},"binding":{"$ref":"#/$defs/HarnessBinding"},"model_revision":{"type":"string"},"provider":{"type":"string"},"model_id":{"type":"string"},"effort":{"type":"string","description":"Omitted when no effort change is requested; explicit null is not accepted."}}},
+    "HarnessModelReceipt":{"type":"object","additionalProperties":false,"required":["operation_id","subject","binding","model_revision","status","reason","result"],"properties":{"operation_id":{"type":"string"},"subject":{"type":"string"},"binding":{"$ref":"#/$defs/HarnessBinding"},"model_revision":{"type":"string"},"status":{"$ref":"#/$defs/HarnessOutcome"},"reason":{"type":["string","null"]},"result":{"oneOf":[{"$ref":"#/$defs/HarnessModelResult"},{"type":"null"}]}}},
+    "HarnessControlOperationReceipt":{"oneOf":[{"$ref":"#/$defs/HarnessControlReceipt"},{"$ref":"#/$defs/HarnessModelReceipt"}]},
+    "HarnessModelCatalogPage":{"type":"object","additionalProperties":false,"required":["schema","subject","model_revision","selected","atomic_model_effort","available","complete","source","choices","cursor","total"],"properties":{"schema":{"const":"harness-models.v1"},"subject":{"type":"string"},"model_revision":{"type":"string"},"selected":{"oneOf":[{"$ref":"#/$defs/HarnessSelectedModel"},{"type":"null"}]},"atomic_model_effort":{"const":false},"available":{"type":"boolean"},"complete":{"type":"boolean"},"source":{"type":"string"},"choices":{"type":"array","maxItems":100,"items":{"$ref":"#/$defs/HarnessModelChoice"}},"cursor":{"type":["string","null"]},"total":{"type":"integer","minimum":0}}},
     "AgentRepository": {"type": "object", "additionalProperties": false, "required": ["path", "workspaces", "agent_ids"], "properties": {"path": {"type": "string"}, "workspaces": {"type": "array", "items": {"type": "string"}}, "agent_ids": {"type": "array", "items": {"type": "string"}}}},
     "HostRepositories": {"type": "object", "additionalProperties": false, "required": ["host_id", "repositories"], "properties": {"host_id": {"type": "string"}, "repositories": {"type": "array", "items": {"$ref": "#/$defs/AgentRepository"}}}},
     "AgentCreateParameters": {"type": "object", "additionalProperties": false, "required": ["name", "harness"], "properties": {"name": {"type": "string", "minLength": 1}, "harness": {"enum": ["claude", "codex", "pi", "omp", "opencode"]}, "host": {"type": "string", "minLength": 1}, "model": {"type": "string", "minLength": 1}, "effort": {"type": "string", "minLength": 1}, "workspace": {"type": "string", "minLength": 1}, "repo": {"type": "string", "minLength": 1}, "base": {"type": "string", "minLength": 1}, "branch": {"type": "string", "minLength": 1}, "remove_at_run_end": {"type": "boolean"}, "description": {"type": "string", "minLength": 1}, "message": {"type": "string", "minLength": 1}}},
@@ -1906,6 +1945,8 @@
       "allOf": [{ "$ref": "#/$defs/ActionCommon" }],
       "oneOf": [
         {"properties": {"type": {"const": "custom.reply"}, "parameters": {"$ref": "#/$defs/CustomReplyParameters"}}},
+        {"properties":{"type":{"const":"harness.queue.mutate"},"fence":{"allOf":[{"$ref":"#/$defs/Fence"},{"required":["runtime_incarnation","runtime_desired_revision"]}]},"parameters":{"$ref":"#/$defs/HarnessQueueParameters"}}},
+        {"properties":{"type":{"const":"harness.model.set"},"fence":{"allOf":[{"$ref":"#/$defs/Fence"},{"required":["runtime_incarnation","runtime_desired_revision"]}]},"parameters":{"$ref":"#/$defs/HarnessModelParameters"}}},
         {"properties": {"type": {"const": "agent.create"}, "parameters": {"$ref": "#/$defs/AgentCreateParameters"}}},
         {"properties": {"type": {"const": "agent.stop"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["runtime_desired_revision"]}]}, "parameters": {"$ref": "#/$defs/AgentStopParameters"}}},
         {"properties": {"type": {"const": "agent.start"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["runtime_desired_revision"]}]}, "parameters": {"$ref": "#/$defs/AgentStartParameters"}}},
@@ -2150,10 +2191,12 @@
         "kind": { "const": "action-result" },
         "action_id": { "$ref": "#/$defs/Id" },
         "operation_id": { "$ref": "#/$defs/Id" },
-        "status": { "enum": ["accepted", "completed", "rejected"] },
+        "status": { "enum": ["accepted", "completed", "rejected", "dispatched", "applied", "indeterminate", "cancelled"] },
         "affected_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" }, "uniqueItems": true },
         "snapshot_id": { "$ref": "#/$defs/Id" },
-        "terminal_attachment": { "oneOf": [{ "$ref": "#/$defs/TerminalAttachment" }, { "type": "null" }] }
+        "terminal_attachment": { "oneOf": [{ "$ref": "#/$defs/TerminalAttachment" }, { "type": "null" }] },
+        "harness_control": { "$ref": "#/$defs/HarnessControlReceipt" },
+        "harness_model": { "$ref": "#/$defs/HarnessModelReceipt" }
       }
     },
     "PairingBegin": {

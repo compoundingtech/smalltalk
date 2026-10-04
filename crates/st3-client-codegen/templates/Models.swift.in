@@ -217,6 +217,76 @@ public enum AgentQueuePlacement: String, Codable, Sendable { case top, bottom, b
 public struct AgentQueue: Codable, Sendable { public let kind: String; public let agentID: String; public let currentWorkIDs: [String]; public let nextWorkID: String?; public let runs: [AgentQueueRun]; public let moves: [AgentQueueMove]; public let moveCount: UInt64; enum CodingKeys: String, CodingKey { case kind, agentID = "agent_id", currentWorkIDs = "current_work_ids", nextWorkID = "next_work_id", runs, moves, moveCount = "move_count" } }
 public struct AgentQueueRun: Codable, Sendable { public let missionRunID: String; public let position: UInt32; public let state: String; public let runState: String; public let joinedAt: String; public let claimedWorkIDs: [String]; public let readyWorkIDs: [String]; public let waitingWorkIDs: [String]; public let waitingForRunID: String?; enum CodingKeys: String, CodingKey { case missionRunID = "mission_run_id", position, state, runState = "run_state", joinedAt = "joined_at", claimedWorkIDs = "claimed_work_ids", readyWorkIDs = "ready_work_ids", waitingWorkIDs = "waiting_work_ids", waitingForRunID = "waiting_for_run_id" } }
 public struct AgentQueueMove: Codable, Sendable { public let claimID: String; public let missionRunID: String; public let placement: AgentQueuePlacement; public let anchorRunID: String?; public let actorID: String?; public let reason: String?; public let movedAt: String; enum CodingKeys: String, CodingKey { case claimID = "claim_id", missionRunID = "mission_run_id", placement, anchorRunID = "anchor_run_id", actorID = "actor_id", reason, movedAt = "moved_at" } }
+public struct HarnessBinding: Codable, Sendable { public let desiredRevision, incarnationID, sessionID: String; public let turnID: String?; public init(desiredRevision: String, incarnationID: String, sessionID: String, turnID: String?) { self.desiredRevision = desiredRevision; self.incarnationID = incarnationID; self.sessionID = sessionID; self.turnID = turnID }; enum CodingKeys: String, CodingKey { case desiredRevision = "desired_revision", incarnationID = "incarnation_id", sessionID = "session_id", turnID = "turn_id" }; public func encode(to encoder: Encoder) throws { var box = encoder.container(keyedBy: CodingKeys.self); try box.encode(desiredRevision, forKey: .desiredRevision); try box.encode(incarnationID, forKey: .incarnationID); try box.encode(sessionID, forKey: .sessionID); try box.encode(turnID, forKey: .turnID) } }
+public enum HarnessLane: String, Codable, Sendable { case followUp = "follow_up", steer }
+public enum HarnessOutcome: String, Codable, Sendable { case accepted, dispatched, applied, rejected, indeterminate, cancelled }
+public struct HarnessQueueEntry: Codable, Sendable { public let id, actor, content, operationID: String; public let lane: HarnessLane; public let binding: HarnessBinding; public let status: HarnessOutcome; public let reason: String?; public let result: HarnessNativeResult?; enum CodingKeys: String, CodingKey { case id, actor, content, lane, binding, status, operationID = "operation_id", reason, result } }
+public struct HarnessQueue: Codable, Sendable { public let authority: String; public let revision: UInt64; public let entries: [HarnessQueueEntry] }
+public struct HarnessModelChoice: Codable, Sendable { public let provider, id: String; public let reasoning: Bool; public let supportedEfforts: [String]; enum CodingKeys: String, CodingKey { case provider, id, reasoning, supportedEfforts = "supported_efforts" } }
+public struct HarnessSelectedModel: Codable, Sendable { public let provider, id, configuredEffort: String; public let effectiveEffort: String?; enum CodingKeys: String, CodingKey { case provider, id, configuredEffort = "configured_effort", effectiveEffort = "effective_effort" } }
+public struct HarnessModelsSummary: Codable, Sendable { public let selected: HarnessSelectedModel?; public let revision: String; public let atomicModelEffort, available, complete: Bool; public let source, catalogPath: String; enum CodingKeys: String, CodingKey { case selected, revision, atomicModelEffort = "atomic_model_effort", available, complete, source, catalogPath = "catalog_path" } }
+public struct HarnessApproval: Codable, Sendable { public let supported: Bool; public let reason: String }
+public struct HarnessControlState: Codable, Sendable { public let subject: String; public let binding: HarnessBinding; public let idle, inputSupported: Bool; public let models: HarnessModelsSummary; public let approval: HarnessApproval; public let reason: String?; enum CodingKeys: String, CodingKey { case subject, binding, idle, inputSupported = "input_supported", models, approval, reason } }
+public struct HarnessQueueView: Codable, Sendable { public let schema, subject: String; public let queue: HarnessQueue; public let native: HarnessControlState?; public let cursor: String?; public let total: UInt }
+public struct HarnessInputResult: Codable, Sendable {
+    public let nativeEvent: String
+    public let turnID: String?
+    public init(nativeEvent: String, turnID: String? = nil) { self.nativeEvent = nativeEvent; self.turnID = turnID }
+    enum CodingKeys: String, CodingKey { case nativeEvent = "native_event", turnID = "turn_id" }
+    public func encode(to encoder: Encoder) throws { var box = encoder.container(keyedBy: CodingKeys.self); try box.encode(nativeEvent, forKey: .nativeEvent); try box.encode(turnID, forKey: .turnID) }
+}
+public struct HarnessModelResult: Codable, Sendable {
+    public let provider, id, effectiveEffort: String?
+    public let atomicModelEffort: Bool
+    public init(provider: String?, id: String?, effectiveEffort: String?, atomicModelEffort: Bool) { self.provider = provider; self.id = id; self.effectiveEffort = effectiveEffort; self.atomicModelEffort = atomicModelEffort }
+    enum CodingKeys: String, CodingKey { case provider, id, effectiveEffort = "effective_effort", atomicModelEffort = "atomic_model_effort" }
+    public func encode(to encoder: Encoder) throws { var box = encoder.container(keyedBy: CodingKeys.self); try box.encode(provider, forKey: .provider); try box.encode(id, forKey: .id); try box.encode(effectiveEffort, forKey: .effectiveEffort); try box.encode(atomicModelEffort, forKey: .atomicModelEffort) }
+}
+public enum HarnessNativeResult: Codable, Sendable {
+    case input(HarnessInputResult), model(HarnessModelResult)
+    private enum CodingKeys: String, CodingKey { case nativeEvent = "native_event" }
+    public init(from decoder: Decoder) throws { let box = try decoder.container(keyedBy: CodingKeys.self); if box.contains(.nativeEvent) { self = .input(try HarnessInputResult(from: decoder)) } else { self = .model(try HarnessModelResult(from: decoder)) } }
+    public func encode(to encoder: Encoder) throws { switch self { case .input(let value): try value.encode(to: encoder); case .model(let value): try value.encode(to: encoder) } }
+}
+public struct HarnessControlReceipt: Codable, Sendable { public let operationID, subject: String; public let entryID: String?; public let status: HarnessOutcome; public let queueRevision: UInt64; public let reason: String?; public let result: HarnessNativeResult?; public let binding: HarnessBinding; enum CodingKeys: String, CodingKey { case operationID = "operation_id", subject, entryID = "entry_id", status, queueRevision = "queue_revision", reason, result, binding } }
+public struct HarnessModelParameters: Codable, Sendable {
+    public let subject: String
+    public let binding: HarnessBinding
+    public let modelRevision, provider, modelID: String
+    public let effort: String?
+    public init(subject: String, binding: HarnessBinding, modelRevision: String, provider: String, modelID: String, effort: String? = nil) { self.subject = subject; self.binding = binding; self.modelRevision = modelRevision; self.provider = provider; self.modelID = modelID; self.effort = effort }
+    enum CodingKeys: String, CodingKey { case subject, binding, modelRevision = "model_revision", provider, modelID = "model_id", effort }
+}
+public struct HarnessModelReceipt: Codable, Sendable { public let operationID, subject: String; public let binding: HarnessBinding; public let modelRevision: String; public let status: HarnessOutcome; public let reason: String?; public let result: HarnessModelResult?; enum CodingKeys: String, CodingKey { case operationID = "operation_id", subject, binding, modelRevision = "model_revision", status, reason, result } }
+public enum HarnessControlOperationReceipt: Codable, Sendable {
+    case queue(HarnessControlReceipt), model(HarnessModelReceipt)
+    private enum CodingKeys: String, CodingKey { case queueRevision = "queue_revision" }
+    public init(from decoder: Decoder) throws { let box = try decoder.container(keyedBy: CodingKeys.self); if box.contains(.queueRevision) { self = .queue(try HarnessControlReceipt(from: decoder)) } else { self = .model(try HarnessModelReceipt(from: decoder)) } }
+    public func encode(to encoder: Encoder) throws { switch self { case .queue(let value): try value.encode(to: encoder); case .model(let value): try value.encode(to: encoder) } }
+}
+public struct HarnessModelCatalogPage: Codable, Sendable { public let schema, subject, modelRevision: String; public let selected: HarnessSelectedModel?; public let atomicModelEffort, available, complete: Bool; public let source: String; public let choices: [HarnessModelChoice]; public let cursor: String?; public let total: UInt; enum CodingKeys: String, CodingKey { case schema, subject, modelRevision = "model_revision", selected, atomicModelEffort = "atomic_model_effort", available, complete, source, choices, cursor, total } }
+public struct HarnessQueueMutation: Codable, Sendable {
+    public enum Kind: String, Codable, Sendable { case enqueue, move, cancel, replace, promote }
+    public let type: Kind; public let content, entryID, beforeID: String?; public let lane: HarnessLane?
+    private init(type: Kind, content: String? = nil, entryID: String? = nil, beforeID: String? = nil, lane: HarnessLane? = nil) { self.type = type; self.content = content; self.entryID = entryID; self.beforeID = beforeID; self.lane = lane }
+    public static func enqueue(content: String, lane: HarnessLane) -> Self { .init(type: .enqueue, content: content, lane: lane) }
+    public static func move(entryID: String, beforeID: String? = nil) -> Self { .init(type: .move, entryID: entryID, beforeID: beforeID) }
+    public static func cancel(entryID: String) -> Self { .init(type: .cancel, entryID: entryID) }
+    public static func replace(entryID: String, content: String) -> Self { .init(type: .replace, content: content, entryID: entryID) }
+    public static func promote(entryID: String) -> Self { .init(type: .promote, entryID: entryID) }
+    enum CodingKeys: String, CodingKey { case type, content, entryID = "entry_id", beforeID = "before_id", lane }
+    public func encode(to encoder: Encoder) throws {
+        var box = encoder.container(keyedBy: CodingKeys.self)
+        try box.encode(type, forKey: .type)
+        switch type {
+        case .enqueue: try box.encode(content, forKey: .content); try box.encode(lane, forKey: .lane)
+        case .move: try box.encode(entryID, forKey: .entryID); try box.encode(beforeID, forKey: .beforeID)
+        case .cancel, .promote: try box.encode(entryID, forKey: .entryID)
+        case .replace: try box.encode(entryID, forKey: .entryID); try box.encode(content, forKey: .content)
+        }
+    }
+}
+public struct HarnessQueueParameters: Codable, Sendable { public let subject: String; public let binding: HarnessBinding; public let queueRevision: UInt64; public let mutation: HarnessQueueMutation; public init(subject: String, binding: HarnessBinding, queueRevision: UInt64, mutation: HarnessQueueMutation) { self.subject = subject; self.binding = binding; self.queueRevision = queueRevision; self.mutation = mutation }; enum CodingKeys: String, CodingKey { case subject, binding, queueRevision = "queue_revision", mutation } }
 public struct TerminalAccess: Codable, Sendable { public let read, input, resize: String }
 public struct RuntimeResource: Codable, Sendable { public let id, kind, revision, updatedAt, runtimeKind, ownerID, ownerHostID, state, runtimeID: String; public let desiredRevision, incarnationID, ownerRunID, terminalID: String?; public let terminalSequence: UInt64?; public let terminalAccess: TerminalAccess?; public let operational: Operational?; enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", runtimeKind = "runtime_kind", ownerID = "owner_id", ownerHostID = "owner_host_id", state, runtimeID = "runtime_id", incarnationID = "incarnation_id", desiredRevision = "desired_revision", ownerRunID = "owner_run_id", terminalID = "terminal_id", terminalSequence = "terminal_sequence", terminalAccess = "terminal_access", operational } }
 public struct ObserverSpec: Codable, Sendable { public let resource, provider, locator: String; public let fields: [String]; public let stopped: Bool }
@@ -436,7 +506,7 @@ public enum TerminalInputMode: String, Codable, Sendable { case line, raw, key }
 public struct TerminalInputParameters: Codable, Sendable { public var terminalID: String; public var mode: TerminalInputMode; public var value: String; public init(terminalID: String, mode: TerminalInputMode, value: String) { self.terminalID = terminalID; self.mode = mode; self.value = value }; enum CodingKeys: String, CodingKey { case terminalID = "terminal_id", mode, value } }
 public struct TerminalResizeParameters: Codable, Sendable { public var terminalID: String; public var rows: UInt16; public var columns: UInt16; public init(terminalID: String, rows: UInt16, columns: UInt16) { self.terminalID = terminalID; self.rows = rows; self.columns = columns }; enum CodingKeys: String, CodingKey { case terminalID = "terminal_id", rows, columns } }
 public struct TerminalAttachment: Codable, Sendable { public let attachmentID: String; public let terminalID: String; public let runtimeIncarnation: String; public let ownerHostID: String; public let streamURL: String; public let streamCapability: String?; public let state: String; public let expiresAt: String; public let reusable: Bool?; public let ttlS: UInt64?; public let retryHint: String?; enum CodingKeys: String, CodingKey { case attachmentID = "attachment_id", terminalID = "terminal_id", runtimeIncarnation = "runtime_incarnation", ownerHostID = "owner_host_id", streamURL = "stream_url", streamCapability = "stream_capability", state, expiresAt = "expires_at", reusable, ttlS = "ttl_s", retryHint = "retry_hint" } }
-public struct ActionResult: Codable, Sendable { public let kind: String; public let actionID: String; public let operationID: String; public let status: String; public let affectedIDs: [String]; public let snapshotID: String; public let terminalAttachment: TerminalAttachment?; enum CodingKeys: String, CodingKey { case kind, actionID = "action_id", operationID = "operation_id", status, affectedIDs = "affected_ids", snapshotID = "snapshot_id", terminalAttachment = "terminal_attachment" } }
+public struct ActionResult: Codable, Sendable { public let kind: String; public let actionID: String; public let operationID: String; public let status: String; public let affectedIDs: [String]; public let snapshotID: String; public let terminalAttachment: TerminalAttachment?; public let harnessControl: HarnessControlReceipt?; public let harnessModel: HarnessModelReceipt?; enum CodingKeys: String, CodingKey { case kind, actionID = "action_id", operationID = "operation_id", status, affectedIDs = "affected_ids", snapshotID = "snapshot_id", terminalAttachment = "terminal_attachment", harnessControl = "harness_control", harnessModel = "harness_model" } }
 
 public struct PairingBegin: Codable, Sendable { public let apiVersion: String; public let deviceName: String; public let personID: String; public let fullControl: Bool?; public let scopes: [String]?; public init(apiVersion: String, deviceName: String, personID: String, fullControl: Bool? = nil, scopes: [String]? = nil) { self.apiVersion = apiVersion; self.deviceName = deviceName; self.personID = personID; self.fullControl = fullControl; self.scopes = scopes }; enum CodingKeys: String, CodingKey { case apiVersion = "api_version", deviceName = "device_name", personID = "person_id", fullControl = "full_control", scopes } }
 public struct PairingChallenge: Codable, Sendable { public let kind: String; public let pairingID: String; public let code: String; public let expiresAt: String; enum CodingKeys: String, CodingKey { case kind, pairingID = "pairing_id", code, expiresAt = "expires_at" } }

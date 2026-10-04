@@ -42,6 +42,7 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
   let turnId: string | null = null;
   let transitioning = false;
   let mutation: string | undefined;
+  let lastSnapshot: string | undefined;
   const pending = new Map<string, Command>();
   const receipts = new Map<string, Receipt>();
   const current = (): ControlBinding | undefined => context && desired ? { ...desired, session_id: context.sessionManager.getSessionId(), turn_id: turnId } : undefined;
@@ -64,15 +65,20 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
     }
     return { ...values, revision: createHash("sha256").update(JSON.stringify(values)).digest("hex") };
   };
-  const snapshot = () => {
+  const snapshot = (force = false) => {
     if (!context) return;
-    send({ type: "harness_control_state", session_id: context.sessionManager.getSessionId(), turn_id: turnId, idle: idle(), input_supported: !transitioning && !!current(), reason: transitioning ? "session-transition-state-unknown" : undefined,
+    const frame = { type: "harness_control_state", session_id: context.sessionManager.getSessionId(), turn_id: turnId, idle: idle(), input_supported: !transitioning && !!current(), reason: transitioning ? "session-transition-state-unknown" : undefined,
       models: modelDescriptor(),
-      approval: { supported: false, reason: "native-live-approval-api-unavailable" } });
+      approval: { supported: false, reason: "native-live-approval-api-unavailable" } };
+    const serialized = JSON.stringify(frame);
+    if (force || serialized !== lastSnapshot) {
+      lastSnapshot = serialized;
+      send(frame);
+    }
   };
   const settle = (command: Command, status: Receipt["status"], reason?: string, result?: Record<string, unknown>) => {
     if (receipts.has(command.operation_id)) return;
-    const receipt: Receipt = { type: "harness_control_receipt", operation_id: command.operation_id, binding: command.binding, status, ...(reason ? { reason } : {}), ...(result ? { result } : {}) };
+    const receipt: Receipt = { type: "harness_control_receipt", operation_id: command.operation_id, binding: command.binding, status, ...(reason ? { reason } : {}), ...(result ? { result: command.type === "set_model" ? { atomic_model_effort: false, ...result } : result } : {}) };
     pending.delete(command.operation_id);
     receipts.set(command.operation_id, receipt);
     send(receipt);
@@ -143,6 +149,11 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
       if (!accepted) { settle(command, "rejected", "model-credential-unavailable"); return; }
       const after = modelDescriptor();
       if (!after.available || JSON.stringify(before.choices) !== JSON.stringify(after.choices)) { settle(command, "indeterminate", "native-model-catalog-replaced"); return; }
+      const selected = selectedModel();
+      if (selected?.provider !== command.provider || selected.id !== command.model_id) {
+        settle(command, "indeterminate", "native-selection-replaced", { provider: selected?.provider, id: selected?.id, effective_effort: pi.getThinkingLevel() ?? null });
+        return;
+      }
       if (requested !== undefined) {
         // The public setter's choices are narrower than model metadata. Reject unknown choices
         // before mutation; no cast converts a provider-only effort into an extension capability.
@@ -161,10 +172,11 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
   const handle = (frame: unknown, ctx: ExtensionContext): boolean => {
     const raw = record(frame);
     if (raw?.type === "harness_control_binding") {
-      desired = bindingOf(raw.binding);
+      const binding = bindingOf(raw.binding);
+      const changed = binding && (!desired || !sameBinding(binding, desired));
+      desired = binding;
       context = ctx;
-      snapshot();
-      for (const receipt of receipts.values()) send(receipt);
+      if (changed) snapshot();
       return true;
     }
     if (raw?.type !== "harness_control") return false;
@@ -198,5 +210,5 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
     } else reject("command-unsupported");
     return true;
   };
-  return { handle, observe: snapshot, replay: () => { snapshot(); for (const receipt of receipts.values()) send(receipt); } };
+  return { handle, observe: () => snapshot(), replay: () => { snapshot(true); for (const receipt of receipts.values()) send(receipt); } };
 };

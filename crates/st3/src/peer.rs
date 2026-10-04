@@ -105,6 +105,19 @@ pub enum ClientReadOperation {
     },
     /// A portable suspended seat payload, read only for the exact fenced resume request.
     SeatSnapshot { subject: String, suspend_operation: String, resume_operation: String, offset: u64 },
+    HarnessQueue {
+        subject: String,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    },
+    HarnessQueueMutation {
+        action_id: String,
+        idempotency_key: String,
+        parameters: Value,
+    },
+    HarnessModelMutation { action_id: String, idempotency_key: String, parameters: Value },
+    HarnessModels { subject: String, cursor: Option<String>, limit: Option<usize> },
+    HarnessControlReceipt { subject: String, operation: String },
     /// The directory this host gives a new agent that names no workspace.
     AgentWorkspace {
         identity: String,
@@ -1015,7 +1028,32 @@ async fn receive_client_read(
             }
         }
         let client = st3_client::Client::unix_as(state.backend().socket(), &request.authority_actor);
+        let queue_read = matches!(&request.request, ClientReadOperation::HarnessQueue { .. });
+        let queue_mutation = matches!(&request.request, ClientReadOperation::HarnessQueueMutation { .. });
         match request.request {
+            ClientReadOperation::HarnessQueue { subject, cursor, limit } | ClientReadOperation::HarnessModels { subject, cursor, limit } => {
+                let collection = if queue_read { "harness-queue" } else { "harness-models" };
+                let mut path = format!("/v1/client/{collection}/{}", urlencoding::encode(&subject));
+                let mut query = Vec::new();
+                if let Some(cursor) = cursor { query.push(format!("cursor={}", urlencoding::encode(&cursor))); }
+                if let Some(limit) = limit { query.push(format!("limit={limit}")); }
+                if !query.is_empty() { path.push('?'); path.push_str(&query.join("&")); }
+                let native = Client::unix_as(state.backend().socket(), &request.authority_actor)?;
+                native.get(&path).await
+            }
+            ClientReadOperation::HarnessQueueMutation { action_id, idempotency_key, parameters } | ClientReadOperation::HarnessModelMutation { action_id, idempotency_key, parameters } => {
+                let snapshot = client.capabilities().await?.snapshot;
+                let incarnation = parameters.pointer("/binding/incarnation_id").and_then(Value::as_str).context("harness binding requires incarnation")?;
+                let desired = parameters.pointer("/binding/desired_revision").and_then(Value::as_str).context("harness binding requires desired revision")?;
+                let action_type = if queue_mutation { "harness.queue.mutate" } else { "harness.model.set" };
+                let action = serde_json::json!({"api_version":st3_client::API_VERSION,"id":action_id,"type":action_type,"idempotency_key":idempotency_key,"fence":{"snapshot_id":snapshot.id,"runtime_incarnation":incarnation,"runtime_desired_revision":desired},"parameters":parameters});
+                let native = Client::unix_as(state.backend().socket(), &request.authority_actor)?;
+                native.post("/v1/client/actions", &action).await
+            }
+            ClientReadOperation::HarnessControlReceipt { subject, operation } => {
+                let native = Client::unix_as(state.backend().socket(), &request.authority_actor)?;
+                native.get(&format!("/v1/client/harness-control-receipts/{}?subject={}", urlencoding::encode(&operation), urlencoding::encode(&subject))).await
+            }
             ClientReadOperation::ConversationChanges {
                 session_id,
                 after,

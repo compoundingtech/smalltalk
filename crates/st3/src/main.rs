@@ -56,6 +56,7 @@ use completion::{Complete, Entity, WorkFilter};
 mod cli_help;
 mod completion;
 mod presentation;
+mod native_control_driver;
 
 use presentation::{
     OutputStyle, follow_snapshot, glance, mission_run_signature, relative_time,
@@ -18471,6 +18472,10 @@ async fn run_pi_channel(
     let observation_paths = st_drivers::driver_paths::Paths::from_environment(identity, &|name| {
         std::env::var(name).ok()
     })?;
+    if driver == "omp" {
+        let paths = observation_paths.as_ref().context("OMP native controls require resolved driver paths")?;
+        state.controls.bind_outbox(paths.session_dir.join("harness-control-outbox"))?;
+    }
     let mut observer = if let Some(paths) = observation_paths
         && st_drivers::harness_events::enabled(&paths.agent_dir)
     {
@@ -18516,7 +18521,7 @@ async fn run_pi_channel(
         None
     };
     let transport = format!("{driver}-channel");
-    if push_mailbox_enabled() && state.pending.fence.is_none() {
+    if (push_mailbox_enabled() || driver == "omp") && state.pending.fence.is_none() {
         state.pending.fence = Some(st3::mailbox::Fence::new(subject, &incarnation, "delivery"));
     }
     if let Some(fence) = &mut state.pending.fence { fence.bind(client).await?; }
@@ -18593,6 +18598,13 @@ async fn run_pi_channel(
                     Some(st_drivers::reexec::StdinChunk::Bytes(bytes)) => {
                         state.lines.push(&bytes);
                         while let Some(line) = state.lines.next_line() {
+                            if driver == "omp" {
+                                match state.controls.accept(&line, subject, state.pending.fence.as_ref()) {
+                                    Ok(true) => continue,
+                                    Ok(false) => {},
+                                    Err(error) => { warn_pi_channel(subject, &error, &mut last_warning); continue; }
+                                }
+                            }
                             match accept_managed_channel_frame(
                                 &mut state, &mut observer, &line,
                                 // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
@@ -18629,6 +18641,15 @@ async fn run_pi_channel(
                                 warn_pi_channel(subject, &error, &mut last_warning);
                             }
                         }
+                        if driver == "omp" {
+                            if let Err(error) = state.controls.flush(client, state.pending.fence.as_ref(), &mut stdout, false).await {
+                                warn_pi_channel(subject, &error, &mut last_warning);
+                            }
+                            if let Some(fence) = &state.pending.fence {
+                                let closed: Result<Value> = client.post("/v1/harness-control/close", fence).await;
+                                if let Err(error) = closed { warn_pi_channel(subject, &error, &mut last_warning); }
+                            }
+                        }
                         return Ok(());
                     }
                     Some(st_drivers::reexec::StdinChunk::Failed(error)) => {
@@ -18645,6 +18666,9 @@ async fn run_pi_channel(
                 }
             }
             _ = interval.tick() => {
+                if driver == "omp" && let Err(error) = state.controls.flush(client, state.pending.fence.as_ref(), &mut stdout, state.first_idle_seen).await {
+                    warn_pi_channel(subject, &error, &mut last_warning);
+                }
                 if let Some(observer) = observer.as_mut() {
                     if let Err(error) = observer.heartbeat() {
                         warn_pi_channel(subject, &error, &mut last_warning);
@@ -18896,6 +18920,8 @@ struct PiChannelResume {
     session: String,
     #[serde(default)]
     native_session: Option<String>,
+    #[serde(default)]
+    controls: native_control_driver::NativeControls,
     #[serde(default)]
     todo_outbox: Option<PathBuf>,
     // The latest validated hydration survives graph lag and binary replacement without rebinding.

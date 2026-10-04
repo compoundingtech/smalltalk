@@ -66,6 +66,7 @@ mod delivery_presence;
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
+mod harness_control;
 mod mailbox;
 mod mail_backlog;
 mod owned_sets;
@@ -397,6 +398,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/agent-queues/{*id}", get(client_v0::agent_queue))
         .route("/v1/client/status-history/{*id}", get(client_v0::status_history))
+        .route("/v1/client/harness-queue/{*id}", get(client_v0::harness_control::queue))
+        .route("/v1/client/harness-models/{*id}", get(client_v0::harness_model::models))
+        .route("/v1/client/harness-control-receipts/{*id}", get(client_v0::harness_control::receipt))
         .route("/v1/client/lanes", get(client_v0::lanes))
         .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
         .route("/v1/client/history", get(client_history))
@@ -559,6 +563,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/mailbox/bind", post(mailbox::bind))
         .route("/v1/mailbox/attachment", get(mailbox::attachment))
         .route("/v1/mailbox/receipts", post(mailbox::receipt))
+        .route("/v1/harness-control/state", post(harness_control::observe))
+        .route("/v1/harness-control/next", post(harness_control::next))
+        .route("/v1/harness-control/receipts", post(harness_control::settle))
+        .route("/v1/harness-control/close", post(harness_control::close))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/read/{*subject}", get(read_message))
         .route("/v1/messages/delivery/{*subject}", get(message_delivery))

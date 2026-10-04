@@ -14,6 +14,9 @@ export default function(pi) {
     const awaitReceipt=async(id)=>{for(let i=0;i<500;i++){const r=frames.find(f=>f.type==='harness_control_receipt'&&f.operation_id===id);if(r)return r;await pause();}throw Error('Missing receipt '+id);};
     const bind=()=>({desired_revision:'revision',incarnation_id:'incarnation',session_id:ctx.sessionManager.getSessionId(),turn_id:frames.filter(f=>f.type==='harness_control_state').at(-1)?.turn_id??null});
     control.handle({type:'harness_control_binding',binding:bind()},ctx);
+    const acknowledgedFrameCount=frames.length;
+    for(let i=0;i<30;i++){control.handle({type:'harness_control_binding',binding:bind()},ctx);control.observe();}
+    if(frames.length!==acknowledgedFrameCount)throw Error('Unchanged native ACK/keepalive emitted duplicate state');
     let binding=bind();
     control.handle({type:'harness_control',command:{type:'set_model',operation_id:'model-off',binding,model_revision:modelRevision(),provider:'control-smoke',model_id:'native-smoke',effort:'off'}},ctx);
     if((await awaitReceipt('model-off')).result?.effective_effort!=='off')throw Error('Native off effort not observed');
@@ -54,5 +57,6 @@ export default function(pi) {
     if((await awaitReceipt('after-reset')).status!=='rejected')throw Error('Reset binding not rejected');
     shutdownBinding=bind();
     console.log('CONTROL_SHUTDOWN_READY');
+    ctx.shutdown();
   }});
 }

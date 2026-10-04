@@ -13,6 +13,9 @@
   "reads": [
     {"id": "custom-subjects.list", "method": "GET", "path": "/v1/client/custom-subjects", "response": "Page", "scope": "read.projections"},
     {"id": "custom-subjects.get", "method": "GET", "path": "/v1/client/custom-subjects/{id}", "response": "Resource", "scope": "read.projections"},
+    { "id": "harness-queue.get", "method": "GET", "path": "/v1/client/harness-queue/{id}", "response": "HarnessQueueView", "scope": "read.projections", "query_parameters": { "cursor": { "type": "string", "maxLength": 16384 }, "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } } },
+    { "id": "harness-models.get", "method": "GET", "path": "/v1/client/harness-models/{id}", "response": "HarnessModelCatalogPage", "scope": "read.projections", "query_parameters": { "cursor": { "type": "string", "maxLength": 16384 }, "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 100 } } },
+    { "id": "harness-control-receipt.get", "method": "GET", "path": "/v1/client/harness-control-receipts/{id}", "response": "HarnessControlOperationReceipt", "scope": "read.projections", "query_parameters": { "subject": { "type": "string", "required": true } } },
     { "id": "host.repositories", "method": "GET", "path": "/v1/client/hosts/{id}/repositories", "response": "HostRepositories", "scope": "read.projections" },
     { "id": "sets.list", "method": "GET", "path": "/v1/client/sets", "response": "Page" },
     { "id": "sets.get", "method": "GET", "path": "/v1/client/sets/{id}", "response": "Resource" },
@@ -80,6 +83,8 @@
   ],
   "actions": {
     "custom.reply": {"capability": "control.attention", "parameters": "CustomReplyParameters"},
+    "harness.queue.mutate": { "capability": "control.runtimes", "parameters": "HarnessQueueParameters" },
+    "harness.model.set": { "capability": "control.runtimes", "parameters": "HarnessModelParameters" },
     "review.approve": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.reject": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.request-changes": { "capability": "control.attention", "parameters": "TargetParameters" },
