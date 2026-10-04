@@ -312,6 +312,56 @@ agent "example/operations/deputy" {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missions_show_missing_mission_fails_but_published_zero_run_mission_succeeds() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let source = "version 2\nmission \"example/unstarted\" state=\"ready\" { goal \"Build.\"; step \"build\" { goal \"Build.\"; }; }\n";
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    state
+        .store
+        .apply_internal(&intent, "unstarted-mission")
+        .unwrap();
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    for json in [false, true] {
+        let missing = run_cli_mode(
+            &socket,
+            json,
+            &["missions", "show", "mission/example/missing"],
+        )
+        .await;
+        assert_eq!(missing.status.code(), Some(2), "{missing:?}");
+        assert!(missing.stdout.is_empty(), "{missing:?}");
+        let error = String::from_utf8_lossy(&missing.stderr);
+        assert!(error.contains("not-found"), "{error}");
+        assert!(error.contains("mission/example/missing"), "{error}");
+        let published = run_cli_mode(
+            &socket,
+            json,
+            &["missions", "show", "mission/example/unstarted"],
+        )
+        .await;
+        assert!(published.status.success(), "{published:?}");
+        if json {
+            assert_eq!(value(&published)["total_runs"], 0);
+        } else {
+            assert!(String::from_utf8_lossy(&published.stdout).contains("0 total"));
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn operational_cli_lists_outcomes_summarizes_runs_and_reports_performance() {
     // The report keeps only the top 20 client/request pairs. Earlier serial tests must
     // not displace this test's requests; nextest already gives each test its own process.

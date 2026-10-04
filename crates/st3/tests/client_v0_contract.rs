@@ -3607,3 +3607,18 @@ async fn native_agent_person_asks_use_source_authority_and_reject_malformed_evid
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn missing_mission_preserves_the_client_v0_not_found_error_shape() {
+    let root = tempfile::tempdir().unwrap();
+    let app = st3::api::router(test_state(root.path()));
+    let (status, error) = client_json(app, "/v1/client/missions/example/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+    assert_eq!(error["code"], "not-found");
+    assert_eq!(error["retryable"], false);
+    assert_conforms(
+        &contract_validator("ErrorEnvelope"),
+        "missing mission",
+        &error,
+    );
+}

@@ -18,6 +18,19 @@ impl Store {
             let (state, count) = row?;
             counts.insert(state, count);
         }
+        if counts.is_empty()
+            && !connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mission_definitions WHERE mission_id=?1)",
+                [mission],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(St3Error::new(
+                "not-found",
+                format!("mission `mission/{mission}` does not exist"),
+            )
+            .into());
+        }
         let mut previews = Vec::new();
         for failed in [false, true] {
             let mut statement = connection.prepare(
@@ -311,6 +324,78 @@ mod tests {
                 .any(|item| item["id"] == "cleanup")
         );
     }
+    fn publish_overview_mission(store: &Store) {
+        let source = "version 2\nmission \"example/overview\" state=\"ready\" { goal \"Build.\"; step \"build\" { goal \"Build.\"; }; }\n";
+        let intent = crate::graph::parse_intent(source, store.origin()).unwrap();
+        store.apply_internal(&intent, "overview-mission").unwrap();
+    }
+
+    #[test]
+    fn mission_overview_missing_mission_is_not_found() {
+        let store = Store::open_memory("fixture").unwrap();
+        for mission in ["mission/example/missing", "example/missing"] {
+            let error = store.mission_overview(mission, 10).unwrap_err();
+            let error = error.downcast_ref::<St3Error>().unwrap();
+            assert_eq!(error.code, "not-found");
+            assert_eq!(
+                error.message,
+                "mission `mission/example/missing` does not exist"
+            );
+        }
+    }
+
+    #[test]
+    fn mission_overview_published_mission_with_zero_runs_is_shown() {
+        let store = Store::open_memory("fixture").unwrap();
+        publish_overview_mission(&store);
+        for mission in ["mission/example/overview", "example/overview"] {
+            let overview = store.mission_overview(mission, 10).unwrap();
+            assert_eq!(overview["mission"], "mission/example/overview");
+            assert_eq!(overview["total_runs"], 0);
+            assert_eq!(overview["counts"], json!({}));
+            assert_eq!(overview["newest"], json!([]));
+            assert_eq!(overview["failed"], json!([]));
+        }
+    }
+
+    #[test]
+    fn mission_overview_runs_without_a_current_definition_are_shown() {
+        let store = Store::open_memory("fixture").unwrap();
+        publish_overview_mission(&store);
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "example/overview".into(),
+                revision: None,
+                workspace: "/example".into(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "overview-run".into(),
+            })
+            .unwrap();
+        // Keep the historical run and revision after the current definition disappears.
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM mission_definitions WHERE mission_id='example/overview'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .mission_spec("example/overview", None)
+                .unwrap()
+                .is_none()
+        );
+        let overview = store
+            .mission_overview("mission/example/overview", 10)
+            .unwrap();
+        assert_eq!(overview["total_runs"], 1);
+        assert_eq!(overview["newest"][0]["id"], run.subject);
+    }
+
     #[test]
     fn fleet_overview_counts_all_runs_but_bounds_previews() {
         let store = Store::open_memory("fixture").unwrap();
@@ -322,12 +407,6 @@ mod tests {
         assert_eq!(overview["newest"].as_array().unwrap().len(), 10);
         assert_eq!(overview["failed"].as_array().unwrap().len(), 10);
         assert!(serde_json::to_vec(&overview).unwrap().len() < 20_000);
-        assert_eq!(
-            store
-                .mission_overview("mission/example/unstarted", 10)
-                .unwrap()["total_runs"],
-            0
-        );
     }
     #[test]
     fn fleet_outcomes_page_stably_keep_reasons_and_filter_time_status_and_actor() {
