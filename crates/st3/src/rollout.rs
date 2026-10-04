@@ -170,7 +170,13 @@ pub fn hold_render(store: &Store, desired: &DesiredSubject) -> Result<bool> {
     let Some(incarnation) = actual["incarnation_id"].as_str() else {
         return Ok(false);
     };
-    if actual["status"] != "running" {
+    if actual["status"] != "running"
+        && !(selection.manual
+            && matches!(
+                actual["status"].as_str(),
+                Some("stopped" | "exited" | "vanished")
+            ))
+    {
         return Ok(false);
     }
     let old = launched_member(store, &desired.subject, incarnation)?;

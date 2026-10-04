@@ -595,7 +595,7 @@ fn native_observation(store: &Store, subject: &str, incarnation: &str) {
         store,
         subject,
         "harness.session-file",
-        json!({"harness":"claude", "session_id":format!("native-{subject}"), "incarnation_id":incarnation}),
+        json!({"harness":"claude", "session_id":format!("native-{}", subject.replace('/', "-")), "incarnation_id":incarnation}),
     );
     append(
         store,

@@ -1084,3 +1084,73 @@ fn manual_rollout_keeps_ready_work_wakes_on_the_original_incarnation() {
     );
     assert!(seat.runtime.stops.lock().unwrap().is_empty());
 }
+
+#[test]
+fn manual_rollout_does_not_apply_a_pending_change_after_incumbent_exit() {
+    let seat = Seat::new();
+    seat.publish_mode(2, "second", None, false, true);
+    seat.runtime
+        .observation
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .status = "exited".into();
+    seat.append("runtime.observed", json!({"status":"exited","runtime_id":seat.desired().member.unwrap().runtime_id,"host":"amber","terminal":true,"incarnation_id":"original-1"}));
+    let reconciler = Reconciler::new(
+        seat.store.clone(),
+        seat.runtime.clone(),
+        "amber".into(),
+        Arc::new(Notify::new()),
+    );
+    reconciler.reconcile_once().unwrap();
+    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+    assert_eq!(
+        rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["mode"],
+        "manual"
+    );
+    assert!(rollout::hold_render(&seat.store, &seat.desired()).unwrap());
+    let selected = seat.store.rollout_selection(SUBJECT).unwrap().unwrap();
+    let (_, old) = rollout::launched_member(&seat.store, SUBJECT, "original-1")
+        .unwrap()
+        .unwrap();
+    seat.binding("original-1", "");
+    assert!(
+        seat.store
+            .request_rollout(
+                SUBJECT,
+                &selected.desired_token,
+                &old,
+                "original-1",
+                "person/operator",
+                &Policy::when_idle(1_800_000, false),
+                "manual-ended-missing-binding",
+            )
+            .is_err()
+    );
+    assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
+    seat.binding("original-1", "native-one");
+    seat.store
+        .request_rollout(
+            SUBJECT,
+            &selected.desired_token,
+            &old,
+            "original-1",
+            "person/operator",
+            &Policy::when_idle(1_800_000, false),
+            "manual-ended",
+        )
+        .unwrap();
+    assert_eq!(
+        seat.operation().native_session_id.as_deref(),
+        Some("native-one")
+    );
+    for _ in 0..4 {
+        seat.step();
+    }
+    seat.binding("replacement-1", "native-one");
+    seat.step();
+    assert_eq!(seat.operation().phase, "running");
+    assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
+    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+}

@@ -61,8 +61,12 @@ The explicit command captures fresh declaration and incarnation fences and uses 
 native drain, resume and session verification flow. It works even when the set was published
 without `--rollout`; its default deadline is thirty minutes. `--force-after-deadline` is an
 explicit choice at that command. Ordinary restart, suspend and resume cannot bypass a pending
-manual cutover. A newly added seat starts normally. Omission of a manual seat publishes its
-retirement but holds its running incarnation until the same explicit command retires it.
+manual cutover. If the incumbent exits before an explicit rollout, the changed declaration
+remains pending; normal crash recovery cannot apply it. An explicit rollout can resume its
+recorded native binding after positive exit evidence, with the same declaration and incarnation
+fences. An absent binding or unknown exit remains a refusal. A newly added seat starts normally.
+Omission of a manual seat publishes its retirement but holds its running incarnation until the
+same explicit command retires it.
 
 ## Cutover lifecycle
 

@@ -350,7 +350,20 @@ impl Store {
             let ended = matches!(actual["status"].as_str(),Some("stopped"|"exited"|"vanished"));
             let carry = prior.as_ref().filter(|o| o.native_session_id.is_some()
                 && (o.old_incarnation == incarnation || o.replacement_incarnation.as_deref() == Some(incarnation)));
-            if actual["incarnation_id"].as_str() != Some(incarnation) || (actual["status"] != "running" && !(ended && carry.is_some())) {
+            // A pending manual publication can outlive its incumbent. Capture its exact
+            // native binding in this transaction; an explicit request still requires positive
+            // runtime exit before replacement and never falls back to a fresh conversation.
+            let ended_binding = if selected.manual && ended && carry.is_none() {
+                tx.query_row(&canonical_sql("SELECT body FROM claims WHERE subject=?1 AND kind='harness.session-file'
+                    AND json_extract(body,'$.fields.incarnation_id')=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                    params![subject,incarnation], |row| row.get::<_,String>(0)).optional().map_err(internal)?
+                    .map(|body| serde_json::from_str::<Value>(&body)).transpose().map_err(internal)?
+            } else { None };
+            let ended_binding = ended_binding.as_ref().map(|body| &body["fields"])
+                .filter(|fields| fields["harness"].as_str() == old.driver.as_deref());
+            let ended_session = ended_binding.and_then(|fields| fields["session_id"].as_str())
+                .filter(|session| !session.trim().is_empty());
+            if actual["incarnation_id"].as_str() != Some(incarnation) || (actual["status"] != "running" && !(ended && (carry.is_some() || ended_session.is_some()))) {
                 return Err(St3Error::new("stale-rollout-incarnation", "rollout needs the exact running incarnation"));
             }
             if old.host != self.origin() || selected.desired.member.as_ref().is_some_and(|new| new.host != old.host || new.driver != old.driver)
@@ -369,7 +382,9 @@ impl Store {
                 policy: policy.clone(), publication_policy: selected.policy, publication_manual: selected.manual, old_incarnation: incarnation.into(),
                 old_member: old.clone(), deadline_unix_ms: now.saturating_add(policy.deadline_ms.into()),
                 requested_by: Some(actor.into()), requested_at_unix_ms: now, phase: if ended { "stopping" } else { "draining" }.into(),
-                phase_at_unix_ms: now, drain_ack: None, start_attempted: false, allowed_work, native_session_id: carry.and_then(|o|o.native_session_id.clone()), native_path: carry.and_then(|o|o.native_path.clone()), native_account: carry.and_then(|o|o.native_account.clone()), replacement_incarnation: None,
+                phase_at_unix_ms: now, drain_ack: None, start_attempted: false, allowed_work, native_session_id: carry.and_then(|o|o.native_session_id.clone()).or_else(|| ended_session.map(str::to_owned)),
+                native_path: carry.and_then(|o|o.native_path.clone()).or_else(|| ended_binding.and_then(|f|f["path"].as_str()).map(str::to_owned)),
+                native_account: carry.and_then(|o|o.native_account.clone()).or_else(|| ended_binding.and_then(|f|f["account_ref"].as_str()).map(str::to_owned)), replacement_incarnation: None,
                 forced: false, blocking: Vec::new(), reason: None };
             let claim = append_claim_tx(tx, self.origin(), subject, "runtime.action.requested", Some(actor),
                 &json!({"fields":{"action":"rollout","operation":key,"rollout":operation},"evidence":[expected_token]}),
