@@ -23,6 +23,7 @@ Every seat must, within the time bound, claim its step with its current incarnat
 st message, and none may park in the crash-loop guard. The verdict is in EVIDENCE_DIR/result.json.
 """
 import argparse
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -259,6 +260,7 @@ class Seats:
         self.node, self.letters, self.bound = node, letters, bound
         self.incarnations = {}
         self.timings = {}
+        self.read_probes = set()
 
     def step(self, letter):
         listed = self.node.cli("work", "ls", "--all")
@@ -304,6 +306,7 @@ class Seats:
                     probes[letter] = sent["subject"]
                 view = self.node.api("/v1/messages/read/" + probes[letter]) or {}
                 if view.get("status") in ("read", "closed"):
+                    self.read_probes.add(probes[letter])
                     self.incarnations[letter] = incarnation
                     self.timings[f"{label}:{letter}"] = round(time.monotonic() - started, 1)
                     pending.discard(letter)
@@ -480,6 +483,14 @@ def continued_session(node, label):
 def scenario(node, seats, name, scratch, replacement_binary=None):
     if name in ("fresh", "concurrent"):
         return
+    # Boot proved a durable read. Observe actual provider receipts too: idempotent graph
+    # claims can hide a second model turn if a restart offers the same old message again.
+    previous_probes = seats.read_probes.copy()
+    def probe_reads():
+        return Counter(row.get("reference") for letter in seats.letters
+                       for row in receipts(node, letter) if row.get("event") == "read")
+    until(lambda: all(probe_reads()[ref] >= 1 for ref in previous_probes), seats.bound,
+          "the providers did not record their boot probe reads")
     if name == "suspend":
         suspend_and_resume(node, seats, node.harness)
         return
@@ -525,6 +536,12 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
             fail("a provider process was replaced during driver reexec")
     else:
         fail(f"unknown scenario {name}")
+    # Keep watching after the new mail succeeds, through several channel polls.
+    time.sleep(3)
+    counts = probe_reads()
+    repeated = {ref: counts[ref] for ref in previous_probes if counts[ref] != 1}
+    if repeated:
+        fail(f"{name}: already-read boot mail reached the provider again: {repeated}")
 
 
 def run(args, root, evidence):

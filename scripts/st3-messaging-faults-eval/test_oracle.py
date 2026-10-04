@@ -15,7 +15,8 @@ class OracleTests(unittest.TestCase):
     def setUp(self):
         self.proof = {
             "case": "daemon-restart", "read_after_clear_ms": 900,
-            "received_copies": 1, "graph_read_claims": 1, "read_receipt_matches_graph": True,
+            "received_copies": 1, "warmup_received_copies": 1,
+            "graph_read_claims": 1, "read_receipt_matches_graph": True,
             "provider_starts": 1, "expected_provider_starts": 1,
             "provider_pids_before": [123], "provider_pids_after": [123],
             "incarnation_before": "123:one", "incarnation_after": "123:one",
@@ -32,6 +33,7 @@ class OracleTests(unittest.TestCase):
             ({"projected_message_files": 1}, "file-mailbox messages"),
             ({"driver_catalog_files": 1}, "fabricated catalogs"),
             ({"received_copies": 2}, "received 2 copies"),
+            ({"warmup_received_copies": 2}, "already-read warmup mail reached the provider 2 times"),
             ({"read_after_clear_ms": None}, "not read"),
             ({"read_after_clear_ms": 10001}, "limit 10000"),
             ({"delivered_during_outage": True}, "before the injected outage cleared"),

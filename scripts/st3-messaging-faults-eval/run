@@ -186,13 +186,13 @@ class Node:
             raise RuntimeError(stderr.decode().strip())
         return stdout.decode()
 
-    async def api(self, path):
+    async def api(self, path, timeout=2):
         try:
             reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(self.endpoint)), 1)
             try:
                 writer.write(f"GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n".encode())
                 await writer.drain()
-                response = await asyncio.wait_for(reader.read(), 2)
+                response = await asyncio.wait_for(reader.read(), timeout)
                 headers, body = response.split(b"\r\n\r\n", 1)
                 if b" 200 " not in headers.split(b"\r\n")[0]:
                     return None
@@ -323,6 +323,8 @@ def judge(proof):
         failures.append("message reached the reader before the injected outage cleared")
     if proof["received_copies"] != 1:
         failures.append(f"native provider received {proof['received_copies']} copies (expected 1)")
+    if proof["warmup_received_copies"] != 1:
+        failures.append(f"already-read warmup mail reached the provider {proof['warmup_received_copies']} times (expected 1)")
     if proof["provider_starts"] != proof["expected_provider_starts"]:
         failures.append(f"provider started {proof['provider_starts']} times (expected {proof['expected_provider_starts']})")
     if proof["case"] != "harness-restart":
@@ -488,7 +490,8 @@ agent "fault-probe" {{
             # counts: scheduling can put the third failure before five seconds.
             await until(old_enough, 20)
             blocked_agent = await agent(target)
-            blocked_doctor = await target.api("/v1/doctor")
+            # Doctor also links a scratch crate, with a ten-second build deadline.
+            blocked_doctor = await target.api("/v1/doctor", timeout=30)
             blocked_sender = await source.api("/v1/messages/delivery/" + subject)
             write_json(directory / "blocked-agent.json", blocked_agent)
             write_json(directory / "blocked-doctor.json", blocked_doctor)
@@ -544,6 +547,8 @@ agent "fault-probe" {{
         graph_reads = [claim for claim in claims if claim.get("kind") == "message.read"]
         source_view = await source.api("/v1/messages/read/" + subject)
         result.update(
+            warmup_received_copies=sum(1 for row in all_receipts
+                if row.get("subject") == warmup and row.get("event") == "received"),
             projected_message_files=sum(1 for path in (target.root / "state").rglob("*")
                 if path.is_file() and any(part in ("inbox", "archive") for part in path.parts)),
             driver_catalog_files=sum(1 for pattern in ("catalog.kdl", "agent.kdl")

@@ -774,6 +774,143 @@ async fn a_cli_command_waits_out_a_daemon_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
+    for driver in ["omp", "pi"] {
+        for transport in ["poll", "push"] {
+            let root = tempfile::tempdir().unwrap();
+            let root = root.path();
+            let seat = "agent/receipt-worker";
+            let graph = root.join("graph.db");
+            let mut daemon = Daemon::new(root);
+            daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
+            daemon.observe_running(seat, "same-incarnation");
+            daemon.start_with_binding(true).await;
+            daemon.send("message/consumed", seat, "CONSUMED SIGNAL");
+
+            let socket = daemon.socket.clone();
+            let open_channel = || {
+                let mut channel = seat_command(root, &socket)
+                    .env("ST_AGENT", seat)
+                    .env("ST3_MAILBOX_TRANSPORT", transport)
+                    .arg("--catalog")
+                    .arg(root.join("catalog"))
+                    .args([
+                        "driver",
+                        &format!("{driver}-channel"),
+                        "--identity",
+                        "receipt-worker",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut input = channel.stdin.take().unwrap();
+                let (frames, received) = std::sync::mpsc::channel::<Value>();
+                let output = channel.stdout.take().unwrap();
+                std::thread::spawn(move || {
+                    for line in BufReader::new(output).lines() {
+                        let Ok(line) = line else { break };
+                        if let Ok(frame) = serde_json::from_str(&line) {
+                            let _ = frames.send(frame);
+                        }
+                    }
+                });
+                assert_eq!(
+                    received.recv_timeout(Duration::from_secs(10)).unwrap()["type"],
+                    "hello"
+                );
+                writeln!(input, "{}", json!({"type":"state", "state":"idle"})).unwrap();
+                input.flush().unwrap();
+                (channel, input, received)
+            };
+            let (channel, mut input, received) = open_channel();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let frame = received
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap();
+                if frame["type"] == "message" {
+                    assert_eq!(frame["meta"]["messageId"], "message/consumed");
+                    break;
+                }
+            }
+            // The provider's context event, rather than a CLI read, proves consumption.
+            writeln!(
+                input,
+                "{}",
+                json!({"type":"read", "meta":{"messageId":"message/consumed"}})
+            )
+            .unwrap();
+            input.flush().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut settled = false;
+            while let Ok(frame) =
+                received.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                if frame["type"] == "settled" {
+                    assert_eq!(frame["meta"]["messageId"], "message/consumed");
+                    settled = true;
+                    break;
+                }
+            }
+            assert!(stop(channel).is_empty());
+            let before = daemon
+                .store
+                .message("message/consumed")
+                .unwrap()
+                .unwrap()
+                .status;
+
+            // A real durable Store reopen discards projection caches as a fresh daemon does.
+            daemon.stop().await;
+            daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
+            daemon.start_with_binding(true).await;
+            daemon.send("message/unread", seat, "UNREAD SIGNAL");
+            let (channel, _input, received) = open_channel();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut offered = Vec::new();
+            while let Ok(frame) =
+                received.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                if frame["type"] == "message" {
+                    offered.push(frame["meta"]["messageId"].as_str().unwrap().to_owned());
+                }
+            }
+            assert!(stop(channel).is_empty());
+            assert_eq!(
+                offered,
+                ["message/unread"],
+                "{driver}/{transport}: native read acknowledged={settled}, pre-restart graph status={before}"
+            );
+            assert!(
+                settled,
+                "{driver}/{transport}: the native read was discarded instead of acknowledged"
+            );
+            assert_eq!(before, "read");
+            assert_eq!(
+                daemon
+                    .store
+                    .claims_for("message/consumed", Some("message.read"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            daemon.store.replay_replication_graph().unwrap();
+            assert_eq!(
+                daemon.store.message("message/consumed").unwrap().unwrap().status,
+                "read"
+            );
+            assert_eq!(
+                daemon.store.message("message/unread").unwrap().unwrap().status,
+                "staged"
+            );
+            daemon.stop().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delivered_unread_mail_replays_after_seat_restart_without_repeating_settled_mail() {
     for driver in ["omp", "pi"] {
         for transport in ["push", "poll"] {
