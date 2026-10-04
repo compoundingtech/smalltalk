@@ -40,6 +40,8 @@ Pure logic lives in tested modules (`agentsView.ts`, `homeView.ts`, `missionsVie
 
 ## Build locally
 
+For a step-by-step setup, see [build and run the iOS app](../../docs/ios-app.md), including prerequisites, simulator and device builds, and pairing.
+
 From this directory run `npm ci`, `npm run typecheck`, `npm test`, then `npx expo prebuild --platform ios --clean --no-install`. Install CocoaPods, run `npm run pods` (the wrapper sets `LANG` and `LC_ALL` to `en_US.UTF-8`), and open the generated `ios/smalltalk.xcworkspace` in Xcode. For daily development, build the Debug scheme for an iOS Simulator and run `npm run start` for Metro. Keep normal simulator code signing enabled: building with `CODE_SIGNING_ALLOWED=NO` leaves the app without a usable Keychain, so device pairing fails. A physical device is optional for this development proof.
 
 For an offline device build, run `npm run export:ios` and build Release with local Apple Development signing and provisioning for that device. The Release bundle is embedded and runs without Metro. No Expo account, EAS service, App Store, or Shareup signing is part of this path.

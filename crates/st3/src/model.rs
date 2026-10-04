@@ -2186,6 +2186,9 @@ pub struct MissionRunView {
     pub steps: Vec<StepRunView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loops: Vec<LoopRunView>,
+    /// Unresolved exit-code field gates on terminal execs, computed for mission details.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stuck_gates: Vec<String>,
 }
 
 /// Who set a finished run's outcome, from what, and why.

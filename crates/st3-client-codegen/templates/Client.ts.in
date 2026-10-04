@@ -3,7 +3,7 @@ import { API_VERSION } from './Models.generated';
 import type {
     AgentDeclaration, HostRepositories, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
-    SubjectDefinition, UsagePeriod, CollectionName, CollectionFrame,
+    SubjectDefinition, UsagePeriod, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated';
