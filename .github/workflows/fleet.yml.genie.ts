@@ -160,12 +160,19 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
         // Node 24, as in the workspace shell; schema tests use its native TypeScript loading.
         { uses: 'actions/setup-node@v4', with: { 'node-version': '24.18.0' } },
         {
+          name: 'Fingerprint the locked dependencies',
+          id: 'lockfiles',
+          // ci1's Nix runner lacks the Node 20 helper used by GitHub's hashFiles expression.
+          run: `lockfiles_hash=$(sha256sum apps/ios/package-lock.json clients/typescript/st3-client/package-lock.json | sha256sum | cut -d ' ' -f1)
+printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
+        },
+        {
           name: 'Cache the locked TypeScript and Effect toolchain',
           id: 'typescript-cache',
-          uses: 'actions/cache@v4',
+          uses: 'actions/cache@v5',
           with: {
             path: 'apps/ios/node_modules\nclients/typescript/st3-client/node_modules',
-            key: "typescript-client-${{ runner.os }}-node24.18.0-${{ hashFiles('apps/ios/package-lock.json', 'clients/typescript/st3-client/package-lock.json') }}",
+            key: 'typescript-client-${{ runner.os }}-node24.18.0-${{ steps.lockfiles.outputs.hash }}',
           },
         },
         {

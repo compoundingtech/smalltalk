@@ -172,6 +172,8 @@ records the KVM probe and each phase's elapsed time.
 (the workspace uses Node 24), TypeScript 6.0.3 from the iOS lockfile and the client's pinned
 `effect@4.0.0-rc.118` development dependency. Both `node_modules` directories are cached together,
 keyed by both lockfiles and the Node version; a miss runs `npm ci --ignore-scripts` in each package.
+The lockfile fingerprint uses `sha256sum` in Bash so ci1's Nix runner needs no Node 20
+`hashFiles` helper when it evaluates the cache key.
 
 `bash scripts/ci-typescript-client` runs the client's contract and schema tests with `node --test`,
 the README's strict raw-client and rich-schema typechecks, and `tsc --noEmit -p apps/ios`.
