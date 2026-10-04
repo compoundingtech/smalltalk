@@ -545,7 +545,7 @@ jobs:
     name: linux-gate
     needs: [pick-runner, linux-tests, linux-clippy, linux-fleet-compat]
     if: always()
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["namespace-profile-linux-x86-64","namespace-features:github.run-id={0}"]', github.run_id)) }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require every Linux stage to pass

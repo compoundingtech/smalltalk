@@ -247,7 +247,8 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       needs: [pickRunnerJobId, 'linux-tests', 'linux-clippy', 'linux-fleet-compat'],
       // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
       if: 'always()',
-      'runs-on': linuxRunsOn,
+      // Aggregation needs no build caches and must not queue behind the work it summarizes.
+      'runs-on': 'ubuntu-latest',
       'timeout-minutes': 5,
       steps: [
         {
