@@ -24,8 +24,8 @@ export function isSnapshotChurn(error: unknown): boolean {
     && 'code' in error.response && error.response.code === 'page-cursor-expired';
 }
 
-export function recentTimeline<T extends { sequence: number }>(entries: T[], limit = 100): T[] {
-  return [...entries].sort((a, b) => a.sequence - b.sequence).slice(-limit);
+export function recentTimeline<T extends Pick<Entry, 'id' | 'sequence' | 'timestamp'>>(entries: T[], limit = 100): T[] {
+  return [...entries].sort(before).slice(-limit);
 }
 
 export function timelineText(body: unknown): string | null {
@@ -97,10 +97,14 @@ export function isConversational(entry: Entry): boolean {
   return entry.type !== 'status' && entry.type !== 'usage';
 }
 
-/** st's order: by time, then by sequence. */
-function before(a: Entry, b: Entry): number {
-  const at = (a.timestamp ?? '').localeCompare(b.timestamp ?? '');
-  return at !== 0 ? at : a.sequence - b.sequence;
+/** st's presentation order; source sequences from different namespaces are only time ties. */
+function before(a: Pick<Entry, 'id' | 'sequence' | 'timestamp'>, b: Pick<Entry, 'id' | 'sequence' | 'timestamp'>): number {
+  const left = Date.parse(a.timestamp ?? '');
+  const right = Date.parse(b.timestamp ?? '');
+  const leftTime = Number.isFinite(left) ? left : Number.NEGATIVE_INFINITY;
+  const rightTime = Number.isFinite(right) ? right : Number.NEGATIVE_INFINITY;
+  if (leftTime !== rightTime) return leftTime < rightTime ? -1 : 1;
+  return a.sequence - b.sequence || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 }
 
 /** Whether st holds entries before the oldest one held. */
