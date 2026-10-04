@@ -2950,15 +2950,18 @@ fn agent_todo(
 
 pub(super) async fn harness(
     State(state): State<AppState>,
-    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(_snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
     let subject = client_detail_id("agent", &id);
-    let index = snapshot.store_index;
-    let value = super::blocking_store(move || harness_value(&state.store, &subject, index)).await?
-        .ok_or_else(|| ApiError::not_found("agent not found"))?;
+    let (snapshot, value) = super::blocking_store(move || {
+        state.store.read_snapshot(|index| {
+            Ok((client_snapshot_at(&state, index), harness_value(&state.store, &subject, index)?))
+        })
+    }).await?;
+    let value = value.ok_or_else(|| ApiError::not_found("agent not found"))?;
     Ok(Json(json!({"snapshot": snapshot, "value": value})))
 }
 
