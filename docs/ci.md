@@ -513,12 +513,22 @@ from its first step to job completion, with unfinished jobs counted through the 
 The observation is repository-scoped; the workspace can also have jobs from other repositories.
 
 To refresh the capacity measurement, dispatch Workspace CI on `main`. Its `namespace-capacity`
-job runs only for `workflow_dispatch`, publishes platform limits and current usage to the job
+job publishes platform limits and current usage for `workflow_dispatch` to the job
 summary and retains the `namespace-capacity` artifact. It reports no workspace or account identity.
 See Namespace's [resource limits](https://namespace.so/docs/architecture/compute/resource-limits)
 and [profile concurrency controls](https://namespace.so/docs/solutions/github-actions/runner-controls/concurrent-runners)
 for the scheduler's limits, and GitHub's [merge queue settings](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
 for the distinction between build concurrency and merge batch size.
+
+## Superseded merge groups
+
+The `namespace-capacity` job also watches `merge_group` events on a GitHub-hosted runner,
+independent of ci1 and Namespace availability. It polls the group's ref and required check statuses
+every 15 seconds. A missing ref or a changed SHA on two consecutive successful lookups force-cancels
+its own workflow, including queued Linux jobs and always-run summaries. Lookup failures retain work.
+Once all four required checks finish, the watcher exits normally; a ref removed by a successful
+merge therefore retains the completed workflow result used by main upkeep. It executes embedded
+workflow code without checking out queued PR code. Manual capacity reports still use Namespace.
 
 ## Namespace jobs that never start
 
