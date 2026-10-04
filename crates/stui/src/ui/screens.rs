@@ -124,7 +124,8 @@ pub fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
         | AttentionKind::Feedback { .. }
         | AttentionKind::Launch { .. }
         | AttentionKind::Revision { .. }
-        | AttentionKind::Request { .. } => ("◆", theme::PERSON),
+        | AttentionKind::Request { .. }
+        | AttentionKind::Decision { .. } => ("◆", theme::PERSON),
         AttentionKind::Fault { .. } => ("✕", theme::FAULT),
         AttentionKind::Message { .. } => ("✉", theme::SAPPHIRE),
         AttentionKind::Update { .. } => ("✦", theme::GREEN),
@@ -703,6 +704,14 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
     }
     card.blank();
     match &item.kind {
+        AttentionKind::Decision { state, source, question } => {
+            card.wrap(&text::inline(question, theme::text()), inner);
+            card.blank();
+            card.field("state", state, inner, theme::soft());
+            card.field("source", source, inner, theme::soft());
+            card.blank();
+            card.wrap(&text::inline("Answer through Axe, or talk to the requesting agent. This card is a read-only source projection.", theme::soft()), inner);
+        }
         AttentionKind::Review {
             question,
             because,

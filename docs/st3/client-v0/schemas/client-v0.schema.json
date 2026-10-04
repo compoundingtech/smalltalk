@@ -215,13 +215,14 @@
           "required": ["kind", "attention_kind", "source_id", "person_id", "title", "detail", "priority", "state", "requested_at", "actions"],
           "properties": {
             "kind": { "const": "attention" },
-            "attention_kind": {"anyOf": [{"enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "person-step", "agent-request", "fault"]}, {"type": "string", "pattern": "^custom\\.[a-zA-Z0-9_.-]+$"}]},
+            "attention_kind": {"anyOf": [{"enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "person-step", "agent-request", "fault", "decision"]}, {"type": "string", "pattern": "^custom\\.[a-zA-Z0-9_.-]+$"}]},
           "custom_form": {"type": "object", "description": "Data-only registered reply form; absent on native attention."},
             "source_kind": {"type": "string"},
             "episode": {"type": "string"},
             "action_parameters": {"type": "object"},
             "request": { "$ref": "#/$defs/StructuredRequest", "description": "A person-step ask's structured request; absent on a free-text ask." },
             "update": { "$ref": "#/$defs/PersonUpdate", "description": "Information the person asked for. It asks nothing: reading it (work.done with answer id read) clears it." },
+            "decision": { "$ref": "#/$defs/DecisionAttention", "description": "Source-owned decision metadata. No private request or answer text; only pending is actionable." },
             "source_id": { "$ref": "#/$defs/Id" },
             "person_id": { "$ref": "#/$defs/Id" },
             "requester_id": { "$ref": "#/$defs/Id" },
@@ -259,6 +260,41 @@
         "step": { "type": "string", "description": "That step's name within its mission." },
         "goal": { "type": "string", "description": "What that step is for." },
         "attempt": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "DecisionNativeAsk": {
+      "type": "object", "additionalProperties": false,
+      "required": ["key", "subject", "status"],
+      "properties": {
+        "key": { "type": "string", "maxLength": 512 },
+        "subject": { "$ref": "#/$defs/StepRunId" },
+        "run": { "$ref": "#/$defs/MissionRunId" },
+        "episode": { "type": "string", "maxLength": 512 },
+        "status": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "DecisionAttention": {
+      "type": "object", "additionalProperties": false,
+      "required": ["decision_id", "request_id", "q", "source_sequence", "source_revision", "person", "decision_kind", "state", "revived", "activation", "claim_id", "native_asks", "source_conflict", "updated_at_unix_ms"],
+      "properties": {
+        "decision_id": { "$ref": "#/$defs/Id" },
+        "request_id": { "type": "string", "pattern": "^[a-z0-9]{6}$" },
+        "q": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "source_sequence": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "source_revision": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "person": { "$ref": "#/$defs/Id" },
+        "decision_kind": { "enum": ["blocker", "refinement"] },
+        "state": { "enum": ["pending", "gated", "answered", "moot", "undecidable"] },
+        "answer_id": { "type": "string", "pattern": "^[a-z0-9]{6}$" },
+        "answer_source_revision": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "answer_link": { "type": "string", "description": "Relative link to this gateway's history-enabled attention detail; no second source or answer-write authority." },
+        "revived": { "type": "boolean" },
+        "activation": { "type": "string", "pattern": "^[a-f0-9]{16}$" },
+        "native_ask": { "$ref": "#/$defs/DecisionNativeAsk" },
+        "native_asks": { "type": "array", "items": { "$ref": "#/$defs/DecisionNativeAsk" } },
+        "claim_id": { "type": "string" },
+        "source_conflict": { "type": "boolean" },
+        "updated_at_unix_ms": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
       }
     },
     "AttentionTargetState": {

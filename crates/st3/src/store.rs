@@ -89,6 +89,7 @@ pub use smallclaims::store::{
 
 mod accounts;
 mod attention_snapshot;
+mod decision_attention;
 mod backup;
 mod checkpoint_rules;
 mod limits;
@@ -11996,6 +11997,7 @@ impl Store {
         items.extend(self.person_attention_items(person, as_of)?);
         items.extend(self.harness_login_attention_items(person)?);
         items.extend(self.custom_attention_items(person)?);
+        self.project_decision_attention(&mut items, person)?;
         // A person who published a broken gate is the one to correct it.
         items.extend(
             self.broken_gate_items(person, as_of)?
