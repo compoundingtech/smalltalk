@@ -49,11 +49,15 @@ by a person or agent, a crash, a diagnostic harness exit, a lost host, and retir
 `ended_at` identifies the observed boundary; available actor, reason, exit code/signal,
 and diagnostic accompany it.
 
-Missing evidence remains absent. A clean exit is completion only with an explicit
-current ended harness, exit 0, no signal, and no stop request. Unknown actors are not
-guessed. Owned-set retirement and explicit stop/suspend requests take precedence over
-an otherwise clean exit. Consumers must preserve stale/missing observation states
-instead of displaying retained completion evidence as current success.
+Missing evidence remains absent. Completion requires a current ended harness or an
+observed exited runtime, explicit exit 0, no signal, and no stop request. Terminal
+harness diagnostics remain tied to that runtime incarnation after its exit; a newer
+incarnation cannot inherit them. Unknown actors are not guessed. A stop request is
+not an ended reason until termination is observed; confirmed suspension is separate
+positive evidence. Confirmed owned-set retirement and actor-attributed stops remain
+explainable on historical rows and take precedence over an otherwise clean exit.
+Consumers preserve stale/missing observation states instead of displaying retained
+completion evidence as current success.
 
 ## One-shot seats
 

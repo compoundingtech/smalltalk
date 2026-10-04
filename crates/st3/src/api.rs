@@ -2201,7 +2201,12 @@ fn client_agent_resources_uncached(
             let desired_claim = subject.desired_token.as_deref()
                 .filter(|_| subject.kind.as_deref() == Some("stop"))
                 .map(|claim| store.claim_by_id(claim)).transpose()?.flatten();
-            let end_reason = end_reason::project(&subject, suspension.as_ref(), desired_claim.as_ref(), retired_subjects.contains(&subject.subject), &updated_at);
+            let terminal_harness = if subject.harness.is_none()
+                && matches!(fields.and_then(|fields| fields.get("status")).and_then(Value::as_str), Some("exited" | "stopped"))
+            {
+                store.terminal_harness_at(&subject.subject, snapshot_index)?
+            } else { None };
+            let end_reason = end_reason::project(&subject, terminal_harness.as_ref(), suspension.as_ref(), desired_claim.as_ref(), retired_subjects.contains(&subject.subject), &updated_at);
             let name = crate::model::effective_agent_name(
                 &subject.subject, subject.desired.as_ref(),
             ).to_owned();
