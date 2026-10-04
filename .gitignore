@@ -1,5 +1,12 @@
 /target
 
+# Native release outputs and setup-zig's restored cache are not source changes.
+/dist
+/.zig-cache
+
+# Python installer tests import the installer before the native build stamps Git.
+__pycache__/
+
 # Nix build symlink.
 /result
 
