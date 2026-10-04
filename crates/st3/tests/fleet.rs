@@ -3522,15 +3522,15 @@ async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_convers
                     .args(["list", "--json"])
                     .env("PTY_ROOT", root)
                     .output();
-                if let Ok(output) = output {
-                    if let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&output.stdout) {
-                        for row in rows {
-                            if let Some(name) = row["name"].as_str() {
-                                let _ = Command::new(&self.pty)
-                                    .args(["kill", name])
-                                    .env("PTY_ROOT", root)
-                                    .output();
-                            }
+                if let Ok(output) = output
+                    && let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&output.stdout)
+                {
+                    for row in rows {
+                        if let Some(name) = row["name"].as_str() {
+                            let _ = Command::new(&self.pty)
+                                .args(["kill", name])
+                                .env("PTY_ROOT", root)
+                                .output();
                         }
                     }
                 }
