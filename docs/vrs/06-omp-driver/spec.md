@@ -188,7 +188,11 @@ require all five checks before admitting an unseen identity:
    and the harness's completed user/assistant messages containing the nonce.
 
 A passed exact build never admits a different patch merely because its minor matches.
-Executable, interpreter, npm installation, extension or probe replacement triggers remeasurement.
+Executable, interpreter, package manifest, available lockfile, extension or probe replacement
+triggers remeasurement. Identity streams executable and runtime contents and package metadata,
+including npm’s hidden installation lock when present. It never walks the installation asset tree
+and has no installation size limit. This identifies dependency releases recorded in metadata,
+not arbitrary asset edits; all five contract measurements remain required.
 All subprocesses use disposable roots and are reaped by process group on success, refusal,
 timeout or malformed evidence. Version probing, model requests and cache locking are bounded.
 The startup probe does not certify context arithmetic, provider/model matrices, pricing,
@@ -219,7 +223,7 @@ It records the reason, time and exact executable/interpreter/installation and sh
 identity in a separate user-local `*.override.json` record. It bypasses even scratch `--version`;
 it neither replaces failed measurements nor certifies the contract. The driver logs that a
 person's exception is active and does not label its support as measured passing. An executable,
-dependency, interpreter or shipped-extension replacement needs a new exception. Other builds
+package manifest, lockfile, interpreter or shipped-extension replacement needs a new exception. Other builds
 retain normal measured admission. The exception persists across st updates with the same
 producer and extension. Revocation restores retained measured results on the next launch:
 

@@ -28,7 +28,10 @@ Use `opencode` for OpenCode; `--binary` must name the executable used by the aff
 For a daemon using a nondefault state directory, add `--state-dir /path/to/state`. Then restart
 only the affected seat. The override command runs no producer or probe child and needs no daemon.
 The recorded exception contains a reason and exact build/extension identity; it preserves failed
-measurements and expires on executable, interpreter, dependency or shipped-extension replacement.
+measurements and expires when executable, interpreter, package manifest, lockfile or shipped-extension
+identity changes. Build identity hashes executable and runtime contents plus package metadata; it
+does not traverse package assets or refuse installations for their size. A dependency upgrade
+recorded in a manifest or lockfile changes identity; an arbitrary asset edit does not.
 The driver logs the active exception. `st admission revoke omp --binary /path/to/omp` (with the
 same state directory, if customized) restores normal admission on the next launch. An override
 cannot supply a runtime missing from the real harness installation or repair incompatible APIs.
