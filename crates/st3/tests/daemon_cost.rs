@@ -767,6 +767,49 @@ const PROBES: &[Probe] = &[
                 .map_err(|error| error.message)
         },
     ),
+    post(
+        "POST /v1/work/start",
+        "/v1/work/start",
+        |fixture, attempt| {
+            json!({
+                "actor": fixture.items["asker"],
+                "title": format!("Invented spontaneous task {attempt}"),
+                "idempotency_key": format!("cost-start-{attempt}"),
+            })
+        },
+    ),
+    // Like renewal, handoff is fenced to a live harness at the HTTP boundary. Measure the
+    // same store write with a separate claimed step for each attempt, rather than cached retries.
+    direct(
+        "POST /v1/work/handoff/{*subject}",
+        |store, fixture, attempt| {
+            let (agent, step, incarnation) = &fixture.handoffs[attempt];
+            store
+                .handoff_work(
+                    step,
+                    &st3::model::WorkHandoffRequest {
+                        actor: agent.clone(),
+                        incarnation: Some(incarnation.clone()),
+                        to: "person/bench-operator".into(),
+                        note: "Review the invented fixture next.".into(),
+                        evidence: Vec::new(),
+                        idempotency_key: format!("cost-handoff-{attempt}"),
+                    },
+                )
+                .map(|view| serde_json::to_value(view).unwrap())
+                .map_err(|error| error.message)
+        },
+    ),
+    post(
+        "POST /v1/work/acknowledge/{*subject}",
+        "/v1/work/acknowledge/{acknowledge_step}",
+        |fixture, attempt| {
+            json!({
+                "actor": "person/bench-operator",
+                "message": fixture.acknowledgments[attempt].1,
+            })
+        },
+    ),
     post("POST /v1/work/ask", "/v1/work/ask", |fixture, attempt| {
         json!({
             "person": "person/bench-operator",
@@ -937,12 +980,16 @@ struct Fixture {
     sent: String,
     /// Person asks the done probe answers, one per attempt.
     asks: Vec<String>,
+    /// Fresh claimed steps and incarnation fences, one per handoff measurement.
+    handoffs: Vec<(String, String, String)>,
+    /// Fresh pending handoffs and their recipient-visible notes, one per acknowledgment.
+    acknowledgments: Vec<(String, String)>,
     peer_inventory: Value,
     peer_exchange: Value,
 }
 
 impl Fixture {
-    fn fill(&self, path: &str) -> String {
+    fn fill(&self, path: &str, attempt: usize) -> String {
         let mut path = path
             .replace("{seat}", &urlencoding::encode(&self.subjects.seats[0]))
             .replace(
@@ -953,6 +1000,9 @@ impl Fixture {
                 "{held_step}",
                 self.subjects.held.first().map_or("", |(_, step, _)| step),
             );
+        if path.contains("{acknowledge_step}") {
+            path = path.replace("{acknowledge_step}", &self.acknowledgments[attempt].0);
+        }
         for (name, value) in &self.items {
             path = path.replace(&format!("{{{name}}}"), value);
         }
@@ -1347,6 +1397,11 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
 
     let mut costs = BTreeMap::new();
     for probe in PROBES {
+        // Prepare immediately before the work writes so the extra person steps do not change
+        // the generated read fixtures or their existing growth baselines.
+        if probe.route == "POST /v1/work/start" {
+            prepare_handoffs(&store, &mut fixture);
+        }
         let mut samples = Vec::new();
         // The first run warms statement caches and lazily built state; it is not counted.
         for attempt in 0..4 {
@@ -1360,7 +1415,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                 })
                 .await
             } else {
-                let path = fixture.fill(probe.path);
+                let path = fixture.fill(probe.path, attempt);
                 let body = probe.body.map(|body| body(&fixture, attempt));
                 let client = if path.starts_with("/v1/client/") {
                     person.clone()
@@ -1563,8 +1618,76 @@ async fn fixture(person: &Client, client: &Client, subjects: Subjects) -> Fixtur
         items,
         sent,
         asks,
+        handoffs: Vec::new(),
+        acknowledgments: Vec::new(),
         peer_inventory: Value::Null,
         peer_exchange: Value::Null,
+    }
+}
+
+/// Set up fresh writes outside the measured region. A handoff releases its sender before the
+/// next task starts, so each dedicated agent has exactly one worker lease during measurement.
+fn prepare_handoffs(store: &Store, fixture: &mut Fixture) {
+    let kdl = (0..4)
+        .map(|attempt| format!(
+            "agent \"bench/cost/handoff-{attempt}\" {{ workspace \"/tmp\"; command \"true\" }}\n"
+        ))
+        .collect::<String>();
+    let intent = st3::parse_intent(&format!("version 2\n{kdl}"), NODE).unwrap();
+    store.apply_internal(&intent, "cost-handoff-seats").unwrap();
+    for attempt in 0..4 {
+        let actor = format!("agent/bench/cost/handoff-{attempt}");
+        let incarnation = format!("cost-handoff-incarnation-{attempt}");
+        for purpose in ["acknowledge", "transfer"] {
+            let work = store
+                .start_work(&st3::model::WorkStartRequest {
+                    actor: actor.clone(),
+                    title: format!("Invented {purpose} task {attempt}"),
+                    idempotency_key: format!("cost-{purpose}-start-{attempt}"),
+                })
+                .unwrap();
+            store
+                .work_action(
+                    &work.subject,
+                    "claim",
+                    &st3::model::WorkRequest {
+                        actor: Some(actor.clone()),
+                        incarnation: Some(incarnation.clone()),
+                        summary: None,
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: format!("cost-{purpose}-claim-{attempt}"),
+                    },
+                )
+                .unwrap();
+            if purpose == "acknowledge" {
+                store
+                    .handoff_work(
+                        &work.subject,
+                        &st3::model::WorkHandoffRequest {
+                            actor: actor.clone(),
+                            incarnation: Some(incarnation.clone()),
+                            to: "person/bench-operator".into(),
+                            note: "Review the invented fixture next.".into(),
+                            evidence: Vec::new(),
+                            idempotency_key: format!("cost-prepare-handoff-{attempt}"),
+                        },
+                    )
+                    .unwrap();
+                let claims = store
+                    .claims_for(&work.subject, Some("work.released"))
+                    .unwrap();
+                let note = claims.last().unwrap().body["fields"]["handoff_message"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                fixture.acknowledgments.push((work.subject, note));
+            } else {
+                fixture
+                    .handoffs
+                    .push((actor.clone(), work.subject, incarnation.clone()));
+            }
+        }
     }
 }
 

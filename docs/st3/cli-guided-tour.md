@@ -93,6 +93,9 @@ st work show step-run/e3e841ba011236a21fe8bd3e50c21a1d/walkthrough-and-followup
 Then inspect every lifecycle and revision action:
 
 ```sh
+st work start --help
+st work handoff --help
+st work acknowledge --help
 st work claim --help
 st work renew --help
 st work progress --help

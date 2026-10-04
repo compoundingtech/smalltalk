@@ -4,6 +4,7 @@
 //! `mod NAME;` line here or an explicit test target for every new file.
 
 mod action_coverage;
+mod adhoc_work;
 mod agents_restart;
 mod backup;
 mod boot_canaries;

@@ -2387,6 +2387,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("attempt", integer()),
         ],
         "mission-run.created" => &[
+            ("mission_spec", object()),
+            ("ad_hoc_title", string()),
             ("status", string()),
             ("mission", reference()),
             ("revision", string()),
@@ -2533,6 +2535,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("claim_expires_at_unix_ms", integer()),
             ("readiness_epoch", integer()),
             ("extend_ms", integer()),
+            ("handoff_key", string()),
+            ("handoff_request", object()),
+            ("handoff_to", reference()),
+            ("handoff_message", reference()),
+            ("handoff_acknowledged", reference()),
         ],
         "gate.requested" => &[
             ("status", string()),

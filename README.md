@@ -220,6 +220,15 @@ Lists show current state. Add `--all` for history. Every command has `--help`, a
 `--json` flag prints the stable client format that the apps read. Run `stui` for the same views
 in a terminal app.
 
+For spontaneous work, `st work start "Inspect the fixture" --as agent/example/worker` opens a
+one-step run and prints how to claim it. Use `work progress --summary` for checkpoints and
+`work complete --summary --evidence` to close it. `work handoff STEP --to agent/example/reviewer
+--note TEXT --as agent/example/worker` releases the sender's claim and delivers a note to the
+recipient. The recipient reads it, uses `work acknowledge STEP --message MESSAGE --as RECIPIENT`,
+then claims it. A person recipient sees the step on their home and closes with `work done`.
+`work show STEP` includes the note and acknowledgment. Start and handoff accept
+`--idempotency-key KEY` for retries after a timeout.
+
 ### Embedding native conversations
 
 `crates/st3-conversation-ui` provides the same native conversation presentation used by

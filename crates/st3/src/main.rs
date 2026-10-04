@@ -3495,6 +3495,13 @@ struct AttentionWithdrawArgs {
 
 #[derive(Subcommand)]
 enum WorkCommand {
+    /// Open a one-step run for this seat without authoring a mission; then use claim.
+    Start(WorkStartArgs),
+    /// Release claimed work to another seat or person with a note they acknowledge.
+    Handoff(WorkHandoffArgs),
+    /// Acknowledge the exact handoff note before claiming or completing its work.
+    Acknowledge(WorkAcknowledgeArgs),
+
     /// Ask a person through a runtime step owned by live work.
     ///
     /// Puts a structured request on the person's home.
@@ -3575,6 +3582,44 @@ enum WorkCommand {
         #[command(subcommand)]
         command: WorkRevisionCommand,
     },
+}
+
+#[derive(Args)]
+struct WorkStartArgs {
+    /// What this spontaneous task is for.
+    title: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    /// Reuse a key after a timeout to recover the same run.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+struct WorkHandoffArgs {
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    #[arg(long, env = "ST3_INCARNATION")]
+    incarnation: Option<String>,
+    #[arg(long)]
+    to: String,
+    #[arg(long)]
+    note: String,
+    #[arg(long)]
+    evidence: Vec<String>,
+    #[arg(long)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+struct WorkAcknowledgeArgs {
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    /// The message ID from the handoff note or work show.
+    #[arg(long)]
+    message: String,
 }
 
 #[derive(Args)]
@@ -4695,6 +4740,9 @@ fn guard_mutating_cli_actor(
             _ => None,
         },
         Command::Work { command } => match command {
+            WorkCommand::Start(args) => Some(args.actor.as_str()),
+            WorkCommand::Handoff(args) => Some(args.actor.as_str()),
+            WorkCommand::Acknowledge(args) => Some(args.actor.as_str()),
             WorkCommand::Claim(args) | WorkCommand::Renew(args) | WorkCommand::Progress(args)
             | WorkCommand::Complete(args) | WorkCommand::Fail(args) | WorkCommand::Release(args) => args.actor.as_deref(),
             WorkCommand::Wake(args) => args.actor.as_deref(),
@@ -13612,6 +13660,69 @@ async fn run_work(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        WorkCommand::Start(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let response: StepRunView = client
+                .post(
+                    "/v1/work/start",
+                    &st3::model::WorkStartRequest {
+                        actor: args.actor.clone(),
+                        title: args.title,
+                        idempotency_key: args
+                            .idempotency_key
+                            .unwrap_or_else(|| format!("work-start:{}", uuid::Uuid::now_v7())),
+                    },
+                )
+                .await?;
+            if json_output {
+                print_value(&response, true)
+            } else {
+                println!(
+                    "{}\t{}\nClaim: st work claim {} --as {}",
+                    response.status, response.subject, response.subject, args.actor
+                );
+                Ok(())
+            }
+        }
+        WorkCommand::Handoff(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let incarnation = match args.incarnation {
+                Some(value) => Some(value),
+                None => current_agent_incarnation(client, &args.actor).await?,
+            };
+            let response: StepRunView = client
+                .post(
+                    &format!("/v1/work/handoff/{}", urlencoding::encode(&args.subject)),
+                    &st3::model::WorkHandoffRequest {
+                        actor: args.actor,
+                        incarnation,
+                        to: args.to,
+                        note: args.note,
+                        evidence: args.evidence,
+                        idempotency_key: args
+                            .idempotency_key
+                            .unwrap_or_else(|| format!("work-handoff:{}", uuid::Uuid::now_v7())),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+        WorkCommand::Acknowledge(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let response: StepRunView = client
+                .post(
+                    &format!(
+                        "/v1/work/acknowledge/{}",
+                        urlencoding::encode(&args.subject)
+                    ),
+                    &st3::model::WorkAcknowledgeRequest {
+                        actor: args.actor,
+                        message: args.message,
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
         WorkCommand::Ask(args) => {
             reject_foreign_agent_actor(&args.actor)?;
             let request = args
