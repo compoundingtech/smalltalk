@@ -827,7 +827,8 @@
             "runs_truncated": { "type": "boolean" },
             "run_generations": { "propertyNames": {"$ref": "#/$defs/MissionRunId"}, "type": "object", "additionalProperties": { "$ref": "#/$defs/RunGenerationId" } },
             "visualization": { "oneOf": [{ "$ref": "#/$defs/Visualization" }, { "type": "null" }] },
-            "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] }
+            "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
+            "resources": { "type": "array", "items": { "$ref": "#/$defs/DeclaredResource" }, "description": "The resources the current published revision names, in authored order. Read-only. An older daemon omits the field." }
           }
         }
       ]
@@ -1015,7 +1016,8 @@
             "subagents": { "type": "array", "items": { "$ref": "#/$defs/AgentSubagent" }, "description": "The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field." },
             "handoff": {"oneOf": [{"$ref": "#/$defs/AgentHandoff"}, {"type": "null"}], "description": "Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes."},
             "rollout": { "type": ["object", "null"], "description": "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." },
-            "suspension": { "oneOf": [{ "$ref": "#/$defs/AgentSuspension" }, { "type": "null" }], "description": "The seat's latest suspend or resume and its phase. An older daemon omits the field." }
+            "suspension": { "oneOf": [{ "$ref": "#/$defs/AgentSuspension" }, { "type": "null" }], "description": "The seat's latest suspend or resume and its phase. An older daemon omits the field." },
+            "resources": { "type": "array", "items": { "$ref": "#/$defs/DeclaredResource" }, "description": "The resources the seat's current declaration names, in authored order. Read-only. An older daemon omits the field." }
           }
         }
       ]
@@ -1130,6 +1132,20 @@
       "required": ["agent_id"],
       "properties": {
         "agent_id": { "$ref": "#/$defs/Id" },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "DeclaredResource": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A named edge from a seat or mission declaration to an ordinary resource subject in the graph.",
+      "required": ["name", "subject", "kind", "resolution"],
+      "properties": {
+        "name": { "type": "string", "description": "Unique within the declaration." },
+        "subject": { "$ref": "#/$defs/Id", "description": "The ordinary resource subject targeted by this edge. URI references use resource/uri/SHA256 of the exact URI." },
+        "kind": { "type": "string", "enum": ["uri", "subject"], "description": "Whether the edge was authored with uri= or subject=." },
+        "resolution": { "type": "string", "enum": ["resolved", "unresolved", "not-applicable"], "description": "URI locator availability. Subject references use not-applicable; this is not a subject existence check." },
+        "uri": { "type": "string", "description": "The exact absolute URI, any scheme. Present only for resolved URI references." },
         "reason": { "type": ["string", "null"] }
       }
     },

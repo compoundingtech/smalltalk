@@ -285,6 +285,10 @@ Changing a resource's URI points the edge at a different subject; it does not mu
 subject's URI. A nested or loop mission body cannot name resources, because only a published
 top-level mission declares them.
 
+An owned-set publication (`st apply --set NAME`) publishes these shared URI targets alongside
+its declarations, but excludes them from the set's membership and ownership. Dropping edges
+or retiring the seats and missions that name them never retires the targets.
+
 To inspect incoming edges, run `st subject show RESOURCE --references` (add the global
 `--json` flag for JSON), or request `GET /v1/resource-references/{subject}`. Each incoming
 reference contains `owner`, local `name`, and nullable `reason`. The lookup covers current agent
