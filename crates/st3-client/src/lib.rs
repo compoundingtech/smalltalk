@@ -1359,6 +1359,13 @@ impl Client {
         };
         self.get(&path).await
     }
+    pub async fn status_history_get(
+        &self,
+        id: &str,
+    ) -> Result<Envelope<StatusHistory>, ClientError> {
+        self.get(&format!("/v1/client/status-history/{}", percent_encode(id)))
+            .await
+    }
     pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {
         self.agent_queue_internal(agent_id).await
     }

@@ -149,6 +149,7 @@ public actor St3Client {
     public func agentsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("agents", cursor: cursor, limit: limit, history: history) }
     public func agentsGet(id: String) async throws -> Envelope<Resource> { try await resource("agents", id: id) }
     public func agentDeclarationGet(id: String, revision: String? = nil, showEnvValues: Bool = false) async throws -> Envelope<AgentDeclaration> { var query: [URLQueryItem] = [.init(name: "show_env_values", value: showEnvValues ? "true" : "false")]; if let revision { query.append(.init(name: "revision", value: revision)) }; return try await get("v1/client/agent-declarations/\(id)", query: query) }
+    public func statusHistoryGet(id: String) async throws -> Envelope<StatusHistory> { try await get("v1/client/status-history/\(id)") }
     public func runtimesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("runtimes", cursor: cursor, limit: limit, history: history) }
     public func runtimesGet(id: String) async throws -> Envelope<Resource> { try await resource("runtimes", id: id) }
     public func observersList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("observers", cursor: cursor, limit: limit, history: history) }
