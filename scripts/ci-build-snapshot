@@ -110,7 +110,7 @@ def unpack(archive, dest):
     names = stream(archive, ['tar', '-tf', '-']).splitlines()
     for name in names:
         parts = Path(name).parts
-        if not parts or name.startswith('/') or '..' in parts or parts[0] not in ('target', 'cargo-home', 'st-ci-cache', 'cost-stores'):
+        if not parts or name.startswith('/') or '..' in parts or parts[0] not in ('target', 'cargo-home', 'st-ci-cache', 'cost-stores', 'zig-tool'):
             raise ValueError('unexpected snapshot archive path')
     stream(archive, ['tar', '-xf', '-', '-C', str(dest)])
     for name in ('target', 'cargo-home/registry', 'cargo-home/git', 'st-ci-cache'):
@@ -157,6 +157,12 @@ def restore():
                     if (temp / 'st-bench').exists(): shutil.rmtree(temp / 'st-bench')
                     shutil.move(dest / 'cost-stores', temp / 'st-bench')
                     with open(os.environ['GITHUB_ENV'], 'a') as output: output.write('CI_BUILD_SNAPSHOT_STORES_HIT=1\n')
+                if (dest / 'zig-tool').is_dir():
+                    compiler = Path(os.environ['CI_ZIG_CACHE_DIR'])
+                    compiler.parent.mkdir(parents=True, exist_ok=True)
+                    if compiler.exists(): shutil.rmtree(compiler)
+                    shutil.move(dest / 'zig-tool', compiler)
+                    with open(os.environ['GITHUB_ENV'], 'a') as output: output.write('CI_BUILD_SNAPSHOT_ZIG_HIT=1\n')
             with open(os.environ['GITHUB_ENV'], 'a') as output: output.write('CI_BUILD_SNAPSHOT_HIT=1\n')
             with open(os.environ['GITHUB_OUTPUT'], 'a') as output: output.write('cache-hit=true\n')
             summary('Build snapshot cache HIT: exact source, platform, flags and compiler; dependency archives skipped.')
@@ -211,6 +217,11 @@ def pack():
                           (cargo / 'git', staged / 'cargo-home/git'), (temp / 'st-ci-cache', staged / 'st-ci-cache')):
             shutil.copytree(src, dest, copy_function=copy, symlinks=True)
         names = ['target', 'cargo-home', 'st-ci-cache']
+        if os.environ.get('CI_ZIG_CACHE_DIR'):
+            compiler = Path(os.environ['CI_ZIG_CACHE_DIR'])
+            if compiler.is_dir():
+                shutil.copytree(compiler, staged / 'zig-tool', copy_function=copy, symlinks=True)
+                names.append('zig-tool')
         report = temp / 'perf/cost.json'
         if (temp / 'st-bench').is_dir() and report.exists() and json.loads(report.read_text()).get('failures') == []:
             shutil.copytree(temp / 'st-bench', staged / 'cost-stores', copy_function=copy, symlinks=True)

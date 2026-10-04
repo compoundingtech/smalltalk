@@ -104,12 +104,17 @@ with tempfile.TemporaryDirectory() as tmp:
         (temp / 'st-bench').mkdir(); (temp / 'perf').mkdir()
         (temp / 'st-bench/generated-fixture').write_text('store fixture')
         (temp / 'perf/cost.json').write_text(json.dumps(dict(failures=[])))
+        zig = base / 'tool-cache/zig/0.15.2'
+        zig.mkdir(parents=True)
+        (zig / 'x64.complete').touch()
+        os.environ['CI_ZIG_CACHE_DIR'] = str(zig)
         module.pack()
         archive = temp / 'ci-build-snapshot/build.tar.zst'
         saved = base / 'saved.tar.zst'; shutil.copy(archive, saved)
         shutil.rmtree(work / 'target')
         shutil.rmtree(cargo / 'registry'); shutil.rmtree(cargo / 'git')
         shutil.rmtree(temp / 'st-ci-cache')
+        shutil.rmtree(zig)
         for path in module.source.source_paths(work):
             os.utime(work / path, None, follow_symlinks=False)
         index = work / '.git/index'
@@ -126,6 +131,7 @@ with tempfile.TemporaryDirectory() as tmp:
             module.restore()
         assert index.stat().st_mtime_ns == index_mtime, 'source restoration must not restamp Git metadata'
         assert 'CI_BUILD_SNAPSHOT_STORES_HIT=1' in env_file.read_text()
+        assert 'CI_BUILD_SNAPSHOT_ZIG_HIT=1' in env_file.read_text() and (zig / 'x64.complete').exists()
         assert (temp / 'st-bench/generated-fixture').read_text() == 'store fixture'
         module.prepare()
         _, warm = command('cargo', 'build', '--locked', '-vv', cwd=work, env=dict(os.environ))

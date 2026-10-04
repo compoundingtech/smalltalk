@@ -101,6 +101,7 @@ export default githubWorkflow(auditCaches({
       "env": {
         "MACOSX_DEPLOYMENT_TARGET": "15.0",
         CI_NATIVE_SNAPSHOT: '1',
+        CI_ZIG_CACHE_DIR: '${{ runner.tool_cache }}/zig/0.15.2',
         "RELEASE_TAG": "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
       },
       "steps": [
@@ -129,6 +130,15 @@ export default githubWorkflow(auditCaches({
             path: '~/.cache/zig\n~/Library/Caches/zig\n.zig-cache',
             key: "zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-${{ hashFiles('Cargo.lock', 'flake.lock') }}",
             'restore-keys': 'zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-',
+          },
+        },
+        {
+          name: 'Restore the pinned Zig compiler',
+          if: "env.CI_BUILD_SNAPSHOT_ZIG_HIT != '1'",
+          uses: 'actions/cache@v4',
+          with: {
+            path: '${{ env.CI_ZIG_CACHE_DIR }}',
+            key: 'zig-tool-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2',
           },
         },
         {

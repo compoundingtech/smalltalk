@@ -416,7 +416,7 @@ include the flake, Nix expressions and compatibility pins. Both cover macOS as w
 Linux, with isolated Cargo and Nix-cache directories. Genie freshness and isolation have
 job-specific caches seeded on main; portable builds use the same pinned Rust cache action as native
 releases. Native releases retain Zig objects under a dependency key rather than making
-another cache entry for every run.
+another cache entry for every run. The pinned Zig compiler has its own stable key and is also retained in matching native snapshots, so fresh nodes do not fetch it again.
 
 Compiled outputs also have three-day artifact snapshots keyed by the actual full source SHA,
 job, platform, architecture, build flags and workflow contents. Native snapshots additionally
