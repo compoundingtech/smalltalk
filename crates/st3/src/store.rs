@@ -5,6 +5,7 @@ pub mod owned_sets;
 mod owned_sets_tests;
 mod resources;
 mod rollouts;
+mod seat_status;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -14210,6 +14211,33 @@ impl Store {
         check_mailbox_fence(&self.readers.get(), fence)
     }
 
+    /// First observation of the current boot, including its index to distinguish messages
+    /// accepted within the same millisecond. Late replicas must also pass the time boundary.
+    pub(crate) fn native_mail_boot_floor(&self, subject: &str) -> Result<Option<(u128, u64)>> {
+        let runtime = self.latest_claim(subject, Some("runtime.observed"))?;
+        let Some(incarnation) = runtime.as_ref().and_then(|claim| {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            fields["incarnation_id"].as_str()
+        }) else {
+            return Ok(None);
+        };
+        self.readers
+            .get()
+            .prepare_cached(&canonical_sql(&format!(
+                "SELECT accepted_at_unix_ms, store_index
+             FROM claims INDEXED BY claims_incarnation_accepted_index
+             WHERE subject=?1 AND {INCARNATION_OF_CLAIM}=?2
+             ORDER BY CANONICAL_ASC(claims)
+             LIMIT 1"
+            )))?
+            .query_row(params![subject, incarnation], |row| {
+                let time: String = row.get(0)?;
+                Ok((time.parse::<u128>().unwrap_or(u128::MAX), row.get(1)?))
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// What a mailbox stream's snapshot can depend on, read before the snapshot is taken. A change
     /// after it to any of that brings a new snapshot; see [`Store::mailbox_changed_since`].
     pub(crate) fn mailbox_watermark(
@@ -17169,6 +17197,36 @@ fn publish_latest_claim_tx(
     .map_err(claim_append_error)
 }
 
+fn latest_harness_of_incarnation_tx(
+    connection: &Transaction<'_>,
+    subject: &str,
+    incarnation: Option<&str>,
+) -> Result<Option<ClaimRecord>, St3Error> {
+    let latest = latest_claim_of_kind_tx(connection, subject, "harness.observed")?;
+    if latest.as_ref().is_none_or(|claim| {
+        claim.body.pointer("/fields/incarnation_id").and_then(Value::as_str) == incarnation
+    }) {
+        return Ok(latest);
+    }
+    let comparison = if incarnation.is_some() { "=?2" } else { "IS ?2" };
+    let indexed = if incarnation.is_some() {
+        " INDEXED BY claims_incarnation_accepted_index"
+    } else {
+        ""
+    };
+    connection
+        .prepare_cached(&format!(
+            "SELECT {CLAIM_COLUMNS} FROM claims{indexed}
+             JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND {INCARNATION_OF_CLAIM}{comparison} AND claims.kind='harness.observed'
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+        ))
+        .map_err(internal)?
+        .query_row(params![subject, incarnation], claim_from_row)
+        .optional()
+        .map_err(internal)
+}
+
 /// Publish a harness observation when any field other than its observation time differs
 /// from the subject's latest replicated observation. When the harness stops working, its
 /// usage that is still only local replicates too.
@@ -17183,11 +17241,15 @@ fn publish_changed_harness_state_tx(
     ) -> BTreeMap<&'a str, &'a Value> {
         fields
             .into_iter()
-            .filter(|(name, _)| name.as_str() != "observed_at_ms")
+            .filter(|(name, _)| !matches!(name.as_str(), "observed_at_ms" | "observed_since_ms" | "status_transition"))
             .map(|(name, value)| (name.as_str(), value))
             .collect()
     }
-    let latest = latest_claim_of_kind_tx(transaction, &input.subject, &input.kind)?;
+    let latest = latest_harness_of_incarnation_tx(
+        transaction,
+        &input.subject,
+        input.fields.get("incarnation_id").and_then(Value::as_str),
+    )?;
     let unchanged = latest.as_ref().is_some_and(|claim| {
         claim
             .body
@@ -17195,16 +17257,38 @@ fn publish_changed_harness_state_tx(
             .and_then(Value::as_object)
             .is_some_and(|fields| state_fields(fields) == state_fields(&input.fields))
     });
-    if unchanged {
+    // Refresh remote freshness at most once a minute, without manufacturing transitions.
+    if unchanged && latest.as_ref().is_some_and(|claim| now.saturating_sub(claim.accepted_at_unix_ms) < 60_000) {
         return Ok(None);
     }
+    let mut fields = input.fields.clone();
+    let observed_at = fields.get("observed_at_ms").and_then(Value::as_u64)
+        .map_or(now, u128::from).min(now);
+    let same_state = latest.as_ref().is_some_and(|claim| {
+        claim.body["fields"]["state"] == fields["state"]
+            && claim.body["fields"].get("incarnation_id") == fields.get("incarnation_id")
+    });
+    let since = if same_state {
+        let previous = latest.as_ref().unwrap();
+        match previous.body["fields"]["observed_since_ms"].as_u64() {
+            Some(since) => u128::from(since),
+            None => seat_status::state_run_since(transaction, &input.subject,
+                fields.get("incarnation_id").and_then(Value::as_str).unwrap_or_default(),
+                fields.get("state").and_then(Value::as_str).unwrap_or_default(), i64::MAX as u64).map_err(internal)?
+                .unwrap_or_else(|| seat_status::observation_time(previous)),
+        }
+    } else {
+        observed_at
+    };
+    fields.insert("observed_since_ms".into(), json!(since as u64));
+    fields.insert("status_transition".into(), json!(!same_state));
     let claim = publish_latest_claim_tx(
         transaction,
         origin,
         &input.subject,
         &input.kind,
         input.actor.as_deref(),
-        &json!(input.fields),
+        &json!(fields),
     )?;
     if input.fields.get("state").and_then(Value::as_str) != Some("working") {
         publish_pending_usage_tx(transaction, origin, &input.subject, now)?;
@@ -18720,6 +18804,10 @@ fn mailbox_harness_ended(
         return Ok(false);
     }
 
+    if update_prompt_fence(connection, subject, incarnation, i64::MAX as u64)?.is_some() {
+        return Ok(false);
+    }
+
     // These positive prompt fences precede the harness state in the display fold. A restored
     // login removes the override. Read them only when they can change an ended decision.
     let diagnostic: Option<String> = connection
@@ -18844,10 +18932,64 @@ fn check_mailbox_fence(
     Ok(())
 }
 
+fn update_prompt_fence(
+    connection: &Connection,
+    subject: &str,
+    incarnation: &str,
+    at_index: u64,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
+    let claim = connection.prepare_cached(&format!(
+        "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.diagnostic' AND claims.store_index<=?2
+           AND json_extract(claims.body, '$.fields.incarnation_id')=?3
+           AND json_extract(claims.body, '$.fields.code') IN ('provider-update-prompt','provider-update-restored')
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    ))?.query_row(params![subject, at_index, incarnation], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    }).optional()?;
+    let Some((claim, body, at)) = claim else {
+        return Ok(None);
+    };
+    let body: Value = serde_json::from_str(&body)?;
+    let fields = &body["fields"];
+    if fields["code"] != "provider-update-prompt" {
+        return Ok(None);
+    }
+    let text = |name: &str| fields[name].as_str().map(str::to_owned);
+    Ok(Some(crate::model::CurrentHarnessView {
+        state: "blocked".into(),
+        driver: text("driver"),
+        incarnation_id: incarnation.into(),
+        transport: Some("native".into()),
+        reason: text("reason"),
+        blocked_on: Some("human".into()),
+        ask: None,
+        input_buffer: None,
+        exit: None,
+        claim,
+        since_unix_ms: at.parse()?,
+        observed_at_unix_ms: at.parse()?,
+    }))
+}
+
 fn current_harness_at(
     connection: &Connection,
     subject: &str,
     at_index: Option<u64>,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
+    let mut view = current_harness_fold_at(connection, subject, at_index, true)?;
+    if let Some(harness) = view.as_mut() {
+        seat_status::enrich_harness(connection, subject, at_index, harness)?;
+    }
+    Ok(view)
+}
+
+fn current_harness_fold_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    include_work_activity: bool,
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let runtime = connection
@@ -18872,13 +19014,19 @@ fn current_harness_at(
         return Ok(None);
     };
 
+    // A terminal modal holds even if a parallel native channel reports idle or work progress.
+    // Only a successful subsequent screen observation or a new runtime lifts this fence.
+    if let Some(harness) = update_prompt_fence(connection, subject, incarnation_id, at_index)? {
+        return Ok(Some(harness));
+    }
+
     // A login prompt or a workspace trust prompt is positive evidence that the current Claude
     // incarnation cannot accept work. Neither has a hook edge, and channel initialization or work
     // activity can otherwise overwrite a one-off blocked observation. Fence the entire incarnation
     // instead.
     let prompt_rejection = connection
         .prepare_cached(&format!(
-            "SELECT claims.id, claims.accepted_at_unix_ms, json_extract(claims.body, '$.fields.code')
+            "SELECT claims.id, claims.accepted_at_unix_ms, json_extract(claims.body, '$.fields.code'), claims.body
              FROM claims JOIN batches ON batches.id=claims.batch_id
              WHERE claims.subject=?1 AND claims.kind='harness.diagnostic'
                AND claims.store_index<=?2
@@ -18894,12 +19042,13 @@ fn current_harness_at(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()?;
     // A lifted login fence no longer holds the incarnation.
-    if let Some((claim, observed_at_unix_ms, code)) = prompt_rejection
+    if let Some((claim, observed_at_unix_ms, code, body)) = prompt_rejection
         && code != "provider-auth-restored"
     {
         let (state, reason) = if code == "provider-trust-prompt" {
@@ -18907,17 +19056,21 @@ fn current_harness_at(
         } else {
             ("unauthenticated", "providerAuth")
         };
+        let body: Value = serde_json::from_str(&body)?;
+        let fields = &body["fields"];
+        let driver = fields["driver"].as_str().unwrap_or("claude");
         return Ok(Some(crate::model::CurrentHarnessView {
             state: state.into(),
-            driver: Some("claude".into()),
+            driver: Some(driver.into()),
             incarnation_id: incarnation_id.to_owned(),
-            transport: Some("claude-channel".into()),
+            transport: Some(if driver == "claude" { "claude-channel" } else { "native" }.into()),
             reason: Some(reason.into()),
             blocked_on: Some("human".into()),
             ask: None,
             input_buffer: None,
             exit: None,
             claim,
+            since_unix_ms: observed_at_unix_ms.parse::<u128>()?,
             observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
         }));
     }
@@ -19005,7 +19158,7 @@ fn current_harness_at(
             break;
         }
     }
-    let work_activity = connection
+    let work_activity = if include_work_activity { connection
         .query_row(
             &canonical_sql(
                 "SELECT id, store_index, accepted_at_unix_ms FROM claims
@@ -19028,8 +19181,10 @@ fn current_harness_at(
             let key = canonical::claim_key(connection, &claim)?;
             Ok::<_, anyhow::Error>((claim, store_index, observed_at_unix_ms, key))
         })
-        .transpose()?;
+        .transpose()?
+    } else { None };
     if let Some((claim, _store_index, observed_at_unix_ms, key)) = work_activity
+        && include_work_activity
         && key > runtime_key
         && current
             .as_ref()
@@ -19046,6 +19201,7 @@ fn current_harness_at(
             input_buffer: None,
             exit: None,
             claim,
+            since_unix_ms: observed_at_unix_ms.parse::<u128>()?,
             observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
         }));
     }
@@ -19063,6 +19219,7 @@ fn current_harness_at(
         input_buffer: optional.remove("input_buffer").flatten(),
         exit: optional.remove("exit").flatten(),
         claim,
+        since_unix_ms: observed_at_unix_ms,
         observed_at_unix_ms,
     }))
 }
@@ -46846,7 +47003,7 @@ fn append_latest_observation_fenced(
         .connection
         .batched(|transaction| {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
-            let (local, appended) =
+            let (mut local, appended) =
                 insert_local_observation_tx(transaction, &graph.origin, input, now)?;
             if !appended {
                 return Ok((local, false));
@@ -46868,6 +47025,30 @@ fn append_latest_observation_fenced(
                 )?),
                 _ => None,
             };
+            if input.kind == "harness.observed" && event_runtime.is_some() {
+                // Native acknowledgements echo the admitted producer event, including on
+                // replay. Derived history metadata belongs to its replicated publication.
+                return Ok((local, true));
+            }
+            if input.kind == "harness.observed" {
+                let source = match published.as_ref() {
+                    Some(claim) => Some(claim.clone()),
+                    None => latest_harness_of_incarnation_tx(
+                        transaction,
+                        &input.subject,
+                        input.fields.get("incarnation_id").and_then(Value::as_str),
+                    )?,
+                };
+                if let Some(source) = source {
+                    local.body["fields"]["observed_since_ms"] = source.body["fields"]["observed_since_ms"].clone();
+                    local.body["fields"]["status_transition"] = published.as_ref()
+                        .map_or(json!(false), |claim| claim.body["fields"]["status_transition"].clone());
+                    transaction.execute("UPDATE local_observations SET body=?1 WHERE id=?2", params![
+                        canonical_json_text(&local.body).map_err(internal)?,
+                        local_observation_position(&local).expect("a local observation has a position"),
+                    ]).map_err(internal)?;
+                }
+            }
             Ok((published.unwrap_or(local), true))
         })
         .map_err(|error| St3Error::new("internal", error))?

@@ -542,6 +542,10 @@ const PROBES: &[Probe] = &[
         "/v1/client/agent-workspaces/{agent}",
     ),
     get(
+        "GET /v1/client/status-history/{*id}",
+        "/v1/client/status-history/{agent}",
+    ),
+    get(
         "GET /v1/client/agent-declarations/{*id}",
         "/v1/client/agent-declarations/{agent}",
     ),

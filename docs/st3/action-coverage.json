@@ -1981,6 +1981,15 @@
       "verification": "UI reducer and corresponding real daemon action; local effects have no graph fence"
     },
     {
+      "effect": "AgentControl",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::ctrl_a_opens_an_agents_actions_and_restart_asks_first",
+        "crates/st3/tests/action_coverage.rs::creation_and_declaration_actions_survive_stale_fences_and_restarts",
+        "crates/st3/tests/action_coverage.rs::suspension_requests_survive_stale_incarnations_and_restarts"
+      ],
+      "verification": "UI reducer and corresponding real daemon actions (agent.stop, agent.start, agent.suspend, agent.resume)"
+    },
+    {
       "effect": "StopAgent",
       "tests": [
         "crates/stui/src/ui/glass.rs::ctrl_c_twice_stops_a_working_agent_and_quits_elsewhere",

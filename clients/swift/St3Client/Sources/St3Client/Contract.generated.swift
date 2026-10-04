@@ -87,6 +87,7 @@ public enum ReadOperation: String, CaseIterable, Sendable {
     case agentsGet = "agents.get"
     case agentWorkspaceGet = "agent-workspace.get"
     case agentDeclarationGet = "agent-declaration.get"
+    case statusHistoryGet = "status-history.get"
     case agentQueueGet = "agent-queue.get"
     case runtimesList = "runtimes.list"
     case runtimesGet = "runtimes.get"
@@ -142,6 +143,7 @@ public let st3ClientReadPaths: [ReadOperation: String] = [
     .agentsGet: "/v1/client/agents/{id}",
     .agentWorkspaceGet: "/v1/client/agent-workspaces/{id}",
     .agentDeclarationGet: "/v1/client/agent-declarations/{id}",
+    .statusHistoryGet: "/v1/client/status-history/{id}",
     .agentQueueGet: "/v1/client/agent-queues/{id}",
     .runtimesList: "/v1/client/runtimes",
     .runtimesGet: "/v1/client/runtimes/{id}",

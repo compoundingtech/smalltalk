@@ -895,6 +895,61 @@ pub fn channel_transcript_paths(
         .map(|binding| binding.transcript_path))
 }
 
+/// Recover a SessionStart binding that ran before Claude created its transcript.
+/// The lightweight hook binding is fenced by this wrapper; never discover a
+/// session by recency or use an older wrapper's transcript as receipt evidence.
+pub fn channel_transcript_recovering(
+    paths: &crate::driver_paths::Paths,
+    identity: &str,
+    runtime_id: &str,
+    incarnation: &str,
+) -> Result<Option<PathBuf>> {
+    let hook_path = paths.agent_dir.join("claude-native-session");
+    let hook = match fs::read(&hook_path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+        Err(error) => return Err(error.into()),
+    };
+    let native = (hook["incarnation"].as_str() == Some(incarnation))
+        .then(|| hook["native_session_id"].as_str())
+        .flatten();
+    let binding = load_binding(&paths.session_dir, identity, runtime_id)?
+        .filter(|binding| binding.runtime_incarnation == incarnation);
+    if let Some(binding) = binding.as_ref()
+        && native.is_none_or(|native| native == binding.native_session_id)
+    {
+        return Ok(Some(binding.transcript_path.clone()));
+    }
+    let Some(native) = native else {
+        return Ok(None);
+    };
+    let (claude_root, codex_root) = managed_transcript_roots()?;
+    let candidates = transcript_matches(&claude_root, native, false)?;
+    anyhow::ensure!(
+        candidates.len() == 1,
+        "Claude hook-bound transcript {native} is not yet uniquely available"
+    );
+    let path = resolve_managed_transcript(&candidates[0], native, &claude_root, &codex_root)?;
+    let payload = serde_json::json!({"session_id":native,"transcript_path":path});
+    // Reuse the SessionStart validation, including managed-store uniqueness and
+    // workspace lineage. This ordinary recovery never satisfies a mandatory
+    // residency resume: its pending binding remains owned by the resume driver.
+    anyhow::ensure!(
+        !paths.session_dir.join(PENDING_BINDING_FILE).exists(),
+        "Claude mandatory resume binding is still pending"
+    );
+    let binding = record_session_start_binding(
+        &paths.session_dir,
+        identity,
+        runtime_id,
+        incarnation,
+        &payload,
+        None,
+        None,
+    )?;
+    Ok(Some(binding.transcript_path))
+}
+
 fn load_pending_binding(
     state_dir: &Path,
     agent: &str,

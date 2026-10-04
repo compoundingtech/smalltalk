@@ -121,6 +121,7 @@
             { "$ref": "#/$defs/PairingChallenge" },
             { "$ref": "#/$defs/PairedSession" },
             { "$ref": "#/$defs/TerminalScreen" },
+            { "$ref": "#/$defs/StatusHistory" },
             { "$ref": "#/$defs/AgentQueue" },
             { "$ref": "#/$defs/UsagePeriod" }
           ]
@@ -791,7 +792,9 @@
             "runtime_ids": { "type": "array", "items": { "$ref": "#/$defs/RuntimeId" } },
             "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/MissionRunId" }, { "type": "null" }] },
             "driver": { "type": ["string", "null"] },
-            "harness_state": { "type": ["string", "null"] },
+            "harness_state": { "type": ["string", "null"], "description": "Observed harness state; stale idle is indeterminate. Desired state and declared work status remain separate." },
+            "since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "When this observed state began in this runtime incarnation. Same-state observations never reset it." },
+            "observation": { "enum": ["current", "stale", "missing"], "description": "Stale after 90 seconds without a new observation; missing when this runtime has no observation." },
             "blocked_on": { "type": ["string", "null"], "description": "Current incarnation's harness blocking axis; human means a person must answer before it continues." },
             "ask": { "type": ["string", "null"], "description": "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." },
             "reason": { "type": ["string", "null"], "description": "Diagnostic harness reason, not a machine-readable verdict." },
@@ -942,6 +945,70 @@
         "tree": { "type": "object" },
         "kdl": { "type": "string" },
         "revisions": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "StatusHistory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "seat",
+        "items",
+        "retained_from",
+        "complete"
+      ],
+      "properties": {
+        "kind": {
+          "const": "status-history"
+        },
+        "seat": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "items": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/StatusTransition"
+          }
+        },
+        "retained_from": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "complete": {
+          "type": "boolean"
+        }
+      }
+    },
+    "StatusTransition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "seat",
+        "runtime_incarnation",
+        "state",
+        "observed_at",
+        "reset"
+      ],
+      "properties": {
+        "seat": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "runtime_incarnation": {
+          "type": "string"
+        },
+        "state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observed_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "reset": {
+          "type": "boolean",
+          "description": "An incarnation starts here. A runtime reset without a harness observation has a null state."
+        }
       }
     },
     "AgentQueue": {

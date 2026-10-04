@@ -40,6 +40,7 @@
     { "id": "agents.get", "method": "GET", "path": "/v1/client/agents/{id}", "response": "Resource" },
     { "id": "agent-workspace.get", "method": "GET", "path": "/v1/client/agent-workspaces/{id}", "response": "AgentWorkspace", "scope": "read.projections" },
     { "id": "agent-declaration.get", "method": "GET", "path": "/v1/client/agent-declarations/{id}", "response": "AgentDeclaration", "scope": "read.declarations" },
+    { "id": "status-history.get", "method": "GET", "path": "/v1/client/status-history/{id}", "response": "StatusHistory", "scope": "read.projections" },
     { "id": "agent-queue.get", "method": "GET", "path": "/v1/client/agent-queues/{id}", "response": "AgentQueue" },
     { "id": "runtimes.list", "method": "GET", "path": "/v1/client/runtimes", "response": "Page" },
     { "id": "runtimes.get", "method": "GET", "path": "/v1/client/runtimes/{id}", "response": "Resource" },

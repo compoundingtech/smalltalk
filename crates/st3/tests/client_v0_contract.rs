@@ -3863,3 +3863,45 @@ async fn missing_mission_preserves_the_client_v0_not_found_error_shape() {
         &error,
     );
 }
+
+#[tokio::test]
+async fn status_history_is_typed_and_readable_through_the_paired_gateway() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    for (kind, fields) in [
+        ("runtime.observed", serde_json::json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"})),
+        ("harness.observed", serde_json::json!({"state":"idle", "incarnation_id":"one"})),
+        ("runtime.observed", serde_json::json!({"status":"running", "runtime_id":"native", "incarnation_id":"two"})),
+    ] {
+        state.store.append_claim(&st3::model::ClaimInput {
+            subject: "agent/cedar".into(), kind: kind.into(), actor: Some("agent/cedar".into()),
+            fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+            expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+    let app = st3::api::router(state.clone());
+    let fabric = st3::api::fabric_router(state.clone());
+    let (status, challenge) = client_post_json(app.clone(), "/v1/client/pairings", serde_json::json!({
+        "api_version":"st3.client.v0", "device_name":"Cedar client", "person_id":"person/alex"
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let pairing = challenge["value"]["pairing_id"].as_str().unwrap().trim_start_matches("pairing/");
+    let (status, paired) = client_post_json(app.clone(), &format!("/v1/client/pairings/{pairing}/complete"), serde_json::json!({
+        "api_version":"st3.client.v0", "code":challenge["value"]["code"], "device_public_key":"cedar-public-key-0000000000000000000000000000"
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{paired}");
+    let credential = paired["value"]["credential"].as_str().unwrap();
+    let (status, local) = client_json(app, "/v1/client/status-history/agent%2Fcedar").await;
+    assert_eq!(status, StatusCode::OK, "{local}");
+    let (status, remote) = client_json_auth(fabric.clone(), "/v1/client/status-history/agent%2Fcedar", credential).await;
+    assert_eq!(status, StatusCode::OK, "{remote}");
+    assert_eq!(local["value"], remote["value"]);
+    assert_conforms(&contract_validator("StatusHistory"), "paired history", &remote["value"]);
+    let typed: st3_client::StatusHistory = serde_json::from_value(remote["value"].clone()).unwrap();
+    assert!(typed.complete);
+    assert_eq!(typed.items.last().unwrap().runtime_incarnation, "two");
+    assert!(typed.items.last().unwrap().reset);
+    assert!(typed.items.last().unwrap().state.is_none());
+    let (status, _) = client_json(fabric, "/v1/client/status-history/cedar").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

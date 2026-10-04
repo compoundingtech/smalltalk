@@ -24,6 +24,7 @@ struct Daemon {
     root: PathBuf,
     socket: PathBuf,
     store: Arc<Store>,
+    event_notify: watch::Sender<u64>,
     server: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -33,6 +34,7 @@ impl Daemon {
             root: root.to_path_buf(),
             socket: root.join("st3.sock"),
             store: Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap()),
+            event_notify: watch::channel(0_u64).0,
             server: None,
         }
     }
@@ -45,7 +47,7 @@ impl Daemon {
         let state = AppState {
             store: self.store.clone(),
             notify: Arc::new(Notify::new()),
-            event_notify: watch::channel(0_u64).0,
+            event_notify: self.event_notify.clone(),
             node: "restart-node".into(),
             state_dir: self.root.join("daemon"),
             pty_root: self.root.join("pty"),
@@ -99,6 +101,7 @@ impl Daemon {
                 idempotency_key: None,
             })
             .unwrap();
+        self.event_notify.send_modify(|value| *value = value.wrapping_add(1));
     }
 
     /// The runtime observation the reconciler recorded before the restart.
@@ -192,8 +195,7 @@ fn seat_command(root: &Path, socket: &Path) -> Command {
         .env("XDG_RUNTIME_DIR", root.join("runtime"))
         .env("ST3_DRIVER_STATE_DIR", root.join("drivers"))
         .env("ST3_DAEMON_WAIT", "0")
-        .arg("--endpoint")
-        .arg(socket);
+        .env("ST3_ENDPOINT", socket);
     for directory in ["workspace", "home", "state", "config", "runtime", "drivers"] {
         std::fs::create_dir_all(root.join(directory)).unwrap();
     }
@@ -786,10 +788,17 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
             daemon.observe_running(seat, "same-incarnation");
             daemon.start_with_binding(true).await;
-            daemon.send("message/consumed", seat, "CONSUMED SIGNAL");
 
             let socket = daemon.socket.clone();
-            let open_channel = || {
+            daemon.send("message/ready-probe", seat, "READINESS PROBE");
+            for lifecycle in ["delivered", "read", "closed"] {
+                daemon.store.append_claim(&ClaimInput {
+                    subject: "message/ready-probe".into(), kind: format!("message.{lifecycle}"),
+                    actor: Some(seat.into()), fields: BTreeMap::from([("status".into(), json!(lifecycle))]),
+                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+                }).unwrap();
+            }
+            let open_channel = || async {
                 let mut channel = seat_command(root, &socket)
                     .env("ST_AGENT", seat)
                     .env("ST3_MAILBOX_TRANSPORT", transport)
@@ -823,9 +832,22 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
                 );
                 writeln!(input, "{}", json!({"type":"state", "state":"idle"})).unwrap();
                 input.flush().unwrap();
+                let client = st3::client::Client::new(st3::client::Endpoint::Unix(socket.clone()));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let status: Value = client.get("/v1/messages/delivery/ready-probe").await.unwrap();
+                    let delivery = &status["delivery"]["recipient_delivery"];
+                    let ready = matches!(delivery["state"].as_str(), Some("current" | "outdated" | "legacy"));
+                    let own_pid = delivery["state"] == "current" || delivery["reason"].as_str()
+                        .is_some_and(|reason| reason.contains(&format!("pid {}", channel.id())));
+                    if ready && own_pid { break; }
+                    assert!(Instant::now() < deadline, "{driver}/{transport}: channel not ready: {status}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 (channel, input, received)
             };
-            let (channel, mut input, received) = open_channel();
+            let (channel, mut input, received) = open_channel().await;
+            daemon.send("message/consumed", seat, "CONSUMED SIGNAL");
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 let frame = received
@@ -867,8 +889,8 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             daemon.stop().await;
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
             daemon.start_with_binding(true).await;
+            let (channel, _input, received) = open_channel().await;
             daemon.send("message/unread", seat, "UNREAD SIGNAL");
-            let (channel, _input, received) = open_channel();
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut offered = Vec::new();
             while let Ok(frame) =
@@ -912,7 +934,7 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delivered_unread_mail_replays_after_seat_restart_without_repeating_settled_mail() {
+async fn delivered_unread_mail_stays_in_the_mailbox_after_seat_restart() {
     for driver in ["omp", "pi"] {
         for transport in ["push", "poll"] {
             let root = tempfile::tempdir().unwrap();
@@ -971,27 +993,7 @@ async fn delivered_unread_mail_replays_after_seat_restart_without_repeating_sett
             assert_eq!(received.recv_timeout(Duration::from_secs(10)).unwrap()["type"], "hello");
             writeln!(input, "{}", json!({"type":"state", "state":"idle"})).unwrap();
             input.flush().unwrap();
-            let mut replayed = Vec::new();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while replayed.len() < 2 {
-                match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(frame) if frame["type"] == "message" => {
-                        replayed.push(frame["meta"]["messageId"].as_str().unwrap().to_owned());
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        let stderr = stop(channel);
-                        panic!("{driver}/{transport}: delivered-unread mail did not replay: {error}; {stderr}");
-                    }
-                }
-            }
-            replayed.sort();
-            assert_eq!(replayed, ["message/unread-one", "message/unread-two"], "{driver}/{transport}");
-            // Several mailbox ticks and a delivered receipt must not reinject into this channel.
-            writeln!(input, "{}", json!({
-                "type":"delivered", "meta":{"messageId":"message/unread-one"},
-            })).unwrap();
-            input.flush().unwrap();
+            // Several mailbox ticks must not reoffer old mail, regardless of native receipts.
             let deadline = Instant::now() + Duration::from_millis(2_200);
             while let Ok(frame) = received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 assert_ne!(frame["type"], "message", "{driver}/{transport}: duplicate or settled mail: {frame}");
@@ -1005,4 +1007,452 @@ async fn delivered_unread_mail_replays_after_seat_restart_without_repeating_sett
             daemon.stop().await;
         }
     }
+}
+
+// Claude can create its transcript after SessionStart. Its channel must recover the
+// exact hook-bound session, and consumption need not run UserPromptSubmit.
+struct ClaudeChannelFixture {
+    paths: st_drivers::driver_paths::Paths,
+    transcript: PathBuf,
+}
+impl ClaudeChannelFixture {
+    fn new(root: &Path, daemon: &Daemon, wrapper: &str) -> Self {
+        let paths = st_drivers::driver_paths::Paths {
+            root: root.join("claude-driver"),
+            agent_dir: root.join("claude-driver/observations"),
+            session_dir: root.join("claude-driver/sessions/claude"),
+        };
+        std::fs::create_dir_all(&paths.agent_dir).unwrap();
+        let transcript =
+            root.join("home/.claude/projects/quartz/019fae17-c215-7882-a4d9-5f247168ffce.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let fixture = Self { paths, transcript };
+        // No transcript yet: reproduce a real SessionStart binding failure. The
+        // lightweight hook binding still identifies this wrapper's native session.
+        let mut hook = fixture
+            .command(root, daemon, wrapper)
+            .args(["driver-hook", "claude-observe", "SessionStart"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(hook.stdin.take().unwrap(), "{}", json!({
+            "session_id":"019fae17-c215-7882-a4d9-5f247168ffce",
+            "transcript_path":fixture.transcript, "cwd":root.join("workspace"), "source":"startup",
+        })).unwrap();
+        let output = hook.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "SessionStart failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        daemon.send("message/quartz-ready", "agent/quartz", "READINESS PROBE");
+        for lifecycle in ["delivered", "read", "closed"] {
+            daemon.store.append_claim(&ClaimInput {
+                subject: "message/quartz-ready".into(), kind: format!("message.{lifecycle}"),
+                actor: Some("agent/quartz".into()), fields: BTreeMap::from([("status".into(), json!(lifecycle))]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        fixture
+    }
+    fn command(&self, root: &Path, daemon: &Daemon, wrapper: &str) -> Command {
+        let mut command = seat_command(root, &daemon.socket);
+        command
+            .envs(self.paths.environment("quartz"))
+            .env("ST_AGENT", "agent/quartz")
+            .env("ST3_SUBJECT", "agent/quartz")
+            .env("ST3_MAILBOX_TRANSPORT", "push")
+            .env("ST_CLAUDE_IDENTITY", "quartz")
+            .env("ST_CLAUDE_RUNTIME_ID", "quartz")
+            .env("ST_CLAUDE_SESSION", wrapper)
+            .env("ST_CLAUDE_SESSION_SEQ", "1");
+        command
+    }
+    async fn open(
+        &self,
+        root: &Path,
+        daemon: &Daemon,
+        wrapper: &str,
+    ) -> (
+        Child,
+        std::process::ChildStdin,
+        std::sync::mpsc::Receiver<Value>,
+    ) {
+        let mut channel = self
+            .command(root, daemon, wrapper)
+            .args(["driver", "claude-mcp", "--subject", "agent/quartz"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = channel.stdin.take().unwrap();
+        let (sender, received) = std::sync::mpsc::channel::<Value>();
+        let output = channel.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                let Ok(line) = line else { break };
+                if let Ok(frame) = serde_json::from_str(&line) {
+                    let _ = sender.send(frame);
+                }
+            }
+        });
+        writeln!(
+            input,
+            "{}",
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize"})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(10)).unwrap()["id"],
+            1
+        );
+        writeln!(
+            input,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        let client = st3::client::Client::new(st3::client::Endpoint::Unix(daemon.socket.clone()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let view: Value = client.get("/v1/messages/delivery/quartz-ready").await.unwrap();
+            let delivery = &view["delivery"]["recipient_delivery"];
+            let ready = matches!(delivery["state"].as_str(), Some("current" | "outdated" | "legacy"));
+            let own_pid = delivery["state"] == "current" || delivery["reason"].as_str()
+                .is_some_and(|reason| reason.contains(&format!("pid {}", channel.id())));
+            if ready && own_pid { break; }
+            assert!(Instant::now() < deadline, "Claude channel not ready: {view}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        (channel, input, received)
+    }
+    fn append(&self, root: &Path, record: Value) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.transcript)
+            .unwrap();
+        let mut record = record;
+        record["sessionId"] = json!("019fae17-c215-7882-a4d9-5f247168ffce");
+        record["cwd"] = json!(root.join("workspace"));
+        writeln!(file, "{record}").unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receipt_forms() {
+    for mid_turn in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let mut daemon = Daemon::new(root);
+        daemon.observe_running("agent/quartz", "first");
+        daemon.start_with_binding(true).await;
+        let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-first");
+        let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-first").await;
+        daemon.send("message/idle", "agent/quartz", "QUARTZ IDLE SIGNAL");
+        let frame = received.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(frame["method"], "notifications/claude/channel");
+        assert!(daemon.has_diagnostic("agent/quartz", "first", "claude-receipt-unavailable"));
+        assert_eq!(
+            daemon
+                .store
+                .message("message/idle")
+                .unwrap()
+                .unwrap()
+                .status,
+            "staged"
+        );
+        let content = &frame["params"]["content"];
+        fixture.append(
+            root,
+            json!({"type":"queue-operation","operation":"enqueue","content":content}),
+        );
+        // Enqueue proves native transport acceptance, but not consumption.
+        wait_until(
+            "the native Claude acceptance receipt",
+            Duration::from_secs(6),
+            || {
+                daemon
+                    .store
+                    .message("message/idle")
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    == "delivered"
+            },
+        )
+        .await;
+        assert!(
+            daemon
+                .store
+                .claims_for("message/idle", Some("message.read"))
+                .unwrap()
+                .is_empty()
+        );
+        if mid_turn {
+            fixture.append(root, json!({"type":"queue-operation","operation":"remove",
+                "reason":"absorbed_mid_turn","content":content,"commandUuid":"native-command","deliveryId":"native-delivery"}));
+        } else {
+            fixture.append(
+                root,
+                json!({"type":"user","isMeta":true,"message":{"role":"user","content":content}}),
+            );
+        }
+        wait_until(
+            "the native Claude consumption receipt",
+            Duration::from_secs(6),
+            || {
+                daemon
+                    .store
+                    .message("message/idle")
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    == "read"
+            },
+        )
+        .await;
+        for kind in ["message.delivered", "message.read"] {
+            assert_eq!(
+                daemon
+                    .store
+                    .claims_for("message/idle", Some(kind))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+        assert!(stop(channel).is_empty());
+        daemon.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_staged_mail_receipted_after_restart_is_not_injected_on_second_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    daemon.observe_running("agent/quartz", "first");
+    daemon.start_with_binding(true).await;
+    let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-first");
+    let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-first").await;
+    daemon.send("message/restart", "agent/quartz", "QUARTZ RESTART SIGNAL");
+    let frame = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    let content = frame["params"]["content"].clone();
+    assert!(stop(channel).is_empty());
+    assert_eq!(
+        daemon
+            .store
+            .message("message/restart")
+            .unwrap()
+            .unwrap()
+            .status,
+        "staged"
+    );
+    // Claude consumed the old notification while the channel was down. Native
+    // proof precedes restarting the channel; reoffering it would duplicate work.
+    fixture.append(
+        root,
+        json!({"type":"user","isMeta":true,"message":{"role":"user","content":content}}),
+    );
+    for incarnation in ["second", "third"] {
+        daemon.observe_running("agent/quartz", incarnation);
+        // A wrapper restart keeps the provider's resumed transcript and records
+        // its lightweight binding before the channel's first mailbox replay.
+        std::fs::write(fixture.paths.agent_dir.join("claude-native-session"),
+            json!({"incarnation":incarnation,"native_session_id":"019fae17-c215-7882-a4d9-5f247168ffce"}).to_string()).unwrap();
+        let (channel, _input, received) = fixture.open(root, &daemon, incarnation).await;
+        wait_until(
+            "the recovered startup receipt",
+            Duration::from_secs(6),
+            || {
+                daemon
+                    .store
+                    .message("message/restart")
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    == "read"
+            },
+        )
+        .await;
+        assert!(
+            received.recv_timeout(Duration::from_millis(1200)).is_err(),
+            "{incarnation} reinjected consumed mail"
+        );
+        assert!(stop(channel).is_empty());
+    }
+    for kind in ["message.delivered", "message.read"] {
+        assert_eq!(
+            daemon
+                .store
+                .claims_for("message/restart", Some(kind))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_preboot_mail_is_held_while_live_receipts_survive_outage() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    daemon.observe_running("agent/quartz", "previous");
+    daemon.send("message/startup", "agent/quartz", "QUARTZ STARTUP SIGNAL");
+    daemon
+        .store
+        .append_claim(&ClaimInput {
+            subject: "message/startup".into(),
+            kind: "message.staged".into(),
+            actor: Some("agent/quartz".into()),
+            fields: BTreeMap::from([
+                ("status".into(), json!("staged")),
+                ("recipient".into(), json!("agent/quartz")),
+                ("transport".into(), json!("claude-channel")),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    daemon.observe_running("agent/quartz", "replacement");
+    daemon.start_with_binding(true).await;
+    let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-replacement");
+    let (mut channel, _input, received) = fixture.open(root, &daemon, "wrapper-replacement").await;
+    assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert_eq!(daemon.store.message("message/startup").unwrap().unwrap().status, "staged");
+    daemon.send("message/live", "agent/quartz", "QUARTZ LIVE SIGNAL");
+    let frame = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(frame["params"]["meta"]["messageId"], "message/live");
+    // Consumption happens while receipt publication is unavailable. The channel
+    // must keep proof, retry only the receipt, and never repeat the notification.
+    daemon.stop().await;
+    fixture.append(
+        root,
+        json!({"type":"user","isMeta":true,
+        "message":{"role":"user","content":frame["params"]["content"]}}),
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_alive(&mut channel, "the Claude channel");
+    daemon.start_with_binding(true).await;
+    wait_until(
+        "startup receipts after daemon recovery",
+        Duration::from_secs(8),
+        || {
+            daemon
+                .store
+                .message("message/live")
+                .unwrap()
+                .unwrap()
+                .status
+                == "read"
+        },
+    )
+    .await;
+    assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert!(stop(channel).is_empty());
+    daemon.observe_running("agent/quartz", "second-restart");
+    std::fs::write(fixture.paths.agent_dir.join("claude-native-session"),
+        json!({"incarnation":"wrapper-second","native_session_id":"019fae17-c215-7882-a4d9-5f247168ffce"}).to_string()).unwrap();
+    let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-second").await;
+    assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert!(stop(channel).is_empty());
+    for kind in ["message.delivered", "message.read"] {
+        assert_eq!(
+            daemon
+                .store
+                .claims_for("message/live", Some(kind))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert_eq!(daemon.store.message("message/startup").unwrap().unwrap().status, "staged");
+    assert!(daemon.store.claims_for("message/startup", Some("message.delivered")).unwrap().is_empty());
+    assert!(daemon.store.claims_for("message/startup", Some("message.read")).unwrap().is_empty());
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_delivered_unread_mail_from_an_old_ledger_is_held_in_a_fresh_session() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    daemon.observe_running("agent/quartz", "replacement");
+    daemon.send("message/unread", "agent/quartz", "QUARTZ UNREAD SIGNAL");
+    daemon
+        .store
+        .append_claim(&ClaimInput {
+            subject: "message/unread".into(),
+            kind: "message.delivered".into(),
+            actor: Some("agent/quartz".into()),
+            fields: BTreeMap::from([("status".into(), json!("delivered"))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    daemon.start_with_binding(true).await;
+    let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-replacement");
+    fixture.append(
+        root,
+        json!({"type":"user","message":{"role":"user","content":"A fresh native session"}}),
+    );
+    // The old format lacks acceptance tracking. Its previous offer is neither
+    // consumption proof nor a reason to lose delivered-but-unread mail.
+    std::fs::write(
+        fixture.paths.agent_dir.join("native-channel-handoffs.json"),
+        json!({"incarnation":"previous","attempted":["message/unread"],"confirmed":[]}).to_string(),
+    )
+    .unwrap();
+    let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-replacement").await;
+    assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert_eq!(daemon.store.message("message/unread").unwrap().unwrap().status, "delivered");
+    assert!(daemon.store.claims_for("message/unread", Some("message.read")).unwrap().is_empty());
+    daemon.send("message/fresh", "agent/quartz", "QUARTZ FRESH SIGNAL");
+    let frame = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(frame["params"]["meta"]["messageId"], "message/fresh");
+    fixture.append(
+        root,
+        json!({"type":"user","isMeta":true,
+        "message":{"role":"user","content":frame["params"]["content"]}}),
+    );
+    wait_until(
+        "the replacement session consumes unread mail",
+        Duration::from_secs(6),
+        || {
+            daemon
+                .store
+                .message("message/fresh")
+                .unwrap()
+                .unwrap()
+                .status
+                == "read"
+        },
+    )
+    .await;
+    for kind in ["message.delivered", "message.read"] {
+        assert_eq!(
+            daemon
+                .store
+                .claims_for("message/fresh", Some(kind))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert!(stop(channel).is_empty());
+    assert_eq!(daemon.store.message("message/unread").unwrap().unwrap().status, "delivered");
+    assert!(daemon.store.claims_for("message/unread", Some("message.read")).unwrap().is_empty());
+    daemon.stop().await;
 }

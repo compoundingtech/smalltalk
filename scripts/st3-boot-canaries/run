@@ -15,8 +15,8 @@ step it names. SCENARIO is one of
                     takes a message
     concurrent      five seats launch at once
     suspend         the booted seat finishes its step and is suspended: no process remains, a
-                    message waits, and resume brings back the same native session, which reads
-                    it. Then a resume whose transcript is gone fails with a typed reason and the
+                    message waits, and resume brings back the same native session, which holds
+                    that old mail and reads a fresh message. Then a resume whose transcript is gone fails with a typed reason and the
                     seat stays suspended.
 
 Every seat must, within the time bound, claim its step with its current incarnation and read an
@@ -447,8 +447,19 @@ def suspend_and_resume(node, seats, harness):
     latest = native_sessions(node, "a")[-1]
     if latest != (native, True):
         fail(f"the resumed harness ran {latest}, not session {native} resumed")
-    until(lambda: (node.api("/v1/messages/read/" + sent) or {}).get("status") in ("read", "closed"),
-          seats.bound, "the resumed seat did not read the message that waited for it")
+    # Resuming a native session is still a new seat boot. Its old mail remains listable,
+    # and a fresh message proves that the resumed provider's delivery path works.
+    until(lambda: (node.json("agents", "show", subject).get("value", {}).get("delivery") or {}).get("state") in ("current", "legacy"),
+          seats.bound, "the resumed seat's channel did not become ready")
+    fresh = node.json("conversations", "send", subject, "--from", "person/eval",
+                      "--subject", "after resume", "--body", "boot canary fresh resume")["subject"]
+    until(lambda: (node.api("/v1/messages/read/" + fresh) or {}).get("status") in ("read", "closed"),
+          seats.bound, "the resumed seat did not read fresh mail")
+    if (node.api("/v1/messages/read/" + sent) or {}).get("status") != held.get("status"):
+        fail("resuming a seat automatically advanced its old mail")
+    if any(row.get("subject") == sent and row.get("event") in ("received", "read")
+           for row in receipts(node, "a")):
+        fail("resuming a seat offered old mail to the provider")
     wait_drained(list((node.root / "state/drivers").rglob("st-harness-events.sqlite")), seats.bound)
     check_boundary(node)
 
