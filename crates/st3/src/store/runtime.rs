@@ -40,6 +40,7 @@ impl Runtime for SmalltalkRuntime {
 
     fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(arrangements::SCHEMA)?;
         migrate_local_usage_seen(connection)?;
         backfill_message_index(connection)?;
         resources::create_schema(connection)?;
@@ -49,6 +50,7 @@ impl Runtime for SmalltalkRuntime {
     fn open_projections(&self, transaction: &Transaction<'_>, shared_memory: bool) -> Result<()> {
         resources::open(transaction)?;
         glass_heads::open(transaction)?;
+        arrangements::open(transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
@@ -211,7 +213,7 @@ impl Runtime for SmalltalkRuntime {
 
 /// The version of smalltalk's shared projection layout, beside the claim vocabulary. Nodes whose
 /// layouts differ keep exchanging claim authority but do not compare projection maps.
-const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.one-shot-seats.seat-status.v1";
+const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.arrangements.v2";
 
 /// The replication `schema_digest`: the claim vocabulary digest and the shared projection layout.
 pub(crate) fn compatibility_digest(registry_digest: &str) -> String {

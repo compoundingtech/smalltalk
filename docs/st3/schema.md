@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `cc5ebb114240ac1b9b8a5cc14ed5d46cca00a45ee52add8d61276839cd793241`
+Digest: `e078ee2f2cce94fb1be90c0148895cfd3aa8f85470e163386a893caa2342fbd2`
 
 ## Subject families
 
@@ -11,6 +11,7 @@ Digest: `cc5ebb114240ac1b9b8a5cc14ed5d46cca00a45ee52add8d61276839cd793241`
 |---|---|---:|---|
 | `account` | `account/NAME` | no | A model account: its provider, owner, plan and where its login lives. |
 | `agent` | `agent/RUN/LOCAL_ID` | no | A mission-run agent runtime. |
+| `arrangement` | `arrangement/person/NAME/UUIDv7` | no | A permanently person-owned shared folder arrangement. |
 | `attention` | `attention/ID` | yes | An explicit request for human attention. |
 | `checkpoint` | `checkpoint/DAY` | no | A checkpoint that trims replicated history dated before a UTC day. |
 | `checkpoint-excusal` | `checkpoint-excusal/ID` | no | A person's excusal of an unreachable writer from checkpoints. |
@@ -49,6 +50,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 
 | Kind | Facts | Description |
 |---|---|---|
+| `arrangement` | `body:object`, `owner!:subject-reference(person) immutable` | A person-owned per-register arrangement. |
 | `ci.run` | `commit:subject-reference`, `completed_at:string`, `conclusion:string`, `external_id:string`, `name:string`, `provider:string`, `pull_request:subject-reference`, `repository:subject-reference`, `started_at:string`, `status:string`, `url:string` | A continuous integration run. |
 | `filesystem.file` | `content_hash:string`, `mode:integer`, `path:string immutable`, `reason:string`, `size:integer`, `status:string` | A file observed through an explicit local path. |
 | `harness.session-file` | `agent:subject-reference`, `harness:string immutable`, `incarnation_id:string`, `modified_at:string`, `path:string`, `session_id:string`, `status:string` | A harness session file that can outlive one runtime incarnation. |
@@ -68,6 +70,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `agent.placement.source-offline` | `agent` | `authorized-requester` | `append` | `durable` | `desired_token!:string`, `destination!:string`, `sources!:array` |  |
 | `agent.presence` | `agent` | `same-subject-actor` | `append` | `durable` | `presence!:string`, `reachability:string`, `reason:string` |  |
 | `agent.queue.moved` | `agent` | `authorized-requester` | `append` | `durable` | `anchor:subject-reference(mission-run)`, `placement!:string`, `reason:string`, `run!:subject-reference(mission-run)` |  |
+| `arrangement.edited` | `arrangement` | `ordinary-client` | `append` | `durable` | `action_digest:string`, `action_id:string`, `operations!:array`, `owner!:subject-reference(person)` |  |
 | `attention.requested` | `attention` | `authorized-participant` | `once` | `durable` | `closed_by:string`, `reason!:string`, `reviewer!:subject-reference(person)`, `severity!:string`, `step:subject-reference(step-run)`, `step_attempt:integer`, `targets:array`, `title!:string`, `until:string` |  |
 | `attention.resolved` | `attention` | `authorized-participant` | `once` | `durable` | `outcome!:string`, `reason:string`, `request!:string` |  |
 | `checkpoint.excused` | `checkpoint-excusal` | `system-only` | `append` | `durable` | `reason!:string`, `writer!:string` |  |

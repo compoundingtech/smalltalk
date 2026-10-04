@@ -3,6 +3,7 @@ import { API_VERSION } from './Models.generated.ts';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
+    Arrangement, ArrangementPage,
     SubjectDefinition, UsagePeriod, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
@@ -63,7 +64,8 @@ export type CollectionStreamOptions = {
 export type CollectionStream = {
     /** Hold a window of up to `limit` (1–200) current items. A held ID is replaced. */
     subscribeGlasses(id: string): void;
-    subscribe(id: string, collection: CollectionName, limit?: number, filters?: CollectionFilters): void;
+    subscribeArrangements(id: string, person: string, limit?: number): void;
+    subscribe(id: string, collection: Exclude<CollectionName, 'arrangements'>, limit?: number, filters?: CollectionFilters): void;
     /** Follow a terminal with the incarnation and single-use capability `terminal.attach` returned. */
     subscribeTerminal(id: string, terminal: string, incarnation: string | null | undefined, capability: string): void;
     /** Follow the conversation of an agent or a session. */
@@ -320,6 +322,7 @@ export class St3Client {
         socket.onerror = () => end(new Error('The collections socket failed'));
         return {
             subscribeGlasses: id => send({kind: 'subscribe', id, collection: 'glasses', limit: 100}),
+            subscribeArrangements: (id, person, limit = 100) => send({kind: 'subscribe', id, collection: 'arrangements', person, limit}),
             subscribe: (id, collection, limit, filters = {}) => send({ kind: 'subscribe', id, collection, ...(limit === undefined ? {} : { limit }), ...filters }),
             subscribeTerminal: (id, terminal, incarnation, capability) => send({ kind: 'subscribe', id, collection: 'terminal', terminal, incarnation, capability }),
             subscribeConversation: (id, conversation) => send({ kind: 'subscribe', id, collection: 'conversation', conversation }),
@@ -381,6 +384,8 @@ export class St3Client {
     async conversationChanges(id: string, options: { after?: string; wait_ms?: number } = {}): Promise<EnvelopeOf<ConversationChanges>> { return this.get(`/v1/client/conversations/${encodeURIComponent(routedId(id))}/changes` + query(options)); }
     async eventsList(options: EventOptions = {}): Promise<EnvelopeOf<EventPage>> { return this.get('/v1/client/events' + query(options), 'events'); }
     async terminalScreen(id: string): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`); }
+    async arrangementsList(person: string, options: PageOptions = {}): Promise<EnvelopeOf<ArrangementPage>> { return this.get('/v1/client/arrangements' + query({ person, ...options })); }
+    async arrangementsGet(personName: string, uuid: string): Promise<EnvelopeOf<Arrangement>> { return this.get(`/v1/client/arrangements/${encodeURIComponent(personName)}/${encodeURIComponent(uuid)}`); }
     async glassesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/glasses' + query(options)); }
     async glassesGet(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(routedId(id))}`); }
     async agentCreate(input: Omit<ActionOf<'agent.create'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.create' } as ActionOf<'agent.create'>); }
@@ -389,6 +394,7 @@ export class St3Client {
     async agentStart(input: Omit<ActionOf<'agent.start'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.start' } as ActionOf<'agent.start'>); }
     async agentStop(input: Omit<ActionOf<'agent.stop'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.stop' } as ActionOf<'agent.stop'>); }
     async agentSuspend(input: Omit<ActionOf<'agent.suspend'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.suspend' } as ActionOf<'agent.suspend'>); }
+    async arrangementEdit(input: Omit<ActionOf<'arrangement.edit'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'arrangement.edit' } as ActionOf<'arrangement.edit'>); }
     async attentionResolve(input: Omit<ActionOf<'attention.resolve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'attention.resolve' } as ActionOf<'attention.resolve'>); }
     async laneApprove(input: Omit<ActionOf<'lane.approve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.approve' } as ActionOf<'lane.approve'>); }
     async laneJoin(input: Omit<ActionOf<'lane.join'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.join' } as ActionOf<'lane.join'>); }

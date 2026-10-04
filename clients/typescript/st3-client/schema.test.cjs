@@ -205,3 +205,35 @@ test('resource pages decode only through ResourcesPage, never the generic Page',
     assert.equal(Rich.decodeUnknownSync(Rich.Page, 'strict')(page('missions')).collection, 'missions');
     assert.throws(() => Rich.decodeUnknownSync(Rich.Page)(page('resources')));
 });
+
+test('arrangement subscriptions require a concrete owner and placements preserve explicit root', async () => {
+    const [{ Schema, Option }, Rich] = await modules;
+    const command = { kind: 'subscribe', id: 'sidebar', collection: 'arrangements', person: 'person/alice', limit: 100 };
+    const decodeCommand = Rich.decodeUnknownSync(Rich.CollectionCommand, 'strict');
+    assert.equal(decodeCommand(command).person, 'person/alice');
+    for (const person of [undefined, null, 'agent/alice', 'person/alice/other']) {
+        assert.throws(() => decodeCommand({ ...command, person }));
+    }
+    const operation = { op: 'subject.place', subject: 'agent/alice/worker', folder: null, key: 'a0' };
+    const decoded = Rich.decodeUnknownSync(Rich.ArrangementOperation, 'strict')(operation);
+    assert(Option.isNone(decoded.folder));
+    assert.deepEqual(Schema.encodeSync(Rich.ArrangementOperation)(decoded), operation);
+    assert.throws(() => Rich.decodeUnknownSync(Rich.ArrangementOperation, 'strict')({ ...operation, folder: 'not-a-folder-id' }));
+    for (const subject of ['pty/person/alice/019a0000-0000-7000-8000-000000000001', 'session/worker']) {
+        assert.throws(() => Rich.decodeUnknownSync(Rich.ArrangementOperation, 'strict')({ ...operation, subject }));
+    }
+    assert.throws(() => Rich.decodeUnknownSync(Rich.ArrangementOperation, 'strict')({ ...operation, parent: null }));
+    assert.throws(() => Rich.decodeUnknownSync(Rich.ArrangementTombstoneRegister, 'strict')({ value: false, revision: 'claim/deleted' }));
+});
+
+test('arrangement resources keep deleted folder positions and missing-seat placements distinct from resolved locations', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const fixture = require('../../../fixtures/clients/arrangements-v1.json');
+    const encoded = Schema.encodeSync(Rich.Arrangement)(Rich.decodeUnknownSync(Rich.Arrangement, 'strict')(fixture.resource));
+    const deletedID = Object.keys(encoded.body.folders).find(id => encoded.body.folders[id].tombstone !== null);
+    assert.equal(encoded.body.folders[deletedID].position.value.key, 'a0');
+    assert.equal(encoded.body.placements['agent/ada/worker'].value.folder, deletedID);
+    assert.equal(encoded.resolved.folders['agent/ada/worker'], null);
+    assert.equal(encoded.body.placements['agent/ada/offline'].value.key, 'a1');
+    assert.equal(encoded.body.folders[deletedID].tombstone.value, true);
+});
