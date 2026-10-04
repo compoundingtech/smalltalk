@@ -147,6 +147,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arrangement_create_race_returns_typed_exists_and_exact_retry_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "arrangement-create-race");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        let original = request(&state, "original-create", json!([{"op":"create","name":"Sidebar"}]));
+        let accepted = action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session.clone()), Json(original.clone())).await.unwrap().0;
+        let index = state.store.index().unwrap();
+        let competing = request(&state, "different-create-key", json!([{"op":"create","name":"Sidebar"}]));
+        let response = crate::api::router(state.clone()).oneshot(Request::builder()
+            .method("POST").uri("/v1/client/actions").header(LOCAL_PERSON_HEADER, "person/ada")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&competing).unwrap())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let envelope: st3_client::ErrorEnvelope = serde_json::from_slice(
+            &to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap()).unwrap();
+        assert_eq!(envelope.code, st3_client::ErrorCode::ArrangementExists);
+        assert!(!envelope.retryable);
+        assert_eq!(state.store.index().unwrap(), index);
+        let replay = action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session), Json(original)).await.unwrap().0;
+        assert_eq!(replay["arrangement_revision"], accepted["arrangement_revision"]);
+        assert_eq!(replay["operation_id"], accepted["operation_id"]);
+        assert_eq!(state.store.index().unwrap(), index);
+    }
+
+    #[tokio::test]
+    async fn arrangement_folder_race_and_validation_refusals_stay_typed() {
+        use st3_client::ErrorCode;
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "arrangement-typed-refusals");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        let folder = "019a0000-0000-7000-8000-000000000010";
+        let original = request(&state, "create-with-folder", json!([
+            {"op":"create","name":"Sidebar"},
+            {"op":"folder.create","id":folder,"name":"Folder","parent":null,"key":"a0"}
+        ]));
+        let accepted = action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session.clone()), Json(original.clone())).await.unwrap().0;
+        let refused = |key: &str, operations: Value| {
+            let app = crate::api::router(state.clone());
+            let input = request(&state, key, operations);
+            async move {
+                let response = app.oneshot(Request::builder().method("POST").uri("/v1/client/actions")
+                    .header(LOCAL_PERSON_HEADER, "person/ada").header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&input).unwrap())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+                serde_json::from_slice::<st3_client::ErrorEnvelope>(
+                    &to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap()).unwrap()
+            }
+        };
+        for (key, operations, expected) in [
+            ("folder-race", json!([{"op":"folder.create","id":folder,"name":"Other","parent":null,"key":"a0"}]), ErrorCode::ArrangementFolderExists),
+            ("cycle", json!([{"op":"folder.move","id":folder,"parent":folder,"key":"a0"}]), ErrorCode::ArrangementCycle),
+            ("bad-key", json!([{"op":"subject.place","subject":"agent/seat","folder":null,"key":"not-a-key"}]), ErrorCode::InvalidArrangementKey),
+            ("bad-name", json!([{"op":"rename","name":""}]), ErrorCode::InvalidArrangementName),
+            ("bad-folder", json!([{"op":"folder.rename","id":"not-a-uuid","name":"Other"}]), ErrorCode::InvalidArrangementFolder),
+            ("bad-ops", json!([]), ErrorCode::InvalidArrangementOperations),
+            ("bad-ref", json!([{"op":"subject.place","subject":"pty/ephemeral","folder":null,"key":"a0"}]), ErrorCode::InvalidSubjectReference),
+            ("too-large", json!((0..1024).map(|id| json!({"op":"subject.place","subject":format!("agent/{id}/{}", "x".repeat(430)),"folder":null,"key":"a0"})).collect::<Vec<_>>()), ErrorCode::ArrangementBodyTooLarge),
+        ] {
+            let index = state.store.index().unwrap();
+            let error = refused(key, operations).await;
+            assert_eq!(error.code, expected, "{key}");
+            assert!(!error.retryable, "{key}");
+            assert_eq!(state.store.index().unwrap(), index, "{key}");
+        }
+        let replay = action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session.clone()), Json(original)).await.unwrap().0;
+        assert_eq!(replay["arrangement_revision"], accepted["arrangement_revision"]);
+        assert_eq!(replay["operation_id"], accepted["operation_id"]);
+        edit(&state, &session, &request(&state, "delete-folder", json!([{"op":"folder.delete","id":folder}]))).await.unwrap();
+        let error = refused("deleted-folder", json!([{"op":"folder.rename","id":folder,"name":"Resurrect"}])).await;
+        assert_eq!(error.code, ErrorCode::ArrangementFolderDeleted);
+        assert!(!error.retryable);
+        edit(&state, &session, &request(&state, "retire-typed", json!([{"op":"retire"}]))).await.unwrap();
+        let error = refused("retired", json!([{"op":"rename","name":"Resurrect"}])).await;
+        assert_eq!(error.code, ErrorCode::ArrangementRetired);
+        assert!(!error.retryable);
+    }
+
+    #[tokio::test]
+    async fn selected_arrangement_survives_byte_window_edits_and_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "selected-arrangement");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        let sidebar = "arrangement/person/ada/019a0000-0000-7000-8000-000000000002";
+        for (subject, name) in [(SUBJECT, "Earlier"), (sidebar, "Sidebar")] {
+            let mut operations = vec![json!({"op":"create","name":name})];
+            operations.extend((0..480).map(|id| json!({
+                "op":"subject.place","subject":format!("agent/{id}/{}", "x".repeat(430)),
+                "folder":null,"key":"a0"
+            })));
+            state.store.append_claim(&ClaimInput {
+                subject:subject.into(), kind:"arrangement.edited".into(), actor:Some("person/ada".into()),
+                fields:serde_json::from_value(json!({"owner":"person/ada","operations":operations})).unwrap(),
+                evidence:vec![], expected_subject:None, idempotency_key:None,
+            }).unwrap();
+        }
+        let mut subscription: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":100
+        })).unwrap();
+        let (_, prefix, has_more) = collection_items(&state, &session, &subscription).await.unwrap();
+        assert_eq!(prefix.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(), [SUBJECT]);
+        assert!(has_more);
+        subscription.subject = Some(sidebar.into());
+        let (_, selected, has_more) = collection_items(&state, &session, &subscription).await.unwrap();
+        assert_eq!(selected.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(), [sidebar]);
+        assert!(!has_more);
+        assert_eq!(selected[0]["body"]["name"]["value"], "Sidebar");
+        let mut rename = request(&state, "selected-rename", json!([{"op":"rename","name":"Selected edit"}]));
+        rename.parameters["subject"] = json!(sidebar);
+        edit(&state, &session, &rename).await.unwrap();
+        let (_, updated, has_more) = collection_items(&state, &session, &subscription).await.unwrap();
+        assert_eq!(updated[0]["body"]["name"]["value"], "Selected edit");
+        assert_ne!(updated[0]["revision"], selected[0]["revision"]);
+        assert!(!has_more);
+        let mut wrong_owner = subscription.clone();
+        wrong_owner.subject = Some(sidebar.replace("person/ada", "person/other"));
+        assert_eq!(collection_items(&state, &session, &wrong_owner).await.unwrap_err().code, "validation-failed");
+        let mut retire = request(&state, "selected-retire", json!([{"op":"retire"}]));
+        retire.parameters["subject"] = json!(sidebar);
+        edit(&state, &session, &retire).await.unwrap();
+        let (_, removed, has_more) = collection_items(&state, &session, &subscription).await.unwrap();
+        assert!(removed.is_empty());
+        assert!(!has_more);
+        subscription.subject = None;
+        let (_, unfiltered, has_more) = collection_items(&state, &session, &subscription).await.unwrap();
+        assert_eq!(unfiltered, prefix);
+        assert!(!has_more);
+    }
+
+    #[tokio::test]
     async fn arrangement_actions_merge_layout_fences_replay_receipts_and_preserve_owner() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "arrangement-actions");

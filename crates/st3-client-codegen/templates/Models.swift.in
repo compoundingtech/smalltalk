@@ -36,6 +36,11 @@ public struct ErrorEnvelope: Codable, Error, Sendable {
 public enum ErrorCode: Codable, Sendable, Equatable {
     case notFound, forbidden, unsupportedCapability, validationFailed, idempotencyConflict
     case attentionMigrated
+    case arrangementExists
+    case arrangementFolderExists, arrangementRetired, arrangementLimit, arrangementFolderDeleted
+    case arrangementCycle, arrangementBodyTooLarge, arrangementOwnerForbidden
+    case invalidArrangementSubject, invalidArrangementAction, invalidArrangementOperations
+    case invalidArrangementFolder, invalidArrangementName, invalidArrangementKey, invalidSubjectReference
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
@@ -48,6 +53,15 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "attention-migrated": .attentionMigrated; case "not-found": .notFound; case "forbidden": .forbidden
         case "unsupported-capability": .unsupportedCapability; case "validation-failed": .validationFailed
         case "idempotency-conflict": .idempotencyConflict; case "stale-fence": .staleFence
+        case "arrangement-exists": .arrangementExists
+        case "arrangement-folder-exists": .arrangementFolderExists
+        case "arrangement-retired": .arrangementRetired; case "arrangement-limit": .arrangementLimit
+        case "arrangement-folder-deleted": .arrangementFolderDeleted; case "arrangement-cycle": .arrangementCycle
+        case "arrangement-body-too-large": .arrangementBodyTooLarge; case "arrangement-owner-forbidden": .arrangementOwnerForbidden
+        case "invalid-arrangement-subject": .invalidArrangementSubject; case "invalid-arrangement-action": .invalidArrangementAction
+        case "invalid-arrangement-operations": .invalidArrangementOperations; case "invalid-arrangement-folder": .invalidArrangementFolder
+        case "invalid-arrangement-name": .invalidArrangementName; case "invalid-arrangement-key": .invalidArrangementKey
+        case "invalid-subject-reference": .invalidSubjectReference
         case "cursor-gap": .cursorGap; case "page-cursor-expired": .pageCursorExpired
         case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
         case "timeline-history-incomplete": .timelineHistoryIncomplete
@@ -63,6 +77,15 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .attentionMigrated: "attention-migrated"; case .notFound: "not-found"; case .forbidden: "forbidden"
         case .unsupportedCapability: "unsupported-capability"; case .validationFailed: "validation-failed"
         case .idempotencyConflict: "idempotency-conflict"; case .staleFence: "stale-fence"
+        case .arrangementExists: "arrangement-exists"
+        case .arrangementFolderExists: "arrangement-folder-exists"
+        case .arrangementRetired: "arrangement-retired"; case .arrangementLimit: "arrangement-limit"
+        case .arrangementFolderDeleted: "arrangement-folder-deleted"; case .arrangementCycle: "arrangement-cycle"
+        case .arrangementBodyTooLarge: "arrangement-body-too-large"; case .arrangementOwnerForbidden: "arrangement-owner-forbidden"
+        case .invalidArrangementSubject: "invalid-arrangement-subject"; case .invalidArrangementAction: "invalid-arrangement-action"
+        case .invalidArrangementOperations: "invalid-arrangement-operations"; case .invalidArrangementFolder: "invalid-arrangement-folder"
+        case .invalidArrangementName: "invalid-arrangement-name"; case .invalidArrangementKey: "invalid-arrangement-key"
+        case .invalidSubjectReference: "invalid-subject-reference"
         case .cursorGap: "cursor-gap"; case .pageCursorExpired: "page-cursor-expired"
         case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
         case .timelineHistoryIncomplete: "timeline-history-incomplete"
