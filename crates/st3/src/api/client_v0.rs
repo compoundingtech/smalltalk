@@ -3390,23 +3390,10 @@ fn timeline_attribution(owner: &str, desired: &[crate::model::DesiredSubject]) -
     })
 }
 
-fn timeline_retention_is_explicit(claims: &[ClaimRecord], has_older: bool) -> bool {
-    if !has_older {
+fn timeline_retention_is_explicit(claims: &[ClaimRecord], required_through: u64) -> bool {
+    if required_through == 0 {
         return true;
     }
-    let earliest_retained = claims
-        .iter()
-        .filter_map(|claim| {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            (fields.get("entry_type").and_then(Value::as_str) != Some("truncation"))
-                .then(|| fields.get("sequence").and_then(Value::as_u64))
-                .flatten()
-        })
-        .min();
-    let Some(required_through) = earliest_retained.and_then(|sequence| sequence.checked_sub(1))
-    else {
-        return false;
-    };
     let mut intervals = claims
         .iter()
         .filter_map(|claim| {
@@ -4032,26 +4019,46 @@ pub(super) fn timeline_value(
             fields.get("incarnation_id").and_then(Value::as_str) == Some(expected)
         })
     });
-    if !timeline_retention_is_explicit(&timeline_claims, has_older_timeline) {
-        return Err(ApiError {
-            status: StatusCode::GONE,
-            code: "timeline-history-incomplete".into(),
-            message: "the retained transcript start is incomplete: older history has no truncation interval"
-                .into(),
-            details: Box::new(serde_json::Map::from_iter([
-                ("full_resync".into(), Value::Bool(false)),
-                ("retained_history_incomplete".into(), Value::Bool(true)),
-            ])),
-        });
-    }
+    // The oldest physical row, not a query cursor, establishes missing prefix history.
+    let oldest = if let Some(incarnation) = incarnation {
+        state.store.timeline_claims_for_incarnation_at(owner, incarnation, before, false, 1)
+            .map_err(ApiError::internal)?.claims.pop()
+    } else {
+        None
+    };
+    let missing_prefix_through = oldest.as_ref().and_then(|claim| {
+        claim.body.pointer("/fields/sequence").and_then(Value::as_u64)
+    }).unwrap_or(1).saturating_sub(1);
+    let prefix_unavailable =
+        !timeline_retention_is_explicit(&timeline_claims, missing_prefix_through);
+    let window_start = timeline_claims.first().map(crate::store::claim_log_order);
+    let mut omitted_updates = BTreeSet::new();
     let mut retained_entries = BTreeSet::new();
     for claim in &timeline_claims {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
         let Some(entry_id) = fields.get("entry_id").and_then(Value::as_str) else {
             continue;
         };
+        if omitted_updates.contains(entry_id) {
+            continue;
+        }
         let operation = fields.get("operation").and_then(Value::as_str);
         if !retained_entries.contains(entry_id) && operation != Some("append") {
+            let append = if has_older_timeline {
+                state.store.timeline_entry_append_at(
+                    owner, incarnation.unwrap_or_default(), entry_id, before,
+                ).map_err(ApiError::internal)?
+            } else {
+                None
+            };
+            if let Some(append) = append
+                && window_start.is_some_and(|start| crate::store::claim_log_order(&append) < start)
+            {
+                // This entry is outside this view, not absent from retained storage.
+                // Do not reconstruct a latest revision without its intervening operations.
+                omitted_updates.insert(entry_id.to_owned());
+                continue;
+            }
             return Err(ApiError {
                 status: StatusCode::GONE,
                 code: "timeline-history-incomplete".into(),
@@ -4064,6 +4071,11 @@ pub(super) fn timeline_value(
         }
         retained_entries.insert(entry_id.to_owned());
     }
+    timeline_claims.retain(|claim| {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        !fields.get("entry_id").and_then(Value::as_str)
+            .is_some_and(|entry| omitted_updates.contains(entry))
+    });
     let mut owner_claims = state
         .store
         .claims_page(Some(owner), None, 0, before, true, 10_000)
@@ -4312,6 +4324,37 @@ pub(super) fn timeline_value(
         }
     }
     items.extend(transcript_notice_entry);
+    if has_older_timeline || prefix_unavailable {
+        let mut notice_sequence = items
+            .iter()
+            .filter_map(|item| item["sequence"].as_u64())
+            .max()
+            .unwrap_or(0);
+        let mut notice = |code: &str, message: &str, details: Value| {
+            notice_sequence = notice_sequence.saturating_add(1);
+            items.push(json!({
+                "id": format!("timeline-entry/{session_leaf}/{code}"),
+                "sequence": notice_sequence,
+                "revision": 1, "timestamp": snapshot.created_at,
+                "role": "system", "type": "error", "final": true,
+                "body": {"code":code, "message":message, "retryable":false, "details":details}
+            }));
+        };
+        if has_older_timeline {
+            notice(
+                "timeline-query-limited",
+                "Only the newest 4096 stored transcript operations are available in this view. Older operations and entries updated across that boundary are not included; page cursors cover only this view.",
+                json!({"operation_limit":4096, "omitted_updated_entries":omitted_updates.len()}),
+            );
+        }
+        if prefix_unavailable {
+            notice(
+                "timeline-history-incomplete",
+                "Earlier transcript history is unavailable: the physical retained prefix has no covering truncation interval.",
+                json!({"retained_history_incomplete":true, "full_resync":false}),
+            );
+        }
+    }
     items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
     // A conversation opens at its newest bounded window. The cursor walks toward older
     // windows, while each individual page remains chronological for straightforward rendering.
@@ -13550,7 +13593,57 @@ mission "example/zero-run" state="ready" {
     }
 
     #[test]
-    fn timeline_retention_requires_an_actual_typed_gap_interval() {
+    fn timeline_physical_retention_does_not_invent_prefix_coverage() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "physical-retention-node");
+        let subject = "agent/physical-retention-owner";
+        let incarnation = "physical-retention-runtime:i1";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
+                expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        append("runtime.observed", json!({
+            "status":"running", "runtime_id":"physical-retention-runtime",
+            "incarnation_id":incarnation, "terminal":false,
+        }));
+        let entry = |sequence, entry_type, body| json!({
+            "operation":"append", "entry_id":format!("timeline-entry/physical-{sequence}"),
+            "sequence":sequence, "revision":1, "role":"system", "entry_type":entry_type,
+            "final":true, "body":body, "driver":"codex", "incarnation_id":incarnation,
+        });
+        append("harness.timeline", entry(3, "status", json!({"status":"running"})));
+        let session = ClientSession::local(None).unwrap();
+        let read = || {
+            let snapshot = new_client_snapshot(&state);
+            let id = client_session_resources(&state.store, true, &snapshot.created_at,
+                snapshot.store_index, None, false).unwrap()[0]["id"].as_str().unwrap().to_owned();
+            timeline_value(&state, &snapshot, &session, id.trim_start_matches("session/"),
+                &ClientListQuery::default()).unwrap().0
+        };
+        let unavailable = |page: &Value| page["items"].as_array().unwrap().iter().any(|item| {
+            item["body"]["code"] == "timeline-history-incomplete"
+                && item["body"]["retryable"] == false
+        });
+        let page = read();
+        assert!(unavailable(&page));
+        assert!(page["items"].as_array().unwrap().iter().any(|item| {
+            item["id"] == "timeline-entry/physical-3"
+        }));
+        append("harness.timeline", entry(4, "truncation", json!({
+            "reason":"producer-retention", "omitted_from_sequence":1, "omitted_to_sequence":1,
+        })));
+        assert!(unavailable(&read()));
+        append("harness.timeline", entry(5, "truncation", json!({
+            "reason":"producer-retention", "omitted_from_sequence":1, "omitted_to_sequence":2,
+        })));
+        assert!(!unavailable(&read()));
+    }
+
+    #[test]
+    fn timeline_query_limit_keeps_ordinary_history_and_identifies_omitted_updates() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "timeline-retention-node");
         let subject = "agent/timeline-retention-owner";
@@ -13589,7 +13682,7 @@ mission "example/zero-run" state="ready" {
                 ("revision".into(), Value::from(1)),
                 ("role".into(), Value::String("system".into())),
                 ("entry_type".into(), Value::String(entry_type.into())),
-                ("final".into(), Value::Bool(true)),
+                ("final".into(), Value::Bool(false)),
                 ("body".into(), body),
                 ("driver".into(), Value::String("codex".into())),
                 ("incarnation_id".into(), Value::String(incarnation.into())),
@@ -13597,12 +13690,6 @@ mission "example/zero-run" state="ready" {
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: Some(format!("timeline-retention-{sequence}")),
-        };
-        let append_entry = |sequence: u64, entry_type: &str, body: Value| {
-            state
-                .store
-                .append_claim(&entry(sequence, entry_type, body))
-                .unwrap();
         };
         // One entry more than a timeline read returns, in one commit: a commit for each entry
         // took minutes on a busy disk.
@@ -13631,57 +13718,46 @@ mission "example/zero-run" state="ready" {
             .as_str()
             .unwrap()
             .to_owned();
+        let read = |snapshot: &ClientSnapshot| {
+            timeline_value(
+                &state,
+                snapshot,
+                &session,
+                session_id.trim_start_matches("session/"),
+                &ClientListQuery { limit: Some(200), ..Default::default() },
+            )
+            .expect("a query bound is not missing retained history")
+            .0
+        };
+        let page = read(&snapshot);
+        assert!(page["items"].as_array().unwrap().iter().any(|item| {
+            item["body"]["code"] == "timeline-query-limited"
+        }));
+        assert!(page["items"].as_array().unwrap().iter().any(|item| {
+            item["id"] == "timeline-entry/retention-4097"
+        }));
+        let mut update = entry(1, "status", json!({"status":"waiting", "detail":"old entry updated"}));
+        update.fields.insert("operation".into(), json!("replace"));
+        update.fields.insert("revision".into(), json!(2));
+        update.idempotency_key = None;
+        state.store.append_claim(&update).unwrap();
+        let page = read(&new_client_snapshot(&state));
+        assert!(page["items"].as_array().unwrap().iter().any(|item| {
+            item["body"]["code"] == "timeline-query-limited"
+                && item["body"]["details"]["omitted_updated_entries"] == 1
+        }));
+        assert!(!page["items"].as_array().unwrap().iter().any(|item| {
+            item["body"]["code"] == "invalid-timeline-transition"
+        }));
+        update.fields.insert("entry_id".into(), json!("timeline-entry/actually-missing"));
+        update.idempotency_key = None;
+        state.store.append_claim(&update).unwrap();
         let gap = timeline_value(
-            &state,
-            &snapshot,
-            &session,
-            session_id.trim_start_matches("session/"),
-            &ClientListQuery::default(),
-        )
-        .unwrap_err();
-        assert_eq!(gap.status, StatusCode::GONE);
+            &state, &new_client_snapshot(&state), &session,
+            session_id.trim_start_matches("session/"), &ClientListQuery::default(),
+        ).unwrap_err();
         assert_eq!(gap.code, "timeline-history-incomplete");
-        assert_eq!(gap.details.get("full_resync"), Some(&Value::Bool(false)));
-        assert!(!client_error_retryable(gap.status, Some(&gap.code)));
-
-        append_entry(
-            4_098,
-            "truncation",
-            json!({
-                "reason":"producer-retention",
-                "omitted_from_sequence":1,
-                "omitted_to_sequence":1
-            }),
-        );
-        let snapshot = new_client_snapshot(&state);
-        let insufficient = timeline_value(
-            &state,
-            &snapshot,
-            &session,
-            session_id.trim_start_matches("session/"),
-            &ClientListQuery::default(),
-        )
-        .unwrap_err();
-        assert_eq!(insufficient.code, "timeline-history-incomplete");
-
-        append_entry(
-            4_099,
-            "truncation",
-            json!({
-                "reason":"producer-retention",
-                "omitted_from_sequence":1,
-                "omitted_to_sequence":3
-            }),
-        );
-        let snapshot = new_client_snapshot(&state);
-        let _ = timeline_value(
-            &state,
-            &snapshot,
-            &session,
-            session_id.trim_start_matches("session/"),
-            &ClientListQuery::default(),
-        )
-        .expect("the typed retention intervals cover the complete omitted logical prefix");
+        assert!(gap.message.contains("append operation is missing"));
     }
 
     #[test]

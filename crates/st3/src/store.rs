@@ -13765,6 +13765,9 @@ impl Store {
     /// The page merges replicated timeline claims, which older builds wrote, with
     /// this node's local timeline observations; a local observation sorts after the
     /// claim it follows.
+    /// `next_cursor` means the query omitted existing rows, never physical retention.
+    /// It is not a lossless local-observation cursor: several local IDs may follow
+    /// the same store index.
     pub fn timeline_claims_for_incarnation_at(
         &self,
         subject: &str,
@@ -13816,6 +13819,35 @@ impl Store {
             claims: merged,
             next_cursor,
         })
+    }
+    /// Find a retained append independently of the bounded operation window.
+    /// Local IDs, not just store indices, decide whether it precedes that window.
+    pub(crate) fn timeline_entry_append_at(
+        &self,
+        subject: &str,
+        incarnation: &str,
+        entry: &str,
+        before_index: Option<u64>,
+    ) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        let filter = "subject=?1 AND kind='harness.timeline'
+            AND json_extract(body, '$.fields.incarnation_id')=?2
+            AND json_extract(body, '$.fields.entry_id')=?3
+            AND json_extract(body, '$.fields.operation')='append'";
+        let claim = connection.query_row(
+            &format!("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+                FROM claims WHERE {filter} AND (?4 IS NULL OR store_index<?4)
+                ORDER BY store_index LIMIT 1"),
+            params![subject, incarnation, entry, before_index],
+            claim_from_row,
+        ).optional()?;
+        let local = connection.query_row(
+            &format!("{LOCAL_OBSERVATION_COLUMNS} WHERE {filter}
+                AND (?4 IS NULL OR after_store_index<?4) ORDER BY id LIMIT 1"),
+            params![subject, incarnation, entry, before_index],
+            |row| local_observation_from_row(&self.origin, row),
+        ).optional()?;
+        Ok(claim.into_iter().chain(local).min_by_key(claim_log_order))
     }
 
     /// The newest local timeline observation for one incarnation at or before a snapshot.
