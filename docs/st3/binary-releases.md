@@ -60,6 +60,14 @@ files and Python bytecode are ignored by Git, so restored caches and previous ar
 the baked source version dirty. The extracted, installed binary must still report the exact clean
 checkout version.
 
+The separate **Nix** workflow builds the default Linux package and every native flake check on
+tags, relevant trusted PRs, manual dispatch, and daily at 01:17 UTC. It uses ci1's persistent Nix
+store, retains the latest outputs per runner as GC roots, and repeats the build with downloads
+and both local and remote builders disabled to prove the results are cached. It needs neither
+GitHub's Actions cache nor FlakeHub. The `nix-release-proof` artifact records the exact source,
+targets, and output paths. The scheduled check starts four hours before the daily release schedule
+to catch package breakage early.
+
 ## Daily releases
 
 **Smalltalk daily release** (`release-daily.yml`) runs at 05:17 UTC and on manual dispatch. It takes the

@@ -697,7 +697,7 @@
         hookSuccessorSource = pkgs.runCommand "st2-hook-successor-source" { } ''
           cp -R ${self} $out
           chmod -R u+w $out
-          printf '\n# Nix hook replacement acceptance probe.\n' >> $out/hooks/codex-stop.sh
+          printf '\n# Nix hook replacement acceptance probe.\n' >> $out/crates/st-drivers/hooks/codex-stop.sh
         '';
 
         st2HookSuccessor = st2.overrideAttrs (_: {
