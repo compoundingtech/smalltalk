@@ -78,7 +78,20 @@ Shape of `pi_session.rs`:
 ## Channel (`hooks/omp-channel.ts`)
 
 Forked from `pi-channel.ts`; same frame protocol discipline (LF-delimited JSON, hello /
-message / delivered / failed / state / context frames, PROTOCOL constant). Differences:
+message / delivered / failed / state / context frames, PROTOCOL constant).
+
+The pi-family channel reports native session bindings under the exact subject and
+incarnation supplied to its publish loop. When the harness supplies `sessionFile`,
+the publisher checks that exact file: it must be a regular file whose session header
+(optionally following a title line) names the reported native session ID. The verified
+canonical path is sent to `/v1/agents/native-session`, including for an externally
+resumed transcript outside managed `provider-sessions`. A missing, unreadable,
+malformed, or mismatched explicit file stays pending; the publisher never substitutes
+a managed file, cwd match, or newest transcript. Without an explicit file, the existing
+managed-session guard still waits for the matching transcript before publishing;
+pi writes a fresh transcript only on its first turn.
+
+omp-specific differences:
 
 - **Idle and terminal edges:** `agent_start` emits active. On a terminal `agent_end`, poll
   `ctx.isIdle()` every ~100 ms until positive proof or superseding ownership/activity, and emit

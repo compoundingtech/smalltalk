@@ -249,6 +249,15 @@ fn pi_family_header_id(path: &Path) -> Option<String> {
     None
 }
 
+/// Verify the exact transcript path reported by a pi-family harness, including an externally
+/// resumed file. The header, not the filename or directory, must name `id`. Return the canonical
+/// path for binding; never search for a substitute if the reported file is missing or foreign.
+pub fn pi_family_reported_transcript(path: &Path, id: &str) -> Option<PathBuf> {
+    valid_id(id).ok()?;
+    let path = fs::canonicalize(path).ok()?;
+    (path.is_file() && pi_family_header_id(&path).as_deref() == Some(id)).then_some(path)
+}
+
 /// The seat's own transcript of pi-family session `id`: `<time>_<id>.jsonl` in its private
 /// session directory `sessions`, whose header names the same session.
 pub fn pi_family_transcript(sessions: &Path, id: &str) -> Option<PathBuf> {
@@ -486,6 +495,24 @@ mod tests {
                 .code,
             "authored-session-selection"
         );
+    }
+
+    #[test]
+    fn pi_family_reports_verify_the_exact_external_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("external.jsonl");
+        assert_eq!(pi_family_reported_transcript(&path, "one"), None);
+        fs::write(&path, "{\"type\":\"session\",\"id\":\"other\"}\n").unwrap();
+        assert_eq!(pi_family_reported_transcript(&path, "one"), None);
+        fs::write(&path, "{}\n").unwrap();
+        assert_eq!(pi_family_reported_transcript(&path, "one"), None);
+        fs::write(&path, "{\"type\":\"title\"}\n{\"type\":\"session\",\"id\":\"one\"}\n").unwrap();
+        assert_eq!(
+            pi_family_reported_transcript(&path, "one"),
+            Some(fs::canonicalize(&path).unwrap())
+        );
+        assert_eq!(pi_family_reported_transcript(root.path(), "one"), None);
+        assert_eq!(pi_family_reported_transcript(&path, "../one"), None);
     }
 
     #[test]

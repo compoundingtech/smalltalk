@@ -18554,18 +18554,30 @@ impl PiFamilyReports {
         // It stays pending and goes again with the next report. A session is reported only once
         // its transcript exists, because only then can a resume find it: pi writes nothing until
         // its first turn.
-        let resumable = |native: &str| {
-            std::env::var_os(st_drivers::driver_paths::SESSION_DIR_ENV).is_none_or(|dir| {
-                st3::native_resume::pi_family_transcript(
-                    &PathBuf::from(dir).join("provider-sessions"),
-                    native,
-                )
-                .is_some()
-            })
-        };
-        if let Some((native, path)) = self.native_session.clone()
-            && resumable(&native)
-        {
+        if let Some((native, path)) = self.native_session.clone() {
+            let path = match path {
+                Some(path) => {
+                    let Some(verified) = st3::native_resume::pi_family_reported_transcript(
+                        Path::new(&path),
+                        &native,
+                    ) else {
+                        return Ok(());
+                    };
+                    Some(verified)
+                }
+                None => {
+                    if std::env::var_os(st_drivers::driver_paths::SESSION_DIR_ENV).is_some_and(|dir| {
+                        st3::native_resume::pi_family_transcript(
+                            &PathBuf::from(dir).join("provider-sessions"),
+                            &native,
+                        )
+                        .is_none()
+                    }) {
+                        return Ok(());
+                    }
+                    None
+                }
+            };
             let reported: Result<ClaimRecord> = client
                 .post(
                     "/v1/agents/native-session",
