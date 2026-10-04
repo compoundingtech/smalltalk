@@ -4,7 +4,7 @@
 
 Workspace CI runs on pull requests, merge groups and manual dispatch. The merge queue tests the
 exact commit that lands on `main`; its successful checks stay attached to that SHA, so a main push
-does not repeat the workspace gate. `Main upkeep` verifies those four checks, runs `perf-cost`
+does not repeat the workspace gate. `Main upkeep` verifies those five checks, runs `perf-cost`
 (which the queue skips), and fills missing main-scope caches on Namespace. `macOS CI` still runs
 on main pushes. Each non-PR run uses its own `github.run_id` in the concurrency group, so
 successive pushes do not cancel checks or cache saves. PR updates still cancel stale checks;
@@ -12,12 +12,12 @@ macOS checks on PRs require the `macos-ci` label.
 
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
 (`.github/workflows/macos.yml`) replace the fleet's former Linux `st/ci` and optional `st/ci-macos`
-execution. The required checks on `main` are `linux-gate`, `isolation-vm`, `genie-freshness` and
-`typescript-client`,
+execution. The required checks on `main` are `linux-gate`, `isolation-vm`, `genie-freshness`,
+`typescript-client` and `mail-redelivery-canaries`,
 and `main` lands through GitHub's merge queue (see [Merge queue](#merge-queue)).
 
 Every pull request, including a fork and a draft, gets the Linux gate, the isolation VM, the
-freshness check and the TypeScript client check. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
+freshness check, the TypeScript client check and the mail redelivery canaries. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
 the required checks for each queued entry.
 Checkout uses GitHub's default `pull_request` merge ref, not the contributor's unmerged
 head: it tests that head merged with the current base. Strict branch protection also requires
@@ -25,8 +25,8 @@ that the head itself contain the latest `main`. No `pull_request_target` job run
 and the gate has only `contents: read` permission. Forks do not receive publishing secrets.
 
 The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
-`linux-gate` is the single required check: it needs the three jobs and passes only when every one of
-them succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
+`linux-gate` requires all three stage jobs and the named mail redelivery check to succeed
+(a skipped or cancelled stage fails it). The stage jobs use the shape label
 `nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm`, `typescript-client` and the `linux-gate`
 aggregate use `namespace-profile-linux-x86-64`. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
@@ -278,7 +278,7 @@ through the API and picks one pool for the whole run:
 
 Every other job's `runs-on` reads `pick-runner`'s output and falls back to its Namespace label when
 the output is empty. The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
-names its three stages instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
+names its stages and the redelivery canary instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
 Two runs that pick at the same moment can both choose ci1; the later run's jobs then wait for
 runners on ci1.
 
@@ -402,6 +402,21 @@ cargo test -p st3 --test integration daemon_cost:: -- --nocapture --test-threads
 ST_LOAD_GATE=1 nix develop .#perf -c cargo test --release -p st3 --features perf-load --test perf_load daemon_load:: -- --nocapture
 ```
 
+## Required mail redelivery canaries
+
+Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires eleven named,
+unignored regressions: boot/reconnect mailbox suppression for Claude, Codex, OpenCode, Pi,
+and OMP; each harness's native suspend/resume canary with old mail held and fresh mail read;
+and delivered-but-unread retention across native channel restart. The mailbox cases seed
+sent, staged, and delivered-but-unread mail and prove zero old offers, live delivery, and
+continued explicit mailbox access. Every selected test runs with zero retries.
+
+The script fails if any required test is missing, ignored, or filtered out. The named
+`mail-redelivery-canaries` check reads that step's actual outcome; a skipped step cannot pass.
+`linux-gate` requires it, so this protection applies to pull requests and merge groups. It
+reuses the compiled Linux test runner instead of allocating another native-test runner.
+Apply the fifth live ruleset check after this workflow has passed on main.
+
 ## Generated files and existing workflows
 
 All workflow YAML and `.github/repo-settings.json` are generated from neighboring `.genie.ts`
@@ -451,7 +466,7 @@ queued check fails, the entry leaves the queue and the pull request page says wh
 queue it again. The merge train (`st lanes join smalltalk`) is retired.
 
 The ruleset (`.github/repo-settings.json`, generated from `repo-settings.json.genie.ts`, applied
-by an administrator and never by CI) requires the four checks from GitHub Actions with an empty
+by an administrator and never by CI) requires the five checks from GitHub Actions with an empty
 bypass list, keeps the pull-request, deletion and force-push protections, and configures the queue:
 merge method MERGE, up to five entries build at once (see [Measured concurrency](#measured-concurrency)),
 up to five merge together, and a check that

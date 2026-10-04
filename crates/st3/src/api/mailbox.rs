@@ -602,6 +602,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opencode_boot_and_reconnect_never_inject_old_mail() {
+        boot_and_reconnect_hold_old_mail("opencode-server").await;
+    }
+
+    #[tokio::test]
     async fn a_restarted_native_mailbox_holds_a_watch_wake_queued_while_the_seat_was_stopped() {
         let root = tempfile::tempdir().unwrap();
         let mut state = super::super::tests::state(root.path());
