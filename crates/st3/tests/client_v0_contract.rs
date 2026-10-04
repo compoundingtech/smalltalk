@@ -1369,7 +1369,7 @@ async fn agent_workspace_read_conforms_for_mission_seats_and_refuses_missing_dec
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());
     let source = r#"version 2
-mission "garden/workspace" {
+mission "garden/workspace" state="ready" {
   goal "Read the exact seat directory."
   agent "interactive" { workspace "${ST_WORKSPACE}/interactive"; harness "omp" {} }
   step "work" { assigned-to "agent/${ST_MISSION_RUN}/interactive"; goal "Wait." }
