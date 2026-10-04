@@ -2766,6 +2766,22 @@ fn client_attention_resources(
     Ok(resources)
 }
 
+// Older client-v0 models use closed enums for attention kinds and action names.
+fn client_attention_compatibility(items: &mut [Value], custom_forms: bool) {
+    if custom_forms {
+        return;
+    }
+    for item in items {
+        if item["kind"] == "attention" && item["source_kind"] == "custom" {
+            item["custom_attention_kind"] = item["attention_kind"].clone();
+            item["attention_kind"] = json!("agent-request");
+            item["actions"] = json!([]);
+            let p = &item["action_parameters"]["custom.reply"];
+            item["detail"] = json!(format!("{}\n\nReply with st subject reply {} --registration {} --revision {} --episode {} --fields-file REPLY.json --idempotency-key REPLY-KEY --as {}", item["detail"].as_str().unwrap_or_default(), item["source_id"].as_str().unwrap_or_default(), p["registration"].as_str().unwrap_or_default(), p["revision"].as_str().unwrap_or_default(), p["episode"].as_str().unwrap_or_default(), item["person_id"].as_str().unwrap_or_default()));
+        }
+    }
+}
+
 fn client_attention_resources_with_previews(
     state: &AppState,
     person: Option<&str>,
@@ -3973,7 +3989,11 @@ async fn client_attention(
         snapshot,
         "attention",
         &effective_query,
-        move |state, _| client_attention_resources_with_previews(state, person.as_deref(), history),
+        move |state, _| {
+            let mut items = client_attention_resources_with_previews(state, person.as_deref(), history)?;
+            client_attention_compatibility(&mut items, session.custom_forms);
+            Ok(items)
+        },
     )
     .await
 }
@@ -3985,12 +4005,10 @@ async fn client_attention_detail(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
-    client_detail(
-        client_attention_resources_with_previews(&state, person.as_deref(), query.history)
-            .map_err(ApiError::internal)?,
-        "attention",
-        &id,
-    )
+    let mut items = client_attention_resources_with_previews(&state, person.as_deref(), query.history)
+        .map_err(ApiError::internal)?;
+    client_attention_compatibility(&mut items, session.custom_forms);
+    client_detail(items, "attention", &id)
 }
 
 async fn client_messages(

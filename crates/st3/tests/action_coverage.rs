@@ -4084,13 +4084,13 @@ async fn custom_reply_survives_fences_cli_and_daemon_restarts() {
                     "--field",
                     "detail=Choose Keep or Discard.",
                     "--field",
-                    "recipient=person/fern",
+                    "recipient=person/lichen",
                 ],
             )
             .await,
     );
     let source = daemon
-        .client("person/fern")
+        .client("person/lichen")
         .custom_subjects_get(subject)
         .await
         .unwrap();
@@ -4098,13 +4098,13 @@ async fn custom_reply_survives_fences_cli_and_daemon_restarts() {
     let basis=cli_value(daemon.cli(PERSON,&["subject","basis",subject,"--kind","custom.garden.review.v1.requested"]).await);
     assert_eq!(basis["revision"],daemon.store().custom_basis_revision(subject,&["custom.garden.review.v1.requested".into()]).unwrap());
     let page = daemon
-        .client("person/fern")
+        .client("person/lichen")
         .custom_subjects_list(Some("garden.review"), Some(1), None, Some(10))
         .await
         .unwrap();
     assert_eq!(page.value.items.len(), 1);
     let cards = daemon
-        .client("person/fern")
+        .client("person/lichen")
         .attention_list(None, Some(10), false)
         .await
         .unwrap();
@@ -4138,11 +4138,11 @@ async fn custom_reply_survives_fences_cli_and_daemon_restarts() {
     .unwrap_err();
     assert!(matches!(denied, ClientError::Api(ErrorCode::Forbidden, ..)));
     daemon
-        .exercise("person/fern", "custom.reply", parameters, fence)
+        .exercise("person/lichen", "custom.reply", parameters, fence)
         .await;
     assert!(
         daemon
-            .client("person/fern")
+            .client("person/lichen")
             .attention_list(None, Some(10), false)
             .await
             .unwrap()
@@ -4152,7 +4152,7 @@ async fn custom_reply_survives_fences_cli_and_daemon_restarts() {
     );
     let read = cli_value(
         daemon
-            .cli("person/fern", &["subject", "show", subject])
+            .cli("person/lichen", &["subject", "show", subject])
             .await,
     );
     assert_eq!(read["fields"]["selection"], "keep");
@@ -4172,7 +4172,7 @@ async fn custom_reply_survives_fences_cli_and_daemon_restarts() {
                     "--field",
                     "detail=Choose Keep or Discard.",
                     "--field",
-                    "recipient=person/fern",
+                    "recipient=person/lichen",
                 ],
             )
             .await,
@@ -4183,7 +4183,7 @@ async fn custom_reply_survives_fences_cli_and_daemon_restarts() {
     cli_value(
         daemon
             .cli(
-                "person/fern",
+                "person/lichen",
                 &[
                     "subject",
                     "reply",
@@ -4199,7 +4199,7 @@ async fn custom_reply_survives_fences_cli_and_daemon_restarts() {
                     "--idempotency-key",
                     "custom-cli-answer-001",
                     "--as",
-                    "person/fern",
+                    "person/lichen",
                 ],
             )
             .await,

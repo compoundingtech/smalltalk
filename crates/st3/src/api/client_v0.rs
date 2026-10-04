@@ -127,6 +127,7 @@ async fn collection_items(
     let actor = request.actor.clone();
     let status = request.status.clone();
     let collection = request.collection.clone();
+    let custom_forms = session.custom_forms;
     let (snapshot, mut items, has_more) = super::blocking_store(move || {
         let store = state.store.clone();
         store.read_snapshot(|index| {
@@ -156,6 +157,7 @@ async fn collection_items(
                 )?,
                 _ => unreachable!(),
             };
+            client_attention_compatibility(&mut items, custom_forms);
             if let Some(status) = status {
                 items.retain(|item| item["state"].as_str() == Some(status.as_str()));
             }
@@ -1169,6 +1171,7 @@ pub(super) struct ClientSession {
     /// The concrete graph person whose explicitly delegated authority is exercised.
     pub(super) authority_actor: String,
     pub(super) transport: &'static str,
+    pub(super) custom_forms: bool,
     scopes: std::collections::BTreeSet<String>,
 }
 
@@ -1179,11 +1182,13 @@ impl ClientSession {
             actor: actor.into(),
             authority_actor: authority_actor.into(),
             transport,
+            custom_forms: true,
             scopes: std::collections::BTreeSet::new(),
         }
     }
 
     fn local(person: Option<&str>) -> Result<Self, ApiError> {
+        let custom_forms = false;
         if person.is_some_and(|person| {
             !(person.starts_with("person/") && person.matches('/').count() == 1
                 || person.starts_with("agent/"))
@@ -1197,6 +1202,7 @@ impl ClientSession {
                 actor: "client/local/read-only".into(),
                 authority_actor: "client/local/read-only".into(),
                 transport: "unix",
+                custom_forms,
                 scopes: ["read.projections", "terminal.read"]
                     .into_iter()
                     .map(str::to_owned)
@@ -1209,6 +1215,7 @@ impl ClientSession {
             actor: person.into(),
             authority_actor: person.into(),
             transport: "unix",
+            custom_forms,
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
         })
     }
@@ -1218,6 +1225,7 @@ impl ClientSession {
             actor: "client/pairing/completion".into(),
             authority_actor: "client/pairing/completion".into(),
             transport: "fabric-loopback",
+            custom_forms: false,
             scopes: std::collections::BTreeSet::new(),
         }
     }
@@ -1318,13 +1326,22 @@ pub(super) fn authenticate(
     request: &Request<Body>,
     transport: &'static str,
 ) -> Result<ClientSession, ApiError> {
+    let custom_forms = request
+        .headers()
+        .get("x-st3-features")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|feature| feature.trim() == "custom-subjects.v1")
+        });
     let Some(value) = request.headers().get(AUTHORIZATION) else {
         if transport == "unix" {
             let person = request
                 .headers()
                 .get(LOCAL_PERSON_HEADER)
                 .and_then(|value| value.to_str().ok());
-            return ClientSession::local(person);
+            let mut session = ClientSession::local(person)?;
+            session.custom_forms = custom_forms;
+            return Ok(session);
         }
         let pairing_completion = request.method() == axum::http::Method::POST
             && request.uri().path().starts_with("/v1/client/pairings/")
@@ -1401,6 +1418,7 @@ pub(super) fn authenticate(
         actor: actor.into(),
         authority_actor: authority_actor.into(),
         transport,
+        custom_forms,
         scopes,
     };
     if request.method() == axum::http::Method::GET {
@@ -3156,6 +3174,7 @@ pub(super) async fn now(
         move |state, snapshot| {
             let mut items =
                 super::client_attention_resources_with_previews(state, person.as_deref(), history)?;
+            client_attention_compatibility(&mut items, session.custom_forms);
             // The default Now view is the person's attention queue. Mission work belongs
             // in Control; only an explicit work filter opts it into this combined view.
             if actor.is_some() || owner_run.is_some() {
@@ -14564,6 +14583,7 @@ mission "example/zero-run" state="ready" {
             actor: "person/alex/session/device-one".into(),
             authority_actor: "person/alex".into(),
             transport: "paired",
+            custom_forms: false,
             scopes: ["terminal.read".into()].into_iter().collect(),
         };
         let mut remote_request = request.clone();
