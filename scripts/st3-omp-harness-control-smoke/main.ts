@@ -12,7 +12,7 @@ const server=Bun.serve({port:0,hostname:'127.0.0.1',fetch:async request=>{
   return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: ${JSON.stringify(end)}\n\ndata: [DONE]\n\n`,{headers:{'content-type':'text/event-stream'}});
 }});
 const root=resolve(import.meta.dir,'../..');
-const proc=Bun.spawn([binary,'--mode','rpc','--no-ui','--no-tools','--no-lsp','--no-extensions','--no-skills','--no-rules','--no-title','--no-session','--extension',resolve(import.meta.dir,'extension.ts'),'--model','control-smoke/native-smoke','--thinking','low'],{cwd:root,env:{...process.env,PI_CODING_AGENT_DIR:profile,SMOKE_BASE_URL:`http://127.0.0.1:${server.port}/v1`},stdin:'pipe',stdout:'pipe',stderr:'pipe'});
+const proc=Bun.spawn([binary,'--mode','rpc','--no-ui','--no-tools','--no-lsp','--no-extensions','--no-skills','--no-rules','--no-title','--no-session','--extension',resolve(import.meta.dir,'extension.ts'),'--model','control-smoke/native-initial','--thinking','low'],{cwd:root,env:{...process.env,PI_CODING_AGENT_DIR:profile,SMOKE_BASE_URL:`http://127.0.0.1:${server.port}/v1`},stdin:'pipe',stdout:'pipe',stderr:'pipe'});
 let result='';let success=false;
 const deadline=setTimeout(()=>proc.kill(),30000);
 const stderr=new Response(proc.stderr).text();

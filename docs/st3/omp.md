@@ -68,6 +68,13 @@ effort changes are **not atomic**. Unsupported effort choices are rejected befor
 effort remains explicitly unknown when the extension API exposes only the effective value. Live
 approval response is unsupported because there is no native extension approval-resolution API.
 
+The model descriptor includes native source, availability, completeness, and a content revision
+covering the available registry, selected model, and effective effort. Model commands require that
+revision; a fresh native read rejects a stale selection, including a change made outside the
+channel. The channel samples native selection changes on its keepalive; the extension API has no
+model/effort change hook. This is a pre-invocation fence, not a compare-and-swap guarantee across the
+native asynchronous setter.
+
 Receipt replay is process-local channel recovery, not durable native deduplication. The driver must
 not blindly replay an operation after a process replacement or an indeterminate result.
 

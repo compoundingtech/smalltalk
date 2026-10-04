@@ -1,17 +1,26 @@
 // Native control admission is not atomic model+effort application and is not durable deduplication.
 // A void ExtensionAPI sendMessage return proves nothing: only the exact native message event settles input.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 // OMP's native thinking selector includes max, unlike older pi-family declarations.
 type NativeControlAPI = Omit<ExtensionAPI, "setThinkingLevel"> & {
   setThinkingLevel(level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"): void;
 };
+type NativeControlContext = ExtensionContext & {
+  models?: { current(): ExtensionContext["model"] };
+};
 
 export type ControlBinding = { desired_revision: string; incarnation_id: string; session_id: string; turn_id: string | null };
 type Input = { type: "input"; operation_id: string; entry_id: string; actor: string; content: string; lane: "steer" | "follow_up"; binding: ControlBinding };
-type SetModel = { type: "set_model"; operation_id: string; binding: ControlBinding; provider: string; model_id: string; effort?: string };
+type SetModel = { type: "set_model"; operation_id: string; binding: ControlBinding; model_revision: string; provider: string; model_id: string; effort?: string };
 type Command = Input | SetModel;
 type Receipt = { type: "harness_control_receipt"; operation_id: string; binding: ControlBinding; status: "applied" | "rejected" | "indeterminate"; reason?: string; result?: Record<string, unknown> };
+type ModelDescriptor = {
+  revision: string; available: boolean; complete: boolean; source: "native-extension-model-registry";
+  choices: { provider: string; id: string; reasoning: boolean; supported_efforts: string[] }[];
+  selected: { provider: string; id: string; effective_effort: string | null; configured_effort: "unknown" } | null;
+  atomic_model_effort: false;
+};
 const record = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const bindingOf = (value: unknown): ControlBinding | undefined => {
   const raw = record(value);
@@ -37,12 +46,28 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
   const receipts = new Map<string, Receipt>();
   const current = (): ControlBinding | undefined => context && desired ? { ...desired, session_id: context.sessionManager.getSessionId(), turn_id: turnId } : undefined;
   const idle = () => { try { return context?.isIdle() === true; } catch { return false; } };
+  const selectedModel = (): ExtensionContext["model"] | undefined => {
+    const models = (context as NativeControlContext | undefined)?.models;
+    return typeof models?.current === "function" ? models.current() : undefined;
+  };
+  const modelDescriptor = (): ModelDescriptor => {
+    let values: Omit<ModelDescriptor, "revision">;
+    try {
+      const model = selectedModel();
+      values = {
+        available: typeof (context as NativeControlContext | undefined)?.models?.current === "function", complete: context !== undefined, source: "native-extension-model-registry", atomic_model_effort: false,
+        choices: (context?.modelRegistry.getAvailable() ?? []).map(item => ({ provider: item.provider, id: item.id, reasoning: item.reasoning, supported_efforts: efforts(item) })),
+        selected: model ? { provider: model.provider, id: model.id, effective_effort: pi.getThinkingLevel() ?? null, configured_effort: "unknown" } : null,
+      };
+    } catch {
+      values = { available: false, complete: false, source: "native-extension-model-registry", choices: [], selected: null, atomic_model_effort: false };
+    }
+    return { ...values, revision: createHash("sha256").update(JSON.stringify(values)).digest("hex") };
+  };
   const snapshot = () => {
     if (!context) return;
-    const models = context.modelRegistry.getAvailable();
-    const model = context.model;
     send({ type: "harness_control_state", session_id: context.sessionManager.getSessionId(), turn_id: turnId, idle: idle(), input_supported: !transitioning && !!current(), reason: transitioning ? "session-transition-state-unknown" : undefined,
-      models: { choices: models.map(item => ({ provider: item.provider, id: item.id, reasoning: item.reasoning, supported_efforts: efforts(item) })), selected: model ? { provider: model.provider, id: model.id, effective_effort: pi.getThinkingLevel() ?? null, configured_effort: "unknown" } : null, atomic_model_effort: false },
+      models: modelDescriptor(),
       approval: { supported: false, reason: "native-live-approval-api-unavailable" } });
   };
   const settle = (command: Command, status: Receipt["status"], reason?: string, result?: Record<string, unknown>) => {
@@ -103,25 +128,30 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
   pi.on("session_shutdown", () => { transitioning = true; invalidate("native-process-shutdown"); });
 
   const setModel = async (command: SetModel, ctx: ExtensionContext) => {
-    const model = ctx.modelRegistry.getAvailable().find(item => item.provider === command.provider && item.id === command.model_id);
-    if (!model) { settle(command, "rejected", "model-unavailable"); return; }
-    const requested = command.effort;
-    if (requested !== undefined && !efforts(model).includes(requested)) { settle(command, "rejected", "effort-unsupported"); return; }
     mutation = command.operation_id;
     try {
+      const before = modelDescriptor();
+      if (!before.available) { settle(command, "rejected", "native-model-registry-unavailable"); return; }
+      if (before.revision !== command.model_revision) { settle(command, "rejected", "stale-native-model-revision"); return; }
+      const model = ctx.modelRegistry.getAvailable().find(item => item.provider === command.provider && item.id === command.model_id);
+      if (!model) { settle(command, "rejected", "model-unavailable"); return; }
+      const requested = command.effort;
+      if (requested !== undefined && !efforts(model).includes(requested)) { settle(command, "rejected", "effort-unsupported"); return; }
       const accepted = await pi.setModel(model);
       const binding = current();
       if (!binding || !sameBinding(binding, command.binding) || transitioning) { settle(command, "indeterminate", "native-binding-replaced"); return; }
       if (!accepted) { settle(command, "rejected", "model-credential-unavailable"); return; }
+      const after = modelDescriptor();
+      if (!after.available || JSON.stringify(before.choices) !== JSON.stringify(after.choices)) { settle(command, "indeterminate", "native-model-catalog-replaced"); return; }
       if (requested !== undefined) {
         // The public setter's choices are narrower than model metadata. Reject unknown choices
         // before mutation; no cast converts a provider-only effort into an extension capability.
         switch (requested) {
           case "off": case "minimal": case "low": case "medium": case "high": case "xhigh": case "max": pi.setThinkingLevel(requested); break;
-          default: settle(command, "indeterminate", "model-applied-effort-api-unavailable", { provider: ctx.model?.provider, id: ctx.model?.id, effective_effort: pi.getThinkingLevel() ?? null }); return;
+          default: settle(command, "indeterminate", "model-applied-effort-api-unavailable", { effective_effort: pi.getThinkingLevel() ?? null }); return;
         }
       }
-      const observed = ctx.model;
+      const observed = selectedModel();
       const effective = pi.getThinkingLevel() ?? null;
       if (observed?.provider !== command.provider || observed.id !== command.model_id || (requested !== undefined && effective !== requested)) settle(command, "indeterminate", "native-effective-value-mismatch", { provider: observed?.provider, id: observed?.id, effective_effort: effective });
       else settle(command, "applied", undefined, { provider: observed.provider, id: observed.id, effective_effort: effective, atomic_model_effort: false });
@@ -160,8 +190,8 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
       try {
         pi.sendMessage({ customType: "st-control-input", content: command.content, display: true, details: { operation_id: operationId, actor: command.actor, entry_id: command.entry_id }, attribution: "user" }, { triggerTurn: true, deliverAs: command.lane === "follow_up" ? "followUp" : "steer" });
       } catch { settle(command, "indeterminate", "native-input-invocation-failed"); }
-    } else if (wire.type === "set_model" && typeof wire.provider === "string" && typeof wire.model_id === "string" && (wire.effort === undefined || typeof wire.effort === "string")) {
-      const command: SetModel = { type: "set_model", operation_id: operationId, binding, provider: wire.provider, model_id: wire.model_id, ...(typeof wire.effort === "string" ? { effort: wire.effort } : {}) };
+    } else if (wire.type === "set_model" && typeof wire.provider === "string" && typeof wire.model_id === "string" && typeof wire.model_revision === "string" && (wire.effort === undefined || typeof wire.effort === "string")) {
+      const command: SetModel = { type: "set_model", operation_id: operationId, binding, model_revision: wire.model_revision, provider: wire.provider, model_id: wire.model_id, ...(typeof wire.effort === "string" ? { effort: wire.effort } : {}) };
       if (command.effort !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(command.effort)) { reject("effort-api-unsupported"); return true; }
       pending.set(operationId, command);
       void setModel(command, ctx);
