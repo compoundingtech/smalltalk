@@ -125,6 +125,104 @@ tailscale serve reset
 Warning: `tailscale serve reset` clears all Serve configuration on the host, not only the st
 gateway.
 
+### Browser bundle and relays
+
+The paired gateway optionally serves a browser bundle and same-origin relays. Configure these
+in `config.toml` and restart the daemon:
+
+```toml
+[client_web]
+static_dir = "/opt/client-bundle"
+mount = "/app"
+otlp_endpoint = "http://127.0.0.1:4318"
+
+[usage]
+endpoint = "http://127.0.0.1:4319"
+```
+
+The `client_web` fields are optional; the mount defaults to `/app`. When `[usage]` is present,
+its `endpoint` is required. The bundle directory must contain `index.html`. Existing files are
+served under the mount; missing extensionless paths
+fall back to the root index for client-side routing. Missing assets return `404`. Paths and
+symlinks cannot escape the configured directory. The static bundle is public within the trusted
+tailnet carrier, not an authenticated API, and must not contain credentials or private data.
+
+Browsers complete the same pairing as native clients and receive the same scoped bearer in JSON.
+The TypeScript client's `IndexedDbCredentialStore` keeps it in IndexedDB, keyed by the gateway
+origin and base path, and supplies it through the client's `credential` callback. Delete the entry
+when disconnecting or revoking the device. Do not use cookies, localStorage, URL query parameters,
+or bundle-embedded credentials. The current pairing protocol records a device public key but has
+no signed-challenge authentication; the bearer is therefore script-readable. A non-extractable
+WebCrypto challenge-signing key requires a protocol change rather than wrapping this bearer
+([#1038](https://github.com/compoundingtech/smalltalk/issues/1038)).
+
+HTTP requests use `Authorization: Bearer ...`. Browsers cannot set that header on a WebSocket,
+so they offer one additional `st3.bearer.<credential>` subprotocol alongside the stream's normal
+protocol (and `st3.cap.<capability>` for terminals). Authentication completes before upgrade,
+using the same expiry, revocation, actor and scopes as native bearers. The server selects and
+echoes only the normal stream protocol, never the credential. An explicit Authorization header
+is selected before parsing the fallback, even if that fallback is empty or duplicated. Invalid
+explicit Authorization never falls back to another credential. Redact the credential protocol
+from reverse-proxy handshake logs.
+
+The gateway sends this CSP on bundle responses, including HEAD, SPA fallbacks and errors:
+
+```text
+default-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'none';
+connect-src 'self' ws://GATEWAY_AUTHORITY wss://GATEWAY_AUTHORITY;
+img-src 'self' data:; font-src 'self'; manifest-src 'self'; worker-src 'self';
+base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'
+```
+
+`GATEWAY_AUTHORITY` is the validated request authority, including its port. Explicit WebSocket
+sources avoid browsers' inconsistent treatment of `'self'` for socket schemes; neither source
+allows another host or a wildcard. There are no inline/eval script allowances or third-party
+scripts. Inline scripts and inline style attributes are blocked. For React Aria's
+`react-aria-pressable-style`, `style-src` additionally contains the SHA256 hash of its exact
+known touch-action template, derived from the installed JavaScript. Unrecognized representations
+fail startup instead of relaxing CSP; externalize the style for other React Aria builds.
+
+At startup the gateway parses every installed HTML document, rejects external, missing or escaping
+script/style references and base overrides, and computes SHA384 `integrity` attributes on script,
+stylesheet, script/style preload and modulepreload tags. Asset URLs become mount-absolute paths
+so deep SPA routes retain the same resolution. Every built `.js`/`.mjs` chunk receives an
+integrity-bearing modulepreload as browser defense in depth. Independently, the server pins each
+registered executable's SHA384 hash at startup and verifies the exact response bytes before
+serving them, including on HEAD and query-variant requests. Changed or newly added executables
+return `404` until daemon restart; verification does not reopen the file before sending it.
+This boundary does not depend on preload ordering or discovery of descendant integrity links.
+Bundle CSS must be flattened: HTML SRI does not cover CSS `@import` subrequests. HTML is cached
+with pinned integrity metadata until daemon restart; modified styles fail browser SRI checks.
+Deploy the directory as a complete immutable build and restart to register its new assets and
+regenerate security metadata.
+
+The two usage GET relays are `/v1/client/usage/quota` and `/v1/client/usage/history?account=ACCOUNT`.
+Only `/api/v1/quota` and `/api/v1/lens/usage_over_time` on the configured upstream are contacted;
+history pins `window=all`, `group_by=account`, `bucket=day` and the requested account as `group`.
+Responses are returned unchanged. Quota reads cache for five seconds and history for sixty;
+identical concurrent requests share one fetch. Failed reads are not cached.
+The telemetry route, `POST /v1/client/telemetry/traces`, accepts OTLP JSON and
+relays to the collector's `/v1/traces`; it does not rewrite resource attributes. Relays require
+the existing paired client boundary and return `404` when their endpoint is absent.
+These relays do not read or write the local graph; the daemon graph-cost inventory records
+them as outside-graph endpoints rather than measuring upstream usage or collector work.
+
+The collection WebSocket accepts a W3C `traceparent` URL query parameter (and subscription
+commands may supply their own `traceparent`) to correlate gateway delivery with browser
+traces. A retryable first collection read retains its trace parent until delivery completes
+or the subscription ends. Terminal viewers opened by a collection subscription end on
+unsubscribe or socket closure; closing a viewer does not end the shared terminal or revoke
+its projected-screen attachment. All transports, including paired native and browser clients,
+keep the reusable lease until explicit `terminal.detach`, expiry, or runtime incarnation change.
+Raw-terminal capabilities remain single-use and their viewer guard detaches them on closure.
+
+Each collection socket holds up to 64 subscriptions by default. Set the top-level
+`client_subscription_limit` in `config.toml` to a positive integer to change the limit.
+An additional subscription receives an error with code `subscription-limit`; replacing an
+existing ID does not consume another slot, and unsubscribe frees its slot.
+
+### Fabric carrier
+
 The equivalent trusted-peer Fabric carrier lifecycle is:
 
 ```sh

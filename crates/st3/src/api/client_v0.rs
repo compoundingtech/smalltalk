@@ -11,7 +11,52 @@ const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
 const COLLECTION_SUBPROTOCOL: &str = "st3.client.collections.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
+const BEARER_PROTOCOL_PREFIX: &str = "st3.bearer.";
 pub(super) const LOCAL_PERSON_HEADER: &str = "x-st3-person";
+
+fn offered_protocols(headers: &HeaderMap) -> impl Iterator<Item = &str> {
+    headers
+        .get_all(SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|protocol| !protocol.is_empty())
+}
+
+fn stream_protocols(headers: &HeaderMap) -> Vec<&str> {
+    offered_protocols(headers)
+        .filter(|protocol| !protocol.starts_with(BEARER_PROTOCOL_PREFIX))
+        .collect()
+}
+
+fn websocket_credential(request: &Request<Body>) -> Result<Option<&str>, ApiError> {
+    let path = request.uri().path();
+    if request.method() != axum::http::Method::GET
+        || !path.starts_with("/v1/client/")
+        || !(path.ends_with("/stream") || path.ends_with("/raw-stream"))
+        || !request
+            .headers()
+            .get(axum::http::header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    {
+        return Ok(None);
+    }
+    let mut credentials = offered_protocols(request.headers())
+        .filter_map(|protocol| protocol.strip_prefix(BEARER_PROTOCOL_PREFIX));
+    let credential = credentials.next();
+    if credentials.next().is_some()
+        || credential.is_some_and(|value| {
+            value.is_empty()
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        return Err(forbidden("the WebSocket bearer protocol is malformed"));
+    }
+    Ok(credential)
+}
 
 pub(super) async fn request_latency(
     Extension(session): Extension<ClientSession>,
@@ -34,12 +79,14 @@ struct CollectionSubscribe {
     actor: Option<String>,
     status: Option<String>,
     /// A terminal subscription names the terminal, the incarnation `terminal.attach` fenced,
-    /// and the single-use stream capability that attach returned.
+    /// and the reusable stream lease that attach returned.
     terminal: Option<String>,
     incarnation: Option<String>,
     capability: Option<String>,
     /// A conversation subscription names an agent or a session.
     conversation: Option<String>,
+    /// Parents the first collection read; falls back to the socket URL's traceparent.
+    traceparent: Option<String>,
 }
 
 struct CollectionSubscription {
@@ -51,7 +98,6 @@ struct CollectionSubscription {
     has_more: bool,
 }
 
-const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
 /// The least time between two rereads of a socket's held windows. A window read can take a
 /// few hundred milliseconds and the fleet commits about once a second, so rereading on every
 /// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
@@ -72,25 +118,36 @@ pub(super) async fn collection_stream(
     State(state): State<AppState>,
     Extension(session): Extension<ClientSession>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
+    web: Option<Extension<Arc<super::client_web::ClientWeb>>>,
+    limit: Option<Extension<super::ClientSubscriptionLimit>>,
 ) -> Result<Response, ApiError> {
+    let started = super::client_web::unix_nanos();
+    let web = web.map(|Extension(web)| web);
+    let trace = super::client_web::traceparent_query(uri.query());
+    let limit = limit.map(|Extension(limit)| limit).unwrap_or_default().0;
     require_scope(&session, "read.projections")?;
-    let protocols = headers
-        .get_all(SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|header| header.to_str().ok())
-        .flat_map(|header| header.split(','))
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
+    let protocols = stream_protocols(&headers);
     if protocols != [COLLECTION_SUBPROTOCOL] {
         return Err(validation(
             "the collection WebSocket requires exactly st3.client.collections.v0",
         ));
     }
     let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
+    if let Some(trace) = &trace {
+        super::client_web::record_span(
+            web.as_ref(),
+            trace,
+            "st3.client.collections.upgrade",
+            started,
+            &[("st3.client.actor", session.actor.as_str())],
+        );
+    }
     Ok(websocket
         .protocols([COLLECTION_SUBPROTOCOL])
-        .on_upgrade(move |socket| collection_stream_socket(socket, state, session, presence)))
+        .on_upgrade(move |socket| {
+            collection_stream_socket(socket, state, session, presence, web, trace, limit)
+        }))
 }
 
 /// Read one bounded window. The whole read sees one SQLite snapshot, and the fence names
@@ -564,12 +621,16 @@ async fn collection_stream_socket(
     state: AppState,
     session: ClientSession,
     presence: super::client_presence::StreamGuard,
+    web: Option<Arc<super::client_web::ClientWeb>>,
+    socket_trace: Option<super::client_web::TraceParent>,
+    max_subscriptions: usize,
 ) {
     collection_stream_socket_with_reader(
         socket,
         state,
         session,
         Some(presence),
+        (web, socket_trace, max_subscriptions),
         |state, session, request| async move { collection_items(&state, &session, &request).await },
     )
     .await;
@@ -580,11 +641,17 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     state: AppState,
     session: ClientSession,
     presence: Option<super::client_presence::StreamGuard>,
+    (web, socket_trace, max_subscriptions): (
+        Option<Arc<super::client_web::ClientWeb>>,
+        Option<super::client_web::TraceParent>,
+        usize,
+    ),
     read: F,
 ) where
     F: Fn(AppState, ClientSession, CollectionSubscribe) -> Fut + Clone + Send + 'static,
-    Fut: std::future::Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
+    Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
 {
+    let mut traced = BTreeMap::<String, (super::client_web::TraceParent, u128)>::new();
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
     let mut changed = state.event_notify.subscribe();
@@ -628,11 +695,16 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             subscriptions.remove(&request.id);
                             terminals.remove(&request.id);
                             conversations.stop(&request.id);
+                            traced.remove(&request.id);
                             break 'command;
                         }
                         let held = subscriptions.contains_key(&request.id) || terminals.contains_key(&request.id) || conversations.0.contains_key(&request.id);
-                        if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() + terminals.len() + conversations.0.len() >= COLLECTION_MAX_SUBSCRIPTIONS && !held {
-                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
+                        if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 {
+                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "code":"validation-failed", "message":"invalid subscription"})).await { return; }
+                            break 'command;
+                        }
+                        if subscriptions.len() + terminals.len() + conversations.0.len() >= max_subscriptions && !held {
+                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "code":"subscription-limit", "message":"collection subscription limit exceeded"})).await { return; }
                             break 'command;
                         }
                         // What this client follows, for clients.list.
@@ -647,6 +719,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         subscriptions.remove(&request.id);
                         terminals.remove(&request.id);
                         conversations.stop(&request.id);
+                        traced.remove(&request.id);
                         if request.collection == "conversation" {
                             let target = request.conversation.as_deref().unwrap_or_default();
                             let opened = conversation_session_id(&state, target).and_then(|session_id| {
@@ -676,6 +749,12 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             break 'command;
                         }
                         refresh.push(request.id.clone());
+                        let trace = request.traceparent.as_deref()
+                            .and_then(super::client_web::parse_traceparent)
+                            .or_else(|| socket_trace.clone());
+                        if let Some(trace) = trace {
+                            traced.insert(request.id.clone(), (trace, super::client_web::unix_nanos()));
+                        }
                         subscriptions.insert(request.id.clone(), CollectionSubscription { request, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
 
                     }
@@ -747,7 +826,32 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             let Some(subscription) = subscriptions.get_mut(&id) else {
                 continue;
             };
-            match deliver_collection(&mut socket, subscription, read).await {
+            let outcome = deliver_collection(&mut socket, subscription, read).await;
+            let result = match outcome {
+                Refreshed::Current => Some("delivered"),
+                Refreshed::Retry => None,
+                Refreshed::Dropped => Some("dropped"),
+                Refreshed::Closed => Some("closed"),
+            };
+            if let Some(result) = result
+                && let Some((trace, started)) = traced.remove(&id)
+            {
+                super::client_web::record_span(
+                    web.as_ref(),
+                    &trace,
+                    "st3.client.collections.subscribe",
+                    started,
+                    &[
+                        (
+                            "st3.client.collection",
+                            subscription.request.collection.as_str(),
+                        ),
+                        ("st3.client.subscription", id.as_str()),
+                        ("st3.client.result", result),
+                    ],
+                );
+            }
+            match outcome {
                 Refreshed::Current => {}
                 Refreshed::Retry => {
                     reread_due = true;
@@ -922,7 +1026,10 @@ pub(super) async fn subject_definition(
         let store = state.store.clone();
         store.read_snapshot(|index| {
             let status = store.status_at(Some(&subject), None, Some(index))?;
-            let Some(status) = status.subjects.into_iter().find(|item| item.subject == subject)
+            let Some(status) = status
+                .subjects
+                .into_iter()
+                .find(|item| item.subject == subject)
             else {
                 return Ok(None);
             };
@@ -933,9 +1040,11 @@ pub(super) async fn subject_definition(
                 crate::graph::redact_agent_env_values(&mut desired);
             }
             let kdl = crate::graph::render_agent_desired_kdl(&desired)?;
-            let revision = status.desired_revision
+            let revision = status
+                .desired_revision
                 .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired revision"))?;
-            let token = status.desired_token
+            let token = status
+                .desired_token
                 .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired token"))?;
             let value = json!({
                 "kind": "subject-definition",
@@ -948,12 +1057,18 @@ pub(super) async fn subject_definition(
             });
             Ok(Some((client_snapshot_at(&state, index), value)))
         })
-    }).await?;
-    let (snapshot, value) = result.ok_or_else(|| ApiError::not_found(
-        format!("subject `{}` has no applied definition", query.subject),
-    ))?;
+    })
+    .await?;
+    let (snapshot, value) = result.ok_or_else(|| {
+        ApiError::not_found(format!(
+            "subject `{}` has no applied definition",
+            query.subject
+        ))
+    })?;
     // Reserve space for the snapshot and response envelope. Definitions are never truncated.
-    if serde_json::to_vec(&value).map_err(ApiError::internal)?.len()
+    if serde_json::to_vec(&value)
+        .map_err(ApiError::internal)?
+        .len()
         > CLIENT_MAX_RESPONSE_BYTES - 4096
     {
         return Err(ApiError::bad(St3Error::new(
@@ -1248,7 +1363,21 @@ pub(super) fn authenticate(
     request: &Request<Body>,
     transport: &'static str,
 ) -> Result<ClientSession, ApiError> {
-    let Some(value) = request.headers().get(AUTHORIZATION) else {
+    // Authenticate at the handshake, before accepting subscriptions. The credential protocol
+    // is never selected or echoed; native Authorization headers retain precedence.
+    let pairing_completion = request.method() == axum::http::Method::POST
+        && request.uri().path().starts_with("/v1/client/pairings/")
+        && request.uri().path().ends_with("/complete");
+    let credential = if let Some(value) = request.headers().get(AUTHORIZATION) {
+        value
+            .to_str()
+            .map_err(|_| forbidden("the client authorization header is malformed"))?
+            .strip_prefix("Bearer ")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| forbidden("the client authorization scheme must be Bearer"))?
+    } else if let Some(bearer) = websocket_credential(request)? {
+        bearer
+    } else {
         if transport == "unix" {
             let person = request
                 .headers()
@@ -1256,20 +1385,10 @@ pub(super) fn authenticate(
                 .and_then(|value| value.to_str().ok());
             return ClientSession::local(person);
         }
-        let pairing_completion = request.method() == axum::http::Method::POST
-            && request.uri().path().starts_with("/v1/client/pairings/")
-            && request.uri().path().ends_with("/complete");
         return pairing_completion
             .then(ClientSession::pairing)
             .ok_or_else(|| forbidden("the Fabric-loopback client credential is required"));
     };
-    let value = value
-        .to_str()
-        .map_err(|_| forbidden("the client authorization header is malformed"))?;
-    let credential = value
-        .strip_prefix("Bearer ")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| forbidden("the client authorization scheme must be Bearer"))?;
     let digest = credential_digest(credential);
     let pairings = state
         .store
@@ -4904,16 +5023,14 @@ pub(super) async fn conversation_stream(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ConversationQuery>,
     headers: HeaderMap,
+    (uri, web): (
+        axum::http::Uri,
+        Option<Extension<Arc<super::client_web::ClientWeb>>>,
+    ),
 ) -> Result<Response, ApiError> {
+    let started = super::client_web::unix_nanos();
     require_scope(&session, "read.projections")?;
-    let protocols = headers
-        .get_all(SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|header| header.to_str().ok())
-        .flat_map(|header| header.split(','))
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
+    let protocols = stream_protocols(&headers);
     if protocols != [CONVERSATION_SUBPROTOCOL] {
         return Err(validation(
             "the conversation WebSocket requires exactly st3.client.conversation.v0",
@@ -4944,6 +5061,15 @@ pub(super) async fn conversation_stream(
     }
     let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
     presence.follow("conversation", format!("conversation:{id}"));
+    if let Some(trace) = super::client_web::traceparent_query(uri.query()) {
+        super::client_web::record_span(
+            web.as_ref().map(|Extension(web)| web),
+            &trace,
+            "st3.client.conversation.upgrade",
+            started,
+            &[("st3.client.actor", session.actor.as_str())],
+        );
+    }
     Ok(websocket
         .protocols([CONVERSATION_SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
@@ -5506,10 +5632,9 @@ pub(super) fn device_signing_key(public_key: &str) -> Option<&str> {
 
 pub(super) async fn pairing_complete(
     State(state): State<AppState>,
-    Extension(_session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
     Json(request): Json<PairingComplete>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     if request.api_version != CLIENT_API_VERSION || request.device_public_key.len() < 32 {
         return Err(validation(
             "the pairing completion has an invalid version or public key",
@@ -5640,11 +5765,12 @@ pub(super) async fn pairing_complete(
         None => None,
     };
     signal_changed(&state);
-    let mut session = json!({ "kind": "paired-session", "device_id": device_id, "person_id": person_id, "session_actor": session_actor, "credential": credential, "scopes": scopes, "expires_at": client_timestamp(expires_at) });
+    let mut body = json!({ "kind": "paired-session", "device_id": device_id, "person_id": person_id, "session_actor": session_actor, "scopes": scopes, "expires_at": client_timestamp(expires_at) });
     if let Some(chain) = chain {
-        session["device_key_chain"] = json!(chain);
+        body["device_key_chain"] = json!(chain);
     }
-    Ok(Json(session))
+    body["credential"] = json!(credential);
+    Ok(Json(body).into_response())
 }
 
 fn terminal_subject(id: &str) -> String {
@@ -5956,16 +6082,14 @@ pub(super) async fn terminal_stream(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<TerminalStreamQuery>,
     headers: HeaderMap,
+    (uri, web): (
+        axum::http::Uri,
+        Option<Extension<Arc<super::client_web::ClientWeb>>>,
+    ),
 ) -> Result<Response, ApiError> {
+    let started = super::client_web::unix_nanos();
     require_scope(&session, "terminal.read")?;
-    let protocols = headers
-        .get_all(SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|protocol| !protocol.is_empty())
-        .collect::<Vec<_>>();
+    let protocols = stream_protocols(&headers);
     let normative_count = protocols
         .iter()
         .filter(|protocol| **protocol == TERMINAL_SUBPROTOCOL)
@@ -5998,6 +6122,15 @@ pub(super) async fn terminal_stream(
     )?;
     let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
     presence.follow("terminal", format!("terminal:{id}"));
+    if let Some(trace) = super::client_web::traceparent_query(uri.query()) {
+        super::client_web::record_span(
+            web.as_ref().map(|Extension(web)| web),
+            &trace,
+            "st3.client.terminal.upgrade",
+            started,
+            &[("st3.client.actor", session.actor.as_str())],
+        );
+    }
     Ok(websocket
         .protocols([TERMINAL_SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
@@ -6006,24 +6139,31 @@ pub(super) async fn terminal_stream(
         }))
 }
 
-/// A terminal viewer, checked and holding its consumed attachment, ready to follow.
+/// A terminal viewer, checked and holding its attachment lease, ready to follow.
 enum TerminalFollow {
     Local {
         id: String,
         incarnation: String,
+        viewer: TerminalViewer,
     },
     Remote {
         id: String,
         owner: String,
         authority_actor: String,
         incarnation: String,
+        viewer: TerminalViewer,
     },
 }
 
 impl TerminalFollow {
     async fn run(self, state: AppState, sink: TerminalSink) {
         match self {
-            Self::Local { id, incarnation } => {
+            Self::Local {
+                id,
+                incarnation,
+                viewer,
+            } => {
+                let _viewer = viewer;
                 terminal_stream_socket(sink, state, id, incarnation).await;
             }
             Self::Remote {
@@ -6031,7 +6171,9 @@ impl TerminalFollow {
                 owner,
                 authority_actor,
                 incarnation,
+                viewer,
             } => {
+                let _viewer = viewer;
                 remote_terminal_stream_socket(sink, state, id, owner, authority_actor, incarnation)
                     .await;
             }
@@ -6039,7 +6181,7 @@ impl TerminalFollow {
     }
 }
 
-/// Check a viewer's right to follow a terminal and consume its single-use attachment.
+/// Check a viewer's right to follow a terminal using its attachment lease.
 fn prepare_terminal_follow(
     state: &AppState,
     session: &ClientSession,
@@ -6063,7 +6205,7 @@ fn prepare_terminal_follow(
             "remote terminal stream requires a concrete person or agent",
         ));
     }
-    consume_terminal_attachment(
+    let viewer = consume_terminal_attachment(
         state,
         session,
         &client_detail_id("terminal", id),
@@ -6076,11 +6218,13 @@ fn prepare_terminal_follow(
             owner: live.owner_host_id,
             authority_actor: session.authority_actor.clone(),
             incarnation: live.incarnation_id,
+            viewer,
         }
     } else {
         TerminalFollow::Local {
             id: id.to_owned(),
             incarnation: live.incarnation_id,
+            viewer,
         }
     })
 }
@@ -6106,7 +6250,30 @@ enum TerminalSink {
 impl TerminalSink {
     async fn send(&mut self, value: &Value) -> bool {
         match self {
-            Self::Socket(socket) => send_terminal_stream_value(socket, value).await,
+            Self::Socket(socket) => {
+                let Ok(bytes) = serde_json::to_vec(value) else {
+                    return false;
+                };
+                if bytes.len() > CLIENT_MAX_RESPONSE_BYTES {
+                    return false;
+                }
+                let (mut outgoing, mut incoming) = (&mut **socket).split();
+                let send = outgoing.send(WsMessage::Text(
+                    String::from_utf8(bytes).expect("JSON is UTF-8").into(),
+                ));
+                tokio::pin!(send);
+                loop {
+                    tokio::select! {
+                        biased;
+                        message = incoming.next() => {
+                            if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) {
+                                return false;
+                            }
+                        }
+                        result = &mut send => return result.is_ok(),
+                    }
+                }
+            }
             Self::Subscription(sender) => {
                 serde_json::to_vec(value)
                     .is_ok_and(|bytes| bytes.len() <= CLIENT_MAX_RESPONSE_BYTES)
@@ -6199,7 +6366,10 @@ async fn remote_terminal_stream_socket(
                 let error = remote_read_error(&owner, error);
                 if error.code == "remote-unavailable" && failures < 3 {
                     failures += 1;
-                    tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))) => {}
+                        () = sink.gone() => return,
+                    }
                     continue;
                 }
                 sink.fail(&error).await;
@@ -6548,7 +6718,7 @@ fn consume_terminal_attachment(
     terminal_id: &str,
     incarnation: &str,
     capability: Option<&str>,
-) -> Result<(), ApiError> {
+) -> Result<TerminalViewer, ApiError> {
     consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None)
 }
 
@@ -6559,7 +6729,7 @@ fn consume_terminal_attachment_mode(
     incarnation: &str,
     capability: Option<&str>,
     raw_mode: Option<&str>,
-) -> Result<(), ApiError> {
+) -> Result<TerminalViewer, ApiError> {
     let lookup_span = crate::profile::span("terminal/capability-lookup");
     let capability = capability
         .filter(|value| !value.is_empty())
@@ -6572,9 +6742,9 @@ fn consume_terminal_attachment_mode(
         .ok_or_else(|| forbidden("the terminal stream capability is unknown"))?;
     drop(lookup_span);
     let field = |name: &str| attached.body.pointer(&format!("/fields/{name}"));
-    let raw_live = raw_mode.map(|_| {
-        remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation)
-    }).transpose()?;
+    let raw_live = raw_mode
+        .map(|_| remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation))
+        .transpose()?;
     let valid = is_current
         && attached.origin == state.store.origin()
         && field("session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
@@ -6607,11 +6777,20 @@ fn consume_terminal_attachment_mode(
         ));
     }
     if raw_mode.is_none() {
-        // A projected-screen capability is a lease and stays valid for more streams.
-        return Ok(());
+        // Projected-screen leases survive every viewer and transport disconnect.
+        return Ok(TerminalViewer {
+            state: state.clone(),
+            subject: attached.subject.clone(),
+            consumed_id: attached.id.clone(),
+            actor: session_claim_actor(session),
+            attachment_id: field("attachment_id")
+                .cloned()
+                .ok_or_else(|| ApiError::internal("terminal attachment ID is missing"))?,
+            raw: false,
+        });
     }
     let _span = crate::profile::span("terminal/capability-consume");
-    state
+    let consumed = state
         .store
         .append_claim(&ClaimInput {
             subject: attached.subject.clone(),
@@ -6629,7 +6808,56 @@ fn consume_terminal_attachment_mode(
         })
         .map_err(|_| forbidden("the terminal stream capability was already consumed"))?;
     signal_changed(state);
-    Ok(())
+    Ok(TerminalViewer {
+        state: state.clone(),
+        subject: attached.subject.clone(),
+        consumed_id: consumed.id,
+        actor: session_claim_actor(session),
+        attachment_id: field("attachment_id")
+            .cloned()
+            .ok_or_else(|| ApiError::internal("terminal attachment ID is missing"))?,
+        raw: true,
+    })
+}
+
+/// Raw capabilities belong to one viewer; projected-screen leases remain reusable.
+struct TerminalViewer {
+    state: AppState,
+    subject: String,
+    consumed_id: String,
+    actor: String,
+    attachment_id: Value,
+    raw: bool,
+}
+
+impl std::fmt::Debug for TerminalViewer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TerminalViewer")
+            .field("attachment_id", &self.attachment_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TerminalViewer {
+    fn drop(&mut self) {
+        if !self.raw {
+            return;
+        }
+        match self.state.store.append_claim(&ClaimInput {
+            subject: self.subject.clone(),
+            kind: "custom.client.terminal-detached".into(),
+            actor: Some(self.actor.clone()),
+            fields: BTreeMap::from([("attachment_id".into(), self.attachment_id.clone())]),
+            evidence: vec![self.consumed_id.clone()],
+            expected_subject: Some(Some(self.consumed_id.clone())),
+            idempotency_key: None,
+        }) {
+            Ok(_) => signal_changed(&self.state),
+            Err(error) if error.code == "stale-subject" => {}
+            Err(error) => tracing::warn!(%error, "could not end terminal viewer"),
+        }
+    }
 }
 
 fn detach_terminal_attachment(
@@ -6771,7 +6999,11 @@ async fn terminal_stream_socket(
     let mut screens =
         terminal_view::subscribe(&state.pty_root, &live.runtime_id, &live.incarnation_id);
     let first = tokio::time::Instant::now() + TERMINAL_FIRST_SCREEN_TIMEOUT;
-    let mut screen = match terminal_view::next_screen(&mut screens, None, first).await {
+    let initial = tokio::select! {
+        initial = terminal_view::next_screen(&mut screens, None, first) => initial,
+        () = sink.gone() => return,
+    };
+    let mut screen = match initial {
         Ok(Some(screen)) => Some(screen),
         Ok(None) => {
             sink.fail(&terminal_unavailable("the terminal screen did not arrive"))
@@ -8982,6 +9214,11 @@ mod tests {
                             state,
                             ClientSession::local(None).unwrap(),
                             None,
+                            (
+                                None,
+                                None,
+                                super::super::ClientSubscriptionLimit::default().0,
+                            ),
                             move |state, session, request| {
                                 let reads = reads.clone();
                                 async move {
@@ -9049,6 +9286,7 @@ mod tests {
         socket.close(None).await.unwrap();
         server.abort();
     }
+    include!("client_v0/gateway_tests.rs");
 
     #[test]
     fn listed_unresolved_process_opens_into_explanatory_no_conversation_state() {
@@ -9109,19 +9347,30 @@ mod tests {
         assert_eq!(document.nodes()[1].name().value(), "agent");
         let node = &document.nodes()[1].children().unwrap().nodes()[0];
         assert_eq!(node.name().value(), "name with spaces");
-        let values = node.entries().iter().filter(|entry| entry.name().is_none())
-            .map(|entry| entry.value().clone()).collect::<Vec<_>>();
-        assert_eq!(values, vec![
-            kdl::KdlValue::String("λ \"quoted\"\\\n".into()),
-            kdl::KdlValue::Integer(i128::from(i64::MIN)),
-            kdl::KdlValue::Integer(i128::from(i64::MAX)),
-            kdl::KdlValue::Float(1.0),
-            kdl::KdlValue::Float(1.25),
-            kdl::KdlValue::Bool(true),
-            kdl::KdlValue::Bool(false),
-            kdl::KdlValue::Null,
-        ]);
-        let property = node.entries().iter().find(|entry| entry.name().is_some()).unwrap();
+        let values = node
+            .entries()
+            .iter()
+            .filter(|entry| entry.name().is_none())
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                kdl::KdlValue::String("λ \"quoted\"\\\n".into()),
+                kdl::KdlValue::Integer(i128::from(i64::MIN)),
+                kdl::KdlValue::Integer(i128::from(i64::MAX)),
+                kdl::KdlValue::Float(1.0),
+                kdl::KdlValue::Float(1.25),
+                kdl::KdlValue::Bool(true),
+                kdl::KdlValue::Bool(false),
+                kdl::KdlValue::Null,
+            ]
+        );
+        let property = node
+            .entries()
+            .iter()
+            .find(|entry| entry.name().is_some())
+            .unwrap();
         assert_eq!(property.name().unwrap().value(), "property with spaces");
         assert_eq!(property.value(), &kdl::KdlValue::String("\"\\\nλ".into()));
         let child = &node.children().unwrap().nodes()[0];
@@ -13950,8 +14199,8 @@ mission "example/zero-run" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let mut state = test_state(root.path());
         state.pty_binary = pty.clone();
-        let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone())
-            .with_binary(pty.to_string_lossy());
+        let runtime =
+            st_runtime::PtyRuntime::new(state.pty_root.clone()).with_binary(pty.to_string_lossy());
         struct Cleanup(st_runtime::PtyRuntime);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -14463,7 +14712,7 @@ mission "example/zero-run" state="ready" {
             .code,
             "forbidden"
         );
-        consume_terminal_attachment(
+        let _viewer = consume_terminal_attachment(
             &follower,
             &paired,
             "terminal/agent/fleet-terminal",
@@ -14676,7 +14925,10 @@ async fn glass_write(
     .map_err(|error| {
         let is_idempotency = matches!(error.code, "idempotency-mismatch" | "idempotency-conflict");
         let mut error = ApiError::bad(error);
-        if is_idempotency { error.code = "idempotency-conflict".into(); error.status = StatusCode::CONFLICT; }
+        if is_idempotency {
+            error.code = "idempotency-conflict".into();
+            error.status = StatusCode::CONFLICT;
+        }
         error
     })?;
     signal_changed(&state);

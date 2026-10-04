@@ -28,6 +28,7 @@ futures-util = "0.3"
 getrandom = "0.3"
 hex = "0.4"
 hmac = "0.12"
+html-escape = "0.2"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -36,6 +37,7 @@ libc = "0.2"
 # Exactly pty-terminal's pin: libghostty's C API is not stable between Ghostty commits.
 libghostty-vt = "=0.2.1"
 libghostty-vt-sys = { version = "=0.2.1", features = ["pkg-config"] }
+lol_html = "2"
 notify = "8"
 pty-client = { git = "https://github.com/compoundingtech/pty", rev = "ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f" }
 pty-core = { git = "https://github.com/compoundingtech/pty", rev = "ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f" }

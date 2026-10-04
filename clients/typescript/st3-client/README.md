@@ -6,7 +6,36 @@ The package exports TypeScript source with explicit `.ts` relative import specif
 consumers use `allowImportingTsExtensions` for no-emit checking, or
 `rewriteRelativeImportExtensions` when emitting JavaScript.
 
-The client uses standard `fetch`, so callers can supply a fetch implementation and a credential callback. Call `discover()` before rendering capability-dependent controls. List and event limits are checked against the server's advertised bounds. Submit fenced actions with the generated typed methods, then use `followOperation(operation_id)` for accepted actions. `terminalStream` opens the screen stream a `terminal.attach` capability allows and calls `onScreen` with each changed screen; it needs a WebSocket that accepts headers, such as React Native's, or a `socket` factory. `collectionStream` opens the one collections socket: `subscribe` holds a window of missions, attention, agents, or work, `subscribeTerminal` follows a terminal with its attach capability, and `subscribeConversation` follows an agent's or a session's conversation, each by a client-chosen ID; `onFrame` receives every frame. `applyWindow` folds `snapshot` and `changes` frames into a window's ordered rows. Commands sent before the socket opens wait for it.
+The client uses standard `fetch`, so callers can supply a fetch implementation and a credential callback. Call `discover()` before rendering capability-dependent controls. List and event limits are checked against the server's advertised bounds. Submit fenced actions with the generated typed methods, then use `followOperation(operation_id)` for accepted actions. `terminalStream` opens the screen stream a `terminal.attach` capability allows and calls `onScreen` with each changed screen. All three streams work with the browser's two-argument WebSocket constructor: they offer an additional `st3.bearer.<credential>` subprotocol, never a bearer in the URL. The server selects only the normal stream subprotocol. React Native's default constructor still receives Authorization headers as its third argument; custom `socket` factories receive both the offered protocols and native Authorization headers. `collectionStream` opens the one collections socket: `subscribe` holds a window of missions, attention, agents, or work, `subscribeTerminal` follows a terminal with its attach capability, and `subscribeConversation` follows an agent's or a session's conversation, each by a client-chosen ID; `onFrame` receives every frame. `applyWindow` folds `snapshot` and `changes` frames into a window's ordered rows. Commands sent before the socket opens wait for it.
+
+## Browser credentials
+
+`IndexedDbCredentialStore`, exported from the client index, persists the native bearer returned by `completePairing`. Keys are scoped to the gateway's canonical origin and base path, ignoring trailing slashes. Separate gateway ports, schemes, or base paths do not share credentials. IndexedDB itself is scoped to the browser application's origin.
+
+```ts
+import { IndexedDbCredentialStore, St3Client } from './index.ts';
+
+const gatewayUrl = 'https://gateway.example';
+const credentials = new IndexedDbCredentialStore();
+const client = new St3Client({
+    baseUrl: gatewayUrl,
+    credential: () => credentials.get(gatewayUrl),
+});
+
+// After completing the native pairing flow:
+const paired = await client.completePairing(pairingId, pairingRequest);
+await credentials.set(gatewayUrl, paired.value.credential);
+
+// On disconnect, or once the session has been revoked:
+await credentials.delete(gatewayUrl);
+```
+
+The callback reads storage for every request or new stream, so deletion stops future authentication. Close active streams during disconnect; deleting local storage does not revoke a server session or terminate an already authenticated socket. IndexedDB failures reject rather than falling back to another store.
+
+This protocol authenticates with a readable bearer, not challenge signing or a non-extractable WebCrypto key. Any same-origin JavaScript, including XSS, can read and reuse the credential. IndexedDB is persistence, **not** an XSS defense. Browser applications must protect that origin: strict `script-src 'self'` without `unsafe-inline`/`unsafe-eval`, no third-party scripts, gateway-only `connect-src`, and integrity metadata on loaded assets. Bearers also appear in WebSocket handshake headers, so do not log those headers or offered protocols.
+
+## Checks
+
 
 The default transport binds `globalThis.fetch` to `globalThis`, preserving the receiver required by browser implementations. Supplying `fetchImpl` overrides that default without rebinding the custom implementation.
 
@@ -16,6 +45,7 @@ Run the client checks from the repository root with Node 24 or newer:
 npm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund
 npm test --prefix clients/typescript/st3-client
 npm run typecheck --prefix clients/typescript/st3-client
+CHROME_BIN=/path/to/chromium node --test clients/typescript/st3-client/browser.integration.test.cjs
 ```
 
 The client package pins TypeScript 6.0.3 and Effect 4.0.0-rc.118 in its own development dependencies and lockfile. These commands need only the client installation. `npm test` runs the contract and schema tests; `npm run typecheck` checks the raw client, its type fixtures and the rich schemas with the strict compiler options declared in `package.json`.
@@ -44,3 +74,4 @@ After installing the client development dependencies, run the focused rich check
 npm run test:schema --prefix clients/typescript/st3-client
 npm run typecheck:schema --prefix clients/typescript/st3-client
 ```
+The browser integration check requires a local Chromium executable (defaults to `chromium`) and the same TypeScript installation as the contract checks. It exercises real IndexedDB persistence across navigation, gateway isolation, overwrite/deletion, credential callbacks, and native browser WebSocket handshakes for all three streams.
