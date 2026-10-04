@@ -1182,7 +1182,7 @@ impl Ui {
         buf.set_style(area, Style::default().bg(theme::CRUST));
         let backlog_notice = match &self.world.mail_backlog {
             Load::Ready(backlog) if backlog.count > 0 => Some(format!(
-                "{} undelivered >1h · {}", backlog.count, backlog.cleanup_command
+                "{} unread >1h · {}", backlog.count, backlog.cleanup_command
             )),
             Load::Failed(error) => Some(error.clone()),
             _ => None,

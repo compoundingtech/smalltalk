@@ -15,7 +15,7 @@ its original idempotency key. Completing the mission that installed the probe do
 not close an unresolved delivery alert.
 
 Boots and channel reconnects hold earlier mail, including old probe messages.
-Those messages stay in the mailbox and contribute to the aged undelivered count
+Those messages stay in the mailbox and contribute to the aged unread count
 in doctor and stui. Preview and close that backlog with the commands in
 [seat deploys](seat-deploys.md), including
 `st conversations cleanup --all --older-than 1h`. Cleanup does not count as a

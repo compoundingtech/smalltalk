@@ -1857,7 +1857,7 @@ impl Ui {
         if let Load::Ready(backlog) = &self.world.mail_backlog
             && backlog.count > 0
         {
-            spans.push(Span::styled(format!(" · {} undelivered >1h", backlog.count), bar(theme::fg(theme::YELLOW))));
+            spans.push(Span::styled(format!(" · {} unread >1h", backlog.count), bar(theme::fg(theme::YELLOW))));
         }
         if let Load::Failed(_) = &self.world.mail_backlog {
             spans.push(Span::styled(" · mail backlog unavailable", bar(theme::fg(theme::YELLOW))));
@@ -3555,13 +3555,13 @@ mod tests {
             cleanup_command: "st conversations cleanup --all --older-than 1h".into(),
         };
         ui.world.mail_backlog = Load::Ready(backlog.clone());
-        assert!(screen(&ui).contains("37 undelivered >1h"));
+        assert!(screen(&ui).contains("37 unread >1h"));
         ui.glasses = None;
         let shown = screen(&ui);
-        assert!(shown.contains("37 undelivered >1h"));
+        assert!(shown.contains("37 unread >1h"));
         assert!(shown.contains(&backlog.cleanup_command));
         ui.world.mail_backlog = Load::Ready(st3_client::MailBacklog { count: 0, ..backlog });
-        assert!(!screen(&ui).contains("undelivered >1h"));
+        assert!(!screen(&ui).contains("unread >1h"));
     }
 
     #[test]

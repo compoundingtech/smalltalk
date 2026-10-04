@@ -3805,7 +3805,7 @@ enum MessageCommand {
     Reply(MessageReplyArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
-    /// Archive undelivered mail past an age threshold as each recipient.
+    /// Archive unread mail past an age threshold as each recipient.
     Cleanup {
         #[arg(long, conflicts_with = "actor", required_unless_present = "actor")]
         all: bool,
@@ -14567,7 +14567,7 @@ async fn run_message(
             if json_output {
                 print_value(&result, true)
             } else {
-                println!("{} {} undelivered messages older than {}", if dry_run { "Would archive" } else { "Archived" }, result["count"], older_than);
+                println!("{} {} unread messages older than {}", if dry_run { "Would archive" } else { "Archived" }, result["count"], older_than);
                 if dry_run {
                     for id in result["messages"].as_array().into_iter().flatten() {
                         if let Some(id) = id.as_str() {

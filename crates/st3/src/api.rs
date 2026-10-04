@@ -6144,7 +6144,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         Ok(backlog) => checks.push(DoctorCheck {
             name: "mail-backlog".into(),
             status: if backlog.count == 0 { "pass" } else { "warn" }.into(),
-            message: format!("{} undelivered messages older than 1h; close them with `{}`", backlog.count, backlog.cleanup_command),
+            message: format!("{} unread messages older than 1h; close them with `{}`", backlog.count, backlog.cleanup_command),
         }),
         Err(error) => checks.push(DoctorCheck { name: "mail-backlog".into(), status: "warn".into(), message: error.to_string() }),
     }

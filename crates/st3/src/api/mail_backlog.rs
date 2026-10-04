@@ -14,7 +14,7 @@ fn overdue(
     // Include retained mail for retired seats: those are precisely the messages a current
     // agents projection would hide. Inspection never changes their lifecycle.
     for message in store.messages(to, false)? {
-        if !matches!(message.status.as_str(), "sent" | "staged")
+        if !matches!(message.status.as_str(), "sent" | "staged" | "delivered")
             && !(resume_archives && unfinished_archive(store, &message)?)
         {
             continue;
@@ -37,7 +37,11 @@ fn unfinished_archive(store: &Store, message: &MessageView) -> anyhow::Result<bo
     Ok(matches!(message.status.as_str(), "delivered" | "read")
         && store
             .operation_claim(&archive_key(&message.subject, "delivered"))?
-            .is_some())
+            .is_some()
+        || message.status == "read"
+            && store
+                .operation_claim(&archive_key(&message.subject, "read"))?
+                .is_some())
 }
 
 pub(super) fn report(store: &Store, now: u128) -> anyhow::Result<st3_client::MailBacklog> {
@@ -104,7 +108,7 @@ pub(super) async fn cleanup(
                     .message(&message.subject)
                     .map_err(ApiError::internal)?
                     .unwrap();
-                if !matches!(current.status.as_str(), "sent" | "staged")
+                if !matches!(current.status.as_str(), "sent" | "staged" | "delivered")
                     && !unfinished_archive(&store, &current).map_err(ApiError::internal)?
                 {
                     continue;
@@ -153,7 +157,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn backlog_counts_retired_mail_and_cleanup_keeps_fresh_and_accepted_mail() {
+    async fn backlog_counts_unread_retired_mail_and_cleanup_keeps_fresh_and_read_mail() {
         let root = tempfile::tempdir().unwrap();
         let state = super::super::tests::state(root.path());
         let now = client_now_ms();
@@ -178,7 +182,15 @@ mod tests {
                 "delivered",
                 now - 7_200_000,
             ),
+            (
+                "interrupted-read",
+                "agent/example/retired",
+                "read",
+                now - 7_200_000,
+            ),
+            ("closed", "agent/example/retired", "closed", now - 7_200_000),
             ("fresh", "agent/example/retired", "sent", now),
+            ("fresh-delivered", "agent/example/retired", "delivered", now),
         ] {
             state.store.set_write_clock_at(time).unwrap();
             let subject = format!("message/{id}");
@@ -203,6 +215,7 @@ mod tests {
                 "staged" => &["staged"],
                 "delivered" => &["delivered"],
                 "read" => &["delivered", "read"],
+                "closed" => &["delivered", "read", "closed"],
                 _ => &[],
             };
             for phase in phases {
@@ -215,14 +228,15 @@ mod tests {
                         fields: BTreeMap::from([("status".into(), json!(phase))]),
                         evidence: vec![],
                         expected_subject: None,
-                        idempotency_key: (id == "interrupted")
+                        idempotency_key: (id == "interrupted"
+                            || id == "interrupted-read" && phase == &"read")
                             .then(|| archive_key(&subject, phase)),
                     })
                     .unwrap();
             }
         }
         state.store.set_write_clock_at(now).unwrap();
-        assert_eq!(report(&state.store, now).unwrap().count, 2);
+        assert_eq!(report(&state.store, now).unwrap().count, 4);
         let Json(doctor) = doctor_report(&state).unwrap();
         let warning = doctor
             .checks
@@ -230,7 +244,7 @@ mod tests {
             .find(|check| check.name == "mail-backlog")
             .unwrap();
         assert_eq!(warning.status, "warn");
-        assert!(warning.message.starts_with("2 undelivered"));
+        assert!(warning.message.starts_with("4 unread"));
         assert!(warning.message.contains(CLEANUP_COMMAND));
         let request = |dry_run, to: Option<String>| CleanupRequest {
             older_than_ms: THRESHOLD_MS,
@@ -241,15 +255,15 @@ mod tests {
         let Json(preview) = cleanup(State(state.clone()), Json(request(true, None)))
             .await
             .unwrap();
-        assert_eq!(preview["count"], 3);
-        assert_eq!(report(&state.store, now).unwrap().count, 2);
+        assert_eq!(preview["count"], 5);
+        assert_eq!(report(&state.store, now).unwrap().count, 4);
         let Json(selected) = cleanup(
             State(state.clone()),
             Json(request(false, Some("agent/example/retired".into()))),
         )
         .await
         .unwrap();
-        assert_eq!(selected["count"], 2);
+        assert_eq!(selected["count"], 4);
         let Json(all) = cleanup(State(state.clone()), Json(request(false, None)))
             .await
             .unwrap();
@@ -273,7 +287,10 @@ mod tests {
             ("old-sent", "closed"),
             ("old-staged", "closed"),
             ("fresh", "sent"),
-            ("accepted", "delivered"),
+            ("accepted", "closed"),
+            ("fresh-delivered", "delivered"),
+            ("closed", "closed"),
+            ("interrupted-read", "closed"),
             ("read", "read"),
             ("interrupted", "closed"),
         ] {
@@ -287,7 +304,13 @@ mod tests {
                 expected
             );
         }
-        for id in ["old-sent", "old-staged", "interrupted"] {
+        for id in [
+            "old-sent",
+            "old-staged",
+            "accepted",
+            "interrupted",
+            "interrupted-read",
+        ] {
             let claims = state
                 .store
                 .claims_for(&format!("message/{id}"), Some("message.closed"))
