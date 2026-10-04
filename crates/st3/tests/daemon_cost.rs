@@ -26,6 +26,9 @@
 //! measures replication receive and export as the replication worker calls them, and the deletes
 //! of a checkpoint trim, per deleted row.
 //!
+//! Arrangement probes keep one live resource's register heads fixed while its edit history grows
+//! with the generated scale, so both the owner-selected list and detail must be history-independent.
+//!
 //! - `ST_COST_SCALES` sets the two generated scales, smaller first. The default is `0.01,0.1`.
 //! - `ST_BENCH_DIR` keeps generated stores for the next run, as for `daemon_bench`.
 //! - `ST_COST_REPORT` writes the measurements as JSON to that path.
@@ -40,6 +43,7 @@ use serde_json::{Value, json};
 use smallclaims::sqlite::work::{self, SqliteWork};
 use st3::api::AppState;
 use st3::client::Client;
+use st3::model::ClaimInput;
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
 
@@ -438,6 +442,14 @@ const PROBES: &[Probe] = &[
     get(
         "GET /v1/client/sets/{*id}",
         "/v1/client/sets/bench/cost/fixture",
+    ),
+    get(
+        "GET /v1/client/arrangements",
+        "/v1/client/arrangements?person=person%2Fada",
+    ),
+    get(
+        "GET /v1/client/arrangements/{person_name}/{uuid}",
+        ARRANGEMENT_PATH,
     ),
     post("POST /v1/sets/preview", "/v1/sets/preview", |_, attempt| {
         owned_set_request(&format!("preview-{attempt}"))
@@ -979,6 +991,51 @@ const SEAT_RUNTIME: &str = "cost-seat-0-runtime";
 
 /// The same agent list, after one seat changes at each scale.
 const COLD_AGENTS: &str = "GET /v1/client/agents (after harness observation)";
+const ARRANGEMENT_OWNER: &str = "person/ada";
+const ARRANGEMENT_SUBJECT: &str = "arrangement/person/ada/019a0000-0000-7000-8000-000000000001";
+const ARRANGEMENT_PATH: &str = "/v1/client/arrangements/ada/019a0000-0000-7000-8000-000000000001";
+const ARRANGEMENT_FOLDER: &str = "019a0000-0000-7000-8000-000000000010";
+const ARRANGEMENT_PLACEMENT: &str = "agent/fleet/fixture-cost-arrangements/seat";
+
+/// Grow only durable history, not the live answer, to catch reads that fold old edits.
+fn seed_arrangement(store: &Store, scale: f64) -> String {
+    let append = |key: &str, operations: Value| {
+        store
+            .append_claim(&ClaimInput {
+                subject: ARRANGEMENT_SUBJECT.into(),
+                kind: "arrangement.edited".into(),
+                actor: Some(ARRANGEMENT_OWNER.into()),
+                fields: serde_json::from_value(json!({
+                    "owner": ARRANGEMENT_OWNER,
+                    "operations": operations,
+                }))
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: Some(key.into()),
+            })
+            .expect("the arrangement cost fixture must publish")
+            .id
+    };
+    append(
+        "cost-arrangement-create",
+        json!([
+            {"op":"create","name":"Invented arrangement"},
+            {"op":"folder.create","id":ARRANGEMENT_FOLDER,"name":"Work","parent":null,"key":"a0"},
+            {"op":"subject.place","subject":ARRANGEMENT_PLACEMENT,"folder":ARRANGEMENT_FOLDER,"key":"a0"},
+        ]),
+    );
+    for edit in 0..((scale * 10_000.0).round() as usize).max(1) {
+        append(
+            &format!("cost-arrangement-history-{edit}"),
+            json!([{"op":"rename","name":format!("Invented revision {edit}")}]),
+        );
+    }
+    append(
+        "cost-arrangement-current",
+        json!([{"op":"rename","name":"Invented arrangement"}]),
+    )
+}
 
 /// The replication summary a peer asks for each exchange; a route of its own above would answer
 /// the same request.
@@ -1450,6 +1507,12 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         daemon.append_claim(&started).unwrap();
     }
     sync(&peer, PEER, &store);
+    let arrangement_revision = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || seed_arrangement(&store, scale))
+            .await
+            .unwrap()
+    };
     let claims = store.index().unwrap();
 
     let socket = root.join("st3.sock");
@@ -1479,6 +1542,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     let client = Client::unix(&socket);
     // Client reads come from a person, as stui and the app make them.
     let person = Client::unix_as(&socket, "person/bench-operator").unwrap();
+    let arrangement_person = Client::unix_as(&socket, ARRANGEMENT_OWNER).unwrap();
     let subjects = {
         let store = store.clone();
         tokio::task::spawn_blocking(move || fleet_subjects(&store, 3))
@@ -1540,6 +1604,27 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         .await
         .expect("the owned-set detail probe must read a live fixture");
     assert_eq!(selected["receipt"]["source"]["sequence"], 1);
+    let selected: Value = arrangement_person
+        .get(ARRANGEMENT_PATH)
+        .await
+        .expect("the arrangement detail probe must read a live fixture");
+    assert_eq!(selected["id"], ARRANGEMENT_SUBJECT);
+    assert_eq!(selected["owner"], ARRANGEMENT_OWNER);
+    assert_eq!(selected["revision"], arrangement_revision);
+    assert_eq!(selected["body"]["name"]["value"], "Invented arrangement");
+    assert_eq!(
+        selected["body"]["folders"][ARRANGEMENT_FOLDER]["name"]["value"],
+        "Work"
+    );
+    assert_eq!(
+        selected["body"]["placements"][ARRANGEMENT_PLACEMENT]["value"],
+        json!({"folder":ARRANGEMENT_FOLDER,"key":"a0"})
+    );
+    let page: Value = arrangement_person
+        .get("/v1/client/arrangements?person=person%2Fada")
+        .await
+        .expect("the arrangement list probe must read the selected owner's fixture");
+    assert_eq!(page["items"], json!([selected]));
 
     prepare_custom_fixture(&store, &mut fixture, scale);
 
@@ -1565,7 +1650,9 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             } else {
                 let path = fixture.fill(probe.path, attempt);
                 let body = probe.body.map(|body| body(&fixture, attempt));
-                let client = if path.starts_with("/v1/client/") {
+                let client = if path.starts_with("/v1/client/arrangements") {
+                    arrangement_person.clone()
+                } else if path.starts_with("/v1/client/") {
                     person.clone()
                 } else {
                     client.clone()
@@ -1587,11 +1674,12 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             println!("{}: {samples:?}", probe.route);
         }
         let cost = Cost::least(&samples);
-        // A missing item answers an error the same way at both scales; only a broken request fails.
+        // Other probes may select a missing generated item; the seeded arrangement must succeed.
         let cost = Cost {
-            error: cost
-                .error
-                .filter(|error| !error.contains("not-found") && !error.contains("404")),
+            error: cost.error.filter(|error| {
+                probe.route.starts_with("GET /v1/client/arrangements")
+                    || (!error.contains("not-found") && !error.contains("404"))
+            }),
             ..cost
         };
         costs.insert(probe.route.to_owned(), cost);
