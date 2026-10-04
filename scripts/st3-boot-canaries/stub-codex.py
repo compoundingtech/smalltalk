@@ -111,6 +111,23 @@ def record_rollout(thread_id):
     path.write_text(json.dumps({"type": "session_meta", "payload": {"id": thread_id, "cwd": os.getcwd()}}) + "\n")
 
 
+def transcript_mode():
+    path = Path.cwd() / "codex-transcript-mode"
+    return path.read_text().strip() if path.exists() else ""
+
+
+def split_utf8_rollout(path, thread_id, client_id=None):
+    """A two-MiB tail starting and ending inside a euro sign, as during an append."""
+    frames = [{"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-live"}}]
+    if client_id:
+        frames.append({"type": "event_msg", "payload": {
+            "type": "item_completed", "thread_id": thread_id, "turn_id": "turn-live",
+            "item": {"type": "UserMessage", "client_id": client_id}}})
+    data = "€\n".encode() + b"".join(json.dumps(frame).encode() + b"\n" for frame in frames)
+    data += b" " * (2 * 1024 * 1024 - len(data)) + "€".encode()[:2]
+    path.write_bytes(data)
+
+
 class AppServer:
     def __init__(self):
         self.clients = []
@@ -118,6 +135,8 @@ class AppServer:
         self.thread_id = None
         self.turns = 0
         self.history = []
+        self.deferred_transcript_input = None
+        self.failure_status_sent = False
 
     def send(self, client, message):
         with self.lock:
@@ -163,6 +182,8 @@ class AppServer:
                 self.clients.remove(client)
 
     def thread(self):
+        if transcript_mode() == "utf8":
+            return {"id": self.thread_id, "status": {"type": "active", "activeFlags": []}, "turns": []}
         return {"id": self.thread_id, "status": {"type": "idle"}, "turns": list(self.history)}
 
     def handle(self, client, message):
@@ -195,7 +216,28 @@ class AppServer:
         elif method == "account/read":
             self.send(client, {"id": ident, "result": {"account": {"type": "apiKey"}}})
         elif method == "thread/read":
-            self.send(client, {"id": ident, "result": {"thread": self.thread()}})
+            if transcript_mode() == "failure" and not self.failure_status_sent:
+                self.failure_status_sent = True
+                self.send(client, {"id": ident, "result": {"thread": {
+                    "id": self.thread_id, "status": {"type": "systemError"}, "turns": []}}})
+                def recover_status():
+                    self.broadcast({"method": "thread/status/changed", "params": {
+                        "threadId": self.thread_id, "status": {"type": "idle"}}})
+                threading.Timer(2.2, recover_status).start()
+            else:
+                self.send(client, {"id": ident, "result": {"thread": self.thread()}})
+        elif method == "turn/steer" and transcript_mode() == "utf8":
+            text = "".join(part.get("text", "") for part in params.get("input", []))
+            stubmodel.receipt("transcript-steer", text=text, client_id=params.get("clientUserMessageId"))
+            self.send(client, {"id": ident, "result": {"turnId": "turn-live"}})
+            if self.deferred_transcript_input is None:
+                self.deferred_transcript_input = text
+                split_utf8_rollout(rollout(self.thread_id), self.thread_id, params.get("clientUserMessageId"))
+                # No live receipt, completion, or model read can release this FIFO head.
+                # Only the driver's bounded transcript receipt recovery lets the next input through.
+            else:
+                first, self.deferred_transcript_input = self.deferred_transcript_input, None
+                threading.Thread(target=lambda: (stubmodel.act(first), stubmodel.act(text)), daemon=True).start()
         elif method == "turn/start":
             self.turns += 1
             turn = f"turn-{self.turns}"
