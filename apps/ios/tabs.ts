@@ -4,6 +4,10 @@
 export const TABS = ['Home', 'Agents', 'Missions', 'Fleet'] as const;
 export type Tab = typeof TABS[number];
 
+/** What a tab is called on screen: Home reads as Now, as `st now` and stui name it
+ * (Nathan, 2026-10-04); its id stays Home so stored orders and links keep working. */
+export const tabLabel = (tab: Tab): string => (tab === 'Home' ? 'Now' : tab);
+
 // Names earlier builds used, still accepted in links and stored preferences.
 const ALIASES: Record<string, Tab> = { now: 'Home', chat: 'Agents', control: 'Missions', usage: 'Fleet' };
 
