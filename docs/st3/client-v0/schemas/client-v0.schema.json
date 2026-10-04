@@ -2161,6 +2161,13 @@
       }
     },
     "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses"] },
+    "TerminalInputData": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["text"], "properties": { "text": { "type": "string", "minLength": 1 } } },
+        { "type": "object", "additionalProperties": false, "required": ["bytes_b64"], "properties": { "bytes_b64": { "type": "string", "minLength": 1 } } }
+      ]
+    },
+    "TerminalInputClosedReason": { "enum": ["incarnation-changed", "revoked", "detached", "gap", "rejected"] },
     "CollectionCommand": {
       "oneOf": [
         {
@@ -2206,6 +2213,33 @@
           "additionalProperties": false,
           "required": ["kind", "id"],
           "properties": { "kind": { "const": "unsubscribe" }, "id": { "type": "string", "minLength": 1, "maxLength": 128 } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "follow"],
+          "properties": {
+            "kind": { "const": "input-open" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "follow": { "type": "string", "minLength": 1, "maxLength": 128 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "seq", "data"],
+          "properties": {
+            "kind": { "const": "input" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "seq": { "type": "integer", "minimum": 0 },
+            "data": { "$ref": "#/$defs/TerminalInputData" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": { "kind": { "const": "input-close" }, "id": { "type": "string", "minLength": 1, "maxLength": 128 } }
         }
       ]
     },
@@ -2290,6 +2324,38 @@
             "code": { "type": "string" },
             "message": { "type": "string" },
             "retryable": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "follow", "next_seq"],
+          "properties": {
+            "kind": { "const": "input-opened" },
+            "id": { "type": "string" },
+            "follow": { "type": "string" },
+            "next_seq": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "seq"],
+          "properties": {
+            "kind": { "const": "input-ack" },
+            "id": { "type": "string" },
+            "seq": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "reason", "message"],
+          "properties": {
+            "kind": { "const": "input-closed" },
+            "id": { "type": "string" },
+            "reason": { "$ref": "#/$defs/TerminalInputClosedReason" },
+            "message": { "type": "string" }
           }
         }
       ]
