@@ -669,6 +669,7 @@ fn setup_script(setup: &SetupArgs) -> Result<String> {
 # Run it again after updating st to give the gateway the new binary.
 set -eu
 command -v bwrap >/dev/null || {{ echo "install bubblewrap first (apt install bubblewrap)" >&2; exit 1; }}
+command -v setfacl >/dev/null || {{ echo "install acl first (apt install acl)" >&2; exit 1; }}
 id -u sekrets >/dev/null 2>&1 || useradd --system --user-group --home-dir {store} --shell /usr/sbin/nologin sekrets
 install -d -o sekrets -g sekrets -m 0700 {store}
 install -d -o root -g root -m 0755 /etc/st-sekrets /usr/local/libexec
@@ -685,6 +686,12 @@ checkout_roots = [{roots}]
 {people_toml}
 EOF
 chmod 0644 /etc/st-sekrets/gateway.toml
+# The gateway binds the checkout a caller passes by its path, so it must be able to pass through
+# each person's home: search only, never read or list.
+for uid in {uids}; do
+  home=$(getent passwd "$uid" | cut -d: -f6)
+  [ -n "$home" ] && setfacl -m u:sekrets:x "$home"
+done
 cat > /etc/systemd/system/st-sekrets.service <<'EOF'
 [Unit]
 Description=st sekrets gateway
@@ -708,6 +715,11 @@ systemctl enable st-sekrets.service
 systemctl restart st-sekrets.service
 echo "sekrets gateway running; next, from a login session: st sekrets enable"
 "#,
+        uids = people
+            .iter()
+            .map(|(uid, _)| uid.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
         store = super::gateway::DEFAULT_STORE,
         socket = super::gateway::DEFAULT_SOCKET,
         st = quote(&st),
@@ -743,5 +755,7 @@ mod tests {
         assert!(script.contains("checkout_roots = [\"/home\", \"/srv/work\"]"));
         assert!(script.contains("install -o root -g root -m 0755"));
         assert!(script.contains("User=sekrets"));
+        assert!(script.contains("for uid in 1000 1001; do"));
+        assert!(script.contains("setfacl -m u:sekrets:x \"$home\""));
     }
 }

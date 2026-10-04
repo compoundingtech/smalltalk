@@ -53,6 +53,7 @@ pkgs.testers.runNixOSTest {
       fakeGh
       pkgs.git
       pkgs.bubblewrap
+      pkgs.acl
     ];
     environment.etc."st-sekrets/gateway.toml".source = gatewayConfig;
     systemd.services.st-sekrets = {
@@ -83,6 +84,8 @@ pkgs.testers.runNixOSTest {
         "chown root:root /usr/local/libexec/st-sekrets && chmod 0755 /usr/local/libexec/st-sekrets"
         " && mkdir -p /usr/local/bin && ln -sf /usr/local/libexec/st-sekrets /usr/local/bin/st"
     )
+    # As `st sekrets setup` does: the gateway may pass through each home, never read it.
+    machine.succeed("setfacl -m u:sekrets:x /srv/people/ada /srv/people/robin")
     machine.succeed("systemctl start st-sekrets.service")
     machine.wait_for_file("/run/st-sekrets/gateway.sock")
 

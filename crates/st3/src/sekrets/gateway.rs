@@ -669,14 +669,7 @@ impl Gateway {
     fn servable(&self, fd: &OwnedFd) -> Result<()> {
         let path = sandbox::descriptor_path(fd)?;
         sandbox::check_checkout_path(&path, &self.config.checkout_roots)?;
-        let proc_path = std::ffi::CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
-        if unsafe { libc::access(proc_path.as_ptr(), libc::X_OK) } != 0 {
-            bail!(
-                "the sekrets user may not enter {}; run from a directory others may read, such as a checkout",
-                path.display()
-            );
-        }
-        Ok(())
+        reachable(&path)
     }
 
     fn prepare(&self, profile: &Profile, run: &RunRequest, fds: Vec<OwnedFd>) -> Result<Prepared> {
@@ -714,6 +707,7 @@ impl Gateway {
                 bail!("{} is not a directory", path.display());
             }
             sandbox::check_checkout_path(&path, &self.config.checkout_roots)?;
+            reachable(&path)?;
             directories.push(BoundDirectory { fd, path });
         }
         let cwd = directories
@@ -1160,6 +1154,21 @@ fn plain_term(term: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
         && !term.starts_with('.')
+}
+
+/// Whether the sekrets user can walk to `path` and enter it. bubblewrap binds a passed directory
+/// by the path its descriptor resolves to, so every directory above it must let the sekrets user
+/// search it; setup grants search, never read, on each person's home.
+fn reachable(path: &Path) -> Result<()> {
+    let text = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+    if unsafe { libc::access(text.as_ptr(), libc::X_OK) } != 0 {
+        bail!(
+            "the sekrets user may not reach {}; let it search the directories above it \
+             (setup does `setfacl -m u:sekrets:x` on your home), or run from a checkout it can reach",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn check_policy(policy: &Policy) -> Result<(), String> {
