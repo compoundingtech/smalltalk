@@ -208,12 +208,22 @@ pkgs.testers.runNixOSTest {
     assert out.count("exit=0") == 2, out
 
     # Every call, refusal and change is a claim on the profile, recorded by ada's daemon.
-    def recorded(_):
-        history = machine.succeed(
+    def history(subject):
+        return machine.succeed(
             "su ada -s /bin/sh -c "
-            + shlex.quote(f"XDG_RUNTIME_DIR=/run/user/1000 {st} subject history sekret/machine/ada/agent-gh --json")
+            + shlex.quote(f"XDG_RUNTIME_DIR=/run/user/1000 {st} subject history {subject} --json")
         )
-        return "sekret.called" in history and "sekret.refused" in history and "agent/fleet/fixture-example/web" in history
+
+    def recorded(_):
+        # A call is a claim on its profile; a refusal before any profile fits is on the gateway.
+        calls = history("sekret/machine/ada/agent-gh")
+        refusals = history("sekret/machine")
+        return (
+            "sekret.called" in calls
+            and "agent/fleet/fixture-example/web" in calls
+            and "sekret.refused" in refusals
+        )
+
     retry(recorded, timeout_seconds=120)
   '';
 }

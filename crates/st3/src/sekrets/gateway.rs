@@ -664,6 +664,21 @@ impl Gateway {
         Ok(())
     }
 
+    /// Whether the caller's working directory can be the command's: under a checkout root, and
+    /// a directory the sekrets user may enter.
+    fn servable(&self, fd: &OwnedFd) -> Result<()> {
+        let path = sandbox::descriptor_path(fd)?;
+        sandbox::check_checkout_path(&path, &self.config.checkout_roots)?;
+        let proc_path = std::ffi::CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+        if unsafe { libc::access(proc_path.as_ptr(), libc::X_OK) } != 0 {
+            bail!(
+                "the sekrets user may not enter {}; run from a directory others may read, such as a checkout",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
     fn prepare(&self, profile: &Profile, run: &RunRequest, fds: Vec<OwnedFd>) -> Result<Prepared> {
         let Some(name) = run.argv.first() else {
             bail!("no command");
@@ -679,6 +694,18 @@ impl Gateway {
         }
         let mut fds = fds.into_iter();
         let stdio = (&mut fds).take(streams).collect::<Vec<_>>();
+        let home = self.store().profile_home(&profile.id);
+        let mut fds = fds.collect::<Vec<_>>();
+        // A command runs in the caller's directory when the sekrets user may enter it there;
+        // otherwise (a 0700 home, or somewhere outside the checkout roots) in the profile's home,
+        // with no checkout, and the caller is told.
+        let mut note = None;
+        if let Err(reason) = self.servable(&fds[0]) {
+            note = Some(format!(
+                "running in the profile's home, without your directory: {reason:#}"
+            ));
+            fds.clear();
+        }
         let mut directories = Vec::new();
         for fd in fds {
             let path = sandbox::descriptor_path(&fd)?;
@@ -689,18 +716,25 @@ impl Gateway {
             sandbox::check_checkout_path(&path, &self.config.checkout_roots)?;
             directories.push(BoundDirectory { fd, path });
         }
-        let cwd = directories[0].path.clone();
+        let cwd = directories
+            .first()
+            .map(|directory| directory.path.clone())
+            .unwrap_or_else(|| home.clone());
         // Parents first, so a nested directory is bound over its parent's view.
         directories.sort_by_key(|directory| directory.path.components().count());
         let scratch = tempfile::Builder::new()
             .prefix("call-")
             .tempdir_in(private_dir(self.config.store.join("scratch"))?)?;
-        let view =
-            sandbox::prepare_checkout(&directories, &cwd, self.git.as_deref(), scratch.path())?;
+        let view = if directories.is_empty() {
+            sandbox::CheckoutView::default()
+        } else {
+            sandbox::prepare_checkout(&directories, &cwd, self.git.as_deref(), scratch.path())?
+        };
         let env = self.store().env(&profile.id)?;
         Ok(Prepared {
             tool,
-            home: self.store().profile_home(&profile.id),
+            home,
+            note,
             stdio,
             directories,
             view,
@@ -718,6 +752,7 @@ impl Gateway {
         profile: &str,
         call: i64,
     ) -> Result<std::process::ExitStatus> {
+        let prepared_note = prepared.note.clone();
         let mut hidden = vec![
             self.config.store.clone(),
             self.config
@@ -795,6 +830,7 @@ impl Gateway {
             &Reply::Started {
                 profile: profile.to_owned(),
                 call,
+                note: prepared_note,
             },
             &master_fds,
         )?;
@@ -1136,6 +1172,7 @@ fn check_policy(policy: &Policy) -> Result<(), String> {
 struct Prepared {
     tool: PathBuf,
     home: PathBuf,
+    note: Option<String>,
     stdio: Vec<OwnedFd>,
     directories: Vec<BoundDirectory>,
     view: sandbox::CheckoutView,

@@ -296,6 +296,17 @@ fn a_person_runs_their_profile_without_seeing_the_store_or_other_profiles() {
     assert!(output.stdout.contains(cwd.to_str().unwrap()));
     assert!(home.join("written").exists());
 
+    // From a directory the gateway does not serve, the command runs in the profile's home.
+    fixture.tool("where", "pwd");
+    let elsewhere = run(fixture.connect(), None, &["where"], &fixture.root);
+    assert_eq!(
+        elsewhere.result.as_ref().unwrap(),
+        &0,
+        "{}",
+        elsewhere.stderr
+    );
+    assert_eq!(elsewhere.stdout.trim(), home.to_str().unwrap());
+
     fixture.tool("gh", "echo \"gh $*\"");
     let refused = run(fixture.connect(), None, &["gh", "auth", "token"], &cwd);
     assert!(

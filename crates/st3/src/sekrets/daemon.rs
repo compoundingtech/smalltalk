@@ -248,7 +248,17 @@ fn import_until_error(
         };
         for entry in &entries {
             if let Some(claim) = claim_for(node, person, entry) {
-                store.append_claim(&claim)?;
+                match store.append_claim(&claim) {
+                    Ok(_) => {}
+                    // The graph refuses this entry's claim: record the rest rather than stall.
+                    Err(error) if error.code != "internal" => {
+                        eprintln!(
+                            "st3: sekrets: skipped gateway log entry {}: {error:#}",
+                            entry.seq
+                        );
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
         *cursor = last;
