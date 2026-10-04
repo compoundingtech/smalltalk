@@ -18711,6 +18711,10 @@ fn mailbox_harness_ended(
         return Ok(false);
     }
 
+    if screen_harness_fence(connection, subject, incarnation, i64::MAX as u64)?.is_some() {
+        return Ok(false);
+    }
+
     // These positive prompt fences precede the harness state in the display fold. A restored
     // login removes the override. Read them only when they can change an ended decision.
     let diagnostic: Option<String> = connection
@@ -18835,6 +18839,46 @@ fn check_mailbox_fence(
     Ok(())
 }
 
+fn screen_harness_fence(
+    connection: &Connection,
+    subject: &str,
+    incarnation: &str,
+    at_index: u64,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
+    let claim = connection.prepare_cached(&format!(
+        "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.diagnostic' AND claims.store_index<=?2
+           AND json_extract(claims.body, '$.fields.incarnation_id')=?3
+           AND json_extract(claims.body, '$.fields.code') IN ('harness-screen-blocked','harness-screen-cleared')
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    ))?.query_row(params![subject, at_index, incarnation], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    }).optional()?;
+    let Some((claim, body, at)) = claim else {
+        return Ok(None);
+    };
+    let body: Value = serde_json::from_str(&body)?;
+    let fields = &body["fields"];
+    if fields["code"] != "harness-screen-blocked" {
+        return Ok(None);
+    }
+    let text = |name: &str| fields[name].as_str().map(str::to_owned);
+    Ok(Some(crate::model::CurrentHarnessView {
+        state: "blocked".into(),
+        driver: text("driver"),
+        incarnation_id: incarnation.into(),
+        transport: Some("terminal-screen".into()),
+        reason: text("reason"),
+        blocked_on: text("blocked_on"),
+        ask: None,
+        input_buffer: None,
+        exit: None,
+        claim,
+        observed_at_unix_ms: at.parse()?,
+    }))
+}
+
 fn current_harness_at(
     connection: &Connection,
     subject: &str,
@@ -18862,6 +18906,12 @@ fn current_harness_at(
     let Some(incarnation_id) = runtime_fields.get("incarnation_id").and_then(Value::as_str) else {
         return Ok(None);
     };
+
+    // A terminal modal holds even if a parallel native channel reports idle or work progress.
+    // Only a successful subsequent screen observation or a new runtime lifts this fence.
+    if let Some(harness) = screen_harness_fence(connection, subject, incarnation_id, at_index)? {
+        return Ok(Some(harness));
+    }
 
     // A login prompt or a workspace trust prompt is positive evidence that the current Claude
     // incarnation cannot accept work. Neither has a hook edge, and channel initialization or work

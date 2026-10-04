@@ -4350,6 +4350,42 @@ where
     .map_err(ApiError::internal)?
 }
 
+/// Bound both accept retries and diagnostics while the process or host has no descriptors.
+#[derive(Default)]
+struct AcceptFailures {
+    resource_failures: u32,
+    unreported: u64,
+    last_report: Option<std::time::Instant>,
+}
+
+impl AcceptFailures {
+    fn failed(
+        &mut self,
+        error: &std::io::Error,
+        now: std::time::Instant,
+    ) -> (Duration, Option<u64>) {
+        self.unreported = self.unreported.saturating_add(1);
+        let delay = if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+            self.resource_failures = self.resource_failures.saturating_add(1);
+            Duration::from_millis(100 * (1_u64 << self.resource_failures.saturating_sub(1).min(6)))
+                .min(Duration::from_secs(5))
+        } else {
+            self.resource_failures = 0;
+            Duration::from_millis(100)
+        };
+        let report = if self
+            .last_report
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5))
+        {
+            self.last_report = Some(now);
+            Some(std::mem::take(&mut self.unreported))
+        } else {
+            None
+        };
+        (delay, report)
+    }
+}
+
 pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
     serve_unix_inner(socket, app, false).await
 }
@@ -4417,14 +4453,24 @@ async fn serve_unix_with_ancestor(
     if let Some(state_socket) = state_socket {
         publish_state_socket(socket, state_socket)?;
     }
+    let mut accept_failures = AcceptFailures::default();
     loop {
         let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
+            Ok((stream, _)) => {
+                accept_failures.resource_failures = 0;
+                stream
+            }
             // Running out of file descriptors, or a peer that hung up before it was accepted,
             // fails one accept. It must not end the daemon: back off and keep serving.
             Err(error) => {
-                eprintln!("st3: accept a local API connection: {error}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                let (delay, report) = accept_failures.failed(&error, std::time::Instant::now());
+                if let Some(count) = report {
+                    eprintln!(
+                        "st3: accept a local API connection: {error} ({count} failures since last report; retry in {} ms)",
+                        delay.as_millis()
+                    );
+                }
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
@@ -13573,6 +13619,45 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(body["code"], "already-suspended");
         let (_, body) = ask("/v1/agents/restart", "restart").await;
         assert_eq!(body["code"], "restart-suspended");
+    }
+
+    #[test]
+    fn descriptor_exhaustion_bounds_accept_retries_and_log_reports() {
+        for code in [libc::EMFILE, libc::ENFILE] {
+            let error = std::io::Error::from_raw_os_error(code);
+            let mut failures = AcceptFailures::default();
+            let start = std::time::Instant::now();
+            let mut now = start;
+            let mut delays = Vec::new();
+            let mut reports = Vec::new();
+            while now.duration_since(start) < Duration::from_secs(60) {
+                let (delay, count) = failures.failed(&error, now);
+                assert!(delay <= Duration::from_secs(5));
+                delays.push(delay.as_millis());
+                if let Some(count) = count {
+                    reports.push((now, count));
+                }
+                now += delay;
+            }
+            assert_eq!(&delays[..7], &[100, 200, 400, 800, 1600, 3200, 5000]);
+            assert!(delays.len() <= 18, "retries: {}", delays.len());
+            assert!(reports.len() <= 12, "reports: {}", reports.len());
+            assert!(
+                reports
+                    .windows(2)
+                    .all(|pair| pair[1].0.duration_since(pair[0].0) >= Duration::from_secs(5))
+            );
+            assert_eq!(reports[0].1, 1);
+            assert!(reports.iter().any(|(_, count)| *count > 1));
+            failures.resource_failures = 0;
+            let (delay, report) = failures.failed(&error, now);
+            assert_eq!(delay, Duration::from_millis(100));
+            failures.resource_failures = 0;
+            let (_, immediate_report) = failures.failed(&error, now);
+            if report.is_some() {
+                assert!(immediate_report.is_none());
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
