@@ -19,8 +19,7 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
     let login = match driver {
         "claude" => lines.iter().enumerate().find_map(|(index, line)| {
             let text = ui_line(line);
-            let standalone = !latest_reply
-                .is_some_and(|latest| index < latest || (index > latest && line.starts_with('⎿')));
+            let standalone = latest_reply.is_none_or(|latest| index == latest);
             let matched = [
                 "Login expired · Please run /login",
                 "Not logged in · Run /login",
@@ -163,6 +162,18 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plain_followup_tool_lines_are_not_login_diagnostics() {
+        for text in [
+            "Please run /login",
+            "Invalid API key",
+            "Login expired · Please run /login",
+        ] {
+            let screen = format!("● Bash(cat log)\n  ⎿ first output line\n    {text}");
+            assert_eq!(super::detect("claude", &screen), None);
+        }
+    }
+
     use super::*;
 
     #[test]

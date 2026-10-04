@@ -2254,12 +2254,22 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     )?;
                                     return Ok(());
                                 }
+                                let screen = member
+                                    .terminal
+                                    .then(|| self.member_screen(&member.runtime_id).ok())
+                                    .flatten();
                                 self.reconcile_harness_authentication(
                                     subject,
                                     member,
                                     &observation,
+                                    screen.as_deref(),
                                 )?;
-                                self.reconcile_blocking_screen(subject, member, &observation)?;
+                                self.reconcile_blocking_screen(
+                                    subject,
+                                    member,
+                                    &observation,
+                                    screen.as_deref(),
+                                )?;
                                 self.reconcile_claude_trust_screen(
                                     subject,
                                     member,
@@ -3029,6 +3039,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         subject: &DesiredSubject,
         member: &MemberSpec,
         observation: &RuntimeObservation,
+        screen: Option<&str>,
     ) -> Result<()> {
         if subject.kind != "agent" || !member.terminal {
             return Ok(());
@@ -3039,7 +3050,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         ) else {
             return Ok(());
         };
-        let Ok(screen) = self.member_screen(&member.runtime_id) else {
+        let Some(screen) = screen else {
             return Ok(());
         };
         let matched = st_drivers::blocking_screen::detect(driver, &screen);
@@ -3099,7 +3110,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             {
                 continue;
             }
-            let login = code == "provider-auth-expired";
             self.store.append_claim(&ClaimInput {
                 subject: subject.subject.clone(),
                 kind: "harness.diagnostic".into(),
@@ -3107,10 +3117,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 fields: BTreeMap::from([
                     ("code".into(), Value::String(code.into())),
                     ("severity".into(), Value::String("error".into())),
-                    (
-                        "status".into(),
-                        Value::String(if login { "unauthenticated" } else { "blocked" }.into()),
-                    ),
+                    ("status".into(), Value::String("blocked".into())),
                     ("driver".into(), Value::String(driver.into())),
                     ("reason".into(), Value::String(current.text.clone())),
                     ("matched_line".into(), Value::String(current.text.clone())),
@@ -3139,15 +3146,24 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .and_then(|(_, actor)| actor)
                 .filter(|actor| actor.starts_with("person/")))
             .unwrap_or_else(|| "person/alex".into());
-            self.store.record_runtime_failure(&attention_subject, &AttentionRequest {
-                reviewer,
-                title: if login { format!("{driver} needs login") } else { format!("{driver} update menu needs a response") },
-                reason: format!("{}: {}. {}", subject.subject, current.text,
-                    if login { "Log in in this seat's terminal; work resumes when the prompt clears" }
-                    else { "The update menu holds work; choose how to proceed in this seat's terminal" }),
-                severity: "error".into(), targets: vec![subject.subject.clone()],
-                actor: RECONCILER_ACTOR.into(), idempotency_key: format!("{key}:attention"),
-            }, condition)?;
+            self.store.record_runtime_failure(
+                &attention_subject,
+                &AttentionRequest {
+                    reviewer,
+                    title: format!("{driver} update menu needs a response"),
+                    reason: format!(
+                        "{}: {}. {}",
+                        subject.subject,
+                        current.text,
+                        "The update menu holds work; choose how to proceed in this seat's terminal"
+                    ),
+                    severity: "error".into(),
+                    targets: vec![subject.subject.clone()],
+                    actor: RECONCILER_ACTOR.into(),
+                    idempotency_key: format!("{key}:attention"),
+                },
+                condition,
+            )?;
             self.resolve_pending_alert(
                 &format!("harness-readiness:{}:{incarnation}", subject.subject),
                 "the terminal screen identifies the startup blocker",
@@ -3162,6 +3178,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         subject: &DesiredSubject,
         member: &MemberSpec,
         observation: &RuntimeObservation,
+        screen: Option<&str>,
     ) -> Result<()> {
         if subject.kind != "agent" {
             return Ok(());
@@ -3178,36 +3195,44 @@ impl<R: RuntimeControl> Reconciler<R> {
             .as_ref()
             .and_then(|v| v["provider_auth_sequence"].as_u64())
             .unwrap_or(0);
+        let auth_owner = auth
+            .as_ref()
+            .and_then(|v| v["ownership_sequence"].as_u64())
+            .unwrap_or(0);
         let matched_line = if member.terminal {
-            self.member_screen(&member.runtime_id)
-                .ok()
-                .and_then(|screen| {
-                    let matched = st_drivers::blocking_screen::detect(driver, &screen)?;
-                    if matched.code != "provider-auth-expired" {
-                        return None;
-                    }
-                    // A successful native turn supersedes an old standalone reply in scrollback.
-                    let reply = matched.text.trim_start_matches(['●', '⎿']).trim();
-                    if auth_accepted == Some(true)
-                        && st_drivers::claude_session::claude_login_reply(reply)
-                    {
-                        None
-                    } else {
-                        Some(matched.text)
-                    }
-                })
+            screen.and_then(|screen| {
+                let matched = st_drivers::blocking_screen::detect(driver, &screen)?;
+                if matched.code != "provider-auth-expired" {
+                    return None;
+                }
+                // A successful native turn supersedes an old standalone reply in scrollback.
+                let reply = matched.text.trim_start_matches(['●', '⎿']).trim();
+                if auth_accepted == Some(true)
+                    && st_drivers::claude_session::claude_login_reply(reply)
+                {
+                    None
+                } else {
+                    Some(matched.text)
+                }
+            })
         } else {
             None
         };
         let (fence, key) = self.harness_auth_fence(&subject.subject, incarnation)?;
         if let Some(fence) = fence {
-            let prior_sequence = self
-                .store
-                .claim_by_id(&fence)?
+            let prior = self.store.claim_by_id(&fence)?;
+            let prior_sequence = prior
+                .as_ref()
                 .and_then(|claim| claim.body["fields"]["provider_auth_sequence"].as_u64())
                 .unwrap_or(0);
+            let prior_owner = prior
+                .as_ref()
+                .and_then(|claim| claim.body["fields"]["ownership_sequence"].as_u64())
+                .unwrap_or(0);
             // Losing a screen line or seeing ordinary activity is not authentication proof.
-            if auth_accepted == Some(true) && auth_sequence > prior_sequence {
+            if auth_accepted == Some(true)
+                && (auth_owner, auth_sequence) > (prior_owner, prior_sequence)
+            {
                 self.store.append_claim(&ClaimInput {
                     subject: subject.subject.clone(),
                     kind: "harness.diagnostic".into(),
@@ -3235,6 +3260,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                     "a successful authenticated turn restored this harness",
                 )?;
                 self.signal_changed();
+            } else {
+                self.ensure_login_fallback_fault(subject, &key)?;
             }
             return Ok(());
         }
@@ -3258,6 +3285,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("driver".into(), Value::String(driver.into())),
                 ("incarnation_id".into(), Value::String(incarnation.into())),
                 ("provider_auth_sequence".into(), Value::from(auth_sequence)),
+                ("ownership_sequence".into(), Value::from(auth_owner)),
                 ("auth_attention_key".into(), Value::String(key.clone())),
                 (
                     "matched_line".into(),
@@ -3268,7 +3296,22 @@ impl<R: RuntimeControl> Reconciler<R> {
             expected_subject: None,
             idempotency_key: Some(key.clone()),
         })?;
+        self.ensure_login_fallback_fault(subject, &key)?;
         self.signal_changed();
+        Ok(())
+    }
+
+    fn ensure_login_fallback_fault(&self, subject: &DesiredSubject, key: &str) -> Result<()> {
+        if self.store.agent_person(&subject.subject)?.is_some() {
+            return Ok(());
+        }
+        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        self.store.record_runtime_failure(&format!("attention/{}", &digest[..32]), &AttentionRequest {
+            reviewer: subject.subject.clone(), title: "Harness needs login; person ownership is unresolved".into(),
+            reason: format!("{} needs login. Resolve its account/person ownership and attach to authenticate this harness.", subject.subject),
+            severity: "error".into(), targets: vec![subject.subject.clone()], actor: RECONCILER_ACTOR.into(),
+            idempotency_key: format!("{key}:attention"),
+        }, "provider-auth")?;
         Ok(())
     }
 
@@ -3280,27 +3323,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         subject: &str,
         incarnation: &str,
     ) -> Result<(Option<String>, String)> {
-        let mut fence = None;
-        let mut key = format!("claude-auth-expired:{subject}:{incarnation}");
-        for claim in self.store.claims_for(subject, Some("harness.diagnostic"))? {
-            if claim
-                .body
-                .pointer("/fields/incarnation_id")
-                .and_then(Value::as_str)
-                != Some(incarnation)
-            {
-                continue;
-            }
-            match claim.body.pointer("/fields/code").and_then(Value::as_str) {
-                Some("provider-auth-expired") => fence = Some(claim.id),
-                Some("provider-auth-restored") => {
-                    fence = None;
-                    key = format!("claude-auth-expired:{subject}:{incarnation}:{}", claim.id);
-                }
-                _ => {}
-            }
-        }
-        Ok((fence, key))
+        let (claim, key) = self.store.harness_login_episode_key(subject, incarnation)?;
+        Ok((claim.map(|claim| claim.id), key))
     }
 
     /// Claude's workspace trust prompt appears before any hook or channel can report the session,
@@ -32030,9 +32054,53 @@ version 2
         );
     }
 
-    /// A seat whose screen shows the detector's own source, as a builder's grep output did on
-    /// 2026-09-27, stays authenticated. A seat that shows Claude's login prompt is fenced, and its
-    /// diagnostic records the exact screen line that matched.
+    #[test]
+    fn login_attention_owner_prefers_bound_account_and_pool_before_the_declarer() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            r#"version 2
+account "shared" {{ provider "claude"; owner "person/casey" }}
+agent "bound" {{ workspace {:?}; harness "claude" {{ account "shared" }} }}
+agent "pooled" {{ workspace {:?}; harness "claude" {{ account-pool "person/casey" }} }}
+agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
+"#,
+            workspace.path().display().to_string(),
+            workspace.path().display().to_string(),
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &plan.subject_tokens,
+                "login-account-owner",
+                Some("person/avery"),
+            )
+            .unwrap();
+        assert_eq!(
+            store.agent_person("agent/node.bound").unwrap().as_deref(),
+            Some("person/casey")
+        );
+        assert_eq!(
+            store.agent_person("agent/node.pooled").unwrap().as_deref(),
+            Some("person/casey")
+        );
+        assert_eq!(
+            store.agent_person("agent/node.plain").unwrap().as_deref(),
+            Some("person/avery")
+        );
+    }
+
     #[test]
     fn native_login_failure_routes_once_to_its_person_and_recovers_then_repeats() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -32068,7 +32136,7 @@ version 2
         );
         reconciler.reconcile_once().unwrap();
         *runtime.ptys.lock().unwrap() = vec![claude_seat_pty("seat", "running", "one")];
-        let publish = |accepted: bool, sequence: u64, epoch: &str| {
+        let publish = |accepted: bool, sequence: u64, epoch: &str, owner: u64| {
             store
                 .append_claim(&ClaimInput {
                     subject: "agent/node.seat".into(),
@@ -32079,6 +32147,7 @@ version 2
                         ("incarnation_id".into(), Value::String(epoch.into())),
                         ("provider_auth".into(), Value::Bool(accepted)),
                         ("provider_auth_sequence".into(), Value::from(sequence)),
+                        ("ownership_sequence".into(), Value::from(owner)),
                         (
                             "reason".into(),
                             if accepted {
@@ -32097,7 +32166,7 @@ version 2
                 })
                 .unwrap();
         };
-        publish(false, 1, "one");
+        publish(false, 1, "one", 1);
         store
             .record_runtime_failure(
                 "attention/retained-login-episode",
@@ -32138,7 +32207,7 @@ version 2
                 .unwrap()
                 .is_empty()
         );
-        publish(true, 9, "stale");
+        publish(true, 9, "stale", 99);
         reconciler.reconcile_once().unwrap();
         assert_eq!(
             store
@@ -32148,7 +32217,7 @@ version 2
                 .state,
             "needs-login"
         );
-        publish(true, 2, "one");
+        publish(true, 2, "one", 1);
         reconciler.reconcile_once().unwrap();
         assert!(
             store
@@ -32163,18 +32232,31 @@ version 2
                 .unwrap()
                 .is_empty()
         );
-        publish(false, 3, "one");
+        publish(false, 3, "one", 1);
         reconciler.reconcile_once().unwrap();
         assert_eq!(
             store.attention_items(Some("person/avery")).unwrap().len(),
             1
         );
+        // Re-exec preserves the runtime but advances driver ownership and resets its auth counter.
+        publish(true, 1, "one", 2);
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .current_harness("agent/node.seat")
+                .unwrap()
+                .unwrap()
+                .is_ready()
+        );
+        assert!(
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .is_empty()
+        );
         assert!(runtime.keys.lock().unwrap().is_empty());
     }
 
-    /// A seat whose screen shows the detector's own source, as a builder's grep output did on
-    /// 2026-09-27, stays authenticated. A seat that shows Claude's login prompt is fenced, and its
-    /// diagnostic records the exact screen line that matched.
     #[test]
     fn a_claude_login_prompt_line_fences_the_seat_and_records_the_matched_line() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -32235,6 +32317,12 @@ version 2
         );
         let harness = store.current_harness("agent/node.seat-b").unwrap().unwrap();
         assert_eq!(harness.reason.as_deref(), Some("providerAuth"));
+        assert_eq!(
+            store.fault_items(None).unwrap().len(),
+            1,
+            "unknown ownership retains an agent fault"
+        );
+        assert!(store.attention_items(None).unwrap().is_empty());
         let attention = store.fault_items(Some("person/alex")).unwrap();
         assert!(
             attention.is_empty(),
@@ -32457,10 +32545,7 @@ version 2
                 !crate::suspension::harness_quiescence(&harness.state, "human", "none", "unknown")
                     .0
             );
-            assert_eq!(
-                store.fault_items(None).unwrap().len(),
-                usize::from(code == "provider-update-prompt")
-            );
+            assert_eq!(store.fault_items(None).unwrap().len(), 1);
             assert_eq!(
                 store
                     .claims_for("agent/node.seat", Some("harness.diagnostic"))
@@ -32496,10 +32581,7 @@ version 2
                             .state,
                         "needs-login"
                     );
-                    assert_eq!(
-                        store.fault_items(None).unwrap().len(),
-                        usize::from(code == "provider-update-prompt")
-                    );
+                    assert_eq!(store.fault_items(None).unwrap().len(), 1);
                     assert_eq!(
                         store
                             .claims_for("agent/node.seat", Some("harness.diagnostic"))
@@ -32575,10 +32657,7 @@ version 2
                     .unwrap()
                     .is_ready()
             );
-            assert_eq!(
-                store.fault_items(None).unwrap().len(),
-                usize::from(code == "provider-update-prompt")
-            );
+            assert_eq!(store.fault_items(None).unwrap().len(), 1);
 
             if driver == "codex" {
                 let next = if code == "provider-auth-expired" {
@@ -32606,10 +32685,7 @@ version 2
                         "blocked"
                     }
                 );
-                assert_eq!(
-                    store.fault_items(None).unwrap().len(),
-                    usize::from(code == "provider-auth-expired")
-                );
+                assert_eq!(store.fault_items(None).unwrap().len(), 1);
             }
 
             // An old screen fence never holds a new incarnation.

@@ -654,6 +654,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "fault": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Current member reconcile failure; cleared by a successful pass." }),
   /** Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes. */
   "handoff": Schema.OptionFromOptionalNullOr(AgentHandoff, NULL_NONE).annotate({ description: "Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes." }),
+  /** Known actionable harness error: needs-login. Login keeps the legacy unauthenticated harness_state for older clients; older daemons omit this optional detail. */
+  "harness_error_state": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Known actionable harness error: needs-login. Login keeps the legacy unauthenticated harness_state for older clients; older daemons omit this optional detail." }),
   "harness_state": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "host_id": Schema.OptionFromOptionalNullOr(HostId, NULL_NONE),
   "id": AgentId,

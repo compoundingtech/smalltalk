@@ -285,13 +285,19 @@ WHERE kind='harness.observed'
     AND json_type(body, CASE WHEN json_type(body, '$.fields') IS NULL
         THEN '$.state' ELSE '$.fields.state' END)='text';
 
--- Credential evidence is sparse on older drivers. A partial index prevents an unknown
+-- Older drivers have no credential axis. A partial index prevents an unknown
 -- credential state from scanning every activity observation in a long-lived incarnation.
 CREATE INDEX IF NOT EXISTS claims_harness_auth_incarnation_index
 ON claims(subject, json_extract(body, '$.fields.incarnation_id'),
     length(accepted_at_unix_ms), accepted_at_unix_ms)
 WHERE kind='harness.observed'
     AND json_type(body, '$.fields.provider_auth') IN ('true','false');
+
+CREATE INDEX IF NOT EXISTS claims_harness_auth_diagnostic_index
+ON claims(subject, json_extract(body, '$.fields.incarnation_id'),
+    length(accepted_at_unix_ms), accepted_at_unix_ms)
+WHERE kind='harness.diagnostic'
+    AND json_extract(body, '$.fields.code') IN ('provider-auth-expired','provider-auth-restored');
 
 CREATE TABLE IF NOT EXISTS desired (
     subject TEXT PRIMARY KEY,
@@ -309,6 +315,7 @@ CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject
 -- Deleting a claim checks these references (foreign keys are on); see
 -- `operations_canonical_claim_index`.
 CREATE INDEX IF NOT EXISTS desired_claim_index ON desired(claim_id);
+CREATE INDEX IF NOT EXISTS desired_agent_subject_index ON desired(subject) WHERE kind='agent';
 CREATE INDEX IF NOT EXISTS desired_agent_host_index ON desired(json_extract(member, '$.host'), subject) WHERE kind='agent';
 
 -- A replicated projection finds a mission run tree's runs, generations and proposals from the
@@ -9975,6 +9982,18 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    fn desired_agents(&self) -> Result<Vec<DesiredSubject>> {
+        smallclaims::touched::note_read(|| "desired-kind:agent".to_owned());
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired WHERE kind='agent' ORDER BY subject",
+        )?;
+        statement
+            .query_map([], desired_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Repository candidates on one host, excluding members with neither a checkout nor any
     /// published workspace evidence. Uses the host index rather than walking the fleet graph.
     pub(crate) fn agent_repository_subjects(&self, host: &str) -> Result<Vec<DesiredSubject>> {
@@ -14293,11 +14312,7 @@ impl Store {
         person: Option<&str>,
     ) -> Result<Vec<AttentionItemView>> {
         let mut items = Vec::new();
-        for desired in self
-            .desired_subjects()?
-            .into_iter()
-            .filter(|d| d.kind == "agent")
-        {
+        for desired in self.desired_agents()? {
             if !person_work::declaration_live(&self.readers.get(), &desired.subject)? {
                 continue;
             }
@@ -14333,27 +14348,11 @@ impl Store {
                 }
                 _ => "use this harness's login command",
             };
-            let connection = self.readers.get();
-            let episode: Option<(String, String, String)> = connection.query_row(&canonical_sql(
-                "SELECT id, body, accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='harness.diagnostic'
-                 AND json_extract(body, '$.fields.incarnation_id')=?2
-                 AND json_extract(body, '$.fields.code') IN ('provider-auth-expired','provider-auth-restored')
-                 ORDER BY CANONICAL_DESC(claims) LIMIT 1"), params![desired.subject, harness.incarnation_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
-            let mut requested_at = harness.observed_at_unix_ms;
-            let mut key = format!(
-                "claude-auth-expired:{}:{}",
-                desired.subject, harness.incarnation_id
-            );
-            if let Some((id, body, time)) = episode {
-                requested_at = time.parse()?;
-                let body: Value = serde_json::from_str(&body)?;
-                if body["fields"]["code"] == "provider-auth-restored" {
-                    key = format!("{key}:{id}");
-                } else if let Some(stored) = body["fields"]["auth_attention_key"].as_str() {
-                    key = stored.to_owned();
-                }
-            }
+            let (fence, key) =
+                self.harness_login_episode_key(&desired.subject, &harness.incarnation_id)?;
+            let requested_at = fence.as_ref().map_or(harness.observed_at_unix_ms, |claim| {
+                claim.accepted_at_unix_ms
+            });
             items.push(AttentionItemView {
                 episode: key, priority: "high".into(), kind: "harness-login".into(), review_mode: None,
                 subject: desired.subject.clone(), person: owner, requester_id: None, launch_id: None,
@@ -14367,6 +14366,47 @@ impl Store {
             });
         }
         Ok(items)
+    }
+
+    pub(crate) fn harness_login_episode_key(
+        &self,
+        subject: &str,
+        incarnation: &str,
+    ) -> Result<(Option<ClaimRecord>, String)> {
+        let base = format!("claude-auth-expired:{subject}:{incarnation}");
+        let Some(latest) = self.harness_auth_episode(subject, incarnation, None)? else {
+            return Ok((None, base));
+        };
+        if latest.body["fields"]["code"] == "provider-auth-restored" {
+            return Ok((None, format!("{base}:{}", latest.id)));
+        }
+        let key = match latest.body["fields"]["auth_attention_key"].as_str() {
+            Some(key) => key.to_owned(),
+            None => self
+                .harness_auth_episode(subject, incarnation, Some("provider-auth-restored"))?
+                .map_or(base.clone(), |restored| format!("{base}:{}", restored.id)),
+        };
+        Ok((Some(latest), key))
+    }
+
+    pub(crate) fn harness_auth_episode(
+        &self,
+        subject: &str,
+        incarnation: &str,
+        code: Option<&str>,
+    ) -> Result<Option<ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        let id: Option<String> = connection.query_row(&canonical_sql(
+            "SELECT id FROM claims INDEXED BY claims_harness_auth_diagnostic_index
+             WHERE subject=?1 AND kind='harness.diagnostic'
+               AND json_extract(body, '$.fields.incarnation_id')=?2
+               AND json_extract(body, '$.fields.code') IN ('provider-auth-expired','provider-auth-restored')
+               AND (?3 IS NULL OR json_extract(body, '$.fields.code')=?3)
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1"), params![subject, incarnation, code], |row| row.get(0)).optional()?;
+        id.map(|id| self.claim_by_id(&id))
+            .transpose()
+            .map(Option::flatten)
     }
 
     /// Explicit credential evidence from the currently running native epoch only.
@@ -14392,7 +14432,7 @@ impl Store {
             .transpose()
     }
 
-    /// Follow declaration authors and mission requesters to their concrete person.
+    /// Prefer a bound account person, then follow declaration authors and mission requesters.
     /// Missing or cyclic ownership remains unknown; it never selects a global operator.
     pub(crate) fn agent_person(&self, agent: &str) -> Result<Option<String>> {
         let mut actor = agent.to_owned();
@@ -14407,6 +14447,23 @@ impl Store {
             let Some((desired, writer)) = self.desired_subject_with_writer(&actor)? else {
                 return Ok(None);
             };
+            if actor == agent {
+                let owner = match crate::accounts::harness_binding(&desired.desired)
+                    .map(|binding| binding.binding)
+                {
+                    Some(crate::accounts::Binding::Pool(person)) => Some(person),
+                    Some(crate::accounts::Binding::Account(account)) => self
+                        .desired_subject_with_writer(&format!("account/{account}"))?
+                        .and_then(|(account, _)| {
+                            crate::accounts::parse_account(&account.subject, &account.desired)
+                        })
+                        .and_then(|account| account.owner),
+                    None => None,
+                };
+                if let Some(owner) = owner.filter(|owner| owner.starts_with("person/")) {
+                    return Ok(Some(owner));
+                }
+            }
             let requester = desired
                 .owner_run
                 .as_deref()

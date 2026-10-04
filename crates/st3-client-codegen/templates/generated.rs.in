@@ -901,6 +901,8 @@ pub struct Agent {
     #[serde(default)]
     pub harness_state: Option<String>,
     #[serde(default)]
+    pub harness_error_state: Option<String>,
+    #[serde(default)]
     pub blocked_on: Option<String>,
     #[serde(default)]
     pub ask: Option<String>,

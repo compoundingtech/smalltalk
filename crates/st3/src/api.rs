@@ -2220,7 +2220,8 @@ fn client_agent_resources_uncached(
                 "runtime_ids": runtime_ids,
                 "owner_run_id": subject.owner_run,
                 "driver": driver,
-                "harness_state": harness_state,
+                "harness_state": harness_state.as_deref().map(|state| if state == "needs-login" { "unauthenticated" } else { state }),
+                "harness_error_state": (harness_state.as_deref() == Some("needs-login")).then_some("needs-login"),
                 "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
                 "ask": subject.harness.as_ref().and_then(|harness| harness.ask.as_deref()),
                 "reason": subject.harness.as_ref().and_then(|harness| harness.reason.as_deref()),
@@ -19456,7 +19457,8 @@ mission "agent-auth" state="ready" {
         }
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
-        assert_eq!(resources[0]["harness_state"], "needs-login");
+        assert_eq!(resources[0]["harness_state"], "unauthenticated");
+        assert_eq!(resources[0]["harness_error_state"], "needs-login");
         assert_eq!(resources[0]["state"], "waiting");
     }
 

@@ -544,7 +544,7 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
         while let Ok(event) = event_rx.try_recv() {
             match event {
                 SseMessage::Connected => {
-                    machine = EventMachine::default();
+                    machine.reseed_activity(EventMachine::default());
                     sse_connected = true;
                     session.diagnostics.clear(DiagnosticStage::Sse);
                     // Evidence turns on only once the level seed succeeds: resuming heartbeats
@@ -1020,7 +1020,7 @@ fn seed_from_server(
             seeded.seed_ask(id.to_string(), kind);
         }
     }
-    *machine = seeded;
+    machine.reseed_activity(seeded);
     Ok(())
 }
 
@@ -1068,6 +1068,15 @@ struct EventMachine {
 }
 
 impl EventMachine {
+    fn reseed_activity(&mut self, mut seeded: Self) {
+        // A reconnect replaces activity evidence, not the credential failure or its session.
+        // Otherwise an unrelated session's completion after reconnect could clear the refusal.
+        seeded.provider_auth = self.provider_auth;
+        seeded.auth_session = self.auth_session.clone();
+        seeded.auth_edge = self.auth_edge;
+        *self = seeded;
+    }
+
     fn seed_idle(&mut self) {
         self.seen_level = true;
     }
@@ -2386,6 +2395,10 @@ mod tests {
         assert_eq!(ended.state, Activity::Ended);
         assert_eq!(ended.reason.as_deref(), Some("providerAuth"));
         assert_eq!(ended.provider_auth, Some(false));
+        machine.reseed_activity(EventMachine::default());
+        let mut seed = EventMachine::default();
+        seed.seed_idle();
+        machine.reseed_activity(seed);
         machine.apply(&event(r#"{"type":"message.updated","properties":{"info":{"role":"assistant","sessionID":"ses_b","time":{"completed":1}}}}"#));
         assert_eq!(observed(&machine).provider_auth, Some(false));
         machine.apply(&event(
