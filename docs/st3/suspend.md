@@ -52,7 +52,7 @@ relaunches its harness on exactly that session:
 | Claude | `claude --resume ID` | the transcript is in the workspace's Claude project directory |
 | Codex | `codex --remote … resume THREAD`, then the control connection's `thread/resume` | the app-server accepts the thread |
 | pi | `pi --session TRANSCRIPT` | the seat's transcript has the session's header |
-| omp | `omp --resume ID` | the seat's transcript has the session's header |
+| omp | `omp --resume ID`, or `omp --resume TRANSCRIPT` for an explicit binding | the exact transcript has the session's header |
 | OpenCode | `opencode --session ID`, with delivery held to that session | the session is in `opencode.db`, and the server returns it |
 
 A driver that cannot resume ends the launch before the harness picks another session. It records
@@ -62,6 +62,24 @@ a `native-resume-unavailable` diagnostic whose status is the reason: `transcript
 native session. A different session (`native-session-mismatch`), no session within three minutes
 (`native-session-unbound`), or an exit before binding fails the resume. After a failed resume the
 seat stays suspended on the same snapshot, with the code and reason.
+
+### Explicit pi-family transcript paths
+
+OMP's session manager reports the actual `sessionFile` along with the native ID on
+session, ready, and session-switch frames. The publisher verifies that exact regular
+file's header names the reported ID, then binds its canonical path to the subject and
+incarnation. An externally resumed file need not live under managed `provider-sessions`.
+Conversation replay consumes this exact-incarnation binding, so a resumed transcript
+created before the current incarnation is readable without guessing a file by cwd or age.
+
+Ordinary continuation passes the recorded path through `ST3_NATIVE_CONTINUE_PATH`.
+Rollout restoration passes it through `ST3_NATIVE_RESUME_PATH`. Suspend/resume recovers
+the path from the durable binding for the suspended incarnation and snapshot's native
+ID, then uses the same resume-path carrier; the snapshot schema is unchanged. A changed
+binding fails with `snapshot-binding-changed`. Missing, unreadable, or foreign explicit
+files are refused rather than replaced with a managed transcript. Without an explicit
+path, fresh managed-session publication and ID-based OMP restoration remain unchanged.
+
 
 ## Phases
 

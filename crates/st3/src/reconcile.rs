@@ -5062,6 +5062,27 @@ impl<R: RuntimeControl> Reconciler<R> {
                     );
                 };
                 let mut resumed = member.clone();
+                // Recover the suspended incarnation's durable path, not the current launch's
+                // latest binding. The snapshot's existing native ID remains the resume fence.
+                if let (Some(incarnation), Some(harness)) =
+                    (suspension.incarnation_id.as_deref(), suspension.harness.as_deref())
+                {
+                    match suspended::bound_session_path(
+                        &self.store, agent, incarnation, harness, &session,
+                    ) {
+                        Ok(Some(path)) => {
+                            resumed.environment.insert(crate::rollout::RESUME_PATH_ENV.into(), path);
+                        }
+                        Ok(None) => {
+                            resumed.environment.remove(crate::rollout::RESUME_PATH_ENV);
+                        }
+                        Err(error) => {
+                            return self.fail_suspension(
+                                agent, suspension, "snapshot-binding-changed", format!("{error:#}"), Vec::new(),
+                            );
+                        }
+                    }
+                }
                 resumed
                     .environment
                     .insert(suspended::RESUME_ENV.into(), session);

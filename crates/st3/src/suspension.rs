@@ -259,6 +259,32 @@ pub fn bound_session(
         }))
 }
 
+/// Recover the path from the exact binding a suspension captured, without extending its snapshot.
+/// A later binding for another incarnation cannot substitute its transcript.
+pub fn bound_session_path(
+    store: &Store,
+    subject: &str,
+    incarnation: &str,
+    harness: &str,
+    session: &str,
+) -> Result<Option<String>> {
+    let Some(bound) = store
+        .claims_for(subject, Some("harness.session-file"))?
+        .into_iter()
+        .rev()
+        .find(|claim| field(claim, "incarnation_id") == Some(incarnation))
+    else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        field(&bound, "agent") == Some(subject)
+            && field(&bound, "harness") == Some(harness)
+            && field(&bound, "session_id") == Some(session),
+        "the suspended native session binding no longer matches its snapshot"
+    );
+    Ok(field(&bound, "path").map(str::to_owned))
+}
+
 /// The key of the diagnostic a driver records once when it cannot continue `session`.
 pub fn continue_unavailable_key(subject: &str, session: &str) -> String {
     format!("{CONTINUE_UNAVAILABLE_CODE}:{subject}:{session}")
@@ -430,6 +456,33 @@ pub fn annotate_quiescence(fields: &mut std::collections::BTreeMap<String, Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspension_recovers_only_its_exact_incarnation_transcript_path() {
+        let store = Store::open_memory("suspended-path").unwrap();
+        let owner = "agent/suspended-path";
+        let bind = |incarnation: &str, session: &str, path: &str| {
+            store.append_claim(&crate::model::ClaimInput {
+                subject: owner.into(), kind: "harness.session-file".into(), actor: Some(owner.into()),
+                fields: std::collections::BTreeMap::from([
+                    ("agent".into(), Value::from(owner)), ("harness".into(), Value::from("omp")),
+                    ("incarnation_id".into(), Value::from(incarnation)),
+                    ("session_id".into(), Value::from(session)), ("path".into(), Value::from(path)),
+                ]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        bind("suspended", "native", "/external/suspended.jsonl");
+        bind("replacement", "native", "/external/replacement.jsonl");
+        assert_eq!(
+            bound_session_path(&store, owner, "suspended", "omp", "native").unwrap(),
+            Some("/external/suspended.jsonl".into())
+        );
+        assert_eq!(bound_session_path(&store, owner, "missing", "omp", "native").unwrap(), None);
+        assert!(bound_session_path(&store, owner, "suspended", "pi", "native").is_err());
+        bind("suspended", "other", "/external/other.jsonl");
+        assert!(bound_session_path(&store, owner, "suspended", "omp", "native").is_err());
+    }
 
     #[test]
     fn only_an_idle_harness_with_nothing_pending_is_quiescent() {

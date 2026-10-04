@@ -47,7 +47,7 @@ const api = {
     if (synchronousContext) await events.get("context")({messages:[{role:"user",content}]},ctx);
   },
 };
-const ctx = { isIdle:()=>true,sessionManager:{getSessionId:()=>nativeSession,getEntries:()=>[]},ui:{notify:()=>{}} };
+const ctx = { isIdle:()=>true,sessionManager:{getSessionId:()=>nativeSession,getSessionFile:()=>path.join(dir,`${nativeSession}.jsonl`),getEntries:()=>[]},ui:{notify:()=>{}} };
 const read = ()=>fs.existsSync(frames)?fs.readFileSync(frames,"utf8").trim().split("\n").filter(Boolean).map(JSON.parse).filter(frame=>frame.type!=="keepalive"):[];
 const send = (frame)=>fs.appendFileSync(outgoing,JSON.stringify(frame)+"\n");
 const until = async(predicate)=>{for(let i=0;i<200;i++){if(predicate())return;await new Promise(r=>setTimeout(r,20));}throw new Error("smoke deadline");};
@@ -104,7 +104,7 @@ if (driver === "omp") {
   extension({...api, on:(name,handler)=>subEvents.set(name,handler),
     setSessionName:(name)=>{subTitle=name;}, sendUserMessage:(text)=>subHandoffs.push(text)});
   const subCtx = {...ctx,agent:{kind:"sub",depth:0},isIdle:()=>false,
-    sessionManager:{getSessionId:()=>"sub-session",getEntries:()=>[]}};
+    sessionManager:{getSessionId:()=>"sub-session",getSessionFile:()=>undefined,getEntries:()=>[]}};
   const state = globalThis.__stOmpChannel;
   const child = state.child;
   const pending = {messageId:"message/sub-proof"};

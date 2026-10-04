@@ -3873,30 +3873,38 @@ fn managed_omp_transcript(
         .ok_or_else(|| {
             format!("the OMP incarnation `{incarnation}` does not carry its start time")
         })?;
-    if let Some(claim) = state
+    let bindings = state
         .store
-        .latest_claim(owner, Some("harness.session-file"))
-        .map_err(|error| format!("reading the OMP session record failed: {error:#}"))?
-    {
-        let fields = claim.body.get("fields").unwrap_or(&claim.body);
-        if fields["harness"] == "omp"
+        .claims_for(owner, Some("harness.session-file"))
+        .map_err(|error| format!("reading the OMP session record failed: {error:#}"))?;
+    fn fields_of(claim: &crate::model::ClaimRecord) -> &Value {
+        claim.body.get("fields").unwrap_or(&claim.body)
+    }
+    let binding = bindings.iter().rev().find(|claim| {
+        let fields = fields_of(claim);
+        fields["harness"] == "omp"
+            && fields["agent"] == owner
+            && fields["incarnation_id"].as_str() == Some(incarnation)
+    }).or_else(|| bindings.iter().rev().find(|claim| {
+        // Import provenance is a separate binding authority, not a synthesized incarnation.
+        let fields = fields_of(claim);
+        fields["harness"] == "omp"
             && fields["agent"] == owner
             && fields["source_session"].as_str().is_some()
-            && let (Some(path), Some(native_id)) =
-                (fields["path"].as_str(), fields["session_id"].as_str())
-        {
-            return match crate::external_sessions::find_imported_omp_transcript(
-                Path::new(path),
-                native_id,
-            ) {
+            && fields["incarnation_id"].is_null()
+    }));
+    if let Some(claim) = binding {
+        let fields = fields_of(claim);
+        if let Some(path) = fields["path"].as_str() {
+            let native_id = fields["session_id"].as_str().ok_or_else(|| {
+                "the bound OMP transcript has no native session ID".to_owned()
+            })?;
+            let path = crate::native_resume::pi_family_reported_transcript(Path::new(path), native_id)
+                .ok_or_else(|| format!("the bound OMP session {native_id} is not readable or names another session"))?;
+            return match crate::external_sessions::find_imported_omp_transcript(&path, native_id) {
                 Ok(Some(session)) => Ok(session),
-                Ok(None) => {
-                    Err(format!("the imported OMP session {native_id} is not readable").into())
-                }
-                Err(error) => Err(format!(
-                    "reading the imported OMP session {native_id} failed: {error:#}"
-                )
-                .into()),
+                Ok(None) => Err(format!("the bound OMP session {native_id} is not readable").into()),
+                Err(error) => Err(format!("reading the bound OMP session {native_id} failed: {error:#}").into()),
             };
         }
     }
@@ -13097,6 +13105,53 @@ mission "example/zero-run" state="ready" {
                 .transcript
                 .is_err()
         );
+    }
+
+    #[test]
+    fn managed_omp_reads_only_the_exact_incarnation_external_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "external-omp-binding");
+        let owner = "agent/external-omp";
+        let incarnation = "123:2026-10-04T13:11:17.532Z";
+        let path = root.path().join("external.jsonl");
+        std::fs::write(&path, format!(
+            "{}\n{}\n",
+            json!({"type":"session","id":"bound","timestamp":"2026-10-01T14:31:46.246Z","cwd":"/tmp"}),
+            json!({"type":"message","id":"answer","timestamp":"2026-10-04T13:12:00Z","message":{"role":"assistant","content":[{"type":"text","text":"External resumed answer"}]}}),
+        )).unwrap();
+        let bind = |agent: &str, incarnation: &str, native: &str, path: &Path| {
+            state.store.append_claim(&ClaimInput {
+                subject: owner.into(), kind: "harness.session-file".into(), actor: Some(owner.into()),
+                fields: BTreeMap::from([
+                    ("harness".into(), json!("omp")), ("agent".into(), json!(agent)),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("session_id".into(), json!(native)), ("path".into(), json!(path)),
+                ]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        bind("agent/another", incarnation, "bound", &path);
+        assert!(managed_omp_transcript(&state, owner, incarnation).is_err());
+        bind(owner, incarnation, "bound", &path);
+        // A later report for another incarnation cannot steal the historical binding.
+        bind(owner, "124:2026-10-04T14:00:00Z", "foreign", &path);
+        let exact = managed_omp_transcript(&state, owner, incarnation).unwrap();
+        assert_eq!(exact.native_id, "bound");
+        assert_eq!(exact.transcript, std::fs::canonicalize(&path).unwrap());
+        assert!(crate::external_sessions::normalized_timeline(&exact).unwrap().iter()
+            .any(|entry| entry["body"]["text"] == "External resumed answer"));
+        assert!(managed_omp_transcript(&state, owner, "124:2026-10-04T14:00:00Z").is_err());
+        // Even a valid managed fallback cannot hide a broken explicit binding.
+        let managed = state.state_dir.join("drivers")
+            .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
+            .join("sessions/omp/provider-sessions");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join("2026-10-04T13-12-00-000Z_bound.jsonl"),
+            format!("{}\n", json!({"type":"session","id":"bound","timestamp":"2026-10-04T13:12:00Z"}))).unwrap();
+        std::fs::write(&path, "{\"type\":\"session\",\"id\":\"other\"}\n").unwrap();
+        assert!(managed_omp_transcript(&state, owner, incarnation).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(managed_omp_transcript(&state, owner, incarnation).is_err());
     }
 
     #[test]

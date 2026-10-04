@@ -276,13 +276,14 @@ pub fn pi_family_transcript(sessions: &Path, id: &str) -> Option<PathBuf> {
         .find(|path| pi_family_header_id(path).as_deref() == Some(id))
 }
 
-/// pi resumes by transcript path, omp by session ID. pi silently starts a new session at a
-/// path that does not exist, so both check the transcript first.
+/// pi resumes by transcript path; omp accepts a managed session ID or an explicit transcript.
+/// An explicit binding is authoritative: verify it and refuse rather than finding a substitute.
 pub fn pi_family_argv(
     driver: &str,
     argv: Vec<String>,
     sessions: &Path,
     id: &str,
+    reported_path: Option<&Path>,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
     refuse_authored(
@@ -298,14 +299,19 @@ pub fn pi_family_argv(
             "--no-session",
         ],
     )?;
-    let transcript = pi_family_transcript(sessions, id).ok_or_else(|| {
+    let transcript = match reported_path {
+        Some(path) => pi_family_reported_transcript(path, id),
+        None => pi_family_transcript(sessions, id),
+    }
+    .ok_or_else(|| {
         Refusal::new(
             "transcript-missing",
-            format!("{driver} session {id} has no transcript in {}", sessions.display()),
+            format!("{driver} session {id} has no matching readable transcript"),
         )
     })?;
     Ok(match driver {
-        "omp" => insert_after_program(argv, &["--resume", id]),
+        "omp" if reported_path.is_none() => insert_after_program(argv, &["--resume", id]),
+        "omp" => insert_after_program(argv, &["--resume", &transcript.to_string_lossy()]),
         _ => insert_after_program(argv, &["--session", &transcript.to_string_lossy()]),
     })
 }
@@ -470,7 +476,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi"]), &sessions, "one")
+            pi_family_argv("pi", argv(&["pi"]), &sessions, "one", None)
                 .unwrap_err()
                 .code,
             "transcript-missing"
@@ -482,15 +488,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi", "-e", "x"]), &sessions, "two").unwrap(),
+            pi_family_argv("pi", argv(&["pi", "-e", "x"]), &sessions, "two", None).unwrap(),
             argv(&["pi", "--session", &path.to_string_lossy(), "-e", "x"])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp"]), &sessions, "two").unwrap(),
+            pi_family_argv("omp", argv(&["omp"]), &sessions, "two", None).unwrap(),
             argv(&["omp", "--resume", "two"])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two")
+            pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two", None)
                 .unwrap_err()
                 .code,
             "authored-session-selection"
@@ -513,6 +519,36 @@ mod tests {
         );
         assert_eq!(pi_family_reported_transcript(root.path(), "one"), None);
         assert_eq!(pi_family_reported_transcript(&path, "../one"), None);
+    }
+
+    #[test]
+    fn pi_family_restores_the_exact_external_binding_without_managed_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("provider-sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let managed = sessions.join("time_one.jsonl");
+        fs::write(&managed, "{\"type\":\"session\",\"id\":\"one\"}\n").unwrap();
+        let external = root.path().join("external.jsonl");
+        fs::write(&external, "{\"type\":\"session\",\"id\":\"one\"}\n").unwrap();
+        for (driver, selector) in [("pi", "--session"), ("omp", "--resume")] {
+            assert_eq!(
+                pi_family_argv(driver, argv(&[driver]), &sessions, "one", Some(&external)).unwrap(),
+                argv(&[driver, selector, &fs::canonicalize(&external).unwrap().to_string_lossy()])
+            );
+            fs::write(&external, "{\"type\":\"session\",\"id\":\"other\"}\n").unwrap();
+            assert_eq!(
+                pi_family_argv(driver, argv(&[driver]), &sessions, "one", Some(&external))
+                    .unwrap_err().code,
+                "transcript-missing"
+            );
+            fs::remove_file(&external).unwrap();
+            assert_eq!(
+                pi_family_argv(driver, argv(&[driver]), &sessions, "one", Some(&external))
+                    .unwrap_err().code,
+                "transcript-missing"
+            );
+            fs::write(&external, "{\"type\":\"session\",\"id\":\"one\"}\n").unwrap();
+        }
     }
 
     #[test]
