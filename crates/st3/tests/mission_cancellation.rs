@@ -4,7 +4,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -38,11 +38,10 @@ impl Daemon {
     fn launch(&mut self) {
         let log = File::create(self.root.join("daemon.log")).unwrap();
         self.child = Some(
-            Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+            st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
                 .env_clear()
                 .env("HOME", &self.root)
-                .env("SHELL", "/bin/bash")
-                .env(
+                    .env(
                     "PATH",
                     format!(
                         "{}:{}",
@@ -82,7 +81,7 @@ impl Daemon {
     }
 
     fn command(&self, args: &[&str]) -> Value {
-        let output = Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
             .env_clear()
             .env("HOME", &self.root)
             .env("ST3_DAEMON_WAIT", "0")

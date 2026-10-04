@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use st3::client::Client;
 use st3::model::ClaimInput;
 
-const ST3: &str = env!("CARGO_BIN_EXE_st3");
+const ST3: &str = env!("CARGO_BIN_EXE_st3-fixture");
 const PERSON: &str = "person/fleet-tester";
 const NOTE: &str = "custom.fleet-test.note";
 
@@ -112,7 +112,7 @@ impl Node {
                 .map(|argument| (*argument).to_owned())
                 .collect(),
         );
-        let mut command = Command::new(&self.binary);
+        let mut command = st3::test_support::command(&self.binary);
         command
             .args(arguments)
             .current_dir(&self.root)
@@ -389,6 +389,10 @@ impl Node {
     }
 
     async fn note(&self, text: &str) -> String {
+        self.note_as(text, PERSON).await
+    }
+
+    async fn note_as(&self, text: &str, actor: &str) -> String {
         let claim: Value = self
             .client()
             .post(
@@ -396,7 +400,7 @@ impl Node {
                 &ClaimInput {
                     subject: format!("custom/fleet-test/{text}"),
                     kind: NOTE.into(),
-                    actor: Some(PERSON.into()),
+                    actor: Some(actor.into()),
                     fields: [("text".to_owned(), Value::String(text.into()))]
                         .into_iter()
                         .collect(),
@@ -828,6 +832,92 @@ fn authority_digest(node: &Node) -> String {
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_populated_standalone_daemon_founds_a_fleet_with_verified_person_and_agent_claims() {
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Node::new(root.path(), "studio");
+    a.start().await;
+    wait_until(
+        "the initial standalone checkpoint is sealed",
+        30,
+        || async {
+            a.claims()
+                .await
+                .iter()
+                .any(|claim| claim["kind"] == "checkpoint.sealed")
+        },
+    )
+    .await;
+    let agent = "agent/garden/worker";
+    let mut claims = vec![
+        a.note("person-before-founding").await,
+        a.note_as("agent-before-founding", agent).await,
+    ];
+    // No doctor, replication exchange or later checkpoint may seal the grants first.
+    let pending: u64 = rusqlite::Connection::open_with_flags(
+        a.state_dir().join("claims.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT COUNT(*) FROM claims WHERE kind='principal.key-granted'
+         AND NOT EXISTS (SELECT 1 FROM replica_envelopes WHERE batch_id=claims.batch_id)",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap();
+    assert!(
+        pending > 0,
+        "the regression needs unsealed delegation history"
+    );
+    a.stop();
+    a.create();
+    a.start().await;
+    claims.push(a.note("person-after-founding").await);
+    claims.push(a.note_as("agent-after-founding", agent).await);
+    a.restart().await;
+    claims.push(a.note_as("agent-after-another-restart", agent).await);
+    a.wait_listening().await;
+    let b = joined(root.path(), &a, "beacon", &[]).await;
+    b.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+    wait_until(
+        "the peer receives every person and agent claim",
+        60,
+        || async {
+            let received = b.claims().await;
+            claims
+                .iter()
+                .all(|id| received.iter().any(|claim| claim["id"] == id.as_str()))
+        },
+    )
+    .await;
+    for node in [&a, &b] {
+        let doctor = node.st_json(&["doctor"]);
+        let signatures = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "claim-signatures")
+            .unwrap();
+        assert_eq!(signatures["status"], "pass", "{}: {signatures}", node.name);
+        let connection = rusqlite::Connection::open_with_flags(
+            node.state_dir().join("claims.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        for id in &claims {
+            let (verdict, reason): (String, Option<String>) = connection
+                .query_row(
+                    "SELECT verdict, reason FROM claim_verdicts WHERE claim_id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(verdict, "verified", "{} claim {id}: {reason:?}", node.name);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1760,6 +1850,125 @@ async fn leave_drains_everything_before_it_leaves() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "orchard").await;
+    let b = joined(root.path(), &a, "meadow", &[]).await;
+    let mut c = joined(root.path(), &a, "grove", &[]).await;
+    c.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+    c.note("before-leave").await;
+    let before = BTreeSet::from(["custom/fleet-test/before-leave".to_owned()]);
+    wait_for_notes(&a, &before, 60, &[&a, &b, &c]).await;
+    wait_for_notes(&b, &before, 60, &[&a, &b, &c]).await;
+
+    c.st_ok(&[
+        "fleet",
+        "leave",
+        "--no-service",
+        "--wait",
+        "2m",
+        "--as",
+        PERSON,
+    ]);
+    c.restart().await;
+    // The same local store accepts writes after leaving; its old incarnation has ended.
+    c.note("after-leave-one").await;
+    c.note("after-leave-two").await;
+    c.stop();
+    c.name = "grove-returned".into();
+    fs::write(
+        c.root.join("config/st3/config.toml"),
+        format!("node = \"{}\"\nperson = \"{PERSON}\"\n", c.name),
+    )
+    .unwrap();
+    let code = a.invite(&c.name, &[]);
+    let joined = c.join(&code, &[]);
+    assert!(
+        joined.status.success(),
+        "rejoin failed: {}{}",
+        String::from_utf8_lossy(&joined.stdout),
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    c.start().await;
+    wait_until(
+        "both peers fence the old writer's post-leave envelopes",
+        90,
+        || async {
+            a.st_json(&["replication", "status"])["fenced_envelopes"]
+                .as_u64()
+                .is_some_and(|count| count >= 2)
+                && b.st_json(&["replication", "status"])["fenced_envelopes"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 2)
+        },
+    )
+    .await;
+    // Equal envelope inventories do not imply equal admitted claims. The old local history
+    // remains on the rejoining node; reporting must not delete it to manufacture equality.
+    let after = BTreeSet::from([
+        "custom/fleet-test/after-leave-one".to_owned(),
+        "custom/fleet-test/after-leave-two".to_owned(),
+    ]);
+    assert!(after.is_subset(&c.notes().await));
+    assert!(after.is_disjoint(&a.notes().await));
+    assert!(after.is_disjoint(&b.notes().await));
+    wait_until(
+        "rejoining node compares the common envelope inventory",
+        90,
+        || async {
+            let diff = c.st_json(&["replication", "diff", "orchard"]);
+            diff["authority"]["equal"] == true && diff["status"] == "up"
+        },
+    )
+    .await;
+    let diff = c.st_json(&["replication", "diff", "orchard"]);
+    let doctor = c.st(&["--json", "doctor"]);
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let admission = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "fleet-admission")
+        .unwrap();
+    let waited = c.st(&["fleet", "wait", "--timeout", "5s"]);
+    eprintln!(
+        "rejoin receipt: {}",
+        json!({
+            "diff": diff,
+            "admission": admission,
+            "wait_success": waited.status.success(),
+            "wait_stdout": String::from_utf8_lossy(&waited.stdout),
+            "wait_stderr": String::from_utf8_lossy(&waited.stderr),
+        })
+    );
+    assert_eq!(diff["graph"]["equal"], false, "{diff}");
+    assert!(
+        diff["differing_tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|table| table == "claim_sources"),
+        "{diff}"
+    );
+    assert!(
+        admission["message"]
+            .as_str()
+            .unwrap()
+            .contains("admitted beyond high water"),
+        "{admission}"
+    );
+    assert!(
+        !waited.status.success(),
+        "fleet wait accepted retained fenced history"
+    );
+    assert!(
+        String::from_utf8_lossy(&waited.stderr).contains("projects a different graph"),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_leave_already_refused_as_left_finishes_when_run_again() {
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
@@ -2226,6 +2435,11 @@ async fn an_old_build_config_peer_replicates_with_new_members() {
         wait_for_notes(node, &expected, 60, &[&o, &n1, &n2]).await;
     }
 
+    // The baseline predates the backup CLI. Export a private SQLite snapshot of its graph
+    // with the current envelope exporter, then restore the logical file at the current schema.
+    // This is also run by the existing exact fleet-compat CI invocation.
+    backup_baseline_graph(&o, root.path());
+
     // n1 and n2 move to membership while the old build keeps replicating with them.
     n1.stop();
     n1.migrate(&["--anchor"]);
@@ -2258,6 +2472,89 @@ async fn an_old_build_config_peer_replicates_with_new_members() {
         assert_eq!(status["unsigned_envelopes"], 0, "{}: {status}", node.name);
         assert_eq!(status["invalid_records"], 0, "{}: {status}", node.name);
     }
+}
+
+fn backup_baseline_graph(old: &Node, directory: &Path) {
+    let original = old.state_dir().join("claims.sqlite3");
+    let copy = directory.join("baseline-copy.db");
+    let reader = rusqlite::Connection::open_with_flags(
+        &original,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let old_schema: u32 = reader
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    reader
+        .execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+        .unwrap();
+    drop(reader);
+    // Capture the baseline's unchanged sync payloads before current code opens or migrates it.
+    let reader =
+        rusqlite::Connection::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let baseline_envelopes = reader
+        .prepare(
+            "SELECT writer,sequence,envelope_hash,previous_hash,accepted_at_unix_ms,payload
+         FROM replica_envelopes WHERE batch_id IS NOT NULL ORDER BY writer,sequence,envelope_hash",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok(st3::model::ReplicaEnvelope {
+                writer: row.get(0)?,
+                sequence: row.get(1)?,
+                hash: row.get(2)?,
+                previous_hash: row.get(3)?,
+                accepted_at_unix_ms: row.get::<_, String>(4)?.parse().unwrap(),
+                payload: row.get(5)?,
+                member_key: None,
+                signature: None,
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    drop(reader);
+    let archive = directory.join("baseline-claims.jsonl");
+    let header = st3::backup::create_from_database(&copy, &archive).unwrap();
+    let source = st3::store::Store::open(&copy, "backup-reader").unwrap();
+    let target = directory.join("baseline-restored.db");
+    let report = st3::backup::restore(&archive, &target).unwrap();
+    let restored = st3::store::Store::open(&target, &report.writer).unwrap();
+    assert!(old_schema <= header.source_schema);
+    assert_eq!(report.graph_digest, header.graph_digest);
+    assert!(report.projections_match);
+    let restored_envelopes = restored
+        .replica_envelopes(
+            baseline_envelopes
+                .iter()
+                .map(|envelope| st3::model::ReplicaEnvelopeId {
+                    writer: envelope.writer.clone(),
+                    sequence: envelope.sequence,
+                    hash: envelope.hash.clone(),
+                })
+                .collect(),
+        )
+        .unwrap();
+    assert!(!baseline_envelopes.is_empty());
+    assert_eq!(
+        serde_json::to_value(restored_envelopes).unwrap(),
+        serde_json::to_value(baseline_envelopes).unwrap()
+    );
+    assert_eq!(
+        source.replication_inventory().unwrap().digest,
+        restored.replication_inventory().unwrap().digest
+    );
+    assert_eq!(
+        source.backup_header().unwrap().tables,
+        restored.backup_header().unwrap().tables
+    );
+    assert!(
+        !restored
+            .claims_for("custom/fleet-test/o-0", None)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

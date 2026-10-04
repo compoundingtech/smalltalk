@@ -46,3 +46,25 @@ response reached the caller. Work still running when the daemon stops has no com
 SQLite reports a statement's time from its first step to its reset, at millisecond resolution. A
 query whose rows the caller processes one at a time includes that processing, so the outer query
 of a nested loop looks slow. Statement times from concurrent operations overlap.
+
+## Raw terminal cold opens
+
+Enable profiling on both the gateway and owner to separate admission work from transport work.
+Client requests record `admission/queue`, `admission/authenticate`, `admission/snapshot`, and
+`handler/queue`. Terminal operations record `terminal/live-fence`, `terminal/capability-lookup`,
+and `terminal/capability-consume`; the same record carries SQLite statement, read-wait, and
+writer-wait accounting.
+
+The gateway's raw stream records `raw/route`, `raw/dial` (including Fabric route resolution),
+`raw/tcp-dial`, `raw/peer-upgrade`, and `raw/peer-verify`. The owner's
+`GET /v1/peer/raw-terminal` operation records `raw/peer-authenticate`,
+`raw/owner-attachment`, and `raw/owner-open`. Peer upgrade includes the owner's admission and
+open work, so these nested durations must not be added together.
+
+Async spans measure wall time against their originating operation even when the future resumes
+on another thread. They do not attribute another thread's CPU or SQLite counters; the owner-local
+client request records provide that detail. Profiling remains off unless `ST3_PROFILE_DIR` is set.
+
+Capability admission seeks the attachment's indexed hash and its subject-head fence in one
+SQLite snapshot instead of decoding a bounded page of the whole fleet graph. Single-use CAS,
+session, person, and mode binding, expiry, and owner/incarnation checks remain unchanged.

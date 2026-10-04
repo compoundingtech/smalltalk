@@ -87,9 +87,10 @@ pub(super) async fn collection_stream(
             "the collection WebSocket requires exactly st3.client.collections.v0",
         ));
     }
+    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
     Ok(websocket
         .protocols([COLLECTION_SUBPROTOCOL])
-        .on_upgrade(move |socket| collection_stream_socket(socket, state, session)))
+        .on_upgrade(move |socket| collection_stream_socket(socket, state, session, presence)))
 }
 
 /// Read one bounded window. The whole read sees one SQLite snapshot, and the fence names
@@ -558,11 +559,17 @@ impl Drop for ConversationFollowers {
     }
 }
 
-async fn collection_stream_socket(socket: WebSocket, state: AppState, session: ClientSession) {
+async fn collection_stream_socket(
+    socket: WebSocket,
+    state: AppState,
+    session: ClientSession,
+    presence: super::client_presence::StreamGuard,
+) {
     collection_stream_socket_with_reader(
         socket,
         state,
         session,
+        Some(presence),
         |state, session, request| async move { collection_items(&state, &session, &request).await },
     )
     .await;
@@ -572,6 +579,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     mut socket: WebSocket,
     state: AppState,
     session: ClientSession,
+    presence: Option<super::client_presence::StreamGuard>,
     read: F,
 ) where
     F: Fn(AppState, ClientSession, CollectionSubscribe) -> Fut + Clone + Send + 'static,
@@ -616,6 +624,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             break 'command;
                         };
                         if request.kind == "unsubscribe" {
+                            if let Some(presence) = &presence { presence.unfollow(&request.id); }
                             subscriptions.remove(&request.id);
                             terminals.remove(&request.id);
                             conversations.stop(&request.id);
@@ -625,6 +634,14 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() + terminals.len() + conversations.0.len() >= COLLECTION_MAX_SUBSCRIPTIONS && !held {
                             if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
                             break 'command;
+                        }
+                        // What this client follows, for clients.list.
+                        if let Some(presence) = &presence {
+                            presence.follow(&request.id, match request.collection.as_str() {
+                                "conversation" => format!("conversation:{}", request.conversation.as_deref().unwrap_or_default()),
+                                "terminal" => format!("terminal:{}", request.terminal.as_deref().unwrap_or_default()),
+                                other => other.to_owned(),
+                            });
                         }
                         // A subscription with a held ID replaces it.
                         subscriptions.remove(&request.id);
@@ -1087,6 +1104,16 @@ pub(super) struct ClientSession {
 }
 
 impl ClientSession {
+    #[cfg(test)]
+    pub(super) fn for_tests(actor: &str, authority_actor: &str, transport: &'static str) -> Self {
+        Self {
+            actor: actor.into(),
+            authority_actor: authority_actor.into(),
+            transport,
+            scopes: std::collections::BTreeSet::new(),
+        }
+    }
+
     fn local(person: Option<&str>) -> Result<Self, ApiError> {
         if person.is_some_and(|person| {
             !(person.starts_with("person/") && person.matches('/').count() == 1
@@ -3127,12 +3154,28 @@ fn device_resources(
     snapshot: &ClientSnapshot,
     person: &str,
 ) -> Result<Vec<Value>, ApiError> {
-    let before = snapshot.store_index.checked_add(1);
-    let mut claims = state
-        .store
-        .claims_page(None, None, 0, before, false, 100_000)
-        .map_err(ApiError::internal)?
-        .claims;
+    // Unrelated traffic must not hide recent devices. Read only indexed pairing history,
+    // in bounded pages, at the requested snapshot; keep every page so old names and later
+    // revocations remain visible even after many pairings.
+    let mut claims = Vec::new();
+    for kind in [
+        "custom.client.pairing-begun",
+        "custom.client.pairing-completed",
+        "custom.client.pairing-revoked",
+    ] {
+        let mut before = snapshot.store_index.checked_add(1);
+        loop {
+            let page = state
+                .store
+                .claims_for_kind_at(kind, before, true, 256)
+                .map_err(ApiError::internal)?;
+            claims.extend(page.claims);
+            let Some(cursor) = page.next_cursor else {
+                break;
+            };
+            before = Some(cursor);
+        }
+    }
     claims.sort_by_key(|claim| claim.store_index);
     let mut paired = BTreeMap::<String, (&ClaimRecord, Option<&ClaimRecord>)>::new();
     let mut names = BTreeMap::<String, String>::new();
@@ -3199,6 +3242,43 @@ fn device_resources(
         .collect::<Vec<_>>();
     resources.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
     Ok(resources)
+}
+
+/// The clients connected to this member now and those seen in the last few minutes, newest
+/// first, with the paired device each person's session belongs to. Visibility only.
+pub(super) async fn clients_list(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let mut items = super::client_presence::list(&state.node, super::client_now_ms());
+    // A paired phone acts as person/NAME/session/ID: name its device.
+    let people = items
+        .iter()
+        .filter(|item| item["actor"].as_str().is_some_and(|actor| actor.contains("/session/")))
+        .filter_map(|item| item["person"].as_str().map(str::to_owned))
+        .filter(|person| person.starts_with("person/"))
+        .collect::<BTreeSet<_>>();
+    let mut devices = BTreeMap::<String, (Value, Value)>::new();
+    for person in people {
+        for device in device_resources(&state, &snapshot, &person)? {
+            if let Some(actor) = device["session_actor"].as_str() {
+                devices.insert(actor.to_owned(), (device["id"].clone(), device["name"].clone()));
+            }
+        }
+    }
+    for item in &mut items {
+        if let Some((id, name)) = item["actor"].as_str().and_then(|actor| devices.get(actor)) {
+            item["device_id"] = id.clone();
+            item["device_name"] = name.clone();
+        }
+    }
+    Ok(Json(json!({
+        "kind": "client-connections",
+        "member": super::client_host_id(&state.node),
+        "items": items,
+    })))
 }
 
 pub(super) async fn devices(
@@ -4848,10 +4928,13 @@ pub(super) async fn conversation_stream(
     } else {
         conversation_read_now(&state, &session, &session_id, query.after.as_deref())?;
     }
+    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
+    presence.follow("conversation", format!("conversation:{id}"));
     Ok(websocket
         .protocols([CONVERSATION_SUBPROTOCOL])
-        .on_upgrade(move |socket| {
-            conversation_stream_socket(socket, state, session, session_id, query.after, remote)
+        .on_upgrade(move |socket| async move {
+            let _presence = presence;
+            conversation_stream_socket(socket, state, session, session_id, query.after, remote).await
         }))
 }
 
@@ -5549,6 +5632,7 @@ fn remote_terminal_live_session(
     subject: &str,
     expected_incarnation: &str,
 ) -> Result<LiveSession, ApiError> {
+    let _span = crate::profile::span("terminal/live-fence");
     let status = state
         .store
         .status(Some(subject))
@@ -5872,9 +5956,14 @@ pub(super) async fn terminal_stream(
         query.incarnation.as_deref(),
         stream_capability,
     )?;
+    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
+    presence.follow("terminal", format!("terminal:{id}"));
     Ok(websocket
         .protocols([TERMINAL_SUBPROTOCOL])
-        .on_upgrade(move |socket| follow.run(state, TerminalSink::Socket(Box::new(socket)))))
+        .on_upgrade(move |socket| async move {
+            let _presence = presence;
+            follow.run(state, TerminalSink::Socket(Box::new(socket))).await
+        }))
 }
 
 /// A terminal viewer, checked and holding its consumed attachment, ready to follow.
@@ -6431,37 +6520,22 @@ fn consume_terminal_attachment_mode(
     capability: Option<&str>,
     raw_mode: Option<&str>,
 ) -> Result<(), ApiError> {
+    let lookup_span = crate::profile::span("terminal/capability-lookup");
     let capability = capability
         .filter(|value| !value.is_empty())
         .ok_or_else(|| forbidden("a terminal stream capability is required"))?;
     let digest = credential_digest(capability);
-    let claims = state
+    let (attached, is_current) = state
         .store
-        .claims_page(None, None, 0, None, true, 100_000)
-        .map_err(ApiError::internal)?;
-    let attached = claims
-        .claims
-        .iter()
-        .find(|claim| {
-            claim.kind == "custom.client.terminal-attached"
-                && claim
-                    .body
-                    .pointer("/fields/capability_hash")
-                    .and_then(Value::as_str)
-                    == Some(digest.as_str())
-        })
+        .terminal_attachment_for_capability_hash(&digest)
+        .map_err(ApiError::internal)?
         .ok_or_else(|| forbidden("the terminal stream capability is unknown"))?;
-    let latest = claims
-        .claims
-        .iter()
-        .filter(|claim| claim.subject == attached.subject)
-        .max_by_key(|claim| claim.store_index)
-        .ok_or_else(|| ApiError::internal("the terminal attachment has no head"))?;
+    drop(lookup_span);
     let field = |name: &str| attached.body.pointer(&format!("/fields/{name}"));
     let raw_live = raw_mode.map(|_| {
         remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation)
     }).transpose()?;
-    let valid = latest.id == attached.id
+    let valid = is_current
         && attached.origin == state.store.origin()
         && field("session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
         && field("raw_mode").and_then(Value::as_str) == raw_mode
@@ -6496,6 +6570,7 @@ fn consume_terminal_attachment_mode(
         // A projected-screen capability is a lease and stays valid for more streams.
         return Ok(());
     }
+    let _span = crate::profile::span("terminal/capability-consume");
     state
         .store
         .append_claim(&ClaimInput {
@@ -8866,6 +8941,7 @@ mod tests {
                             socket,
                             state,
                             ClientSession::local(None).unwrap(),
+                            None,
                             move |state, session, request| {
                                 let reads = reads.clone();
                                 async move {
@@ -10442,6 +10518,144 @@ subscription "watch/source" {
         let resources =
             device_resources(&state, &new_client_snapshot(&state), "person/alex").unwrap();
         assert_eq!(resources[0]["name"], "Alex's iPhone");
+    }
+
+    #[test]
+    fn device_projection_finds_new_pairings_after_unrelated_history() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let append = |subject: &str, kind: &str, fields: Value| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some("person/alex".into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let seed = append(
+            "message/history-seed",
+            "message.sent",
+            json!({
+                "from":"person/alex", "to":"person/blair", "content":"old history", "status":"sent"
+            }),
+        );
+        // Make a mature log without running 100,000 separate writer transactions. These
+        // unrelated fixture rows are never replicated or used by a projection.
+        let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
+        smallclaims::store::configure_projection_writer(&connection).unwrap();
+        connection
+            .execute(
+                "WITH RECURSIVE numbers(n) AS (
+                 SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<100000
+             )
+             INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body,
+                                predecessors, accepted_at_unix_ms)
+             SELECT printf('%064x', n), c.batch_id, c.subject, c.kind, c.origin,
+                    c.actor, c.body, c.predecessors, c.accepted_at_unix_ms
+             FROM numbers CROSS JOIN claims c WHERE c.id=?1",
+                [&seed.id],
+            )
+            .unwrap();
+        let subject = "custom/client/pairing-new-phone";
+        append(
+            subject,
+            "custom.client.pairing-begun",
+            json!({"device_name":"Alex's new phone"}),
+        );
+        let completed = append(
+            subject,
+            "custom.client.pairing-completed",
+            json!({
+                "device_id":"device/new-phone", "person_id":"person/alex",
+                "session_actor":"person/alex/session/new-phone", "scopes":["control.messages"],
+                "expires_at_unix_ms": client_now_ms() as u64 + 60_000,
+            }),
+        );
+        let snapshot = new_client_snapshot(&state);
+        let revoked = append(
+            subject,
+            "custom.client.pairing-revoked",
+            json!({"device_id":"device/new-phone"}),
+        );
+        let resources = device_resources(&state, &snapshot, "person/alex").unwrap();
+        assert_eq!(
+            resources.len(),
+            1,
+            "new pairings must survive unrelated history"
+        );
+        assert_eq!(resources[0]["name"], "Alex's new phone");
+        assert_eq!(resources[0]["revision"], completed.id);
+        assert_eq!(
+            resources[0]["state"], "active",
+            "a later revocation cannot change an older snapshot"
+        );
+        let current =
+            device_resources(&state, &new_client_snapshot(&state), "person/alex").unwrap();
+        assert_eq!(current[0]["revision"], revoked.id);
+        assert_eq!(current[0]["state"], "revoked");
+        assert!(
+            device_resources(&state, &snapshot, "person/blair")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn device_projection_keeps_pairings_across_history_pages() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        for index in 0..300 {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: format!("custom/client/pairing-{index}"),
+                    kind: "custom.client.pairing-completed".into(),
+                    actor: Some("person/alex".into()),
+                    fields: serde_json::from_value(json!({
+                        "device_id":format!("device/{index:03}"),
+                        "person_id": if index % 2 == 0 { "person/alex" } else { "person/blair" },
+                        "session_actor":format!("person/alex/session/{index}"),
+                        "expires_at_unix_ms":client_now_ms() as u64 + 60_000,
+                    }))
+                    .unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/client/pairing-0".into(),
+                kind: "custom.client.pairing-revoked".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::from([("device_id".into(), json!("device/000"))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let resources = device_resources(&state, &snapshot, "person/alex").unwrap();
+        assert_eq!(resources.len(), 150);
+        assert_eq!(resources[0]["id"], "device/000");
+        assert_eq!(resources[0]["state"], "revoked");
+        assert_eq!(resources[149]["id"], "device/298");
+        assert!(
+            resources
+                .iter()
+                .all(|device| device["person_id"] == "person/alex")
+        );
+        let other = device_resources(&state, &snapshot, "person/blair").unwrap();
+        assert_eq!(other.len(), 150);
+        assert!(other.iter().all(|device| device["state"] == "active"));
     }
 
     #[test]

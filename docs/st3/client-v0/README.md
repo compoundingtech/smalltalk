@@ -12,6 +12,11 @@ local Unix socket and authenticated paired HTTP over Tailscale or optional Fabri
 [`clients/typescript/st3-client`](../../../clients/typescript/st3-client). Regenerate all three
 clients' contract tables with `cargo run -p st3-client-codegen`;
 CI and local verification use `cargo run -p st3-client-codegen -- --check` for byte stability.
+The contract digest is written once, in `crates/st3-client/src/contract.rs`. When generated
+client files conflict in a merge, resolve the schema and template files, take either side of every
+generated file (`git checkout --theirs -- clients crates/st3-client/src/contract.rs
+crates/st3-client/src/generated.rs`), and run the generator again; never edit generated files by
+hand.
 
 `ResourceHeader.operational` describes current versus historical state, actionability, reasons,
 and optional owner-generation/runtime-incarnation identities. Work also exposes `agentless`,
@@ -305,6 +310,30 @@ its end is `validation-failed`. `limits` lists each account's freshest limits re
 host it was measured, and the seats whose newest reading names the account. A harness that does
 not report a value leaves it out. The Rust method is `Client::usage_period(since_ms, until_ms)`;
 Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
+
+### Clients connected now
+
+A client may name itself and its build in an `x-st3-client` header on every request and stream,
+for example `stui 0.1.0+a0c135e3`, `smalltalk-ios 1.0 (42)` or `st 0.1.0+a0c135e3`. The Rust
+crate sends what `st3_client::set_client_name` was given; the TypeScript client takes `client` in
+its options, and Swift `client:` in its initializer. The header is optional, and st shows it as
+reported: it is never identity or authority, and no client is refused, slowed or warned for its
+version.
+
+Each member keeps, in memory only, the clients connected to it now: every open collection,
+conversation or terminal stream, and every client that made a request in the last five minutes.
+`GET /v1/client/clients` (`clients.list`, which requires `read.projections`) reads them as
+`ClientConnections { kind: "client-connections", member, items }`, newest first. Each
+`ClientConnection` has the acting session (`actor`), the person or agent whose authority it
+uses (`person`), the reported `client`, the paired `device_id` and `device_name` when a paired
+device's session is acting, the `member` it reached, `via` (`local` for the member's own Unix
+socket; `gateway` for a paired device through the client gateway, which a Tailscale forward and
+Fabric both reach, so st cannot tell them apart; `tailscale` when Tailscale Serve names itself),
+whether it is `connected` now with how many open `streams`, `since` and `last_seen`, and what it
+`follows`: windows by name, `conversation:ID` and `terminal:ID`. Another member's clients are on
+that member's list. The Rust method is `Client::clients_list()`, Swift `clientsList()` and
+TypeScript `clientsList()`. `st clients` (or `--json`) prints the list, and `st devices ls` adds
+"connected now" or "last seen" with the reported build to each paired device.
 
 
 `operations` is the client-safe operational view: daemon health, host reachability, transport

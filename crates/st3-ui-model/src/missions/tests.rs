@@ -340,3 +340,42 @@ fn ready_work_is_unclaimed_queued_or_unstaffed_from_the_agents_queue() {
     model.agents[0].state = "failed".into();
     assert_eq!(project(&model)[0].word, Word::Unstaffed);
 }
+
+#[test]
+fn duplicate_paths_keep_run_identity_and_the_actual_seat_after_pipeline_sort() {
+    let run = |id: &str, state: &str, claimant: Option<&str>, agentless: bool| {
+        json!({
+            "id": format!("mission-run/{id}"), "requester": "person/avery",
+            "status": "running", "phase": "normal", "progress": {},
+            "current_steps": [], "state_since": "2026-09-29T09:58:00Z",
+            "must_act": "agent",
+            "steps": [{
+                "id": format!("step-run/{id}/build"), "path": "build", "state": state,
+                "attempt": 1, "assignee": "agent/assigned", "claimant": claimant,
+                "agentless": agentless, "since": "2026-09-29T09:58:00Z",
+            }],
+        })
+    };
+    let model = Inputs {
+        missions: window(vec![json!({
+            "id": "mission/build", "revision": "r", "updated_at": "2026-09-29T09:58:00Z",
+            "title": "build", "state": "running", "mission_revision": "r",
+            "runs": ["mission-run/a", "mission-run/b", "mission-run/c"],
+            "run_details": [
+                run("a", "waiting", None, false),
+                run("b", "working", Some("agent/claimant"), false),
+                run("c", "completed", Some("agent/obsolete"), true),
+            ],
+        })]),
+        ..Inputs::default()
+    };
+    let missions = project(&model);
+    let identities = missions[0].steps.iter()
+        .map(|step| (step.id.as_str(), step.seat.as_deref(), step.state))
+        .collect::<Vec<_>>();
+    assert_eq!(identities, [
+        ("step-run/c/build", None, StepState::Done),
+        ("step-run/b/build", Some("agent/claimant"), StepState::Working),
+        ("step-run/a/build", Some("agent/assigned"), StepState::Waiting),
+    ]);
+}

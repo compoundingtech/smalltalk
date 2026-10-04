@@ -4430,6 +4430,7 @@ dependencies = [
  "smallclaims",
  "st-drivers",
  "st-runtime",
+ "st3",
  "st3-client",
  "st3-conversation-ui",
  "st3-schema",
@@ -4491,6 +4492,21 @@ dependencies = [
  "serde_json",
  "st3-client",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "st3-feed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "st3",
+ "st3-client",
+ "st3-conversation-ui",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4594,6 +4610,7 @@ dependencies = [
  "st3",
  "st3-client",
  "st3-conversation-ui",
+ "st3-feed",
  "st3-ui-model",
  "tempfile",
  "tokio",

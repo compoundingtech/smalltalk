@@ -5,10 +5,12 @@
 
 mod action_coverage;
 mod agents_restart;
+mod backup;
 mod boot_canaries;
 mod broken_gates;
 mod client_creation;
 mod client_glasses;
+mod client_presence;
 mod client_v0_cli;
 mod client_v0_contract;
 mod codex_bootstrap;
@@ -19,6 +21,7 @@ mod daemon_cost;
 mod daemon_load;
 mod daemon_environment;
 mod daemon_restart;
+mod driver_incarnation;
 mod delivery_probe;
 mod examples;
 mod fault_isolation;
@@ -26,6 +29,7 @@ mod first_sync;
 mod fleet;
 mod gate_kinds;
 mod getting_started;
+mod hermetic;
 mod hook_telemetry;
 mod human_gates;
 mod idle_budget;

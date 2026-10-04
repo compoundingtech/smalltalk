@@ -3,6 +3,7 @@ pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
 mod resources;
+mod rollouts;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -87,6 +88,7 @@ pub use smallclaims::store::{
 
 mod accounts;
 mod attention_snapshot;
+mod backup;
 mod checkpoint_rules;
 mod limits;
 mod person_work;
@@ -172,9 +174,15 @@ const MAX_STEP_EXTENSION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// smalltalk's projection tables, and the indexes its folds read the claim log through. The
 /// graph creates its own tables first; see `smallclaims::store::SCHEMA`.
 const SCHEMA: &str = r#"
+-- An unmanaged member's staging check needs tagged claims, not its runtime history.
+CREATE INDEX IF NOT EXISTS claims_owned_set_subject_index ON claims(subject)
+WHERE json_extract(body,'$.owned_set') IS NOT NULL;
 CREATE INDEX IF NOT EXISTS claims_terminal_history_index ON claims(store_index)
 WHERE kind IN ('mission-run.state','step-run.state','work.failed')
   AND json_extract(body,'$.fields.status') IN ('failed','cancelled','completed');
+CREATE INDEX IF NOT EXISTS claims_terminal_capability_hash_index
+ON claims(json_extract(body, '$.fields.capability_hash'), store_index)
+WHERE kind='custom.client.terminal-attached';
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -1186,6 +1194,16 @@ struct ChildMissionContext {
     root_run_id: String,
     parent_step_run: String,
     default_selector: Option<WorkSelector>,
+}
+
+fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str) -> Result<Option<String>> {
+    let Some(requested) = claim_by_id_tx(connection, discovery)?.filter(|claim|
+        claim.subject == resource && claim.body.pointer("/fields/kind").and_then(Value::as_str) == Some("vcs.ref")) else { return Ok(None); };
+    let Some(current) = latest_actual(connection, resource)?.and_then(|actual| actual.get("facts").cloned()) else { return Ok(None); };
+    let requested_head = requested.body.pointer("/fields/facts/head").and_then(Value::as_str);
+    if let Some((requested, current)) = requested_head.zip(current.get("head").and_then(Value::as_str))
+        && requested != current { return Ok(Some(format!("ref {resource} moved from head {requested} to {current}"))); }
+    Ok(None)
 }
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
@@ -2274,6 +2292,9 @@ impl Store {
         Ok(Self { graph, smalltalk })
     }
 
+    /// Open a shared-memory store for sequential fixtures and short-lived tools.
+    /// Concurrent server tests should use [`Self::open`]: shared-cache read/write
+    /// contention returns `SQLITE_LOCKED` immediately instead of waiting.
     pub fn open_memory(origin: impl Into<String>) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::default());
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -3101,7 +3122,7 @@ impl Store {
         &self,
         request: &MissionRunRequest,
     ) -> Result<MissionRunView, St3Error> {
-        self.create_mission_run_inner(request, None, None)
+        self.create_mission_run_inner(request, None, None, None)
     }
 
     pub fn mission_run_subject_for_idempotency_key(&self, idempotency_key: &str) -> String {
@@ -3132,6 +3153,7 @@ impl Store {
                 parent_step_run: normalize_step_run(parent_step_run),
                 default_selector: default_selector.cloned(),
             }),
+            None,
             None,
         )
     }
@@ -3167,7 +3189,18 @@ impl Store {
             parent_step_run: normalize_step_run(schedule),
             default_selector: None,
         });
-        self.create_mission_run_inner(request, child, Some(&subject))
+        self.create_mission_run_inner(request, child, Some(&subject), None)
+    }
+
+    pub fn create_subscription_mission_run(&self, request: &MissionRunRequest,
+        parent: Option<&MissionRunView>, subscription: &str, resource: &str, discovery: &str,
+    ) -> Result<MissionRunView, St3Error> {
+        let child = parent.map(|parent| ChildMissionContext {
+            root_revision: parent.root_revision.clone(),
+            root_run_id: parent.root_mission_run.trim_start_matches("mission-run/").into(),
+            parent_step_run: normalize_step_run(subscription), default_selector: None,
+        });
+        self.create_mission_run_inner(request, child, None, Some((resource, discovery)))
     }
 
     fn create_mission_run_inner(
@@ -3175,6 +3208,7 @@ impl Store {
         request: &MissionRunRequest,
         child: Option<ChildMissionContext>,
         occurrence_subject: Option<&str>,
+        latest_ref: Option<(&str, &str)>,
     ) -> Result<MissionRunView, St3Error> {
         let mission_id = request
             .mission
@@ -3254,6 +3288,10 @@ impl Store {
         }
         let transaction = connection.transaction().map_err(internal)?;
         owned_sets::guard_mission_start(&transaction, mission_id)?;
+        if let Some((resource, discovery)) = latest_ref
+            && let Some(reason) = stale_ref_request_tx(&transaction, resource, discovery).map_err(internal)? {
+            return Err(St3Error::new("stale-ref-head", reason));
+        }
         let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
         enforce_mission_run_capacity(&transaction, &mission)?;
         let subject = occurrence_subject.map(str::to_owned).unwrap_or_else(|| {
@@ -6629,6 +6667,9 @@ impl Store {
                 {
                     return serde_json::from_str(&response).map_err(internal);
                 }
+                if action == "claim" && rollouts::intake_held(transaction, &actor, &subject)? {
+                    return Err(St3Error::new("seat-rollout-draining", "the seat holds new work intake while its rollout drains; existing work may finish"));
+                }
                 let current = transaction
                     .query_row(
                         "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
@@ -7600,7 +7641,9 @@ impl Store {
                     .as_ref()
                     .filter(|row| row.kind == "agent")
                     .and_then(|row| row.member.as_deref())
-                    .and_then(|launched| serde_json::from_str::<crate::model::MemberSpec>(launched).ok())
+                    .and_then(|launched| {
+                        serde_json::from_str::<crate::model::MemberSpec>(launched).ok()
+                    })
                     .map(|launched| member.launch_changes(&launched))
                     .unwrap_or_default();
                 actions.push(if changes.is_empty() {
@@ -11803,10 +11846,11 @@ impl Store {
             "normal" => 2,
             _ => 3,
         };
+        // Most urgent first, and within that the newest first (Nathan, 2026-10-04).
         live.sort_by(|left, right| {
             priority(left)
                 .cmp(&priority(right))
-                .then_with(|| left.requested_at_unix_ms.cmp(&right.requested_at_unix_ms))
+                .then_with(|| right.requested_at_unix_ms.cmp(&left.requested_at_unix_ms))
                 .then_with(|| left.subject.cmp(&right.subject))
                 .then_with(|| left.person.cmp(&right.person))
                 .then_with(|| left.episode.cmp(&right.episode))
@@ -13073,6 +13117,12 @@ impl Store {
         Ok(None)
     }
 
+    /// Unstarted ref deliveries collapse to the latest observed head. Running missions
+    /// retain their pinned discovery and exact CI gate, even when the ref moves again.
+    pub fn stale_ref_request(&self, resource: &str, discovery: &str) -> Result<Option<String>> {
+        stale_ref_request_tx(&self.readers.get(), resource, discovery)
+    }
+
     pub fn authoring_review_owner(&self, discovery: &str) -> Result<Option<String>> {
         let Some(claim) = self.claim_by_id(discovery)? else {
             return Ok(None);
@@ -13631,6 +13681,31 @@ impl Store {
         }
         result.sort_by(|a, b| b["total_tokens"].as_u64().cmp(&a["total_tokens"].as_u64()));
         Ok(result)
+    }
+
+    /// Resolve a terminal capability and its current-head fence with two indexed seeks, in
+    /// one SQLite snapshot. Unrelated fleet history cannot hide an unexpired capability.
+    pub fn terminal_attachment_for_capability_hash(
+        &self,
+        digest: &str,
+    ) -> Result<Option<(ClaimRecord, bool)>> {
+        let connection = self.readers.get();
+        Ok(connection
+            .prepare_cached(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                        predecessors, accepted_at_unix_ms,
+                        NOT EXISTS (
+                            SELECT 1 FROM claims AS newer
+                            WHERE newer.subject=claims.subject
+                              AND newer.store_index>claims.store_index
+                        )
+                 FROM claims
+                 WHERE kind='custom.client.terminal-attached'
+                   AND json_extract(body, '$.fields.capability_hash')=?1
+                 ORDER BY store_index DESC LIMIT 1",
+            )?
+            .query_row([digest], |row| Ok((claim_from_row(row)?, row.get(10)?)))
+            .optional()?)
     }
 
     /// Bounded claim history for one subject/kind projection, backed by the composite index.
@@ -18240,7 +18315,9 @@ fn message_view_tx(
         attachments: actual
             .get("attachments")
             .cloned()
-            .and_then(|value| serde_json::from_value::<Vec<crate::model::MessageAttachment>>(value).ok())
+            .and_then(|value| {
+                serde_json::from_value::<Vec<crate::model::MessageAttachment>>(value).ok()
+            })
             .unwrap_or_default()
             .into_iter()
             .filter(|attachment| {
@@ -28244,6 +28321,40 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn terminal_capability_lookup_fences_the_subject_head_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graph.db");
+        let store = Store::open(&path, "node").unwrap();
+        let append = |subject: &str, kind: &str| {
+            store.append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: None,
+                fields: BTreeMap::from([("capability_hash".into(), json!("secret-digest"))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap()
+        };
+        let attached = append("custom/client/attachment-a", "custom.client.terminal-attached");
+        append("custom/client/decoy", "custom.client.other");
+        assert_eq!(
+            store.terminal_attachment_for_capability_hash("secret-digest").unwrap()
+                .map(|(claim, current)| (claim.id, current)),
+            Some((attached.id.clone(), true)),
+        );
+        assert!(store.terminal_attachment_for_capability_hash("unknown").unwrap().is_none());
+        append("custom/client/attachment-a", "custom.client.terminal-consumed");
+        drop(store);
+        let reopened = Store::open(&path, "node").unwrap();
+        assert_eq!(
+            reopened.terminal_attachment_for_capability_hash("secret-digest").unwrap()
+                .map(|(claim, current)| (claim.id, current)),
+            Some((attached.id, false)),
+        );
+    }
 
     mod mailbox_fence_tests {
         use super::*;
@@ -46440,6 +46551,9 @@ fn append_claim_with_fences(
                 let message = message_view_tx(transaction, &input.subject, index).map_err(internal)?;
                 if message.to != fence.subject || input.actor.as_deref() != Some(&fence.subject) {
                     return Err(St3Error::new("wrong-message-recipient", "receipt belongs to another seat"));
+                }
+                if input.kind == "message.staged" && !rollouts::message_allowed(transaction, &message)? {
+                    return Err(St3Error::new("seat-rollout-draining", "new independent delivery waits for the seat rollout"));
                 }
                 matches!((input.kind.as_str(), message.status.as_str()),
                     ("message.staged", "delivered" | "read" | "closed") | ("message.delivered", "read" | "closed") | ("message.read", "closed"))

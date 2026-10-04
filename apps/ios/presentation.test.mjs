@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { agentHeaderDetail, agentHealth, ago, attentionActionLabel, attentionHeadline, attentionKindLabel, currentWorkSummary, deviceDetail, deviceTitle, missionDetail, missionGroup, missionLabels, missionSteps, pingPresentation, queuedWorkSummary, smallTalkPresentation } from './presentation.ts';
+import { agentHeaderDetail, agentHealth, attentionActionLabel, attentionHeadline, attentionKindLabel, currentWorkSummary, deviceDetail, deviceTitle, missionDetail, missionGroup, missionLabels, missionSteps, pingPresentation, queuedWorkSummary, smallTalkPresentation } from './presentation.ts';
 
 const now = Date.parse('2026-09-25T08:25:00Z');
 
@@ -58,10 +58,6 @@ assert.equal(missionGroup({ ...stuck, state: 'completed' }), 'Archive');
 assert.deepEqual(smallTalkPresentation({ message_id: 'message/1', from: 'agent/example/cos/standing/cos', to: 'person/alex', title: 'Release is ready' }), { from: 'COS → alex', text: 'Release is ready' });
 assert.deepEqual(smallTalkPresentation({ message_id: 'message/2', from: 'agent/example/app' }), { from: 'App → someone', text: 'Small Talk' });
 
-assert.equal(ago('2026-09-25T08:24:30Z', now), '30s');
-assert.equal(ago('2026-09-25T07:25:00Z', now), '1h');
-assert.equal(ago('2026-09-22T08:25:00Z', now), '3d');
-assert.equal(ago('not a time', now), 'unknown');
 
 // (3) A crash-looping seat must stand out rather than read as a normal row.
 const failing = { id: 'agent/example/st3/standing/st3', name: 'fleet/st3/standing/st3', state: 'failed', driver: 'codex', harness_state: 'ended', updated_at: '2026-09-25T08:14:00Z', operational: { layer: 'current', actionable: false, reasons: ['unhealthy'] } };

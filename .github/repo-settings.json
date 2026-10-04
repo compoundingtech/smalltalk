@@ -59,6 +59,10 @@
               {
                 "context": "genie-freshness",
                 "integration_id": 15368
+              },
+              {
+                "context": "typescript-client",
+                "integration_id": 15368
               }
             ]
           }

@@ -15,6 +15,30 @@ pub(super) async fn preview(
     if let Some(error) = publication_refusals(&state, &intent).await?.error() {
         preview.blockers.push(error.message);
     }
+    if preview.rollout.is_some() {
+        for (subject, effect) in &preview.effects {
+            if !effect.starts_with("drain") {
+                continue;
+            }
+            let actual = state
+                .store
+                .latest_actual_value(subject)
+                .map_err(ApiError::internal)?;
+            let incarnation = actual.as_ref().and_then(|a| a["incarnation_id"].as_str());
+            let blocking = match incarnation {
+                Some(incarnation) => {
+                    crate::suspension::blockers(&state.store, subject, incarnation)
+                        .map_err(ApiError::internal)?
+                }
+                None => vec!["runtime-unknown".into()],
+            };
+            preview.rollouts.insert(
+                subject.clone(),
+                json!({"action":if effect.contains("retire") {"retire"} else {"cutover"},
+                "incarnation":incarnation,"blocking":blocking,"policy":preview.rollout}),
+            );
+        }
+    }
     Ok(Json(preview))
 }
 
@@ -85,9 +109,28 @@ fn resource(state: &AppState, view: sets::View) -> anyhow::Result<Value> {
                 .launch_lineage(&subject)
                 .is_ok_and(|lineage| lineage.contains(token))
         });
-        let running = actual == Some("running") && launch_current;
+        let operation = state.store.rollout(&subject)?;
+        let verified = operation.as_ref().is_none_or(|o| o.phase == "running");
+        let running = actual == Some("running") && launch_current && verified;
+        let phase = if !view.blockers.is_empty() {
+            "blocked"
+        } else if let Some(operation) = &operation {
+            operation.phase.as_str()
+        } else if member.kind == "mission" || member.kind == "schedule" {
+            if retired { "retired" } else { "published" }
+        } else if retired && actual == Some("running") {
+            "retirement-pending"
+        } else if retired && matches!(actual, Some("stopped" | "exited" | "vanished" | "absent")) {
+            "retired"
+        } else if running {
+            "running"
+        } else if actual.is_none() {
+            "unknown"
+        } else {
+            "pending"
+        };
         statuses.push(json!({"subject":subject,"desired_token":member.claim,"launched_token":launched,"incarnation":incarnation,
-            "retired":retired,"launch_current":launch_current,"rollout":if !view.blockers.is_empty(){"blocked"}else if retired && actual==Some("running"){"retirement-pending"}else if retired{"retired"}else if running{"running"}else if member.kind=="mission"||member.kind=="schedule"{"published"}else{"pending"}}));
+            "retired":retired,"launch_current":launch_current,"rollout":phase,"operation":operation}));
     }
     value["members_status"] = json!(statuses);
     let mut replicas = state
@@ -181,7 +224,7 @@ fn detail(state: &AppState, id: &str, sha: Option<String>) -> Result<Value, ApiE
                 })
             });
         value["commit_status"] = json!({"sha":sha,"published":true,"visible_local":true,
-            "superseded":superseded,"running":running,"receipts":receipts});
+            "superseded":superseded,"running":running,"satisfied":running,"receipts":receipts});
         return Ok(value);
     }
     resource(state, selected).map_err(ApiError::internal)

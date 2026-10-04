@@ -1613,7 +1613,18 @@ partition; a cold member needs a peer exchange before starting scheduled work.
 
 The mission steps are normal claimable work. A schedule does not start another occurrence while its prior mission run remains active.
 
-Only the host that requested an occurrence's work starts it. The request can name a mission revision
+Only the schedule's owning host arms occurrences, requests work, and creates its workspaces and
+mission runs. An omitted `host` or `host "local"` means the selected declaration's originating host,
+including for schedules declared by a mission run; replication does not make each receiving member
+an owner. An explicit host selects that member. The owning host can also start an old request
+recorded by another member, so requests made by older daemons do not block the schedule forever.
+
+An unavailable workspace leaves its request pending. The owning daemon retries at most once every
+30 seconds per schedule and records each unchanged `workspace-unavailable` diagnostic once per
+schedule and code, including across daemon restarts. A different failure reason can surface a new
+diagnostic; another schedule's diagnostic cannot defeat this deduplication.
+
+The request can name a mission revision
 or owner run that has not reached that host yet. Then it stays pending, and the schedule records a
 `reconcile.fault` naming the cause. A request that cannot start for any other reason records
 `schedule.work-failed`, and the schedule fires again at its next occurrence.

@@ -34,7 +34,7 @@ fn a_seats_subagents_appear_renew_and_end() {
             "python3",
         ])
         .arg(repo.join("scripts/st3-subagents-eval/run"))
-        .arg(env!("CARGO_BIN_EXE_st3"))
+        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
         .output()
         .expect("run the subagent seat eval");

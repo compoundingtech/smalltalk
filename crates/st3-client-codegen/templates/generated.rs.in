@@ -326,6 +326,40 @@ pub struct DocumentContent {
     pub bytes: Vec<u8>,
 }
 
+/// The clients connected to one member now and those seen in the last few minutes, newest first.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ClientConnections {
+    pub kind: String,
+    pub member: String,
+    pub items: Vec<ClientConnection>,
+}
+/// One client, person or agent, and way in: what it says it is, as it said it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ClientConnection {
+    /// The session acting: `person/NAME`, `person/NAME/session/ID` for a paired device, or an agent.
+    pub actor: String,
+    /// The person or agent whose authority the session uses.
+    pub person: String,
+    /// The client's own `x-st3-client` name and build; absent when it sent none.
+    #[serde(default)]
+    pub client: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    pub member: String,
+    /// `local`, `gateway` (a paired device over Tailscale or Fabric) or `tailscale`.
+    pub via: String,
+    /// An open stream right now.
+    pub connected: bool,
+    pub streams: u64,
+    pub since: String,
+    pub last_seen: String,
+    /// Windows, `conversation:ID` and `terminal:ID` it follows.
+    #[serde(default)]
+    pub follows: Vec<String>,
+}
+
 /// Token spend over a period, one row per agent, mission run, step, model, account and host.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsagePeriod {
@@ -915,6 +949,8 @@ pub struct Agent {
     /// Placement handoff phase and the sources still holding its fence.
     #[serde(default)]
     pub handoff: Option<AgentHandoff>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<Value>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentHandoff {
@@ -1366,6 +1402,73 @@ pub enum Resource {
     Session(Session),
     Glass(Glass),
     OwnedSet(OwnedSet),
+    /// A kind this client does not know, from a member newer than it. It keeps the header and
+    /// the whole resource as sent, so an older client skips it or shows it plainly instead of
+    /// failing the page it came in.
+    #[serde(untagged)]
+    Unknown(UnknownResource),
+}
+
+/// The resource kinds this client models; any other kind reads as [`Resource::Unknown`].
+pub const KNOWN_RESOURCE_KINDS: &[&str] = &[
+    "attention",
+    "message",
+    "launch",
+    "launch-variant",
+    "launch-decision",
+    "launch-approval",
+    "mission",
+    "work",
+    "agent",
+    "runtime",
+    "observer",
+    "subscription",
+    "lane",
+    "machine",
+    "device",
+    "operation",
+    "history",
+    "session",
+    "glass",
+    "owned-set",
+];
+
+/// A resource of a kind this client does not model.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct UnknownResource {
+    pub kind: String,
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    /// Every other field, as sent.
+    #[serde(flatten)]
+    pub fields: serde_json::Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for UnknownResource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut fields = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let kind = match fields.remove("kind") {
+            Some(Value::String(kind)) => kind,
+            _ => return Err(D::Error::missing_field("kind")),
+        };
+        // A known kind that failed its own model is an error, never an unknown resource.
+        if KNOWN_RESOURCE_KINDS.contains(&kind.as_str()) {
+            return Err(D::Error::custom(format!(
+                "a `{kind}` resource does not match its model"
+            )));
+        }
+        let header = ResourceHeader::deserialize(Value::Object(fields.clone()))
+            .map_err(D::Error::custom)?;
+        for name in ["id", "revision", "updated_at", "operational"] {
+            fields.remove(name);
+        }
+        Ok(Self {
+            kind,
+            header,
+            fields,
+        })
+    }
 }
 
 impl Resource {
@@ -1391,6 +1494,7 @@ impl Resource {
             Self::Session(v) => &v.header,
             Self::Glass(v) => &v.header,
             Self::OwnedSet(v) => &v.header,
+            Self::Unknown(v) => &v.header,
         }
     }
 }

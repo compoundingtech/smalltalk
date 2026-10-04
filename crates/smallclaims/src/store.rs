@@ -333,6 +333,12 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     detail TEXT NOT NULL DEFAULT '{}',
     updated_at_unix_ms INTEGER NOT NULL
 );
+-- Backup seeks only admitted wire records and the newest recorded manifest.
+CREATE INDEX IF NOT EXISTS replica_envelopes_admitted
+ON replica_envelopes(writer, sequence, envelope_hash) WHERE batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS checkpoints_manifest_cut
+ON checkpoints(cut_unix_ms DESC)
+WHERE state IN ('trimming','trimmed') AND drop_digest IS NOT NULL;
 CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
 -- A trim reads each envelope's dropped claims.
 CREATE INDEX IF NOT EXISTS checkpoint_claims_envelope
@@ -407,6 +413,25 @@ impl Store {
         }
         let mut connection = Connection::open(path)
             .with_context(|| format!("open st database {}", path.display()))?;
+        let has_meta: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_meta
+            && let Some(writer) = connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key='backup_restore_writer'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        {
+            anyhow::ensure!(
+                origin == writer,
+                "restored database requires fresh writer `{writer}`; configure node to that identity before starting"
+            );
+        }
         projection_digest::register(&connection)?;
         crate::sqlite::observe(&mut connection);
         connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
@@ -419,7 +444,6 @@ impl Store {
         {
             let transaction = connection.transaction()?;
             runtime.open_projections(&transaction, false)?;
-            seed_replica_envelopes_tx(&transaction, &origin, None)?;
             transaction.commit()?;
         }
         let readers = ReadPool::new(path, false)?;
@@ -434,6 +458,8 @@ impl Store {
     }
 
     /// Open a new store in shared memory, as tests and short-lived tools use.
+    /// Shared-cache read/write contention returns `SQLITE_LOCKED` immediately;
+    /// concurrent server tests should use the file-backed [`Self::open`] instead.
     pub fn open_memory(origin: impl Into<String>, runtime: Arc<dyn Runtime>) -> Result<Self> {
         let origin = origin.into();
         let uri = PathBuf::from(format!(
@@ -453,7 +479,6 @@ impl Store {
         {
             let transaction = connection.transaction()?;
             runtime.open_projections(&transaction, true)?;
-            seed_replica_envelopes_tx(&transaction, &origin, None)?;
             transaction.commit()?;
         }
         let readers = ReadPool::new(&uri, true)?;
@@ -485,8 +510,25 @@ impl Store {
         shared_memory: bool,
         runtime: Arc<dyn Runtime>,
     ) -> Result<Self> {
-        let seeded_batch_rowid = max_batch_rowid(&connection)?;
-        let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
+        // Opening cannot seal recent work: the caller has not loaded its signing keys yet.
+        // Resume at the first batch still needing an envelope, so a restart seals it with
+        // the same person and agent keys instead of permanently losing its delegation signatures.
+        let seeded_batch_rowid = connection.query_row(
+            "SELECT COALESCE(
+                (SELECT MIN(batches.rowid)-1 FROM batches WHERE NOT EXISTS (
+                    SELECT 1 FROM replica_envelopes WHERE batch_id=batches.id)),
+                (SELECT MAX(rowid) FROM batches), 0)",
+            [],
+            |row| row.get(0),
+        )?;
+        let index = current_index(&connection)?;
+        // Older stores have no admission watermark. Startup recovery projects this index
+        // before serving; subsequent admission chunks update it in their own transaction.
+        connection.execute(
+            "INSERT OR IGNORE INTO meta(key,value) VALUES('replication_admitted_index',?1)",
+            [index.to_string()],
+        )?;
+        let committed_index = Arc::new(AtomicU64::new(index));
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
@@ -1227,11 +1269,12 @@ impl Store {
                 .unwrap_or_else(PoisonError::into_inner) = None;
             return Ok(0);
         }
-        // Seed envelopes for any local batch first, so the full pass below sees all of them.
-        self.replication_snapshot()?;
         if let Some(key) = &key {
             self.set_node_key(key.clone())?;
         }
+        // Load the node signer before sealing recent standalone work. Its person and agent keys
+        // must likewise have been restored by the caller before this step.
+        self.replication_snapshot()?;
         *self
             .member_key
             .write()
@@ -5347,6 +5390,12 @@ impl Store {
                 }
                 if outcome.changed {
                     self.defer_replication_projection();
+                    // Persist with the admission commit: a backup reader in another process
+                    // must distinguish the admitted log from a projection still catching up.
+                    pass.execute(
+                        "INSERT OR REPLACE INTO meta(key,value) VALUES('replication_admitted_index',?1)",
+                        [current_index_tx(&pass)?.to_string()],
+                    )?;
                 }
                 pass.commit()?;
                 #[cfg(any(test, feature = "test-support"))]

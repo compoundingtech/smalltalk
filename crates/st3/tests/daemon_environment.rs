@@ -2,7 +2,7 @@
 //! A service manager supplies HOME and state locations, but no PATH or credentials.
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 struct Service(Child);
@@ -19,15 +19,13 @@ fn executable(path: &Path, source: &str) {
 }
 
 fn start_service(root: &Path, home: &Path, state_home: &Path) -> (Service, std::path::PathBuf) {
-    let shell = st_runtime::resolve_executable("bash", &std::env::vars().collect()).unwrap();
     let socket = root.join("daemon.sock");
     let log = std::fs::File::create(root.join("daemon.log")).unwrap();
-    let binary = assert_cmd::cargo::cargo_bin!("st3");
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture");
     let mut service = Service(
-        Command::new(binary)
+        st3::test_support::command(binary)
             .env_clear()
             .env("HOME", home)
-            .env("SHELL", &shell)
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_STATE_HOME", state_home)
             .env("XDG_RUNTIME_DIR", root.join("runtime"))
@@ -57,7 +55,7 @@ fn start_service(root: &Path, home: &Path, state_home: &Path) -> (Service, std::
 }
 
 fn doctor_report(home: &Path, socket: &Path) -> serde_json::Value {
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         .env_clear()
         .env("HOME", home)
         .arg("--endpoint")
@@ -66,6 +64,40 @@ fn doctor_report(home: &Path, socket: &Path) -> serde_json::Value {
         .output()
         .unwrap();
     serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+}
+
+#[test]
+fn a_fixture_listener_ignores_the_callers_host_seat_ancestry() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join(".bash_profile"), format!("export PATH='{}'\n", std::env::var("PATH").unwrap())).unwrap();
+    let (_service, socket) = start_service(root.path(), &home, &root.path().join("state"));
+    let source = root.path().join("fixture.kdl");
+    std::fs::write(&source, r#"version 2
+mission "hermetic" state="ready" {
+  goal "Fixture goal."
+  step "work" {
+    goal "Fixture work."
+    gate "done" { exec "true"; host "orchid"; workspace "."; time-limit "1m"; }
+  }
+}
+"#).unwrap();
+    let env = st_runtime::resolve_executable("env", &std::env::vars().collect()).unwrap();
+    // Keep a synthetic agent parent alive while its CLI child has ST_AGENT removed. CI thus
+    // exercises the ancestry boundary too, even when its runner is not itself an agent seat.
+    let output = std::process::Command::new(env!("ST3_FIXTURE_BASH"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("ST_AGENT", "agent/fixture/host")
+        .args(["--noprofile", "--norc", "-c", "\"$@\"; status=$?; exit \"$status\"", "fixture-parent"])
+        .arg(env).args(["-u", "ST_AGENT"])
+        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
+        .arg("--endpoint").arg(&socket)
+        .args(["missions", "publish"]).arg(source)
+        .args(["--as", "person/pat", "--no-gate-check"])
+        .output().unwrap();
+    assert!(output.status.success(), "{output:?}");
 }
 
 #[test]
@@ -84,7 +116,7 @@ fn client_without_runtime_dir_reaches_daemon_with_different_socket() {
     assert!(state_socket.as_os_str().len() > 108);
     assert_eq!(std::fs::read_link(&state_socket).unwrap(), socket);
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         .env_clear()
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", root.path().join("config"))
@@ -243,9 +275,8 @@ fn a_login_shell_too_slow_for_the_first_capture_still_lets_the_daemon_start() {
     }
     executable(&bin.join("pty"), "#!/bin/sh\nprintf '[]\\n'\n");
     executable(&bin.join("gh"), "#!/bin/sh\nexit 1\n");
-    // The account's login shell reads these. Its first run is slow beyond the first capture's
-    // allowance, as on a loaded machine; later runs are not. (The account's shell, not $SHELL,
-    // is what st runs, so the slowness lives in the startup files.)
+    // The controlled fixture shell reads .bash_profile, independent of the account shell.
+    // Its first run exceeds the capture allowance; subsequent runs finish immediately.
     let marker = root.path().join("slow-shell-ran");
     let slow = format!(
         "[ -e '{marker}' ] || {{ : > '{marker}'; sleep 120; }}\n",
@@ -268,7 +299,8 @@ fn a_login_shell_too_slow_for_the_first_capture_still_lets_the_daemon_start() {
     let (_service, socket) = start_service(root.path(), &home, &root.path().join("state"));
     assert!(
         started.elapsed() >= Duration::from_secs(10),
-        "the first capture should have waited out its allowance"
+        "the first capture should have waited out its allowance: elapsed={:?}",
+        started.elapsed()
     );
     let log = std::fs::read_to_string(root.path().join("daemon.log")).unwrap();
     assert!(log.contains("the login shell is slow to start"), "{log}");
