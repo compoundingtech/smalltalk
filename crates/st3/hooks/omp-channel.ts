@@ -384,7 +384,12 @@ export default function (pi: ExtensionAPI) {
   };
   const applyLabel = async (ctx: ExtensionContext) => {
     if (!state.label) return;
-    try { await pi.setSessionName(state.label); }
+    // Seat replay after reconnect must not append another title change to the session.
+    try {
+      if (typeof pi.getSessionName !== "function" || pi.getSessionName() !== state.label) {
+        await pi.setSessionName(state.label);
+      }
+    }
     catch { ctx.ui?.notify?.("st: could not update the session name", "warning"); }
   };
   const { bin, identity, runtimeId, session, seq } = state;
