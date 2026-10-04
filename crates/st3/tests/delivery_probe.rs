@@ -3,14 +3,19 @@
 #[test]
 fn native_delivery_probe_alerts_and_recovers_without_model_turns() {
     use std::path::PathBuf;
-    use std::process::Command;
 
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let result = Command::new("setsid")
+    let scratch = tempfile::Builder::new()
+        .prefix("delivery-probe-scratch-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let result = st3::test_support::command("setsid")
         .args(["-f", "env", "-u", "ST_AGENT", "python3"])
         .arg(repo.join("scripts/st3-delivery-probe-test"))
         .arg("--binary")
         .arg(env!("CARGO_BIN_EXE_st3-fixture"))
+        .arg("--scratch")
+        .arg(scratch.path())
         .output()
         .expect("run the isolated native delivery probe");
     let stderr = String::from_utf8_lossy(&result.stderr);

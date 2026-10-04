@@ -392,7 +392,7 @@ async fn operational_cli_lists_outcomes_summarizes_runs_and_reports_performance(
             .unwrap()
             .iter()
             .any(
-                |row| row["client"].as_str().unwrap().contains("st3 missions")
+                |row| row["client"].as_str().unwrap().contains("st3-fixture missions")
                     && row["count"].as_u64().unwrap() > 0
             ),
         "{report:#}"

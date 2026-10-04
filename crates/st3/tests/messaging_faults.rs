@@ -4,7 +4,6 @@
 
 fn run_case(case: &str) {
     use std::path::PathBuf;
-    use std::process::Command;
 
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let old = match std::env::var_os("ST3_MESSAGING_COMPAT_BIN") {
@@ -12,7 +11,7 @@ fn run_case(case: &str) {
         None => {
             // Pin the real channel before reexec/reporting, rather than making a current
             // process pretend it is old. Nix caches this immutable package across CI runs.
-            let output = Command::new("timeout")
+            let output = st3::test_support::command("timeout")
                 .args(["10m", "bash"])
                 .arg(repo.join("scripts/messaging-compat-binary"))
                 .output()
@@ -59,7 +58,7 @@ fn run_case(case: &str) {
         .unwrap();
     // Double-fork out of the CI seat's ancestry. A sender is person/eval; an st harness
     // must never impersonate that sender. Captured pipes stay open until the eval exits.
-    let output = Command::new("setsid")
+    let output = st3::test_support::command("setsid")
         .args(["-f", "env", "-u", "ST_AGENT", "python3"])
         .arg(repo.join("scripts/st3-messaging-faults-eval/run"))
         .arg(env!("CARGO_BIN_EXE_st3-fixture"))
