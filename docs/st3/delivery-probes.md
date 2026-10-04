@@ -7,12 +7,19 @@ actual `omp-channel` driver and records `delivered`, `read`, and `closed` claims
 It launches no model provider and never polls a mailbox to manufacture a read.
 Python 3.9 or newer and the installed `st3` binary are the only dependencies.
 
-Each direction keeps at most one outstanding message. An unread message remains
-under observation through a network or daemon outage; the sender raises one
-attention item after 60 seconds and keeps watching. Its message target closes the
-item when the recipient closes the consumed message. The sender also withdraws
-the item once it observes the actual recipient's read claim. Completing the
-mission that installed the probe does not close an unresolved delivery alert.
+Each direction measures one active message. An accepted unread message becomes
+overdue after 60 seconds and raises one attention item. At the next probe interval,
+the sender creates a fresh message and retains that alert until a recipient's real
+read claim proves recovery. A send whose acceptance is uncertain keeps retrying
+its original idempotency key. Completing the mission that installed the probe does
+not close an unresolved delivery alert.
+
+Boots and channel reconnects hold earlier mail, including old probe messages.
+Those messages stay in the mailbox and contribute to the aged undelivered count
+in doctor and stui. Preview and close that backlog with the commands in
+[seat deploys](seat-deploys.md), including
+`st conversations cleanup --all --older-than 1h`. Cleanup does not count as a
+successful native probe; recovery still requires a fresh recipient read.
 
 Sender state, received envelopes awaiting acknowledgement, and send idempotency
 keys are written and synced before the corresponding network mutations. The seat
