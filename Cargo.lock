@@ -4230,6 +4230,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "st-decision-fold"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "st-drivers"
 version = "0.1.0"
 dependencies = [

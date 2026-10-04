@@ -10,6 +10,7 @@ members = [
   "crates/agent-spec",
   "crates/demo-resolver-wasm",
   "crates/smallclaims",
+  "crates/st-decision-fold",
   "crates/st-drivers",
   "crates/st-runtime",
   "crates/st-resource-protocol",
