@@ -11,7 +11,12 @@ use st3::model::{ClaimInput, PlannerSpec};
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
 
-async fn provider_incarnation(inherited: Option<&str>, resume: bool) {
+async fn provider_incarnation(
+    inherited: Option<&str>,
+    resume: bool,
+    subject: &'static str,
+    expected: &str,
+) {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("api.sock");
     let store = Arc::new(Store::open_memory("orchid").unwrap());
@@ -82,7 +87,7 @@ async fn provider_incarnation(inherited: Option<&str>, resume: bool) {
                 "driver",
                 "exec",
                 "--subject",
-                "agent/garden/worker",
+                subject,
                 "--",
                 env!("ST3_FIXTURE_BASH"),
                 "--noprofile",
@@ -97,7 +102,7 @@ async fn provider_incarnation(inherited: Option<&str>, resume: bool) {
     .unwrap();
     server.abort();
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"worker:current");
+    assert_eq!(output.stdout, expected.as_bytes());
     if let Some(path) = resume_path {
         assert!(
             path.exists(),
@@ -108,15 +113,32 @@ async fn provider_incarnation(inherited: Option<&str>, resume: bool) {
 
 #[tokio::test]
 async fn fresh_driver_exports_its_incarnation_in_the_provider_environment() {
-    provider_incarnation(None, false).await;
+    provider_incarnation(None, false, "agent/garden/worker", "worker:current").await;
 }
 
 #[tokio::test]
 async fn fresh_driver_replaces_an_inherited_incarnation() {
-    provider_incarnation(Some("worker:predecessor"), false).await;
+    provider_incarnation(
+        Some("worker:predecessor"),
+        false,
+        "agent/garden/worker",
+        "worker:current",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn reexecuted_driver_refreshes_its_environment_from_the_saved_runtime_fence() {
-    provider_incarnation(Some("worker:predecessor"), true).await;
+    provider_incarnation(
+        Some("worker:predecessor"),
+        true,
+        "agent/garden/worker",
+        "worker:current",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn exec_gates_start_without_an_agent_runtime_fence() {
+    provider_incarnation(None, false, "gate-operation/catalog/check", "").await;
 }

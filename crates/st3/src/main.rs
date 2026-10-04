@@ -3939,6 +3939,11 @@ fn driver_environment_incarnation(cli: &Cli) -> Result<Option<String>> {
     let Some(subject) = subject.as_deref() else {
         return Ok(None);
     };
+    // The exec driver also runs gates and resource tasks. Those processes do not own
+    // an agent runtime and must start without waiting for a seat incarnation.
+    if !subject.starts_with("agent/") {
+        return Ok(None);
+    }
     if let Some(path) = st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV) {
         let resume: DriverResume = st_drivers::reexec::peek_state(&path)?;
         anyhow::ensure!(
