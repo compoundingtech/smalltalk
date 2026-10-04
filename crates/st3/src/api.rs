@@ -10538,7 +10538,12 @@ async fn list_messages_page(
     let after = cursor.as_ref().map(|cursor| cursor.after);
     let store = state.store.clone();
     let (items, next_after) = blocking_store(move || {
-        store.messages_page(to.as_deref(), query.include_closed, after, through, limit)
+        let (mut items, next_after) =
+            store.messages_page(to.as_deref(), query.include_closed, after, through, limit)?;
+        mailbox::hold_pre_boot_mail(
+            &store, peer.as_ref().map(|peer| &peer.0), to.as_deref(), &mut items,
+        )?;
+        Ok((items, next_after))
     })
     .await?;
     let next_cursor = next_after
@@ -10579,9 +10584,15 @@ async fn list_messages(
         query.include_closed,
     );
     let store = state.store.clone();
-    blocking_store(move || store.messages(recipient.as_deref(), query.include_closed))
-        .await
-        .map(Json)
+    blocking_store(move || {
+        let mut messages = store.messages(recipient.as_deref(), query.include_closed)?;
+        mailbox::hold_pre_boot_mail(
+            &store, peer.as_ref().map(|peer| &peer.0), recipient.as_deref(), &mut messages,
+        )?;
+        Ok(messages)
+    })
+    .await
+    .map(Json)
 }
 
 async fn read_message(

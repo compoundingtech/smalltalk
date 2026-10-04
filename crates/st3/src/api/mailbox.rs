@@ -109,6 +109,58 @@ type Snapshot = (
     Vec<crate::model::MessageView>,
 );
 
+/// Automatic delivery has a live boundary. Historical mail remains available through the
+/// ordinary conversation APIs, but neither a boot nor a reconnect authorizes replaying it.
+fn retain_live_mail(
+    store: &Store,
+    messages: &mut Vec<crate::model::MessageView>,
+    since: u128,
+    through: Option<u64>,
+) -> anyhow::Result<()> {
+    let mut live = Vec::new();
+    for message in messages.drain(..) {
+        if through.is_some_and(|index| message.created_index <= index) {
+            continue;
+        }
+        if store
+            .latest_claim(&message.subject, Some("message.sent"))?
+            .is_some_and(|claim| claim.accepted_at_unix_ms >= since)
+        {
+            live.push(message);
+        }
+    }
+    *messages = live;
+    Ok(())
+}
+
+/// Older drivers poll instead of subscribing. Apply the same boot rule only to native
+/// delivery processes, leaving an agent's explicit mailbox listing and reading intact.
+pub(super) fn hold_pre_boot_mail(
+    store: &Store,
+    peer: Option<&NativeDeliveryPeer>,
+    recipient: Option<&str>,
+    messages: &mut Vec<crate::model::MessageView>,
+) -> anyhow::Result<()> {
+    let Some(peer) = peer.filter(|peer| recipient == Some(peer.agent.as_str())) else {
+        return Ok(());
+    };
+    let (since, through) = store
+        .native_mail_boot_floor(&peer.agent)?
+        .unwrap_or((u128::MAX, u64::MAX));
+    // A closed projection tells legacy drivers to remove old native inbox files. It does
+    // not close graph mail: explicit conversation reads still see its original status.
+    for message in messages {
+        if message.created_index <= through
+            || !store
+                .latest_claim(&message.subject, Some("message.sent"))?
+                .is_some_and(|claim| claim.accepted_at_unix_ms >= since)
+        {
+            message.status = "closed".into();
+        }
+    }
+    Ok(())
+}
+
 fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
     store.check_mailbox(binding).map_err(anyhow::Error::new)?;
     let seat = store
@@ -157,6 +209,11 @@ async fn stream_with_reader<F>(state: AppState, fence: Fence, mut socket: WebSoc
 where
     F: Fn(&Store, &Fence) -> anyhow::Result<Snapshot> + Clone + Send + 'static,
 {
+    let since = client_now_ms();
+    let through = match state.store.index() {
+        Ok(index) => index,
+        Err(_) => return,
+    };
     // Subscribe before reading to close the replay-to-live race. Watch coalesces writes; every
     // wake recomputes the durable state, so lag needs no lossy event cursor.
     let mut changed = state.event_notify.subscribe();
@@ -199,7 +256,11 @@ where
             let result = tokio::task::spawn_blocking(move || {
                 crate::profile::task("task mailbox-snapshot", || {
                     let mark = store.mailbox_watermark(&binding);
-                    (mark, read(&store, &binding))
+                    let snapshot = read(&store, &binding).and_then(|(seat, mut messages)| {
+                        retain_live_mail(&store, &mut messages, since, Some(through))?;
+                        Ok((seat, messages))
+                    });
+                    (mark, snapshot)
                 })
             })
             .await;
@@ -373,8 +434,175 @@ mod tests {
         }
     }
 
+    async fn boot_and_reconnect_hold_old_mail(transport: &'static str) {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
+        let seat = "agent/eval.worker";
+        let send = |id: &str| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/{id}"),
+                    kind: "message.sent".into(),
+                    actor: Some("person/eval".into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), json!("sent")),
+                        ("from".into(), json!("person/eval")),
+                        ("to".into(), json!(seat)),
+                        ("content".into(), json!("QUARTZ SIGNAL")),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("send:{id}")),
+                })
+                .unwrap();
+            signal_changed(&state);
+        };
+        for (id, status) in [
+            ("boot-sent", "sent"),
+            ("boot-staged", "staged"),
+            ("boot-delivered", "delivered"),
+        ] {
+            send(id);
+            if status != "sent" {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: format!("message/{id}"),
+                        kind: format!("message.{status}"),
+                        actor: Some(seat.into()),
+                        fields: BTreeMap::from([("status".into(), json!(status))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("status:{id}")),
+                    })
+                    .unwrap();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        crate::mailbox::tests::ready(&state.store, "session-1");
+        let peer = NativeDeliveryPeer {
+            agent: seat.into(),
+            transport,
+            pid: 37,
+            archives_inbox: true,
+        };
+        let app = router(state.clone()).layer(Extension(peer));
+        let path = root.path().join("daemon.sock");
+        let server_path = path.clone();
+        let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = Client::new(Endpoint::Unix(path));
+        let fence: Fence = client
+            .post(
+                "/v1/mailbox/bind",
+                &Fence::new(seat, "session-1", "delivery"),
+            )
+            .await
+            .unwrap();
+        let mut socket = client.open_mailbox(&fence).await.unwrap();
+        assert!(
+            matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.is_empty()),
+            "{transport} injected pre-boot mail"
+        );
+
+        // Legacy native polling receives archive projections; the graph and explicit reads
+        // retain the original mail and lifecycle, rather than synthesizing receipts or closes.
+        let legacy: Vec<crate::model::MessageView> = client
+            .get("/v1/messages?to=agent%2Feval.worker")
+            .await
+            .unwrap();
+        assert!(legacy.iter().all(|message| message.status == "closed"));
+        let page: crate::model::MessagePage = client
+            .get("/v1/messages/page?to=agent%2Feval.worker")
+            .await
+            .unwrap();
+        assert!(page.items.iter().all(|message| message.status == "closed"));
+        let manual = list_messages(
+            State(state.clone()),
+            Query(MessagesQuery {
+                to: Some(seat.into()),
+                include_closed: false,
+            }),
+            None,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(manual.len(), 3);
+        assert_eq!(
+            manual
+                .iter()
+                .filter(|message| message.status == "closed")
+                .count(),
+            0
+        );
+        let old: crate::model::MessageView = client.get("/v1/messages/read/boot-staged").await.unwrap();
+        assert_eq!(old.status, "staged");
+
+        send("live-first");
+        let legacy: Vec<crate::model::MessageView> = client
+            .get("/v1/messages?to=agent%2Feval.worker")
+            .await.unwrap();
+        assert!(legacy.iter().any(|message| message.subject == "message/live-first" && message.status == "sent"));
+        assert!(
+            matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.len() == 1 && messages[0].subject == "message/live-first"),
+            "{transport} dropped live mail"
+        );
+        socket.close(None).await.unwrap();
+        let mut socket = client.open_mailbox(&fence).await.unwrap();
+        assert!(
+            matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.is_empty()),
+            "{transport} replayed pre-reconnect mail"
+        );
+        send("live-second");
+        assert!(
+            matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.len() == 1 && messages[0].subject == "message/live-second")
+        );
+        assert_eq!(
+            state
+                .store
+                .message("message/live-first")
+                .unwrap()
+                .unwrap()
+                .status,
+            "sent"
+        );
+        assert!(
+            state
+                .store
+                .claims_for("message/boot-staged", Some("message.closed"))
+                .unwrap()
+                .is_empty()
+        );
+        server.abort();
+    }
+
     #[tokio::test]
-    async fn a_restarted_native_mailbox_delivers_a_watch_wake_queued_while_the_seat_was_stopped() {
+    async fn claude_boot_and_reconnect_never_inject_old_mail() {
+        boot_and_reconnect_hold_old_mail("claude-channel").await;
+    }
+    #[tokio::test]
+    async fn omp_boot_and_reconnect_never_inject_old_mail() {
+        boot_and_reconnect_hold_old_mail("omp-channel").await;
+    }
+    #[tokio::test]
+    async fn pi_boot_and_reconnect_never_inject_old_mail() {
+        boot_and_reconnect_hold_old_mail("pi-channel").await;
+    }
+    #[tokio::test]
+    async fn codex_boot_and_reconnect_never_inject_old_mail() {
+        boot_and_reconnect_hold_old_mail("app-server").await;
+    }
+
+    #[tokio::test]
+    async fn a_restarted_native_mailbox_holds_a_watch_wake_queued_while_the_seat_was_stopped() {
         let root = tempfile::tempdir().unwrap();
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
@@ -475,28 +703,17 @@ mod tests {
         let mut mailbox = client.open_mailbox(&fence).await.unwrap();
         assert!(matches!(next(&mut mailbox).await, Frame::Seat { .. }));
         assert!(
-            matches!(next(&mut mailbox).await, Frame::Mailbox { messages } if messages.len() == 1 && messages[0].subject == queued[0].subject)
+            matches!(next(&mut mailbox).await, Frame::Mailbox { messages } if messages.is_empty())
         );
-        let _: ClaimRecord = client
-            .post(
-                "/v1/mailbox/receipts",
-                &Receipt {
-                    fence,
-                    message: queued[0].subject.clone(),
-                    lifecycle: "delivered".into(),
-                },
-            )
-            .await
-            .unwrap();
         assert_eq!(
             state.store.messages(Some(seat), false).unwrap()[0].status,
-            "delivered"
+            "sent"
         );
         server.abort();
     }
 
     #[tokio::test]
-    async fn every_harness_replays_and_receipts_over_a_real_unix_push_stream_without_files() {
+    async fn every_harness_delivers_live_mail_and_receipts_over_a_real_unix_push_stream_without_files() {
         for transport in [
             "claude-channel",
             "pi-channel",
@@ -603,12 +820,12 @@ mod tests {
             assert!(
                 matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages[0].subject == send.subject)
             );
-            // Disconnecting writes no receipt; reconnect is a replay of the same immutable ID.
+            // Disconnecting writes no receipt; reconnect leaves the old mail in the mailbox.
             socket.close(None).await.unwrap();
             let mut socket = client.open_mailbox(&fence).await.unwrap();
             next(&mut socket).await;
             assert!(
-                matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages[0].status == "sent")
+                matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.is_empty())
             );
             for lifecycle in ["staged", "delivered", "read"] {
                 let receipt = Receipt {
@@ -735,7 +952,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn current_owner_reconnects_and_replays_after_an_injected_snapshot_failure() {
+    async fn current_owner_reconnects_without_old_mail_after_an_injected_snapshot_failure() {
         let root = tempfile::tempdir().unwrap();
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
@@ -814,7 +1031,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(frame, Frame::Mailbox { messages } if messages.len() == 1 && messages[0].subject == input.subject)
+            matches!(frame, Frame::Mailbox { messages } if messages.is_empty())
         );
         assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 4);
         state.store.check_mailbox(&fence).unwrap();
