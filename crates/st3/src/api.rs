@@ -2360,10 +2360,10 @@ pub(crate) fn client_declared_resources(
                 },
                 "reason": reference.reason,
             });
-            if reference.kind == crate::model::ResourceReferenceKind::Uri {
-                if let Some(uri) = uris.get(&reference.subject) {
-                    value["uri"] = json!(uri);
-                }
+            if reference.kind == crate::model::ResourceReferenceKind::Uri
+                && let Some(uri) = uris.get(&reference.subject)
+            {
+                value["uri"] = json!(uri);
             }
             value
         })
