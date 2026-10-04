@@ -1,5 +1,5 @@
 //! Suspended seats: a running seat stops at a quiet boundary and later resumes its own native
-//! session on the same host.
+//! session on the same host or, for portable drivers, another fleet host.
 //!
 //! A suspension is a pair of fenced runtime actions on the seat, like a restart. A person or
 //! agent asks with `runtime.action.requested {action: suspend | resume}`; the seat's owner records
@@ -11,7 +11,8 @@
 //! resume:  restoring -> verifying   -> resumed           (failed: the seat stays suspended)
 //! ```
 //!
-//! The snapshot is the native session the seat's driver bound for the suspended incarnation, read
+//! The snapshot includes a host-local workspace bundle and, for portable drivers, native files.
+//! The native session is the one the driver bound for the suspended incarnation, read
 //! from its `harness.session-file` claim. Resume launches the driver with that session named in
 //! [`RESUME_ENV`]; the driver relaunches the harness on exactly that session or exits with a typed
 //! reason, and the resume completes only when the driver binds the same session again.
@@ -63,6 +64,10 @@ pub fn resume_completed_key(request: &str) -> String {
 pub struct Suspension {
     /// `suspend` or `resume`: the request this phase belongs to.
     pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_host: Option<String>,
     /// `quiescing`, `snapshotting`, `suspended`, `failed` (a refused suspend), `restoring`,
     /// `verifying` or `resumed`.
     pub phase: String,
@@ -102,7 +107,7 @@ impl Suspension {
     pub fn holds_seat(&self) -> bool {
         matches!(
             self.phase.as_str(),
-            "quiescing" | "snapshotting" | "suspended" | "restoring" | "verifying"
+            "quiescing" | "snapshotting" | "suspended" | "fencing-source" | "transferring" | "restoring" | "verifying"
         )
     }
 }
@@ -178,6 +183,7 @@ fn suspend_state(store: &Store, request: &ClaimRecord) -> Result<Suspension> {
         state.phase = "snapshotting".into();
         state.harness = field(snapshot, "harness").map(str::to_owned);
         state.native_session_id = field(snapshot, "native_session_id").map(str::to_owned);
+        state.source_host = field(snapshot, "source_host").map(str::to_owned);
         state.updated_at_unix_ms = snapshot.accepted_at_unix_ms;
     }
     if let Some(completed) = store.operation_claim(&suspend_completed_key(&request.id))? {
@@ -200,7 +206,16 @@ pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
         return Ok(None);
     }
     let lineage = store.launch_lineage(subject)?;
-    if !evidence(request, 0).is_some_and(|token| lineage.iter().any(|item| item == token)) {
+    let mut moved = false;
+    if action(request) == Some("resume") && field(request, "host").is_some() {
+        for token in &lineage {
+            if store.claim_by_id(token)?.is_some_and(|selected| {
+                selected.body.get("evidence").and_then(Value::as_array)
+                    .is_some_and(|items| items.iter().any(|id| id.as_str() == Some(&request.id)))
+            }) { moved = true; break; }
+        }
+    }
+    if !moved && !evidence(request, 0).is_some_and(|token| lineage.iter().any(|item| item == token)) {
         return Ok(None);
     }
     if action(request) == Some("suspend") {
@@ -221,7 +236,15 @@ pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
     state.requested_by = request.actor.clone();
     state.updated_at_unix_ms = request.accepted_at_unix_ms;
     state.requested_at_unix_ms = request.accepted_at_unix_ms;
-    state.phase = "restoring".into();
+    state.host = field(request, "host").map(str::to_owned);
+    state.source_host = field(request, "source_host").map(str::to_owned).or(state.source_host);
+    state.phase = if state.host.is_some() { "fencing-source" } else { "restoring" }.into();
+    for (suffix, phase) in [("transfer", "transferring"), ("restored", "restoring")] {
+        if let Some(claim) = store.operation_claim(&format!("agent-resume-{suffix}:{}", request.id))? {
+            state.phase = phase.into();
+            state.updated_at_unix_ms = claim.accepted_at_unix_ms;
+        }
+    }
     if let Some(failed) = store.operation_claim(&resume_failed_key(&request.id))? {
         // A resume that fails leaves the seat suspended on the same snapshot, with the reason.
         state.phase = "suspended".into();
