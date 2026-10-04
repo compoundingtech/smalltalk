@@ -71,6 +71,13 @@ struct Meter {
 }
 static METER: OnceLock<Mutex<Meter>> = OnceLock::new();
 
+/// Clear process-wide accounting before an isolated metrics test starts its requests.
+/// Callers must not run alongside other tests that rely on the meter's contents.
+#[cfg(feature = "test-support")]
+pub fn reset_for_test() {
+    *METER.get_or_init(Mutex::default).lock().unwrap() = Meter::default();
+}
+
 impl Meter {
     fn prune(&mut self, now: Instant) {
         while self

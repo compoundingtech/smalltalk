@@ -250,6 +250,9 @@ agent "example/operations/deputy" {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn operational_cli_lists_outcomes_summarizes_runs_and_reports_performance() {
+    // The report keeps only the top 20 client/request pairs. Earlier serial tests must
+    // not displace this test's requests; nextest already gives each test its own process.
+    st3::performance::reset_for_test();
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = test_state(root.path());
