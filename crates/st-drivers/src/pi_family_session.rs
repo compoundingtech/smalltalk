@@ -47,6 +47,8 @@ const OFFLINE_DEFAULTS: [(&str, &str); 2] = [("PI_OFFLINE", "1"), ("PI_SKIP_VERS
 /// value.
 const OMP_UNATTENDED_DEFAULTS: [(&str, &str); 1] = [("OMP_SKIP_SETUP", "1")];
 
+type AdmissionVerifier = fn(&str, &Path, &Path) -> Result<()>;
+
 /// The harness-specific facts the shared wrapper body needs: the label that goes on records and
 /// errors, the extension asset to inject, the env names the shipped extension reads, and the
 /// launch gate — if any — this harness enforces.
@@ -69,7 +71,7 @@ pub(crate) struct HarnessKind {
     pub(crate) seq_env: &'static str,
     /// The launch-time measured producer/extension admission gate (OMP-R05). Pi has no
     /// runtime admission contract, so its slot is `None`.
-    pub(crate) verify_version: Option<fn(&str, &Path, &Path) -> Result<()>>,
+    pub(crate) verify_version: Option<AdmissionVerifier>,
 }
 
 /// What the wrapper hands the provider process: the channel environment plus the launch argv with
@@ -149,7 +151,7 @@ pub(crate) fn run_for_paths(
     // the seat's observed record, so a refused launch leaves the predecessor's state alone.
     let admitted_set = if let Some(verify_version) = kind.verify_version {
         let set = channel_extension_set(kind, &runtime_id)?;
-        verify_version(&provider_argv[0], &agent_dir, &set.join(kind.extension))?;
+        verify_version(&provider_argv[0], agent_dir, &set.join(kind.extension))?;
         Some(set)
     } else {
         None
