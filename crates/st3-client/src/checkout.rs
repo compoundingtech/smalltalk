@@ -18,10 +18,11 @@ pub fn agent_branch(name: &str) -> String {
         })
         .collect();
     let branch = branch.trim_matches('-');
-    if branch.is_empty() {
-        "agent".into()
-    } else {
-        branch.into()
+    match branch {
+        "" => "agent".into(),
+        // Git reserves HEAD even though every character is valid.
+        "HEAD" => "head".into(),
+        _ => branch.into(),
     }
 }
 

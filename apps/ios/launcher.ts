@@ -8,7 +8,8 @@ export function agentBranch(name: string): string {
   const identity = name.replace(/^(?:agent\/)+/, '');
   let simple = identity.split('/').pop() ?? identity;
   if (!identity.includes('/') && simple.includes('.')) simple = simple.slice(simple.indexOf('.') + 1);
-  return simple.replace(/[^a-zA-Z0-9_-]/gu, '-').replace(/^-+|-+$/g, '') || 'agent';
+  const branch = simple.replace(/[^a-zA-Z0-9_-]/gu, '-').replace(/^-+|-+$/g, '') || 'agent';
+  return branch === 'HEAD' ? 'head' : branch;
 }
 
 export function checkoutLabel(checkout?: AgentCheckout | null): string | undefined {

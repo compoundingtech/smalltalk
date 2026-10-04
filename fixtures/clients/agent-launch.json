@@ -19,6 +19,10 @@
     {
       "name": "agent/example/fox🦊kit",
       "branch": "fox-kit"
+    },
+    {
+      "name": "agent/example/HEAD",
+      "branch": "head"
     }
   ],
   "launches": [
@@ -93,6 +97,23 @@
         "name": "keen-otter",
         "harness": "pi",
         "workspace": "/srv/example/scratch"
+      }
+    },
+    {
+      "form": {
+        "name": "HEAD",
+        "message": "",
+        "harness": "claude",
+        "model": "default",
+        "effort": "default",
+        "repository": "/srv/example/atlas"
+      },
+      "parameters": {
+        "name": "HEAD",
+        "harness": "claude",
+        "repo": "/srv/example/atlas",
+        "branch": "head",
+        "base": "origin/main"
       }
     }
   ],
