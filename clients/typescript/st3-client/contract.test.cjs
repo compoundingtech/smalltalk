@@ -72,25 +72,60 @@ test('actual delayed WebSocket upgrade distinguishes readiness and contains malf
     await once(server, 'listening');
     t.after(() => { peer?.destroy(); server.close(); });
     const client = new St3Client({ baseUrl: `http://127.0.0.1:${server.address().port}` });
-    let opens = 0;
+    let opens = 0, stream;
     const frames = [];
     let ended;
     const end = new Promise(resolve => { ended = resolve; });
     const ready = new Promise(resolve => {
         client.collectionStream({
-            onOpen: () => { opens++; resolve(); },
+            onOpen: () => {
+                opens++;
+                stream.unsubscribe('talk');
+                stream.subscribeTerminal('term', 'terminal/test', 'new-incarnation', 'new-capability');
+                resolve();
+            },
             onFrame: frame => frames.push(frame),
             onEnd: ended,
-        }).then(stream => {
+        }).then(value => {
+            stream = value;
             stream.subscribeConversation('talk', 'session/test');
+            stream.subscribeTerminal('term', 'terminal/test', 'old-incarnation', 'old-capability');
         });
     });
     const request = await upgrading;
     assert.equal(opens, 0);
+    const commands = [];
+    let buffered = Buffer.alloc(0), received;
+    const flushed = new Promise(resolve => { received = resolve; });
+    peer.on('data', bytes => {
+        buffered = Buffer.concat([buffered, bytes]);
+        while (buffered.length >= 2) {
+            let length = buffered[1] & 127, offset = 2;
+            if (length === 126) {
+                if (buffered.length < 4) return;
+                length = buffered.readUInt16BE(2);
+                offset = 4;
+            }
+            if (buffered.length < offset + 4 + length) return;
+            const mask = buffered.subarray(offset, offset + 4);
+            const data = Buffer.from(buffered.subarray(offset + 4, offset + 4 + length));
+            for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
+            if ((buffered[0] & 15) === 1) commands.push(JSON.parse(data.toString()));
+            buffered = buffered.subarray(offset + 4 + length);
+            if (commands.length === 4) received();
+        }
+    });
     const accept = createHash('sha1').update(request.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
     peer.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\nSec-WebSocket-Protocol: st3.client.collections.v0\r\n\r\n`);
     await ready;
     assert.equal(opens, 1);
+    await flushed;
+    assert.deepEqual(commands.map(command => [command.kind, command.id, command.incarnation]), [
+        ['subscribe', 'talk', undefined],
+        ['subscribe', 'term', 'old-incarnation'],
+        ['unsubscribe', 'talk', undefined],
+        ['subscribe', 'term', 'new-incarnation'],
+    ]);
     const send = frame => {
         const data = Buffer.from(JSON.stringify(frame));
         const header = data.length < 126 ? Buffer.from([0x81, data.length]) : Buffer.from([0x81, 126, data.length >> 8, data.length & 255]);
@@ -145,6 +180,29 @@ test('readiness callback precedes buffered commands and can close before flushin
         assert.equal(calls, 1);
         assert.deepEqual(socket.sent, closeOnOpen ? [] : [{ kind: 'subscribe', id: 'talk', collection: 'conversation', conversation: 'session/test' }]);
     }
+});
+
+test('onOpen cancellation and fence replacement follow pre-open subscriptions in FIFO order', async () => {
+    const socket = collectionSocket();
+    const client = new St3Client({ baseUrl: 'https://example.test' });
+    const stream = await client.collectionStream({
+        socket: () => socket,
+        onFrame: () => {},
+        onOpen: () => {
+            stream.unsubscribe('talk');
+            stream.subscribeTerminal('term', 'terminal/test', 'new-incarnation', 'new-capability');
+        },
+    });
+    stream.subscribeConversation('talk', 'session/test');
+    stream.subscribeTerminal('term', 'terminal/test', 'old-incarnation', 'old-capability');
+    socket.onopen();
+    const held = new Map();
+    for (const command of socket.sent) {
+        if (command.kind === 'unsubscribe') held.delete(command.id);
+        else held.set(command.id, command);
+    }
+    assert.equal(held.has('talk'), false);
+    assert.deepEqual(held.get('term'), { kind: 'subscribe', id: 'term', collection: 'terminal', terminal: 'terminal/test', incarnation: 'new-incarnation', capability: 'new-capability' });
 });
 function envelope(value) { return { api_version: 'st3.client.v0', request_id: 'request/test', snapshot, value }; }
 function response(value, status = 200) { return { ok: status < 400, status, json: async () => value }; }

@@ -342,9 +342,9 @@ export class St3Client {
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? (defaultTerminalSocket as unknown as CollectionSocketFactory))(url.toString(), [COLLECTIONS_SUBPROTOCOL], headers);
-        let ended = false, open = false;
+        let ended = false, open = false, opening = false;
         const waiting: string[] = [];
-        const stop = () => { ended = true; socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
+        const stop = () => { ended = true; waiting.length = 0; socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
         const end = (error?: Error) => { if (ended) return; stop(); options.onEnd?.(error); };
         const send = (command: Record<string, unknown>) => {
             if (ended) return;
@@ -352,11 +352,19 @@ export class St3Client {
             if (open) socket.send(text); else waiting.push(text);
         };
         socket.onopen = () => {
-            if (ended || open) return;
-            open = true;
+            if (ended || open || opening) return;
+            opening = true;
             try {
                 options.onOpen?.();
-                if (!ended) for (const text of waiting.splice(0)) socket.send(text);
+                // onOpen commands join the existing queue: cancellation and replacement must
+                // follow earlier subscriptions, even though the native socket is already ready.
+                for (const text of waiting) {
+                    if (ended) break;
+                    socket.send(text);
+                }
+                waiting.length = 0;
+                open = !ended;
+                opening = false;
             } catch (error) { end(error instanceof Error ? error : new Error(String(error))); socket.close(1000); }
         };
         socket.onmessage = event => {
