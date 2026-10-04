@@ -45,3 +45,4 @@ jobs:
           assert os.environ['MISSING'] == ''
           print('Actual Actions expressions returned the expected digest and empty unmatched result')
           PYTHON
+          sleep 20
