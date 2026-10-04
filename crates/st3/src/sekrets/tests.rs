@@ -183,15 +183,23 @@ fn pipe() -> (OwnedFd, OwnedFd) {
 }
 
 fn run(connection: Connection, profile: Option<&str>, argv: &[&str], cwd: &Path) -> Output {
-    let stdin: OwnedFd = fs::File::open("/dev/null").unwrap().into();
-    let (out_read, out_write) = pipe();
-    let (err_read, err_write) = pipe();
-    let result = connection.run_in(
+    run_request(
+        connection,
         RunRequest {
             profile: profile.map(str::to_owned),
             argv: argv.iter().map(|word| (*word).to_owned()).collect(),
             ..RunRequest::default()
         },
+        cwd,
+    )
+}
+
+fn run_request(connection: Connection, request: RunRequest, cwd: &Path) -> Output {
+    let stdin: OwnedFd = fs::File::open("/dev/null").unwrap().into();
+    let (out_read, out_write) = pipe();
+    let (err_read, err_write) = pipe();
+    let result = connection.run_in(
+        request,
         cwd,
         Streams::Fds([
             stdin.as_raw_fd(),
@@ -757,4 +765,142 @@ fn a_terminal_command_gets_a_controlling_terminal_whose_side_the_caller_holds() 
         matches!(exited, Reply::Exited { code: Some(0), .. }),
         "{exited:?}"
     );
+}
+
+#[test]
+fn owners_manage_their_profiles_and_only_they_log_them_in() {
+    if !sandbox_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.tool("gh", "echo \"gh $*\"");
+    let cwd = fixture.checkout("web");
+    fixture
+        .manage(Request::ProfileCreate {
+            profile: "ada/agent-gh".into(),
+            description: Some("agents".into()),
+            policy: policy(&["gh-read"], &[]),
+            default: false,
+        })
+        .unwrap();
+    for (name, value) in [("GH_TOKEN", "example-one"), ("EXTRA", "example-two")] {
+        fixture
+            .manage(Request::Put {
+                profile: "ada/agent-gh".into(),
+                name: name.into(),
+                value: value.into(),
+            })
+            .unwrap();
+    }
+    fixture
+        .manage(Request::Unset {
+            profile: "ada/agent-gh".into(),
+            name: "EXTRA".into(),
+        })
+        .unwrap();
+    let shown = fixture
+        .manage(Request::ProfileShow {
+            profile: "ada/agent-gh".into(),
+        })
+        .unwrap();
+    assert_eq!(shown[0]["profile"]["env"], serde_json::json!(["GH_TOKEN"]));
+    assert!(
+        !shown.to_string().contains("example-one"),
+        "values never come back out"
+    );
+    let listed = fixture.manage(Request::ProfileList).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+
+    // A policy change applies to the next call.
+    let refused = run(
+        fixture.connect(),
+        Some("ada/agent-gh"),
+        &["gh", "pr", "create"],
+        &cwd,
+    );
+    assert!(refusal(&refused).contains("no allow rule matches"));
+    fixture
+        .manage(Request::PolicySet {
+            profile: "ada/agent-gh".into(),
+            policy: policy(&["gh-pr"], &[]),
+        })
+        .unwrap();
+    let created = run(
+        fixture.connect(),
+        Some("ada/agent-gh"),
+        &["gh", "pr", "create"],
+        &cwd,
+    );
+    assert_eq!(created.result.unwrap(), 0);
+
+    // A login is the owner's, whatever the policy says; nobody else's.
+    let login = |connection: Connection| {
+        run_request(
+            connection,
+            RunRequest {
+                profile: Some("ada/agent-gh".into()),
+                argv: vec!["gh".into(), "auth".into(), "login".into()],
+                login: true,
+                ..RunRequest::default()
+            },
+            &cwd,
+        )
+    };
+    let owned = login(fixture.connect());
+    assert_eq!(owned.result.as_ref().unwrap(), &0, "{}", owned.stderr);
+    assert_eq!(owned.stdout, "gh auth login\n");
+    let (key, _) = MemberKey::generate().unwrap();
+    fixture
+        .manage(Request::Register {
+            node: "host/example".into(),
+            key: key.public().into(),
+        })
+        .unwrap();
+    let grant = fixture
+        .manage(Request::GrantAdd {
+            profile: "ada/agent-gh".into(),
+            to: "agent/fleet/fixture-web/**".into(),
+            policy: policy(&["gh-read"], &[]),
+            until_unix_ms: None,
+        })
+        .unwrap();
+    let seat_login = login(fixture.seat(&key, "agent/fleet/fixture-web/builder"));
+    assert!(
+        refusal(&seat_login).contains("only its owner logs it in"),
+        "{}",
+        refusal(&seat_login)
+    );
+
+    // The owner sees and removes the grants on their profiles.
+    fixture.as_person();
+    let grants = fixture.manage(Request::GrantList).unwrap();
+    assert_eq!(grants.as_array().unwrap().len(), 1);
+    fixture
+        .manage(Request::GrantRemove {
+            grant: grant["id"].as_str().unwrap().into(),
+        })
+        .unwrap();
+    assert!(
+        fixture
+            .manage(Request::GrantList)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    fixture
+        .manage(Request::ProfileRemove {
+            profile: "ada/agent-gh".into(),
+        })
+        .unwrap();
+    assert!(
+        fixture
+            .manage(Request::ProfileList)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!fixture.store.join("profiles/ada/agent-gh").exists());
 }
