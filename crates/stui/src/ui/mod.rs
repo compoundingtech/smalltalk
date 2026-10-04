@@ -2598,7 +2598,7 @@ impl Ui {
                 ),
                 (
                     "ctrl+h",
-                    "Home, and again to close it (in a text box it is backspace)",
+                    "Now, and again to close it (in a text box it is backspace)",
                 ),
                 ("q", "quit"),
             ],
@@ -2640,7 +2640,7 @@ impl Ui {
                 ("x", "Missions: show st's own missions"),
                 ("n", "Agents: a new agent; Missions: a new mission"),
                 ("y", "confirm what a card asks; Enter never does"),
-                ("x", "Home: dismiss a request, update or message"),
+                ("x", "Now: dismiss a request, update or message"),
                 (
                     "b p",
                     "Usage: group by agent, mission, step...; change the period",

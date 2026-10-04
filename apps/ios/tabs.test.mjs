@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { parseDevLink, tabNamed, tabOrder, TABS } from './tabs.ts';
+import { parseDevLink, tabLabel, tabNamed, tabOrder, TABS } from './tabs.ts';
 
 assert.deepEqual(TABS, ['Home', 'Agents', 'Missions', 'Fleet']);
 // Usage is a screen in Fleet on the phone, so its links land there.
@@ -29,3 +29,6 @@ assert.equal(parseDevLink(`${scheme}session?id=agent/x`), null);
 assert.deepEqual(parseDevLink(`${scheme}terminal?id=terminal/pty/x`), { kind: 'terminal', id: 'terminal/pty/x' });
 assert.equal(parseDevLink(`${scheme}terminal?id=agent/x`), null);
 assert.equal(parseDevLink('not a url'), null);
+// Home reads as Now on screen, as stui and `st now` name it.
+assert.equal(tabLabel('Home'), 'Now');
+assert.equal(tabLabel('Agents'), 'Agents');
