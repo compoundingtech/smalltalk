@@ -291,27 +291,33 @@ async fn real_shells_complete_live_terminals_through_the_installed_stub() {
         assert_eq!(bash.trim(), "agent/example/solo-worker", "bash: {bash}");
 
         // zsh completes inside its line editor, so drive an interactive zsh through zpty: TAB
-        // must insert the only matching subject. The loop waits for that, up to 30 s.
+        // must insert the only matching subject. Read ZLE's buffer after its completion widget,
+        // rather than relying on terminal redraw output (which can be empty on CI runners).
         let zsh_stub = stub(root, "zsh");
         let script = root.join("drive.zsh");
+        let completed_buffer = root.join("completed-buffer");
         std::fs::write(
             &script,
             format!(
                 r#"zmodload zsh/zpty
-zpty z 'zsh -f -i'
-zpty -w z 'PS1="ready> "; autoload -Uz compinit; compinit -u -D; source {stub}; print -r -- "stub-$((1+1))"'
-zpty -r z out '*stub-2*'
+zpty z 'TERM=xterm zsh -f -i'
+zpty -w z 'PS1="ready> "; autoload -Uz compinit; compinit -u -D; source {stub}; _capture_completion() {{ zle expand-or-complete; print -r -- "$BUFFER" > {buffer}.tmp; mv -- {buffer}.tmp {buffer}; }}; zle -N _capture_completion; bindkey "^I" _capture_completion; _completion_ready() {{ print -r -- "completion-$((1+1))-ready"; }}; zle -N zle-line-init _completion_ready'
+zpty -r z out '*completion-2-ready*'
 zpty -w -n z $'st terminals attach agent/example/so\t'
-typeset seen=
 for attempt in {{1..600}}; do
-  while zpty -r -t z chunk; do seen+=$chunk; done
-  [[ $seen == *solo-worker* ]] && {{ print -r -- completed; exit 0 }}
+  if [[ -f {buffer} ]]; then
+    seen=$(<{buffer})
+    [[ $seen == 'st terminals attach agent/example/solo-worker ' || $seen == 'st terminals attach agent/example/solo-worker' ]] && {{ print -r -- completed; exit 0 }}
+    print -r -- "wrong completion buffer: ${{(q)seen}}"
+    exit 1
+  fi
   sleep 0.05
 done
-print -r -- "no completion: ${{(q)seen}}"
+print -r -- "completion widget did not finish"
 exit 1
 "#,
-                stub = zsh_stub.display()
+                stub = zsh_stub.display(),
+                buffer = completed_buffer.display(),
             ),
         )
         .unwrap();
