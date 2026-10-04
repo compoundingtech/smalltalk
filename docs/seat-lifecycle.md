@@ -56,6 +56,9 @@ incarnation cannot inherit them. Unknown actors are not guessed. A stop request 
 not an ended reason until termination is observed; confirmed suspension is separate
 positive evidence. Confirmed owned-set retirement and actor-attributed stops remain
 explainable on historical rows and take precedence over an otherwise clean exit.
+Provider exit codes take precedence over wrapper outcome codes; failure in either
+source prevents completion. Suspension evidence uses the same snapshot and retains
+the original suspend actor and boundary when a different requester fails to resume.
 Consumers preserve stale/missing observation states instead of displaying retained
 completion evidence as current success.
 

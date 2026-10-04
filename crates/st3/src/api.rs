@@ -2162,7 +2162,7 @@ fn client_agent_resources_uncached(
                 .transpose()?.flatten();
             let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
             let state = if fault.is_some() { "failed" } else if moving { "waiting" } else { state };
-            let suspension = crate::suspension::current(store, &subject.subject)?;
+            let suspension = crate::suspension::current_at(store, &subject.subject, Some(snapshot_index))?;
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
                 Some("suspended") if fault.is_none() => "suspended",
@@ -2206,7 +2206,12 @@ fn client_agent_resources_uncached(
             {
                 store.terminal_harness_at(&subject.subject, snapshot_index)?
             } else { None };
-            let end_reason = end_reason::project(&subject, terminal_harness.as_ref(), suspension.as_ref(), desired_claim.as_ref(), retired_subjects.contains(&subject.subject), &updated_at);
+            let original_suspend = suspension.as_ref()
+                .filter(|state| state.action == "resume" && state.phase == "suspended")
+                .and_then(|state| state.suspend_operation_id.as_deref())
+                .map(|request| crate::suspension::completed_suspend_at(store, request, snapshot_index))
+                .transpose()?.flatten();
+            let end_reason = end_reason::project(&subject, terminal_harness.as_ref(), original_suspend.as_ref().or(suspension.as_ref()), desired_claim.as_ref(), retired_subjects.contains(&subject.subject), &updated_at);
             let name = crate::model::effective_agent_name(
                 &subject.subject, subject.desired.as_ref(),
             ).to_owned();

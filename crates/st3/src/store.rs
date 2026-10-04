@@ -11890,6 +11890,15 @@ impl Store {
         launch_lineage_tx(&connection, subject)
     }
 
+    /// Agent launch ancestry selected at a client snapshot; stopped declarations have none.
+    pub fn agent_launch_lineage_at(&self, subject: &str, at: Option<u64>) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        let Some(row) = desired_row_at(&connection, subject, at)?.filter(|row| row.kind == "agent") else {
+            return Ok(Vec::new());
+        };
+        launch_lineage_for_claim_tx(&connection, subject, row.claim_id)
+    }
+
     /// `selected_desired_token` of each of `subjects` that has a declaration, in one statement.
     pub fn selected_desired_tokens(&self, subjects: &[&str]) -> Result<BTreeMap<String, String>> {
         let connection = self.readers.get();
@@ -17566,8 +17575,12 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
     let Some(row) = current_desired_row(connection, subject)? else {
         return Ok(Vec::new());
     };
-    let mut lineage = vec![row.claim_id.clone()];
-    let mut current = row.claim_id;
+    launch_lineage_for_claim_tx(connection, subject, row.claim_id)
+}
+
+fn launch_lineage_for_claim_tx(connection: &Connection, subject: &str, claim_id: String) -> Result<Vec<String>> {
+    let mut lineage = vec![claim_id.clone()];
+    let mut current = claim_id;
     while let Some(claim) = claim_by_id_tx(connection, &current)? {
         // A claim that merges concurrent revisions has one predecessor per fork; follow the
         // first one that is still the same launch.

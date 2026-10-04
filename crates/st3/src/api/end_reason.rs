@@ -14,8 +14,11 @@ pub(super) fn project(subject: &SubjectStatus, terminal_harness: Option<&Current
     let actor = suspended.and_then(|s| s.requested_by.as_deref()).or_else(|| stop.then(|| desired.and_then(|c| c.actor.as_deref())).flatten());
     let harness = subject.harness.as_ref().or(terminal_harness).filter(|h| h.state == "ended");
     let raw_exit = harness.and_then(|h| h.exit.as_deref());
-    let exit_code = fields.and_then(|v| v.get("exit_code")).and_then(Value::as_i64).or_else(|| raw_exit.and_then(|v| v.strip_prefix("exit ")).and_then(|v| v.parse::<i64>().ok()));
-    let exit_signal = fields.and_then(|v| v.get("exit_signal")).filter(|v| !v.is_null()).map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())).or_else(|| raw_exit.and_then(|v| v.strip_prefix("signal ")).map(str::to_owned));
+    let runtime_exit_code = fields.and_then(|v| v.get("exit_code")).and_then(Value::as_i64);
+    let harness_exit_code = raw_exit.and_then(|v| v.strip_prefix("exit ")).and_then(|v| v.parse::<i64>().ok());
+    let exit_code = harness_exit_code.or(runtime_exit_code);
+    let exit_signal = raw_exit.and_then(|v| v.strip_prefix("signal ")).map(str::to_owned).or_else(|| fields.and_then(|v| v.get("exit_signal")).filter(|v| !v.is_null()).map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())));
+    let failed_exit = exit_signal.is_some() || harness_exit_code.is_some_and(|code| code != 0) || runtime_exit_code.is_some_and(|code| code != 0);
     let diagnostic = harness.and_then(|h| h.reason.as_deref());
     let kind = if retired && matches!(actual, Some("stopped" | "exited" | "absent" | "vanished")) { "retired" }
     else if (stop && (terminal_runtime || harness.is_some())) || suspended.is_some() {
@@ -26,8 +29,8 @@ pub(super) fn project(subject: &SubjectStatus, terminal_harness: Option<&Current
         }
     } else if subject.reachability == "unreachable" && matches!(actual, Some("running" | "ready" | "working" | "idle")) { "host-lost" }
     else if harness.is_some() && diagnostic.is_some() { "harness-exited" }
-    else if (harness.is_some() || actual == Some("exited")) && (exit_signal.is_some() || exit_code.is_some_and(|code| code != 0)) { "crashed" }
-    else if (harness.is_some() || actual == Some("exited")) && exit_code == Some(0) && exit_signal.is_none() && matches!(subject.reachability.as_str(), "reachable" | "local") { "completed" }
+    else if (harness.is_some() || actual == Some("exited")) && failed_exit { "crashed" }
+    else if (harness.is_some() || actual == Some("exited")) && exit_code == Some(0) && !failed_exit && matches!(subject.reachability.as_str(), "reachable" | "local") { "completed" }
     else { return None; };
     let ended_at = suspended.map(|s| super::client_timestamp(s.suspended_at_unix_ms.unwrap_or(s.updated_at_unix_ms)))
         .or_else(|| harness.map(|h| super::client_timestamp(h.observed_at_unix_ms)))
@@ -157,5 +160,46 @@ mod tests {
         let retired = row(&store, id, store.index().unwrap());
         assert_eq!(retired["operational"]["layer"], "history");
         assert_eq!(retired["end_reason"]["kind"], "retired");
+    }
+    #[test]
+    fn exact_provider_exit_wins_without_hiding_wrapper_failure() {
+        let store = crate::store::Store::open_memory("node").unwrap();
+        let id = declare(&store, "version 2\nagent \"end\" { workspace \"/tmp\"; harness \"omp\" {} }", "declare", "person/operator");
+        for (provider, wrapper) in [(3, 1), (3, 0), (0, 1)] {
+            observe(&store, &id, "harness.observed", json!({"state":"ended","incarnation_id":"one","exit":format!("exit {provider}"),"reason":null}));
+            observe(&store, &id, "runtime.observed", json!({"status":"exited","incarnation_id":"one","exit_code":wrapper}));
+            let result = row(&store, &id, store.index().unwrap());
+            assert_eq!(result["end_reason"]["kind"], "crashed");
+            assert_eq!(result["end_reason"]["exit_code"], provider);
+        }
+    }
+    #[test]
+    fn suspension_snapshot_and_failed_resume_preserve_original_actor() {
+        let store = crate::store::Store::open_memory("node").unwrap();
+        let id = declare(&store, "version 2\nagent \"end\" { command \"sleep 100\" }", "declare", "person/operator");
+        observe(&store, &id, "runtime.observed", json!({"status":"running","incarnation_id":"one"}));
+        let token = store.selected_desired_token(&id).unwrap().unwrap();
+        let append = |kind: &str, actor: &str, fields: Value, evidence: Vec<String>, key: Option<String>| {
+            store.append_claim(&crate::model::ClaimInput {
+                subject: id.clone(), kind: kind.into(), actor: Some(actor.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence,
+                expected_subject: None, idempotency_key: key,
+            }).unwrap()
+        };
+        let request = append("runtime.action.requested", "person/operator", json!({"action":"suspend","incarnation_id":"one"}), vec![token.clone()], None);
+        let pending = store.index().unwrap();
+        let completed = append("runtime.action.succeeded", "person/operator", json!({"action":"suspend","operation_status":"suspended"}), vec![request.id.clone()], Some(crate::suspension::suspend_completed_key(&request.id)));
+        let suspended = store.index().unwrap();
+        assert!(row(&store, &id, pending)["end_reason"].is_null());
+        assert_eq!(row(&store, &id, suspended)["end_reason"]["actor"], "person/operator");
+        let resume = append("runtime.action.requested", "agent/helper", json!({"action":"resume"}), vec![token, request.id], None);
+        append("runtime.action.failed", "agent/helper", json!({"action":"resume","code":"native-resume-unavailable","reason":"resume failed"}), vec![resume.id.clone()], Some(crate::suspension::resume_failed_key(&resume.id)));
+        let failed = row(&store, &id, store.index().unwrap());
+        assert_eq!(failed["state"], "suspended");
+        assert_eq!(failed["end_reason"]["kind"], "stopped-by-person");
+        assert_eq!(failed["end_reason"]["actor"], "person/operator");
+        assert_eq!(failed["end_reason"]["ended_at"], super::super::client_timestamp(completed.accepted_at_unix_ms));
+        assert!(row(&store, &id, pending)["end_reason"].is_null());
+        assert_eq!(row(&store, &id, suspended)["end_reason"]["actor"], "person/operator");
     }
 }
