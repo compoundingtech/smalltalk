@@ -65,10 +65,10 @@ jobs:
           summarize: true
       - name: Isolate test state and keep the compiler cache
         run: |
-          home="$RUNNER_TEMP/test-home"
-          mkdir -p "$home"/{.config,.cache,.local/state} "$RUNNER_TEMP/cargo-home"/{registry,git} "$RUNNER_TEMP/perf-sccache"
+          bench_home="$RUNNER_TEMP/test-home"
+          mkdir -p "$bench_home"/{.config,.cache,.local/state} "$RUNNER_TEMP/cargo-home"/{registry,git} "$RUNNER_TEMP/perf-sccache"
           printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\nSCCACHE_DIR=%s\nSCCACHE_CACHE_SIZE=1G\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" "$RUNNER_TEMP/perf-sccache" >> "$GITHUB_ENV"
-          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$bench_home" "$bench_home" "$bench_home" "$bench_home" >> "$GITHUB_ENV"
       - name: Use the cached Nix outputs
         run: bash scripts/ci-nix-cache use
       - name: Prepare fast scratch space for a new store recipe
@@ -112,7 +112,7 @@ jobs:
           for name, sha in [('"'"'main'"'"', main_sha), ('"'"'head'"'"', head_sha)]:
               subprocess.run(['"'"'git'"'"', '"'"'checkout'"'"', '"'"'--detach'"'"', sha], check=True)
               report = out / f'"'"'paired-{name}.json'"'"'
-              env = dict(os.environ, ST_LOAD_GATE='"'"'1'"'"', ST_LOAD_REPORT=str(report),
+              env = dict(os.environ, ST_LOAD_GATE='"'"'1'"'"', ST_LOAD_SECONDS='"'"'300'"'"', ST_LOAD_REPORT=str(report),
                          ST_LOAD_BASELINE=str(root / '"'"'perf-baseline'"'"'),
                          ST_BENCH_DIR=str(root / '"'"'st-bench'"'"'), TMPDIR=str(root))
               env.pop('"'"'ST_AGENT'"'"', None)
