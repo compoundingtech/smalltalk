@@ -4443,11 +4443,6 @@ fn conversation_read_now(
     let native_changed = position.map_or(0, |(_, _, native)| {
         projection.iter().filter_map(native_sequence).filter(|sequence| *sequence > native).count()
     });
-    projection.reverse();
-    let mut page = client_page(state, &snapshot, &format!("timeline/{session_id}"), projection,
-                               &ClientListQuery { limit: Some(200), ..Default::default() })?;
-    page.items.reverse();
-    let all = &page.items;
     let local_latest = state
         .store
         .local_observations_tail(1)
@@ -4553,6 +4548,14 @@ fn conversation_read_now(
             }
         }
     }
+    let graph_changed = projection.iter().filter(|item| {
+        item["id"].as_str().is_some_and(|id| changed_ids.contains(id))
+    }).count();
+    projection.reverse();
+    let mut page = client_page(state, &snapshot, &format!("timeline/{session_id}"), projection,
+                               &ClientListQuery { limit: Some(200), ..Default::default() })?;
+    page.items.reverse();
+    let all = &page.items;
     let items = all
         .iter()
         .filter(|item| {
@@ -4585,6 +4588,9 @@ fn conversation_read_now(
         .iter()
         .any(|id| !items.iter().any(|item| item["id"].as_str() == Some(id)))
         || native_changed != items.iter().filter_map(native_sequence).count()
+        || graph_changed != items.iter().filter(|item| {
+            item["id"].as_str().is_some_and(|id| changed_ids.contains(id))
+        }).count()
     {
         return Err(ApiError {
             status: StatusCode::GONE,
@@ -13124,6 +13130,8 @@ mission "example/zero-run" state="ready" {
         // Old graph events have a larger local store-derived sequence than recent native prose.
         append(owner, "harness.usage", BTreeMap::from([
             ("input_tokens".into(), json!(7)),
+            ("semantics".into(), json!("response")),
+            ("driver".into(), json!("omp")),
             ("incarnation_id".into(), json!(incarnation)),
             ("observed_at_unix_ms".into(), json!(stamp("2026-10-04T21:40:11Z"))),
         ]));
@@ -13165,6 +13173,8 @@ mission "example/zero-run" state="ready" {
         assert!(idle["items"].as_array().unwrap().is_empty());
         let usage = append(owner, "harness.usage", BTreeMap::from([
             ("input_tokens".into(), json!(77)),
+            ("semantics".into(), json!("response")),
+            ("driver".into(), json!("omp")),
             ("incarnation_id".into(), json!(incarnation)),
             ("observed_at_unix_ms".into(), json!(stamp("2026-10-04T21:40:21Z"))),
         ]));
@@ -13172,6 +13182,67 @@ mission "example/zero-run" state="ready" {
         let usage_delta = conversation_read_now(&state, &session, &session_id,
                                                 idle["next_cursor"].as_str()).unwrap();
         assert_eq!(usage_delta["items"].as_array().unwrap().iter().map(|entry| entry["type"].as_str().unwrap()).collect::<Vec<_>>(), ["usage"]);
+    }
+
+    #[test]
+    fn chronological_graph_changes_outside_window_resynchronize_before_cursor_advances() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "backdated-graph-node");
+        let owner = "agent/backdated-graph";
+        let incarnation = "backdated-runtime:i1";
+        state.store.append_claim(&ClaimInput {
+            subject: owner.into(), kind: "runtime.observed".into(), actor: Some(owner.into()),
+            fields: BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("backdated-runtime")),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("terminal".into(), json!(false)),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        state.store.append_local_observations_for_test(
+            &(1..=205).map(|sequence| ClaimInput {
+                subject: owner.into(), kind: "harness.timeline".into(), actor: Some(owner.into()),
+                fields: BTreeMap::from([
+                    ("operation".into(), json!("append")),
+                    ("entry_id".into(), json!(format!("timeline-entry/newer-{sequence}"))),
+                    ("sequence".into(), json!(sequence)),
+                    ("revision".into(), json!(1)),
+                    ("role".into(), json!("assistant")),
+                    ("entry_type".into(), json!("content")),
+                    ("final".into(), json!(true)),
+                    ("body".into(), json!({"media_type":"text/plain","text":format!("newer {sequence}")})),
+                    ("driver".into(), json!("omp")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("observed_at_unix_ms".into(), json!(1_791_151_200_000_u64)),
+                ]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).collect::<Vec<_>>(),
+        );
+        let session_id = managed_session_id(owner, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let initial = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        let usage = |semantics: &str| state.store.append_claim(&ClaimInput {
+            subject: owner.into(), kind: "harness.usage".into(), actor: Some(owner.into()),
+            fields: BTreeMap::from([
+                ("semantics".into(), json!(semantics)),
+                ("driver".into(), json!("omp")),
+                ("input_tokens".into(), json!(7)),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("observed_at_unix_ms".into(), json!(1_791_100_000_000_u64)),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        // A suppressed rollup is not an omitted conversation event.
+        usage("response_rollup");
+        let rollup = conversation_read_now(&state, &session, &session_id,
+                                           initial["next_cursor"].as_str()).unwrap();
+        assert!(rollup["items"].as_array().unwrap().is_empty());
+        usage("response");
+        let gap = conversation_read_now(&state, &session, &session_id,
+                                        rollup["next_cursor"].as_str()).unwrap_err();
+        assert_eq!(gap.code, "cursor-gap");
+        assert_eq!(gap.details["full_resync"], true);
     }
 
     #[test]
