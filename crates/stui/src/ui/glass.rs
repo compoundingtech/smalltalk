@@ -501,7 +501,7 @@ enum Action {
     NewTerminal,
     /// The new mission form, in a new tab.
     NewMission,
-    /// Every conversation simplified, or in full again (Shift+O).
+    /// Every conversation simplified, or in full again (Ctrl+P).
     ToggleSimple,
     /// Ask for a name, for a glass to rename, make or copy.
     Name(Naming),
