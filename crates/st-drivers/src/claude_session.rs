@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::{BufReader, Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -533,7 +533,6 @@ const CHECKPOINT_SCHEMA: &str = "st.claude-residency-checkpoint.v1";
 const BINDING_FILE: &str = "binding.json";
 const PENDING_BINDING_FILE: &str = "binding.pending.json";
 const CHECKPOINT_FILE: &str = "residency-checkpoint.json";
-const TRANSCRIPT_RECORD_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -760,31 +759,36 @@ fn validate_transcript(
         "Claude transcript {} is not a regular file",
         transcript_path.display()
     );
-    let mut reader = BufReader::new(file);
-    let mut line = Vec::new();
-    let mut digest = Sha256::new();
+    // Native tool results can exceed a megabyte. Stream their JSON without retaining the
+    // payload, while still validating session/workspace metadata anywhere in each record.
+    // Ignored fields are consumed by Serde rather than skipped as an unverified large line.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Lineage {
+        session_id: Option<String>,
+        cwd: Option<PathBuf>,
+    }
+    struct DigestReader {
+        file: std::fs::File,
+        digest: Sha256,
+    }
+    impl std::io::Read for DigestReader {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.file.read(bytes)?;
+            self.digest.update(&bytes[..count]);
+            Ok(count)
+        }
+    }
+    let mut reader = BufReader::new(DigestReader {
+        file,
+        digest: Sha256::new(),
+    });
     let mut workspaces = BTreeSet::new();
     let mut identity_seen = false;
-    loop {
-        line.clear();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .with_context(|| format!("reading Claude transcript {}", transcript_path.display()))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&line);
-        anyhow::ensure!(
-            line.len() <= TRANSCRIPT_RECORD_LIMIT,
-            "Claude transcript {} contains an oversized JSONL record",
-            transcript_path.display()
-        );
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let value: serde_json::Value = serde_json::from_slice(&line)
+    for record in serde_json::Deserializer::from_reader(&mut reader).into_iter::<Lineage>() {
+        let record = record
             .with_context(|| format!("parsing Claude transcript {}", transcript_path.display()))?;
-        if let Some(session_id) = value.get("sessionId").and_then(serde_json::Value::as_str) {
+        if let Some(session_id) = record.session_id {
             anyhow::ensure!(
                 session_id == native_session_id,
                 "Claude transcript {} carries a different native session id",
@@ -792,8 +796,8 @@ fn validate_transcript(
             );
             identity_seen = true;
         }
-        if let Some(cwd) = value.get("cwd").and_then(serde_json::Value::as_str) {
-            workspaces.insert(PathBuf::from(cwd));
+        if let Some(cwd) = record.cwd {
+            workspaces.insert(cwd);
         }
     }
     let mut roots = workspaces
@@ -828,7 +832,7 @@ fn validate_transcript(
         recorded_workspace.display(),
         expected_workspace.display()
     );
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(format!("{:x}", reader.into_inner().digest.finalize()))
 }
 
 fn load_binding_file(
@@ -3384,6 +3388,38 @@ mod tests {
             load_binding(&state, "h.worker", "h.worker").unwrap(),
             Some(switched)
         );
+    }
+
+    #[test]
+    fn claude_transcript_lineage_streams_large_native_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let transcript = temp.path().join(format!("{RESUME_ID}.jsonl"));
+        // Put lineage after a legitimate large tool payload. Skipping the line wholesale
+        // would miss this metadata; collecting the whole JSON value would retain its body.
+        let large = "tool output ".repeat(200_000);
+        let record = format!(
+            "{{\"payload\":{},\"sessionId\":{},\"cwd\":{}}}\n",
+            serde_json::to_string(&large).unwrap(),
+            serde_json::to_string(RESUME_ID).unwrap(),
+            serde_json::to_string(&workspace).unwrap(),
+        );
+        fs::write(&transcript, &record).unwrap();
+        assert_eq!(
+            validate_transcript(&transcript, RESUME_ID, &workspace).unwrap(),
+            format!("{:x}", Sha256::digest(record.as_bytes())),
+        );
+        let other = "019fae17-c215-7882-a4d9-5f247168ffce";
+        fs::write(&transcript, record.replace(RESUME_ID, other)).unwrap();
+        assert!(
+            validate_transcript(&transcript, RESUME_ID, &workspace)
+                .unwrap_err()
+                .to_string()
+                .contains("different native session id")
+        );
+        fs::write(&transcript, &record[..record.len() - 3]).unwrap();
+        assert!(validate_transcript(&transcript, RESUME_ID, &workspace).is_err());
     }
 
     #[test]
