@@ -33,6 +33,28 @@ A step that runs out of time raises a fault, not a failure: `work extend STEP --
 A mission's goals, constraints and named documents encode every known rule and decision. `depends-on` orders steps; `missions start --after` orders runs without reports.
 A final step assigned to the author, depending on the last real step, reaches the author once when work is done. Review gates mark decisions only a person can make. `missions publish FILE` publishes a mission; `work revise RUN FILE` proposes a revision.
 
+## Spontaneous work and handoff
+
+`"$ST3_BIN" work start "Inspect the fixture" --as "$ST_AGENT" --idempotency-key fixture-inspection`
+opens a one-step run assigned to this seat without a mission file. It prints the step ID and the
+`work claim` command. Reuse the start key after a timeout to recover the same run. Finish or release
+independent claimed work before starting another run. Claim the step, add notes or checkpoints with
+`work progress STEP --summary TEXT --evidence REF`, and close with
+`work complete STEP --summary TEXT --evidence REF`, each with `--as "$ST_AGENT"`.
+
+`work handoff STEP --to agent/example/reviewer --note TEXT --as "$ST_AGENT"` atomically releases
+this incarnation's lease and assigns the leaf step to that recipient. `--to person/avery` hands it
+to a person. The note goes to the recipient's conversations; a person's step also appears on their
+home. `work show STEP` shows the note, its message ID and whether it was acknowledged. The sender
+no longer holds authority over the work. `--idempotency-key KEY` recovers the same transfer after
+a timeout.
+
+The recipient reads the note and runs `work acknowledge STEP --message MESSAGE --as RECIPIENT`.
+Acknowledgment records a read receipt and progress on this exact handoff; it does not acquire a
+worker lease. An agent then uses `work claim`; a person closes with `work done --summary TEXT
+--evidence REF`. Claiming or closing a handed-off step requires acknowledgment. A later handoff
+has a new note and needs its own acknowledgment. Spontaneous work requires evidence when closed.
+
 ## Person work
 
 `"$ST3_BIN" work ask --for PERSON --title TEXT --reason TEXT --step STEP --idempotency-key KEY --as "$ST_AGENT"` puts a structured request on a person's home and creates a person-assigned step in the same generation. The asking step waits without a worker lease; the person's response resumes it. `--new-run NAME` creates a minimal ask run when the seat has no claimed work; its answer arrives as a message. The ask ends with its requester, originating attempt or owner. `--request FILE` asks a structured decision, choice or feedback with named answers (`work ask --help` shows the JSON); the answer returns as data in the resumed step's `person_answers` (`work show STEP --json`).
