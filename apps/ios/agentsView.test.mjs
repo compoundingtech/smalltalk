@@ -7,6 +7,9 @@ const agent = (id, extra = {}) => ({ id: `agent/${id}`, name: id, kind: 'agent',
 // Names read the way stui reads them, including an omp seat under its parent.
 assert.equal(agentName({ id: 'agent/example/cos/standing/cos', name: 'example/cos/standing/cos' }), 'COS');
 assert.equal(agentName({ id: 'agent/example/pty-rust/omp', name: 'example/pty-rust/omp' }), 'PTY Rust · OMP');
+// A seat named after its host (st agents new NAME) is labelled without the host.
+assert.equal(agentName({ id: 'agent/harbor.image-sorter', name: 'harbor.image-sorter', host_id: 'host/harbor' }), 'Image Sorter');
+assert.equal(agentName({ id: 'agent/v2.parser', name: 'v2.parser', host_id: 'host/harbor' }), 'V2.parser');
 assert.equal(agentName({ id: 'agent/example/smalltalk-ci', name: 'example/smalltalk-ci' }), 'Smalltalk Ci');
 
 // States follow stui: a fault or a stale delivery is broken whatever the harness says.

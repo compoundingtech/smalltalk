@@ -34,9 +34,13 @@ function label(slug: string): string {
 }
 
 /** An agent's readable name, as stui names it: the last path segment, and `Parent · OMP` for an omp seat. */
-export function agentName(agent: Pick<Agent, 'id' | 'name'>): string {
+export function agentName(agent: Pick<Agent, 'id' | 'name'> & { host_id?: string | null }): string {
   const parts = (agent.name || agent.id).split('/').filter(Boolean);
-  const slug = parts.at(-1) ?? agent.id;
+  // `st agents new NAME` names a seat HOST.NAME; the host shows beside it, so the label is NAME.
+  const host = agent.host_id?.replace(/^host\//, '').toLowerCase();
+  const dotted = parts.at(-1) ?? agent.id;
+  const dot = dotted.indexOf('.');
+  const slug = host && dot > 0 && dot < dotted.length - 1 && dotted.slice(0, dot).toLowerCase() === host ? dotted.slice(dot + 1) : dotted;
   if (slug.toLowerCase() === 'omp' && parts.length > 1) return `${label(parts.at(-2)!)} · OMP`;
   return label(slug);
 }
