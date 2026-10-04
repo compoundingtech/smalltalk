@@ -47,6 +47,8 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_work_lease_renewals",
         "local_mailbox_owners",
         "local_mailbox_bindings",
+        "unread_mail",
+        "unread_mail_prefixes",
         "local_observations",
         "local_blobs",
         "local_blob_uploads",

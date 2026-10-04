@@ -46577,21 +46577,22 @@ impl Store {
             for claim in &batch.claims {
                 ensure_claim_blobs(&transaction, claim)?;
                 let inserted = transaction
-                    .execute(
+                    .prepare_cached(
                         "INSERT OR IGNORE INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                        params![
-                            claim.id,
-                            claim.batch_id,
-                            claim.subject,
-                            claim.kind,
-                            claim.origin,
-                            claim.actor,
-                            canonical_json_text(&claim.body).map_err(internal)?,
-                            serde_json::to_string(&claim.predecessors).map_err(internal)?,
-                            claim.accepted_at_unix_ms.to_string(),
-                        ],
                     )
+                    .map_err(internal)?
+                    .execute(params![
+                        claim.id,
+                        claim.batch_id,
+                        claim.subject,
+                        claim.kind,
+                        claim.origin,
+                        claim.actor,
+                        canonical_json_text(&claim.body).map_err(internal)?,
+                        serde_json::to_string(&claim.predecessors).map_err(internal)?,
+                        claim.accepted_at_unix_ms.to_string(),
+                    ])
                     .map_err(internal)?;
                 if inserted != 0 {
                     let index = transaction.last_insert_rowid() as u64;

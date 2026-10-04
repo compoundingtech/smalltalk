@@ -53,6 +53,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_work_lease_renewals` | Local | Local lease extensions, re-applied after canonical replay. Durable replicated lease anchors remain shared. |
 | `local_mailbox_owners` | Local | This daemon's native socket subscription owner, live runtime incarnation and replacement epoch. Survives daemon restart; excluded from replicated projection digests. |
 | `local_mailbox_bindings` | Local | Stable binding request tokens mapped to daemon-allocated epochs. Lost acknowledgements retry the same binding; retired tokens cannot allocate a successor. Excluded from replicated projection digests. |
+| `unread_mail`, `unread_mail_prefixes` | Local cache | Rebuildable unread-message timestamp and prefix-count indexes over this node's retained sent/read/closed claims. They accelerate current age counts, are not replicated, and do not add shared identities to projection digests. |
 | `local_observations` | Local | Local-retention observations and their local frontier/id; never replicated. |
 | `local_subscription_mission_deferrals` | Local | Local reconciler capacity backoff/retry scheduling. |
 | `local_usage_spend` | Local | Local provider usage and cost accumulation before publication. |
