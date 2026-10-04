@@ -493,6 +493,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pi_family_links_authored_transcripts_without_copying_or_replacing_inventory() {
+        use std::io::Write as _;
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
@@ -512,11 +513,12 @@ mod tests {
         assert!(pi_family_link_transcript(&arguments, &managed).unwrap());
         assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
         assert_eq!(fs::read_link(&managed).unwrap(), legacy);
-        fs::write(
-            &transcript,
-            format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n{{\"turn\":2}}\n"),
-        )
-        .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(b"{\"turn\":2}\n")
+            .unwrap();
         assert_eq!(
             fs::read(managed.join(transcript.file_name().unwrap())).unwrap(),
             fs::read(&transcript).unwrap()
