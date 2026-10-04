@@ -32060,9 +32060,9 @@ version 2
         let workspace = tempfile::tempdir().unwrap();
         let source = format!(
             r#"version 2
-account "shared" {{ provider "claude"; owner "person/casey" }}
+account "shared" {{ provider "claude"; owner "person/robin" }}
 agent "bound" {{ workspace {:?}; harness "claude" {{ account "shared" }} }}
-agent "pooled" {{ workspace {:?}; harness "claude" {{ account-pool "person/casey" }} }}
+agent "pooled" {{ workspace {:?}; harness "claude" {{ account-pool "person/robin" }} }}
 agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
 "#,
             workspace.path().display().to_string(),
@@ -32089,11 +32089,11 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
             .unwrap();
         assert_eq!(
             store.agent_person("agent/node.bound").unwrap().as_deref(),
-            Some("person/casey")
+            Some("person/robin")
         );
         assert_eq!(
             store.agent_person("agent/node.pooled").unwrap().as_deref(),
-            Some("person/casey")
+            Some("person/robin")
         );
         assert_eq!(
             store.agent_person("agent/node.plain").unwrap().as_deref(),
