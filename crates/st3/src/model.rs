@@ -1519,6 +1519,8 @@ pub struct CurrentHarnessView {
     pub exit: Option<String>,
     pub claim: String,
     pub observed_at_unix_ms: u128,
+    #[serde(default)]
+    pub since_unix_ms: u128,
 }
 
 impl CurrentHarnessView {
@@ -1544,6 +1546,7 @@ mod current_harness_view_tests {
             input_buffer: None,
             exit: None,
             claim: "claim/one".into(),
+            since_unix_ms: 1,
             observed_at_unix_ms: 1,
         }
     }

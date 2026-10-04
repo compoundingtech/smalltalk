@@ -1703,3 +1703,87 @@ fn the_documented_examples_drop_what_the_document_says() {
     );
     let _ = (renewals, person, third);
 }
+
+#[test]
+fn status_history_checkpoint_keeps_last_200_recent_transitions_across_incarnations() {
+    let mut sealed = Sealed::default();
+    let mut ids = Vec::new();
+    for index in 0..240 {
+        let incarnation = if index < 120 { "one" } else { "two" };
+        ids.push(sealed.add("cedar", CUT - DAY_MS + index, draft("harness.observed", "agent/cedar", json!({
+            "incarnation_id": incarnation, "state": if index % 2 == 0 { "idle" } else { "working" },
+            "status_transition": true
+        }))));
+    }
+    let set = sealed.build();
+    let gone = dropped(&plan_drops(&set));
+    assert!(ids[40..].iter().all(|id| !gone.contains(id)));
+    assert!(ids[1..40].iter().any(|id| gone.contains(id)));
+}
+
+#[test]
+fn status_history_checkpoint_drops_old_transitions_but_keeps_current_state_start() {
+    let mut sealed = Sealed::default();
+    let mut ids = Vec::new();
+    for index in 0..5 {
+        ids.push(sealed.add(
+            "cedar",
+            T + index,
+            draft(
+                "harness.observed",
+                "agent/cedar",
+                json!({
+                    "incarnation_id":"one", "state":if index == 1 { "working" } else { "idle" },
+                    "status_transition": index <= 2
+                }),
+            ),
+        ));
+    }
+    let set = sealed.build();
+    let gone = dropped(&plan_drops(&set));
+    assert!(!gone.contains(&ids[2]), "current idle state began here");
+    assert!(
+        gone.contains(&ids[1]),
+        "older transition is outside the history window"
+    );
+    assert!(gone.contains(&ids[3]), "repeated idle adds no history");
+}
+
+#[test]
+fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
+    let store = Store::open_memory("cedar").unwrap();
+    let append = |kind: &str, fields: Value| {
+        store.append_claim(&ClaimInput {
+            subject:"agent/cedar".into(), kind:kind.into(), actor:Some("agent/cedar".into()),
+            fields:serde_json::from_value(fields).unwrap(), evidence:Vec::new(),
+            expected_subject:None, idempotency_key:None,
+        }).unwrap()
+    };
+    append("runtime.observed", json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}));
+    for index in 0..220 {
+        append("harness.observed", json!({"state":if index%2==0 {"idle"} else {"working"}, "incarnation_id":"one"}));
+    }
+    let cut = now_ms() + 1_000;
+    let before = store.seat_status_history("agent/cedar", cut).unwrap();
+    let since = store.current_harness("agent/cedar").unwrap().unwrap().since_unix_ms;
+    let sealed = store.checkpoint_sealed_set(cut).unwrap();
+    let plan = plan_drops(&sealed);
+    assert!(!plan.claims.is_empty());
+    let scratch = tempfile::tempdir().unwrap();
+    let copy = scratch.path().join("checkpoint.sqlite3");
+    store.copy_store_to(&copy).unwrap();
+    let proof = prove_on_copy(&copy, &sealed, &plan).unwrap();
+    assert!(proof.passed, "bounded transitions and current since must survive the proof: {:?}", proof.mismatches);
+    {
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims).unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        transaction.commit().unwrap();
+    }
+    let after = store.seat_status_history("agent/cedar", cut).unwrap();
+    assert_eq!(after["items"], before["items"]);
+    assert_eq!(after["retained_from"], before["retained_from"]);
+    assert_eq!(after["complete"], false);
+    assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().since_unix_ms, since);
+}

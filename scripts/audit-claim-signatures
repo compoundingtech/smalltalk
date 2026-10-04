@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Bounded read-only stored-evidence audit; does not recompute signature verdicts."""
+
+import argparse
+import base64
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import cbor2
+except ImportError:
+    cbor2 = None
+
+ROW_LIMIT = 5000
+ENVELOPE_LIMIT = 8
+PAYLOAD_LIMIT = 16 * 1024 * 1024
+TOTAL_PAYLOAD_LIMIT = 64 * 1024 * 1024
+
+
+class AuditLimit(Exception):
+    """An audit cap with a shareable, non-private reason."""
+
+
+def audit(database):
+    result = {"audit_started_at_utc": datetime.now(timezone.utc).isoformat(),
+              "complete": False, "limitations": []}
+    try:
+        # mode=ro refuses a missing database. Do not use st's store opener here.
+        with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=2) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+
+            def query(sql, args=()):
+                ticks = 0
+
+                def budget():
+                    nonlocal ticks
+                    ticks += 1
+                    return ticks > 600
+
+                db.set_progress_handler(budget, 1000)
+                try:
+                    return [dict(row) for row in db.execute(sql, args)]
+                finally:
+                    db.set_progress_handler(None, 0)
+
+            grants = query("""SELECT c.id,c.batch_id,s.signature,
+                EXISTS(SELECT 1 FROM replica_envelopes e WHERE e.batch_id=c.batch_id) AS sealed
+                FROM claims c LEFT JOIN claim_signatures s ON s.claim_id=c.id
+                WHERE c.kind='principal.key-granted' ORDER BY c.store_index LIMIT ?""",
+                (ROW_LIMIT + 1,))
+            invalid = query("""SELECT reason FROM claim_verdicts
+                WHERE verdict='invalid' LIMIT ?""", (ROW_LIMIT + 1,))
+            result.update({
+                "snapshot_index": query("SELECT COALESCE(MAX(store_index),0) AS n FROM claims")[0]["n"],
+                "grants_observed": min(len(grants), ROW_LIMIT),
+                "grant_query_truncated": len(grants) > ROW_LIMIT,
+                "sealed_without_stored_signature": sum(
+                    row["sealed"] and row["signature"] is None for row in grants[:ROW_LIMIT]),
+                "unsealed_without_stored_signature": sum(
+                    not row["sealed"] and row["signature"] is None for row in grants[:ROW_LIMIT]),
+                "cached_invalid_observed": min(len(invalid), ROW_LIMIT),
+                "invalid_query_truncated": len(invalid) > ROW_LIMIT,
+                "unsigned_delegation_errors_observed": sum(
+                    "delegation " in (row["reason"] or "") and " is unsigned" in (row["reason"] or "")
+                    for row in invalid[:ROW_LIMIT]),
+                "payload_decoder_available": cbor2 is not None,
+            })
+            if result["grant_query_truncated"]:
+                result["limitations"].append("grant row cap reached")
+            if result["invalid_query_truncated"]:
+                result["limitations"].append("cached-invalid row cap reached")
+            if cbor2 is None:
+                result["limitations"].append("cbor2 unavailable; sealed payload maps not inspected")
+            else:
+                counts = {"envelopes_checked": 0, "grant_absent_from_payload": 0,
+                          "grant_signature_absent_from_payload": 0,
+                          "payload_signature_differs_from_stored": 0,
+                          "envelope_query_truncated": False, "decoded_bytes": 0}
+                result["sealed_payloads"] = counts
+                for grant in grants[:ROW_LIMIT]:
+                    # Bound transfer before fetching/base64-decoding a payload.
+                    envelopes = query("""SELECT CASE WHEN length(payload)<=? THEN payload END AS payload
+                        FROM replica_envelopes WHERE batch_id=? LIMIT ?""",
+                        (4 * ((PAYLOAD_LIMIT + 2) // 3), grant["batch_id"], ENVELOPE_LIMIT + 1))
+                    if len(envelopes) > ENVELOPE_LIMIT:
+                        counts["envelope_query_truncated"] = True
+                        if "envelope row cap reached" not in result["limitations"]:
+                            result["limitations"].append("envelope row cap reached")
+                    for envelope in envelopes[:ENVELOPE_LIMIT]:
+                        if envelope["payload"] is None:
+                            raise AuditLimit("payload exceeds audit size limit")
+                        raw = base64.b64decode(envelope["payload"], validate=True)
+                        if len(raw) > PAYLOAD_LIMIT:
+                            raise AuditLimit("payload exceeds audit size limit")
+                        if counts["decoded_bytes"] + len(raw) > TOTAL_PAYLOAD_LIMIT:
+                            raise AuditLimit("total payload byte cap reached")
+                        counts["decoded_bytes"] += len(raw)
+                        payload = cbor2.loads(raw)
+                        counts["envelopes_checked"] += 1
+                        counts["grant_absent_from_payload"] += not any(
+                            claim["id"] == grant["id"] for claim in payload["batch"]["claims"])
+                        signature = payload.get("claim_signatures", {}).get(grant["id"])
+                        counts["grant_signature_absent_from_payload"] += signature is None
+                        stored = json.loads(grant["signature"]) if grant["signature"] else None
+                        counts["payload_signature_differs_from_stored"] += signature != stored
+            # Roll back even though the connection and transaction are read-only.
+            db.rollback()
+        result["complete"] = not result["limitations"]
+    except AuditLimit as error:
+        result["limitations"].append(str(error))
+    except Exception as error:
+        # No claim bodies, IDs, host paths or raw payloads in shareable output.
+        result["limitations"].append("audit interrupted: " + type(error).__name__)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, epilog=
+        "Caps: 5000 grants/invalid verdicts, 8 envelopes per grant, 16 MiB per payload, "
+        "64 MiB total decoded bytes, about 600000 SQL instructions per query. "
+        "Optional cbor2 decodes payload maps. Exit 2 means incomplete evidence; "
+        "exit 0 does not imply valid signatures. Do not run doctor/restart to prepare this audit.")
+    parser.add_argument("database", type=Path)
+    args = parser.parse_args()
+    result = audit(args.database.resolve())
+    print(json.dumps(result, indent=2))
+    return 0 if result["complete"] else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

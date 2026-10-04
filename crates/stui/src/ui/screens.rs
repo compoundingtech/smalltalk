@@ -64,6 +64,7 @@ fn state_of<T>(load: &Load<Vec<T>>, loading: &'static str, empty: &'static str) 
 pub fn agent_glyph(state: AgentState, spinner: &'static str) -> (&'static str, Color) {
     match state {
         AgentState::NeedsYou => ("◆", theme::PERSON),
+        AgentState::NeedsLogin => ("⚿", theme::PERSON),
         AgentState::Fault => ("✕", theme::FAULT),
         AgentState::Working => (spinner, theme::WORKING),
         AgentState::Idle => ("●", theme::IDLE),
@@ -76,6 +77,7 @@ pub fn agent_glyph(state: AgentState, spinner: &'static str) -> (&'static str, C
 pub fn agent_word(state: AgentState) -> &'static str {
     match state {
         AgentState::NeedsYou => "needs you",
+        AgentState::NeedsLogin => "needs login",
         AgentState::Fault => "broken",
         AgentState::Working => "working",
         AgentState::Idle => "idle",
@@ -1297,6 +1299,7 @@ fn agent_group(agent: &Agent) -> &'static str {
     }
     match agent.state {
         AgentState::NeedsYou => "waiting on you",
+        AgentState::NeedsLogin => "needs login",
         AgentState::Fault => "broken",
         AgentState::Working => "working",
         AgentState::Idle | AgentState::Starting => "idle",
@@ -1349,7 +1352,9 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
             items.push(Item::Header {
                 title: group.into(),
                 count,
-                color: if agent.state == AgentState::NeedsYou && !agent.unmanaged {
+                color: if matches!(agent.state, AgentState::NeedsYou | AgentState::NeedsLogin)
+                    && !agent.unmanaged
+                {
                     theme::PERSON
                 } else {
                     theme::OVERLAY1
@@ -1395,6 +1400,25 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
 }
 
 /// The header strip above an agent's conversation.
+/// What a person does for an agent whose harness is signed out of its provider. st clears the
+/// state once the harness is signed in again, on the same run: no restart (Nathan, 2026-10-04).
+pub fn login_guidance(agent: &Agent) -> String {
+    let how = match agent.harness {
+        Harness::Claude => "open its terminal (ctrl+]) and run /login".to_owned(),
+        Harness::Codex => format!("run `codex login` on {} (or in its terminal)", agent.host),
+        _ => "open its terminal (ctrl+]) and log it in".to_owned(),
+    };
+    let provider = match agent.harness {
+        Harness::Claude => "Claude",
+        Harness::Codex => "Codex",
+        _ => "Its provider",
+    };
+    format!(
+        "{provider} login required on {}: {how}. Messages wait until it is signed in; it carries on without a restart.",
+        agent.host
+    )
+}
+
 pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'static str) -> Doc {
     let mut doc = Doc::new();
     let (glyph, color) = agent_glyph(agent.state, spinner);
@@ -1419,7 +1443,30 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
     if let Some(tree) = &agent.worktree {
         second.push(span(format!("  ·  {tree}"), theme::dim()));
     }
+    // The agent's actions, discoverable from where it is shown (ctrl+a too).
+    let actions = "⋯ actions ";
+    let used = second.iter().map(Span::width).sum::<usize>();
+    if used + text::width(actions) + 2 <= width {
+        let column = width - text::width(actions);
+        second.push(span(" ".repeat(column - used), theme::dim()));
+        second.push(span(actions, theme::fg(theme::ACCENT)));
+        doc.targets.push(super::doc::Target {
+            line: doc.lines.len(),
+            column: column as u16,
+            width: text::width(actions) as u16,
+            hit: Hit::Actions(agent.id.clone()),
+        });
+    }
     doc.line(Line::from(second));
+    if agent.state == AgentState::NeedsLogin {
+        doc.lines(text::wrap(
+            &text::inline(&login_guidance(agent), theme::fg(theme::PERSON)),
+            width,
+            &[text::run("   ⚿ ", theme::fg(theme::PERSON))],
+            &[text::run("     ", theme::dim())],
+            None,
+        ));
+    }
     if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
         let title = world
             .missions
@@ -2096,8 +2143,71 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
     }
     doc.card("agents here", theme::OVERLAY1, false, agents, width);
     if machine.you_are_here {
+        doc.append(clients_card(world, width), 0);
         doc.append(devices_card(world, width), 0);
     }
+    doc
+}
+
+// ------------------------------------------------------------------ clients
+
+/// Who is connected to this member: each client as it describes itself, who it acts for, how
+/// it came in, since when, and what it follows. A build older than the member's own carries a
+/// quiet note, nothing more.
+pub fn clients_card(world: &World, width: usize) -> Doc {
+    let mut inner = Doc::new();
+    match &world.clients {
+        Load::Loading => inner.line(Line::from(span("Loading connected clients…", theme::dim()))),
+        Load::Failed(error) => inner.wrap(
+            &[run(
+                format!("Could not read connected clients: {error}"),
+                theme::fg(theme::RED),
+            )],
+            width.saturating_sub(4),
+        ),
+        Load::Ready(clients) if clients.is_empty() => {
+            inner.line(Line::from(span("No clients connected.", theme::dim())))
+        }
+        Load::Ready(clients) => {
+            for item in clients {
+                let name = if item.client.is_empty() {
+                    "unnamed client"
+                } else {
+                    item.client.as_str()
+                };
+                let who = match &item.device {
+                    Some(device) => format!("{} · {device}", item.who),
+                    None => item.who.clone(),
+                };
+                let mut head = vec![
+                    span(
+                        if item.connected { "● " } else { "○ " },
+                        theme::fg(if item.connected {
+                            theme::GREEN
+                        } else {
+                            theme::QUIET
+                        }),
+                    ),
+                    span(format!("{name}  "), theme::text()),
+                    span(who, theme::soft()),
+                ];
+                if item.older {
+                    head.push(span("  older than this member", theme::dim()));
+                }
+                inner.line(Line::from(head));
+                let mut about = vec![item.via.clone(), item.member.clone(), item.when.clone()];
+                if !item.follows.is_empty() {
+                    about.push(format!("follows {}", item.follows.join(", ")));
+                }
+                inner.wrap(
+                    &[run(about.join(" · "), theme::dim())],
+                    width.saturating_sub(4),
+                );
+            }
+        }
+    }
+    let mut doc = Doc::new();
+    doc.card("connected clients", theme::OVERLAY1, false, inner, width);
     doc
 }
 
@@ -2285,6 +2395,74 @@ fn demo_banner(doc: &mut Doc, width: usize) {
 
 /// The small card a clicked reference opens: enough to recognise the subject, and a way
 /// to go to it.
+/// One row of the agent actions menu: its key, what it says, and what it does.
+pub struct AgentAction {
+    pub key: char,
+    pub label: &'static str,
+    pub what: &'static str,
+}
+
+/// What can be done to `agent` now, in the order the menu lists it (Nathan, 2026-10-04: make
+/// restart, retire and the rest discoverable). Ones that change the seat ask y first.
+pub fn agent_actions(agent: &Agent) -> Vec<AgentAction> {
+    let row = |key, label, what| AgentAction { key, label, what };
+    let mut rows = Vec::new();
+    let running = !matches!(agent.state, AgentState::Stopped | AgentState::Unknown);
+    if agent.state == AgentState::Working {
+        rows.push(row('i', "Interrupt", "stop its current turn, as Esc does in its own screen"));
+    }
+    if running {
+        rows.push(row('r', "Restart", "a new process for the same seat, on its declaration"));
+        rows.push(row('p', "Suspend", "stop at a quiet moment, keeping its session to resume"));
+        rows.push(row('x', "Retire", "stop it and take it off the lists; start brings it back"));
+    } else {
+        rows.push(row('s', "Start", "start it again on its declaration"));
+        rows.push(row('u', "Resume", "resume a suspended seat on the same session"));
+    }
+    if agent.terminal {
+        rows.push(row('t', "Terminal", "attach its terminal (ctrl+] too)"));
+    }
+    rows.push(row('d', "Details", "what it is doing and what is queued (ctrl+d too)"));
+    rows.push(row('f', "Find", "find in its conversation (ctrl+f too)"));
+    rows.push(row('c', "Copy id", "copy its id to the clipboard"));
+    rows
+}
+
+/// The agent actions menu's card.
+pub fn agent_actions_doc(agent: &Agent, width: usize, spinner: &'static str) -> Doc {
+    let mut doc = Doc::new();
+    doc.blank();
+    let (glyph, color) = agent_glyph(agent.state, spinner);
+    doc.line(Line::from(vec![
+        span(format!("{glyph} "), theme::strong(color)),
+        span(agent.name.clone(), theme::bold()),
+        span(format!("  {}", agent_word(agent.state)), theme::fg(color)),
+        span(format!("  {} · {}", agent.harness.name(), agent.host), theme::dim()),
+    ]));
+    doc.blank();
+    for action in agent_actions(agent) {
+        let line = doc.lines.len();
+        let label = format!("{:<10}", action.label);
+        doc.line(Line::from(vec![
+            span(format!(" {} ", action.key), theme::strong(theme::CRUST).bg(theme::ACCENT)),
+            span(format!(" {label}"), theme::bold()),
+            span(text::truncate(action.what, width.saturating_sub(16)), theme::dim()),
+        ]));
+        doc.targets.push(super::doc::Target {
+            line,
+            column: 0,
+            width: width.min(u16::MAX as usize) as u16,
+            hit: Hit::Key(action.key),
+        });
+    }
+    doc.blank();
+    doc.wrap(
+        &text::inline("Restart, suspend and retire ask y first. Esc closes.", theme::dim()),
+        width,
+    );
+    doc
+}
+
 pub fn peek(world: &World, subject: &str, width: usize, spinner: &'static str) -> Doc {
     let mut doc = Doc::new();
     doc.blank();
@@ -2449,6 +2627,15 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
         let mut inner = Doc::new();
         inner.wrap(&text::inline(fault, theme::text()), width.saturating_sub(4));
         doc.card("broken", theme::FAULT, true, inner, width);
+        doc.blank();
+    }
+    if agent.state == AgentState::NeedsLogin {
+        let mut inner = Doc::new();
+        inner.wrap(
+            &text::inline(&login_guidance(agent), theme::text()),
+            width.saturating_sub(4),
+        );
+        doc.card("needs login", theme::PERSON, true, inner, width);
         doc.blank();
     }
     doc.section("now", None, width);

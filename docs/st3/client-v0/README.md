@@ -1053,3 +1053,24 @@ Rust exposes `agent_create`, `terminal_create`, `terminal_end`; TypeScript and S
 Messages tagged `dictated` carry a delivery-only line explaining that voice transcription may
 contain mistakes. The stored text and body digest stay unchanged. Timeline message bodies carry
 the message's optional `tags` array so clients can mark dictation without inspecting its text.
+
+The agent resource exposes observed harness status as `harness_state`, `since` (RFC 3339),
+and `observation: current | stale | missing`. `since` is the start of that state in that
+runtime incarnation; repeated observations and changes to display details preserve it.
+`observation` becomes stale after 90 seconds without fresh evidence, and is missing when
+this runtime has no observation. Stale idle is exposed as indeterminate, never proven idle.
+Desired runtime state and agent-declared work progress remain separate from harness evidence.
+
+`GET /v1/client/status-history/{agent-id}` (`statusHistoryGet` in TypeScript) reads canonical
+ordered transitions for one seat. Each item has `seat`, `runtime_incarnation`, `state`,
+`observed_at`, and `reset`. A replacement runtime produces a reset immediately, even before
+its first harness observation (`state: null`); no new state vocabulary is introduced.
+The read retains at most 200 transitions/reset entries and only the last 7 days. It reports
+`retained_from` and `complete: false` when either bound trims history or checkpoint tombstones
+prevent proving completeness. Absence from incomplete history never proves continuity.
+The paired gateway uses the same endpoint and `read.projections` scope. Current status
+updates use the existing agents collection stream, including clock-driven staleness updates.
+
+Same-state observations remain local except for a freshness publication at most once a minute.
+That publication preserves `since` and does not add a history transition. Freshness uses the
+source observation time, so replaying old evidence cannot make a stale seat current.
