@@ -83,7 +83,7 @@ socket by opening input on that follow:
 {"kind":"input-close","id":"keys"}
 ```
 
-The input inherits the follow's consumed viewer and fenced incarnation, so it
+The input inherits the follow's viewer lease and fenced incarnation, so it
 needs no second capability. `input-opened` carries `id`, `follow`, and
 `next_seq`, the first sequence to send. Each batch holds exactly one of `text`
 (written as its UTF-8 bytes) or `bytes_b64`, 1 to 16384 bytes with no NUL byte,
@@ -91,7 +91,7 @@ and is acknowledged with `input-ack` (`id`, `seq`) once written. A `seq` below
 `next_seq` is a repeat: it is acknowledged again and never written. Sequences
 apply in order: a `seq` above `next_seq` closes the input with `gap`.
 
-Before every batch the server checks that the device is still paired, the
+Before writing each new batch the server checks that the device is still paired, the
 viewer was not detached, and the terminal still runs the follow's incarnation.
 `input-closed` (`id`, `reason`, `message`) ends the input, and nothing more is
 written: `incarnation-changed` when the incarnation changed or the process
@@ -100,9 +100,12 @@ viewer was detached or its follow ended or was unsubscribed or replaced, `gap`,
 and `rejected` for a refused open or batch, including a device without
 `terminal.control`, a follow another host owns, or a follow that already has
 input. Batches for a closed input are dropped without a frame. The server never
-resends; after a close, attach again and open a new input with fresh bytes.
+resends. Socket closure destroys every input session and its sequence state,
+even when the projected viewer lease remains reusable. After reconnect, follow
+the terminal on the new socket and explicitly open a new input; its sequence
+starts at zero. Never resend bytes whose earlier acknowledgement was lost.
 `input-close` ends an input without a frame. An input ID held again replaces
-the earlier input.
+the earlier input; callers must send fresh bytes, not replay an uncertain batch.
 
 ## Conversations
 
