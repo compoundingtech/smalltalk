@@ -1303,6 +1303,14 @@ impl Ui {
         else {
             return;
         };
+        // The group a tab left keeps showing one of its tabs: the one that was shown, which moved
+        // up a place if the tab came from before it, else the next one, else the last.
+        if let Some(group) = glass.layout.group_mut(from_group) {
+            if from_tab < group.current {
+                group.current -= 1;
+            }
+            group.current = group.current.min(group.tabs.len().saturating_sub(1));
+        }
         let emptied = sources == 1 && glass.layout.groups().len() > 1;
         if emptied {
             let layout = std::mem::take(&mut glass.layout);
@@ -3580,6 +3588,82 @@ mod tests {
         assert_eq!(tabs(&ui).1, 1);
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
+    }
+
+    #[test]
+    fn a_group_a_tab_was_dragged_out_of_still_shows_one_of_its_tabs() {
+        // Nathan, 2026-10-04: after dragging a tab to a new place, the group with the other tabs
+        // showed none of them.
+        let shown = |ui: &Ui, group: usize| {
+            ui.glasses
+                .as_ref()
+                .unwrap()
+                .glass()
+                .shown(group)
+                .map(|tab| tab.pane.clone())
+        };
+        let three = |ui: &mut Ui| {
+            ui.open_in_glass(
+                Pane::Agent(Some("agent/example/atlas/builder".into())),
+                Open::Tab,
+            );
+            ui.open_in_glass(
+                Pane::Mission(Some("mission/fleet/release/weekly".into())),
+                Open::Tab,
+            );
+            ui.open_in_glass(Pane::Agent(Some("agent/example/cos".into())), Open::Tab);
+        };
+        let cos = "agent:agent/example/cos";
+
+        // The shown tab is the last one and it leaves into a new split: the one before it shows.
+        let mut ui = glass();
+        three(&mut ui);
+        assert_eq!(tabs(&ui).1, 2);
+        ui.drop_tab(
+            (0, 2),
+            Drop::Edge {
+                group: 0,
+                side: Side::Right,
+                first: false,
+            },
+        );
+        assert_eq!(tabs(&ui).2, vec![vec![ATLAS, WEEKLY], vec![cos]]);
+        assert_eq!(shown(&ui, 0).as_deref(), Some(WEEKLY));
+        assert_eq!(shown(&ui, 1).as_deref(), Some(cos));
+
+        // The shown tab leaves from the middle: the next one takes its place.
+        let mut ui = glass();
+        three(&mut ui);
+        ui.glasses
+            .as_mut()
+            .unwrap()
+            .glass_mut()
+            .layout
+            .group_mut(0)
+            .unwrap()
+            .current = 1;
+        ui.drop_tab(
+            (0, 1),
+            Drop::Edge {
+                group: 0,
+                side: Side::Below,
+                first: false,
+            },
+        );
+        assert_eq!(shown(&ui, 0).as_deref(), Some(cos));
+
+        // A tab before the shown one leaves: the shown tab stays shown.
+        let mut ui = glass();
+        three(&mut ui);
+        ui.drop_tab(
+            (0, 0),
+            Drop::Edge {
+                group: 0,
+                side: Side::Right,
+                first: false,
+            },
+        );
+        assert_eq!(shown(&ui, 0).as_deref(), Some(cos));
     }
 
     #[test]
