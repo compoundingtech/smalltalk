@@ -32,7 +32,7 @@ impl Daemon {
         Self {
             root: root.to_path_buf(),
             socket: root.join("st3.sock"),
-            store: Arc::new(Store::open_memory("restart-node").unwrap()),
+            store: Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap()),
             server: None,
         }
     }
