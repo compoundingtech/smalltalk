@@ -806,6 +806,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: Some(s(ATLAS_KDL)),
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/site/pricing-page"),
@@ -840,6 +841,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/release/weekly"),
@@ -882,6 +884,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/harbor/pull-request-review"),
@@ -916,6 +919,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/rekey"),
@@ -960,6 +964,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/docs/handbook"),
@@ -986,6 +991,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/atlas/nightly"),
@@ -1020,6 +1026,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
     ]
 }
