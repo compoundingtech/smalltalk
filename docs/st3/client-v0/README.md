@@ -628,6 +628,9 @@ means older rows still exist, not that retention deleted them. A non-retryable
 whose retained append precedes the window and whose updates therefore cannot be projected
 coherently. Page cursors reach only the materialized window, not those omitted store rows.
 The notice remains in the newest page and does not invent an omitted sequence interval.
+Conversation changes carry these projection notices when managed history changes, including
+the first operation that crosses the bound. An updated entry outside the materialized window
+causes the ordinary cursor-gap/newest-page refresh instead of an incomplete revision delta.
 
 When the physical retained prefix starts after sequence one without a covering typed truncation
 interval, a non-retryable `timeline-history-incomplete` system error entry explains that earlier
