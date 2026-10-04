@@ -19,6 +19,10 @@ export default githubWorkflow({
     "pull_request": {
       "paths": [
         ".github/workflows/release-smalltalk.yml",
+        ".github/workflows/release-smalltalk.yml.genie.ts",
+        ".gitignore",
+        "build.rs",
+        "crates/st-drivers/src/version.rs",
         "scripts/release-smalltalk*",
         "scripts/install-release*",
         "scripts/install-macos*",
@@ -65,7 +69,7 @@ export default githubWorkflow({
       ]
     },
     "build": {
-      "if": "${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.event.deleted == false) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}",
+      "if": "${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.event.deleted == false) || github.event_name == 'pull_request' }}",
       "name": "release-build (${{ matrix.target }})",
       "strategy": {
         "fail-fast": false,
@@ -102,6 +106,13 @@ export default githubWorkflow({
           "uses": "dtolnay/rust-toolchain@stable"
         },
         {
+          "uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+          "with": {
+            "key": "release-${{ matrix.target }}",
+            "cache-on-failure": true
+          }
+        },
+        {
           "uses": "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
           "with": {
             "version": "0.15.2"
@@ -109,7 +120,7 @@ export default githubWorkflow({
         },
         {
           "name": "Test installer",
-          "run": "scripts/install-release-test\npython3 scripts/install-macos-test\n"
+          "run": "scripts/install-release-test\npython3 scripts/install-macos-test\npython3 scripts/release-smalltalk-test\n"
         },
         {
           "name": "Build, package, and test extracted tools",

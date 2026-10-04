@@ -54,6 +54,12 @@ points at the built commit, upload a draft, and publish it only after every asse
 Existing releases are not overwritten. If publication fails leaving a draft, inspect and remove
 that draft before rerunning the publish job; never move a published tag.
 
+Native builds restore Cargo dependencies and Zig's cache on both platforms; the pinned PTY
+runtime uses the same cached Cargo target directory. Generated `target`, `.zig-cache`, and `dist`
+files and Python bytecode are ignored by Git, so restored caches and previous archives do not mark
+the baked source version dirty. The extracted, installed binary must still report the exact clean
+checkout version.
+
 ## Daily releases
 
 **Smalltalk daily release** (`release-daily.yml`) runs at 05:17 UTC and on manual dispatch. It takes the
