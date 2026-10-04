@@ -847,7 +847,7 @@
         "transport": { "type": ["string", "null"] }
       }
     },
-    "AgentHandoff": {"type": "object", "additionalProperties": false, "required": ["phase", "destination", "sources", "pending_sources", "desired_token"], "properties": {"phase": {"type": "string", "enum": ["stopping-source", "waiting-for-destination", "starting", "running"]}, "destination": {"type": "string"}, "sources": {"type": "array", "items": {"type": "string"}}, "pending_sources": {"type": "array", "items": {"type": "string"}}, "desired_token": {"type": "string"}}},
+    "AgentHandoff": {"type": "object", "additionalProperties": false, "required": ["phase", "destination", "sources", "pending_sources", "desired_token"], "properties": {"phase": {"type": "string", "enum": ["stopping-source", "waiting-for-destination", "starting", "running"]}, "destination": {"type": "string"}, "sources": {"type": "array", "items": {"type": "string"}}, "pending_sources": {"type": "array", "items": {"type": "string"}}, "overridden_sources": {"type": "array", "items": {"type": "string"}}, "desired_token": {"type": "string"}}},
     "AgentSuspension": {
       "type": "object",
       "additionalProperties": false,

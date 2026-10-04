@@ -922,6 +922,8 @@ pub struct AgentHandoff {
     pub destination: String,
     pub sources: Vec<String>,
     pub pending_sources: Vec<String>,
+    #[serde(default)]
+    pub overridden_sources: Vec<String>,
     pub desired_token: String,
 }
 /// The latest accepted harness todo observation, including its provenance and freshness.

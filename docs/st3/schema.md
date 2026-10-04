@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `93f5c83b46d285ff661df9b324822dc318b6f0ac767fbe7c08dcedb2c72e7542`
+Digest: `6becf282bdefd3968692ffc8270b513f0601a0b4735c751440c14903d9bf4e25`
 
 ## Subject families
 
@@ -65,6 +65,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | Kind | Subjects | Write policy | Cardinality | Retention | Fields | KDL source |
 |---|---|---|---|---|---|---|
 | `agent.account` | `agent` | `same-subject-actor` | `state-transition` | `durable` | `account!:subject-reference(account)` |  |
+| `agent.placement.source-offline` | `agent` | `authorized-requester` | `append` | `durable` | `desired_token!:string`, `destination!:string`, `sources!:array` |  |
 | `agent.presence` | `agent` | `same-subject-actor` | `append` | `durable` | `presence!:string`, `reachability:string`, `reason:string` |  |
 | `agent.queue.moved` | `agent` | `authorized-requester` | `append` | `durable` | `anchor:subject-reference(mission-run)`, `placement!:string`, `reason:string`, `run!:subject-reference(mission-run)` |  |
 | `attention.requested` | `attention` | `authorized-participant` | `once` | `durable` | `closed_by:string`, `reason!:string`, `reviewer!:subject-reference(person)`, `severity!:string`, `step:subject-reference(step-run)`, `step_attempt:integer`, `targets:array`, `title!:string`, `until:string` |  |

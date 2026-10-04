@@ -1,12 +1,104 @@
 //! Placement handoff is a graph fence, independent of peer liveness or wall-clock time.
 //! A former owner acknowledges the selected placement only after its local runtime is gone.
-use crate::model::{ClaimRecord, DesiredSubject};
+use crate::model::{ClaimInput, ClaimRecord, DesiredSubject, St3Error};
 use crate::store::Store;
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+
+pub const SOURCE_OFFLINE_KIND: &str = "agent.placement.source-offline";
+
+#[derive(Deserialize)]
+pub struct SourceOfflineRequest {
+    pub subject: String,
+    pub actor: String,
+    pub desired_token: String,
+    pub sources: Vec<String>,
+    pub idempotency_key: String,
+}
+
+/// The operator names an exact placement and sources; no peer timeout becomes stop evidence.
+pub fn source_offline_input(
+    store: &Store,
+    request: SourceOfflineRequest,
+) -> Result<ClaimInput, St3Error> {
+    let invalid = |message| St3Error::new("invalid-source-offline", message);
+    let claim = store
+        .claim_by_id(&request.desired_token)
+        .map_err(|e| St3Error::new("internal", e.to_string()))?
+        .ok_or_else(|| invalid("placement declaration is missing"))?;
+    if claim.subject != request.subject || claim.kind != "intent.desired" {
+        return Err(invalid(
+            "override must name this seat's placement declaration",
+        ));
+    }
+    let fence = fence(store, &request.subject, &request.desired_token)
+        .map_err(|e| St3Error::new("internal", e.to_string()))?
+        .ok_or_else(|| invalid("override needs an agent placement"))?;
+    let sources = request.sources.into_iter().collect::<BTreeSet<_>>();
+    if sources.is_empty()
+        || sources
+            .iter()
+            .any(|source| !fence.sources.contains_key(source))
+    {
+        return Err(invalid(
+            "override must name former source hosts of this placement",
+        ));
+    }
+    Ok(ClaimInput {
+        subject: request.subject,
+        kind: SOURCE_OFFLINE_KIND.into(),
+        actor: Some(request.actor),
+        fields: BTreeMap::from([
+            (
+                "desired_token".into(),
+                Value::String(request.desired_token.clone()),
+            ),
+            (
+                "destination".into(),
+                Value::String(fence.destination.clone()),
+            ),
+            ("sources".into(), serde_json::json!(sources)),
+        ]),
+        evidence: vec![request.desired_token],
+        expected_subject: None,
+        idempotency_key: Some(request.idempotency_key),
+    })
+}
+
+/// Only explicitly recorded overrides of this immutable placement release its sources.
+pub fn source_offline_overrides(
+    store: &Store,
+    subject: &str,
+    fence: &Fence,
+    at: u64,
+) -> Result<BTreeMap<String, ClaimRecord>> {
+    let mut overrides = BTreeMap::new();
+    for claim in store.claims_for(subject, Some(SOURCE_OFFLINE_KIND))? {
+        if claim.store_index > at
+            || field(&claim, "desired_token") != Some(fence.token.as_str())
+            || field(&claim, "destination") != Some(fence.destination.as_str())
+            || claim
+                .actor
+                .as_deref()
+                .is_none_or(|actor| !actor.starts_with("person/") && !actor.starts_with("agent/"))
+        {
+            continue;
+        }
+        for source in claim.body["fields"]["sources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|source| fence.sources.contains_key(*source))
+        {
+            overrides.insert(source.to_owned(), claim.clone());
+        }
+    }
+    Ok(overrides)
+}
 
 pub fn field<'a>(claim: &'a ClaimRecord, key: &str) -> Option<&'a str> {
     claim
@@ -113,6 +205,7 @@ pub struct Handoff {
     pub destination: String,
     pub sources: Vec<String>,
     pub pending_sources: Vec<String>,
+    pub overridden_sources: Vec<String>,
     pub desired_token: String,
 }
 
@@ -133,6 +226,7 @@ pub fn handoff(store: &Store, subject: &str, token: &str, at: u64) -> Result<Opt
         return Ok(None);
     }
     let latest = latest_by_origin(store, subject, at)?;
+    let overrides = source_offline_overrides(store, subject, &fence, at)?;
     let mut pending_sources = Vec::new();
     for (host, tokens) in &fence.sources {
         let acknowledged = match latest.get(host) {
@@ -141,7 +235,7 @@ pub fn handoff(store: &Store, subject: &str, token: &str, at: u64) -> Result<Opt
             }
             _ => false,
         };
-        if !acknowledged {
+        if !acknowledged && !overrides.contains_key(host) {
             pending_sources.push(host.clone());
         }
     }
@@ -160,6 +254,7 @@ pub fn handoff(store: &Store, subject: &str, token: &str, at: u64) -> Result<Opt
         destination: fence.destination.clone(),
         sources: fence.sources.keys().cloned().collect(),
         pending_sources,
+        overridden_sources: overrides.keys().cloned().collect(),
         desired_token: fence.token.clone(),
     }))
 }

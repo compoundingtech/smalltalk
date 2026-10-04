@@ -1565,6 +1565,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "agent.placement.source-offline",
+            &["agent"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::Append,
+            Some("agents"),
+            true,
+            &[],
+        ),
+        (
             "agent.queue.moved",
             &["agent"],
             WritePolicy::AuthorizedRequester,
@@ -2840,6 +2849,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("deadline_unix_ms", required_string()),
             ("reason", required_string()),
         ],
+        "agent.placement.source-offline" => &[
+            ("desired_token", required_string()),
+            ("destination", required_string()),
+            ("sources", required_array()),
+        ],
         "delivery.hold" => &[
             ("held", required_boolean()),
             ("until_unix_ms", required_integer()),
@@ -3775,6 +3789,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "agent.account",
+                "agent.placement.source-offline",
                 "agent.presence",
                 "agent.queue.moved",
                 "attention.requested",

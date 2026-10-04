@@ -459,6 +459,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
         .route("/v1/agents/start", post(start_mission_seat))
+        .route("/v1/agents/source-offline", post(override_placement_source))
         .route("/v1/agents/suspend", post(suspend_agent))
         .route("/v1/agents/resume", post(resume_agent))
         .route("/v1/agents/native-session", post(report_native_session))
@@ -4762,6 +4763,7 @@ async fn guard_bound_request(
         "/v1/agents/rename",
         "/v1/agents/restart",
         "/v1/agents/start",
+        "/v1/agents/source-offline",
         "/v1/agents/suspend",
         "/v1/agents/resume",
         "/v1/agents/native-session",
@@ -8583,6 +8585,22 @@ struct MissionSeatStartRequest {
     #[serde(default)]
     expected: Option<String>,
     idempotency_key: String,
+}
+
+/// Record an operator's source-offline exception for one exact placement.
+async fn override_placement_source(
+    State(state): State<AppState>,
+    Json(mut request): Json<crate::placement::SourceOfflineRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    request.actor = person_or_agent_actor(&request.actor, "invalid-source-offline-actor")?;
+    request.subject = agent_subject(request.subject);
+    let store = state.store.clone();
+    let (claim, appended) = blocking_action(move || {
+        let input = crate::placement::source_offline_input(&store, request)?;
+        store.append_claim_outcome(&input)
+    }).await?;
+    if appended { signal_claim_changed(&state, crate::placement::SOURCE_OFFLINE_KIND); }
+    Ok(Json(claim))
 }
 
 /// Start a stopped mission seat on the declaration its run gave it, as `st agents start` does.

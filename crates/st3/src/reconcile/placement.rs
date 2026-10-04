@@ -154,18 +154,23 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(Some(Vec::new()));
         }
         let latest = crate::placement::latest_by_origin(&self.store, subject, u64::MAX)?;
+        let overrides =
+            crate::placement::source_offline_overrides(&self.store, subject, &fence, u64::MAX)?;
         let mut evidence = Vec::new();
         for (source, tokens) in &fence.sources {
-            let Some(claim) = latest.get(source) else {
-                return Ok(None);
-            };
-            if crate::placement::field(claim, "status") != Some("stopped")
-                || !crate::placement::acknowledges(&self.store, claim, tokens)?
+            if let Some(claim) = latest.get(source)
+                && crate::placement::field(claim, "status") == Some("stopped")
+                && crate::placement::acknowledges(&self.store, claim, tokens)?
             {
+                evidence.push(claim.id.clone());
+            } else if let Some(override_claim) = overrides.get(source) {
+                evidence.push(override_claim.id.clone());
+            } else {
                 return Ok(None);
             }
-            evidence.push(claim.id.clone());
         }
+        evidence.sort();
+        evidence.dedup();
         Ok(Some(evidence))
     }
 }

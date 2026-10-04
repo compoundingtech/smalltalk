@@ -2944,6 +2944,9 @@ struct AgentStartArgs {
     harness: Option<String>,
     #[arg(long)]
     host: Option<String>,
+    /// Record permission to start this placement before unreachable source hosts acknowledge exit.
+    #[arg(long, conflicts_with = "print_kdl")]
+    source_offline: bool,
     /// Override the workspace; new seats default to the current directory.
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -10425,6 +10428,8 @@ async fn run_agents(
             let client = cli_client(endpoint);
             let (subject, tokens, existing, mission) =
                 agent_start_declaration(&client, &args).await?;
+            anyhow::ensure!(!args.source_offline || existing.is_some(),
+                "--source-offline needs an existing seat with a pending placement handoff");
             let response = if let Some(mission) = mission {
                 anyhow::ensure!(
                     args.harness.is_none()
@@ -10438,6 +10443,12 @@ async fn run_agents(
                      that declaration through its mission"
                 );
                 if let MissionSeatStart::Declared(run) = mission {
+                    if args.source_offline {
+                        let agent = agent_start_status(endpoint, &client, &subject, &args).await?;
+                        if json_output { return print_value(&agent, true); }
+                        print!("{}", render_client_agent(&agent, &[], current_unix_ms()?));
+                        return Ok(());
+                    }
                     println!(
                         "{subject} is declared by {run}; `st agents restart {subject}` relaunches it"
                     );
@@ -10469,10 +10480,7 @@ async fn run_agents(
                 )
                 .await?
             };
-            let agent = generated_client(endpoint, None)?.agents_get(&subject).await?;
-            let ClientResource::Agent(agent) = agent.value else {
-                anyhow::bail!("`{subject}` is not an agent");
-            };
+            let agent = agent_start_status(endpoint, &client, &subject, &args).await?;
             if json_output {
                 let mut value = serde_json::to_value(&response)?;
                 value["handoff"] = serde_json::to_value(&agent.handoff)?;
@@ -10483,6 +10491,9 @@ async fn run_agents(
                     println!("{subject}: {} → {}", handoff.phase, handoff.destination);
                     if !handoff.pending_sources.is_empty() {
                         println!("Waiting for source stop: {}", handoff.pending_sources.join(", "));
+                    }
+                    if !handoff.overridden_sources.is_empty() {
+                        println!("Source-offline override recorded: {}", handoff.overridden_sources.join(", "));
                     }
                 } else {
                     let state = cli_help::agent_state(
@@ -10691,6 +10702,36 @@ enum MissionSeatStart {
     Declared(String),
     /// Someone stopped it; the daemon restores the run's declaration.
     Stopped,
+}
+
+async fn agent_start_status(
+    endpoint: &Endpoint,
+    client: &Client,
+    subject: &str,
+    args: &AgentStartArgs,
+) -> Result<st3_client::Agent> {
+    let generated = generated_client(endpoint, None)?;
+    let ClientResource::Agent(mut agent) = generated.agents_get(subject).await?.value else {
+        anyhow::bail!("`{subject}` is not an agent");
+    };
+    if args.source_offline {
+        let handoff = agent.handoff.as_ref()
+            .context("--source-offline needs a placement handoff with former source hosts")?;
+        if !handoff.pending_sources.is_empty() {
+            client.post::<_, st3::model::ClaimRecord>("/v1/agents/source-offline", &json!({
+                "subject": subject,
+                "actor": args.actor,
+                "desired_token": handoff.desired_token,
+                "sources": handoff.pending_sources,
+                "idempotency_key": format!("source-offline:{}", uuid::Uuid::now_v7()),
+            })).await?;
+            let ClientResource::Agent(updated) = generated.agents_get(subject).await?.value else {
+                anyhow::bail!("`{subject}` is not an agent");
+            };
+            agent = updated;
+        }
+    }
+    Ok(agent)
 }
 
 async fn agent_start_declaration(
@@ -12110,6 +12151,9 @@ fn render_client_agent(
         let pending = if handoff.pending_sources.is_empty() { String::new() }
             else { format!(" · waiting for {}", handoff.pending_sources.join(", ")) };
         let _ = writeln!(output, "HANDOFF      {} → {}{pending}", handoff.phase, handoff.destination);
+        if !handoff.overridden_sources.is_empty() {
+            let _ = writeln!(output, "SOURCE OFFLINE {} · override recorded", handoff.overridden_sources.join(", "));
+        }
     }
     if let Some(suspension) = &agent.suspension {
         let session = match (&suspension.harness, &suspension.native_session_id) {

@@ -9,6 +9,302 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, watch};
 const FLEET: &str = "7d3f9a2e-5b6c-4e1d-8a0f-2c9b8e7d6f5a";
 const SEAT: &str = "agent/example/mover";
+
+async fn override_sources(
+    node: &Node,
+    token: &str,
+    sources: &[&str],
+    key: &str,
+) -> anyhow::Result<Value> {
+    st3::client::Client::unix(node.root.path().join("st3.sock"))
+        .post(
+            "/v1/agents/source-offline",
+            &serde_json::json!({
+                "subject": SEAT, "actor": "person/avery", "desired_token": token,
+                "sources": sources, "idempotency_key": key,
+            }),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn source_offline_cli_records_the_actor_and_returning_source_still_stops() {
+    let amber = Node::new("amber").await;
+    let cobalt = Node::new("cobalt").await;
+    amber.declare("amber", true, "initial");
+    amber.pass();
+    amber.pass();
+    amber.sync_to(&cobalt);
+    // The source takes no passes or replication exchanges while the move is requested.
+    let result = cobalt
+        .cli(&[
+            "agents",
+            "start",
+            SEAT,
+            "--host",
+            "cobalt",
+            "--as",
+            "person/avery",
+        ])
+        .await;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    cobalt.pass();
+    cobalt.pass();
+    assert_eq!(cobalt.running(), 0, "unreachable source waits by default");
+    let result = cobalt
+        .cli(&[
+            "agents",
+            "start",
+            SEAT,
+            "--source-offline",
+            "--as",
+            "person/avery",
+            "--json",
+        ])
+        .await;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let view: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        view["handoff"]["overridden_sources"],
+        serde_json::json!(["amber"])
+    );
+    assert_eq!(view["handoff"]["phase"], "waiting-for-destination");
+    let proof = cobalt
+        .store
+        .claims_for(SEAT, Some(st3::placement::SOURCE_OFFLINE_KIND))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(proof.actor.as_deref(), Some("person/avery"));
+    assert_eq!(proof.body["fields"]["destination"], "cobalt");
+    assert_eq!(
+        proof.body["fields"]["desired_token"],
+        view["handoff"]["desired_token"]
+    );
+    cobalt.pass();
+    cobalt.pass();
+    assert_eq!(cobalt.running(), 1);
+    assert_eq!(
+        amber.running(),
+        1,
+        "override is permission, not fabricated stop evidence"
+    );
+    assert_eq!(
+        cobalt.show().await["reachability"],
+        "reachable",
+        "the explicit exception supersedes the source's older running record for routing"
+    );
+    let running = cobalt
+        .store
+        .claims_for(SEAT, Some("runtime.observed"))
+        .unwrap()
+        .into_iter()
+        .find(|c| c.origin == "cobalt" && c.body["fields"]["status"] == "running")
+        .unwrap();
+    assert!(
+        st3::placement::acknowledges(
+            &cobalt.store,
+            &running,
+            &std::collections::BTreeSet::from([proof.id])
+        )
+        .unwrap()
+    );
+    let show = cobalt.cli(&["agents", "show", SEAT]).await;
+    assert!(String::from_utf8_lossy(&show.stdout).contains("SOURCE OFFLINE amber"));
+    cobalt.sync_to(&amber);
+    amber.pass();
+    amber.pass();
+    assert_eq!(
+        amber.running(),
+        0,
+        "returning source retires its old runtime"
+    );
+    amber.sync_to(&cobalt);
+    cobalt.pass();
+    assert_eq!(cobalt.running(), 1);
+    assert_eq!(cobalt.show().await["handoff"]["phase"], "running");
+}
+
+#[tokio::test]
+async fn source_offline_overrides_are_idempotent_and_do_not_release_a_later_move() {
+    let amber = Node::new("amber").await;
+    let cobalt = Node::new("cobalt").await;
+    let slate = Node::new("slate").await;
+    amber.declare("amber", true, "initial");
+    amber.pass();
+    amber.pass();
+    amber.sync_to(&cobalt);
+    cobalt.declare("cobalt", true, "first-move");
+    let first = cobalt.store.selected_desired_token(SEAT).unwrap().unwrap();
+    let proof = override_sources(&cobalt, &first, &["amber"], "override-first")
+        .await
+        .unwrap();
+    assert_eq!(
+        override_sources(&cobalt, &first, &["amber"], "override-first")
+            .await
+            .unwrap()["id"],
+        proof["id"]
+    );
+    assert_eq!(
+        cobalt
+            .store
+            .claims_for(SEAT, Some(st3::placement::SOURCE_OFFLINE_KIND))
+            .unwrap()
+            .len(),
+        1
+    );
+    cobalt.pass();
+    cobalt.pass();
+    cobalt.sync_to(&slate);
+    slate.declare("slate", true, "second-move");
+    slate.pass();
+    assert_eq!(slate.running(), 0);
+    assert_eq!(
+        slate.show().await["handoff"]["overridden_sources"],
+        serde_json::json!([])
+    );
+    slate.sync_to(&cobalt);
+    cobalt.pass();
+    cobalt.pass();
+    cobalt.sync_to(&slate);
+    slate.pass();
+    assert_eq!(
+        slate.running(),
+        0,
+        "the earlier source-offline exception cannot release amber again"
+    );
+    let second = slate.store.selected_desired_token(SEAT).unwrap().unwrap();
+    override_sources(&slate, &second, &["amber"], "override-second")
+        .await
+        .unwrap();
+    slate.pass();
+    slate.pass();
+    assert_eq!(slate.running(), 1);
+}
+
+#[tokio::test]
+async fn source_offline_overrides_release_only_the_explicitly_named_sources() {
+    let amber = Node::new("amber").await;
+    let cobalt = Node::new("cobalt").await;
+    let slate = Node::new("slate").await;
+    amber.declare("amber", true, "initial");
+    amber.pass();
+    amber.pass();
+    amber.sync_to(&cobalt);
+    cobalt.declare("cobalt", true, "intermediate");
+    cobalt.sync_to(&slate);
+    slate.declare("slate", true, "destination");
+    let token = slate.store.selected_desired_token(SEAT).unwrap().unwrap();
+    override_sources(&slate, &token, &["amber"], "amber-offline")
+        .await
+        .unwrap();
+    slate.pass();
+    assert_eq!(slate.running(), 0);
+    assert_eq!(
+        slate.show().await["handoff"]["pending_sources"],
+        serde_json::json!(["cobalt"])
+    );
+    override_sources(&slate, &token, &["cobalt"], "cobalt-offline")
+        .await
+        .unwrap();
+    slate.pass();
+    slate.pass();
+    assert_eq!(slate.running(), 1);
+}
+
+#[tokio::test]
+async fn source_offline_override_survives_reversed_replication_and_replay() {
+    let amber = Node::new("amber").await;
+    let cobalt = Node::new("cobalt").await;
+    let slate = Node::new("slate").await;
+    amber.declare("amber", true, "initial");
+    amber.pass();
+    amber.pass();
+    amber.sync_to(&cobalt);
+    cobalt.declare("cobalt", true, "move");
+    let token = cobalt.store.selected_desired_token(SEAT).unwrap().unwrap();
+    override_sources(&cobalt, &token, &["amber"], "offline")
+        .await
+        .unwrap();
+    cobalt.pass();
+    cobalt.pass();
+    let expected = cobalt.show().await["handoff"].clone();
+    let exchange = cobalt
+        .store
+        .export_replication_exchange(FLEET, &slate.store.replication_inventory().unwrap())
+        .unwrap();
+    for envelope in exchange.envelopes.iter().rev() {
+        let mut single = exchange.clone();
+        single.envelopes = vec![envelope.clone()];
+        slate
+            .store
+            .receive_replication_exchange("cobalt", FLEET, &single)
+            .unwrap();
+        Node::admit(&slate.store);
+    }
+    assert_eq!(slate.show().await["handoff"], expected);
+    slate.store.replay_replication_graph().unwrap();
+    assert_eq!(slate.show().await["handoff"], expected);
+}
+
+#[tokio::test]
+async fn source_offline_api_rejects_stale_foreign_and_unrelated_source_requests() {
+    let amber = Node::new("amber").await;
+    let cobalt = Node::new("cobalt").await;
+    amber.declare("amber", true, "initial");
+    amber.sync_to(&cobalt);
+    cobalt.declare("cobalt", true, "move");
+    let old = cobalt.store.selected_desired_token(SEAT).unwrap().unwrap();
+    assert!(
+        override_sources(&cobalt, &old, &["unknown"], "unknown")
+            .await
+            .is_err()
+    );
+    cobalt.declare("cobalt", true, "revision");
+    assert!(
+        override_sources(&cobalt, &old, &["amber"], "stale")
+            .await
+            .is_err()
+    );
+    let token = cobalt.store.selected_desired_token(SEAT).unwrap().unwrap();
+    let client = st3::client::Client::unix(cobalt.root.path().join("st3.sock"));
+    assert!(client.post::<_, Value>("/v1/agents/source-offline", &serde_json::json!({
+        "subject": "agent/example/other", "actor": "person/avery", "desired_token": token,
+        "sources": ["amber"], "idempotency_key": "foreign",
+    })).await.is_err());
+    assert!(
+        client
+            .post::<_, Value>(
+                "/v1/agents/source-offline",
+                &serde_json::json!({
+                    "subject": SEAT, "actor": "daemon/runtime", "desired_token": token,
+                    "sources": ["amber"], "idempotency_key": "wrong-actor",
+                })
+            )
+            .await
+            .is_err()
+    );
+    assert!(client.post::<_, Value>("/v1/claims", &serde_json::json!({
+        "subject": SEAT, "kind": st3::placement::SOURCE_OFFLINE_KIND, "actor": "person/avery",
+        "fields": {"desired_token": token, "destination": "cobalt", "sources": ["amber"]},
+        "evidence": [token],
+    })).await.is_err(), "ordinary claim publication cannot bypass the dedicated operation");
+    assert!(
+        cobalt
+            .store
+            .claims_for(SEAT, Some(st3::placement::SOURCE_OFFLINE_KIND))
+            .unwrap()
+            .is_empty()
+    );
+}
 /// Only this fixture's runtimes exist here; no shared seats or daemons are touched.
 #[derive(Default)]
 struct Runtime {

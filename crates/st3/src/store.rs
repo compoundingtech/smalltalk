@@ -46509,6 +46509,16 @@ fn append_claim_with_fences(
                     .with_detail("current_head", json!(actual)));
                 }
             }
+            if input.kind == crate::placement::SOURCE_OFFLINE_KIND {
+                let current: Option<String> = transaction.query_row(
+                    "SELECT claim_id FROM desired WHERE subject=?1 AND kind='agent'",
+                    [&input.subject], |row| row.get(0),
+                ).optional().map_err(internal)?;
+                if current.as_deref() != input.fields.get("desired_token").and_then(Value::as_str) {
+                    return Err(St3Error::new("stale-placement",
+                        "placement changed; read the current handoff before overriding its sources"));
+                }
+            }
             let mut stored_fields = normalize_resource_observation(transaction, input)?;
             if let Some(fields) = glasses::prepare(transaction, input)? {
                 stored_fields = Some(fields);
@@ -46554,12 +46564,27 @@ fn append_claim_with_fences(
             // A placement handoff explicitly cites its local runtime and peer stop proof.
             // Keep same-subject evidence as causal links even when a newer declaration
             // displaced the runtime branch from the selected subject head.
-            if input.kind == "runtime.observed" {
+            if input.kind == "runtime.observed" || input.kind == crate::placement::SOURCE_OFFLINE_KIND {
                 for evidence in &input.evidence {
                     if claim_by_id_tx(transaction, evidence).map_err(internal)?
                         .is_some_and(|claim| claim.subject == input.subject)
                     {
                         predecessors.push(evidence.clone());
+                    }
+                }
+                if input.kind == crate::placement::SOURCE_OFFLINE_KIND {
+                    // The operator explicitly supersedes these sources' known runtime records.
+                    // Retain those branches so destination routing is usable while sources are
+                    // offline. Choose them under the writer lock; idempotent retries keep the
+                    // original claim rather than changing the request with newer observations.
+                    for source in input.fields.get("sources").and_then(Value::as_array)
+                        .into_iter().flatten().filter_map(Value::as_str) {
+                        let prior: Option<String> = transaction.query_row(&format!(
+                            "SELECT claims.id FROM claims JOIN batches ON batches.id=claims.batch_id
+                             WHERE claims.subject=?1 AND claims.kind='runtime.observed' AND claims.origin=?2
+                             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+                        ), params![input.subject, source], |row| row.get(0)).optional().map_err(internal)?;
+                        predecessors.extend(prior);
                     }
                 }
                 predecessors.sort();
