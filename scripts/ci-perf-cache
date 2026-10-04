@@ -22,6 +22,12 @@ def trusted(run):
             and run.get('path') == '.github/workflows/perf.yml')
 
 
+def trusted_snapshot(run):
+    # A completed workload can miss a latency budget while its compiled outputs and
+    # generated source stores remain valid. Failed reports never become baselines.
+    return run.get('conclusion') in ('success', 'failure') and trusted(dict(run, conclusion='success'))
+
+
 def valid_report(report):
     # Never substitute tiny fixture reports or measurements with a different workload.
     def number(value):
@@ -38,7 +44,7 @@ def valid_report(report):
 
 
 def own_pr(run, number, repository, branch, commits):
-    return (run.get('event') == 'pull_request' and run.get('conclusion') == 'success'
+    return (run.get('event') == 'pull_request' and run.get('conclusion') in ('success', 'failure')
             and run.get('path') == '.github/workflows/perf.yml'
             and (run.get('head_repository') or {}).get('full_name') == repository
             and run.get('head_branch') == branch and run.get('head_sha') in commits
@@ -177,7 +183,7 @@ def restore():
             previous = api(f"repos/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{attempt - 1}")
             candidates.append(previous)
         from urllib.parse import quote
-        candidates += api(f'repos/{repo}/actions/workflows/perf.yml/runs?event=pull_request&branch={quote(branch, safe="")}&status=success&per_page=100')['workflow_runs']
+        candidates += api(f'repos/{repo}/actions/workflows/perf.yml/runs?event=pull_request&branch={quote(branch, safe="")}&status=completed&per_page=100')['workflow_runs']
         for run in candidates:
             if not own_pr(run, number, repository, branch, commits):
                 continue
@@ -186,15 +192,15 @@ def restore():
             if len(found) == 2:
                 break
     # Bound discovery; seven days of snapshots and thirty days of reports fit comfortably.
-    runs = api(f'repos/{repo}/actions/workflows/perf.yml/runs?branch=main&status=success&per_page=100')
+    runs = api(f'repos/{repo}/actions/workflows/perf.yml/runs?branch=main&status=completed&per_page=100')
     for run in runs['workflow_runs']:
-        if not trusted(run):
+        if not trusted_snapshot(run):
             continue
         names = artifact_names(run)
         with tempfile.TemporaryDirectory(dir=temp) as tmp:
             dest = Path(tmp)
             snapshots(run, names, dest, 'main')
-            if reports < 5 and 'perf-load-logs' in names:
+            if trusted(run) and reports < 5 and 'perf-load-logs' in names:
                 download(repo, run, 'perf-load-logs', dest / 'report')
                 files = list((dest / 'report').rglob('load.json'))
                 if len(files) != 1:
@@ -231,20 +237,35 @@ def pack():
         if state['head'] == git(work, 'rev-parse', 'HEAD') and not git(work, 'status', '--porcelain'):
             shutil.copyfile(checkpoint, saved)
     # Registry source/config files contain no runner credentials; never archive all of CARGO_HOME.
-    subprocess.run(['tar', '-I', 'zstd -1 -T2', '-cf', str(output / 'build.tar.zst'),
+    subprocess.run(['tar', '--format=pax', '-I', 'zstd -1 -T2', '-cf', str(output / 'build.tar.zst'),
                     '-C', str(work), 'target', '-C', str(temp),
                     'cargo-home/registry', 'cargo-home/git', 'perf-sccache', 'st-ci-cache'], check=True)
-    subprocess.run(['tar', '-I', 'zstd -1 -T2', '-cf', str(output / 'stores.tar.zst'),
+    subprocess.run(['tar', '--format=pax', '-I', 'zstd -1 -T2', '-cf', str(output / 'stores.tar.zst'),
                     '-C', str(temp), 'st-bench'], check=True)
+
+
+def check_report():
+    report = Path(os.environ['RUNNER_TEMP']) / 'perf/load.json'
+    try:
+        complete = valid_report(json.loads(report.read_text()))
+    except (OSError, ValueError):
+        complete = False
+    if not complete:
+        print('Performance snapshots skipped: no complete workload report', flush=True)
+        return 1
+    with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+        output.write('publish=true\n')
+    return 0
 
 
 def main():
     try:
-        {'restore': restore, 'pack': pack, 'remember-sources': remember_sources}[sys.argv[1]]()
+        result = {'restore': restore, 'pack': pack, 'remember-sources': remember_sources,
+                  'check-report': check_report}[sys.argv[1]]()
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
         print(f'::error::P0: Performance cache/baseline operation failed: {error}', file=sys.stderr)
         return 1
-    return 0
+    return result or 0
 
 
 if __name__ == '__main__':
