@@ -2480,7 +2480,8 @@ async fn cli_service_install_status_restart_reset_uninstall_use_isolated_manager
     let config_path = root.path().join("config/st3/config.toml");
     std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
     let manager = root.path().join("bin/systemctl");
-    std::fs::write(&manager, r#"#!/usr/bin/env python3
+    std::fs::write(&manager, r#"#!/bin/sh
+exec python3 - "$@" <<'PY'
 import os, pathlib, signal, subprocess, sys, time
 root = pathlib.Path(os.environ['ST3_COVERAGE_ROOT'])
 args = sys.argv[1:]
@@ -2507,6 +2508,7 @@ if 'show' in args:
 elif 'st3.service' in args:
     if 'stop' in args or 'restart' in args or ('disable' in args and '--now' in args): stop()
     if 'start' in args or 'restart' in args: start()
+PY
 "#).unwrap();
     std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(root.path().join("bin/pty"), "#!/bin/sh\nexit 0\n").unwrap();

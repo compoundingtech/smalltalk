@@ -24,7 +24,7 @@ export default githubWorkflow({
   "permissions": { "contents": "read" },
   "concurrency": {
     "group": "nix-${{ github.ref }}",
-    "cancel-in-progress": false
+    "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"
   },
   "jobs": {
     "nix-release-x86_64-linux": {
