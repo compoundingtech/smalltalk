@@ -6,21 +6,34 @@ name: Nix
 on:
   push:
     tags: ["**"]
+  schedule:
+    - cron: 17 1 * * *
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - .github/workflows/nix.yml*
+      - .github/messaging-compat-baseline.json
+      - scripts/ci-nix-release*
+      - flake.nix
+      - flake.lock
+      - nix/**
+
+permissions:
+  contents: read
 
 concurrency:
-  group: "nix-${{ github.workflow }}-${{ github.ref }}"
+  group: "nix-${{ github.ref }}"
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   nix-release-x86_64-linux:
-    if: ${{ startsWith(github.ref, 'refs/tags/') }}
-    runs-on: namespace-profile-linux-x86-64
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ci1
     timeout-minutes: 180
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -33,5 +46,15 @@ jobs:
             extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
             access-tokens = github.com=${{ github.token }}
           summarize: true
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-      - run: "nix build --no-link --print-build-logs .#packages.x86_64-linux.default .#checks.x86_64-linux.st2 .#checks.x86_64-linux.st3 .#checks.x86_64-linux.debug-assertions .#checks.x86_64-linux.help .#checks.x86_64-linux.completions .#checks.x86_64-linux.hooks-replacement .#checks.x86_64-linux.pty-fleet-contract .#checks.x86_64-linux.st3-help .#checks.x86_64-linux.install-layout .#checks.x86_64-linux.st2-install-layout .#checks.x86_64-linux.provider-components .#checks.x86_64-linux.wasip2-resource-providers .#checks.x86_64-linux.release-integration .#checks.x86_64-linux.pi-extension-types .#checks.x86_64-linux.wasm-resolver-feature .#checks.x86_64-linux.wasm-resolver-artifact"
+      - name: Test persistent-store release verification
+        run: python3 scripts/ci-nix-release-test
+      - name: Build the package and every native check
+        run: scripts/ci-nix-release build
+      - name: Prove the warm cache without downloads or builds
+        run: scripts/ci-nix-release verify-cache
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nix-release-proof
+          path: "${{ runner.temp }}/nix-release-build.json"
+          if-no-files-found: error
+          retention-days: 7
