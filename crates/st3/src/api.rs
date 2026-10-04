@@ -14472,39 +14472,48 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 idempotency_key: None,
             })
             .unwrap();
-        let hold = Duration::from_secs(5);
+        let watchdog = Duration::from_secs(30);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let mut holders = Vec::new();
+        // Keep every resource held until all probes finish. Dropping the senders also
+        // releases the holders on assertion failure, so a failed probe cannot strand them.
+        let mut releases = Vec::new();
         let store = state.store.clone();
         let ready = ready_tx.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        releases.push(release_tx);
         holders.push(std::thread::spawn(move || {
             store.hold_write_transaction_for_test(|| {
                 ready.send(()).unwrap();
-                std::thread::sleep(hold);
+                let _ = release_rx.recv();
             });
         }));
         let store = state.store.clone();
         let ready = ready_tx.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        releases.push(release_tx);
         holders.push(std::thread::spawn(move || {
             store.hold_read_connections_for_test(|| {
                 ready.send(()).unwrap();
-                std::thread::sleep(hold);
+                let _ = release_rx.recv();
             });
         }));
         for _ in 0..8 {
             let (store, ready) = (state.store.clone(), ready_tx.clone());
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            releases.push(release_tx);
             holders.push(std::thread::spawn(move || {
                 store
                     .read_snapshot(|_| {
                         ready.send(()).unwrap();
-                        std::thread::sleep(hold);
+                        let _ = release_rx.recv();
                         Ok(())
                     })
                     .unwrap();
             }));
         }
         for _ in 0..holders.len() {
-            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            ready_rx.recv_timeout(watchdog).unwrap();
         }
 
         // As the daemon does when it starts, so no read makes the first diagnostic report.
@@ -14518,17 +14527,16 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/internal/fleet/membership",
             "/v1/client/operations",
         ] {
-            let started = Instant::now();
-            let response =
-                tokio::time::timeout(Duration::from_millis(250), get_request(app.clone(), path))
-                    .await;
+            // This is a deadlock watchdog, not a latency bound: runner scheduling can
+            // delay a request, but it must answer before any held resource is released.
+            let response = tokio::time::timeout(watchdog, get_request(app.clone(), path)).await;
             assert!(
                 response.is_ok(),
-                "{path} waited {:?} behind the writer or other reads",
-                started.elapsed()
+                "{path} did not answer while the writer and other reads were held"
             );
             assert_eq!(response.unwrap().0, StatusCode::OK, "{path}");
         }
+        drop(releases);
         for holder in holders {
             holder.join().unwrap();
         }
