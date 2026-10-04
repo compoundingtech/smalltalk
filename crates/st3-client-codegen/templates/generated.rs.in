@@ -58,6 +58,7 @@ pub enum ErrorCode {
     RuntimeAuthorityIndeterminate,
     RemoteUnavailable,
     TerminalUnavailable,
+    InventoryUnavailable,
     TerminalEnded,
     TimelineHistoryIncomplete,
     BlobTooLarge,
