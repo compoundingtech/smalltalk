@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Verify that main's exact SHA already has the merge queue's required checks."""
+
+import json
+import os
+import subprocess
+import sys
+
+REQUIRED = {"linux-gate", "isolation-vm", "genie-freshness", "typescript-client"}
+
+
+def api(path):
+    return json.loads(subprocess.check_output(
+        ["gh", "api", "--paginate", "--slurp", path], text=True, timeout=60
+    ))
+
+
+def main():
+    repo, sha = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"]
+    pages = api(f"repos/{repo}/actions/workflows/fleet.yml/runs?event=merge_group&head_sha={sha}&per_page=100")
+    for run in (r for page in pages for r in page["workflow_runs"]):
+        if not (run["head_sha"] == sha and run["event"] == "merge_group"
+                and run["path"] == ".github/workflows/fleet.yml"
+                and run["conclusion"] == "success"
+                and run["head_branch"].startswith("gh-readonly-queue/main/")):
+            continue
+        checks = [check for page in api(f"repos/{repo}/check-suites/{run['check_suite_id']}/check-runs?per_page=100")
+                  for check in page["check_runs"]]
+        if all(any(c["name"] == name and c["conclusion"] == "success" for c in checks) for name in REQUIRED):
+            message = f"Main `{sha}` retains all four successful merge-queue checks: {run['html_url']}"
+            print(message)
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                summary.write(message + "\n")
+            return 0
+    print(f"::error::main {sha} has no successful Workspace CI merge-group run with all required checks")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -6,8 +6,6 @@ name: Workspace CI
 on:
   pull_request: {}
   merge_group: {}
-  push:
-    branches: [main]
   workflow_dispatch: {}
 
 permissions:
@@ -113,7 +111,7 @@ jobs:
           summarize: true
       - name: Check runner selection and generated files
         shell: bash
-        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && genie --check'"
+        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/check-main-ci-test && genie --check'"
   typescript-client:
     name: typescript-client
     needs: [pick-runner, genie-freshness]
