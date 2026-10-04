@@ -1,7 +1,7 @@
 import { githubRepoSettings, githubRuleset } from '../repos/effect-utils/genie/external.ts'
 
-// Landing goes through GitHub's merge queue. Apply the fourth required check only after
-// typescript-client has passed on main; the live ruleset keeps its three existing checks until then.
+// Landing goes through GitHub's merge queue. Apply the fifth required check only after
+// mail-redelivery-canaries has passed on main; keep the existing live checks until then.
 // Every required job must run on merge_group, or the queue never receives its checks and merges freeze.
 export default githubRepoSettings({
   repository: { allow_auto_merge: true, delete_branch_on_merge: true },
@@ -40,6 +40,7 @@ export default githubRepoSettings({
             { context: 'isolation-vm', integration_id: 15368 },
             { context: 'genie-freshness', integration_id: 15368 },
             { context: 'typescript-client', integration_id: 15368 },
+            { context: 'mail-redelivery-canaries', integration_id: 15368 },
           ],
         },
       },

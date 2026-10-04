@@ -63,6 +63,10 @@
               {
                 "context": "typescript-client",
                 "integration_id": 15368
+              },
+              {
+                "context": "mail-redelivery-canaries",
+                "integration_id": 15368
               }
             ]
           }

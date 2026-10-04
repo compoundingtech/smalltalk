@@ -120,7 +120,7 @@ jobs:
           from urllib.parse import quote
           from urllib.request import Request, urlopen
 
-          REQUIRED = {"linux-gate", "typescript-client", "isolation-vm", "genie-freshness"}
+          REQUIRED = {"linux-gate", "typescript-client", "isolation-vm", "genie-freshness", "mail-redelivery-canaries"}
 
 
           def decision(jobs, ref_status, ref, sha):
@@ -456,6 +456,10 @@ jobs:
         run: nix develop -c bash scripts/ci-nextest run --no-run
       - name: Summarize tested revision
         run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
+      - name: Require every harness to hold old mail across boot and reconnect
+        shell: bash
+        run: nix develop -c python3 scripts/ci-mail-redelivery-canaries
+        id: mail-redelivery-canaries
       - name: Run nextest
         shell: bash
         run: nix develop -c bash scripts/ci-linux tests
@@ -494,6 +498,8 @@ jobs:
         env:
           CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
+    outputs:
+      mail_redelivery: ${{ steps.mail-redelivery-canaries.outcome }}
   linux-clippy:
     name: linux-clippy
     needs: [pick-runner]
@@ -725,16 +731,33 @@ jobs:
         env:
           CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
+  mail-redelivery-canaries:
+    name: mail-redelivery-canaries
+    needs: [linux-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Require the explicit zero-redelivery canaries to pass
+        env:
+          RESULT: ${{ needs.linux-tests.outputs.mail_redelivery }}
+        run: '[ "$RESULT" = success ]'
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_REASON: Verifies the completed Linux canary outcome and builds nothing.
+        run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""
   linux-gate:
     name: linux-gate
-    needs: [pick-runner, linux-tests, linux-clippy, linux-fleet-compat]
+    needs: [pick-runner, linux-tests, linux-clippy, linux-fleet-compat, mail-redelivery-canaries]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require every Linux stage to pass
         env:
-          RESULTS: "${{ needs.linux-tests.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }}"
+          RESULTS: "${{ needs.linux-tests.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}"
         run: |
           echo "stage results: $RESULTS"
           for result in $RESULTS; do
