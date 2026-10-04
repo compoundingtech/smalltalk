@@ -717,8 +717,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         }
                         // A subscription with a held ID replaces it.
                         subscriptions.remove(&request.id);
-                        // Keep its viewer alive until the replacement has acquired the lease.
-                        let _replaced_terminal = terminals.remove(&request.id);
+                        terminals.remove(&request.id);
                         conversations.stop(&request.id);
                         traced.remove(&request.id);
                         if request.collection == "conversation" {
@@ -6203,21 +6202,13 @@ fn prepare_terminal_follow(
             "remote terminal stream requires a concrete person or agent",
         ));
     }
-    // Serialize lease validation/registration with last-viewer detach.
-    let mut viewers = TERMINAL_GATEWAY_VIEWERS.lock();
-    let mut viewer = consume_terminal_attachment(
+    let viewer = consume_terminal_attachment(
         state,
         session,
         &client_detail_id("terminal", id),
         &live.incarnation_id,
         capability,
     )?;
-    if session.transport != "unix" {
-        let key = viewer.gateway_key();
-        *viewers.entry(key).or_default() += 1;
-        viewer.gateway_managed = true;
-    }
-    drop(viewers);
     Ok(if live.owner_host_id != client_host_id(&state.node) {
         TerminalFollow::Remote {
             id: id.to_owned(),
@@ -6783,8 +6774,7 @@ fn consume_terminal_attachment_mode(
         ));
     }
     if raw_mode.is_none() {
-        // Projected screens keep their reusable lease; only the gateway's last
-        // active viewer explicitly detaches it.
+        // Projected-screen leases survive every viewer and transport disconnect.
         return Ok(TerminalViewer {
             state: state.clone(),
             subject: attached.subject.clone(),
@@ -6794,7 +6784,6 @@ fn consume_terminal_attachment_mode(
                 .cloned()
                 .ok_or_else(|| ApiError::internal("terminal attachment ID is missing"))?,
             raw: false,
-            gateway_managed: false,
         });
     }
     let _span = crate::profile::span("terminal/capability-consume");
@@ -6825,17 +6814,10 @@ fn consume_terminal_attachment_mode(
             .cloned()
             .ok_or_else(|| ApiError::internal("terminal attachment ID is missing"))?,
         raw: true,
-        gateway_managed: false,
     })
 }
 
-// Keys include the store identity: independent daemons/tests never share viewers.
-type TerminalGatewayViewers = BTreeMap<(usize, String), usize>;
-static TERMINAL_GATEWAY_VIEWERS: std::sync::LazyLock<parking_lot::Mutex<TerminalGatewayViewers>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(BTreeMap::new()));
-
 /// Raw capabilities belong to one viewer; projected-screen leases remain reusable.
-/// Gateway leases are explicitly detached only after their last active viewer ends.
 struct TerminalViewer {
     state: AppState,
     subject: String,
@@ -6843,14 +6825,8 @@ struct TerminalViewer {
     actor: String,
     attachment_id: Value,
     raw: bool,
-    gateway_managed: bool,
 }
 
-impl TerminalViewer {
-    fn gateway_key(&self) -> (usize, String) {
-        (Arc::as_ptr(&self.state.store) as usize, self.subject.clone())
-    }
-}
 
 impl std::fmt::Debug for TerminalViewer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -6863,20 +6839,8 @@ impl std::fmt::Debug for TerminalViewer {
 
 impl Drop for TerminalViewer {
     fn drop(&mut self) {
-        if !self.raw && !self.gateway_managed {
+        if !self.raw {
             return;
-        }
-        // Hold this lock through the detach CAS so a new viewer cannot register
-        // between removing the last viewer and revoking the lease.
-        let mut viewers = TERMINAL_GATEWAY_VIEWERS.lock();
-        if self.gateway_managed {
-            let key = self.gateway_key();
-            let count = viewers.get_mut(&key).expect("registered terminal viewer");
-            *count -= 1;
-            if *count != 0 {
-                return;
-            }
-            viewers.remove(&key);
         }
         match self.state.store.append_claim(&ClaimInput {
             subject: self.subject.clone(),

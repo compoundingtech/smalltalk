@@ -333,86 +333,37 @@ mod gateway_tests {
         (session, attachment)
     }
 
-    async fn wait_detached(state: &AppState, session: &ClientSession, attachment: &Value) {
-        let mut changed = state.event_notify.subscribe();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if terminal_attachment_response(
-                    state,
-                    session,
-                    attachment["attachment_id"].as_str().unwrap(),
-                )
-                .unwrap()["state"]
-                    == "detached"
-                {
-                    return;
-                }
-                changed.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn terminal_viewer_ends_on_unsubscribe_and_socket_close_while_waiting_for_first_screen() {
-        for mode in ["unsubscribe", "collection-close", "terminal-close"] {
+    #[test]
+    fn projected_lease_survives_last_viewer_for_every_transport() {
+        for transport in ["unix", "fabric-loopback", "tailscale"] {
             let root = tempfile::tempdir().unwrap();
             let state = test_state(root.path());
-            let (session, attachment) = viewer_attachment(&state);
-            fs::create_dir_all(&state.pty_root).unwrap();
-            let listener =
-                tokio::net::UnixListener::bind(state.pty_root.join("terminal-runtime.sock"))
-                    .unwrap();
-            let (address, server) = serve(crate::api::fabric_router(state.clone())).await;
-            let capability = attachment["stream_capability"].as_str().unwrap();
-            let mut socket = if mode == "terminal-close" {
-                connect(address, "/v1/client/terminals/agent%2Fterminal-owner/stream?incarnation=terminal-runtime%3Ai1",
-                    &format!("{TERMINAL_SUBPROTOCOL}, {TERMINAL_CAPABILITY_PROTOCOL_PREFIX}{capability}")).await
-            } else {
-                let mut socket = connect(
-                    address,
-                    "/v1/client/collections/stream",
-                    COLLECTION_SUBPROTOCOL,
-                )
-                .await;
-                socket.send(Message::Text(json!({"kind":"subscribe", "id":"viewer", "collection":"terminal", "terminal":"terminal/agent/terminal-owner", "incarnation":"terminal-runtime:i1", "capability":capability}).to_string().into())).await.unwrap();
-                socket
-            };
-            // Holding the PTY without a screen exercises the previously uninterruptible first read.
-            let (_pty, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (mut session, attachment) = viewer_attachment(&state);
+            session.transport = transport.into();
+            let open = || prepare_terminal_follow(
+                &state,
+                &session,
+                "agent/terminal-owner",
+                Some("terminal-runtime:i1"),
+                attachment["stream_capability"].as_str(),
+            ).unwrap();
+            let first = open();
+            let second = open();
+            drop(first);
+            drop(second);
             assert_eq!(
-                terminal_attachment_response(
-                    &state,
-                    &session,
-                    attachment["attachment_id"].as_str().unwrap()
-                )
-                .unwrap()["state"],
-                "available"
+                terminal_attachment_response(&state, &session, attachment["attachment_id"].as_str().unwrap())
+                    .unwrap()["state"],
+                "available",
+                "{transport}",
             );
-            if mode == "unsubscribe" {
-                socket
-                    .send(Message::Text(
-                        json!({"kind":"unsubscribe", "id":"viewer"})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
-                    .unwrap();
-            } else {
-                socket.close(None).await.unwrap();
-            }
-            wait_detached(&state, &session, &attachment).await;
-            server.abort();
-            let _ = server.await;
+            // Reopening the same capability is the client-visible reconnect contract.
+            drop(open());
         }
     }
 
     #[tokio::test]
-    async fn shared_projected_lease_streams_until_last_browser_viewer_closes() {
+    async fn shared_projected_lease_streams_and_reconnects_after_all_viewers_close() {
         use pty_core::protocol::{MessageType, encode_data, encode_geometry, encode_packet};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -435,21 +386,12 @@ mod gateway_tests {
             .await.unwrap().unwrap();
         let mut request = [0_u8; 6];
         pty.read_exact(&mut request).await.unwrap();
-        pty.write_all(&encode_geometry(2, 20)).await.unwrap();
+        pty.write_all(&encode_geometry(2, 40)).await.unwrap();
         pty.write_all(&encode_packet(MessageType::Screen, b"before")).await.unwrap();
         assert_eq!(next_json(&mut first).await["value"]["lines"][0]["text"], "before");
         assert_eq!(next_json(&mut second).await["value"]["lines"][0]["text"], "before");
 
         first.close(None).await.unwrap();
-        let key = (
-            Arc::as_ptr(&state.store) as usize,
-            terminal_attachment_subject(attachment["attachment_id"].as_str().unwrap()).unwrap(),
-        );
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while TERMINAL_GATEWAY_VIEWERS.lock().get(&key) != Some(&1) {
-                tokio::task::yield_now().await;
-            }
-        }).await.unwrap();
         assert_eq!(
             terminal_attachment_response(&state, &session, attachment["attachment_id"].as_str().unwrap())
                 .unwrap()["state"],
@@ -458,7 +400,11 @@ mod gateway_tests {
         pty.write_all(&encode_data(b" after")).await.unwrap();
         assert_eq!(next_json(&mut second).await["value"]["lines"][0]["text"], "before after");
         second.close(None).await.unwrap();
-        wait_detached(&state, &session, &attachment).await;
+        let mut reconnected = connect(address, path, &protocols).await;
+        assert_eq!(next_json(&mut reconnected).await["value"]["lines"][0]["text"], "before after");
+        pty.write_all(&encode_data(b" reconnect")).await.unwrap();
+        assert_eq!(next_json(&mut reconnected).await["value"]["lines"][0]["text"], "before after reconnect");
+        reconnected.close(None).await.unwrap();
         server.abort();
         let _ = server.await;
     }
@@ -502,7 +448,11 @@ mod gateway_tests {
             "available",
         );
         socket.close(None).await.unwrap();
-        wait_detached(&state, &session, &attachment).await;
+        assert_eq!(
+            terminal_attachment_response(&state, &session, attachment["attachment_id"].as_str().unwrap())
+                .unwrap()["state"],
+            "available",
+        );
         server.abort();
         let _ = server.await;
     }
