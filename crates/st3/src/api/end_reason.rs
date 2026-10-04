@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn actor_stop_and_retirement_take_precedence_over_clean_exit() {
         let seat = subject(Some("exit 0"));
-        for (actor, kind) in [("person/alice", "stopped-by-person"), ("agent/helper", "stopped-by-agent")] {
+        for (actor, kind) in [("person/operator", "stopped-by-person"), ("agent/helper", "stopped-by-agent")] {
             let suspension = Suspension { action: "suspend".into(), phase: "suspended".into(), requested_by: Some(actor.into()), suspended_at_unix_ms: Some(1000), ..Suspension::default() };
             let end = project(&seat, None, Some(&suspension), None, false, "2026-10-04T00:00:00Z").unwrap();
             assert_eq!(end["kind"], kind);
