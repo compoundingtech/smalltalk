@@ -902,7 +902,7 @@ impl Store {
             let f = &claim.body["fields"];
             if matches!(
                 f["condition"].as_str(),
-                Some("readiness" | "provider-auth" | "provider-trust" | "harness-screen")
+                Some("readiness" | "provider-auth" | "provider-trust" | "provider-update")
             ) {
                 if self
                     .current_harness(source)?

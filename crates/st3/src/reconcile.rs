@@ -244,9 +244,7 @@ fn calendar_occurrence(
 }
 
 
-/// The screen line on which Claude asks for /login. Claude prints the prompt as its own line,
-/// at most after a status glyph, so a line that only quotes the phrase, such as source code or
-/// grep output a session prints, does not match.
+/// Keep the existing Claude regression cases exercising the shared driver classifier.
 #[cfg(test)]
 fn claude_login_expired(screen: &str) -> Option<&str> {
     let matched = st_drivers::blocking_screen::detect("claude", screen)?;
@@ -2818,7 +2816,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .current_harness(&subject.subject)?
             .is_some_and(|harness| {
                 harness.incarnation_id == incarnation
-                    && harness.transport.as_deref() == Some("terminal-screen")
+                    && matches!(harness.state.as_str(), "unauthenticated" | "blocked")
             })
         {
             return Ok(());
@@ -2991,16 +2989,16 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// A member's terminal screen, read as an input: a later pass looks at it again (see
     /// [`SCREEN_POLL_EVERY_MS`]) and evaluates the member when it changed.
     fn member_screen(&self, runtime_id: &str) -> Result<String> {
-        let screen = self.runtime.screen(runtime_id)?;
         let key = format!("screen:{runtime_id}");
         smallclaims::touched::note_read(|| key.clone());
+        let screen = self.runtime.screen(runtime_id)?;
         self.incremental
             .saw_value(&key, screen_digest(&screen), now_ms());
         Ok(screen)
     }
 
-    /// Screen evidence fences native idle/ready reports until the screen is resolved. Reading
-    /// failures preserve the fence; they are never evidence that somebody logged in.
+    /// Extend the existing authentication fence with driver-specific screen variants and
+    /// Codex's update prompt. Failed screen reads never release a prompt fence.
     fn reconcile_blocking_screen(
         &self,
         subject: &DesiredSubject,
@@ -3019,209 +3017,127 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Ok(screen) = self.member_screen(&member.runtime_id) else {
             return Ok(());
         };
-        let mut fence = None;
-        let mut key = format!("harness-screen:{0}:{incarnation}", subject.subject);
-        for claim in self
-            .store
-            .claims_for(&subject.subject, Some("harness.diagnostic"))?
-        {
-            if claim_incarnation(&claim) != Some(incarnation) {
-                continue;
-            }
-            match claim.body.pointer("/fields/code").and_then(Value::as_str) {
-                Some("harness-screen-blocked") => fence = Some(claim),
-                Some("harness-screen-cleared") => {
-                    fence = None;
-                    key = format!(
-                        "harness-screen:{0}:{incarnation}:{1}",
-                        subject.subject, claim.id
-                    );
-                }
-                _ => {}
-            }
-        }
         let matched = st_drivers::blocking_screen::detect(driver, &screen);
-        if let Some(previous) = fence.as_ref()
-            && let Some(matched) = matched.as_ref()
-            && previous
-                .body
-                .pointer("/fields/blocked_on")
-                .and_then(Value::as_str)
-                != Some(matched.blocked_on)
-        {
-            let cleared = self.store.append_claim(&ClaimInput {
-                subject: subject.subject.clone(),
-                kind: "harness.diagnostic".into(),
-                actor: Some(subject.subject.clone()),
-                fields: BTreeMap::from([
-                    (
-                        "code".into(),
-                        Value::String("harness-screen-cleared".into()),
-                    ),
-                    ("status".into(), Value::String("resolved".into())),
-                    ("incarnation_id".into(), Value::String(incarnation.into())),
-                ]),
-                evidence: vec![previous.id.clone()],
-                expected_subject: None,
-                idempotency_key: Some(format!("{key}:cleared")),
-            })?;
-            self.resolve_pending_alert(&key, "a different blocking screen replaced this one")?;
-            key = format!(
-                "harness-screen:{}:{incarnation}:{}",
-                subject.subject, cleared.id
-            );
-            fence = None;
-        }
-        let Some(matched) = matched else {
-            // A daemon upgraded in place may still hold the previous Claude login fence.
-            if driver == "claude" {
-                let (legacy, legacy_key) = self.claude_auth_fence(&subject.subject, incarnation)?;
-                if let Some(legacy) = legacy {
+        for (code, restored, prefix, condition) in [
+            (
+                "provider-auth-expired",
+                "provider-auth-restored",
+                "claude-auth-expired",
+                "provider-auth",
+            ),
+            (
+                "provider-update-prompt",
+                "provider-update-restored",
+                "provider-update-prompt",
+                "provider-update",
+            ),
+        ] {
+            // Retain Claude's original episode keys, including repeated prompts after a lift.
+            let mut fence = None;
+            let mut key = format!("{prefix}:{}:{incarnation}", subject.subject);
+            for claim in self
+                .store
+                .claims_for(&subject.subject, Some("harness.diagnostic"))?
+            {
+                if claim_incarnation(&claim) != Some(incarnation) {
+                    continue;
+                }
+                match claim.body.pointer("/fields/code").and_then(Value::as_str) {
+                    Some(found) if found == code => fence = Some(claim),
+                    Some(found) if found == restored => {
+                        fence = None;
+                        key = format!("{prefix}:{}:{incarnation}:{}", subject.subject, claim.id);
+                    }
+                    _ => {}
+                }
+            }
+            let current = matched.as_ref().filter(|matched| matched.code == code);
+            let Some(current) = current else {
+                if let Some(fence) = fence {
                     self.store.append_claim(&ClaimInput {
                         subject: subject.subject.clone(),
                         kind: "harness.diagnostic".into(),
                         actor: Some(subject.subject.clone()),
                         fields: BTreeMap::from([
-                            (
-                                "code".into(),
-                                Value::String("provider-auth-restored".into()),
-                            ),
-                            ("status".into(), Value::String("authenticated".into())),
+                            ("code".into(), Value::String(restored.into())),
+                            ("status".into(), Value::String("resolved".into())),
                             ("incarnation_id".into(), Value::String(incarnation.into())),
                         ]),
-                        evidence: vec![legacy],
+                        evidence: vec![fence.id],
                         expected_subject: None,
-                        idempotency_key: Some(format!("{legacy_key}:restored")),
+                        idempotency_key: Some(format!("{key}:restored")),
                     })?;
-                    self.resolve_pending_alert(
-                        &legacy_key,
-                        "the blocking screen is no longer present",
-                    )?;
+                    self.resolve_pending_alert(&key, "the blocking screen is no longer present")?;
                     self.signal_changed();
                 }
-            }
-            if let Some(fence) = fence {
-                let old_key = &key;
-                self.store.append_claim(&ClaimInput {
-                    subject: subject.subject.clone(),
-                    kind: "harness.diagnostic".into(),
-                    actor: Some(subject.subject.clone()),
-                    fields: BTreeMap::from([
-                        (
-                            "code".into(),
-                            Value::String("harness-screen-cleared".into()),
-                        ),
-                        ("status".into(), Value::String("resolved".into())),
-                        ("incarnation_id".into(), Value::String(incarnation.into())),
-                    ]),
-                    evidence: vec![fence.id.clone()],
-                    expected_subject: None,
-                    idempotency_key: Some(format!("{old_key}:cleared")),
-                })?;
-                self.resolve_pending_alert(old_key, "the blocking screen is no longer present")?;
-                self.signal_changed();
-            }
-            return Ok(());
-        };
-        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-        let attention_subject = format!("attention/{}", &digest[..32]);
-        if fence.is_some()
-            && self
-                .store
-                .operational_failure(&attention_subject)?
-                .is_some()
-        {
-            return Ok(());
-        }
-        self.store.append_claim(&ClaimInput {
-            subject: subject.subject.clone(),
-            kind: "harness.diagnostic".into(),
-            actor: Some(subject.subject.clone()),
-            fields: BTreeMap::from([
-                (
-                    "code".into(),
-                    Value::String("harness-screen-blocked".into()),
-                ),
-                ("status".into(), Value::String("blocked".into())),
-                ("driver".into(), Value::String(driver.into())),
-                (
-                    "blocked_on".into(),
-                    Value::String(matched.blocked_on.into()),
-                ),
-                ("reason".into(), Value::String(matched.text.clone())),
-                ("matched_line".into(), Value::String(matched.text.clone())),
-                ("incarnation_id".into(), Value::String(incarnation.into())),
-            ]),
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: Some(key.clone()),
-        })?;
-        let login = matched.blocked_on == "login";
-        let reviewer = match crate::accounts::harness_binding(&subject.desired)
-            .map(|binding| binding.binding)
-        {
-            Some(crate::accounts::Binding::Pool(person)) => Some(person),
-            Some(crate::accounts::Binding::Account(account)) => self
-                .store
-                .desired_subject_with_writer(&format!("account/{account}"))?
-                .and_then(|(desired, _)| {
-                    crate::accounts::parse_account(&desired.subject, &desired.desired)
-                })
-                .and_then(|account| account.owner),
-            None => None,
-        }
-        .or(self
-            .store
-            .desired_subject_with_writer(&subject.subject)?
-            .and_then(|(_, actor)| actor)
-            .filter(|actor| actor.starts_with("person/")))
-        .unwrap_or_else(|| "person/alex".into());
-        self.store.record_runtime_failure(&attention_subject, &AttentionRequest {
-            reviewer,
-            title: if login { format!("{driver} needs login") } else { format!("{driver} update menu needs a response") },
-            reason: format!("{}: {}. {}", subject.subject, matched.text,
-                if login { "Log in in this seat's terminal; work resumes when the prompt clears" }
-                else { "Choose Skip in this seat's terminal to continue; work is held while the menu is visible" }),
-            severity: "error".into(), targets: vec![subject.subject.clone()],
-            actor: RECONCILER_ACTOR.into(), idempotency_key: format!("{key}:attention"),
-        }, "harness-screen")?;
-        self.resolve_pending_alert(
-            &format!("harness-readiness:{}:{incarnation}", subject.subject),
-            "the terminal screen identifies the startup blocker",
-        )?;
-        self.signal_changed();
-        Ok(())
-    }
-
-    /// The login fence of one Claude incarnation: the claim that fences it, if it is fenced now,
-    /// and the key of that fence, or of the next one. A fence lifted once can fence the same
-    /// incarnation again, so a fence after a lift is keyed by that lift.
-    fn claude_auth_fence(
-        &self,
-        subject: &str,
-        incarnation: &str,
-    ) -> Result<(Option<String>, String)> {
-        let mut fence = None;
-        let mut key = format!("claude-auth-expired:{subject}:{incarnation}");
-        for claim in self.store.claims_for(subject, Some("harness.diagnostic"))? {
-            if claim
-                .body
-                .pointer("/fields/incarnation_id")
-                .and_then(Value::as_str)
-                != Some(incarnation)
+                continue;
+            };
+            let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+            let attention_subject = format!("attention/{}", &digest[..32]);
+            if fence.is_some()
+                && self
+                    .store
+                    .operational_failure(&attention_subject)?
+                    .is_some()
             {
                 continue;
             }
-            match claim.body.pointer("/fields/code").and_then(Value::as_str) {
-                Some("provider-auth-expired") => fence = Some(claim.id),
-                Some("provider-auth-restored") => {
-                    fence = None;
-                    key = format!("claude-auth-expired:{subject}:{incarnation}:{}", claim.id);
-                }
-                _ => {}
+            let login = code == "provider-auth-expired";
+            self.store.append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(subject.subject.clone()),
+                fields: BTreeMap::from([
+                    ("code".into(), Value::String(code.into())),
+                    ("severity".into(), Value::String("error".into())),
+                    (
+                        "status".into(),
+                        Value::String(if login { "unauthenticated" } else { "blocked" }.into()),
+                    ),
+                    ("driver".into(), Value::String(driver.into())),
+                    ("reason".into(), Value::String(current.text.clone())),
+                    ("matched_line".into(), Value::String(current.text.clone())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(key.clone()),
+            })?;
+            let reviewer = match crate::accounts::harness_binding(&subject.desired)
+                .map(|binding| binding.binding)
+            {
+                Some(crate::accounts::Binding::Pool(person)) => Some(person),
+                Some(crate::accounts::Binding::Account(account)) => self
+                    .store
+                    .desired_subject_with_writer(&format!("account/{account}"))?
+                    .and_then(|(desired, _)| {
+                        crate::accounts::parse_account(&desired.subject, &desired.desired)
+                    })
+                    .and_then(|account| account.owner),
+                None => None,
             }
+            .or(self
+                .store
+                .desired_subject_with_writer(&subject.subject)?
+                .and_then(|(_, actor)| actor)
+                .filter(|actor| actor.starts_with("person/")))
+            .unwrap_or_else(|| "person/alex".into());
+            self.store.record_runtime_failure(&attention_subject, &AttentionRequest {
+                reviewer,
+                title: if login { format!("{driver} needs login") } else { format!("{driver} update menu needs a response") },
+                reason: format!("{}: {}. {}", subject.subject, current.text,
+                    if login { "Log in in this seat's terminal; work resumes when the prompt clears" }
+                    else { "The update menu holds work; choose how to proceed in this seat's terminal" }),
+                severity: "error".into(), targets: vec![subject.subject.clone()],
+                actor: RECONCILER_ACTOR.into(), idempotency_key: format!("{key}:attention"),
+            }, condition)?;
+            self.resolve_pending_alert(
+                &format!("harness-readiness:{}:{incarnation}", subject.subject),
+                "the terminal screen identifies the startup blocker",
+            )?;
+            self.signal_changed();
         }
-        Ok((fence, key))
+        Ok(())
     }
 
     /// Claude's workspace trust prompt appears before any hook or channel can report the session,
@@ -14785,6 +14701,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         kills: Mutex<Vec<String>>,
         removes: Mutex<Vec<String>>,
         screen: Mutex<String>,
+        screen_error: Mutex<bool>,
         screens: Mutex<HashMap<String, String>>,
         keys: Mutex<Vec<String>>,
         leftovers: Mutex<Vec<(String, bool)>>,
@@ -14852,6 +14769,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             Ok(())
         }
         fn screen(&self, runtime_id: &str) -> Result<String> {
+            anyhow::ensure!(!*self.screen_error.lock().unwrap(), "screen unavailable");
             let screens = self.screens.lock().unwrap();
             Ok(screens
                 .get(runtime_id)
@@ -31922,14 +31840,14 @@ version 2
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(
             diagnostics[0].body.pointer("/fields/code"),
-            Some(&Value::String("harness-screen-blocked".into()))
+            Some(&Value::String("provider-auth-expired".into()))
         );
         assert_eq!(
             diagnostics[0].body.pointer("/fields/matched_line"),
             Some(&Value::String("● Login expired · Please run /login".into()))
         );
         let harness = store.current_harness("agent/node.seat-b").unwrap().unwrap();
-        assert_eq!(harness.reason.as_deref(), Some("● Login expired · Please run /login"));
+        assert_eq!(harness.reason.as_deref(), Some("providerAuth"));
         let attention = store.fault_items(None).unwrap();
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].targets, ["agent/node.seat-b"]);
@@ -31964,7 +31882,7 @@ version 2
             store
                 .current_harness("agent/node.seat")
                 .unwrap()
-                .is_some_and(|harness| harness.reason.as_deref() == Some("● Login expired · Please run /login"))
+                .is_some_and(|harness| harness.reason.as_deref() == Some("providerAuth"))
         };
 
         show("> Work.\n\n● Login expired · Please run /login\n");
@@ -31998,7 +31916,7 @@ version 2
                     .map(str::to_owned)
             })
             .collect::<Vec<_>>();
-        assert_eq!(codes, ["harness-screen-blocked", "harness-screen-cleared"]);
+        assert_eq!(codes, ["provider-auth-expired", "provider-auth-restored"]);
 
         // The prompt returns: the incarnation is fenced again, with a new request.
         show("> Work.\n\n● Login expired · Please run /login\n");
@@ -32011,32 +31929,34 @@ version 2
     }
 
     #[test]
-    fn blocking_screens_override_idle_and_work_clear_and_fence_again() {
-        for (driver, screen, blocked_on) in [
+    fn blocking_screens_override_idle_clear_and_fence_again() {
+        for (driver, screen, code) in [
             (
                 "claude",
-                include_str!("../../st-drivers/tests/fixtures/blocking-screens/claude-footer.txt"),
-                "login",
+                include_str!(
+                    "../../st-drivers/tests/fixtures/blocking-screens/claude-wide-footer.txt"
+                ),
+                "provider-auth-expired",
             ),
             (
                 "codex",
                 include_str!("../../st-drivers/tests/fixtures/blocking-screens/codex-login.txt"),
-                "login",
+                "provider-auth-expired",
             ),
             (
                 "codex",
                 include_str!("../../st-drivers/tests/fixtures/blocking-screens/codex-update.txt"),
-                "harness-modal",
+                "provider-update-prompt",
             ),
             (
                 "pi",
                 include_str!("../../st-drivers/tests/fixtures/blocking-screens/pi-no-key.txt"),
-                "login",
+                "provider-auth-expired",
             ),
             (
                 "omp",
                 include_str!("../../st-drivers/tests/fixtures/blocking-screens/omp-no-key.txt"),
-                "login",
+                "provider-auth-expired",
             ),
         ] {
             let store = Arc::new(Store::open_memory("node").unwrap());
@@ -32055,7 +31975,8 @@ version 2
                 runtime.clone(),
                 "node".into(),
                 Arc::new(Notify::new()),
-            );
+            )
+            .skipping_unneeded(true);
             reconciler.reconcile_once().unwrap();
             *runtime.ptys.lock().unwrap() = vec![claude_seat_pty("seat", "running", "one")];
             runtime
@@ -32063,6 +31984,7 @@ version 2
                 .lock()
                 .unwrap()
                 .insert("node.seat".into(), screen.into());
+            *runtime.screen_error.lock().unwrap() = true;
             reconciler.reconcile_once().unwrap();
             let publish_idle = |incarnation: &str| {
                 store
@@ -32082,34 +32004,40 @@ version 2
                     .unwrap();
             };
             publish_idle("one");
+            reconciler.reconcile_once().unwrap();
+            reconciler.reconcile_once().unwrap();
+            // Once an initial screen read succeeds, incremental polling must fence even
+            // without another runtime or harness claim changing.
+            *runtime.screen_error.lock().unwrap() = false;
             for _ in 0..3 {
                 reconciler.reconcile_once().unwrap();
             }
+            publish_idle("one");
+            reconciler.reconcile_once().unwrap();
             let harness = store.current_harness("agent/node.seat").unwrap().unwrap();
             assert_eq!(
                 harness.state,
-                "blocked",
+                if code == "provider-auth-expired" {
+                    "unauthenticated"
+                } else {
+                    "blocked"
+                },
                 "{driver}: {:?}",
                 store
                     .claims_for("agent/node.seat", Some("harness.diagnostic"))
                     .unwrap()
             );
-            assert_eq!(harness.blocked_on.as_deref(), Some(blocked_on));
+            assert_eq!(harness.blocked_on.as_deref(), Some("human"));
             assert_eq!(harness.driver.as_deref(), Some(driver));
             assert!(!harness.is_ready());
             assert!(
                 crate::suspension::blockers(&store, "agent/node.seat", "one")
                     .unwrap()
-                    .contains(&blocked_on.to_owned())
+                    .contains(&"pending-ask".to_owned())
             );
             assert!(
-                !crate::suspension::harness_quiescence(
-                    &harness.state,
-                    blocked_on,
-                    "none",
-                    "unknown"
-                )
-                .0
+                !crate::suspension::harness_quiescence(&harness.state, "human", "none", "unknown")
+                    .0
             );
             assert_eq!(store.fault_items(None).unwrap().len(), 1);
             assert_eq!(
@@ -32120,6 +32048,18 @@ version 2
                 1
             );
             assert!(runtime.keys.lock().unwrap().is_empty());
+
+            // A failed read cannot clear a known prompt.
+            *runtime.screen_error.lock().unwrap() = true;
+            reconciler.reconcile_once().unwrap();
+            assert!(
+                !store
+                    .current_harness("agent/node.seat")
+                    .unwrap()
+                    .unwrap()
+                    .is_ready()
+            );
+            *runtime.screen_error.lock().unwrap() = false;
 
             // Clearing the screen releases the same incarnation and its single attention item.
             runtime
@@ -32152,7 +32092,7 @@ version 2
             assert_eq!(store.fault_items(None).unwrap().len(), 1);
 
             if driver == "codex" {
-                let next = if blocked_on == "login" {
+                let next = if code == "provider-auth-expired" {
                     include_str!(
                         "../../st-drivers/tests/fixtures/blocking-screens/codex-update.txt"
                     )
@@ -32170,9 +32110,12 @@ version 2
                         .current_harness("agent/node.seat")
                         .unwrap()
                         .unwrap()
-                        .blocked_on
-                        .as_deref(),
-                    Some(blocked_on)
+                        .state,
+                    if code == "provider-auth-expired" {
+                        "unauthenticated"
+                    } else {
+                        "blocked"
+                    }
                 );
                 assert_eq!(store.fault_items(None).unwrap().len(), 1);
             }

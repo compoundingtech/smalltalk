@@ -4368,7 +4368,7 @@ impl AcceptFailures {
         let delay = if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
             self.resource_failures = self.resource_failures.saturating_add(1);
             Duration::from_millis(100 * (1_u64 << self.resource_failures.saturating_sub(1).min(6)))
-                .min(Duration::from_secs(5))
+                .min(Duration::from_secs(2))
         } else {
             self.resource_failures = 0;
             Duration::from_millis(100)
@@ -5020,6 +5020,7 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         &crate::resource::github_usage_report(),
         client_now_ms(),
     ));
+    report.checks.push(descriptor_check());
     report.status = if report.checks.iter().any(|check| check.status == "fail") {
         "fail"
     } else if report.checks.iter().any(|check| check.status == "warn") {
@@ -5029,6 +5030,57 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
     }
     .into();
     Ok(Json(report))
+}
+
+fn descriptor_check() -> DoctorCheck {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return DoctorCheck {
+            name: "file-descriptors".into(),
+            status: "warn".into(),
+            message: format!(
+                "cannot read descriptor limits: {}",
+                std::io::Error::last_os_error()
+            ),
+        };
+    }
+    #[cfg(target_os = "linux")]
+    let path = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    let path = "/dev/fd";
+    // Enumerating descriptors temporarily opens one itself.
+    let usage = std::fs::read_dir(path)
+        .ok()
+        .map(|entries| entries.count().saturating_sub(1) as u64);
+    descriptor_usage_check(limit.rlim_cur, limit.rlim_max, usage)
+}
+
+fn descriptor_usage_check(soft: u64, hard: u64, usage: Option<u64>) -> DoctorCheck {
+    let low = soft < 1024;
+    let full = usage.is_some_and(|usage| u128::from(usage) * 5 >= u128::from(soft) * 4);
+    let used = usage.map_or_else(|| "usage unavailable".into(), |used| format!("{used} open"));
+    DoctorCheck {
+        name: "file-descriptors".into(),
+        status: if low || full || usage.is_none() {
+            "warn"
+        } else {
+            "pass"
+        }
+        .into(),
+        message: format!(
+            "{used}; soft limit {soft}, hard limit {hard}{}",
+            if low {
+                "; low soft limit: raise the service's descriptor limit and restart the daemon"
+            } else if full {
+                "; at least 80% in use: inspect descriptor growth before accepting more connections"
+            } else {
+                ""
+            }
+        ),
+    }
 }
 
 /// Show what spends the GitHub budget that every observer on every host shares: the budget
@@ -13622,6 +13674,23 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
     }
 
     #[test]
+    fn doctor_flags_low_descriptor_limits_and_high_usage() {
+        let low = descriptor_usage_check(256, 8192, Some(92));
+        assert_eq!(low.status, "warn");
+        assert!(
+            low.message
+                .contains("92 open; soft limit 256, hard limit 8192")
+        );
+        assert!(low.message.contains("low soft limit"));
+        assert_eq!(
+            descriptor_usage_check(8192, 8192, Some(7000)).status,
+            "warn"
+        );
+        assert_eq!(descriptor_usage_check(8192, 8192, Some(92)).status, "pass");
+        assert_eq!(descriptor_usage_check(8192, 8192, None).status, "warn");
+    }
+
+    #[test]
     fn descriptor_exhaustion_bounds_accept_retries_and_log_reports() {
         for code in [libc::EMFILE, libc::ENFILE] {
             let error = std::io::Error::from_raw_os_error(code);
@@ -13632,15 +13701,15 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             let mut reports = Vec::new();
             while now.duration_since(start) < Duration::from_secs(60) {
                 let (delay, count) = failures.failed(&error, now);
-                assert!(delay <= Duration::from_secs(5));
+                assert!(delay <= Duration::from_secs(2));
                 delays.push(delay.as_millis());
                 if let Some(count) = count {
                     reports.push((now, count));
                 }
                 now += delay;
             }
-            assert_eq!(&delays[..7], &[100, 200, 400, 800, 1600, 3200, 5000]);
-            assert!(delays.len() <= 18, "retries: {}", delays.len());
+            assert_eq!(&delays[..7], &[100, 200, 400, 800, 1600, 2000, 2000]);
+            assert!(delays.len() <= 35, "retries: {}", delays.len());
             assert!(reports.len() <= 12, "reports: {}", reports.len());
             assert!(
                 reports

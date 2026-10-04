@@ -312,9 +312,10 @@ pub fn blockers(store: &Store, subject: &str, incarnation: &str) -> Result<Vec<S
     let mut blocking = Vec::new();
     if let Some(harness) = store.current_harness(subject)?
         && harness.incarnation_id == incarnation
-        && let Some(reason @ ("login" | "harness-modal")) = harness.blocked_on.as_deref()
+        && matches!(harness.state.as_str(), "unauthenticated" | "blocked")
+        && harness.blocked_on.as_deref() == Some("human")
     {
-        blocking.push(reason.into());
+        blocking.push("pending-ask".into());
     }
     let harness = store
         .latest_observation(subject, "harness.observed")?
@@ -384,13 +385,6 @@ pub fn harness_quiescence(
         _ => blocking.push("harness-indeterminate"),
     }
     // An axis the harness cannot see (`unknown`) is not a blocker; a person's ask is.
-    if matches!(blocked_on, "login" | "harness-modal") {
-        blocking.push(if blocked_on == "login" {
-            "login"
-        } else {
-            "harness-modal"
-        });
-    }
     if blocked_on == "human" || !matches!(ask, "" | "none" | "unknown") {
         blocking.push("pending-ask");
     }

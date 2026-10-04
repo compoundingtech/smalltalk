@@ -2911,7 +2911,6 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         ],
         "harness.diagnostic" => &[
             ("driver", string()),
-            ("blocked_on", string()),
             ("severity", enumeration(&["warning", "error"])),
             ("status", string()),
             ("code", string()),

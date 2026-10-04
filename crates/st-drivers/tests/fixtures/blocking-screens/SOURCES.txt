@@ -10,3 +10,7 @@ OpenCode's equivalent is the native session.error ProviderAuthError event, alrea
 covered by opencode_session::tests::provider_auth_error_is_terminal_and_other_errors_settle_to_idle_with_a_reason.
 Its "Connect a provider" command also serves authenticated users choosing another
 provider, so that title alone is not evidence of a logged-out seat.
+
+claude-wide-footer.txt: same isolated Claude capture resized to 160 columns.
+The permissions footer and login message share a line; the previous starts-with
+matcher missed this layout. No production terminal input was sent.

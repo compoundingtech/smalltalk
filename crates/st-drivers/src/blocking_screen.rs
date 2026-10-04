@@ -3,7 +3,7 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockingScreen {
-    pub blocked_on: &'static str,
+    pub code: &'static str,
     pub text: String,
 }
 
@@ -26,9 +26,14 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
             .any(|phrase| {
                 text.strip_prefix(phrase)
                     .is_some_and(|tail| tail.is_empty() || tail.starts_with(" ·"))
-                    || text
-                        .strip_prefix("? for shortcuts")
-                        .is_some_and(|footer| footer.trim() == *phrase)
+                    || ["? for shortcuts", "⏵⏵ bypass permissions on"]
+                        .iter()
+                        .any(|prefix| {
+                            text.starts_with(prefix)
+                                && text
+                                    .strip_suffix(phrase)
+                                    .is_some_and(|footer| footer.ends_with("  "))
+                        })
             })
         }),
         "pi" | "omp" => lines.iter().enumerate().find_map(|(index, line)| {
@@ -67,7 +72,7 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
     };
     if let Some(line) = login {
         return Some(BlockingScreen {
-            blocked_on: "login",
+            code: "provider-auth-expired",
             text: (*line).to_owned(),
         });
     }
@@ -82,7 +87,7 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
             .any(|line| line.starts_with("2. Anthropic Console account"))
     {
         return Some(BlockingScreen {
-            blocked_on: "login",
+            code: "provider-auth-expired",
             text: "Select login method:".into(),
         });
     }
@@ -103,7 +108,7 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
         })
     {
         return Some(BlockingScreen {
-            blocked_on: "login",
+            code: "provider-auth-expired",
             text: "Sign in with ChatGPT or provide an API key".into(),
         });
     }
@@ -122,7 +127,7 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
             && option("3. Skip until next version")
         {
             return Some(BlockingScreen {
-                blocked_on: "harness-modal",
+                code: "provider-update-prompt",
                 text: (*headline).to_owned(),
             });
         }
@@ -136,49 +141,54 @@ mod tests {
 
     #[test]
     fn captured_blocking_screens() {
-        for (driver, screen, blocked_on) in [
+        for (driver, screen, code) in [
             (
                 "claude",
                 include_str!("../tests/fixtures/blocking-screens/claude-footer.txt"),
-                "login",
+                "provider-auth-expired",
             ),
             (
                 "claude",
                 include_str!("../tests/fixtures/blocking-screens/claude-login.txt"),
-                "login",
+                "provider-auth-expired",
             ),
             (
                 "claude",
                 "? for shortcuts                 Not logged in · Run /login",
-                "login",
+                "provider-auth-expired",
             ),
-            ("claude", "● Login expired · Please run /login", "login"),
+            (
+                "claude",
+                include_str!("../tests/fixtures/blocking-screens/claude-wide-footer.txt"),
+                "provider-auth-expired",
+            ),
+            (
+                "claude",
+                "● Login expired · Please run /login",
+                "provider-auth-expired",
+            ),
             (
                 "codex",
                 include_str!("../tests/fixtures/blocking-screens/codex-login.txt"),
-                "login",
+                "provider-auth-expired",
             ),
             (
                 "codex",
                 include_str!("../tests/fixtures/blocking-screens/codex-update.txt"),
-                "harness-modal",
+                "provider-update-prompt",
             ),
             (
                 "pi",
                 include_str!("../tests/fixtures/blocking-screens/pi-no-key.txt"),
-                "login",
+                "provider-auth-expired",
             ),
             (
                 "omp",
                 include_str!("../tests/fixtures/blocking-screens/omp-no-key.txt"),
-                "login",
+                "provider-auth-expired",
             ),
         ] {
-            assert_eq!(
-                detect(driver, screen).unwrap().blocked_on,
-                blocked_on,
-                "{driver}"
-            );
+            assert_eq!(detect(driver, screen).unwrap().code, code, "{driver}");
         }
     }
 
