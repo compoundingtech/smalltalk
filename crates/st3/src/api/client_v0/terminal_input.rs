@@ -1,8 +1,8 @@
 //! Ordered terminal input on the collection socket. An input binds to a terminal follow the
-//! socket already holds, so it inherits that follow's consumed viewer and fenced incarnation;
+//! socket already holds, so it inherits that follow's viewer lease and fenced incarnation;
 //! `terminal.control` is checked once, when it opens. Batches carry a sequence from
-//! `next_seq`: a repeat is acknowledged without a write, a gap closes the input. Every batch
-//! rechecks the device pairing, the viewer record and the incarnation first, and any failure
+//! `next_seq`: a repeat is acknowledged without a write, a gap closes the input. Before writing
+//! a new batch it rechecks the device pairing, viewer record and incarnation; any failure
 //! closes the input. Nothing is ever resent.
 
 use super::*;
@@ -11,7 +11,7 @@ use super::*;
 const TERMINAL_INPUT_MAX_BATCH_BYTES: usize = 16 * 1024;
 
 /// What a batch to a followed terminal is checked against: the incarnation the follow fenced,
-/// and the viewer record it consumed.
+/// and the viewer record's head held by that follow.
 #[derive(Clone)]
 pub(super) struct InputTarget {
     subject: String,
