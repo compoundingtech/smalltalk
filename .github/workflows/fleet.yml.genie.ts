@@ -148,7 +148,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       nix: { binaryCaches: readOnlyBinaryCaches },
       step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && genie --check'] }),
     }),
-    // Start non-required; apply the staged ruleset change only after this check passes on main.
+    // Check the shared client and its iOS consumer before merge.
     'typescript-client': {
       name: 'typescript-client',
       // Reuse freshness's slot so the five general ci1 runners can cover the initial fan-out.
@@ -178,11 +178,20 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
           },
         },
         {
-          name: 'Install locked dependencies',
+          name: 'Install locked client dependencies',
           if: "steps.typescript-cache.outputs.cache-hit != 'true'",
-          run: 'npm ci --prefix apps/ios --ignore-scripts --no-audit --no-fund\nnpm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund',
+          run: 'npm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund',
         },
-        { name: 'Run client contracts, schemas and strict typechecks', run: 'bash scripts/ci-typescript-client' },
+        {
+          name: 'Run client contracts, schemas and strict typechecks',
+          run: 'npm test --prefix clients/typescript/st3-client\nnpm run typecheck --prefix clients/typescript/st3-client',
+        },
+        {
+          name: 'Install locked iOS dependencies',
+          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
+          run: 'npm ci --prefix apps/ios --ignore-scripts --no-audit --no-fund',
+        },
+        { name: 'Typecheck the iOS project', run: 'apps/ios/node_modules/.bin/tsc --noEmit -p apps/ios' },
       ],
     },
     // The Linux gate runs as three jobs on separate runners, each with its own caches.

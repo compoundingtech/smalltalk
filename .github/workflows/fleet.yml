@@ -143,13 +143,18 @@ jobs:
             apps/ios/node_modules
             clients/typescript/st3-client/node_modules
           key: "typescript-client-${{ runner.os }}-node24.18.0-${{ steps.lockfiles.outputs.hash }}"
-      - name: Install locked dependencies
+      - name: Install locked client dependencies
         if: steps.typescript-cache.outputs.cache-hit != 'true'
-        run: |
-          npm ci --prefix apps/ios --ignore-scripts --no-audit --no-fund
-          npm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund
+        run: npm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund
       - name: Run client contracts, schemas and strict typechecks
-        run: bash scripts/ci-typescript-client
+        run: |
+          npm test --prefix clients/typescript/st3-client
+          npm run typecheck --prefix clients/typescript/st3-client
+      - name: Install locked iOS dependencies
+        if: steps.typescript-cache.outputs.cache-hit != 'true'
+        run: npm ci --prefix apps/ios --ignore-scripts --no-audit --no-fund
+      - name: Typecheck the iOS project
+        run: apps/ios/node_modules/.bin/tsc --noEmit -p apps/ios
   linux-tests:
     name: linux-tests
     needs: [pick-runner]
