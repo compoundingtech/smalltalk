@@ -11846,10 +11846,11 @@ impl Store {
             "normal" => 2,
             _ => 3,
         };
+        // Most urgent first, and within that the newest first (Nathan, 2026-10-04).
         live.sort_by(|left, right| {
             priority(left)
                 .cmp(&priority(right))
-                .then_with(|| left.requested_at_unix_ms.cmp(&right.requested_at_unix_ms))
+                .then_with(|| right.requested_at_unix_ms.cmp(&left.requested_at_unix_ms))
                 .then_with(|| left.subject.cmp(&right.subject))
                 .then_with(|| left.person.cmp(&right.person))
                 .then_with(|| left.episode.cmp(&right.episode))
