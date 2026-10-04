@@ -25,10 +25,11 @@ that the head itself contain the latest `main`. No `pull_request_target` job run
 and the gate has only `contents: read` permission. Forks do not receive publishing secrets.
 
 The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
-`linux-gate` requires all three stage jobs and the named mail redelivery check to succeed
-(a skipped or cancelled stage fails it). The stage jobs use the shape label
-`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm`, `typescript-client` and the `linux-gate`
-aggregate use `namespace-profile-linux-x86-64`. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
+`linux-gate` is the single required check: it needs the three stage jobs and the named mail redelivery
+check, and passes only when every one succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
+`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm` and `typescript-client`
+use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggregate uses GitHub-hosted
+`ubuntu-latest`, so it cannot queue behind build or benchmark jobs. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
 
@@ -269,24 +270,37 @@ warm caches kept on the machine. GitHub has no overflow between runner labels, s
 starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
 through the API and picks one pool for the whole run:
 
-- `ci1` when at least `CI1_MIN_IDLE` (default 5, the jobs a run starts at once) runners with that
-  label are online and idle; merge-group runs ask for `ci1-merge`, which a runner reserved for the
-  merge queue also carries, so queued merges never wait behind pull request pushes;
+- `ci1` when at least `CI1_MIN_IDLE` (default 1) general runners are online and idle. Work starts
+  on available capacity; the remaining jobs can wait briefly for a runner;
+- `ci1-priority` for trusted PRs labelled `ci-priority`, without an idle-count or token dependency.
+  Pending urgent checks get the next free general runners; one slot stays reserved for priority
+  and merge work after urgent checks finish;
+- `ci1-priority` for a merge-group entry whose PR is labelled `ci-priority`, including after its
+  PR checks passed. A read-only PR-label lookup identifies the entry from its queue ref;
+- `ci1-merge` for other merge-group runs while ci1 is enabled. These jobs wait for their reserved
+  pool even when its runners are currently busy, and do not query the status API;
 - Namespace otherwise, exactly as above: when ci1 is busy or offline, when the runner list is
   unavailable, and always for a pull request from a fork. The repository is public and a self-hosted
   runner runs whatever a job asks, so fork code never reaches ci1 (and forks receive no secrets).
 
-Every other job's `runs-on` reads `pick-runner`'s output and falls back to its Namespace label when
-the output is empty. The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
+Build and test jobs read `pick-runner`'s output and fall back to their Namespace label when
+the output is empty. The aggregate stays on GitHub-hosted capacity regardless of that choice.
+The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
 names its stages and the redelivery canary instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
+Priority selection follows the fork boundary, so a fork label cannot reach a self-hosted runner.
+The private host controller keeps the priority slot out of the ordinary pool and removes its merge
+label while urgent required checks are pending. It also lends the other general runners to
+priority work during that interval, so queued ordinary work cannot take the next free slot.
+A guard applies labels after every ephemeral registration, before the runner accepts work.
+It changes labels without interrupting running jobs; the dedicated merge runner stays available.
 Two runs that pick at the same moment can both choose ci1; the later run's jobs then wait for
 runners on ci1.
 
 The switch is the repository variable `CI1_RUNNERS`: unset (the default), `pick-runner` is skipped
-and every run goes to Namespace with no extra job. `on` turns the choice on, and unsetting it turns
+and build/test jobs go to Namespace. `on` turns the choice on, and unsetting it turns
 it off again without a pull request. `pick-runner` reads the runners with the
 `CI1_RUNNERS_READ_TOKEN` secret, a token that may only read the organization's self-hosted runners;
-without it every run goes to Namespace.
+without it non-queue runs go to Namespace. Merge-group runs need no organization status token; a failed PR-label lookup retains merge capacity.
 
 On ci1 each runner is ephemeral: it takes one job, runs it as its own user in a fresh work directory
 with its own `/tmp`, and nothing the job started outlives it. The runner names a Cargo home in
@@ -527,12 +541,22 @@ from its first step to job completion, with unfinished jobs counted through the 
 The observation is repository-scoped; the workspace can also have jobs from other repositories.
 
 To refresh the capacity measurement, dispatch Workspace CI on `main`. Its `namespace-capacity`
-job runs only for `workflow_dispatch`, publishes platform limits and current usage to the job
+job publishes platform limits and current usage for `workflow_dispatch` to the job
 summary and retains the `namespace-capacity` artifact. It reports no workspace or account identity.
 See Namespace's [resource limits](https://namespace.so/docs/architecture/compute/resource-limits)
 and [profile concurrency controls](https://namespace.so/docs/solutions/github-actions/runner-controls/concurrent-runners)
 for the scheduler's limits, and GitHub's [merge queue settings](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
 for the distinction between build concurrency and merge batch size.
+
+## Superseded merge groups
+
+The `namespace-capacity` job also watches `merge_group` events on a GitHub-hosted runner,
+independent of ci1 and Namespace availability. It polls the group's ref and required check statuses
+every 15 seconds. A missing ref or a changed SHA on two consecutive successful lookups force-cancels
+its own workflow, including queued Linux jobs and always-run summaries. Lookup failures retain work.
+Once all four required checks finish, the watcher exits normally; a ref removed by a successful
+merge therefore retains the completed workflow result used by main upkeep. It executes embedded
+workflow code without checking out queued PR code. Manual capacity reports still use Namespace.
 
 ## Namespace jobs that never start
 
