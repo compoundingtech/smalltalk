@@ -889,6 +889,19 @@ mod gateway_tests {
         follow(&mut socket, "term3", &third).await;
         open(&mut socket, "in3", "term3").await;
         assert_eq!(input(&mut socket, "in3", 0, text("fresh")).await, ack("in3", 0));
+        // Reconnecting preserves the projected viewer lease, not the socket's input session.
+        socket.close(None).await.unwrap();
+        socket = connect_as(
+            address,
+            "/v1/client/collections/stream",
+            COLLECTION_SUBPROTOCOL,
+            "control-secret",
+        )
+        .await;
+        send_json(&mut socket, json!({"kind":"input", "id":"in3", "seq":1, "data":text("replayed")})).await;
+        follow(&mut socket, "term3", &third).await;
+        open(&mut socket, "in3", "term3").await;
+        assert_eq!(input(&mut socket, "in3", 0, text("reconnected")).await, ack("in3", 0));
         state
             .store
             .append_claim(&ClaimInput {
@@ -913,7 +926,7 @@ mod gateway_tests {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 let screen = runtime.screen("input-test").unwrap();
-                if screen.contains("accepted:fresh") || std::time::Instant::now() > deadline {
+                if screen.contains("accepted:reconnected") || std::time::Instant::now() > deadline {
                     return screen;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -921,12 +934,17 @@ mod gateway_tests {
         })
         .await
         .unwrap();
-        for line in ["one", "two", "kept", "fresh"] {
+        for line in ["one", "two", "kept", "fresh", "reconnected"] {
             assert!(screen.contains(&format!("accepted:{line}")), "{line} missing: {screen}");
         }
-        for line in ["repeat", "gapped", "late", "detached", "replaced", "revoked"] {
+        for line in ["repeat", "gapped", "late", "detached", "replaced", "revoked", "replayed"] {
             assert!(!screen.contains(&format!("accepted:{line}")), "{line} written: {screen}");
         }
+        let accepted: Vec<_> = screen
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("accepted:"))
+            .collect();
+        assert_eq!(accepted, ["one", "two", "kept", "fresh", "reconnected"]);
         server.abort();
         let _ = server.await;
     }
