@@ -3053,7 +3053,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Some(screen) = screen else {
             return Ok(());
         };
-        let matched = st_drivers::blocking_screen::detect(driver, &screen);
+        let matched = st_drivers::blocking_screen::detect(driver, screen);
         for (code, restored, prefix, condition) in [(
             "provider-update-prompt",
             "provider-update-restored",
