@@ -2140,7 +2140,11 @@ fn client_agent_resources_uncached(
                 _ if subject.desired.is_some() => "desired",
                 _ => "stopped",
             };
-            let state = if fault.is_some() { "failed" } else { state };
+            let handoff = subject.desired_token.as_deref()
+                .map(|token| crate::placement::handoff(store, &subject.subject, token, snapshot_index))
+                .transpose()?.flatten();
+            let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
+            let state = if fault.is_some() { "failed" } else if moving { "waiting" } else { state };
             let suspension = crate::suspension::current(store, &subject.subject)?;
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
@@ -2155,6 +2159,7 @@ fn client_agent_resources_uncached(
                 .map(|runtime| vec![format!("runtime/{runtime}")])
                 .unwrap_or_default();
             let incarnation_id = fields
+                .filter(|_| !moving)
                 .and_then(|fields| fields.get("incarnation_id"))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
@@ -2225,6 +2230,7 @@ fn client_agent_resources_uncached(
                 })).collect::<Vec<_>>(),
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
+                "handoff": handoff,
             });
             Ok((name, value))
         })

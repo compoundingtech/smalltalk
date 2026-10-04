@@ -912,6 +912,17 @@ pub struct Agent {
     /// The seat's latest suspend or resume and its phase. An older daemon omits it.
     #[serde(default)]
     pub suspension: Option<AgentSuspension>,
+    /// Placement handoff phase and the sources still holding its fence.
+    #[serde(default)]
+    pub handoff: Option<AgentHandoff>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentHandoff {
+    pub phase: String,
+    pub destination: String,
+    pub sources: Vec<String>,
+    pub pending_sources: Vec<String>,
+    pub desired_token: String,
 }
 /// The latest accepted harness todo observation, including its provenance and freshness.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
