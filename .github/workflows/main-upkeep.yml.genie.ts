@@ -48,6 +48,14 @@ fi`,
       ...setup,
       nixDevelopStep({ name: 'Build missing cache contents', flake: stage === 'genie' ? '.#genie' : '.', command: ['bash', 'scripts/ci-cache-warm', stage] }),
       { name: 'Save Nix outputs', run: 'bash scripts/ci-nix-cache save' },
+      // A snapshot can supply a warm build after an Actions entry was evicted. Fill
+      // that missing main entry directly; do not overwrite the snapshot with a fallback.
+      ...(nixOnly ? [nixCacheStep] : [cargoCacheStep, nixCacheStep]).map((step) => ({
+        name: `Refill ${step.id} from the restored snapshot`,
+        if: `env.CI_BUILD_SNAPSHOT_HIT == '1' && steps.${step.id === 'cargo-cache' ? 'cargo-probe' : 'nix-probe'}.outputs.cache-hit != 'true'`,
+        uses: 'actions/cache/save@v4',
+        with: { path: step.with.path, key: step.with.key },
+      })),
       ...buildSnapshotSave,
     ], nixOnly ? "steps.nix-probe.outputs.cache-hit != 'true'" : missing),
   ],
