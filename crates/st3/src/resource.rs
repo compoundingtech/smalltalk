@@ -293,20 +293,24 @@ fn parse_github_ref_locator(locator: &str) -> Result<GithubRefLocator> {
 }
 
 async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObservation> {
+    let token = github_token().await?;
+    observe_github_ref_at(request, &github_api_base(), &token).await
+}
+
+async fn observe_github_ref_at(request: ObservationRequest, api: &str, token: &str) -> Result<ProviderObservation> {
     let cache_for = github_cache_for(&request);
     let locator = parse_github_ref_locator(&request.locator)?;
     let client = github_client();
-    let token = github_token().await?;
     let base = format!(
         "{}/repos/{}/{}",
-        github_api_base(),
+        api.trim_end_matches('/'),
         locator.owner,
         locator.repository
     );
     let branch = github_json(
         &client,
         format!("{base}/branches/{}", urlencoding::encode(&locator.name)),
-        &token,
+        token,
         cache_for,
     )
     .await?
@@ -325,7 +329,7 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
                 github_json(
                     &client,
                     format!("{base}/branches?per_page=100&page={page}"),
-                    &token,
+                    token,
                     cache_for,
                 )
                 .await?
@@ -349,7 +353,7 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
                     let comparison = github_json(
                         &client,
                         format!("{base}/compare/{candidate_head}...{head}"),
-                        &token,
+                        token,
                         cache_for,
                     )
                     .await?
@@ -381,7 +385,7 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
     Ok(ProviderObservation {
         facts,
         cursor,
-        next_check_unix_ms: now.saturating_add(300_000),
+        next_check_unix_ms: now.saturating_add(u128::from(request.every_ms.unwrap_or(300_000))),
     })
 }
 
@@ -450,6 +454,8 @@ fn github_next_page(link: &str) -> Option<String> {
             })
     })
 }
+
+pub const GITHUB_REF_WATCH_MS: u64 = 30_000;
 
 const GITHUB_CACHE_FOR: Duration = Duration::from_secs(300);
 
@@ -1405,6 +1411,45 @@ mod tests {
         .expect("the request did not time out");
         assert!(observed.is_err());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn watched_ref_conditional_reads_keep_the_304_facts_and_detect_the_next_head() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, etag, body) in [
+                ("200 OK", "head-one", r#"{"commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#),
+                ("304 Not Modified", "head-one", ""),
+                ("200 OK", "head-two", r#"{"commit":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 1024]; let size = stream.read(&mut chunk).await.unwrap();
+                    request.extend_from_slice(&chunk[..size]);
+                    if size == 0 || request.windows(4).any(|bytes| bytes == b"\r\n\r\n") { break; }
+                }
+                requests.push(String::from_utf8(request).unwrap().to_lowercase());
+                stream.write_all(format!("HTTP/1.1 {status}\r\nETag: \"{etag}\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let request = || ObservationRequest { provider:"github.ref".into(), locator:"acme/garden@main".into(), fields:BTreeSet::from(["head".into()]),
+            cursor:None, previous_facts:None, every_ms:Some(GITHUB_REF_WATCH_MS), refresh:true };
+        let first = observe_github_ref_at(request(), &base, "fixture-token").await.unwrap();
+        let unchanged = observe_github_ref_at(request(), &base, "fixture-token").await.unwrap();
+        let changed = observe_github_ref_at(request(), &base, "fixture-token").await.unwrap();
+        assert_eq!(first.facts, unchanged.facts); assert_eq!(first.cursor, unchanged.cursor);
+        assert_ne!(changed.cursor, unchanged.cursor);
+        assert_eq!(changed.facts["head"], "b".repeat(40));
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        assert!(changed.next_check_unix_ms <= now + u128::from(GITHUB_REF_WATCH_MS));
+        let requests = server.await.unwrap();
+        assert!(!requests[0].contains("if-none-match"));
+        assert!(requests[1].contains("if-none-match: \"head-one\""));
+        assert!(requests[2].contains("if-none-match: \"head-one\""));
     }
 
     #[tokio::test]

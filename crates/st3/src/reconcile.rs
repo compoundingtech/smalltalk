@@ -10774,6 +10774,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         if requests.is_empty() {
             return Ok(());
         }
+        let mut latest_ref_requests = BTreeMap::new();
+        for resource in requests.iter().filter_map(|request|
+            request.body.pointer("/fields/resource").and_then(Value::as_str)).collect::<BTreeSet<_>>() {
+            if self.store.latest_actual_value(resource)?.is_some_and(|actual|
+                actual["kind"] == "vcs.ref" && actual["facts"]["head"].is_string()) {
+                if let Some(request) = requests.iter().rev().find(|request|
+                    request.body.pointer("/fields/resource").and_then(Value::as_str) == Some(resource)) {
+                    latest_ref_requests.insert(resource.to_owned(), request.id.clone());
+                }
+            }
+        }
         let is_held = |request: &crate::model::ClaimRecord| {
             request
                 .body
@@ -10829,6 +10840,20 @@ impl<R: RuntimeControl> Reconciler<R> {
                         "subscription-stale-pull-request:{}",
                         request.id
                     )),
+                })?;
+                continue;
+            }
+            if let Some((resource, discovery)) = request.body.pointer("/fields/resource").and_then(Value::as_str)
+                .zip(request.body.pointer("/fields/discovery").and_then(Value::as_str))
+                && let Some(reason) = match latest_ref_requests.get(resource) {
+                    Some(newest) if newest != &request.id => Some(format!("newer ref delivery {newest} supersedes this queued request")),
+                    _ => self.store.stale_ref_request(resource, discovery)?,
+                } {
+                self.store.append_claim(&ClaimInput {
+                    subject: item.subject.clone(), kind: "subscription.mission-request-cancelled".into(), actor: None,
+                    fields: BTreeMap::from([("request".into(), Value::String(request.id.clone())), ("reason".into(), Value::String(reason))]),
+                    evidence: vec![request.id.clone()], expected_subject: None,
+                    idempotency_key: Some(format!("subscription-stale-ref:{}", request.id)),
                 })?;
                 continue;
             }
@@ -10927,26 +10952,25 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .collect(),
                 idempotency_key: format!("subscription-mission:{}", request.id),
             };
-            let created = match &item.owner_run {
+            let parent = match &item.owner_run {
                 Some(owner) => match self.store.mission_run(owner)? {
-                    Some(parent) => self.store.create_child_mission_run(
-                        &request_value,
-                        &parent,
-                        &item.subject,
-                        None,
-                    ),
-                    None => {
-                        waiting.push(format!(
-                            "request {}: its owner run {owner} is not stored here yet",
-                            request.id
-                        ));
-                        continue;
-                    }
+                    Some(parent) => Some(parent),
+                    None => { waiting.push(format!("request {}: its owner run {owner} is not stored here yet", request.id)); continue; }
                 },
-                None => self.store.create_mission_run(&request_value),
+                None => None,
             };
+            let created = self.store.create_subscription_mission_run(&request_value, parent.as_ref(), &item.subject, resource, discovery);
             let run = match created {
                 Ok(run) => run,
+                Err(error) if error.code == "stale-ref-head" => {
+                    self.store.append_claim(&ClaimInput {
+                        subject: item.subject.clone(), kind: "subscription.mission-request-cancelled".into(), actor: None,
+                        fields: BTreeMap::from([("request".into(), Value::String(request.id.clone())), ("reason".into(), Value::String(error.message))]),
+                        evidence: vec![request.id.clone()], expected_subject: None,
+                        idempotency_key: Some(format!("subscription-stale-ref:{}", request.id)),
+                    })?;
+                    continue;
+                }
                 Err(error) if error.code == "mission-run-capacity" => {
                     capacity_waiting.insert(mission.to_owned());
                     let attempt =
@@ -11321,6 +11345,13 @@ impl<R: RuntimeControl> Reconciler<R> {
         );
         spec.fields.sort();
         spec.fields.dedup();
+        // A live subscription is a watch of this ref. Keep explicit faster intervals,
+        // and use conditional reads every thirty seconds while anyone watches it.
+        let watched_ref = spec.provider == "github.ref" && selected.iter().any(|(_, subscription)|
+            subscription.observer == observer.subject && !subscription.stopped);
+        if watched_ref {
+            spec.every_ms = Some(spec.every_ms.unwrap_or(300_000).min(crate::resource::GITHUB_REF_WATCH_MS));
+        }
         let Some(revision) = self.store.selected_desired_revision(&observer.subject)? else {
             return Ok(());
         };
@@ -11343,7 +11374,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
         let deadline_key = format!("{}:{revision}", observer.subject);
-        let next_check = refresh_attempt
+        let mut next_check = refresh_attempt
             .as_ref()
             .map(|_| now_ms())
             .unwrap_or_else(|| {
@@ -11361,18 +11392,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                     })
                     .unwrap_or_else(now_ms)
             });
-        let operation = format!(
-            "{}:{revision}:{}",
-            observer.subject,
-            refresh_attempt.as_deref().unwrap_or("scheduled")
-        );
-        if !self
-            .armed_observers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(operation.clone())
+        // A changed cadence retires the old sleeping poll; its result cannot overwrite
+        // a newer watcher observation if it was already in flight.
+        if watched_ref && refresh_attempt.is_none() && observer_actual.as_ref().is_none_or(|actual|
+            actual["error_code"] != "rate-limited") {
+            next_check = next_check.min(now_ms().saturating_add(u128::from(spec.every_ms.unwrap())));
+        }
+        let operation_prefix = format!("{}:{revision}:{}:", observer.subject,
+            refresh_attempt.as_deref().unwrap_or("scheduled"));
+        let cadence_prefix = format!("{operation_prefix}{}:", spec.every_ms.map_or("default".into(), |ms| ms.to_string()));
+        let operation = format!("{cadence_prefix}{}", uuid::Uuid::now_v7());
         {
-            return Ok(());
+            let mut armed = self.armed_observers.lock().unwrap_or_else(PoisonError::into_inner);
+            armed.retain(|key| !key.starts_with(&operation_prefix) || key.starts_with(&cadence_prefix));
+            if armed.iter().any(|key| key.starts_with(&cadence_prefix)) { return Ok(()); }
+            armed.insert(operation.clone());
         }
         let store = self.store.clone();
         let provider = self.resource_provider.clone();
@@ -11427,6 +11461,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     signal_changed(&notify, &event_notify);
                     return;
                 }
+                if !armed.lock().unwrap_or_else(PoisonError::into_inner).contains(&operation) { return; }
                 let request = ObservationRequest {
                     provider: spec.provider.clone(),
                     locator: spec.locator.clone(),
@@ -11439,6 +11474,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let observed =
                     crate::resource::spend_as(observer_subject.clone(), provider.observe(request))
                         .await;
+                let mut active = armed.lock().unwrap_or_else(PoisonError::into_inner);
+                if !active.contains(&operation)
+                    || store.selected_desired_revision(&observer_subject).ok().flatten().as_deref() != Some(revision.as_str()) {
+                    active.remove(&operation);
+                    signal_changed(&notify, &event_notify);
+                    return;
+                }
                 match observed {
                     Ok(mut observation) => {
                         if spec.provider == "github.repository" {
@@ -11584,10 +11626,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         }
                     }
                 }
-                armed
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&operation);
+                active.remove(&operation);
+                drop(active);
                 signal_changed(&notify, &event_notify);
             });
         } else {
@@ -14280,6 +14320,7 @@ fn now_ms() -> u128 {
 mod tests {
     mod differential;
     mod rollout_tests;
+    mod ref_watch_tests;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};

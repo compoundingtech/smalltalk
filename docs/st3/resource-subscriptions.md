@@ -53,6 +53,10 @@ The `github.ref` provider supports `head` and `ancestors`. `head` is the selecte
 `ancestors` contains the full `refs/heads/NAME` name of every other repository branch whose head is
 reachable from the selected branch.
 
+A live subscription to a `github.ref` observer now checks at least every thirty seconds, using the existing shared ETag cache and conditional requests. An explicit faster `every` interval is retained. Unchanged HTTP 304 responses reuse the complete normalized facts and do not create another resource observation or delivery. Without a subscription the observer retains its ordinary five-minute default or its authored interval. Rate-limit retry deadlines remain authoritative.
+
+For mission deliveries from a `vcs.ref`, only the newest observed head remains queued. Older unstarted deliveries are cancelled before capacity retries and stay cancelled across daemon restart. Run creation rechecks that head in its writer transaction. A running mission retains its original pinned resource claim and its exact-commit `ci-passed` gate. Keep the applier mission at `concurrent-runs max=1` and on its existing host; no push receiver or additional applier is introduced.
+
 Every item the observer sees becomes its resource, including a draft pull request and every open
 item at the baseline. Only a change records an observation: an unchanged item records nothing, and
 an observation that read only some facts, such as a new comment, keeps the others.
