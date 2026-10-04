@@ -657,6 +657,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   /** Diagnostic harness reason, not a machine-readable verdict. */
   "reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Diagnostic harness reason, not a machine-readable verdict." }),
   "revision": Revision,
+  /** Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons. */
+  "rollout": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE).annotate({ description: "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." }),
   "runtime_ids": Schema.Array(RuntimeId),
   "silent_since": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "state": AgentState,
