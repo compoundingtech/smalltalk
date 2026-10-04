@@ -1419,6 +1419,20 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
     if let Some(tree) = &agent.worktree {
         second.push(span(format!("  ·  {tree}"), theme::dim()));
     }
+    // The agent's actions, discoverable from where it is shown (ctrl+a too).
+    let actions = "⋯ actions ";
+    let used = second.iter().map(Span::width).sum::<usize>();
+    if used + text::width(actions) + 2 <= width {
+        let column = width - text::width(actions);
+        second.push(span(" ".repeat(column - used), theme::dim()));
+        second.push(span(actions, theme::fg(theme::ACCENT)));
+        doc.targets.push(super::doc::Target {
+            line: doc.lines.len(),
+            column: column as u16,
+            width: text::width(actions) as u16,
+            hit: Hit::Actions(agent.id.clone()),
+        });
+    }
     doc.line(Line::from(second));
     if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
         let title = world
@@ -2285,6 +2299,74 @@ fn demo_banner(doc: &mut Doc, width: usize) {
 
 /// The small card a clicked reference opens: enough to recognise the subject, and a way
 /// to go to it.
+/// One row of the agent actions menu: its key, what it says, and what it does.
+pub struct AgentAction {
+    pub key: char,
+    pub label: &'static str,
+    pub what: &'static str,
+}
+
+/// What can be done to `agent` now, in the order the menu lists it (Nathan, 2026-10-04: make
+/// restart, retire and the rest discoverable). Ones that change the seat ask y first.
+pub fn agent_actions(agent: &Agent) -> Vec<AgentAction> {
+    let row = |key, label, what| AgentAction { key, label, what };
+    let mut rows = Vec::new();
+    let running = !matches!(agent.state, AgentState::Stopped | AgentState::Unknown);
+    if agent.state == AgentState::Working {
+        rows.push(row('i', "Interrupt", "stop its current turn, as Esc does in its own screen"));
+    }
+    if running {
+        rows.push(row('r', "Restart", "a new process for the same seat, on its declaration"));
+        rows.push(row('p', "Suspend", "stop at a quiet moment, keeping its session to resume"));
+        rows.push(row('x', "Retire", "stop it and take it off the lists; start brings it back"));
+    } else {
+        rows.push(row('s', "Start", "start it again on its declaration"));
+        rows.push(row('u', "Resume", "resume a suspended seat on the same session"));
+    }
+    if agent.terminal {
+        rows.push(row('t', "Terminal", "attach its terminal (ctrl+] too)"));
+    }
+    rows.push(row('d', "Details", "what it is doing and what is queued (ctrl+d too)"));
+    rows.push(row('f', "Find", "find in its conversation (ctrl+f too)"));
+    rows.push(row('c', "Copy id", "copy its id to the clipboard"));
+    rows
+}
+
+/// The agent actions menu's card.
+pub fn agent_actions_doc(agent: &Agent, width: usize, spinner: &'static str) -> Doc {
+    let mut doc = Doc::new();
+    doc.blank();
+    let (glyph, color) = agent_glyph(agent.state, spinner);
+    doc.line(Line::from(vec![
+        span(format!("{glyph} "), theme::strong(color)),
+        span(agent.name.clone(), theme::bold()),
+        span(format!("  {}", agent_word(agent.state)), theme::fg(color)),
+        span(format!("  {} · {}", agent.harness.name(), agent.host), theme::dim()),
+    ]));
+    doc.blank();
+    for action in agent_actions(agent) {
+        let line = doc.lines.len();
+        let label = format!("{:<10}", action.label);
+        doc.line(Line::from(vec![
+            span(format!(" {} ", action.key), theme::strong(theme::CRUST).bg(theme::ACCENT)),
+            span(format!(" {label}"), theme::bold()),
+            span(text::truncate(action.what, width.saturating_sub(16)), theme::dim()),
+        ]));
+        doc.targets.push(super::doc::Target {
+            line,
+            column: 0,
+            width: width.min(u16::MAX as usize) as u16,
+            hit: Hit::Key(action.key),
+        });
+    }
+    doc.blank();
+    doc.wrap(
+        &text::inline("Restart, suspend and retire ask y first. Esc closes.", theme::dim()),
+        width,
+    );
+    doc
+}
+
 pub fn peek(world: &World, subject: &str, width: usize, spinner: &'static str) -> Doc {
     let mut doc = Doc::new();
     doc.blank();

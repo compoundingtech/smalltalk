@@ -2418,6 +2418,12 @@ impl Ui {
         }
         match key.code {
             KeyCode::Char('q') if control => self.quit = true,
+            // The agent's actions: restart, retire, suspend and the rest (Nathan, 2026-10-04).
+            KeyCode::Char('a') if control && conversation.is_some() => {
+                if let Some(agent) = &conversation {
+                    self.popover = Some(format!("actions:{agent}"));
+                }
+            }
             KeyCode::Char('f') if control && conversation.is_some() => {
                 if let Some(agent) = &conversation {
                     self.find_in(agent, "");
@@ -3819,6 +3825,55 @@ mod tests {
             Some(shell)
         );
         assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+    }
+
+    #[test]
+    fn ctrl_a_opens_an_agents_actions_and_restart_asks_first() {
+        let mut ui = glass();
+        ui.live = true;
+        let agent = "agent/example/atlas/builder";
+        ui.open_in_glass(Pane::Agent(Some(agent.into())), Open::Tab);
+        // The header offers them too.
+        assert!(screen(&ui).contains("⋯ actions"), "{}", screen(&ui));
+        ctrl(&mut ui, 'a');
+        assert_eq!(ui.popover.as_deref(), Some("actions:agent/example/atlas/builder"));
+        let shown = screen(&ui);
+        for action in ["Restart", "Suspend", "Retire", "Copy id", "ACTIONS · ESC CLOSES"] {
+            assert!(shown.contains(action), "{action}: {shown}");
+        }
+        // Restart asks first; Esc would keep it, y restarts.
+        ui.effects.clear();
+        press(&mut ui, KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(ui.effects.is_empty());
+        assert!(ui.flash.as_ref().is_some_and(|(text, _)| text.contains("y to restart")));
+        press(&mut ui, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(
+            ui.effects,
+            [Effect::AgentControl {
+                agent: agent.into(),
+                control: AgentControl::Restart
+            }]
+        );
+        // Retire then Esc does nothing.
+        ui.effects.clear();
+        ctrl(&mut ui, 'a');
+        press(&mut ui, KeyCode::Char('x'), KeyModifiers::NONE);
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(ui.effects.is_empty());
+    }
+
+    #[test]
+    fn a_stopped_agents_actions_offer_start_and_resume() {
+        let agent = Agent {
+            state: AgentState::Stopped,
+            ..glass().world.agents.items()[0].clone()
+        };
+        let keys = screens::agent_actions(&agent)
+            .iter()
+            .map(|action| action.key)
+            .collect::<String>();
+        assert!(keys.contains('s') && keys.contains('u'), "{keys}");
+        assert!(!keys.contains('r') && !keys.contains('x'), "{keys}");
     }
 
     #[test]

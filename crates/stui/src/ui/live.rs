@@ -9,7 +9,7 @@
 use super::adapt::{self, Extras};
 use super::glass::GlassWrite;
 use super::view::{Load, MissionPreview};
-use super::{Effect, Guard, Ui};
+use super::{AgentControl, Effect, Guard, Ui};
 use crate::feed::{self, Command, TerminalUpdate, Window};
 use crate::model::{self, Collection, Model};
 use anyhow::Result;
@@ -1501,6 +1501,78 @@ pub(crate) fn plain(error: &anyhow::Error) -> String {
         .unwrap_or_else(|| error.to_string())
 }
 
+/// One agent action, fenced to the seat's current declaration as st asks. A restart is a stop
+/// and then a start, each on the declaration st selects at that moment.
+async fn agent_control(client: &Client, agent: &str, control: AgentControl) -> Result<()> {
+    let fence = |definition: st3_client::Envelope<st3_client::SubjectDefinition>| Fence {
+        snapshot_id: definition.snapshot.id,
+        runtime_desired_revision: Some(definition.value.desired_token),
+        ..Fence::default()
+    };
+    let reason = Some("from stui's agent actions".to_owned());
+    let steps: &[AgentControl] = match control {
+        AgentControl::Restart => &[AgentControl::Retire, AgentControl::Start],
+        _ => std::slice::from_ref(&control),
+    };
+    for step in steps {
+        let fence = fence(client.subject_definition(agent, false).await?);
+        let (id, idem) = crate::action_pair();
+        match step {
+            AgentControl::Retire | AgentControl::Restart => {
+                client
+                    .agent_stop(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentStopParameters {
+                            agent: agent.to_owned(),
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            AgentControl::Start => {
+                client
+                    .agent_start(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentStartParameters {
+                            agent: agent.to_owned(),
+                        },
+                    )
+                    .await?;
+            }
+            AgentControl::Suspend => {
+                client
+                    .agent_suspend(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentSuspendParameters {
+                            agent: agent.to_owned(),
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            AgentControl::Resume => {
+                client
+                    .agent_resume(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentResumeParameters {
+                            agent: agent.to_owned(),
+                        },
+                    )
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn perform(
     client: &Client,
     person: &str,
@@ -1512,6 +1584,17 @@ async fn perform(
         // Glass writes and retries never reach here: the loop handles them itself.
         Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::Forget { .. } => {
             Ok((String::new(), None))
+        }
+        Effect::AgentControl { agent, control } => {
+            agent_control(client, &agent, control).await?;
+            Ok((
+                format!(
+                    "{} {}: asked st",
+                    control.verb(),
+                    agent.trim_start_matches("agent/")
+                ),
+                None,
+            ))
         }
         Effect::StopAgent { agent } => {
             let runtime = model
