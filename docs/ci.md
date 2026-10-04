@@ -33,7 +33,8 @@ limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
   builds the selected test executables with dev/test debug info and incremental compilation
   disabled, then runs `bash scripts/ci-nextest run` on every CPU, selected
   by the profile's default filter (see [gate scope](#gate-scope));
-- `linux-clippy`: `cargo clippy --workspace --all-targets --locked`, then
+- `linux-clippy`: `cargo clippy --workspace --all-targets --locked`, the standalone conversation
+  model check, the [warning ratchet](#clippy-warning-ratchet), then
   `cargo run --locked -p st3-client-codegen -- --check`;
 - `linux-fleet-compat`: the fleet compatibility test against `.github/fleet-compat-baseline.json`'s
   pinned older st3. Building that baseline also runs the pinned pty's own unit tests, two of which
@@ -104,6 +105,43 @@ its claim trace and the stand-in's receipts under `target/boot-canaries/`, which
 The Codex stand-in's schema files are generated from the protocol gate's own fixture; when the
 required Codex methods change, `ST_REGENERATE_CODEX_STUB_SCHEMAS=1 cargo test -p st-drivers
 the_boot_canary_codex_stub_schemas` rewrites them.
+
+### Clippy warning ratchet
+
+`linux-clippy` reuses JSON diagnostics from its existing workspace and standalone
+`st3-conversation-ui` Clippy runs. `.github/clippy-baseline.json` records warning counts per
+workspace crate and lint, with sorted keys and the compiler/Clippy versions supplied by the
+`flake.lock`-pinned devShell. It includes Rust warnings as well as Clippy warnings, ignores
+dependencies outside the workspace, and counts each source diagnostic once when Cargo repeats
+it for library/test targets or the standalone model run. A cached Cargo run replays diagnostics.
+Errors and deny-level lints still fail Cargo; a failed, truncated or malformed diagnostic stream
+cannot pass the ratchet.
+
+Any crate/lint count above its baseline fails, including a newly introduced crate or lint.
+Removing warnings also requires lowering the baseline in the same pull request, so a later
+change cannot spend the removed warnings. CI checks that the committed counts do not increase
+relative to the event's immutable base SHA (PR base, merge-group base, or preceding main commit).
+The first rollout permits a base without the file. There is no new required check:
+`linux-gate` already requires `linux-clippy`.
+
+To check locally and lower the baseline after fixing warnings:
+
+```sh
+export RUNNER_TEMP=$(mktemp -d)
+export GITHUB_STEP_SUMMARY="$RUNNER_TEMP/summary.md"
+nix develop -c bash scripts/ci-linux clippy
+# If the stage reports removed warnings, use its saved diagnostics without rebuilding:
+python3 scripts/clippy_ratchet.py --logs "$RUNNER_TEMP/ci-logs" --update
+git add .github/clippy-baseline.json
+nix develop -c bash scripts/ci-linux clippy
+```
+
+`--update` refuses to increase any existing count. The job retains the diagnostic streams,
+metadata and toolchain versions in its `linux-clippy-logs` artifact; the failure message gives
+the same update command. When updating `flake.lock`'s Rust toolchain, regenerate the version
+metadata using fresh diagnostics in the new pinned shell and fix any new warnings; counts
+still cannot increase. Run the ratchet's focused regression proofs with
+`python3 scripts/clippy-ratchet-test` (CI runs them in the same stage).
 
 ### Gate scope
 
