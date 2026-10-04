@@ -1098,9 +1098,6 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
             } else if *table == "desired" && column == "body" {
                 // Declaration-edge triggers read this JSON during the same update.
                 "(json_set(body,'$.__audit_digest_change',1)||'')".to_owned()
-            } else if *table == "desired" && column == "member" {
-                // The agent-host expression index reads member JSON on updates.
-                "(json_set(COALESCE(member,'{}'),'$.__audit_digest_change',1)||'')".to_owned()
             } else {
                 format!("COALESCE({column},'')||'-changed'")
             };
