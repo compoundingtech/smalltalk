@@ -1340,6 +1340,7 @@ impl ClientSession {
             authority_actor: authority_actor.into(),
             transport,
             scopes: std::collections::BTreeSet::new(),
+            pairing: None,
         }
     }
 
