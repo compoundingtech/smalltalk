@@ -6,11 +6,11 @@ const path = require('node:path');
 const http = require('node:http');
 const { createHash } = require('node:crypto');
 const { spawn } = require('node:child_process');
-const ts = require('../../../apps/ios/node_modules/typescript');
+const ts = require('typescript');
 
 // Runs against actual IndexedDB and WebSocket implementations, not a storage/socket mock.
 const browserChecks = async () => {
-    const { IndexedDbCredentialStore, St3Client } = await import('/index');
+    const { IndexedDbCredentialStore, St3Client } = await import('/index.js');
     const gateway = location.origin;
     const otherGateway = 'https://other-gateway.example';
     const store = new IndexedDbCredentialStore();
@@ -71,7 +71,7 @@ test('browser persists gateway-scoped native bearers and authenticates every str
     const modules = new Map();
     for (const name of ['Models.generated', 'Client.generated', 'errors', 'IndexedDbCredentialStore', 'index']) {
         const source = fs.readFileSync(path.join(__dirname, `${name}.ts`), 'utf8');
-        modules.set(`/${name}`, ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2020, target: ts.ScriptTarget.ES2020 } }).outputText);
+        modules.set(`/${name}.js`, ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2020, target: ts.ScriptTarget.ES2020, rewriteRelativeImportExtensions: true } }).outputText);
     }
     const snapshot = { id: 'snapshot/test', host_id: 'host/test', store_index: 1, projection_version: 'client-projection.v0', created_at: '2026-09-20T00:00:00Z' };
     const envelope = value => ({ api_version: 'st3.client.v0', request_id: 'request/test', snapshot, value });
