@@ -17170,13 +17170,26 @@ fn accept_managed_channel_frame(
     observer: &mut Option<st_drivers::pi_channel::EventObserver>,
     line: &str,
 ) -> Result<bool> {
-    if let Some(observer) = observer.as_mut()
-        && let Ok(frame) = serde_json::from_str::<Value>(line)
-    {
-        observer.observe(&frame)?;
-        if frame["type"] == "todo" {
-            // The managed observer committed this snapshot to the durable outbox already.
-            return Ok(false);
+    if let Ok(frame) = serde_json::from_str::<Value>(line) {
+        let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("unknown");
+        let handled = match frame_type {
+            "state" | "session" | "ready" | "delivered" | "read" | "failed" | "todo" => true,
+            "timeline" | "context" | "turn" => observer.is_some(),
+            _ => false,
+        };
+        if !handled {
+            tracing::debug!(
+                frame_type,
+                observer_enabled = observer.is_some(),
+                "unhandled pi-family channel frame"
+            );
+        }
+        if let Some(observer) = observer.as_mut() {
+            observer.observe(&frame)?;
+            if frame["type"] == "todo" {
+                // The managed observer committed this snapshot to the durable outbox already.
+                return Ok(false);
+            }
         }
     }
     let publish = state.accept_frame(line);
@@ -20878,6 +20891,59 @@ mod tests {
         // A handoff failure below the retry limit makes the message deliverable again.
         assert!(!resumed.accept_frame(r#"{"type":"failed","meta":{"messageId":"message/one"}}"#));
         assert!(!resumed.delivered.contains("message/one"));
+    }
+
+    #[test]
+    fn pi_family_channel_logs_unhandled_frames_without_claiming_or_panicking() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for frame_type in ["future_frame", "pre_compact", "timeline", "context", "turn"] {
+            let capture = Capture(Default::default());
+            let writer = capture.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let mut state = PiChannelResume::default();
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(
+                    !accept_managed_channel_frame(
+                        &mut state,
+                        &mut None,
+                        &json!({"type": frame_type, "private_payload": "not logged"}).to_string(),
+                    )
+                    .unwrap()
+                );
+            });
+            let output = String::from_utf8(
+                capture.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone(),
+            ).unwrap();
+            assert!(
+                output.contains("unhandled pi-family channel frame"),
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!("frame_type=\"{frame_type}\"")),
+                "{output}"
+            );
+            assert!(!output.contains("not logged"), "{output}");
+            assert!(state.pending.state.is_none());
+            assert!(state.pending.native_session.is_none());
+        }
     }
 
     #[tokio::test]
