@@ -2151,6 +2151,13 @@ const OMP_BOOKKEEPING: &[&str] = &[
     "credential_pin",
     "title",
 ];
+/// Observed OMP administrative records that are visible events, not conversation text.
+const OMP_ADMIN_ENTRIES: &[&str] = &[
+    "model_usage",
+    "title_change",
+    "session_init",
+    "ttsr_injection",
+];
 /// OpenCode parts that are known and deliberately not shown.
 const OPENCODE_HIDDEN_PARTS: &[&str] = &[
     "reasoning",
@@ -2490,26 +2497,15 @@ fn normalize_omp(
             // An extension's message; `display: false` marks it hidden in the harness itself.
             if value.get("display") != Some(&Value::Bool(false)) {
                 if driver == ExternalDriver::Omp {
-                    // The role is transport-level. Consumers derive sender provenance from the
-                    // native attribution and details, not from display text or guessed labels.
-                    let envelope = json!({
-                        "_tag": "OmpEvent",
-                        "version": 1,
-                        "kind": value.get("customType").unwrap_or(&Value::Null),
-                        "attribution": value.get("attribution").unwrap_or(&Value::Null),
-                        "content": bounded_value(value.get("content").cloned().unwrap_or(Value::Null)),
-                        "details": bounded_value(value.get("details").cloned().unwrap_or(Value::Null))
-                    });
-                    items.push(timeline_item(
+                    push_omp_event(
+                        items,
                         sequence,
                         &timestamp,
-                        "system",
-                        "content",
-                        json!({
-                            "media_type": "application/vnd.omp.event+json",
-                            "text": envelope.to_string()
-                        }),
-                    ));
+                        value.get("customType").unwrap_or(&Value::Null),
+                        value.get("attribution").unwrap_or(&Value::Null),
+                        value.get("content").unwrap_or(&Value::Null),
+                        value.get("details").unwrap_or(&Value::Null),
+                    );
                 } else {
                     push_omp_content(
                         driver,
@@ -2520,6 +2516,20 @@ fn normalize_omp(
                         "system",
                     );
                 }
+            }
+            return;
+        }
+        Some(kind) if driver == ExternalDriver::Omp && OMP_ADMIN_ENTRIES.contains(&kind) => {
+            if value.get("display") != Some(&Value::Bool(false)) {
+                push_omp_event(
+                    items,
+                    sequence,
+                    &timestamp,
+                    &value["type"],
+                    value.get("attribution").unwrap_or(&Value::Null),
+                    &Value::Null,
+                    value,
+                );
             }
             return;
         }
@@ -2587,6 +2597,37 @@ fn normalize_omp(
         &timestamp,
         role,
     );
+}
+
+fn push_omp_event(
+    items: &mut Vec<Value>,
+    sequence: u64,
+    timestamp: &str,
+    kind: &Value,
+    attribution: &Value,
+    content: &Value,
+    details: &Value,
+) {
+    // The role is transport-level. Consumers derive provenance and event classification from
+    // native fields, not display text. Bound fields before serialization to keep JSON valid.
+    let envelope = json!({
+        "_tag": "OmpEvent",
+        "version": 1,
+        "kind": kind,
+        "attribution": attribution,
+        "content": bounded_value(content.clone()),
+        "details": bounded_value(details.clone())
+    });
+    items.push(timeline_item(
+        sequence,
+        timestamp,
+        "system",
+        "content",
+        json!({
+            "media_type": "application/vnd.omp.event+json",
+            "text": envelope.to_string()
+        }),
+    ));
 }
 
 fn push_omp_content(
@@ -3519,6 +3560,66 @@ mod tests {
         let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
         assert_eq!(result["body"]["call_id"], "failed-call");
         assert_eq!(result["body"]["status"], "error");
+    }
+
+    #[test]
+    fn omp_observed_admin_records_are_typed_events_with_native_timestamps() {
+        // Native 2026-10-04 shapes; all payload strings and numeric usage are redacted.
+        for line in include_str!("../fixtures/omp-admin-events.jsonl").lines() {
+            let entry: Value = serde_json::from_str(line).unwrap();
+            let mut items = Vec::new();
+            normalize_native_line(ExternalDriver::Omp, &entry, 16, "fallback", &mut items);
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0]["role"], "system");
+            assert_eq!(items[0]["timestamp"], entry["timestamp"]);
+            assert_eq!(items[0]["body"]["media_type"], "application/vnd.omp.event+json");
+            let envelope: Value =
+                serde_json::from_str(items[0]["body"]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(envelope["_tag"], "OmpEvent");
+            assert_eq!(envelope["version"], 1);
+            assert_eq!(envelope["kind"], entry["type"]);
+            assert_eq!(envelope["attribution"], Value::Null);
+            assert_eq!(envelope["content"], Value::Null);
+            assert_eq!(envelope["details"], entry);
+
+            let mut hidden = entry.clone();
+            hidden["display"] = json!(false);
+            let mut hidden_items = Vec::new();
+            normalize_native_line(ExternalDriver::Omp, &hidden, 16, "", &mut hidden_items);
+            assert!(hidden_items.is_empty());
+
+            let mut pi_items = Vec::new();
+            normalize_native_line(ExternalDriver::Pi, &entry, 16, "", &mut pi_items);
+            assert_eq!(pi_items[0]["body"]["media_type"], "text/plain");
+        }
+    }
+
+    #[test]
+    fn omp_admin_events_do_not_make_hidden_bookkeeping_visible() {
+        for kind in ["session", "model_change", "custom", "credential_pin", "title"] {
+            let mut items = Vec::new();
+            normalize_native_line(
+                ExternalDriver::Omp,
+                &json!({"type":kind,"timestamp":"2026-10-01T00:00:00Z"}),
+                0,
+                "",
+                &mut items,
+            );
+            assert!(items.is_empty(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn omp_admin_event_missing_timestamp_uses_predecessor_timestamp() {
+        let mut items = Vec::new();
+        normalize_native_line(
+            ExternalDriver::Omp,
+            &json!({"type":"title_change","title":"fixture"}),
+            0,
+            "2026-10-01T00:00:00Z",
+            &mut items,
+        );
+        assert_eq!(items[0]["timestamp"], "2026-10-01T00:00:00Z");
     }
 
     #[test]

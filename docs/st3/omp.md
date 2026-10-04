@@ -70,6 +70,21 @@ The existing native-value byte bound applies separately to content and details; 
 fields become marked truncated text without corrupting the envelope's JSON.
 Pi's existing plain custom-message projection is unchanged.
 
+The observed administrative entry types `model_usage`, `title_change`, `session_init`, and
+`ttsr_injection` use the same envelope rather than an unrecognized-entry text fallback.
+Their `kind` is the native entry type, `content` is `null`, and `details` contains the bounded
+native record, including its IDs and timestamp. Native attribution is retained when present;
+otherwise it stays `null`. The timeline timestamp uses the same native/predecessor rule as
+conversation entries. `display: false` remains hidden.
+Existing bookkeeping (`session`, `model_change`, `custom`, `credential_pin`, and `title`)
+stays hidden; compaction still contributes its summary. This whitelist applies only to OMP:
+Pi and genuinely unknown entry types retain their existing behavior.
+
+`crates/st3/fixtures/omp-admin-events.jsonl` preserves one native shape per administrative kind
+from a session resumed on 2026-10-04. Native IDs and timestamps remain exact, but every payload
+string and numeric usage value is redacted. No bootstrap prompt, injected rule, task, model
+label, or tool name from that capture is published.
+
 `crates/st3/fixtures/omp-native-events.jsonl` contains a redacted 2026-10-01 OMP capture:
 the native tool call/result IDs and error flag, plus an incoming IRC event's envelope.
 Tool arguments, result text, sender name and incoming text are redacted; no credentials,
