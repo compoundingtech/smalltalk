@@ -1,6 +1,6 @@
 {
   "api_version": "st3.client.v0",
-  "request_id": "req/glass",
+  "request_id": "request/glass",
   "snapshot": {
     "id": "snapshot/host-a/1842/2fc9",
     "host_id": "host/host-a",

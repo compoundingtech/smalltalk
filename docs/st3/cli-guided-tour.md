@@ -66,6 +66,7 @@ st missions ls
 st missions show --help
 st missions show mission-run/64bcc9227e0166a571e09117d35c572e
 st missions publish --help
+st missions check --help
 st missions start --help
 st missions cancel --help
 st missions outcome --help
@@ -207,12 +208,18 @@ write paths:
 ```sh
 st conversations send --help
 st conversations reply --help
+st conversations status --help
 st conversations archive --help
 st conversations export --help
 ```
 
 Check role, ordering, partial/final state, tool calls and results, errors, token usage, reply
 threading, read/archive state, redaction, truncation, and pagination.
+
+Run one `send` twice: the second prints the same message ID, says on stderr that it was already
+sent, and sends nothing (`already_sent: true` and the first `sent_at` with `--json`). A send that
+times out prints its idempotency key and `st conversations status --idempotency-key KEY`, which
+answers `landed` with the message's delivery or `not landed`; running the same send again is safe.
 
 ### 7. `agents` and `machines` — who is doing what, where
 
@@ -477,6 +484,26 @@ st diagnostic --help
 
 This is agent-only and mutating, so the live human tour reviews help and the already automated
 failure tests rather than publishing a fake fault.
+
+### 18a. `gh` — a seat's watch on a GitHub issue or pull request
+
+Why: a seat that asked a question on GitHub, or opened a pull request, needs to hear the answer and
+the checks without polling. A watch wakes it once for each comment or review by anyone else, each
+time the required checks on the head turn pass or fail, and when the thread closes or merges.
+The watch survives stop/start, suspend/resume and daemon restarts; wakes wait as mail while the
+seat is stopped. Retirement or an explicit fresh conversation ends it silently, and the deadline
+sends a final wake. The shared observer keeps polling until the last watch ends.
+
+```sh
+st gh --help
+st gh watch --help
+st gh ls --all
+```
+
+`comment` posts as the seat and records the new comment's GitHub ID as its own, so the seat's
+watches skip it; `own URL` records one posted some other way. `watch`, `unwatch`, `comment` and
+`own` are agent-only and mutating, and they reach GitHub, so the live human tour reviews help and
+`ls --all`; the automated watch tests cover the rest.
 
 ### 19. `skill` — how an agent seat uses st
 

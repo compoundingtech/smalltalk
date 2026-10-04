@@ -8,11 +8,15 @@ public actor St3Client {
     public let baseURL: URL
     private let session: URLSession
     private var credential: String?
+    /// The app's name and build, sent as `x-st3-client` ("smalltalk-ios 1.0 (42)"). st lists it as
+    /// reported; it is never identity or authority.
+    private let client: String?
 
-    public init(fabricLoopbackURL: URL, credential: String? = nil, session: URLSession = .shared) {
+    public init(fabricLoopbackURL: URL, credential: String? = nil, session: URLSession = .shared, client: String? = nil) {
         self.baseURL = fabricLoopbackURL
         self.credential = credential
         self.session = session
+        self.client = client
     }
 
     public func setCredential(_ credential: String?) { self.credential = credential }
@@ -47,7 +51,7 @@ public actor St3Client {
         var components = URLComponents(url: baseURL.appending(path: "v1/client/conversations/\(Self.routedSessionID(sessionID))/stream"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"
         if let after { components.queryItems = [.init(name: "after", value: after)] }
-        var request = URLRequest(url: components.url!); request.setValue("st3.client.conversation.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        var request = URLRequest(url: components.url!); request.setValue("st3.client.conversation.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
         let task = session.webSocketTask(with: request)
         return AsyncThrowingStream { continuation in
             continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
@@ -79,7 +83,7 @@ public actor St3Client {
     public func glassesStream(subscriptionID: String = "glasses") -> AsyncThrowingStream<GlassCollectionFrame, Error> {
         var components = URLComponents(url: baseURL.appending(path: "v1/client/collections/stream"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"
-        var request = URLRequest(url: components.url!); request.setValue("st3.client.collections.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        var request = URLRequest(url: components.url!); request.setValue("st3.client.collections.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
         let task = session.webSocketTask(with: request)
         return AsyncThrowingStream { continuation in
             continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
@@ -118,9 +122,13 @@ public actor St3Client {
             if UInt64(whole.count) >= chunk.size { return whole }
         }
     }
+    public func hostRepositories(id: String) async throws -> Envelope<HostRepositories> { try await get("v1/client/hosts/\(id)/repositories") }
+    public func setsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("sets", cursor: cursor, limit: limit, history: history) }
+    public func setsGet(id: String) async throws -> Envelope<Resource> { try await resource("sets", id: id) }
     public func documentGet(name: String) async throws -> Envelope<DocumentContent> { try await get("v1/client/documents/content", query: [.init(name: "name", value: name)]) }
     public func subjectDefinition(subject: String, showEnvValues: Bool = false) async throws -> Envelope<SubjectDefinition> { try await get("v1/client/subject-definition", query: [.init(name: "subject", value: subject), .init(name: "show_env_values", value: showEnvValues ? "true" : "false")]) }
     public func usagePeriod(sinceMS: UInt64? = nil, untilMS: UInt64? = nil) async throws -> Envelope<UsagePeriod> { var query: [URLQueryItem] = []; if let sinceMS { query.append(.init(name: "since_ms", value: String(sinceMS))) }; if let untilMS { query.append(.init(name: "until_ms", value: String(untilMS))) }; return try await get("v1/client/usage", query: query) }
+    public func clientsList() async throws -> Envelope<ClientConnections> { try await get("v1/client/clients") }
     public func nowList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("now", cursor: cursor, limit: limit, history: history) }
     public func machinesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("machines", cursor: cursor, limit: limit, history: history) }
     public func devicesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("devices", cursor: cursor, limit: limit, history: history) }
@@ -137,6 +145,7 @@ public actor St3Client {
     public func missionsGet(id: String) async throws -> Envelope<Resource> { try await resource("missions", id: id) }
     public func workList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("work", cursor: cursor, limit: limit, history: history) }
     public func workGet(id: String) async throws -> Envelope<Resource> { try await resource("work", id: id) }
+    public func resourcesList(filters: ResourcesFilter = .init(), cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ResourcesPage> { var query: [URLQueryItem] = []; if let openedBy = filters.openedBy { query.append(.init(name: "opened_by", value: openedBy)) }; if let kind = filters.kind { query.append(.init(name: "kind", value: kind)) }; if let subjectPrefix = filters.subjectPrefix { query.append(.init(name: "subject_prefix", value: subjectPrefix)) }; if let cursor { query.append(.init(name: "cursor", value: cursor)) }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/resources", query: query) }
     public func agentsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("agents", cursor: cursor, limit: limit, history: history) }
     public func agentsGet(id: String) async throws -> Envelope<Resource> { try await resource("agents", id: id) }
     public func agentDeclarationGet(id: String, revision: String? = nil, showEnvValues: Bool = false) async throws -> Envelope<AgentDeclaration> { var query: [URLQueryItem] = [.init(name: "show_env_values", value: showEnvValues ? "true" : "false")]; if let revision { query.append(.init(name: "revision", value: revision)) }; return try await get("v1/client/agent-declarations/\(id)", query: query) }
@@ -222,7 +231,7 @@ public actor St3Client {
         var components = URLComponents(url: baseURL.appending(path: "v1/client/terminals/\(id.replacingOccurrences(of: "terminal/", with: ""))/stream"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"
         if let incarnation { components.queryItems = [.init(name: "incarnation", value: incarnation)] }
-        var request = URLRequest(url: components.url!); request.setValue("\(st3ClientTerminalSubprotocol), st3.cap.\(streamCapability)", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        var request = URLRequest(url: components.url!); request.setValue("\(st3ClientTerminalSubprotocol), st3.cap.\(streamCapability)", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
         let task = session.webSocketTask(with: request)
         return AsyncThrowingStream { continuation in
             continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
@@ -250,8 +259,10 @@ public actor St3Client {
     private func post<T: Decodable & Sendable, Body: Encodable>(_ path: String, _ body: Body) async throws -> T { try await request(path, query: [], method: "POST", body: try JSONEncoder().encode(body)) }
     private func request<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem], method: String, body: Data?, idempotencyKey: String? = nil, contentType: String = "application/json") async throws -> T {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!; let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")); components.percentEncodedPath = "/" + ([basePath, path].filter { !$0.isEmpty }.joined(separator: "/")); if !query.isEmpty { components.queryItems = query }
+        // Query parameters are decoded as form data by the server, where an unescaped "+" is a space.
+        components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         var request = URLRequest(url: components.url!); request.httpMethod = method; request.httpBody = body; request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if body != nil { request.setValue(contentType, forHTTPHeaderField: "Content-Type") }; if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        if body != nil { request.setValue(contentType, forHTTPHeaderField: "Content-Type") }; if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
         if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
         let (data, response) = try await session.data(for: request); let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if !(200..<300).contains(status) { throw try JSONDecoder().decode(ErrorEnvelope.self, from: data) }

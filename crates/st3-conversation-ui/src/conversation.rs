@@ -12,6 +12,7 @@ use crate::doc::{Doc, Target};
 use crate::style::{RULES, Token};
 use crate::theme::{self, Theme};
 use crate::{Body, Entry, ToolState};
+pub use crate::{Density, bundle_id, folds};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::cell::RefCell;
@@ -27,20 +28,6 @@ const COLLAPSED_TOOL_LINES: usize = RULES.tool.collapsed_rows;
 #[derive(Default)]
 pub struct Cache {
     entries: RefCell<HashMap<u64, Rc<Doc>>>,
-}
-
-/// How much of a conversation's tool work shows: every call with its output, or (simplified)
-/// each call on one line and a run of calls on one line.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Density {
-    #[default]
-    Full,
-    Simple,
-}
-
-/// The id that opens a run of tool calls starting at `first`, in the expanded set.
-pub fn bundle_id(first: &str) -> String {
-    format!("bundle:{first}")
 }
 
 impl Cache {
@@ -570,12 +557,14 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 on(fg(look.text, theme)),
                 theme,
             ) {
+                let alignment = line.alignment;
                 let mut spans = vec![Span::styled(bar.text.clone(), bar.style)];
                 spans.extend(line.spans.into_iter().map(|span| {
                     let style = on(span.style);
                     span.style(style)
                 }));
-                let line = Line::from(spans);
+                let mut line = Line::from(spans);
+                line.alignment = alignment;
                 rows.push(match tint {
                     Some(bg) => pad(line, inner, bg),
                     None => line,
@@ -637,13 +626,13 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 (Some(error), true) => (
                     rules.unconfirmed.color(theme),
                     format!(
-                        "you · unconfirmed, st did not answer ({error}) · r send again · x clear"
+                        "you · unconfirmed, st did not answer ({error}) · ctrl+r send again · backspace edit"
                     ),
                     fg(rules.unconfirmed, theme),
                 ),
                 (Some(error), false) => (
                     rules.failed.color(theme),
-                    format!("you · not sent: {error} · r retry · x clear"),
+                    format!("you · not sent: {error} · ctrl+r retry · backspace edit"),
                     fg(rules.failed, theme),
                 ),
             };
@@ -660,16 +649,20 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             ));
             for line in text::markdown(body, inner.saturating_sub(2), fg(rules.text, theme), theme)
             {
-                let mut spans = vec![Span::styled(bar.text.clone(), bar.style)];
-                spans.extend(line.spans);
-                doc.line(Line::from(spans));
+                doc.line(text::prefixed(
+                    vec![Span::styled(bar.text.clone(), bar.style)],
+                    line,
+                ));
             }
         }
         Body::Event(event) => {
-            let label = text::truncate(
-                &format!(" {} · {} ", text::sanitize(event), entry.at),
-                width.saturating_sub(1),
-            );
+            // A note with no time (where a session starts) says only itself.
+            let label = if entry.at.is_empty() {
+                format!(" {} ", text::sanitize(event))
+            } else {
+                format!(" {} · {} ", text::sanitize(event), entry.at)
+            };
+            let label = text::truncate(&label, width.saturating_sub(1));
             let side = width.saturating_sub(text::width(&label)) / 2;
             doc.line(Line::from(vec![
                 Span::styled("─".repeat(side.min(6)), fg(RULES.event.rule, theme)),
@@ -678,15 +671,6 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
         }
     }
     doc
-}
-
-/// Whether an entry folds until opened: tool calls, and mail the person is not part of.
-pub fn folds(body: &Body) -> bool {
-    match body {
-        Body::Tool { .. } => true,
-        Body::Mail { from, to, .. } => from != "you" && to != "you",
-        _ => false,
-    }
 }
 
 fn fg(token: Token, theme: &Theme) -> Style {
@@ -729,9 +713,7 @@ fn fold_control(
 }
 
 fn indent(line: Line<'static>) -> Line<'static> {
-    let mut spans = vec![Span::raw(" ")];
-    spans.extend(line.spans);
-    Line::from(spans)
+    text::prefixed(vec![Span::raw(" ")], line)
 }
 
 fn pad(line: Line<'static>, width: usize, bg: ratatui::style::Color) -> Line<'static> {

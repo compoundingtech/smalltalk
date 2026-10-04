@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use st3::client::Client;
 use st3::model::ClaimInput;
 
-const ST3: &str = env!("CARGO_BIN_EXE_st3");
+const ST3: &str = env!("CARGO_BIN_EXE_st3-fixture");
 const PERSON: &str = "person/fleet-tester";
 const NOTE: &str = "custom.fleet-test.note";
 
@@ -112,7 +112,7 @@ impl Node {
                 .map(|argument| (*argument).to_owned())
                 .collect(),
         );
-        let mut command = Command::new(&self.binary);
+        let mut command = st3::test_support::command(&self.binary);
         command
             .args(arguments)
             .current_dir(&self.root)
@@ -389,6 +389,10 @@ impl Node {
     }
 
     async fn note(&self, text: &str) -> String {
+        self.note_as(text, PERSON).await
+    }
+
+    async fn note_as(&self, text: &str, actor: &str) -> String {
         let claim: Value = self
             .client()
             .post(
@@ -396,7 +400,7 @@ impl Node {
                 &ClaimInput {
                     subject: format!("custom/fleet-test/{text}"),
                     kind: NOTE.into(),
-                    actor: Some(PERSON.into()),
+                    actor: Some(actor.into()),
                     fields: [("text".to_owned(), Value::String(text.into()))]
                         .into_iter()
                         .collect(),
@@ -515,6 +519,157 @@ async fn joined(root: &Path, sponsor: &Node, name: &str, extra: &[&str]) -> Node
     node
 }
 
+/// Re-publication and parent revisions must preserve the weekly occurrence, even after its
+/// child finishes. Put the next real weekly tick close enough to exercise it in this daemon.
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduled_occurrence_survives_parent_reapply_revision_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let mut node = Node::new(root.path(), "orchard");
+    node.start().await;
+    let child_file = node.root.join("child.kdl");
+    let mut revisions = Vec::new();
+    for label in ["apple", "pear"] {
+        let source = format!(
+            r#"version 2
+mission "harvest" state="ready" {{
+  completion {{ when "all-steps-exhausted" }}
+  goal "Harvest {label}."
+  step "done" {{ agentless }}
+}}"#
+        );
+        revisions.push(
+            st3::parse_intent(&source, "orchard").unwrap().missions["harvest"]
+                .revision
+                .clone(),
+        );
+        fs::write(&child_file, source).unwrap();
+        node.st_ok(&[
+            "missions",
+            "publish",
+            child_file.to_str().unwrap(),
+            "--as",
+            PERSON,
+        ]);
+    }
+    let next = chrono::Utc::now() + chrono::Duration::seconds(30);
+    let anchor =
+        (next - chrono::Duration::days(7)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let parent_file = node.root.join("parent.kdl");
+    let parent = |revision: &str| {
+        format!(
+            r#"version 2
+mission "orchard/weekly" state="ready" {{
+  goal "Maintain the orchard."
+  schedule "cycle" {{
+    host "orchard"
+    every "7d"
+    anchor "{anchor}"
+    catch-up "latest"
+    work {{ mission "harvest@{revision}"; workspace "{}" }}
+  }}
+  step "retire" {{
+    agentless
+    gate "retire" type="human" {{ reviewer "{PERSON}"; question "Retire the orchard?" }}
+  }}
+}}"#,
+            node.root.join("cycles").display()
+        )
+    };
+    fs::write(&parent_file, parent(&revisions[0])).unwrap();
+    node.st_ok(&[
+        "missions",
+        "publish",
+        parent_file.to_str().unwrap(),
+        "--as",
+        PERSON,
+    ]);
+    node.st_ok(&[
+        "missions",
+        "start",
+        "orchard/weekly",
+        "--id",
+        "orchard/weekly",
+        "--workspace",
+        node.root.to_str().unwrap(),
+        "--as",
+        PERSON,
+    ]);
+    wait_until("the first weekly child finishes", 15, || async {
+        node.claims().await.iter().any(|claim| {
+            claim["kind"] == "mission-run.state" && claim["body"]["fields"]["status"] == "completed"
+        })
+    })
+    .await;
+
+    for index in 0..4 {
+        fs::write(&parent_file, parent(&revisions[index % 2])).unwrap();
+        node.st_ok(&[
+            "missions",
+            "publish",
+            parent_file.to_str().unwrap(),
+            "--as",
+            PERSON,
+        ]);
+        if index > 0 {
+            node.st_ok(&[
+                "work",
+                "revise",
+                "mission-run/orchard/weekly",
+                parent_file.to_str().unwrap(),
+                "--reason",
+                "Select the next harvest revision",
+                "--as",
+                PERSON,
+            ]);
+        }
+        // Let the daemon reach a quiet pass, including any incorrectly admitted duplicate.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let claims = node.claims().await;
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| claim["kind"] == "schedule.work-started")
+                .count(),
+            1,
+            "parent publication/revision replayed the due weekly tick"
+        );
+    }
+    node.restart().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        node.claims()
+            .await
+            .iter()
+            .filter(|claim| claim["kind"] == "schedule.work-started")
+            .count(),
+        1,
+        "restart replayed the due weekly tick"
+    );
+    wait_until("the next genuine weekly tick starts", 35, || async {
+        node.claims()
+            .await
+            .iter()
+            .filter(|claim| claim["kind"] == "schedule.work-started")
+            .count()
+            >= 2
+    })
+    .await;
+    let claims = node.claims().await;
+    assert_eq!(
+        claims
+            .iter()
+            .filter(|claim| claim["kind"] == "schedule.work-started")
+            .count(),
+        2
+    );
+    let occurrences: Vec<_> = claims
+        .iter()
+        .filter(|claim| claim["kind"] == "schedule.occurrence-reached")
+        .map(|claim| claim["body"]["fields"]["occurrence"].as_u64().unwrap())
+        .collect();
+    assert_eq!(occurrences, vec![0, 1]);
+}
+
 /// A stopped origin's earlier running claims must not fence a seat placed on another host.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_seat_is_reachable_after_a_cross_host_move() {
@@ -604,6 +759,92 @@ fn authority_digest(node: &Node) -> String {
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_populated_standalone_daemon_founds_a_fleet_with_verified_person_and_agent_claims() {
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Node::new(root.path(), "studio");
+    a.start().await;
+    wait_until(
+        "the initial standalone checkpoint is sealed",
+        30,
+        || async {
+            a.claims()
+                .await
+                .iter()
+                .any(|claim| claim["kind"] == "checkpoint.sealed")
+        },
+    )
+    .await;
+    let agent = "agent/garden/worker";
+    let mut claims = vec![
+        a.note("person-before-founding").await,
+        a.note_as("agent-before-founding", agent).await,
+    ];
+    // No doctor, replication exchange or later checkpoint may seal the grants first.
+    let pending: u64 = rusqlite::Connection::open_with_flags(
+        a.state_dir().join("claims.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT COUNT(*) FROM claims WHERE kind='principal.key-granted'
+         AND NOT EXISTS (SELECT 1 FROM replica_envelopes WHERE batch_id=claims.batch_id)",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap();
+    assert!(
+        pending > 0,
+        "the regression needs unsealed delegation history"
+    );
+    a.stop();
+    a.create();
+    a.start().await;
+    claims.push(a.note("person-after-founding").await);
+    claims.push(a.note_as("agent-after-founding", agent).await);
+    a.restart().await;
+    claims.push(a.note_as("agent-after-another-restart", agent).await);
+    a.wait_listening().await;
+    let b = joined(root.path(), &a, "beacon", &[]).await;
+    b.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+    wait_until(
+        "the peer receives every person and agent claim",
+        60,
+        || async {
+            let received = b.claims().await;
+            claims
+                .iter()
+                .all(|id| received.iter().any(|claim| claim["id"] == id.as_str()))
+        },
+    )
+    .await;
+    for node in [&a, &b] {
+        let doctor = node.st_json(&["doctor"]);
+        let signatures = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "claim-signatures")
+            .unwrap();
+        assert_eq!(signatures["status"], "pass", "{}: {signatures}", node.name);
+        let connection = rusqlite::Connection::open_with_flags(
+            node.state_dir().join("claims.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        for id in &claims {
+            let (verdict, reason): (String, Option<String>) = connection
+                .query_row(
+                    "SELECT verdict, reason FROM claim_verdicts WHERE claim_id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(verdict, "verified", "{} claim {id}: {reason:?}", node.name);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1536,6 +1777,125 @@ async fn leave_drains_everything_before_it_leaves() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "orchard").await;
+    let b = joined(root.path(), &a, "meadow", &[]).await;
+    let mut c = joined(root.path(), &a, "grove", &[]).await;
+    c.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+    c.note("before-leave").await;
+    let before = BTreeSet::from(["custom/fleet-test/before-leave".to_owned()]);
+    wait_for_notes(&a, &before, 60, &[&a, &b, &c]).await;
+    wait_for_notes(&b, &before, 60, &[&a, &b, &c]).await;
+
+    c.st_ok(&[
+        "fleet",
+        "leave",
+        "--no-service",
+        "--wait",
+        "2m",
+        "--as",
+        PERSON,
+    ]);
+    c.restart().await;
+    // The same local store accepts writes after leaving; its old incarnation has ended.
+    c.note("after-leave-one").await;
+    c.note("after-leave-two").await;
+    c.stop();
+    c.name = "grove-returned".into();
+    fs::write(
+        c.root.join("config/st3/config.toml"),
+        format!("node = \"{}\"\nperson = \"{PERSON}\"\n", c.name),
+    )
+    .unwrap();
+    let code = a.invite(&c.name, &[]);
+    let joined = c.join(&code, &[]);
+    assert!(
+        joined.status.success(),
+        "rejoin failed: {}{}",
+        String::from_utf8_lossy(&joined.stdout),
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    c.start().await;
+    wait_until(
+        "both peers fence the old writer's post-leave envelopes",
+        90,
+        || async {
+            a.st_json(&["replication", "status"])["fenced_envelopes"]
+                .as_u64()
+                .is_some_and(|count| count >= 2)
+                && b.st_json(&["replication", "status"])["fenced_envelopes"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 2)
+        },
+    )
+    .await;
+    // Equal envelope inventories do not imply equal admitted claims. The old local history
+    // remains on the rejoining node; reporting must not delete it to manufacture equality.
+    let after = BTreeSet::from([
+        "custom/fleet-test/after-leave-one".to_owned(),
+        "custom/fleet-test/after-leave-two".to_owned(),
+    ]);
+    assert!(after.is_subset(&c.notes().await));
+    assert!(after.is_disjoint(&a.notes().await));
+    assert!(after.is_disjoint(&b.notes().await));
+    wait_until(
+        "rejoining node compares the common envelope inventory",
+        90,
+        || async {
+            let diff = c.st_json(&["replication", "diff", "orchard"]);
+            diff["authority"]["equal"] == true && diff["status"] == "up"
+        },
+    )
+    .await;
+    let diff = c.st_json(&["replication", "diff", "orchard"]);
+    let doctor = c.st(&["--json", "doctor"]);
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let admission = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "fleet-admission")
+        .unwrap();
+    let waited = c.st(&["fleet", "wait", "--timeout", "5s"]);
+    eprintln!(
+        "rejoin receipt: {}",
+        json!({
+            "diff": diff,
+            "admission": admission,
+            "wait_success": waited.status.success(),
+            "wait_stdout": String::from_utf8_lossy(&waited.stdout),
+            "wait_stderr": String::from_utf8_lossy(&waited.stderr),
+        })
+    );
+    assert_eq!(diff["graph"]["equal"], false, "{diff}");
+    assert!(
+        diff["differing_tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|table| table == "claim_sources"),
+        "{diff}"
+    );
+    assert!(
+        admission["message"]
+            .as_str()
+            .unwrap()
+            .contains("admitted beyond high water"),
+        "{admission}"
+    );
+    assert!(
+        !waited.status.success(),
+        "fleet wait accepted retained fenced history"
+    );
+    assert!(
+        String::from_utf8_lossy(&waited.stderr).contains("projects a different graph"),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_leave_already_refused_as_left_finishes_when_run_again() {
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
@@ -2002,6 +2362,11 @@ async fn an_old_build_config_peer_replicates_with_new_members() {
         wait_for_notes(node, &expected, 60, &[&o, &n1, &n2]).await;
     }
 
+    // The baseline predates the backup CLI. Export a private SQLite snapshot of its graph
+    // with the current envelope exporter, then restore the logical file at the current schema.
+    // This is also run by the existing exact fleet-compat CI invocation.
+    backup_baseline_graph(&o, root.path());
+
     // n1 and n2 move to membership while the old build keeps replicating with them.
     n1.stop();
     n1.migrate(&["--anchor"]);
@@ -2034,6 +2399,89 @@ async fn an_old_build_config_peer_replicates_with_new_members() {
         assert_eq!(status["unsigned_envelopes"], 0, "{}: {status}", node.name);
         assert_eq!(status["invalid_records"], 0, "{}: {status}", node.name);
     }
+}
+
+fn backup_baseline_graph(old: &Node, directory: &Path) {
+    let original = old.state_dir().join("claims.sqlite3");
+    let copy = directory.join("baseline-copy.db");
+    let reader = rusqlite::Connection::open_with_flags(
+        &original,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let old_schema: u32 = reader
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    reader
+        .execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+        .unwrap();
+    drop(reader);
+    // Capture the baseline's unchanged sync payloads before current code opens or migrates it.
+    let reader =
+        rusqlite::Connection::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let baseline_envelopes = reader
+        .prepare(
+            "SELECT writer,sequence,envelope_hash,previous_hash,accepted_at_unix_ms,payload
+         FROM replica_envelopes WHERE batch_id IS NOT NULL ORDER BY writer,sequence,envelope_hash",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok(st3::model::ReplicaEnvelope {
+                writer: row.get(0)?,
+                sequence: row.get(1)?,
+                hash: row.get(2)?,
+                previous_hash: row.get(3)?,
+                accepted_at_unix_ms: row.get::<_, String>(4)?.parse().unwrap(),
+                payload: row.get(5)?,
+                member_key: None,
+                signature: None,
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    drop(reader);
+    let archive = directory.join("baseline-claims.jsonl");
+    let header = st3::backup::create_from_database(&copy, &archive).unwrap();
+    let source = st3::store::Store::open(&copy, "backup-reader").unwrap();
+    let target = directory.join("baseline-restored.db");
+    let report = st3::backup::restore(&archive, &target).unwrap();
+    let restored = st3::store::Store::open(&target, &report.writer).unwrap();
+    assert!(old_schema <= header.source_schema);
+    assert_eq!(report.graph_digest, header.graph_digest);
+    assert!(report.projections_match);
+    let restored_envelopes = restored
+        .replica_envelopes(
+            baseline_envelopes
+                .iter()
+                .map(|envelope| st3::model::ReplicaEnvelopeId {
+                    writer: envelope.writer.clone(),
+                    sequence: envelope.sequence,
+                    hash: envelope.hash.clone(),
+                })
+                .collect(),
+        )
+        .unwrap();
+    assert!(!baseline_envelopes.is_empty());
+    assert_eq!(
+        serde_json::to_value(restored_envelopes).unwrap(),
+        serde_json::to_value(baseline_envelopes).unwrap()
+    );
+    assert_eq!(
+        source.replication_inventory().unwrap().digest,
+        restored.replication_inventory().unwrap().digest
+    );
+    assert_eq!(
+        source.backup_header().unwrap().tables,
+        restored.backup_header().unwrap().tables
+    );
+    assert!(
+        !restored
+            .claims_for("custom/fleet-test/o-0", None)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -2731,4 +3179,256 @@ async fn a_backlog_of_several_pages_is_fetched_without_waiting_for_the_quiet_win
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     eprintln!("caught up {:?} after returning", started.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts() {
+    let root = tempfile::tempdir().unwrap();
+    let mut amber = anchor(root.path(), "fixture-amber").await;
+    let mut cobalt = joined(root.path(), &amber, "fixture-cobalt", &[]).await;
+    amber.st_ok(&[
+        "claim",
+        "custom/fleet-test/coverage-before-restart",
+        NOTE,
+        "--actor",
+        PERSON,
+        "--field",
+        "text=durable",
+    ]);
+    cobalt.st_ok(&["fleet", "wait", "--timeout", "60s"]);
+    amber.restart().await;
+    cobalt.restart().await;
+    for node in [&amber, &cobalt] {
+        node.wait_listening().await;
+        if node.name != "fixture-amber" {
+            node.st_ok(&["fleet", "wait", "--timeout", "60s"]);
+        }
+        node.st_json(&["fleet", "status"]);
+        node.st_json(&["replication", "status"]);
+        node.st_json(&["replication", "invalid"]);
+    }
+    amber.st_json(&["replication", "diff", "fixture-cobalt"]);
+    cobalt.st_ok(&["fleet", "mode", "dial-out", "--no-service"]);
+    cobalt.restart().await;
+    assert!(
+        fs::read_to_string(cobalt.state_dir().join("fleet/fleet.toml"))
+            .unwrap()
+            .contains("dial-out")
+    );
+    let port = cobalt.port.to_string();
+    cobalt.st_ok(&[
+        "fleet",
+        "mode",
+        "listening",
+        "--port",
+        &port,
+        "--no-service",
+    ]);
+    cobalt.restart().await;
+    cobalt.wait_listening().await;
+    let code = amber.invite("fixture-revoked", &[]);
+    let invitations = amber.st_json(&["fleet", "invites"]);
+    let id = invitations
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|invite| invite["name"] == "fixture-revoked")
+        .unwrap()["invite"]
+        .as_str()
+        .unwrap();
+    amber.st_ok(&[
+        "fleet",
+        "invites",
+        "revoke",
+        id,
+        "--as",
+        PERSON,
+        "--reason",
+        "The fixture invitation is withdrawn.",
+    ]);
+    for _ in 0..2 {
+        amber.restart().await;
+        amber.wait_listening().await;
+        let refused = Node::new(root.path(), "fixture-revoked").join(&code, &[]);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("refused this code"));
+    }
+    amber.st_json(&["replication", "checkpoint", "plan", "--cut", "2026-10-01"]);
+    amber.st_json(&[
+        "replication",
+        "checkpoint",
+        "excuse",
+        "fixture-cobalt",
+        "--as",
+        PERSON,
+        "--reason",
+        "The fixture writer may be offline.",
+    ]);
+    amber.restart().await;
+    amber.st_json(&["replication", "checkpoint", "status"]);
+    amber.st_json(&[
+        "replication",
+        "checkpoint",
+        "resume",
+        "--as",
+        PERSON,
+        "--reason",
+        "The fixture projection was checked.",
+    ]);
+    amber.restart().await;
+    amber.wait_listening().await;
+    cobalt.st_ok(&[
+        "fleet",
+        "leave",
+        "--no-service",
+        "--wait",
+        "60s",
+        "--as",
+        PERSON,
+    ]);
+    cobalt.restart().await;
+    assert!(!cobalt.state_dir().join("fleet").exists());
+    let mut jade = joined(root.path(), &amber, "fixture-jade", &[]).await;
+    jade.st_ok(&["fleet", "wait", "--timeout", "60s"]);
+    amber.st_ok(&[
+        "fleet",
+        "remove",
+        "fixture-jade",
+        "--as",
+        PERSON,
+        "--reason",
+        "The fixture member is removed.",
+    ]);
+    amber.restart().await;
+    wait_until(
+        "jade records its removal after the sponsor restarted",
+        60,
+        || async {
+            fs::read_to_string(jade.state_dir().join("fleet/fleet.toml"))
+                .is_ok_and(|file| file.contains("[removed]"))
+        },
+    )
+    .await;
+    jade.restart().await;
+    assert_eq!(
+        jade.st_json(&["fleet", "status"])["removed"]["code"],
+        "member-removed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", http.local_addr().unwrap());
+    let posts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let posted_bodies = posts.clone();
+    let app = axum::Router::new().fallback(
+        axum::routing::get(|uri: axum::http::Uri| async move {
+            let issue = json!({"number": 12, "state": "open", "title": "Copper proof", "html_url": "https://example.org/copper", "updated_at": "2026-10-01T00:00:00Z", "user": {"login": "fixture-author"}});
+            let path = uri.path();
+            axum::Json(if path.ends_with("/issues/12") {
+                issue
+            } else if path.ends_with("/issues") {
+                json!([issue])
+            } else if path == "/user" {
+                json!({"login": "fixture-bot"})
+            } else if path.ends_with("/issues/comments/801") {
+                json!({"id": 801, "html_url": "https://github.com/fixture/app/issues/12#issuecomment-801", "user": {"login": "fixture-bot"}})
+            } else if path.ends_with("/pulls/12/reviews/802") {
+                json!({"id": 802, "html_url": "https://github.com/fixture/app/pull/12#pullrequestreview-802", "user": {"login": "fixture-bot"}})
+            } else if path.ends_with("/issues/comments/902") {
+                json!({"id": 902, "user": {"login": "fixture-other"}})
+            } else {
+                json!([])
+            })
+        }).post(move |uri: axum::http::Uri, axum::Json(body): axum::Json<Value>| {
+            let posts = posted_bodies.clone();
+            async move {
+                posts.lock().unwrap().push(body);
+                axum::Json(if uri.path().ends_with("/reviews") {
+                    json!({"id": 802, "html_url": "https://github.com/fixture/app/pull/12#pullrequestreview-802", "user": {"login": "fixture-bot"}})
+                } else {
+                    json!({"id": 801, "html_url": "https://github.com/fixture/app/issues/12#issuecomment-801", "user": {"login": "fixture-bot"}})
+                })
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(http, app).await.unwrap(); });
+    let mut node = Node::new(root.path(), "fixture-watch");
+    node.env.push(("GH_TOKEN".into(), "fixture-token".into()));
+    node.env.push(("ST3_GITHUB_API_URL".into(), api));
+    node.start().await;
+    let file = node.root.join("seat.kdl");
+    fs::write(&file, format!("version 2\nagent \"example/watch\" {{ host \"fixture-watch\"; workspace {:?}; command \"true\"; restart \"never\" }}\n", node.root)).unwrap();
+    node.st_ok(&["agents", "apply", file.to_str().unwrap(), "--as", PERSON]);
+    let cli = |args: &[&str]| -> Value {
+        let output = node.command(args).env("ST_AGENT", "agent/example/watch").output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stderr), node.logs());
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let first = cli(&["--json", "gh", "watch", "fixture/app#12", "--until", "1h", "--as", "agent/example/watch"]);
+    let subject = first["subject"].as_str().unwrap().to_owned();
+    assert_eq!(first["state"], "active");
+    let refused = node.command(&["--json", "gh", "comment", "fixture/app#12", "--body", "Foreign actor", "--as", "agent/example/other"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("agent/example/watch"));
+    assert!(posts.lock().unwrap().is_empty());
+    let posted = cli(&["--json", "gh", "comment", "fixture/app#12", "--body", "Copper proof", "--as", "agent/example/watch"]);
+    assert_eq!(posted["kind"], "comment");
+    assert_eq!(posted["id"], 801);
+    assert_eq!(posted["watch"]["subject"], subject);
+    node.restart().await;
+    let output = node.command(&["--json", "gh", "ls", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(listed.as_array().unwrap().iter().filter(|watch| watch["subject"] == subject).count(), 1);
+    let foreign_url = "https://github.com/fixture/app/issues/12#issuecomment-902";
+    let refused = node.command(&["--json", "gh", "own", foreign_url, "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("github-post-not-ours"));
+    node.restart().await;
+    for _ in 0..2 {
+        let output = node.command(&["--json", "gh", "own", "https://github.com/fixture/app/issues/12#issuecomment-801", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let owned: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(owned["id"], 801);
+        assert_eq!(owned["agent"], "agent/example/watch");
+        node.restart().await;
+    }
+    let review_file = node.root.join("review.txt");
+    fs::write(&review_file, "The Copper proof is ready.").unwrap();
+    let output = node.command(&["--json", "gh", "comment", "fixture/app#12", "--body-file", review_file.to_str().unwrap(), "--review", "approve", "--no-watch", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let review: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(review["kind"], "review");
+    assert_eq!(review["id"], 802);
+    node.restart().await;
+    let output = node.command(&["--json", "gh", "own", "https://github.com/fixture/app/pull/12#pullrequestreview-802", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let store = st3::store::Store::open(&node.state_dir().join("claims.sqlite3"), "fixture-watch").unwrap();
+    for (kind, id) in [("comment", 801), ("review", 802)] {
+        let subject = st3::github_watch::github_post_subject("fixture/app", kind, id);
+        assert_eq!(store.claims_for(&subject, Some("github.posted")).unwrap().len(), 1);
+        assert_eq!(store.github_post_agent("fixture/app", kind, id).unwrap().as_deref(), Some("agent/example/watch"));
+    }
+    assert_eq!(store.github_post_agent("fixture/app", "comment", 902).unwrap(), None);
+    drop(store);
+    {
+        let bodies = posts.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["body"], "Copper proof");
+        assert_eq!(bodies[1]["body"], "The Copper proof is ready.");
+        assert_eq!(bodies[1]["event"], "APPROVE");
+    }
+    for _ in 0..2 {
+        let output = node.command(&["--json", "gh", "unwatch", "fixture/app#12", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        node.restart().await;
+    }
+    let listed = node.st_json(&["gh", "ls", "--all", "--as", PERSON]);
+    let ended = listed.as_array().unwrap().iter().find(|watch| watch["subject"] == subject).unwrap();
+    assert_eq!(ended["state"], "ended");
+    assert_eq!(ended["ended"], "unwatched");
+    server.abort();
 }

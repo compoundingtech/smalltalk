@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -185,6 +185,70 @@ impl PtyRuntime {
         display_name: Option<&str>,
         tags: &BTreeMap<String, String>,
     ) -> Result<()> {
+        self.spawn_guarded(id, launch, cwd, env, display_name, tags, None, None)
+    }
+
+    /// Start a cutover only after its predecessor exited. A replay can reuse only the exact
+    /// operation's tagged replacement; an unrelated live incarnation is never adopted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_after(
+        &self,
+        id: &str,
+        launch: &Launch,
+        cwd: &Path,
+        env: &BTreeMap<String, String>,
+        display_name: Option<&str>,
+        tags: &BTreeMap<String, String>,
+        predecessor: &str,
+        operation: &str,
+    ) -> Result<()> {
+        self.spawn_guarded(
+            id,
+            launch,
+            cwd,
+            env,
+            display_name,
+            tags,
+            Some((predecessor, operation)),
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_after_checked(
+        &self,
+        id: &str,
+        launch: &Launch,
+        cwd: &Path,
+        env: &BTreeMap<String, String>,
+        display_name: Option<&str>,
+        tags: &BTreeMap<String, String>,
+        predecessor: &str,
+        operation: &str,
+        guard: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.spawn_guarded(
+            id,
+            launch,
+            cwd,
+            env,
+            display_name,
+            tags,
+            Some((predecessor, operation)),
+            Some(guard),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_guarded(
+        &self,
+        id: &str,
+        launch: &Launch,
+        cwd: &Path,
+        env: &BTreeMap<String, String>,
+        display_name: Option<&str>,
+        tags: &BTreeMap<String, String>,
+        cutover: Option<(&str, &str)>,
+        guard: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<()> {
         let _spawn_lock = self.acquire_spawn_lock(id)?;
         let fence = self.spawn_state_path(id, "pending");
         let mut before = self
@@ -202,13 +266,53 @@ impl PtyRuntime {
                 .into_iter()
                 .find(|observation| observation.name == id);
         }
+        if let Some((predecessor, operation)) = cutover
+            && let Some(observed) = before.as_ref() {
+                anyhow::ensure!(
+                    observed.status != "unknown",
+                    "rollout cannot spawn while the PTY identity is unknown"
+                );
+                if observation_is_live(observed) {
+                    anyhow::ensure!(
+                        observed.tags.get("st3.rollout").map(String::as_str) == Some(operation)
+                            && observation_incarnation(observed)
+                                .as_deref()
+                                .is_some_and(|inc| inc != predecessor),
+                        "rollout cannot adopt another live PTY incarnation"
+                    );
+                } else {
+                    let same = observation_incarnation(observed).as_deref() == Some(predecessor)
+                        || (observed.pid.is_none()
+                            && predecessor.split_once(':').is_some_and(|(_, created)| {
+                                observed.created_at.as_deref() == Some(created)
+                            }));
+                    anyhow::ensure!(same, "rollout predecessor changed before spawn");
+                }
+        }
         if before.as_ref().is_some_and(observation_is_live) {
             return Ok(());
+        }
+        // What the previous incarnation left running ends before its replacement starts. Each
+        // launch has a scope of its own, so this never reaches the replacement.
+        if let Err(error) = self.end_previous_scopes(id, before.as_ref()) {
+            eprintln!(
+                "st3: WARN what the last incarnation of {id} left running did not end: {error:#}"
+            );
+        }
+        let unit = crate::scope_unit("st3", id);
+        if crate::isolation_mode() == crate::Isolation::Scope {
+            // The session's record removes itself once its harness exits, so st keeps the name
+            // of the scope to end what the harness leaves behind.
+            let recorded = self.spawn_state_path(id, "scope");
+            std::fs::write(&recorded, &unit)
+                .with_context(|| format!("record PTY scope {}", recorded.display()))?;
+        }
+        if let Some(guard) = guard {
+            guard()?;
         }
         let previous_incarnation = before.as_ref().and_then(observation_incarnation);
         std::fs::write(&fence, previous_incarnation.as_deref().unwrap_or_default())
             .with_context(|| format!("write PTY publication fence {}", fence.display()))?;
-        let unit = crate::scope_unit("st3", id);
         let mut arguments = vec![
             OsString::from("run"),
             OsString::from("-d"),
@@ -234,6 +338,9 @@ impl PtyRuntime {
             ]);
         }
         let mut effective_tags = tags.clone();
+        if let Some((_, operation)) = cutover {
+            effective_tags.insert("st3.rollout".into(), operation.into());
+        }
         effective_tags.insert(
             "st3.isolation".into(),
             isolation_name(crate::isolation_mode()).into(),
@@ -272,7 +379,7 @@ impl PtyRuntime {
                 Ok(output) => output,
                 Err(error) => {
                     let _ = std::fs::remove_file(&fence);
-                    return Err(error.into());
+                    return Err(error);
                 }
             };
             if output.status.success() {
@@ -302,26 +409,10 @@ impl PtyRuntime {
     }
 
     fn acquire_spawn_lock(&self, id: &str) -> Result<File> {
-        let directory = self.spawn_state_directory();
-        std::fs::create_dir_all(&directory)
-            .with_context(|| format!("create PTY spawn-lock directory {}", directory.display()))?;
-        let path = self.spawn_state_path(id, "lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("open PTY spawn lock {}", path.display()))?;
         let deadline = Instant::now() + self.spawn_timeout;
         loop {
-            let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if result == 0 {
+            if let Some(lock) = self.try_spawn_lock(id)? {
                 return Ok(lock);
-            }
-            let error = std::io::Error::last_os_error();
-            if !matches!(error.raw_os_error(), Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN)
-            {
-                return Err(error).with_context(|| format!("lock PTY spawn {}", path.display()));
             }
             if Instant::now() >= deadline {
                 return Err(PtySpawnTimeout {
@@ -333,6 +424,30 @@ impl PtyRuntime {
             }
             std::thread::sleep(SPAWN_POLL_INTERVAL.min(self.spawn_timeout));
         }
+    }
+
+    /// The spawn lock of `id`, or none while another holder has it.
+    fn try_spawn_lock(&self, id: &str) -> Result<Option<File>> {
+        let directory = self.spawn_state_directory();
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("create PTY spawn-lock directory {}", directory.display()))?;
+        let path = self.spawn_state_path(id, "lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open PTY spawn lock {}", path.display()))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(lock));
+        }
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+        {
+            return Ok(None);
+        }
+        Err(error).with_context(|| format!("lock PTY spawn {}", path.display()))
     }
 
     fn spawn_state_path(&self, id: &str, extension: &str) -> PathBuf {
@@ -407,13 +522,29 @@ impl PtyRuntime {
                 }
                 error => anyhow::anyhow!("stop PTY failed: {error}"),
             })?;
+        // The server has exited, and pty has ended the process tree it measured before the
+        // signal. A process that had already left that tree, such as a build whose parent
+        // exited, or a process group started after the measurement, is still in the session's
+        // work scope, and ends with it.
+        if let Some(unit) = work_scope(&session) {
+            crate::end_scope(unit, crate::SCOPE_GRACE)?;
+        }
+        if stopped.verified_empty() {
+            return Ok(());
+        }
+        let running = |pids: &[i32]| {
+            pids.iter()
+                .copied()
+                .filter(|pid| u32::try_from(*pid).is_ok_and(process_runs))
+                .collect::<Vec<_>>()
+        };
+        let survived = running(&stopped.aftermath.survived);
+        let escalated = running(stopped.escalated.as_deref().unwrap_or_default());
+        let unknown = running(&stopped.aftermath.unknown);
         anyhow::ensure!(
-            stopped.verified_empty(),
-            "stop PTY failed: the daemon stopped, but processes {:?} survived, {:?} survived \
-             SIGKILL to their group, and {:?} could not be checked",
-            stopped.aftermath.survived,
-            stopped.escalated.as_deref().unwrap_or_default(),
-            stopped.aftermath.unknown,
+            survived.is_empty() && escalated.is_empty() && unknown.is_empty(),
+            "stop PTY failed: the daemon stopped, but processes {survived:?} survived, \
+             {escalated:?} survived SIGKILL to their group, and {unknown:?} could not be checked",
         );
         Ok(())
     }
@@ -423,7 +554,21 @@ impl PtyRuntime {
     }
 
     pub fn kill_if(&self, id: &str, expected_incarnation: Option<&str>) -> Result<()> {
-        self.signal_if(id, expected_incarnation, libc::SIGKILL)
+        let session = self.require_incarnation(id, expected_incarnation)?;
+        // Everything else the harness started ends with it, but the server leaves the work scope
+        // first: it outlives the harness to record the exit.
+        let unit = work_scope(&session).filter(|unit| {
+            server_apart(
+                id,
+                unit,
+                session.pid.and_then(|pid| u32::try_from(pid).ok()),
+            )
+        });
+        self.signal_if(id, expected_incarnation, libc::SIGKILL)?;
+        if let Some(unit) = unit {
+            crate::end_scope(unit, Duration::ZERO)?;
+        }
+        Ok(())
     }
 
     pub fn signal_if(
@@ -499,7 +644,92 @@ impl PtyRuntime {
         Ok(session)
     }
 
+    /// Ends what an ended session's harness left running in its work scope: a build whose parent
+    /// exited, a test in a process group of its own. It works after the session's record has
+    /// removed itself. A session whose harness still runs keeps everything; [`Self::stop_if`]
+    /// ends it.
+    pub fn end_leftovers(&self, id: &str) -> Result<()> {
+        // A launch under way ends its predecessor's scope itself, and its own is no leftover.
+        let Some(_lock) = self.try_spawn_lock(id)? else {
+            return Ok(());
+        };
+        let session = self
+            .sessions()?
+            .into_iter()
+            .find(|session| session.name == id)
+            .map(observation)
+            .transpose()?;
+        // A session the registry cannot rule out as running keeps its scope.
+        if session
+            .as_ref()
+            .is_some_and(|session| matches!(session.status.as_str(), "running" | "unknown"))
+        {
+            return Ok(());
+        }
+        self.end_previous_scopes(id, session.as_ref())
+    }
+
+    /// [`Self::end_leftovers`] on a background worker, when the last launch of `id` left a scope
+    /// to end. Otherwise it costs one file lookup.
+    pub fn end_leftovers_later(&self, id: &str) {
+        if !self.spawn_state_path(id, "scope").is_file() {
+            return;
+        }
+        let (runtime, id) = (self.clone(), id.to_owned());
+        crate::isolate::end_later(format!("pty {} {id}", self.root.display()), move || {
+            runtime
+                .end_leftovers(&id)
+                .with_context(|| format!("end what PTY `{id}` left running"))
+        });
+    }
+
+    /// Ends the work scopes of `id`'s last launch: the one spawn recorded and the one `ended`,
+    /// its session if the record is still there, names. Then it forgets the recorded one. The
+    /// caller holds the spawn lock.
+    fn end_previous_scopes(&self, id: &str, ended: Option<&PtyObservation>) -> Result<()> {
+        let recorded = self.spawn_state_path(id, "scope");
+        let mut units = BTreeSet::new();
+        match std::fs::read_to_string(&recorded) {
+            Ok(unit) => {
+                units.insert(unit.trim().to_owned());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read PTY scope {}", recorded.display()));
+            }
+        }
+        units.extend(
+            ended
+                .and_then(|session| session.tags.get("st3.scope-unit"))
+                .cloned(),
+        );
+        // A server that wrote its exit record can still be shutting down.
+        let server = ended.and_then(|session| session.pid);
+        let mut done = true;
+        for unit in &units {
+            if server_apart(id, unit, server) {
+                crate::end_scope(unit, crate::SCOPE_GRACE)?;
+            } else {
+                done = false;
+            }
+        }
+        if done {
+            match std::fs::remove_file(&recorded) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("forget PTY scope {}", recorded.display()));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn remove(&self, id: &str) -> Result<()> {
+        // The record is the last place that names the session's work scope.
+        self.end_leftovers(id)?;
         pty_client::remove_in(&self.root, id)
             .map_err(|error| anyhow::anyhow!("remove PTY failed: {error}"))
     }
@@ -637,6 +867,41 @@ fn observation_incarnation(observation: &PtyObservation) -> Option<String> {
         (Some(pid), Some(created_at)) => Some(format!("{pid}:{created_at}")),
         _ => None,
     }
+}
+
+/// The work scope st started `session` in.
+fn work_scope(session: &SessionInfo) -> Option<&str> {
+    session
+        .metadata
+        .as_ref()?
+        .tags
+        .as_ref()?
+        .get("st3.scope-unit")
+        .map(String::as_str)
+}
+
+/// Whether the PTY server `server` of `id`, if it still runs, is outside the work scope `unit`,
+/// moving it out first. Ending the scope then leaves the server, which answers attaches and
+/// records the exit.
+fn server_apart(id: &str, unit: &str, server: Option<u32>) -> bool {
+    server
+        .filter(|pid| process_runs(*pid))
+        .is_none_or(|server| crate::priority::keep_server_apart(id, server, unit))
+}
+
+/// Whether `pid` names a process that has not exited. A zombie has exited.
+fn process_runs(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        return std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, tail)| !tail.starts_with('Z'))
+        });
+    }
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn observation_is_live(observation: &PtyObservation) -> bool {
@@ -778,6 +1043,64 @@ exit 0
     /// A live session's pid file, naming `pid` as its daemon.
     fn write_pid(registry: &Path, name: &str, pid: u32) {
         fs::write(registry.join(format!("{name}.pid")), pid.to_string()).unwrap();
+    }
+
+    #[test]
+    fn rollout_spawn_refuses_an_unrelated_live_incarnation_and_reuses_only_its_own_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        let binary = fake_pty(root.path(), "rollout-pty", "  publish replacement");
+        let runtime = PtyRuntime::new(registry.clone()).with_binary(binary.to_string_lossy());
+        for marker in ["someone-else", "cutover-one"] {
+            write_record(
+                &registry,
+                "work",
+                serde_json::json!({"createdAt":"replacement","tags":{"st3.rollout":marker}}),
+            );
+            write_pid(&registry, "work", std::process::id());
+            fs::write(registry.join("work.sock"), "").unwrap();
+            let result = runtime.spawn_after(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+                "42:original",
+                "cutover-one",
+            );
+            assert_eq!(result.is_ok(), marker == "cutover-one");
+            assert!(
+                !binary.with_extension("args").exists(),
+                "a replay must not execute a second spawn"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_spawn_rechecks_its_source_guard_inside_the_spawn_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(root.path(), "rollout-source", "  publish replacement");
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        let refusal = runtime.spawn_after_checked(
+            "work",
+            &Launch::Argv(vec!["true".into()]),
+            root.path(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+            "42:original",
+            "cutover-one",
+            &|| anyhow::bail!("source superseded"),
+        );
+        assert!(
+            refusal
+                .unwrap_err()
+                .to_string()
+                .contains("source superseded")
+        );
+        assert!(!binary.with_extension("args").exists());
     }
 
     /// A daemon socket for `name` that answers STATUS with `status` and PEEK with `screen`, and
@@ -1430,5 +1753,218 @@ exit 0
 
         assert_server_left_its_harness(&runtime, "protect-old", harness);
         runtime.stop("protect-old").unwrap();
+    }
+
+    /// A harness that writes its pid to `harness`, starts a process in a session of its own whose
+    /// parent exits at once, waits for that process to write its pid to `orphan`, then runs
+    /// `then`. The process has left the harness's process tree and process groups, the way a
+    /// tool's background build does.
+    fn orphaning_harness(harness: &Path, orphan: &Path, then: &str) -> Launch {
+        let orphan = orphan.display();
+        Launch::Argv(vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "echo $$ > '{}'; (setsid sh -c 'echo $$ > \"{orphan}\"; exec sleep 600' &); \
+                 while [ ! -s '{orphan}' ]; do sleep 0.02; done; {then}",
+                harness.display(),
+            ),
+        ])
+    }
+
+    fn assert_gone_soon(pid: u32, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_runs(pid) {
+            if Instant::now() >= deadline {
+                // Leave nothing behind for the next run.
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                panic!("{what} {pid} outlived its session");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A session a test started. Dropping it stops what still runs, so a failing test leaves
+    /// nothing behind.
+    struct Started {
+        runtime: PtyRuntime,
+        id: String,
+        root: tempfile::TempDir,
+        harness: u32,
+        orphan: u32,
+    }
+
+    impl Drop for Started {
+        fn drop(&mut self) {
+            let _ = self.runtime.stop(&self.id);
+            let _ = self.runtime.end_leftovers(&self.id);
+        }
+    }
+
+    impl Started {
+        /// Starts `id` with an [`orphaning_harness`] and `tags`.
+        fn orphaning(pty: &Path, id: &str, then: &str, tags: &[(&str, &str)]) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = PtyRuntime::new(root.path().join("r")).with_binary(pty.to_string_lossy());
+            let (harness, orphan) = (
+                root.path().join("harness.pid"),
+                root.path().join("orphan.pid"),
+            );
+            let mut started = Self {
+                runtime,
+                id: id.into(),
+                root,
+                harness: 0,
+                orphan: 0,
+            };
+            started.spawn(&orphaning_harness(&harness, &orphan, then), tags);
+            started.harness = read_pid(&harness);
+            started.orphan = read_pid(&orphan);
+            assert!(process_runs(started.orphan));
+            assert!(cgroup_leaf(started.orphan).starts_with(&format!("st3-{id}-")));
+            started
+        }
+
+        fn spawn(&self, launch: &Launch, tags: &[(&str, &str)]) {
+            let environment = BTreeMap::from([("PATH".into(), std::env::var("PATH").unwrap())]);
+            let tags = tags
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect();
+            self.runtime
+                .spawn(
+                    &self.id,
+                    launch,
+                    self.root.path(),
+                    &environment,
+                    None,
+                    &tags,
+                )
+                .unwrap();
+        }
+
+        fn observe(&self) -> Option<PtyObservation> {
+            self.runtime
+                .snapshot()
+                .unwrap()
+                .into_iter()
+                .find(|observation| observation.name == self.id)
+        }
+
+        fn incarnation(&self) -> String {
+            observation_incarnation(&self.observe().unwrap()).unwrap()
+        }
+
+        /// Waits until the session's server has exited. Unless the session is tagged
+        /// `keep=true`, its record has removed itself by then.
+        fn wait_until_ended(&self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let observation = self.observe();
+                if observation.as_ref().is_none_or(|observation| {
+                    observation.status != "running" && !observation.pid.is_some_and(process_runs)
+                }) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "PTY `{}` kept running: {observation:?}",
+                    self.id
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[test]
+    fn stopping_a_session_ends_what_its_harness_left_running() {
+        let Some(pty) = scoped_pty() else {
+            eprintln!("skipped: no systemd user scopes or no pty binary");
+            return;
+        };
+        let session = Started::orphaning(&pty, "tree-stop", "exec sleep 600", &[]);
+
+        session
+            .runtime
+            .stop_if(&session.id, Some(&session.incarnation()))
+            .unwrap();
+
+        assert_gone_soon(session.harness, "harness");
+        assert_gone_soon(session.orphan, "the harness's background process");
+    }
+
+    #[test]
+    fn killing_a_session_ends_what_its_harness_left_running() {
+        let Some(pty) = scoped_pty() else {
+            eprintln!("skipped: no systemd user scopes or no pty binary");
+            return;
+        };
+        let session = Started::orphaning(&pty, "tree-kill", "exec sleep 600", &[]);
+
+        session
+            .runtime
+            .kill_if(&session.id, Some(&session.incarnation()))
+            .unwrap();
+
+        assert_gone_soon(session.harness, "harness");
+        assert_gone_soon(session.orphan, "the harness's background process");
+        session.wait_until_ended();
+    }
+
+    #[test]
+    fn an_ended_session_ends_what_its_harness_left_running() {
+        let Some(pty) = scoped_pty() else {
+            eprintln!("skipped: no systemd user scopes or no pty binary");
+            return;
+        };
+        let session = Started::orphaning(&pty, "tree-ended", "exit 0", &[]);
+        session.wait_until_ended();
+
+        // The reconciler asks this on each pass in which a stopped runtime is not running.
+        session.runtime.end_leftovers_later(&session.id);
+
+        assert_gone_soon(session.orphan, "the ended harness's background process");
+    }
+
+    #[test]
+    fn removing_an_ended_session_ends_what_its_harness_left_running() {
+        let Some(pty) = scoped_pty() else {
+            eprintln!("skipped: no systemd user scopes or no pty binary");
+            return;
+        };
+        let session = Started::orphaning(&pty, "tree-remove", "exit 0", &[("keep", "true")]);
+        session.wait_until_ended();
+
+        session.runtime.remove(&session.id).unwrap();
+
+        assert_gone_soon(session.orphan, "the ended harness's background process");
+    }
+
+    #[test]
+    fn an_ended_sessions_leftovers_end_and_its_replacement_keeps_running() {
+        let Some(pty) = scoped_pty() else {
+            eprintln!("skipped: no systemd user scopes or no pty binary");
+            return;
+        };
+        let session = Started::orphaning(&pty, "tree-replace", "exit 0", &[]);
+        let ended_unit = cgroup_leaf(session.orphan);
+        session.wait_until_ended();
+
+        let pid_file = session.root.path().join("replacement.pid");
+        session.spawn(&waiting_harness(&pid_file), &[]);
+        let replacement = read_pid(&pid_file);
+
+        assert_gone_soon(session.orphan, "the ended harness's background process");
+        // Each launch has a scope of its own. Ending the ended one again, as a reconcile pass
+        // that looked before the replacement started does, leaves the replacement.
+        let replacement_unit = session.observe().unwrap().tags["st3.scope-unit"].clone();
+        assert_eq!(cgroup_leaf(replacement), replacement_unit);
+        assert_ne!(replacement_unit, ended_unit);
+        assert!(crate::end_scope(&ended_unit, crate::SCOPE_GRACE).unwrap());
+        session.runtime.end_leftovers(&session.id).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(process_runs(replacement), "the replacement ended");
+        session.runtime.stop(&session.id).unwrap();
+        assert_gone_soon(replacement, "replacement harness");
     }
 }

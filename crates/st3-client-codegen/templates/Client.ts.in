@@ -2,9 +2,10 @@
 import { API_VERSION } from './Models.generated';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
-    SubjectDefinition, UsagePeriod,
+    ResourcesFilter, ResourcesPage,
+    SubjectDefinition, UsagePeriod, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
-    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelineEntry, TimelinePage,
+    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated';
 
 export type PageOptions = { cursor?: string; limit?: number };
@@ -14,6 +15,9 @@ export type ClientOptions = {
     baseUrl: string;
     credential?: () => string | undefined | Promise<string | undefined>;
     fetchImpl?: typeof fetch;
+    /** The app's name and build, sent as `x-st3-client` ("smalltalk-ios 1.0 (42)"). st lists it as
+     * reported (clients.list); it is never identity or authority. */
+    client?: string;
 };
 
 export const TERMINAL_SUBPROTOCOL = 'st3.client.terminal.v0';
@@ -41,20 +45,8 @@ export type TerminalStreamOptions = {
 };
 export type TerminalStream = { close(): void };
 
-/** The bounded current collections one socket can hold windows of. */
-export type CollectionName = 'missions' | 'attention' | 'agents' | 'work' | 'glasses';
 /** `person` applies to attention, `actor` to work, and `status` to agents. */
-export type CollectionFilters = { person?: string; actor?: string; status?: string };
-/** One frame from the collections socket. `snapshot` and `changes` describe a window,
- * `screen` a followed terminal, and `conversation` a followed conversation. `resync` asks for
- * that subscription again (`code` and `message` say why, when a temporary failure caused it); `error` ends the subscription it names. */
-export type CollectionFrame =
-    | { kind: 'snapshot'; id: string; collection: CollectionName; snapshot: Snapshot; items: Resource[]; order: string[]; has_more: boolean }
-    | { kind: 'changes'; id: string; collection: CollectionName; snapshot: Snapshot; upserts: Resource[]; removes: string[]; order: string[]; has_more: boolean }
-    | { kind: 'screen'; id: string; collection: 'terminal'; snapshot: Snapshot; value: TerminalScreen }
-    | { kind: 'conversation'; id: string; collection: 'conversation'; session_id: string; replace: boolean; items: TimelineEntry[]; has_more?: boolean }
-    | { kind: 'resync'; id: string; code?: string; message?: string }
-    | { kind: 'error'; id?: string; collection?: string; code?: string; message: string };
+export type CollectionFilters = { person?: string | null; actor?: string | null; status?: string | null };
 /** The WebSocket surface the collections socket uses: a terminal socket that also sends. */
 export type CollectionSocket = TerminalSocket & {
     onopen: (() => void) | null;
@@ -73,7 +65,7 @@ export type CollectionStream = {
     subscribeGlasses(id: string): void;
     subscribe(id: string, collection: CollectionName, limit?: number, filters?: CollectionFilters): void;
     /** Follow a terminal with the incarnation and single-use capability `terminal.attach` returned. */
-    subscribeTerminal(id: string, terminal: string, incarnation: string, capability: string): void;
+    subscribeTerminal(id: string, terminal: string, incarnation: string | null | undefined, capability: string): void;
     /** Follow the conversation of an agent or a session. */
     subscribeConversation(id: string, conversation: string): void;
     unsubscribe(id: string): void;
@@ -129,12 +121,14 @@ function bounded(value: number | undefined, maximum: number, name: string): void
 export class St3Client {
     private readonly baseUrl: string;
     private readonly credential?: ClientOptions['credential'];
+    private readonly client?: string;
     private readonly fetchImpl: typeof fetch;
     private discovered?: EnvelopeOf<Capabilities>;
 
     constructor(options: ClientOptions) {
         this.baseUrl = options.baseUrl.replace(/\/+$/, '');
         this.credential = options.credential;
+        this.client = options.client;
         this.fetchImpl = options.fetchImpl ?? fetch;
     }
 
@@ -153,6 +147,7 @@ export class St3Client {
         const headers: Record<string, string> = { Accept: 'application/json' };
         if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
         if (credential) headers.Authorization = `Bearer ${credential}`;
+        if (this.client) headers['x-st3-client'] = this.client;
         if (body !== undefined) headers['Content-Type'] = raw?.contentType ?? 'application/json';
         const response = await this.fetchImpl(this.baseUrl + path, {
             method, headers, body: body === undefined ? undefined : raw ? (body as BodyInit) : JSON.stringify(body),
@@ -251,6 +246,7 @@ export class St3Client {
         if (options.incarnation) url.searchParams.set('incarnation', options.incarnation);
         const headers: Record<string, string> = {};
         if (credential) headers.Authorization = `Bearer ${credential}`;
+        if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [TERMINAL_SUBPROTOCOL, `st3.cap.${options.streamCapability}`], headers);
         let ended = false;
         const stop = () => { ended = true; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
@@ -277,6 +273,7 @@ export class St3Client {
         if (options.after) url.searchParams.set('after', options.after);
         const headers: Record<string, string> = {};
         if (credential) headers.Authorization = `Bearer ${credential}`;
+        if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [CONVERSATION_SUBPROTOCOL], headers);
         let ended = false;
         const end = (error?: Error) => { if (ended) return; ended = true; socket.onmessage = null; socket.onclose = null; socket.onerror = null; options.onEnd?.(error); };
@@ -301,6 +298,7 @@ export class St3Client {
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         const headers: Record<string, string> = {};
         if (credential) headers.Authorization = `Bearer ${credential}`;
+        if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? (defaultTerminalSocket as unknown as CollectionSocketFactory))(url.toString(), [COLLECTIONS_SUBPROTOCOL], headers);
         let ended = false, open = false;
         const waiting: string[] = [];

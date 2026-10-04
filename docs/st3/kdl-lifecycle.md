@@ -10,6 +10,10 @@ Every purpose-specific route that applies KDL is an atomic upsert. The daemon fi
 
 Omission has no effect. Removing a declaration from a later file does not stop or delete its existing graph state. Retirement, cancellation, and refresh are explicit declarations.
 
+An explicit [owned set](owned-sets.md), published with `st apply --set NAME`, gives one publisher
+responsibility for a complete membership list. Its successful publication retires omitted members
+with source and revision fences, and requires confirmation for mass retirement.
+
 The removed wrapper keyword is an error. There is no compatibility form.
 
 `st missions publish FILE --as ACTOR` previews and publishes exact authored mission KDL. A person
@@ -160,7 +164,9 @@ work and generations without changing the seat's identity.
 
 `st agents start EXISTING --as person/NAME` keeps the seat's declaration. Only fields explicitly
 passed through `--host`, `--workspace`, `--harness`, `--model`, `--effort`, or `--arg` are changed;
-unspecified restart, launch, environment, and other settings remain intact. A placement override
+unspecified restart, launch, environment, and other settings remain intact. A running seat whose
+workspace, harness, model, effort or arguments change this way restarts on the new declaration and
+continues its harness's last native session. A placement override
 does not rename an existing seat: pass its complete subject when moving it to another host.
 `--model`, `--effort`, and `--arg` require a typed `harness` block and are refused for
 `command`/`argv` declarations. `--harness` alone can explicitly switch the launch style.
@@ -419,7 +425,13 @@ st attention approve step-run/RELEASE_GENERATION/deploy \
 `st attention ls --as person/operator` lists the current person-owned inbox, including pending KDL
 human gates. Human authority is required and never inferred from an environment variable.
 
-The decision target is the mission run or step run that owns the gate. The command binds the decision to the exact current request.
+The decision target is the gate's `attention/...` ID that `st attention ls` prints, or the mission
+run, step run or loop run (`loop-run/GENERATION/PATH`, for a loop's `until` or `on-exhausted`
+gate) that owns it. The command binds the decision to the exact current request. A target that
+names no gate is refused with `review-target-unknown`. A gate with nothing pending is refused
+with `review-not-requested`, which says why: who already answered it and how, or what moved on
+since it was asked (a new attempt, revision or generation, or a finished step or run). A card ID
+the gate has replaced names the card that asks now.
 
 Human gates default to `mode="approve"`: `st attention approve` passes the gate and
 `st attention reject --reason TEXT` fails it with the reviewer's reason. A worker-owned step

@@ -7,7 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 
+/// What the built-in `merged` and `ci-passed` gates read from GitHub.
+pub mod github_gates;
 mod github_repository;
+pub(crate) use github_repository::{RECENT_COMMENTS, merge_recent_comments, recent_comment_key};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -30,6 +33,10 @@ pub struct ProviderObservation {
     pub cursor: Option<String>,
     pub next_check_unix_ms: u128,
 }
+
+/// A provider that asks to be polled again within this many milliseconds continues work it could
+/// not finish in one poll, so an observer's declared interval does not delay it.
+pub const PROVIDER_CONTINUE_MS: u128 = 1_000;
 
 /// GitHub refused a request until a known time: a primary or secondary rate limit. It clears
 /// on its own at `retry_at_unix_ms`.
@@ -201,6 +208,21 @@ const GITHUB_REQUEST_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(60)
 };
 
+/// Where the daemon reaches GitHub's API: `https://api.github.com`, or `ST3_GITHUB_API_URL` when
+/// the daemon's environment names another, such as a test's.
+pub(crate) fn github_api_base() -> String {
+    std::env::var("ST3_GITHUB_API_URL")
+        .ok()
+        .map(|base| base.trim().trim_end_matches('/').to_owned())
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_owned())
+}
+
+/// The HTTP client every GitHub request of this daemon shares.
+pub(crate) fn github_api_client() -> reqwest::Client {
+    github_client()
+}
+
 fn github_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
@@ -271,18 +293,24 @@ fn parse_github_ref_locator(locator: &str) -> Result<GithubRefLocator> {
 }
 
 async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObservation> {
+    let token = github_token().await?;
+    observe_github_ref_at(request, &github_api_base(), &token).await
+}
+
+async fn observe_github_ref_at(request: ObservationRequest, api: &str, token: &str) -> Result<ProviderObservation> {
     let cache_for = github_cache_for(&request);
     let locator = parse_github_ref_locator(&request.locator)?;
     let client = github_client();
-    let token = github_token().await?;
     let base = format!(
-        "https://api.github.com/repos/{}/{}",
-        locator.owner, locator.repository
+        "{}/repos/{}/{}",
+        api.trim_end_matches('/'),
+        locator.owner,
+        locator.repository
     );
     let branch = github_json(
         &client,
         format!("{base}/branches/{}", urlencoding::encode(&locator.name)),
-        &token,
+        token,
         cache_for,
     )
     .await?
@@ -301,7 +329,7 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
                 github_json(
                     &client,
                     format!("{base}/branches?per_page=100&page={page}"),
-                    &token,
+                    token,
                     cache_for,
                 )
                 .await?
@@ -325,7 +353,7 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
                     let comparison = github_json(
                         &client,
                         format!("{base}/compare/{candidate_head}...{head}"),
-                        &token,
+                        token,
                         cache_for,
                     )
                     .await?
@@ -357,7 +385,7 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
     Ok(ProviderObservation {
         facts,
         cursor,
-        next_check_unix_ms: now.saturating_add(300_000),
+        next_check_unix_ms: now.saturating_add(u128::from(request.every_ms.unwrap_or(300_000))),
     })
 }
 
@@ -387,7 +415,7 @@ fn normalize_github_ref(
 
 async fn observe_github_repository(request: ObservationRequest) -> Result<ProviderObservation> {
     let token = github_token().await?;
-    observe_github_repository_at(request, "https://api.github.com", Some(&token)).await
+    observe_github_repository_at(request, &github_api_base(), Some(&token)).await
 }
 
 async fn observe_github_repository_at(
@@ -426,6 +454,8 @@ fn github_next_page(link: &str) -> Option<String> {
             })
     })
 }
+
+pub const GITHUB_REF_WATCH_MS: u64 = 30_000;
 
 const GITHUB_CACHE_FOR: Duration = Duration::from_secs(300);
 
@@ -1045,7 +1075,7 @@ fn observe_local_file(request: ObservationRequest) -> Result<ProviderObservation
 
 async fn observe_github_pull_request(request: ObservationRequest) -> Result<ProviderObservation> {
     let token = github_token().await?;
-    observe_github_pull_request_at(request, "https://api.github.com", Some(&token)).await
+    observe_github_pull_request_at(request, &github_api_base(), Some(&token)).await
 }
 
 async fn observe_github_pull_request_at(
@@ -1381,6 +1411,45 @@ mod tests {
         .expect("the request did not time out");
         assert!(observed.is_err());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn watched_ref_conditional_reads_keep_the_304_facts_and_detect_the_next_head() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, etag, body) in [
+                ("200 OK", "head-one", r#"{"commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#),
+                ("304 Not Modified", "head-one", ""),
+                ("200 OK", "head-two", r#"{"commit":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 1024]; let size = stream.read(&mut chunk).await.unwrap();
+                    request.extend_from_slice(&chunk[..size]);
+                    if size == 0 || request.windows(4).any(|bytes| bytes == b"\r\n\r\n") { break; }
+                }
+                requests.push(String::from_utf8(request).unwrap().to_lowercase());
+                stream.write_all(format!("HTTP/1.1 {status}\r\nETag: \"{etag}\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let request = || ObservationRequest { provider:"github.ref".into(), locator:"acme/garden@main".into(), fields:BTreeSet::from(["head".into()]),
+            cursor:None, previous_facts:None, every_ms:Some(GITHUB_REF_WATCH_MS), refresh:true };
+        let first = observe_github_ref_at(request(), &base, "fixture-token").await.unwrap();
+        let unchanged = observe_github_ref_at(request(), &base, "fixture-token").await.unwrap();
+        let changed = observe_github_ref_at(request(), &base, "fixture-token").await.unwrap();
+        assert_eq!(first.facts, unchanged.facts); assert_eq!(first.cursor, unchanged.cursor);
+        assert_ne!(changed.cursor, unchanged.cursor);
+        assert_eq!(changed.facts["head"], "b".repeat(40));
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        assert!(changed.next_check_unix_ms <= now + u128::from(GITHUB_REF_WATCH_MS));
+        let requests = server.await.unwrap();
+        assert!(!requests[0].contains("if-none-match"));
+        assert!(requests[1].contains("if-none-match: \"head-one\""));
+        assert!(requests[2].contains("if-none-match: \"head-one\""));
     }
 
     #[tokio::test]

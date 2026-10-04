@@ -1,4 +1,5 @@
 {
+  "x-st-integers": "json-safe",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://st3.local/schemas/client-v0.schema.json",
   "title": "st3 client v0",
@@ -13,23 +14,47 @@
     "ConversationSearchHit": {"type": "object", "additionalProperties": false, "required": ["conversation_id", "entry_id", "agent_id", "timestamp", "entry_type", "excerpt"], "properties": {"conversation_id": {"$ref": "#/$defs/Id"}, "entry_id": {"$ref": "#/$defs/Id"}, "agent_id": {"type": ["string", "null"]}, "timestamp": {"$ref": "#/$defs/Timestamp"}, "entry_type": {"type": "string"}, "excerpt": {"type": "string", "maxLength": 512}}},
     "ConversationSearch": {"type": "object", "additionalProperties": false, "required": ["kind", "items", "page", "indexed_at", "host_id", "incomplete_sources", "refreshing"], "properties": {"kind": {"const": "conversation-search"}, "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/ConversationSearchHit"}}, "page": {"$ref": "#/$defs/PageInfo"}, "indexed_at": {"$ref": "#/$defs/Timestamp"}, "host_id": {"$ref": "#/$defs/Id"}, "incomplete_sources": {"type": "array", "items": {"type": "string"}}, "refreshing": {"type": "boolean"}}},
 
+    "MissionId": {"type": "string", "pattern": "^(?:mission)/[^\\s]+$", "x-st-ref": "mission"},
+    "MissionRunId": {"type": "string", "pattern": "^(?:mission-run)/[^\\s]+$", "x-st-ref": "mission-run"},
+    "RunGenerationId": {"type": "string", "pattern": "^(?:run-generation)/[^\\s]+$", "x-st-ref": "run-generation"},
+    "StepRunId": {"type": "string", "pattern": "^(?:step-run)/[^\\s]+$", "x-st-ref": "step-run"},
+    "AgentId": {"type": "string", "pattern": "^(?:agent)/[^\\s]+$", "x-st-ref": "agent"},
+    "HostId": {"type": "string", "pattern": "^(?:host)/[^\\s]+$", "x-st-ref": "host"},
+    "RuntimeId": {"type": "string", "pattern": "^(?:runtime)/[^\\s]+$", "x-st-ref": "runtime"},
+    "TerminalId": {"type": "string", "pattern": "^(?:terminal)/[^\\s]+$", "x-st-ref": "terminal"},
+    "SnapshotId": {"type": "string", "pattern": "^(?:snapshot)/[^\\s]+$", "x-st-ref": "snapshot"},
+    "RequestId": {"type": "string", "pattern": "^(?:request)/[^\\s]+$", "x-st-ref": "request"},
+    "TimelineEntryId": {"type": "string", "pattern": "^(?:timeline-entry)/[^\\s]+$", "x-st-ref": "timeline-entry"},
+    "ActorRef": {"type": "string", "pattern": "^(?:agent|daemon|person)/[^\\s]+$", "x-st-ref": ["agent", "daemon", "person"]},
+    "ParticipantRef": {"type": "string", "pattern": "^(?:agent|person|step)/[^\\s]+$", "x-st-ref": ["agent", "person", "step"]},
+    "MissionState": {"anyOf": [{"enum": ["draft", "ready", "retired", "running", "standing", "completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Lifecycle state of a mission."},
+    "MustAct": {"anyOf": [{"enum": ["you", "agent", "system", "blocked", "nobody"]}, {"type": "string"}], "description": "Who must act next on a mission or run."},
+    "RunOutcomeStatus": {"anyOf": [{"enum": ["completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Terminal outcome of a finished run."},
+    "AgentState": {"anyOf": [{"enum": ["desired", "starting", "running", "waiting", "stopped", "failed", "suspended"]}, {"type": "string"}], "description": "Desired/observed agent seat state. `suspended`: the seat was stopped at a quiet boundary and resumes its own native session; see `suspension`."},
+    "AgentReachability": {"anyOf": [{"enum": ["local", "remote", "unreachable", "unknown", "reachable", "indeterminate"]}, {"type": "string"}], "description": "Whether the daemon can currently reach the agent runtime."},
+    "TimelineStatus": {"anyOf": [{"enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Run status reported in a timeline `status` entry."},
+    "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`."},
+    "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "owned-set"]}}}}]},
+    "OwnedSet": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "claim", "receipt", "blockers", "members_status", "visibility"], "properties": {"kind": {"const": "owned-set"}, "claim": {"type": "string"}, "receipt": {"type": "object"}, "blockers": {"type": "array", "items": {"type": "string"}}, "members_status": {"type": "array", "items": {"type": "object"}}, "visibility": {"type": "object"}, "commit_status": {"type": ["object", "null"]}}}]},
     "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["tabs"], "properties": {"tabs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "ratio": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "First child share; absent means 0.5. Requires glasses capability version 2."}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
     "GlassTab": {"type": "object", "additionalProperties": false, "required": ["pane"], "properties": {"title": {"type": "string"}, "pane": {"type": "string", "minLength": 1}}},
     "GlassBody": {"type": "object", "additionalProperties": false, "required": ["name", "layout"], "properties": {"name": {"type": "string", "minLength": 1}, "layout": {"$ref": "#/$defs/GlassLayout"}}},
     "Glass": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "body", "deleted", "base_revision", "replaced_revision"], "properties": {"kind": {"const": "glass"}, "body": {"oneOf": [{"$ref": "#/$defs/GlassBody"}, {"type": "null"}]}, "deleted": {"type": "boolean"}, "base_revision": {"type": ["string", "null"]}, "replaced_revision": {"type": ["string", "null"]}}}]},
     "GlassPut": {"type": "object", "additionalProperties": false, "required": ["body", "base_revision"], "properties": {"body": {"$ref": "#/$defs/GlassBody"}, "base_revision": {"type": ["string", "null"]}}},
     "GlassDelete": {"type": "object", "additionalProperties": false, "required": ["base_revision"], "properties": {"base_revision": {"type": ["string", "null"]}}},
-    "Id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*/[^\\s]+$" },
-    "Timestamp": { "type": "string", "format": "date-time" },
-    "Cursor": { "type": "string", "minLength": 8, "maxLength": 2048 },
-    "Revision": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "Id": { "x-st-ref": "*", "description": "Subject reference `family/rest`.", "type": "string", "pattern": "^[a-z][a-z0-9-]*/[^\\s]+$" },
+    "Timestamp": { "x-st-codec": "timestamp", "description": "RFC 3339 UTC instant; servers emit millisecond precision with `Z`.", "examples": ["2026-10-01T10:00:00.000Z"], "type": "string", "format": "date-time" },
+    "Cursor": { "x-st-brand": "Cursor", "description": "Opaque, snapshot-bound page/event cursor.", "type": "string", "minLength": 8, "maxLength": 2048 },
+    "Revision": { "x-st-brand": "Revision", "description": "Opaque per-subject revision; compare for equality, echo in fences.", "type": "string", "minLength": 1, "maxLength": 256 },
     "Snapshot": {
+      "description": "The complete projected state at one local store index and projection version.",
+      "examples": [{"id": "snapshot/host-a/1842/2fc9", "host_id": "host/host-a", "store_index": 1842, "projection_version": "client-projection.v0", "created_at": "2026-09-20T12:00:00.000Z"}],
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "host_id", "store_index", "projection_version", "created_at"],
       "properties": {
-        "id": { "$ref": "#/$defs/Id" },
-        "host_id": { "$ref": "#/$defs/Id" },
+        "id": { "$ref": "#/$defs/SnapshotId" },
+        "host_id": { "$ref": "#/$defs/HostId" },
         "store_index": { "type": "integer", "minimum": 0 },
         "projection_version": { "const": "client-projection.v0" },
         "created_at": { "$ref": "#/$defs/Timestamp" }
@@ -77,7 +102,7 @@
       "required": ["api_version", "request_id", "snapshot", "value"],
       "properties": {
         "api_version": { "const": "st3.client.v0" },
-        "request_id": { "$ref": "#/$defs/Id" },
+        "request_id": { "$ref": "#/$defs/RequestId" },
         "snapshot": { "$ref": "#/$defs/Snapshot" },
         "value": {
           "oneOf": [
@@ -85,6 +110,7 @@
             { "$ref": "#/$defs/DocumentContent" },
             { "$ref": "#/$defs/SubjectDefinition" },
             { "$ref": "#/$defs/Page" },
+            { "$ref": "#/$defs/ResourcesPage" },
             { "$ref": "#/$defs/Resource" },
             { "$ref": "#/$defs/TimelinePage" },
             { "$ref": "#/$defs/ConversationChanges" },
@@ -116,6 +142,7 @@
       "required": ["kind", "session_actor", "transport", "capabilities", "limits", "event_cursor", "oldest_event_cursor", "schemas"],
       "properties": {
         "kind": { "const": "capabilities" },
+        "machine_version": { "type": "string", "description": "Compile-time build identity of the responding daemon; absent on older servers." },
         "session_actor": { "$ref": "#/$defs/Id" },
         "transport": { "enum": ["unix", "fabric-loopback"] },
         "capabilities": { "type": "array", "items": { "$ref": "#/$defs/Capability" } },
@@ -139,14 +166,28 @@
         "schemas": { "type": "array", "items": { "type": "string", "format": "uri-reference" }, "minItems": 1 }
       }
     },
+    "Operational": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layer", "actionable"],
+      "description": "Whether a projected resource belongs to current operational state or retained history, and which live identity makes it actionable.",
+      "properties": {
+        "layer": { "enum": ["current", "history"] },
+        "actionable": { "type": "boolean" },
+        "reasons": { "type": "array", "items": { "type": "string" } },
+        "owner_generation": { "type": ["string", "null"] },
+        "runtime_incarnation": { "type": ["string", "null"] }
+      }
+    },
     "ResourceHeader": {
       "type": "object",
       "required": ["id", "kind", "revision", "updated_at"],
       "properties": {
         "id": { "$ref": "#/$defs/Id" },
-        "kind": { "enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass"] },
+        "kind": {"anyOf": [{"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass"]}, {"type": "string"}], "description": "Resource family."},
         "revision": { "$ref": "#/$defs/Revision" },
-        "updated_at": { "$ref": "#/$defs/Timestamp" }
+        "updated_at": { "$ref": "#/$defs/Timestamp" },
+        "operational": { "$ref": "#/$defs/Operational" }
       }
     },
     "Attention": {
@@ -490,9 +531,9 @@
         "used_percent": { "type": "number", "minimum": 0 },
         "model": { "type": "string" },
         "compactions": { "type": "integer", "minimum": 0 },
-        "last_compaction_ms": { "type": "integer", "minimum": 0 },
+        "last_compaction_ms": { "x-st-codec": "duration-ms", "type": "integer", "minimum": 0 },
         "last_compaction_trigger": { "enum": ["manual", "auto", "threshold", "overflow", "idle", "unknown"] },
-        "observed_at_unix_ms": { "type": "integer", "minimum": 0 }
+        "observed_at_unix_ms": { "x-st-codec": "epoch-ms", "type": "integer", "minimum": 0 }
       }
     },
     "UsageSummary": {
@@ -521,11 +562,39 @@
         "limits": { "type": "array", "items": { "$ref": "#/$defs/UsageLimit" } }
       }
     },
+    "ClientConnections": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "member", "items"],
+      "properties": {
+        "kind": { "const": "client-connections" },
+        "member": { "type": "string" },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/ClientConnection" } }
+      }
+    },
+    "ClientConnection": {
+      "type": "object", "additionalProperties": false,
+      "required": ["actor", "person", "member", "via", "connected", "streams", "since", "last_seen", "follows"],
+      "properties": {
+        "actor": { "type": "string" },
+        "person": { "type": "string" },
+        "client": { "type": ["string", "null"] },
+        "device_id": { "type": "string" },
+        "device_name": { "type": "string" },
+        "member": { "type": "string" },
+        "via": { "enum": ["local", "gateway", "tailscale"] },
+        "connected": { "type": "boolean" },
+        "streams": { "type": "integer", "minimum": 0 },
+        "since": { "$ref": "#/$defs/Timestamp" },
+        "last_seen": { "$ref": "#/$defs/Timestamp" },
+        "follows": { "type": "array", "items": { "type": "string" } }
+      }
+    },
     "UsageLimit": {
       "type": "object", "additionalProperties": false,
       "required": ["account", "driver", "measured_at_unix_ms", "measured_by", "host", "seats"],
       "properties": {
         "account": { "type": "string" },
+        "account_ref": { "type": "string" },
         "driver": { "type": "string" },
         "plan": { "type": "string" },
         "five_hour_percent": { "type": "number", "minimum": 0 },
@@ -561,22 +630,27 @@
       }
     },
     "Mission": {
+      "description": "A mission: a reusable definition plus its runs.",
       "allOf": [
         { "$ref": "#/$defs/ResourceHeader" },
         {
           "type": "object",
           "required": ["kind", "title", "state", "mission_revision", "runs", "run_generations"],
           "properties": {
+            "id": {"$ref": "#/$defs/MissionId"},
             "kind": { "const": "mission" },
             "title": { "type": "string" },
-            "state": { "enum": ["draft", "ready", "retired", "running", "standing", "completed", "failed", "cancelled"] },
+            "state": {"$ref": "#/$defs/MissionState"},
             "mission_revision": { "$ref": "#/$defs/Revision" },
-            "runs": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "runs": { "type": "array", "items": { "$ref": "#/$defs/MissionRunId" } },
             "run_details": { "type": "array", "items": { "$ref": "#/$defs/MissionRunSummary" } },
-            "must_act": { "enum": ["you", "agent", "system", "blocked", "nobody"] },
+            "must_act": {"$ref": "#/$defs/MustAct"},
             "active_runs": { "type": "integer", "minimum": 0 },
-            "run_generations": { "type": "object", "additionalProperties": { "$ref": "#/$defs/Id" } },
-            "visualization": { "$ref": "#/$defs/Visualization" },
+            "total_runs": { "type": "integer", "minimum": 0 },
+            "run_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+            "runs_truncated": { "type": "boolean" },
+            "run_generations": { "propertyNames": {"$ref": "#/$defs/MissionRunId"}, "type": "object", "additionalProperties": { "$ref": "#/$defs/RunGenerationId" } },
+            "visualization": { "oneOf": [{ "$ref": "#/$defs/Visualization" }, { "type": "null" }] },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] }
           }
         }
@@ -587,14 +661,14 @@
       "additionalProperties": false,
       "required": ["id", "requester", "status", "phase", "progress", "current_steps", "must_act", "state_since"],
       "properties": {
-        "id": { "$ref": "#/$defs/Id" },
-        "generation_id": { "$ref": "#/$defs/Id" },
-        "requester": { "$ref": "#/$defs/Id" },
+        "id": { "$ref": "#/$defs/MissionRunId" },
+        "generation_id": { "$ref": "#/$defs/RunGenerationId" },
+        "requester": { "$ref": "#/$defs/ActorRef" },
         "status": { "type": "string" },
         "phase": { "type": "string" },
         "progress": { "type": "object", "required": ["done", "total"], "properties": { "done": { "type": "integer" }, "total": { "type": "integer" } } },
-        "current_steps": { "type": "array", "items": { "type": "object", "required": ["id", "title", "state", "since"], "properties": { "id": { "$ref": "#/$defs/Id" }, "title": { "type": ["string", "null"] }, "assignee": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "state": { "$ref": "#/$defs/WorkState" }, "since": { "$ref": "#/$defs/Timestamp" } } } },
-        "must_act": { "enum": ["you", "agent", "system", "blocked", "nobody"] },
+        "current_steps": { "type": "array", "items": { "type": "object", "required": ["id", "title", "state", "since"], "properties": { "id": { "$ref": "#/$defs/StepRunId" }, "title": { "type": ["string", "null"] }, "assignee": { "oneOf": [{ "$ref": "#/$defs/AgentId" }, { "type": "null" }] }, "claimant": { "oneOf": [{ "$ref": "#/$defs/AgentId" }, { "type": "null" }] }, "state": { "$ref": "#/$defs/WorkState" }, "since": { "$ref": "#/$defs/Timestamp" } } } },
+        "must_act": {"$ref": "#/$defs/MustAct"},
         "state_since": { "$ref": "#/$defs/Timestamp" },
         "outcome": { "oneOf": [{ "$ref": "#/$defs/MissionRunOutcome" }, { "type": "null" }], "description": "The outcome a person or an authorized agent set after the run finished." },
         "last_progress": { "type": ["string", "null"] },
@@ -609,10 +683,10 @@
       "additionalProperties": false,
       "required": ["status", "reason", "actor", "at"],
       "properties": {
-        "status": { "enum": ["completed", "failed", "cancelled"] },
+        "status": {"$ref": "#/$defs/RunOutcomeStatus"},
         "previous_status": { "type": ["string", "null"] },
         "reason": { "type": "string" },
-        "actor": { "$ref": "#/$defs/Id" },
+        "actor": { "$ref": "#/$defs/ActorRef" },
         "at": { "$ref": "#/$defs/Timestamp" }
       }
     },
@@ -626,8 +700,8 @@
         "title": { "type": ["string", "null"] },
         "state": { "$ref": "#/$defs/WorkState" },
         "attempt": { "type": "integer", "minimum": 0 },
-        "assignee": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
-        "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+        "assignee": { "oneOf": [{ "$ref": "#/$defs/AgentId" }, { "type": "null" }] },
+        "claimant": { "oneOf": [{ "$ref": "#/$defs/AgentId" }, { "type": "null" }] },
         "agentless": { "type": "boolean" },
         "since": { "$ref": "#/$defs/Timestamp" },
         "last_progress": { "type": ["string", "null"] },
@@ -642,8 +716,8 @@
       "required": ["id", "mission_id", "mission_run_id", "path", "state", "since"],
       "properties": {
         "id": { "$ref": "#/$defs/Id" },
-        "mission_id": { "$ref": "#/$defs/Id" },
-        "mission_run_id": { "$ref": "#/$defs/Id" },
+        "mission_id": { "$ref": "#/$defs/MissionId" },
+        "mission_run_id": { "$ref": "#/$defs/MissionRunId" },
         "path": { "type": "string" },
         "title": { "type": ["string", "null"] },
         "goal": { "type": ["string", "null"] },
@@ -673,6 +747,11 @@
             "readiness_epoch": { "type": "integer", "minimum": 0 },
             "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "claim_incarnation": { "type": ["string", "null"] },
+            "agentless": { "type": "boolean" },
+            "claim_expires_at_unix_ms": { "type": ["integer", "null"], "minimum": 0, "x-st-codec": "epoch-ms" },
+            "execution_started_at_unix_ms": { "type": ["integer", "null"], "minimum": 0, "x-st-codec": "epoch-ms" },
+            "execution_elapsed_ms": { "type": "integer", "minimum": 0, "x-st-codec": "duration-ms" },
+            "timeout_ms": { "type": ["integer", "null"], "minimum": 0, "x-st-codec": "duration-ms" },
             "blocked_reason": { "type": ["string", "null"] },
             "blockers": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "goals": { "type": "array", "items": { "type": "string" } },
@@ -690,24 +769,26 @@
           "type": "object",
           "required": ["kind", "name", "state", "reachability", "runtime_ids"],
           "properties": {
+            "id": {"$ref": "#/$defs/AgentId"},
             "kind": { "const": "agent" },
             "name": { "type": "string" },
-            "state": { "enum": ["desired", "starting", "running", "waiting", "stopped", "failed", "suspended"], "description": "`suspended`: the seat was stopped at a quiet boundary and resumes its own native session; see `suspension`." },
-            "reachability": { "enum": ["local", "remote", "unreachable", "unknown"] },
-            "runtime_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
-            "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+            "state": {"$ref": "#/$defs/AgentState"},
+            "reachability": {"$ref": "#/$defs/AgentReachability"},
+            "runtime_ids": { "type": "array", "items": { "$ref": "#/$defs/RuntimeId" } },
+            "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/MissionRunId" }, { "type": "null" }] },
             "driver": { "type": ["string", "null"] },
             "harness_state": { "type": ["string", "null"] },
             "blocked_on": { "type": ["string", "null"], "description": "Current incarnation's harness blocking axis; human means a person must answer before it continues." },
             "ask": { "type": ["string", "null"], "description": "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." },
             "reason": { "type": ["string", "null"], "description": "Diagnostic harness reason, not a machine-readable verdict." },
-            "host_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+            "host_id": { "oneOf": [{ "$ref": "#/$defs/HostId" }, { "type": "null" }] },
             "last_activity_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
             "silent_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
             "fault": { "type": ["string", "null"], "description": "Current member reconcile failure; cleared by a successful pass." },
             "incarnation_id": { "type": ["string", "null"] },
             "current_session_id": { "type": ["string", "null"] },
-            "current_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "todo": { "oneOf": [{ "$ref": "#/$defs/AgentTodo" }, { "type": "null" }], "description": "Latest accepted harness todo snapshot and claim provenance; null if none was observed. Stale observations remain visible." },
+            "current_work_ids": { "type": "array", "items": { "$ref": "#/$defs/StepRunId" } },
             "active_work_count": { "type": "integer", "minimum": 0 },
             "next_work_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "upcoming_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
@@ -719,10 +800,68 @@
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } },
             "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present for local native seats that are running or waiting, including human-blocked harnesses; a stale path makes a running agent `waiting`." },
             "subagents": { "type": "array", "items": { "$ref": "#/$defs/AgentSubagent" }, "description": "The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field." },
+            "rollout": { "type": ["object", "null"], "description": "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." },
             "suspension": { "oneOf": [{ "$ref": "#/$defs/AgentSuspension" }, { "type": "null" }], "description": "The seat's latest suspend or resume and its phase. An older daemon omits the field." }
           }
         }
       ]
+    },
+    "AgentTodo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot", "claim_id", "accepted_at", "stale"],
+      "properties": {
+        "snapshot": { "$ref": "#/$defs/HarnessTodoSnapshot" },
+        "claim_id": { "type": "string" },
+        "accepted_at": { "$ref": "#/$defs/Timestamp" },
+        "stale": { "type": "boolean" }
+      }
+    },
+    "HarnessTodoSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["harness", "session_id", "incarnation_id", "observed_at", "source_op", "phases", "totals", "truncated"],
+      "properties": {
+        "harness": { "type": "string" },
+        "session_id": { "type": "string" },
+        "incarnation_id": { "type": "string" },
+        "observed_at": { "$ref": "#/$defs/Timestamp" },
+        "source_op": { "type": "string" },
+        "phases": { "type": "array", "items": { "$ref": "#/$defs/HarnessPhase" } },
+        "totals": { "$ref": "#/$defs/HarnessTodoTotals" },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "HarnessPhase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "tasks"],
+      "properties": {
+        "name": { "type": "string" },
+        "tasks": { "type": "array", "items": { "$ref": "#/$defs/HarnessTask" } }
+      }
+    },
+    "HarnessTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content", "status"],
+      "properties": {
+        "content": { "type": "string" },
+        "status": { "enum": ["pending", "in_progress", "completed", "blocked"] },
+        "blocker": { "type": ["string", "null"] }
+      }
+    },
+    "HarnessTodoTotals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pending", "in_progress", "completed", "blocked"],
+      "properties": {
+        "pending": { "type": "integer", "minimum": 0 },
+        "in_progress": { "type": "integer", "minimum": 0 },
+        "completed": { "type": "integer", "minimum": 0 },
+        "blocked": { "type": "integer", "minimum": 0 },
+        "abandoned": { "type": "integer", "minimum": 0 }
+      }
     },
     "AgentDelivery": {
       "type": "object",
@@ -1087,27 +1226,50 @@
             "state": { "enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"] },
             "started_at": { "$ref": "#/$defs/Timestamp" },
             "ended_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+            "runtime_incarnation": { "type": ["string", "null"] },
             "timeline_cursor": { "$ref": "#/$defs/Cursor" }
             ,"usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] }
           }
         }
       ]
     },
+    "ResourceObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "facts", "observed_at", "opened_by", "opened_by_run"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "kind": { "type": "string" },
+        "facts": { "type": "object", "additionalProperties": true },
+        "observed_at": { "$ref": "#/$defs/Timestamp" },
+        "opened_by": { "type": ["string", "null"] },
+        "opened_by_run": { "type": ["string", "null"] }
+      }
+    },
+    "ResourcesFilter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "opened_by": { "type": "string" },
+        "kind": { "type": "string" },
+        "subject_prefix": { "type": "string" }
+      }
+    },
+    "ResourcesPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "collection", "filters", "items", "page"],
+      "properties": {
+        "kind": { "const": "page" },
+        "collection": { "const": "resources" },
+        "filters": { "type": "object", "additionalProperties": { "type": "string" } },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/ResourceObservation" } },
+        "page": { "$ref": "#/$defs/PageInfo" },
+        "sync": { "$ref": "#/$defs/SyncNotice" }
+      }
+    },
     "Resource": {
-      "oneOf": [
-        { "$ref": "#/$defs/Attention" }, { "$ref": "#/$defs/Message" },
-        { "$ref": "#/$defs/Launch" }, { "$ref": "#/$defs/LaunchVariant" },
-        { "$ref": "#/$defs/LaunchDecision" }, { "$ref": "#/$defs/LaunchApproval" },
-        { "$ref": "#/$defs/Mission" }, { "$ref": "#/$defs/Work" },
-        { "$ref": "#/$defs/Agent" }, { "$ref": "#/$defs/Runtime" },
-        { "$ref": "#/$defs/Observer" }, { "$ref": "#/$defs/Subscription" },
-        { "$ref": "#/$defs/Lane" },
-        { "$ref": "#/$defs/Machine" },
-        { "$ref": "#/$defs/Device" },
-        { "$ref": "#/$defs/Operation" }, { "$ref": "#/$defs/History" },
-        { "$ref": "#/$defs/Session" },
-        { "$ref": "#/$defs/Glass" }
-      ]
+      "oneOf": [{"$ref": "#/$defs/Attention"}, {"$ref": "#/$defs/Message"}, {"$ref": "#/$defs/Launch"}, {"$ref": "#/$defs/LaunchVariant"}, {"$ref": "#/$defs/LaunchDecision"}, {"$ref": "#/$defs/LaunchApproval"}, {"$ref": "#/$defs/Mission"}, {"$ref": "#/$defs/Work"}, {"$ref": "#/$defs/Agent"}, {"$ref": "#/$defs/Runtime"}, {"$ref": "#/$defs/Observer"}, {"$ref": "#/$defs/Subscription"}, {"$ref": "#/$defs/Lane"}, {"$ref": "#/$defs/Machine"}, {"$ref": "#/$defs/Device"}, {"$ref": "#/$defs/Operation"}, {"$ref": "#/$defs/History"}, {"$ref": "#/$defs/Session"}, {"$ref": "#/$defs/Glass"}, {"$ref": "#/$defs/OwnedSet"}, {"$ref": "#/$defs/UnknownResource"}]
     },
     "GoldenResourceSet": {
       "type": "array",
@@ -1121,7 +1283,7 @@
       "required": ["kind", "collection", "filters", "items", "page"],
       "properties": {
         "kind": { "const": "page" },
-        "collection": { "type": "string" },
+        "collection": { "type": "string", "not": { "const": "resources" } },
         "filters": { "type": "object", "additionalProperties": { "type": "string" } },
         "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
         "page": { "$ref": "#/$defs/PageInfo" },
@@ -1159,21 +1321,22 @@
         "peer_only_envelopes": { "type": "integer", "minimum": 0 },
         "local_only_envelopes": { "type": "integer", "minimum": 0 },
         "last_exchange_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
-        "estimated_catch_up_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "estimated_catch_up_seconds": { "x-st-codec": "duration-s", "type": ["integer", "null"], "minimum": 0 },
         "diverged_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
       }
     },
     "TimelineEntry": {
+      "description": "One conversation timeline entry. `replace` keeps id, sequence, role and type; `finalize` makes it immutable.",
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "sequence", "revision", "timestamp", "role", "type", "final", "body"],
       "properties": {
-        "id": { "$ref": "#/$defs/Id" },
+        "id": { "$ref": "#/$defs/TimelineEntryId" },
         "sequence": { "type": "integer", "minimum": 0 },
         "revision": { "type": "integer", "minimum": 1 },
         "timestamp": { "$ref": "#/$defs/Timestamp" },
         "role": { "enum": ["system", "user", "assistant", "tool"] },
-        "type": { "enum": ["message", "content", "tool_call", "tool_result", "status", "error", "usage", "redaction", "truncation"] },
+        "type": {"anyOf": [{"enum": ["message", "content", "tool_call", "tool_result", "status", "error", "usage", "redaction", "truncation"]}, {"type": "string"}]},
         "final": { "type": "boolean" },
         "body": { "type": "object" }
       },
@@ -1191,7 +1354,7 @@
     },
     "TimelineMessageBody": {
       "type": "object", "additionalProperties": false, "required": ["message_id"],
-      "properties": { "message_id": { "type": "string" }, "reply_to": { "type": "string" }, "from": { "$ref": "#/$defs/Id" }, "to": { "$ref": "#/$defs/Id" }, "title": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } }, "attachments": { "type": "array", "items": { "$ref": "#/$defs/Attachment" } } }
+      "properties": { "message_id": { "type": "string" }, "reply_to": { "type": ["string", "null"] }, "from": { "$ref": "#/$defs/ParticipantRef" }, "to": { "$ref": "#/$defs/ParticipantRef" }, "title": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } }, "attachments": { "type": "array", "items": { "$ref": "#/$defs/Attachment" } } }
     },
     "TimelineContentBody": {
       "type": "object", "additionalProperties": false, "required": ["media_type"],
@@ -1208,7 +1371,7 @@
     },
     "TimelineStatusBody": {
       "type": "object", "additionalProperties": false, "required": ["status"],
-      "properties": { "status": { "enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"] }, "detail": { "type": "string" } }
+      "properties": { "status": {"$ref": "#/$defs/TimelineStatus"}, "detail": { "type": "string" } }
     },
     "TimelineErrorBody": {
       "type": "object", "additionalProperties": false, "required": ["code", "message", "retryable", "details"],
@@ -1325,24 +1488,25 @@
       }
     },
     "Fence": {
+      "description": "The snapshot and exact mutable identities the user acted on; echoed byte-identically in actions.",
       "type": "object",
       "additionalProperties": false,
       "required": ["snapshot_id", "subject_revisions"],
       "properties": {
-        "snapshot_id": { "$ref": "#/$defs/Id" },
+        "snapshot_id": { "$ref": "#/$defs/SnapshotId" },
         "subject_revisions": {
           "type": "object",
           "propertyNames": { "pattern": "^[a-z][a-z0-9-]*/" },
           "additionalProperties": { "$ref": "#/$defs/Revision" }
         },
-        "mission_generation": { "$ref": "#/$defs/Id" },
+        "mission_generation": { "$ref": "#/$defs/RunGenerationId" },
         "step_definition": { "$ref": "#/$defs/Revision" },
         "attempt": { "type": "integer", "minimum": 0 },
         "readiness_epoch": { "type": "integer", "minimum": 0 },
         "runtime_incarnation": { "type": "string" },
         "runtime_desired_revision": { "type": "string" },
         "terminal_sequence": { "type": "integer", "minimum": 0 },
-        "preview_token": { "type": "string", "pattern": "^lpv0:[0-9a-f]{64}$" }
+        "preview_token": { "x-st-brand": "PreviewToken", "type": "string", "pattern": "^lpv0:[0-9a-f]{64}$" }
       }
     },
     "ActionCommon": {
@@ -1355,12 +1519,14 @@
         "type": {
           "enum": ["attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.ask", "work.done", "work.cancel-ask", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.create", "agent.stop", "agent.start", "agent.suspend", "agent.resume", "terminal.create", "terminal.end", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
         },
-        "idempotency_key": { "type": "string", "minLength": 16, "maxLength": 256 },
+        "idempotency_key": { "x-st-brand": "IdempotencyKey", "type": "string", "minLength": 16, "maxLength": 256 },
         "fence": { "$ref": "#/$defs/Fence" },
         "parameters": { "type": "object" }
       }
     },
-    "AgentCreateParameters": {"type": "object", "additionalProperties": false, "required": ["name", "harness"], "properties": {"name": {"type": "string", "minLength": 1}, "harness": {"enum": ["claude", "codex", "pi", "omp", "opencode"]}, "host": {"type": "string", "minLength": 1}, "model": {"type": "string", "minLength": 1}, "effort": {"type": "string", "minLength": 1}, "workspace": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1}, "message": {"type": "string", "minLength": 1}}},
+    "AgentRepository": {"type": "object", "additionalProperties": false, "required": ["path", "workspaces", "agent_ids"], "properties": {"path": {"type": "string"}, "workspaces": {"type": "array", "items": {"type": "string"}}, "agent_ids": {"type": "array", "items": {"type": "string"}}}},
+    "HostRepositories": {"type": "object", "additionalProperties": false, "required": ["host_id", "repositories"], "properties": {"host_id": {"type": "string"}, "repositories": {"type": "array", "items": {"$ref": "#/$defs/AgentRepository"}}}},
+    "AgentCreateParameters": {"type": "object", "additionalProperties": false, "required": ["name", "harness"], "properties": {"name": {"type": "string", "minLength": 1}, "harness": {"enum": ["claude", "codex", "pi", "omp", "opencode"]}, "host": {"type": "string", "minLength": 1}, "model": {"type": "string", "minLength": 1}, "effort": {"type": "string", "minLength": 1}, "workspace": {"type": "string", "minLength": 1}, "repo": {"type": "string", "minLength": 1}, "base": {"type": "string", "minLength": 1}, "branch": {"type": "string", "minLength": 1}, "remove_at_run_end": {"type": "boolean"}, "description": {"type": "string", "minLength": 1}, "message": {"type": "string", "minLength": 1}}},
     "AgentStopParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}, "reason": {"type": "string"}}},
     "AgentStartParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}}},
     "AgentSuspendParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}, "reason": {"type": "string"}}},
@@ -1747,7 +1913,7 @@
         "device_id": { "$ref": "#/$defs/Id" },
         "person_id": { "type": "string", "pattern": "^person/[^/]+$" },
         "session_actor": { "$ref": "#/$defs/Id" },
-        "credential": { "type": "string", "minLength": 32 },
+        "credential": { "x-st-codec": "redacted", "type": "string", "minLength": 32 },
         "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "expires_at": { "$ref": "#/$defs/Timestamp" },
         "device_key_chain": { "type": "array", "items": { "type": "string" } }
@@ -1776,6 +1942,7 @@
         "row": { "type": "integer", "minimum": 0 },
         "text": { "type": "string" },
         "runs": { "type": "array", "items": { "$ref": "#/$defs/TerminalRun" } },
+        "wrapped": { "type": "boolean", "description": "Whether this line continues onto the next terminal row through automatic wrapping." },
         "redacted": { "type": "boolean" },
         "truncated": { "type": "boolean" }
       }
@@ -1786,13 +1953,24 @@
       "required": ["text"],
       "properties": {
         "text": { "type": "string", "minLength": 1 },
+        "cells": { "type": "integer", "minimum": 0, "description": "Number of terminal display cells occupied by the run, which may differ from its text length." },
         "fg": { "$ref": "#/$defs/TerminalColor" },
         "bg": { "$ref": "#/$defs/TerminalColor" },
         "bold": { "const": true },
         "dim": { "const": true },
         "italic": { "const": true },
         "underline": { "const": true },
-        "inverse": { "const": true }
+        "inverse": { "const": true },
+        "strikethrough": { "const": true, "description": "Present when the run uses strikethrough styling." },
+        "link": { "$ref": "#/$defs/TerminalLink", "description": "Hyperlink associated with the run." }
+      }
+    },
+    "TerminalLink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri"],
+      "properties": {
+        "uri": { "type": "string", "minLength": 1, "description": "Hyperlink destination emitted by the terminal." }
       }
     },
     "TerminalColor": {
@@ -1812,7 +1990,8 @@
         "bracketed_paste": { "type": "boolean" },
         "focus_events": { "type": "boolean" },
         "mouse_tracking": { "enum": ["none", "click", "drag", "motion"] },
-        "mouse_encoding": { "enum": ["default", "utf8", "sgr"] }
+        "mouse_encoding": { "enum": ["default", "utf8", "sgr"] },
+        "kitty_keyboard": { "type": "integer", "minimum": 0, "description": "Active Kitty keyboard protocol enhancement flags as a bitmask." }
       }
     },
     "TerminalScreen": {
@@ -1821,9 +2000,9 @@
       "required": ["kind", "terminal_id", "runtime_incarnation", "revision", "rows", "columns", "cursor", "title", "modes", "lines", "next_sequence", "truncated"],
       "properties": {
         "kind": { "const": "terminal-screen" },
-        "terminal_id": { "$ref": "#/$defs/Id" },
+        "terminal_id": { "$ref": "#/$defs/TerminalId" },
         "runtime_incarnation": { "type": "string" },
-        "revision": { "type": "string", "minLength": 1 },
+        "revision": { "x-st-brand": "ScreenRevision", "description": "Digest of the rest of the screen: equal revisions mean equal screens.", "type": "string", "minLength": 1 },
         "rows": { "type": "integer", "minimum": 1 },
         "columns": { "type": "integer", "minimum": 1 },
         "cursor": {
@@ -1841,7 +2020,7 @@
         "title": { "type": "string" },
         "modes": { "$ref": "#/$defs/TerminalModes" },
         "lines": { "type": "array", "items": { "$ref": "#/$defs/TerminalLine" } },
-        "next_sequence": { "type": "integer", "minimum": 0 },
+        "next_sequence": { "description": "Fence for the next input or resize.", "type": "integer", "minimum": 0 },
         "truncated": { "type": "boolean" },
         "facts": { "$ref": "#/$defs/TerminalFacts" },
         "relay": { "$ref": "#/$defs/TerminalRelay" }
@@ -1898,12 +2077,146 @@
         "api_version": { "const": "st3.client.v0" },
         "error_version": { "const": "st3.client.error.v0" },
         "request_id": { "$ref": "#/$defs/Id" },
-        "code": { "enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"] },
+        "code": {"$ref": "#/$defs/ErrorCode"},
         "message": { "type": "string" },
         "retryable": { "type": "boolean" },
-        "retry_after_ms": { "type": "integer", "minimum": 0 },
+        "retry_after_ms": { "x-st-codec": "duration-ms", "type": "integer", "minimum": 0 },
         "details": { "type": "object" }
       }
+    },
+    "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses"] },
+    "CollectionCommand": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection"],
+          "properties": {
+            "kind": { "const": "subscribe" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "collection": { "$ref": "#/$defs/CollectionName" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+            "person": { "type": ["string", "null"] },
+            "actor": { "type": ["string", "null"] },
+            "status": { "type": ["string", "null"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "terminal", "capability"],
+          "properties": {
+            "kind": { "const": "subscribe" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "collection": { "const": "terminal" },
+            "terminal": { "$ref": "#/$defs/Id" },
+            "incarnation": { "type": ["string", "null"] },
+            "capability": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "conversation"],
+          "properties": {
+            "kind": { "const": "subscribe" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "collection": { "const": "conversation" },
+            "conversation": { "$ref": "#/$defs/Id" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": { "kind": { "const": "unsubscribe" }, "id": { "type": "string", "minLength": 1, "maxLength": 128 } }
+        }
+      ]
+    },
+    "CollectionFrame": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "snapshot", "items", "order", "has_more"],
+          "properties": {
+            "kind": { "const": "snapshot" },
+            "id": { "type": "string" },
+            "collection": { "$ref": "#/$defs/CollectionName" },
+            "snapshot": { "$ref": "#/$defs/Snapshot" },
+            "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
+            "order": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "has_more": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "snapshot", "upserts", "removes", "order", "has_more"],
+          "properties": {
+            "kind": { "const": "changes" },
+            "id": { "type": "string" },
+            "collection": { "$ref": "#/$defs/CollectionName" },
+            "snapshot": { "$ref": "#/$defs/Snapshot" },
+            "upserts": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
+            "removes": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "order": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "has_more": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "snapshot", "value"],
+          "properties": {
+            "kind": { "const": "screen" },
+            "id": { "type": "string" },
+            "collection": { "const": "terminal" },
+            "snapshot": { "$ref": "#/$defs/Snapshot" },
+            "value": { "$ref": "#/$defs/TerminalScreen" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "session_id", "replace", "items"],
+          "properties": {
+            "kind": { "const": "conversation" },
+            "id": { "type": "string" },
+            "collection": { "const": "conversation" },
+            "session_id": { "$ref": "#/$defs/Id" },
+            "replace": { "type": "boolean" },
+            "items": { "type": "array", "items": { "$ref": "#/$defs/TimelineEntry" } },
+            "has_more": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": {
+            "kind": { "const": "resync" },
+            "id": { "type": "string" },
+            "collection": { "type": "string" },
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "retryable": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "message"],
+          "properties": {
+            "kind": { "const": "error" },
+            "id": { "type": "string" },
+            "collection": { "type": "string" },
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "retryable": { "type": "boolean" }
+          }
+        }
+      ]
     }
   }
 }

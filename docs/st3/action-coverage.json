@@ -1,0 +1,2186 @@
+{
+  "version": 1,
+  "typed_actions": [
+    {
+      "action": "agent.create",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::creation_and_declaration_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "agent.queue-move",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::seat_queue_moves_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "agent.resume",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::suspension_requests_survive_stale_incarnations_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "agent.start",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::creation_and_declaration_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "agent.stop",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::creation_and_declaration_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "agent.suspend",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::suspension_requests_survive_stale_incarnations_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "attention.resolve",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::unavailable_actions_refuse_before_and_after_restart_without_writes"
+      ],
+      "behavior": "refused without writes across restart"
+    },
+    {
+      "action": "lane.approve",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::lane_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "lane.join",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::lane_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "lane.leave",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::lane_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "lane.mark",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::lane_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "lane.move",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::lane_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "launch.approve",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::launch_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "launch.cancel",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::launch_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "launch.create",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::launch_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "launch.preview",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::launch_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "launch.revise",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::launch_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "message.close",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::messages_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "message.read",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::messages_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "message.send",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::messages_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "mission.approve-revision",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::revision_decisions_survive_stale_previews_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "mission.cancel",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::mission_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "mission.cancel-revision",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::revision_decisions_survive_stale_previews_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "mission.revise",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::unavailable_actions_refuse_before_and_after_restart_without_writes"
+      ],
+      "behavior": "refused without writes across restart"
+    },
+    {
+      "action": "mission.start",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::mission_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "pairing.revoke",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::pairing_revocation_survives_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "review.approve",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::human_review_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "review.reject",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::human_review_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "review.request-changes",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::human_review_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "runtime.context-clear",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::runtime_controls_survive_stale_incarnations_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "runtime.reset",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::run_runtime_reset_survives_stale_desired_revision_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "runtime.restart",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::runtime_controls_survive_stale_incarnations_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "runtime.signal",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::runtime_controls_survive_stale_incarnations_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "runtime.stop",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::runtime_controls_survive_stale_incarnations_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "session.import",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::native_import_survives_stale_discovery_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "terminal.attach",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::terminal_controls_survive_stale_screens_and_daemon_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "terminal.create",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::creation_and_declaration_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "terminal.detach",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::terminal_controls_survive_stale_screens_and_daemon_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "terminal.end",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::creation_and_declaration_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "terminal.input",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::terminal_controls_survive_stale_screens_and_daemon_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "terminal.resize",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::terminal_controls_survive_stale_screens_and_daemon_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "work.ask",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::person_work_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "work.cancel-ask",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::person_work_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "work.claim",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::work_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "work.complete",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::work_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "work.done",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::person_work_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "work.fail",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::work_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "work.progress",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::work_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "work.publish-mission",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::unavailable_actions_refuse_before_and_after_restart_without_writes"
+      ],
+      "behavior": "refused without writes across restart"
+    },
+    {
+      "action": "work.release",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::work_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "work.renew",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::work_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    },
+    {
+      "action": "work.retry",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::work_actions_survive_stale_fences_and_restarts"
+      ],
+      "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
+    }
+  ],
+  "cli": [
+    {
+      "command": "st activity",
+      "description": "Read bounded changes since a stable cursor",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents apply",
+      "description": "Preview and apply one KDL file containing durable agent seats",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_agent_and_shell_declarations_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents hold",
+      "description": "Inspect, set, or release a Codex/OpenCode delivery hold; the provider keeps running",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_local_skill_completions_holds_and_repairs_use_private_files"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents ls",
+      "description": "List operational agents; use --all for stopped and historical agents",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents repos",
+      "description": "List repositories already used by a host's agents, from replicated graph evidence",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents new",
+      "description": "Declare one new agent seat, start its harness, and wait until it is ready.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_agent_and_shell_declarations_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents queue",
+      "description": "Default read command for this group.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents queue move",
+      "description": "Move one queued mission run. A step the seat already holds stays held",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::agents_queue_cli_shows_seat_order_and_records_person_and_agent_moves"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st agents rename",
+      "description": "Change only a seat's human label, without restarting its harness",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_metadata_documents_blobs_and_rules_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents restart",
+      "description": "Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation",
+      "tests": [
+        "crates/st3/tests/agents_restart.rs::restarts_top_level_seat_on_a_new_incarnation"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st agents resume",
+      "description": "Resume a suspended seat on the same native session; wait until its harness proves it",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_seat_suspension_and_resume_wait_for_durable_owner_acknowledgements"
+      ],
+      "verification": "real CLI request/wait across restart; fixture runtime-owner acknowledgements"
+    },
+    {
+      "command": "st agents show",
+      "description": "Show one exact agent, including its owner and operational annotation",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart",
+        "crates/st3/tests/action_coverage.rs::cli_agent_and_shell_declarations_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents start",
+      "description": "Start a durable seat, patching only explicitly supplied declaration fields. A stopped mission seat starts again on its run's own declaration",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_agent_and_shell_declarations_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents rollout",
+      "description": "Retry a published owned-seat cutover with fresh desired and incarnation fences.",
+      "tests": ["crates/st3/tests/action_coverage.rs::cli_owned_seat_rollout_captures_fences_and_survives_restart"],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents stop",
+      "description": "Stop one exact durable seat and every process it started.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_agent_and_shell_declarations_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents suspend",
+      "description": "Stop a quiet seat at a clean boundary, keeping its native session to resume.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_seat_suspension_and_resume_wait_for_durable_owner_acknowledgements"
+      ],
+      "verification": "real CLI request/wait across restart; fixture runtime-owner acknowledgements"
+    },
+    {
+      "command": "st agents tree",
+      "description": "Group operational agents beneath the mission runs that own them",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st apply",
+      "description": "Publish a complete source-fenced owned set",
+      "tests": [
+        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation"
+      ],
+      "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
+    },
+    {
+      "command": "st attention approve",
+      "description": "Approve one person-owned gate or launch review",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_human_reviews_act_on_the_current_card_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; current source review and durable verdict"
+    },
+    {
+      "command": "st attention ls",
+      "description": "List all current human attention items",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st attention reject",
+      "description": "Reject one person-owned gate or launch review",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_human_reviews_act_on_the_current_card_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; current source review and durable verdict"
+    },
+    {
+      "command": "st attention request",
+      "description": "Legacy mutation: returns attention-migrated. Use work ask or remedy the source",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st attention request-changes",
+      "description": "Ask a feedback-mode step to change its work and rerun",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_human_reviews_act_on_the_current_card_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; current source review and durable verdict"
+    },
+    {
+      "command": "st attention resolve",
+      "description": "Legacy mutation: returns attention-migrated. Complete a person step with work done",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st attention show",
+      "description": "Explain one attention item and show the exact available actions",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st attention withdraw",
+      "description": "Legacy mutation: returns attention-migrated. Cancel your ask with work cancel-ask",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st backup create",
+      "description": "Save a consistent signed claim-log snapshot to a private file",
+      "tests": [
+        "crates/st3/tests/backup.rs::a_live_backup_download_restores_and_leaves_the_daemon_serving_reads"
+      ],
+      "verification": "real CLI downloads paged backup over private Unix socket while reads continue"
+    },
+    {
+      "command": "st backup restore",
+      "description": "Restore a claim-log archive into an empty offline database with a fresh writer",
+      "tests": [
+        "crates/st3/tests/backup.rs::a_live_backup_download_restores_and_leaves_the_daemon_serving_reads"
+      ],
+      "verification": "real CLI restores the downloaded archive and compares all shared graph digests"
+    },
+    {
+      "command": "st blobs get",
+      "description": "Read one attachment. A member that does not hold it asks the member that took the upload",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_metadata_documents_blobs_and_rules_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st blobs put",
+      "description": "Keep one PNG, JPEG, GIF or WebP image (at most 10 MiB) on this member and print its reference. Name it in `conversations send --attach`, or pass the file there directly",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_metadata_documents_blobs_and_rules_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st claim",
+      "description": "Publish one registered typed observation",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_metadata_documents_blobs_and_rules_survive_restart",
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart",
+        "crates/st3/tests/action_coverage.rs::cli_human_reviews_act_on_the_current_card_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st clients",
+      "description": "The clients connected to this member now and those seen in the last few minutes",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st completions",
+      "description": "Generate one shell completion script",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_local_skill_completions_holds_and_repairs_use_private_files"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations archive",
+      "description": "Close exact messages after their related action is complete",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations export",
+      "description": "Write a disposable mailbox tree for translated tools",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations follow",
+      "description": "Follow the visible normalized conversation; JSON output is one entry per line",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations ls",
+      "description": "List the current mailbox for one explicit identity",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations read",
+      "description": "Read exact messages and optionally mark them read or archived",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations reply",
+      "description": "Reply to one canonical message ID while preserving its thread",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations search",
+      "description": "Search readable messages and normalized agent transcripts, newest first",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations send",
+      "description": "Send one durable normalized message to a person or agent",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations sessions",
+      "description": "List normalized harness sessions available for native conversation views",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations status",
+      "description": "Show delivery and read progress without changing the message lifecycle",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations thread",
+      "description": "Render the bounded conversation thread around one message",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations timeline",
+      "description": "Show one conversation as stui shows it: messages, folded tools, Small Talk. `--raw` prints every normalized entry (ids, message boundaries, tool JSON); `--json` the page",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st devices",
+      "description": "Default read command for this group.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart",
+        "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st devices ls",
+      "description": "List paired devices visible to the authenticated person",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st devices pair",
+      "description": "Begin local pairing for one named person and device",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st devices revoke",
+      "description": "Revoke one paired device",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st diagnostic",
+      "description": "Report a harness failure as this agent through the authorized diagnostic path",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_metadata_documents_blobs_and_rules_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st doctor",
+      "description": "Check the daemon and runtime dependencies",
+      "tests": [
+        "crates/st3/tests/daemon_environment.rs::doctor_reports_missing_build_tools_and_whether_a_small_crate_links"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st documents get",
+      "description": "Read exact document bytes by immutable name-and-hash reference",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_metadata_documents_blobs_and_rules_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st documents ls",
+      "description": "List selected document bindings; use --all for immutable version history",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st documents put",
+      "description": "Store a regular file as one immutable named document version",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_metadata_documents_blobs_and_rules_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st fleet create",
+      "description": "Found a new fleet with this machine as its first member (the anchor)",
+      "tests": [
+        "crates/st3/tests/fleet.rs::invite_and_join_sync_full_history"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st fleet invite",
+      "description": "Create a single-use code that lets one new machine join",
+      "tests": [
+        "crates/st3/tests/fleet.rs::invite_and_join_sync_full_history"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st fleet invites",
+      "description": "Default read command for this group.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st fleet invites revoke",
+      "description": "Revoke an invite. The sponsor refuses it once the revocation reaches it",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st fleet join",
+      "description": "Join this machine to a fleet with a code from `st fleet invite`",
+      "tests": [
+        "crates/st3/tests/fleet.rs::invite_and_join_sync_full_history"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st fleet leave",
+      "description": "Take this machine out of its fleet after everything it wrote has reached a member",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st fleet migrate",
+      "description": "Move a machine of a config-peer fleet to membership, keeping its history",
+      "tests": [
+        "crates/st3/tests/fleet.rs::a_config_peer_fleet_migrates_to_membership"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st fleet mode",
+      "description": "Switch this member between listening and dial-out",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st fleet remove",
+      "description": "Remove another member, or a config peer, from the fleet",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st fleet status",
+      "description": "Show this node, the fleet's members, and open invites",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st fleet wait",
+      "description": "Wait for this node's first sync to end, then check that it projects the same graph as the peer it synced from. Fails when the graphs differ after a heal",
+      "tests": [
+        "crates/st3/tests/fleet.rs::fleet_wait_after_a_restart_waits_until_the_member_has_caught_up"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st gate cargo-test",
+      "description": "Whether a cargo test target passes at a ref, built in a worktree st keeps between checks",
+      "tests": [
+        "crates/st3/tests/gate_kinds.rs::cargo_test_waits_for_its_target_and_breaks_on_a_build_this_host_cannot_make"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st gate ci-passed",
+      "description": "Whether the check run or commit status named CHECK passed on a commit or branch head",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_github_gates_pass_wait_and_refuse_over_private_http_across_restart",
+        "crates/st3/src/resource/github_gates.rs::lookups_pass_wait_or_break_as_github_answers"
+      ],
+      "verification": "real CLI with private HTTP fixture covers pass/wait/broken and obsolete refs across daemon restarts"
+    },
+    {
+      "command": "st gate merged",
+      "description": "Whether a pull request has merged; one that closed unmerged cannot pass",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_github_gates_pass_wait_and_refuse_over_private_http_across_restart",
+        "crates/st3/src/resource/github_gates.rs::lookups_pass_wait_or_break_as_github_answers"
+      ],
+      "verification": "real CLI with private HTTP fixture covers pass/wait/broken and obsolete refs across daemon restarts"
+    },
+    {
+      "command": "st gh comment",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_github_watch_cli_uses_private_http_and_survives_restart"
+      ],
+      "verification": "real CLI/daemon with private HTTP fixture; ownership refusal, disk restart and idempotent registration"
+    },
+    {
+      "command": "st gh ls",
+      "description": "List active and ended watches",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_github_watch_cli_uses_private_http_and_survives_restart"
+      ],
+      "verification": "real CLI/daemon with private HTTP fixture, disk restart, repeated unwatch"
+    },
+    {
+      "command": "st gh own",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_github_watch_cli_uses_private_http_and_survives_restart"
+      ],
+      "verification": "real CLI/daemon with private HTTP fixture; ownership refusal, disk restart and idempotent registration"
+    },
+    {
+      "command": "st gh unwatch",
+      "description": "End a seat's watch",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_github_watch_cli_uses_private_http_and_survives_restart"
+      ],
+      "verification": "real CLI/daemon with private HTTP fixture, disk restart, repeated unwatch"
+    },
+    {
+      "command": "st gh watch",
+      "description": "Watch GitHub issue or pull request changes for one seat",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_github_watch_cli_uses_private_http_and_survives_restart"
+      ],
+      "verification": "real CLI/daemon with private HTTP fixture, disk restart, repeated unwatch"
+    },
+    {
+      "command": "st import ls",
+      "description": "List running native sessions; use --all for resumable saved history",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart",
+        "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st import run",
+      "description": "Stop an exactly identified running harness and resume it in a durable st mission",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st import show",
+      "description": "Show the exact native identity, workspace, process fence, and importability",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st lanes approve",
+      "description": "Approve an entry as the lane's approver",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::lanes_cli_keeps_one_ordered_lane_that_people_and_agents_change"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st lanes join",
+      "description": "Add an entry at the back of a lane. An entry already in the lane stays where it is",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::lanes_cli_keeps_one_ordered_lane_that_people_and_agents_change"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st lanes leave",
+      "description": "Take an entry out of a lane",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::lanes_cli_keeps_one_ordered_lane_that_people_and_agents_change"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st lanes ls",
+      "description": "List open lanes; `--all` also lists lanes whose run ended",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st lanes mark",
+      "description": "Record the status the lane's run found for an entry",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::lanes_cli_keeps_one_ordered_lane_that_people_and_agents_change"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st lanes move",
+      "description": "Move an entry to the top, to the bottom, or next to another entry",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::lanes_cli_keeps_one_ordered_lane_that_people_and_agents_change"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st lanes show",
+      "description": "Show one lane's entries in order and its recent changes",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::lanes_cli_keeps_one_ordered_lane_that_people_and_agents_change"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st launch answer",
+      "description": "Record the immutable answer to a launch question",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st launch approve",
+      "description": "Approve the exact previewed candidate without starting it",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st launch approve-and-launch",
+      "description": "Atomically request approval, then idempotently start the published mission revision",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st launch cancel",
+      "description": "Stop a launch conversation without publishing its candidate",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st launch compare",
+      "description": "Compare two candidate variants field by field",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st launch ls",
+      "description": "List current launch conversations; use --all for finished history",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st launch preview",
+      "description": "Validate and render the exact candidate that could be approved",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart",
+        "crates/st3/tests/action_coverage.rs::cli_launch_proposes_a_named_variant_from_an_exact_run_generation"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st launch propose",
+      "description": "Select the candidate variant the requester should review",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart",
+        "crates/st3/tests/action_coverage.rs::cli_launch_proposes_a_named_variant_from_an_exact_run_generation"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st launch question",
+      "description": "Ask the requester one typed, revisioned question",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st launch revise",
+      "description": "Add requester feedback and ask the planner for a new candidate",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st launch run",
+      "description": "Start the exact published revision of an already approved launch",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st launch show",
+      "description": "Review one launch's request, decisions, candidate, and current status",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st launch start",
+      "description": "Turn a natural-language request into a durable planning conversation",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart",
+        "crates/st3/tests/action_coverage.rs::cli_launch_proposes_a_named_variant_from_an_exact_run_generation"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st launch submit",
+      "description": "Record an agent-authored candidate revision for a launch",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_launch_planning_questions_variants_approval_and_run_survive_restart",
+        "crates/st3/tests/action_coverage.rs::cli_launch_proposes_a_named_variant_from_an_exact_run_generation"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st machines",
+      "description": "Assess fleet machines, health, and capacity",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st missions cancel",
+      "description": "Cancel one exact running mission and stop its owned work and runtimes",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st missions cancel-request",
+      "description": "Close one pending or held mission request without starting it",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_subscription_release_and_cancel_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st missions check",
+      "description": "Run each exec gate in a mission file once, now, the way a run would, and report its answer: pass (exit 0), not yet (exit 1), broken (anything else), or unchecked",
+      "tests": [
+        "crates/st3/tests/broken_gates.rs::a_check_answers_for_each_gate_and_publish_refuses_a_broken_one"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st missions ls",
+      "description": "List current missions; use --all for historical terminal missions",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st missions outcome",
+      "description": "Set a finished run's outcome to completed, failed, or cancelled, with a reason",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st missions publish",
+      "description": "Publish exact authored mission KDL after preview, once its exec gates pass a check",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st missions queued",
+      "description": "Show one seat's current claim and its queued mission runs in order; same as `st agents queue AGENT`",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st missions release",
+      "description": "Release a legacy held request; new requests are queued automatically",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_subscription_release_and_cancel_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st missions requests",
+      "description": "Show one subscription's automatic mission request queue",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_subscription_release_and_cancel_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st missions retire",
+      "description": "Retire a mission so it leaves the lists and cannot start; publishing it again brings it back",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st missions show",
+      "description": "Explain one mission run, its goals, state, work, and usage",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st missions start",
+      "description": "Start one run from the current ready mission revision",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st missions tree",
+      "description": "Show active runs, standing queues, unstarted missions, and agents by host",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st now",
+      "description": "Understand what needs action now",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st recorder report",
+      "description": "Summarize recent calls from local or supplied host logs",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st repair apply",
+      "description": "Apply exactly the plan identified by a dry-run token",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_local_skill_completions_holds_and_repairs_use_private_files"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st repair dry-run",
+      "description": "Compute the exact read-only repair plan and approval token",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart",
+        "crates/st3/tests/action_coverage.rs::cli_local_skill_completions_holds_and_repairs_use_private_files"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st replication checkpoint excuse",
+      "description": "Stop waiting for an unreachable writer. It fences nothing: what the writer wrote while away still replicates when it returns, and its next seal ends the excusal",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st replication checkpoint plan",
+      "description": "Show what a checkpoint would drop from this node's store, proved on a copy. Changes nothing",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st replication checkpoint resume",
+      "description": "Go on with checkpoints after a trim stopped because deleting would change the graph. The rows stay as they are; the next checkpoint proceeds",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st replication checkpoint status",
+      "description": "Show the newest stable checkpoint and who has sealed or verified the one being agreed",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st replication diff",
+      "description": "Compare local logical digests with one peer's last signed response",
+      "tests": [
+        "crates/st3/tests/fleet.rs::action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st replication inspect",
+      "description": "Show one replicated record diagnostic",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_replication_inspection_and_repair_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st replication invalid",
+      "description": "List invalid and unknown replicated records",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart",
+        "crates/st3/tests/action_coverage.rs::cli_replication_inspection_and_repair_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st replication repair",
+      "description": "Replace one invalid record with an admitted claim",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_replication_inspection_and_repair_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st replication status",
+      "description": "Show fleet receipt, validation, projection, and peer health",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st rules audit",
+      "description": "List the writes the rules in audit mode would have refused, newest first",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart",
+        "crates/st3/tests/action_coverage.rs::cli_metadata_documents_blobs_and_rules_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st rules lockdown",
+      "description": "Set the lockdown rules, each in audit mode until you enforce it",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_metadata_documents_blobs_and_rules_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st rules ls",
+      "description": "List the rules, each with its mode: off, audit or enforce",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st rules mode",
+      "description": "Turn one rule off, to audit, or to enforce",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_metadata_documents_blobs_and_rules_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st schema claims",
+      "description": "List claim kinds, optionally for one subject",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st schema export",
+      "description": "Export the complete registry",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st schema resources",
+      "description": "List registered resource kinds",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st schema show",
+      "description": "Show one claim kind",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st schema subjects",
+      "description": "List registered subject families",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st service install",
+      "description": "Install and start the st user services for this machine",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_service_install_status_restart_reset_uninstall_use_isolated_manager"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st service permissions",
+      "description": "Explain the one-time macOS permissions for service-owned work",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_service_install_status_restart_reset_uninstall_use_isolated_manager"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st service reset",
+      "description": "Irreversibly erase local st state and restart an empty daemon",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_service_install_status_restart_reset_uninstall_use_isolated_manager"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st service restart",
+      "description": "Restart st after configuration or binary changes",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_service_install_status_restart_reset_uninstall_use_isolated_manager"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st service status",
+      "description": "Show whether the daemon and replication services are installed and running",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_service_install_status_restart_reset_uninstall_use_isolated_manager"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st service uninstall",
+      "description": "Stop and remove st user services while preserving state files",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_service_install_status_restart_reset_uninstall_use_isolated_manager"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st sets ls",
+      "description": "List selected owned sets",
+      "tests": [
+        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation"
+      ],
+      "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
+    },
+    {
+      "command": "st sets show",
+      "description": "Show membership, retirement and blockers",
+      "tests": [
+        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation"
+      ],
+      "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
+    },
+    {
+      "command": "st sets status",
+      "description": "Inspect rollout for a source commit",
+      "tests": [
+        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation"
+      ],
+      "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
+    },
+    {
+      "command": "st skill",
+      "description": "Default read command for this group.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_local_skill_completions_holds_and_repairs_use_private_files"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st skill install",
+      "description": "Write the skill where each named harness loads user skills; no name installs it for all",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_local_skill_completions_holds_and_repairs_use_private_files"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st subject history",
+      "description": "Show bounded immutable history for one subject",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st subject show",
+      "description": "Show one typed subject card",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st terminals attach",
+      "description": "Attach this terminal interactively to one running terminal member.",
+      "tests": [
+        "crates/st3/tests/terminal_attach.rs::a_terminal_on_this_host_attaches_through_its_pty_session"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st terminals attach-info",
+      "description": "Create a short-lived client attachment and show its stream details",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_terminal_controls_and_stream_capabilities_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st terminals detach-client",
+      "description": "End a client attachment by its exact attachment ID",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_terminal_controls_and_stream_capabilities_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st terminals end",
+      "description": "End a personal shell permanently, including its durable declaration",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_agent_and_shell_declarations_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st terminals expose-fabric",
+      "description": "Let fleet peers attach this host's terminals PTY to PTY over Fabric.",
+      "tests": [
+        "crates/st3/tests/terminal_attach.rs::a_terminal_another_host_owns_attaches_pty_to_pty_over_fabric"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st terminals input-client",
+      "description": "Send input through the client gateway to a local or remote terminal",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_terminal_controls_and_stream_capabilities_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st terminals ls",
+      "description": "List current terminal sessions; use --all for stopped history",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st terminals new",
+      "description": "Open a plain shell for the configured person, without an agent harness",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_agent_and_shell_declarations_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st terminals peek",
+      "description": "Read one terminal's current screen without taking control",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_terminal_controls_and_stream_capabilities_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st terminals screen",
+      "description": "Read a terminal screen through the client gateway, including a remote fleet host",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_terminal_controls_and_stream_capabilities_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st terminals send",
+      "description": "Send explicit text or a named key to one running terminal",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_terminal_controls_and_stream_capabilities_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st terminals signal",
+      "description": "Deliver one supported Unix signal to a terminal member",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_terminal_controls_and_stream_capabilities_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st terminals stream",
+      "description": "Follow a terminal's screens with an attachment capability until the stream ends",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_terminal_controls_and_stream_capabilities_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st trace show",
+      "description": "Show or follow bounded graph history",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st trace wait",
+      "description": "Wait until a graph condition is true using bounded retry/long-poll requests",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st uninstall",
+      "description": "Remove st3 from this machine: leave its fleet, then its services, state, and settings",
+      "tests": [
+        "crates/st3/tests/fleet.rs::uninstall_leaves_nothing_behind"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st up",
+      "description": "Start the HTTP API, readers, peers, and reconciler",
+      "tests": [
+        "crates/st3/tests/daemon_environment.rs::bare_service_environment_loads_shell_path_and_rechecks_credentials"
+      ],
+      "verification": "existing CLI integration"
+    },
+    {
+      "command": "st usage",
+      "description": "Show token spend over a period, with the largest spenders first",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work ask",
+      "description": "Ask a person through a runtime step owned by live work",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work cancel-ask",
+      "description": "Cancel your own ask and resume its live origin",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st work claim",
+      "description": "Acquire one ready work item with the current harness incarnation",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_mission_output_and_manual_wake_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work complete",
+      "description": "Finish claimed work and attach its durable evidence",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st work done",
+      "description": "Complete a person-assigned step with a response",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st work extend",
+      "description": "Add time to the execution budget of claimed work that ran out of it",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work fail",
+      "description": "Fail claimed work with an actionable reason and evidence",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st work ls",
+      "description": "List current actionable work; use --as to filter one agent or --all for history",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work progress",
+      "description": "Record a material progress update without changing ownership",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st work publish-mission",
+      "description": "Publish the exact ready mission produced by one claimed step",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_mission_output_and_manual_wake_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work release",
+      "description": "Give claimed work back so another eligible agent can take it",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st work renew",
+      "description": "Extend the live lease for work this incarnation still owns",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "shared API restart case"
+    },
+    {
+      "command": "st work retry",
+      "description": "Retry one failed step; this reopens its failed run when that step was the only failure",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work revise",
+      "description": "Propose a fenced revision to the mission that owns this work",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_revision_propose_inspect_approve_and_cancel_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work revision approve",
+      "description": "Approve an exact proposal preview and permit its cutover",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_revision_propose_inspect_approve_and_cancel_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work revision cancel",
+      "description": "Cancel a pending revision proposal without changing the live generation",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_revision_propose_inspect_approve_and_cancel_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work revision generation",
+      "description": "Explain one exact generation and its work state",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work revision generations",
+      "description": "List every immutable generation created for one mission run",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work revision show",
+      "description": "Show the current revision proposal for one mission run",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_revision_propose_inspect_approve_and_cancel_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work show",
+      "description": "Explain one work item, its owner, readiness, lease, and evidence",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work update",
+      "description": "Bring a person information they asked for. Nothing waits on it; it clears once read",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work wake",
+      "description": "Wake one ready assignee through its supported harness driver",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_mission_output_and_manual_wake_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    }
+  ],
+  "stui_effects": [
+    {
+      "effect": "OpenImage",
+      "tests": [
+        "crates/stui/src/ui/attach.rs::an_image_read_from_st_is_kept_once_by_its_hash",
+        "crates/st3/tests/action_coverage.rs::messages_survive_stale_fences_and_restarts"
+      ],
+      "verification": "UI reducer and corresponding real daemon action; local effects have no graph fence"
+    },
+    {
+      "effect": "Attention",
+      "tests": [
+        "crates/stui/src/main.rs::approving_a_gate_asked_again_acts_once_on_its_current_card",
+        "crates/st3/tests/action_coverage.rs::human_review_actions_survive_stale_fences_and_restarts",
+        "crates/stui/src/main.rs::launch_review_uses_its_public_launch_and_selected_variant_after_restart"
+      ],
+      "verification": "live UI adapter plus daemon restart"
+    },
+    {
+      "effect": "LaunchRevise",
+      "tests": [
+        "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::launch_actions_survive_stale_fences_and_restarts"
+      ],
+      "verification": "live UI adapter across daemon restart"
+    },
+    {
+      "effect": "Reply",
+      "tests": [
+        "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::messages_survive_stale_fences_and_restarts"
+      ],
+      "verification": "live adapter refuses a changed/absent Home card without sending; daemon send covers thread replies"
+    },
+    {
+      "effect": "Send",
+      "tests": [
+        "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::messages_survive_stale_fences_and_restarts"
+      ],
+      "verification": "live UI adapter plus daemon restart"
+    },
+    {
+      "effect": "CancelRun",
+      "tests": [
+        "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::mission_actions_survive_stale_fences_and_restarts"
+      ],
+      "verification": "live UI adapter across daemon restart"
+    },
+    {
+      "effect": "OpenTerminal",
+      "tests": [
+        "crates/stui/src/ui/mod.rs::ctrl_bracket_opens_an_agents_terminal_and_ctrl_backslash_returns",
+        "crates/st3/tests/action_coverage.rs::terminal_controls_survive_stale_screens_and_daemon_restarts"
+      ],
+      "verification": "UI reducer and corresponding real daemon action; local effects have no graph fence"
+    },
+    {
+      "effect": "TerminalKey",
+      "tests": [
+        "crates/stui/src/ui/pty.rs::keys_are_the_bytes_a_terminal_sends",
+        "crates/st3/tests/action_coverage.rs::terminal_controls_survive_stale_screens_and_daemon_restarts"
+      ],
+      "verification": "UI reducer and corresponding real daemon action; local effects have no graph fence"
+    },
+    {
+      "effect": "CloseTerminal",
+      "tests": [
+        "crates/stui/src/ui/mod.rs::ctrl_bracket_opens_an_agents_terminal_and_ctrl_backslash_returns",
+        "crates/st3/tests/action_coverage.rs::terminal_controls_survive_stale_screens_and_daemon_restarts"
+      ],
+      "verification": "UI reducer and corresponding real daemon action; local effects have no graph fence"
+    },
+    {
+      "effect": "CreateLaunch",
+      "tests": [
+        "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::launch_actions_survive_stale_fences_and_restarts"
+      ],
+      "verification": "live UI adapter plus daemon restart"
+    },
+    {
+      "effect": "RevokeDevice",
+      "tests": [
+        "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::pairing_revocation_survives_stale_fences_and_restarts"
+      ],
+      "verification": "live UI adapter across daemon restart"
+    },
+    {
+      "effect": "Discuss",
+      "tests": [
+        "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::messages_survive_stale_fences_and_restarts"
+      ],
+      "verification": "live UI adapter plus daemon restart"
+    },
+    {
+      "effect": "SaveGlass",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::layouts_cross_the_wire_unchanged",
+        "crates/st3/tests/action_coverage.rs::glasses_save_delete_and_read_survive_stale_bases_and_restarts"
+      ],
+      "verification": "UI reducer and corresponding real daemon action; local effects have no graph fence"
+    },
+    {
+      "effect": "StopAgent",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::ctrl_c_twice_stops_a_working_agent_and_quits_elsewhere",
+        "crates/st3/tests/action_coverage.rs::terminal_controls_survive_stale_screens_and_daemon_restarts"
+      ],
+      "verification": "UI reducer and corresponding real daemon action; local effects have no graph fence"
+    },
+    {
+      "effect": "CreateTerminal",
+      "tests": [
+        "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::creation_and_declaration_actions_survive_stale_fences_and_restarts"
+      ],
+      "verification": "live UI adapter plus daemon restart"
+    },
+    {
+      "effect": "CreateAgent",
+      "tests": [
+        "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::creation_and_declaration_actions_survive_stale_fences_and_restarts"
+      ],
+      "verification": "live UI adapter plus daemon restart"
+    },
+    {
+      "effect": "Resend",
+      "tests": [
+        "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::messages_survive_stale_fences_and_restarts"
+      ],
+      "verification": "live UI adapter plus daemon restart"
+    },
+    {
+      "effect": "Forget",
+      "tests": [
+        "crates/stui/src/ui/mod.rs::remind_me_later_hides_a_message_and_the_badge_counts_what_is_left"
+      ],
+      "verification": "UI reducer and corresponding real daemon action; local effects have no graph fence"
+    }
+  ],
+  "local_ui_actions": [
+    {
+      "action": "open panes, tabs, focus and Home",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::a_click_in_another_split_focuses_it"
+      ],
+      "verification": "local UI state; no daemon mutation, restart fence not applicable"
+    },
+    {
+      "action": "create, rename, duplicate, switch and close glasses",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local UI state; no daemon mutation, restart fence not applicable"
+    },
+    {
+      "action": "split and resize panes",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::layouts_cross_the_wire_unchanged"
+      ],
+      "verification": "local UI state; no daemon mutation, restart fence not applicable"
+    },
+    {
+      "action": "palette commands, search and dismiss",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that"
+      ],
+      "verification": "local UI state; no daemon mutation, restart fence not applicable"
+    },
+    {
+      "action": "scroll, follow and search conversations",
+      "tests": [
+        "crates/stui/src/ui/mod.rs::a_conversation_follows_new_lines_until_scrolled_up"
+      ],
+      "verification": "local UI state; no daemon mutation, restart fence not applicable"
+    },
+    {
+      "action": "copy selected text",
+      "tests": [
+        "crates/stui/src/ui/mod.rs::selection_copies_only_its_own_pane"
+      ],
+      "verification": "local UI state; no daemon mutation, restart fence not applicable"
+    },
+    {
+      "action": "edit or discard a draft",
+      "tests": [
+        "crates/stui/src/ui/mod.rs::drafts_take_the_terminal_editing_keys"
+      ],
+      "verification": "local UI state; no daemon mutation, restart fence not applicable"
+    },
+    {
+      "action": "simplify or expand tool detail",
+      "tests": [
+        "crates/stui/src/ui/mod.rs::shift_o_simplifies_every_conversation_and_back"
+      ],
+      "verification": "local UI state; no daemon mutation, restart fence not applicable"
+    },
+    {
+      "action": "dismiss/remind me later",
+      "tests": [
+        "crates/stui/src/ui/mod.rs::remind_me_later_hides_a_message_and_the_badge_counts_what_is_left"
+      ],
+      "verification": "local UI state; no daemon mutation, restart fence not applicable"
+    }
+  ],
+  "palette_actions": [
+    {
+      "action": "Open",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "ShowGlass",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "NewGlass",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "RenameGlass",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "DuplicateGlass",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "CloseGlass",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "NewAgent",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "Home",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "NewTerminal",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "NewMission",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "ToggleSimple",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "Name",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "Said",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    }
+  ]
+}

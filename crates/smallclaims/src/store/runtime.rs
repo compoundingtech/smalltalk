@@ -78,12 +78,14 @@ pub trait Runtime: Send + Sync {
         forced_batch: Option<&str>,
     ) -> Result<ClaimRecord>;
 
-    /// Project newly admitted replicated claims from a healthy frontier. `Ok(false)` asks for a
-    /// replay from nothing instead.
+    /// Project newly admitted replicated claims from a healthy frontier through `through`.
+    /// The store commits that frontier before lending the writer to the next chunk. Aggregates
+    /// may rebuild from their complete history. `Ok(false)` asks for a replay from nothing.
     fn project_incremental(
         &self,
         transaction: &Transaction<'_>,
         origin: &str,
+        through: u64,
     ) -> Result<bool, Error>;
 
     /// Clear every shared projection and fold the claims into it again in canonical order.
@@ -217,6 +219,7 @@ impl Runtime for Plain {
         &self,
         _transaction: &Transaction<'_>,
         _origin: &str,
+        _through: u64,
     ) -> Result<bool, Error> {
         Ok(true)
     }

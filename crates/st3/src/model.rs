@@ -132,6 +132,61 @@ pub struct MemberSpec {
     pub driver: Option<String>,
 }
 
+impl MemberSpec {
+    /// What differs between how this member is declared to launch and how `launched` was:
+    /// `host`, `workspace`, `harness`, `terminal` or `launch` (the command, or a typed harness's
+    /// model, effort and arguments). The argv st adds to a typed harness itself (its channel and
+    /// hook settings), the environment and the restart policy are left out, so a new st build or
+    /// a mission run's new generation is not a launch change.
+    pub fn launch_changes(&self, launched: &MemberSpec) -> Vec<&'static str> {
+        let mut changes = Vec::new();
+        if self.host != launched.host {
+            changes.push("host");
+        }
+        if self.workspace != launched.workspace || self.cwd != launched.cwd {
+            changes.push("workspace");
+        }
+        if self.driver != launched.driver {
+            changes.push("harness");
+        }
+        if self.terminal != launched.terminal {
+            changes.push("terminal");
+        }
+        if authored_launch(&self.launch) != authored_launch(&launched.launch) {
+            changes.push("launch");
+        }
+        changes
+    }
+}
+
+/// A launch without the arguments st puts right after a typed harness's program, past the
+/// wrapper's `--`: its channel and its hook settings, which follow st's build, not the author.
+pub(crate) fn authored_launch(launch: &LaunchSpec) -> Vec<&str> {
+    let argv = match launch {
+        LaunchSpec::Shell(source) => return vec![source.as_str()],
+        LaunchSpec::Argv(argv) => argv,
+    };
+    let Some(separator) = argv.iter().position(|argument| argument == "--") else {
+        return argv.iter().map(String::as_str).collect();
+    };
+    let mut authored = argv[..=separator]
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut provider = argv[separator + 1..].iter().map(String::as_str);
+    authored.extend(provider.next());
+    let mut provider = provider.peekable();
+    while provider
+        .peek()
+        .is_some_and(|flag| matches!(*flag, "--channels" | "--settings"))
+    {
+        provider.next();
+        provider.next();
+    }
+    authored.extend(provider);
+    authored
+}
+
 /// Presentation is independent of the durable seat identity.
 pub fn effective_agent_name<'a>(subject: &'a str, desired: Option<&'a Value>) -> &'a str {
     desired.and_then(|desired| {
@@ -535,6 +590,16 @@ pub struct GateContext {
     /// The owner's attempt. A later attempt gets its own mechanical and LLM gate results.
     #[serde(default)]
     pub attempt: u32,
+    /// The mission run and generation the gate decides for. A broken gate's attention item names
+    /// them and closes when the generation is replaced.
+    #[serde(default)]
+    pub run: String,
+    #[serde(default)]
+    pub generation: String,
+    /// Whether the gate decides for an eval run, whose exec gates keep their verdicts: any
+    /// status but 0 fails the boundary.
+    #[serde(default)]
+    pub eval: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -873,7 +938,20 @@ pub struct SubscriptionSpec {
     /// (`every "30m"`), and only when something arrived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_every_ms: Option<u64>,
+    /// A seat's watch on one issue or pull request (`delivery "watch"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchSpec>,
     pub stopped: bool,
+}
+
+/// What a watch hears: one item of the observed repository, from when the watch began until its
+/// optional deadline.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WatchSpec {
+    pub item: u64,
+    pub since_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_unix_ms: Option<u128>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -922,6 +1000,53 @@ pub struct MissionRequest {
     pub intent: IntentInput,
     #[serde(default)]
     pub at_index: Option<u64>,
+}
+
+/// Run each exec gate of a mission file once, now, the way a run would: `st missions check`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GateCheckRequest {
+    pub intent: IntentInput,
+    /// The workspace `${ST_WORKSPACE}` and relative gate workspaces stand for.
+    pub workspace: String,
+    /// Values for the mission's inputs. A gate that reads an input without one is unchecked.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct GateCheckView {
+    pub id: String,
+    /// The host that ran the checks. A gate declared for another host is `unchecked`.
+    pub host: String,
+    /// Whether every gate has its answer.
+    pub finished: bool,
+    pub gates: Vec<GateCheckItemView>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct GateCheckItemView {
+    pub mission: String,
+    /// What the gate decides for: `mission`, `step PATH`, or `loop PATH`.
+    pub owner: String,
+    pub gate: String,
+    pub host: String,
+    pub workspace: String,
+    pub command: String,
+    /// `waiting`, `running`, `pass`, `not-yet`, `broken`, or `unchecked`.
+    pub answer: String,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    /// Why the gate is broken or unchecked.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The end of the check's output.
+    #[serde(default)]
+    pub output: String,
+    /// The refusals and partial listings the check's `st` commands reported.
+    #[serde(default)]
+    pub calls: Vec<String>,
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1746,6 +1871,23 @@ pub struct MessageView {
     pub created_index: u64,
 }
 
+/// The daemon's answer to a message send, and what a send's idempotency key landed as. Older
+/// daemons answer a send with the bare message, which reads as a new send with no time.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MessageSendReceipt {
+    #[serde(flatten)]
+    pub message: MessageView,
+    /// The key that names this message: a request with the same key and content returns it again.
+    #[serde(default)]
+    pub idempotency_key: String,
+    /// The key already named this message when the request came, so nothing new was sent.
+    #[serde(default)]
+    pub already_sent: bool,
+    /// When this daemon first accepted the message, in RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MessagePage {
     pub items: Vec<MessageView>,
@@ -1903,6 +2045,9 @@ pub struct DoctorCheck {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DoctorReport {
+    /// Build identity of the responding daemon, absent on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_version: Option<String>,
     pub status: String,
     pub checks: Vec<DoctorCheck>,
     #[serde(default)]
@@ -2041,6 +2186,9 @@ pub struct MissionRunView {
     pub steps: Vec<StepRunView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loops: Vec<LoopRunView>,
+    /// Unresolved exit-code field gates on terminal execs, computed for mission details.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stuck_gates: Vec<String>,
 }
 
 /// Who set a finished run's outcome, from what, and why.
@@ -2502,4 +2650,58 @@ pub struct MissionOutputView {
     pub mission: String,
     pub revision: String,
     pub claim_id: String,
+}
+
+#[cfg(test)]
+mod launch_change_tests {
+    use super::{LaunchSpec, MemberSpec};
+
+    fn claude(settings: &str, model: &str) -> MemberSpec {
+        let intent = crate::graph::parse_intent(
+            &format!(
+                "version 2\nagent \"example/worker\" {{ workspace \"/work\"; harness \"claude\" {{ model {model:?}; }} }}"
+            ),
+            "example-host",
+        )
+        .unwrap();
+        let mut member = intent.subjects["agent/example/worker"]
+            .member
+            .clone()
+            .unwrap();
+        // Stand in for another st build's hook registration.
+        if let LaunchSpec::Argv(argv) = &mut member.launch {
+            let at = argv.iter().position(|item| item == "--settings").unwrap();
+            argv[at + 1] = settings.into();
+        }
+        member
+    }
+
+    #[test]
+    fn only_what_the_author_declares_changes_a_launch() {
+        let launched = claude("{\"hooks\":{}}", "example-model");
+        // Another st build's hook settings, a new run generation's environment and a new
+        // restart policy launch the same harness.
+        let mut same = claude("{\"hooks\":{\"Stop\":[]}}", "example-model");
+        same.environment
+            .insert("ST_RUN_GENERATION".into(), "next".into());
+        same.restart = super::RestartType::Never;
+        assert!(same.launch_changes(&launched).is_empty());
+
+        assert_eq!(
+            claude("{\"hooks\":{}}", "another-model").launch_changes(&launched),
+            ["launch"]
+        );
+        let mut moved = launched.clone();
+        moved.workspace = "/elsewhere".into();
+        moved.cwd = "/elsewhere".into();
+        assert_eq!(moved.launch_changes(&launched), ["workspace"]);
+        let mut switched = launched.clone();
+        switched.driver = Some("codex".into());
+        assert_eq!(switched.launch_changes(&launched), ["harness"]);
+        let mut command = launched.clone();
+        command.launch = LaunchSpec::Shell("sleep 1".into());
+        let mut other = command.clone();
+        other.launch = LaunchSpec::Shell("sleep 2".into());
+        assert_eq!(other.launch_changes(&command), ["launch"]);
+    }
 }

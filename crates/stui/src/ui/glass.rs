@@ -96,6 +96,8 @@ enum Drop {
     },
 }
 
+/// The sidebar's Usage section.
+const USAGE_SECTION: usize = 4;
 /// The sidebar's sections, what the number keys were in the old stui.
 /// The sidebar's sections, by the tab whose list each shows. Home is not one: it opens from
 /// the status line's ⌂ and "need you", over the glass.
@@ -310,7 +312,7 @@ impl Glasses {
     /// focused group first.
     /// Whether usage is on screen: the sidebar's Usage section or a usage tab in front.
     pub(crate) fn shows_usage(&self) -> bool {
-        if self.sidebar.shown && self.sidebar.section == 4 {
+        if self.sidebar.shown && self.sidebar.section == USAGE_SECTION {
             return true;
         }
         let glass = self.glass();
@@ -1501,6 +1503,23 @@ impl Ui {
     }
 
     /// Show the sidebar with the keys, or hide it when it has them (Ctrl+S).
+    /// The top bar's usage slot: the sidebar at Usage, or hidden when Usage already shows.
+    pub(crate) fn toggle_usage(&mut self) {
+        let Some(glasses) = self.glasses.as_mut() else {
+            return;
+        };
+        let sidebar = &mut glasses.sidebar;
+        if sidebar.shown && sidebar.section == USAGE_SECTION {
+            sidebar.shown = false;
+            sidebar.focused = false;
+        } else {
+            sidebar.shown = true;
+            sidebar.section = USAGE_SECTION;
+            sidebar.focused = true;
+        }
+        glasses.save();
+    }
+
     pub(crate) fn toggle_sidebar(&mut self) {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
@@ -1945,6 +1964,31 @@ impl Ui {
                 Hit::PaletteSection(3),
             );
         }
+        // Usage beside the fleet: the sidebar's Usage, shown and hidden (Nathan, 2026-10-03).
+        // The fleet's counts end in a space already.
+        let gap = if machines_shown { "· " } else { " · " };
+        spans.push(Span::styled(gap, bar(theme::dim())));
+        let x = area.x + Line::from(spans.clone()).width() as u16;
+        let usage_text = "$ usage";
+        let showing = self.glasses.as_ref().is_some_and(|glasses| {
+            glasses.sidebar.shown && glasses.sidebar.section == USAGE_SECTION
+        });
+        spans.push(Span::styled(
+            usage_text,
+            bar(if showing {
+                theme::strong(theme::YELLOW)
+            } else {
+                theme::fg(theme::YELLOW)
+            }),
+        ));
+        self.hit(
+            Rect {
+                x,
+                width: text::width(usage_text) as u16,
+                ..area
+            },
+            Hit::Usage,
+        );
         buf.set_line(area.x, area.y, &Line::from(spans), area.width);
         // ▢: one space.
         let name = format!(" ▢ {} ▾ ", glass.name);
@@ -2039,7 +2083,14 @@ impl Ui {
     fn pane_title(&self, pane: &Pane) -> String {
         let find = |id: &Option<String>| id.clone().unwrap_or_default();
         match pane {
-            Pane::Terminal(id) if id.starts_with("terminal/") => "shell".into(),
+            // A shell is named by the title its program gives, as a terminal's tab is.
+            Pane::Terminal(id) if id.starts_with("terminal/") => self
+                .terminal
+                .as_ref()
+                .filter(|view| &view.agent == id)
+                .and_then(|view| view.native.as_ref())
+                .and_then(pty::NativeTerminal::title)
+                .unwrap_or_else(|| "shell".into()),
             Pane::Agent(Some(id)) | Pane::Terminal(id) => self
                 .world
                 .agents
@@ -2292,8 +2343,10 @@ impl Ui {
                 }
                 KeyCode::Char('g') if control => self.open_choice(None, Open::Glass),
                 KeyCode::Char('k') if control || command => glasses.palette = None,
-                // Ctrl (or Alt, or ⌘) and a digit show only that section; the same again shows all.
-                KeyCode::Char(digit @ '1'..='5') if control || alt || command => {
+                // Ctrl+Q quits from anywhere, the palette included.
+                KeyCode::Char('q') if control => self.quit = true,
+                // Ctrl (or ⌘) and a digit show only that section; the same again shows all.
+                KeyCode::Char(digit @ '1'..='5') if control || command => {
                     let section = digit as usize - '1' as usize;
                     palette.section = (palette.section != Some(section)).then_some(section);
                     palette.selected = 0;
@@ -2309,14 +2362,14 @@ impl Ui {
             return true;
         }
         // The sidebar, while it has the keys.
-        if glasses.sidebar.focused
-            && glasses.sidebar.shown
-            && !self.editing
-            && self.find.is_none()
-            && self.sidebar_key(key)
-        {
+        let sidebar_keys = glasses.sidebar.focused && glasses.sidebar.shown;
+        if sidebar_keys && !self.editing && self.find.is_none() && self.sidebar_key(key) {
             return true;
         }
+        // The conversation that typing reaches, if one has the focus: never while the sidebar
+        // has the keys, whose own letters (b and p in Usage) must not type into a tab behind it.
+        let conversation = self.composing_agent().filter(|_| !sidebar_keys);
+        let undelivered = self.undelivered().is_some();
         let Some(glasses) = self.glasses.as_mut() else {
             return false;
         };
@@ -2349,12 +2402,68 @@ impl Ui {
         if terminal_focused {
             return false;
         }
+        // Alt and a letter or digit commands nothing: on a Mac Option types a character instead,
+        // and the letter alone may act below.
+        if alt && matches!(key.code, KeyCode::Char(_)) {
+            return true;
+        }
         let glass = glasses.glass();
         let tabs = glass.count(glass.focus).max(1);
         let current = glass.layout.groups()[glass.focus].current;
         let subject = glass.focused().is_some();
         let quiet = !self.editing && self.new_mission.is_none() && self.chat.is_none();
+        // Letters type, chords command (Nathan, 2026-10-03): in a conversation tab a plain
+        // printable key opens its message box and types itself, the first key included. Keys
+        // that act are chords below, so a sentence never starts by running a command.
+        if quiet
+            && self.confirm.is_none()
+            && self.popover.is_none()
+            && !control
+            && !alt
+            && !command
+            && let KeyCode::Char(character) = key.code
+            && let Some(agent) = conversation.clone()
+        {
+            let empty = self
+                .conversation_state
+                .drafts
+                .get(&agent)
+                .is_none_or(|draft| draft.is_empty());
+            if character == '?' && empty {
+                self.help = true;
+                return true;
+            }
+            self.editing = true;
+            // The message box takes this key, as it does every key while typing.
+            return false;
+        }
         match key.code {
+            KeyCode::Char('q') if control => self.quit = true,
+            KeyCode::Char('f') if control && conversation.is_some() => {
+                if let Some(agent) = &conversation {
+                    self.find_in(agent, "");
+                }
+            }
+            // Ctrl chords, not Alt: on a Mac Option and a letter types a character (Nathan,
+            // 2026-10-03).
+            KeyCode::Char('e') if control && conversation.is_some() => self.toggle_all_tools(),
+            KeyCode::Char('p') if control && conversation.is_some() => self.toggle_simple(),
+            KeyCode::Char('d') if control && conversation.is_some() => self.toggle_details(),
+            KeyCode::Char('r') if control && conversation.is_some() && self.live => {
+                if let Some(entry) = self.undelivered() {
+                    self.effects.push(Effect::Resend { entry });
+                }
+            }
+            // Backspace takes a message st never had back into the box, to change or delete.
+            KeyCode::Backspace
+                if quiet
+                    && key.modifiers.is_empty()
+                    && conversation.is_some()
+                    && self.live
+                    && undelivered =>
+            {
+                self.take_back_undelivered()
+            }
             KeyCode::Char('k') if control || command => self.open_palette(None, Open::Here),
             KeyCode::Char('s') if control => self.toggle_sidebar(),
             // Home over the glass, and away again; in a text box Ctrl+H stays backspace.
@@ -2374,7 +2483,6 @@ impl Ui {
                 glasses.zoomed = !glasses.zoomed && glasses.glass().layout.groups().len() > 1;
             }
             KeyCode::Char('g') if control => self.open_glasses_palette(),
-            KeyCode::Char(digit @ '1'..='9') if alt => self.show_tab(digit as usize - '1' as usize),
             // Next and previous tab in the focused split: Ctrl+PgDn/PgUp, Ctrl+Tab where the
             // terminal reports it, and ] and [ whenever nothing is being typed.
             KeyCode::PageDown | KeyCode::Tab if control => self.show_tab((current + 1) % tabs),
@@ -2387,6 +2495,10 @@ impl Ui {
             KeyCode::Char('[') if quiet && key.modifiers.is_empty() => {
                 self.show_tab((current + tabs - 1) % tabs)
             }
+            // Tab and Shift+Tab are tab keys here too. Left to the old layout, Tab switched its
+            // section (Home, Agents…) under the focused conversation (Nathan, 2026-10-03).
+            KeyCode::Tab if quiet => self.show_tab((current + 1) % tabs),
+            KeyCode::BackTab if quiet => self.show_tab((current + tabs - 1) % tabs),
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if alt => {
                 self.move_focus(key.code)
             }
@@ -3478,16 +3590,82 @@ mod tests {
         assert!(!ui.home_open());
         assert_eq!(ui.tab, 2, "back on the weekly release mission");
 
-        press(&mut ui, KeyCode::Char('1'), KeyModifiers::ALT);
+        ui.show_tab(0);
         assert_eq!(tabs(&ui).1, 0);
-        typed(&mut ui, "]");
+        // ] and [ type in a conversation tab; Ctrl+PgDn/PgUp move between tabs.
+        press(&mut ui, KeyCode::PageDown, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 1);
-        typed(&mut ui, "[");
+        press(&mut ui, KeyCode::PageUp, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 0);
         press(&mut ui, KeyCode::PageDown, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 1);
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
+    }
+
+    #[test]
+    fn letters_in_the_sidebar_never_type_into_the_conversation_behind_it() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ctrl(&mut ui, 's');
+        assert!(ui.glasses.as_ref().unwrap().sidebar.focused);
+        // Nathan, 2026-10-03: b in the Usage sidebar typed "b" into the agent's tab.
+        typed(&mut ui, "b");
+        assert!(!ui.editing);
+        assert!(
+            ui.conversation_state
+                .drafts
+                .get("agent/example/atlas/builder")
+                .is_none_or(String::is_empty)
+        );
+    }
+
+    #[test]
+    fn tab_moves_between_a_splits_tabs_and_never_switches_what_a_tab_shows() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "atlas builder");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        ctrl(&mut ui, 't');
+        typed(&mut ui, "weekly release");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        let both = vec![vec![ATLAS.to_owned(), WEEKLY.to_owned()]];
+        assert_eq!(tabs(&ui), (0, 1, both.clone()));
+        // Nathan, 2026-10-03: Tab in a conversation tab changed it to his Home items.
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(tabs(&ui), (0, 0, both.clone()));
+        assert!(screen(&ui).contains("Atlas Builder"));
+        press(&mut ui, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(tabs(&ui), (0, 1, both));
+        assert!(screen(&ui).contains("Weekly release"));
+    }
+
+    #[test]
+    fn details_are_per_agent_and_ctrl_chords_work_where_option_types() {
+        let mut ui = glass();
+        let atlas = "agent/example/atlas/builder".to_owned();
+        ui.open_in_glass(Pane::Agent(Some(atlas.clone())), Open::Tab);
+        // Nathan, 2026-10-03: hiding one agent's details hid every agent's.
+        ctrl(&mut ui, 'd');
+        assert!(!ui.editing, "a chord, not typing");
+        assert!(ui.details_hidden.contains(&atlas));
+        ui.open_in_glass(Pane::Agent(Some("agent/example/cos".into())), Open::Tab);
+        assert!(!ui.details_hidden.contains("agent/example/cos"));
+        // Ctrl+P is the simplified view and Ctrl+E opens the tool calls, on a Mac too.
+        ui.open_in_glass(Pane::Agent(Some(atlas.clone())), Open::Here);
+        let simple = ui.simple;
+        ctrl(&mut ui, 'p');
+        assert_ne!(ui.simple, simple);
+        let expanded = ui.conversation_state.expanded.clone();
+        ctrl(&mut ui, 'e');
+        assert!(!ui.editing);
+        assert_ne!(
+            ui.conversation_state.expanded, expanded,
+            "ctrl+e opens the tool calls"
+        );
     }
 
     #[test]
@@ -3662,6 +3840,38 @@ mod tests {
             Some(shell)
         );
         assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+    }
+
+    #[test]
+    fn ctrl_q_quits_with_the_palette_open() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'k');
+        assert!(ui.palette_open());
+        ctrl(&mut ui, 'q');
+        assert!(ui.quit);
+    }
+
+    #[test]
+    fn the_top_bars_usage_slot_shows_and_hides_the_sidebars_usage() {
+        let mut ui = glass();
+        let shown = screen(&ui);
+        let top = shown.lines().next().unwrap();
+        let column = top[..top.find("$ usage").expect("the top bar has usage")]
+            .chars()
+            .count() as u16;
+        let hit = ui
+            .frame
+            .borrow()
+            .hits
+            .iter()
+            .find(|(rect, _)| rect.y == 0 && rect.x <= column && column < rect.x + rect.width)
+            .map(|(_, hit)| hit.clone());
+        assert_eq!(hit, Some(Hit::Usage));
+        ui.click(Hit::Usage);
+        assert!(ui.glasses.as_ref().unwrap().shows_usage());
+        assert!(ui.glasses.as_ref().unwrap().sidebar.focused);
+        ui.click(Hit::Usage);
+        assert!(!ui.glasses.as_ref().unwrap().sidebar.shown);
     }
 
     #[test]
@@ -4032,7 +4242,7 @@ mod tests {
             Pane::Agent(Some("agent/example/atlas/builder".into())),
             Open::Tab,
         );
-        typed(&mut ui, "c");
+        // In a conversation tab the first letter starts the message.
         typed(&mut ui, "ship it");
         ctrl(&mut ui, 'a');
         typed(&mut ui, "please ");
@@ -4052,16 +4262,73 @@ mod tests {
     }
 
     #[test]
-    fn typing_owns_the_editing_keys_and_enter_keeps_the_input() {
+    fn in_a_conversation_letters_type_and_commands_are_chords() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        // Nathan, 2026-10-03: "letters type, chords command". A sentence that starts with a
+        // command letter is a sentence, not the command.
+        typed(&mut ui, "quite so");
+        assert!(!ui.quit);
+        assert_eq!(
+            ui.conversation_state.drafts["agent/example/atlas/builder"],
+            "quite so"
+        );
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        let shown = screen(&ui);
+        // Nathan, 2026-10-03: a space's footer names only the keys that move around.
+        assert!(
+            shown.contains("ctrl+k open") && shown.contains("tab tabs") && shown.contains("? help"),
+            "the footer: {shown}"
+        );
+        assert!(!shown.contains("q quit"), "{shown}");
+        // Leaving the box keeps the draft; the next letter goes on typing into it.
+        typed(&mut ui, "!");
+        assert!(ui.editing);
+        assert_eq!(
+            ui.conversation_state.drafts["agent/example/atlas/builder"],
+            "quite so!"
+        );
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        ui.conversation_state
+            .drafts
+            .remove("agent/example/atlas/builder");
+        // ? on an empty box is help.
+        typed(&mut ui, "?");
+        assert!(ui.help && !ui.editing);
+        ui.help = false;
+        // The commands are chords.
+        let folded = ui.conversation_state.expanded.clone();
+        ctrl(&mut ui, 'e');
+        assert!(!ui.editing);
+        assert_ne!(
+            ui.conversation_state.expanded, folded,
+            "ctrl+e opens the tool calls"
+        );
+        // Alt and a letter commands nothing: on a Mac Option types a character instead.
+        let expanded = ui.conversation_state.expanded.clone();
+        press(&mut ui, KeyCode::Char('o'), KeyModifiers::ALT);
+        assert_eq!(ui.conversation_state.expanded, expanded);
+        ctrl(&mut ui, 'q');
+        assert!(ui.quit);
+    }
+
+    #[test]
+    fn typing_owns_the_editing_keys_and_a_send_leaves_the_box() {
         let mut ui = glass();
         ui.open_in_glass(
             Pane::Agent(Some("agent/example/atlas/builder".into())),
             Open::Tab,
         );
         ui.live = true;
-        typed(&mut ui, "c");
-        assert!(ui.editing);
-        typed(&mut ui, "ship it now");
+        typed(&mut ui, "s");
+        assert!(
+            ui.editing,
+            "a letter opens the message box and types itself"
+        );
+        typed(&mut ui, "hip it now");
         ctrl(&mut ui, 'w');
         assert_eq!(
             tabs(&ui).2,
@@ -4077,8 +4344,12 @@ mod tests {
         };
         assert_eq!(draft(&ui), "ship it ");
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(ui.editing, "a send keeps the input focused");
+        // Nathan, 2026-10-03: a send leaves the box; the next letter opens it again.
+        assert!(!ui.editing, "a send leaves the box");
         assert_eq!(draft(&ui), "");
+        typed(&mut ui, "a");
+        assert!(ui.editing && draft(&ui) == "a");
+        ctrl(&mut ui, 'u');
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         ctrl(&mut ui, 'w');
         assert_eq!(
@@ -4149,8 +4420,10 @@ mod tests {
             });
         }
         assert!(screen(&ui).contains("unconfirmed, st did not answer"));
-        typed(&mut ui, "r");
-        typed(&mut ui, "x");
+        // Letters type in a conversation: Ctrl+R sends it again, and Backspace takes it back
+        // into the box to change or delete there.
+        ctrl(&mut ui, 'r');
+        press(&mut ui, KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(
             std::mem::take(&mut ui.effects),
             [
@@ -4161,6 +4434,11 @@ mod tests {
                     entry: "pending:token-1".into()
                 }
             ]
+        );
+        assert!(ui.editing);
+        assert_eq!(
+            ui.conversation_state.drafts["agent/example/atlas/builder"],
+            "hello"
         );
     }
 
@@ -4254,7 +4532,7 @@ mod tests {
         // A word the demo conversation says more than once.
         let word = "the";
         assert!(said(&ui).len() > 1);
-        typed(&mut ui, "/");
+        ctrl(&mut ui, 'f');
         typed(&mut ui, word);
         let shown = screen(&ui);
         let find = ui.find.as_ref().unwrap();
@@ -4860,6 +5138,146 @@ mod tests {
         assert!(screen(&ui).contains("echo in the shell"));
     }
 
+
+    #[test]
+    fn text_on_home_over_the_glass_selects_and_copies() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut ui = glass();
+        ui.open_home();
+        let shown = screen(&ui);
+        let (row, line) = shown
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("1,204,881 rows"))
+            .expect("Home shows the selected request");
+        let start = line.find("1,204,881").unwrap();
+        let column = line[..start].chars().count() as u16;
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        ui.mouse(mouse(MouseEventKind::Down(MouseButton::Left), column));
+        ui.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), column + 13));
+        screen(&ui);
+        assert_eq!(ui.selected_text().as_deref(), Some("1,204,881 rows"));
+        ui.mouse(mouse(MouseEventKind::Up(MouseButton::Left), column + 13));
+        assert!(ui.home_open(), "a drag on Home keeps it open");
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text == "Copied 1 line"),
+            "{:?}",
+            ui.flash
+        );
+    }
+
+    #[test]
+    fn a_shell_works_as_a_terminal_ctrl_c_at_once_drag_copies_title_names_the_tab() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use pty_core::protocol::{MessageType, PacketReader, encode_packet};
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        let mut ui = glass();
+        ui.live = true;
+        let shell = "terminal/example-shell".to_owned();
+        ui.open_in_glass(Pane::Terminal(shell.clone()), Open::Tab);
+        let (stui, mut daemon) = UnixStream::pair().unwrap();
+        ui.terminal = Some(crate::ui::TerminalView {
+            agent: shell.clone(),
+            title: "shell".into(),
+            name: "shell".into(),
+            lines: Vec::new(),
+            cursor: None,
+            stale: None,
+            ended: None,
+            native: Some(crate::ui::pty::NativeTerminal::spawn(
+                stui,
+                "example-shell",
+                "one".into(),
+                24,
+                80,
+            )),
+        });
+        let mut reader = PacketReader::new();
+        let mut packets = Vec::new();
+        let mut next = |daemon: &mut UnixStream| {
+            while packets.is_empty() {
+                let mut bytes = [0_u8; 256];
+                let count = daemon.read(&mut bytes).unwrap();
+                packets.extend(reader.feed(&bytes[..count]).unwrap());
+            }
+            packets.remove(0)
+        };
+        assert_eq!(next(&mut daemon).type_, MessageType::Attach);
+        daemon
+            .write_all(&encode_packet(MessageType::Screen, b"$ ls\r\nnotes.txt"))
+            .unwrap();
+        daemon
+            .write_all(&encode_packet(MessageType::Data, b"\x1b]2;vim notes\x07"))
+            .unwrap();
+        let start = std::time::Instant::now();
+        while !screen(&ui).contains("vim notes") {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "{}",
+                screen(&ui)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The person's own cursor stands where the shell's is, in the shape the program asks.
+        let body = ui.terminal_body.get().unwrap();
+        let cursor = ui.terminal_cursor.get().expect("the terminal has the keys");
+        assert_eq!((cursor.x, cursor.y), (body.x + 9, body.y + 1));
+        assert_eq!(
+            ui.cursor_style(),
+            Some(crossterm::cursor::SetCursorStyle::DefaultUserShape),
+            "the person's own shape until the program asks for one"
+        );
+        daemon
+            .write_all(&encode_packet(MessageType::Data, b"\x1b[6 q"))
+            .unwrap();
+        while ui.cursor_style() != Some(crossterm::cursor::SetCursorStyle::SteadyBar) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            screen(&ui);
+        }
+        // Under help the cursor is hidden; help is drawn over the terminal.
+        ui.help = true;
+        screen(&ui);
+        assert_eq!(ui.terminal_cursor.get(), None);
+        ui.help = false;
+        // Ctrl+C reaches the shell at once.
+        ctrl(&mut ui, 'c');
+        let mut packet = next(&mut daemon);
+        while packet.type_ != MessageType::Data {
+            packet = next(&mut daemon);
+        }
+        assert_eq!(packet.payload, b"\x03");
+        // A drag across what the shell printed selects it and copies it on release.
+        let body = ui.terminal_body.get().unwrap();
+        let mouse = |kind, column: u16| MouseEvent {
+            kind,
+            column: body.x + column,
+            row: body.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        ui.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0));
+        ui.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4));
+        ui.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4));
+        assert_eq!(
+            ui.native_terminal().unwrap().selected().as_deref(),
+            Some("notes")
+        );
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text == "Copied 1 line"),
+            "{:?}",
+            ui.flash
+        );
+    }
+
     #[test]
     fn home_opens_over_an_attached_shell_without_detaching_it() {
         let mut ui = glass();
@@ -4925,8 +5343,10 @@ mod tests {
         typed(&mut ui, "atlas builder");
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
 
-        // A new glass by name, from the palette's glasses section.
-        typed(&mut ui, "5");
+        // A new glass by name, from the palette's glasses section (a digit types in a
+        // conversation tab, so the palette opens first).
+        ctrl(&mut ui, 'k');
+        ctrl(&mut ui, '5');
         typed(&mut ui, "review");
         let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
         let new = ui
@@ -5101,7 +5521,6 @@ mod tests {
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned(), WEEKLY.to_owned()]]);
 
         // A change here goes to st on top of what st last sent.
-        press(&mut ui, KeyCode::Char('3'), KeyModifiers::ALT);
         ctrl(&mut ui, 'w');
         let sent = writes(&mut ui);
         assert!(

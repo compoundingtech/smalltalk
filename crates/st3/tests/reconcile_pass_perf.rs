@@ -9,7 +9,8 @@
 //!
 //! `ST3_PERF_NODE` is the member's node name. `ST3_PERF_RUNTIMES` names a JSON list of the member's
 //! running runtimes (`runtime_id`, `incarnation_id`, `terminal`), taken from its
-//! `/v1/client/runtimes`.
+//! `/v1/client/runtimes`. `ST3_PERF_INCREMENTAL=1` times passes that skip mission runs whose
+//! inputs did not change, as a daemon's do between its full passes.
 //!
 //! ```sh
 //! bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --bind COPY_DIR COPY_DIR \
@@ -134,7 +135,8 @@ fn quiet_reconcile_passes_on_a_store_copy() {
         Arc::new(runtime),
         node,
         Arc::new(Notify::new()),
-    );
+    )
+    .skipping_unneeded(std::env::var("ST3_PERF_INCREMENTAL").as_deref() == Ok("1"));
     // Settle: start what is declared and record what changed, until a pass writes nothing.
     for settle in 0..30 {
         let before = store.index().unwrap();
@@ -177,10 +179,21 @@ fn quiet_reconcile_passes_on_a_store_copy() {
         wall.push(started.elapsed().as_secs_f64() * 1000.0);
     }
     let after = queries(&st3::performance::snapshot());
+    // The loop reads the next deadline after every pass.
+    let mut deadline_cpu = Vec::new();
+    for _ in 0..passes {
+        let cpu_started = thread_cpu_ms();
+        st3::profile::task("task reconcile-deadline", || reconciler.next_deadline());
+        deadline_cpu.push(thread_cpu_ms() - cpu_started);
+    }
     println!(
         "quiet pass: wall {:.0} ms, CPU on the pass thread {:.0} ms (mean of {passes})",
         wall.iter().sum::<f64>() / passes as f64,
         cpu.iter().sum::<f64>() / passes as f64
+    );
+    println!(
+        "next deadline after a pass: CPU {:.0} ms (mean of {passes})",
+        deadline_cpu.iter().sum::<f64>() / passes as f64
     );
     let mut rows = after
         .iter()

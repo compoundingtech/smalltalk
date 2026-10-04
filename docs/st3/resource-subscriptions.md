@@ -24,19 +24,38 @@ latest state. The repository resource keeps only its own facts, such as `reposit
 
 | Data type | Facts on each item |
 |---|---|
-| `pull_requests` | `number`, `url`, `title`, `author`, `created_at`, `state`, `merged` once closed, `draft`, `head_sha`, `branch`, `checks_state`, `checks` (each `name`, `status`, `conclusion`), `review_decision`, `reviews` (each reviewer's latest `state` and `commit`), `merge_queue` (`state`, `position`) while queued, and `opened_by`/`opened_by_run` |
+| `pull_requests` | `number`, `url`, `title`, `author`, `created_at`, `state`, `merged` once closed, `draft`, `head_sha`, `branch`, `base_branch`, `checks_state`, `checks` (each `name`, `status`, `conclusion`), `required_checks` (`state`, `source`, `checks`, `failed`), `review_decision`, `reviews` (each reviewer's latest `state` and `commit`), `merge_queue` (`state`, `position`) while queued, and `opened_by`/`opened_by_run` |
 | `issues` | `number`, `url`, `title`, `author`, `created_at`, `state`, `state_reason` |
-| `comments` | `comments` (the count), and `last_comment` (`id`, `author`, `url`, `created_at`, `updated_at`, `body_digest`) |
+| `comments` | `comments` (the count), `last_comment` (`id`, `author`, `url`, `created_at`, `updated_at`, `body_digest`), and `recent_comments`: the newest 20 conversation comments and submitted reviews, oldest first, each `kind` (`comment` or `review`), `id`, `author`, `at`, and a review's `state` |
 | `reactions` | `reactions` (each reaction's count), and `last_comment.reactions` |
 | `mentions` | `mentions`: the newest mention of each GitHub login in the item's body or comments (`login`, `by`, `url`, `at`), up to 50 |
 
 A comment body never enters the graph. `body_digest` tells one body from another, and `url` leads to
 the text. A subscription that selects `comments`, `reactions`, or `mentions` hears a change of that
-type only; a check, a review, or a new head is a `pull_requests` change.
+type only; a check, a review's state, or a new head is a `pull_requests` change, and a new entry in
+`recent_comments`, a comment or a review, is a `comments` change.
+
+`recent_comments` keeps every comment and review once, whichever read saw it, so two comments
+between polls are two entries. An edit keeps its entry. A pull request's reviews join it only on an
+observer that emits `comments`.
+
+`required_checks` says how the checks a pull request's base branch requires stand on its head.
+`checks` names the checks that count. With `source` `rules` they are those the base branch's
+rulesets and classic protection require. A check matches by name, and, when the rule names an
+app, only a check run from that app counts; a commit status names no app, so it counts only for a
+rule that names none. With `source` `all` the base requires none, or GitHub would not show its rules, and every check
+on the head counts. `state` is `pass` when every counted check finished as success, neutral or
+skipped, `fail` when one finished any other way (named in `failed`), `pending` otherwise, including
+while a required check has not appeared, and `none` when nothing counts. Optional checks never
+decide it.
 
 The `github.ref` provider supports `head` and `ancestors`. `head` is the selected branch's commit SHA.
 `ancestors` contains the full `refs/heads/NAME` name of every other repository branch whose head is
 reachable from the selected branch.
+
+A live subscription to a `github.ref` observer now checks at least every thirty seconds, using the existing shared ETag cache and conditional requests. An explicit faster `every` interval is retained. Unchanged HTTP 304 responses reuse the complete normalized facts and do not create another resource observation or delivery. Without a subscription the observer retains its ordinary five-minute default or its authored interval. Rate-limit retry deadlines remain authoritative.
+
+For mission deliveries from a `vcs.ref`, only the newest observed head remains queued. Older unstarted deliveries are cancelled before capacity retries and stay cancelled across daemon restart. Run creation rechecks that head in its writer transaction. A running mission retains its original pinned resource claim and its exact-commit `ci-passed` gate. Keep the applier mission at `concurrent-runs max=1` and on its existing host; no push receiver or additional applier is introduced.
 
 Every item the observer sees becomes its resource, including a draft pull request and every open
 item at the baseline. Only a change records an observation: an unchanged item records nothing, and
@@ -47,7 +66,10 @@ opened one. When a pull request appears or moves to a new head, the observing ho
 agent on that host whose workspace has the pull request's branch checked out. When exactly one
 agent has it, the listing records that agent as `opened_by` and its mission run as `opened_by_run`.
 A pull request keeps an opener once named, so a reviewer or fixer that later checks out the branch
-does not take it over. When no agent is named, a mission run that published
+does not take it over. Like an issue's, each attribution fact stays across every later write to
+the pull request resource: a publisher's partial snapshot such as `{state: merged}`, a
+`github.pull-request` observation that never reads it, and a later claim that names another opener
+(Nathan, 2026-10-03, #778 rule 5). When no agent is named, a mission run that published
 `resource/mission-run/RUN/pull-request` for the pull request becomes its `opened_by_run`. A review
 mission routes its findings to that agent or run.
 
@@ -59,9 +81,9 @@ The local file provider supports `status`, `path`, `content_hash`, `size`, `mode
 
 ## Authored watch operation
 
-A planner or authorized producing agent authors the watch as a mission graph. The public CLI does
-not expose a standalone resource-watch mutation. The delivery target is explicit in the mission;
-it is never inferred from a caller's terminal environment.
+A planner or authorized producing agent authors the watch as a mission graph. The delivery target
+is explicit in the mission; it is never inferred from a caller's terminal environment. The one
+standalone watch is a seat's watch on a GitHub issue or pull request (`st gh watch`, below).
 
 The subscription key includes the provider kind, provider locator, selected fields, target, and delivery type. An exact retry returns the same subjects.
 
@@ -182,8 +204,17 @@ and costs nothing. A read longer than 10 pages records what it read and continue
 Pull request heads, checks, reviews, and merge-queue state come from one GraphQL query for every
 open pull request. GraphQL has no conditional request and spends its own hourly budget, so the
 query runs at the first poll, when the issues listing shows an open pull request changed, while a
-pull request has pending checks or a place in the merge queue, and otherwise every 15 minutes.
-Every observer of the repository on a host shares the answer.
+pull request has pending checks, failed required checks that a rerun may fix, or a place in the
+merge queue, and otherwise every 15 minutes, but
+never sooner than a minute after the last one unless a refresh asks. A change seen within that
+minute is remembered, and the first poll after it reads. Every observer of the repository on a host
+shares the answer. Submitting a review moves the pull request's update time, so the issues listing
+shows it.
+
+With each GraphQL read, the provider reads the rules of each open pull request's base branch:
+`rules/branches/BASE` and `branches/BASE`, conditionally and with read access. A 403 or a 404 from
+either leaves the other; when GitHub shows neither, every check counts. A refused rule never fails
+the observation.
 
 A reaction changes no update time. With `reactions`, the provider also reads the open issues
 listing, which names each open item's reactions, and the newest 100 comments for theirs.
@@ -202,6 +233,8 @@ there and left the open listing, and records the repository facts without the it
 compares an item against that older listing, so the upgrade starts no review and no triage.
 
 The provider can use a webhook, a stream, or a conditional request. A conditional provider returns one next-check deadline.
+An observer's `every` replaces that deadline, except when the provider asks to continue within a
+second, as a listing longer than one read does.
 
 The daemon records that deadline as a one-shot wake. It does not run a periodic discovery sweep.
 
@@ -278,6 +311,97 @@ Each item has a stable delivery key: the subscription's local name, the reposito
 and its head or the mention. An owner's message takes its subject from the key, and a batch
 records the keys it carries, so a repeated observation, a replacement watch, or a daemon restart
 delivers nothing more. A review or triage request keeps the key as before.
+
+## A seat's GitHub watch
+
+`st gh watch OWNER/REPO#N` gives the seat that runs it one watch on that issue or pull request. The
+seat wakes once for each new comment or review on it, each time the required checks on its current
+head move into pass or fail, and a last time when it closes or merges, which ends the watch.
+
+```kdl
+subscription "watch/acme/garden/12/example/planner" {
+  observer "observer/github/acme/garden"
+  to "agent/example/planner"
+  on "comments"
+  on "issues"
+  on "pull_requests"
+  delivery "watch" { item 12; since "2026-10-03T14:00:00.000Z"; until "2026-10-03T18:00:00.000Z" }
+}
+```
+
+The daemon declares the watch for the seat, which owns it; no mission run does. Watching a thread
+twice keeps the one watch and takes the new deadline. `st gh unwatch` ends a seat's own watch, and a
+person ends any seat's with `--agent`. `st gh ls` lists a seat's watches, running and ended in the
+last day, and `--all` every seat's.
+
+Every watch of a repository, from any host, uses one standing observer,
+`observer/github/OWNER/REPO`, which no mission run owns. The first watch of the repository declares
+it on its host, which polls it every 30 seconds; the host stops it once no running subscription
+uses it. No issue or pull request has a poller of its own.
+
+The standing observer records into `resource/github/OWNER/REPO`, unless another observer of the
+repository runs: then it records into that observer's resource and keeps that resource from then
+on. Subscriptions are grouped by resource, so a poll by either observer delivers to the
+subscriptions of both, and every item has one resource.
+
+A mission subscription can name a standing observer too, as an intake does:
+
+```kdl
+subscription "pull-request-reviews" {
+  observer "observer/github/acme/garden"
+  on "pull_requests"
+  delivery "mission" { mission "acme/review"; resource "source"; workspace "/srv/reviews" }
+}
+```
+
+The run declares the standing observer when it starts, and its host keeps it running while the
+subscription runs. Cancelling the run stops its subscriptions, never the observer, which stops
+only once nothing uses it. To move an intake from an observer of its own onto the standing observer,
+revise its run so its subscriptions keep their names and name the standing observer instead, and
+drop its own observer. The revision declares the standing observer before the old observer stops,
+so the standing observer takes the old one's resource; an observer that never recorded anything
+starts from the cursor of the observer that last recorded into its resource. Item facts, delivery
+keys and pending requests stay where they were, so the move delivers nothing twice and misses
+nothing.
+
+The write that records an observation decides each watch's wakes from its item's prior facts:
+
+- each `recent_comments` entry the item did not know is one wake, when it was made no earlier than
+  five minutes before the watch began, so two comments between polls are two wakes; an edit keeps
+  its entry and wakes nobody;
+- a move of `required_checks.state` into `pass` or `fail`, or a new head first seen there, is one
+  wake; a new head starts over, and a rerun that fails again on the same head wakes again;
+- the item closing or merging is the last wake, and `subscription.watch-ended` records it in the
+  same write, so nothing follows it. Only that watch ends.
+
+Each wake is one `message.sent` from the observing host to the seat, in prose: who did what where,
+with the link. Its subject comes from the watch, when it began, and the event, so a repeated
+observation or a restart sends nothing twice, and the baseline sends nothing. When the seat's host
+delivers a wake about a comment or review, it reads the text from GitHub by its ID and shows the
+first 600 characters; the text is never stored in the graph.
+
+A watch survives a seat's stop and start, suspend and resume, and daemon or host restarts. Wakes
+queue as ordinary mail while the seat is stopped. The repository observer keeps polling while
+any watch is alive, including a stopped seat's watch, and stops when the last watch ends.
+
+The host that declared a watch ends it without a wake when the seat is retired (its declaration
+is removed) or explicitly starts a fresh conversation (`fresh-context`). Ending a mission run
+or stopping its seat does not itself remove the watch. A deadline gives one final wake and ends
+the watch even while the seat is stopped. Each ending also stops that watch's declaration.
+
+Every fleet agent posts as one GitHub login, so a login cannot say which seat wrote a comment.
+`st gh comment OWNER/REPO#N --body-file FILE` posts through the seat's daemon, records the new
+comment's GitHub ID as the seat's (`github.posted` on `github-post/OWNER/REPO/KIND/ID`), and
+watches the thread unless `--no-watch`; `--review approve|request-changes|comment` posts a pull
+request review instead. `st gh own URL` records a comment or review posted some other way, and
+refuses one whose author is not the login this host posts as. The first seat to record an ID keeps
+it.
+
+A seat never wakes for what it recorded. The observing host writes no wake for it when the record
+has reached it, and the seat's own host, which knows its posts at once, withdraws any wake that
+arrived first and holds a thread's wakes while the seat's post is in flight. No one else waits:
+every other seat's wake about a recorded comment names the seat that posted it, and a comment from
+the shared login that no seat recorded wakes every watcher, since a person may share the login.
 
 ## Retention
 

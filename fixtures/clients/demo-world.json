@@ -282,6 +282,7 @@
         "id": "attention/1",
         "kind": {
           "because": "cut-over cannot start until you answer; the old store stays read-only meanwhile",
+          "feedback": false,
           "kind": "review",
           "look_at": [
             [
@@ -1067,9 +1068,11 @@
             "goals": [
               "Finish the snapshot step and record what it produced."
             ],
+            "id": "step-run/demo/snapshot",
             "name": "snapshot",
             "note": null,
             "owner": "Atlas Builder",
+            "seat": "Atlas Builder",
             "state": "done"
           },
           {
@@ -1088,9 +1091,11 @@
             "goals": [
               "Finish the convert step and record what it produced."
             ],
+            "id": "step-run/demo/convert",
             "name": "convert",
             "note": "conversion check passed",
             "owner": "Atlas Builder",
+            "seat": "Atlas Builder",
             "state": "done"
           },
           {
@@ -1107,9 +1112,11 @@
             "goals": [
               "Finish the compare step and record what it produced."
             ],
+            "id": "step-run/demo/compare",
             "name": "compare",
             "note": "0 mismatches in 1,204,881 rows",
             "owner": "Atlas Builder",
+            "seat": "Atlas Builder",
             "state": "done"
           },
           {
@@ -1128,9 +1135,11 @@
             "goals": [
               "Switch reads and writes to the new store once a person approves."
             ],
+            "id": "step-run/demo/cut-over",
             "name": "cut-over",
             "note": "waiting for your review",
             "owner": null,
+            "seat": null,
             "state": "needs_you"
           },
           {
@@ -1147,9 +1156,11 @@
             "goals": [
               "Finish the cleanup step and record what it produced."
             ],
+            "id": "step-run/demo/cleanup",
             "name": "cleanup",
             "note": null,
             "owner": "Atlas Builder",
+            "seat": "Atlas Builder",
             "state": "pending"
           }
         ],
@@ -1186,9 +1197,11 @@
             "goals": [
               "Finish the draft step and record what it produced."
             ],
+            "id": "step-run/demo/draft",
             "name": "draft",
             "note": "asked for your feedback",
             "owner": "Docs Writer",
+            "seat": "Docs Writer",
             "state": "needs_you"
           },
           {
@@ -1205,9 +1218,11 @@
             "goals": [
               "Finish the publish step and record what it produced."
             ],
+            "id": "step-run/demo/publish",
             "name": "publish",
             "note": null,
             "owner": "Docs Writer",
+            "seat": "Docs Writer",
             "state": "pending"
           }
         ],
@@ -1244,9 +1259,11 @@
             "goals": [
               "Finish the changelog step and record what it produced."
             ],
+            "id": "step-run/demo/changelog",
             "name": "changelog",
             "note": null,
             "owner": "Release Captain",
+            "seat": "Release Captain",
             "state": "done"
           },
           {
@@ -1265,9 +1282,11 @@
             "goals": [
               "Finish the tag step and record what it produced."
             ],
+            "id": "step-run/demo/tag",
             "name": "tag",
             "note": "seat keeps restarting",
             "owner": "Release Captain",
+            "seat": "Release Captain",
             "state": "failed"
           },
           {
@@ -1284,9 +1303,11 @@
             "goals": [
               "Finish the publish step and record what it produced."
             ],
+            "id": "step-run/demo/publish",
             "name": "publish",
             "note": null,
             "owner": "Release Captain",
+            "seat": "Release Captain",
             "state": "pending"
           }
         ],
@@ -1323,9 +1344,11 @@
             "goals": [
               "Finish the review step and record what it produced."
             ],
+            "id": "step-run/demo/review",
             "name": "review",
             "note": null,
             "owner": "Harbor Reviewer",
+            "seat": "Harbor Reviewer",
             "state": "working"
           },
           {
@@ -1342,9 +1365,11 @@
             "goals": [
               "Finish the route step and record what it produced."
             ],
+            "id": "step-run/demo/route",
             "name": "route",
             "note": null,
             "owner": "Harbor Reviewer",
+            "seat": "Harbor Reviewer",
             "state": "pending"
           }
         ],
@@ -1381,9 +1406,11 @@
             "goals": [
               "Finish the inventory step and record what it produced."
             ],
+            "id": "step-run/demo/inventory",
             "name": "inventory",
             "note": null,
             "owner": "Rekey Worker",
+            "seat": "Rekey Worker",
             "state": "done"
           },
           {
@@ -1400,9 +1427,11 @@
             "goals": [
               "Finish the rotate step and record what it produced."
             ],
+            "id": "step-run/demo/rotate",
             "name": "rotate",
             "note": "queued for Rekey Worker, which finishes harbor/nightly first",
             "owner": null,
+            "seat": null,
             "state": "ready"
           },
           {
@@ -1419,9 +1448,11 @@
             "goals": [
               "Finish the report step and record what it produced."
             ],
+            "id": "step-run/demo/report",
             "name": "report",
             "note": null,
             "owner": "Rekey Worker",
+            "seat": "Rekey Worker",
             "state": "pending"
           }
         ],
@@ -1458,9 +1489,11 @@
             "goals": [
               "Finish the watch step and record what it produced."
             ],
+            "id": "step-run/demo/watch",
             "name": "watch",
             "note": "standing; wakes on merged changes",
             "owner": "Docs Writer",
+            "seat": "Docs Writer",
             "state": "waiting"
           }
         ],
@@ -1495,9 +1528,11 @@
             "goals": [
               "Finish the build step and record what it produced."
             ],
+            "id": "step-run/demo/build",
             "name": "build",
             "note": null,
             "owner": "Atlas Indexer",
+            "seat": "Atlas Indexer",
             "state": "done"
           },
           {
@@ -1514,9 +1549,11 @@
             "goals": [
               "Finish the test step and record what it produced."
             ],
+            "id": "step-run/demo/test",
             "name": "test",
             "note": null,
             "owner": "Atlas Indexer",
+            "seat": "Atlas Indexer",
             "state": "done"
           }
         ],

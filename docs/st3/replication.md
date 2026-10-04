@@ -172,6 +172,15 @@ transactional digest machinery and rebuilds shared projections once, correcting 
 creation/change dates from claim facts. New writer connections must register the projection
 functions, including isolated checkpoint proof connections.
 
+The indexed `resource_observations` projection participates in the complete shared table digest
+and canonical replay audit. The projection version identifying its layout is included in the
+runtime schema compatibility identity alongside the claim vocabulary digest. Mixed builds with and
+without this projection continue exchanging admitted claim authority, but do not compare their
+incompatible projection maps as if they represented the same graph. After upgrade, the table is
+backfilled from retained admitted `resource.observed` claims and projection comparisons resume.
+This changes no claim or resource vocabulary and requires no new replication payload fields.
+
+
 ## Add any machine
 
 Install st on the new machine and configure the person who operates it, as described in the
@@ -445,6 +454,35 @@ The graph is replayed from nothing only in these cases:
 
 A rebuilt part costs what its own history costs, while a replay holds the store's only writer for
 as long as the whole graph takes.
+
+Routine work actions, including `work.extended`, project incrementally. An extension preserves
+the attempt's execution budget and lease on its own node and its peers; an out-of-order extension
+can rebuild its run tree. The extension regression checks newer local state, full-replay parity
+and restart without requiring a full-store replay for the work action.
+
+The extension correction uses checkpoint rules v6 and a new shared projection compatibility
+identity. Mixed builds continue authority sync and defer incompatible graph comparisons. On
+upgrade, `work_extended_projection_rules=1` records a successful canonical rebuild of just the
+roots with retained extension claims; unresolved roots leave the migration pending. Existing v5
+certificates and tombstones remain historical authority, and their certified manifests can still
+be adopted. All checkpoint participants must use v6 before the next cut verifies.
+
+Scheduled occurrence deduplication uses checkpoint rules v7 and a new projection compatibility
+identity. Competing creation claims for one occurrence select one initial definition in canonical
+order, without combining steps from different child revisions. Upgrade rebuilds only run trees
+with multiple creation claims, once; ordinary run trees keep their projections. Historical
+checkpoint certificates remain authority, and mixed builds continue exchanging claim authority
+while deferring incompatible graph comparisons.
+
+Incremental catch-up projection commits at most 128 newly admitted claims per transaction and
+returns the writer between chunks, so queued messages and lease renewals can run. Each commit
+records the frontier actually projected. Admissions and catch-up deferrals advance a generation;
+the final pass clears only the generation it observed while holding the writer, so it cannot
+overwrite a newer deferral. Sync comparisons remain deferred until the pass has
+reached its starting backlog and no later admitted claims remain. A dirty aggregate still
+rebuilds from its complete canonical history; the chunk limit does not bound that history or a
+fallback replay. The regression interleaves local writes with committed prefixes and checks the
+final graph against canonical replay.
 
 The first start of a build with this rule replays from nothing once. A run that this node created
 could show as over in its old graph while its claims say it runs. Starting that work again long

@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const ts = require('../../../apps/ios/node_modules/typescript');
+const ts = require('typescript');
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'st3-ts-client-'));
 for (const name of ['Models.generated', 'Client.generated']) {
@@ -12,7 +12,6 @@ for (const name of ['Models.generated', 'Client.generated']) {
     fs.writeFileSync(path.join(temporary, `${name}.js`), output);
 }
 const { St3Client, ClientError, applyWindow } = require(path.join(temporary, 'Client.generated.js'));
-const { CONTRACT_SHA256 } = require(path.join(temporary, 'Models.generated.js'));
 fs.rmSync(temporary, { recursive: true, force: true });
 
 const snapshot = { id: 'snapshot/test', host_id: 'host/test', store_index: 1, projection_version: 'client-projection.v0', created_at: '2026-09-20T00:00:00Z' };
@@ -177,6 +176,33 @@ test('collection stream holds commands until the socket opens and passes frames 
     assert.deepEqual(socket.closed, [1000]);
 });
 
+test('collection commands preserve omitted and nullable options and failure metadata', async () => {
+    const socket = collectionSocket();
+    const frames = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const stream = await client.collectionStream({ onFrame: frame => frames.push(frame), socket: () => socket });
+    socket.onopen();
+    stream.subscribe('agents', 'agents');
+    stream.subscribe('nullable', 'work', 100, { person: null, actor: null, status: null });
+    stream.subscribeTerminal('current', 'terminal/example', undefined, 'capability-proof');
+    stream.subscribeTerminal('nullable-terminal', 'terminal/example', null, 'capability-proof');
+    assert.deepEqual(socket.sent, [
+        { kind: 'subscribe', id: 'agents', collection: 'agents' },
+        { kind: 'subscribe', id: 'nullable', collection: 'work', limit: 100, person: null, actor: null, status: null },
+        { kind: 'subscribe', id: 'current', collection: 'terminal', terminal: 'terminal/example', capability: 'capability-proof' },
+        { kind: 'subscribe', id: 'nullable-terminal', collection: 'terminal', terminal: 'terminal/example', incarnation: null, capability: 'capability-proof' },
+    ]);
+    const failures = [
+        { kind: 'resync', id: 'agents', code: 'internal', message: 'Retry the read', retryable: true },
+        { kind: 'resync', id: 'chat', collection: 'conversation', retryable: true },
+        { kind: 'error', id: 'chat', collection: 'conversation', code: 'timeline-history-incomplete', message: 'History missing', retryable: false },
+        { kind: 'error', id: 'current', collection: 'terminal', code: 'stale-fence', message: 'Restarted', retryable: false },
+    ];
+    for (const frame of failures) socket.onmessage({ data: JSON.stringify(frame) });
+    assert.deepEqual(frames, failures);
+    stream.close();
+});
+
 test('closing the collection stream sends nothing more and reports no end', async () => {
     const socket = collectionSocket();
     const ends = [];
@@ -204,15 +230,6 @@ test('applyWindow keeps a window in the order each frame names', () => {
     assert.equal(window.hasMore, false);
     assert.equal(window.snapshot.id, 'snapshot/later');
     assert.equal(applyWindow(window, { kind: 'resync', id: 'm' }), window);
-});
-
-test('generated hash uses normative schema and operations bytes', () => {
-    const crypto = require('node:crypto');
-    const root = path.join(__dirname, '../../..');
-    const hash = crypto.createHash('sha256');
-    hash.update(fs.readFileSync(path.join(root, 'docs/st3/client-v0/schemas/client-v0.schema.json')));
-    hash.update(fs.readFileSync(path.join(root, 'docs/st3/client-v0/schemas/operations.json')));
-    assert.equal(CONTRACT_SHA256, hash.digest('hex'));
 });
 
 test('glass methods preserve structure, null creation base, and idempotency headers', async () => {

@@ -30,7 +30,7 @@ struct Fixture {
 }
 
 fn st3() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_st3"))
+    Path::new(env!("CARGO_BIN_EXE_st3-fixture"))
 }
 
 fn write_program(path: &Path, source: &str) {

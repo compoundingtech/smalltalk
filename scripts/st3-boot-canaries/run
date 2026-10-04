@@ -23,6 +23,7 @@ Every seat must, within the time bound, claim its step with its current incarnat
 st message, and none may park in the crash-loop guard. The verdict is in EVIDENCE_DIR/result.json.
 """
 import argparse
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -259,6 +260,7 @@ class Seats:
         self.node, self.letters, self.bound = node, letters, bound
         self.incarnations = {}
         self.timings = {}
+        self.read_probes = set()
 
     def step(self, letter):
         listed = self.node.cli("work", "ls", "--all")
@@ -304,6 +306,7 @@ class Seats:
                     probes[letter] = sent["subject"]
                 view = self.node.api("/v1/messages/read/" + probes[letter]) or {}
                 if view.get("status") in ("read", "closed"):
+                    self.read_probes.add(probes[letter])
                     self.incarnations[letter] = incarnation
                     self.timings[f"{label}:{letter}"] = round(time.monotonic() - started, 1)
                     pending.discard(letter)
@@ -467,15 +470,34 @@ def suspend_and_resume(node, seats, harness):
     seats.timings["suspend:failed-resume-code"] = code
 
 
+def continued_session(node, label):
+    """The relaunched harness continued the session its predecessor ran, as every restart does."""
+    launched = native_sessions(node, "a")
+    if len(launched) < 2:
+        fail(f"{label}: the seat ran {launched}, not a session and its continuation")
+    previous, latest = launched[-2][0], launched[-1]
+    if latest != (previous, True):
+        fail(f"{label}: the relaunched harness ran {latest}, not session {previous} continued")
+
+
 def scenario(node, seats, name, scratch, replacement_binary=None):
     if name in ("fresh", "concurrent"):
         return
+    # Boot proved a durable read. Observe actual provider receipts too: idempotent graph
+    # claims can hide a second model turn if a restart offers the same old message again.
+    previous_probes = seats.read_probes.copy()
+    def probe_reads():
+        return Counter(row.get("reference") for letter in seats.letters
+                       for row in receipts(node, letter) if row.get("event") == "read")
+    until(lambda: all(probe_reads()[ref] >= 1 for ref in previous_probes), seats.bound,
+          "the providers did not record their boot probe reads")
     if name == "suspend":
         suspend_and_resume(node, seats, node.harness)
         return
     if name == "restart":
         node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
         seats.prove("restart")
+        continued_session(node, "restart")
     elif name == "daemon-restart":
         # The provider dies with the daemon, so the new daemon's latest observation of the seat is
         # still the running predecessor.
@@ -484,6 +506,7 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
             node.pty("kill", row["name"])
         node.start()
         seats.prove("daemon-restart")
+        continued_session(node, "daemon-restart")
     elif name == "reexec":
         before = driver_processes(node)
         providers = {pid: argv for pid, argv in node.seat_processes() if "stub-" in argv}
@@ -513,6 +536,12 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
             fail("a provider process was replaced during driver reexec")
     else:
         fail(f"unknown scenario {name}")
+    # Keep watching after the new mail succeeds, through several channel polls.
+    time.sleep(3)
+    counts = probe_reads()
+    repeated = {ref: counts[ref] for ref in previous_probes if counts[ref] != 1}
+    if repeated:
+        fail(f"{name}: already-read boot mail reached the provider again: {repeated}")
 
 
 def run(args, root, evidence):
@@ -588,7 +617,44 @@ def run(args, root, evidence):
                 (evidence / path.name).write_text(path.read_text(errors="replace"))
 
 
+def private_root(make=tempfile.mkdtemp):
+    """A short, private directory for one canary's daemon, sockets and seats.
+
+    Short, because Unix socket paths are limited to about 100 bytes. And never named after st2: the
+    fresh-seat boundary check rejects any launch path that mentions it, and a random name contains
+    those three letters by chance (`/tmp/bc-0st2w5nz` did, and failed an unrelated PR's gate).
+    """
+    for _ in range(100):
+        root = Path(make(prefix="bc-", dir="/tmp"))
+        if "st2" not in root.name.lower():
+            return root
+        shutil.rmtree(root, ignore_errors=True)
+    raise RuntimeError("could not make a private directory whose name avoids st2")
+
+
+def self_test():
+    """The root name is redrawn until it avoids st2, and the rejected directories are removed."""
+    made = []
+    names = iter(["bc-0st2w5nz", "bc-ST2abcde", "bc-xSt2yzzz", "bc-fine1234"])
+
+    def make(prefix, dir):
+        path = Path(tempfile.mkdtemp(prefix="bc-selftest-", dir=dir)).rename(Path(dir) / next(names))
+        made.append(path)
+        return str(path)
+    try:
+        root = private_root(make)
+        assert root.name == "bc-fine1234", root
+        assert [path.exists() for path in made] == [False, False, False, True], made
+    finally:
+        for path in made:
+            shutil.rmtree(path, ignore_errors=True)
+    print("ok")
+    return 0
+
+
 def main():
+    if sys.argv[1:] == ["--self-test"]:
+        return self_test()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("binary", type=Path)
     parser.add_argument("evidence", type=Path)
@@ -604,8 +670,7 @@ def main():
     args.evidence.mkdir(parents=True, exist_ok=True)
     args.scratch = (args.scratch or args.evidence).resolve()
     args.scratch.mkdir(parents=True, exist_ok=True)
-    # Short, private paths: Unix socket paths are limited to about 100 bytes.
-    root = Path(tempfile.mkdtemp(prefix="bc-", dir="/tmp"))
+    root = private_root()
     try:
         result = run(args, root, args.evidence)
     finally:

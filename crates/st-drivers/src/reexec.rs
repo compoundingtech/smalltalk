@@ -285,11 +285,21 @@ pub fn write_state<T: Serialize>(dir: &Path, name: &str, state: &T) -> Result<Pa
     Ok(path)
 }
 
+/// Inspect resume state before startup without consuming the provider's adoption record.
+pub fn peek_state<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    decode_state(path, &bytes)
+}
+
 /// Read and remove a state file written by [`write_state`].
 pub fn read_state<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()));
     let _ = fs::remove_file(path);
-    let envelope: Envelope<T> = serde_json::from_slice(&bytes?)
+    decode_state(path, &bytes?)
+}
+
+fn decode_state<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T> {
+    let envelope: Envelope<T> = serde_json::from_slice(bytes)
         .with_context(|| format!("decoding resume state {}", path.display()))?;
     anyhow::ensure!(
         READABLE_RESUME_FORMATS.contains(&envelope.format),
@@ -705,6 +715,21 @@ mod tests {
         let state: Vec<String> = read_state(&path).unwrap();
         assert_eq!(state, ["a"]);
         assert!(!path.exists(), "the next image consumes its state file");
+    }
+
+    #[test]
+    fn startup_can_inspect_a_resume_fence_without_consuming_adoption_state() {
+        let root = tempfile::tempdir().unwrap();
+        let state = serde_json::json!({"incarnation":"worker:current"});
+        let path = write_state(root.path(), "driver", &state).unwrap();
+        for _ in 0..2 {
+            let peeked: serde_json::Value = peek_state(&path).unwrap();
+            assert_eq!(peeked, state);
+            assert!(path.exists());
+        }
+        let adopted: serde_json::Value = read_state(&path).unwrap();
+        assert_eq!(adopted, state);
+        assert!(!path.exists());
     }
 
     #[test]

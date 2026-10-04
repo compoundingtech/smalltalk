@@ -7,10 +7,13 @@ Use these documents for implementation details:
 - [Architecture](design.md) defines the stable system shape.
 - [Mission graph runtime](mission-graph-runtime.md) defines the KDL language and execution model.
 - [KDL lifecycle](kdl-lifecycle.md) defines day-to-day publication and revision workflows.
+- [Owned sets](owned-sets.md) defines complete membership publication, source ordering and retirement.
+- [Seat rollout](owned-seat-cutover.md) defines idle cutover, strict native-session continuity and source status.
 - [Free mode](kdl-lifecycle.md#free-mode): within a fleet, an agent may do anything the person who
   runs the fleet may do, as itself, until principals and grants land.
 - [Schema registry](schema.md) lists the generated public subject, resource, and claim vocabulary.
 - [Data authority](data-authority.md) separates durable facts from projections and caches.
+- [Claim backups](backups.md) explains live snapshots, offline restore, and recovered writer identities.
 - [Fleet replication](replication.md) defines convergence, inspection, and repair.
 - [Agent seat queues](seat-queue.md) explains how each seat orders its mission runs and how moves
   are recorded and replicated.
@@ -29,9 +32,12 @@ Use these documents for implementation details:
 - [Delivery probes](delivery-probes.md) describes token-free native-channel probes, per-direction
   read latency, overdue attention, and the replicated results in `st doctor`.
 - [Live-path priority](priority.md) explains how the daemon and each PTY server outrank the builds
-  and tests their harnesses run, on Linux and macOS, and what needs root.
+  and tests their harnesses run, on Linux and macOS, and what needs root. It also explains how
+  stopping a seat ends every process the seat started, and what a host without systemd misses.
 - [Subagents](subagents.md) explains how st records the subagents a seat's harness runs as claims
   on the seat, with a lease, and ends them when their harness, session or seat goes away.
+- [Model accounts](accounts.md) explains how a person declares several Claude and Codex accounts, how a
+  seat binds one or a pool, and how a pooled seat at its limit restarts on another account.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
   recorded, the log format, and what the recorder cannot see.
 - [Profiling the daemon](profiling.md) explains how the daemon accounts for its own time: waits

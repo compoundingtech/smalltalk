@@ -102,6 +102,23 @@ pub enum Endpoint {
     FabricLoopback(String),
 }
 
+/// The name and build this process reports to st in the `x-st3-client` header, for example
+/// "stui 0.1.0+a0c135e3". st lists it (clients.list, `st clients`) as reported; it is never
+/// identity or authority, and st never refuses a client for it.
+static CLIENT_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Name this process's client to st, once, before its first request; later calls are ignored.
+pub fn set_client_name(name: impl Into<String>) {
+    let name = name.into();
+    if hyper::header::HeaderValue::from_str(&name).is_ok() {
+        let _ = CLIENT_NAME.set(name);
+    }
+}
+
+fn client_name() -> Option<&'static str> {
+    CLIENT_NAME.get().map(String::as_str)
+}
+
 #[derive(Clone)]
 pub struct Client {
     endpoint: Endpoint,
@@ -787,14 +804,14 @@ impl Client {
         self.list_internal_with_filters(collection, cursor, limit, history, &[])
             .await
     }
-    async fn list_internal_with_filters(
+    async fn list_internal_with_filters<T: DeserializeOwned>(
         &self,
         collection: &str,
         cursor: Option<&str>,
         limit: Option<usize>,
         history: bool,
         filters: &[(&str, &str)],
-    ) -> Result<Envelope<Page>, ClientError> {
+    ) -> Result<Envelope<T>, ClientError> {
         let mut query = Vec::new();
         if let Some(cursor) = cursor {
             query.push(format!("cursor={}", percent_encode(cursor)));
@@ -1098,6 +1115,41 @@ impl Client {
         )
         .await
     }
+    /// Inspect the publication receipt and current rollout for one source commit.
+    pub async fn sets_status(
+        &self,
+        id: &str,
+        sha: &str,
+    ) -> Result<Envelope<Resource>, ClientError> {
+        self.get(&format!(
+            "/v1/client/sets/{}?sha={}",
+            percent_encode(id),
+            percent_encode(sha)
+        ))
+        .await
+    }
+
+    pub async fn host_repositories(
+        &self,
+        host: &str,
+    ) -> Result<Envelope<HostRepositories>, ClientError> {
+        self.get(&format!(
+            "/v1/client/hosts/{}/repositories",
+            percent_encode(host)
+        ))
+        .await
+    }
+    pub async fn sets_list(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal("sets", cursor, limit, history).await
+    }
+    pub async fn sets_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.resource_internal("sets", id).await
+    }
     pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {
         self.capabilities_internal().await
     }
@@ -1137,6 +1189,9 @@ impl Client {
             format!("?{}", query.join("&"))
         };
         self.get(&format!("/v1/client/usage{query}")).await
+    }
+    pub async fn clients_list(&self) -> Result<Envelope<ClientConnections>, ClientError> {
+        self.get("/v1/client/clients").await
     }
     pub async fn now_list(
         &self,
@@ -1244,6 +1299,28 @@ impl Client {
     }
     pub async fn work_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("work", id).await
+    }
+    pub async fn resources_list(
+        &self,
+        filters: &ResourcesFilter,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<ResourcesPage>, ClientError> {
+        let values = [
+            ("opened_by", filters.opened_by.as_deref()),
+            ("kind", filters.kind.as_deref()),
+            ("subject_prefix", filters.subject_prefix.as_deref()),
+        ];
+        let mut filters = [("", ""); 3];
+        let mut count = 0;
+        for (name, value) in values {
+            if let Some(value) = value {
+                filters[count] = (name, value);
+                count += 1;
+            }
+        }
+        self.list_internal_with_filters("resources", cursor, limit, false, &filters[..count])
+            .await
     }
     pub async fn agents_list(
         &self,
@@ -2542,6 +2619,9 @@ impl Client {
                     if let Some(key) = key {
                         request = request.header("idempotency-key", key);
                     }
+                    if let Some(name) = client_name() {
+                        request = request.header("x-st3-client", name);
+                    }
                     if let Some(credential) = &self.credential {
                         request = request.bearer_auth(credential);
                     }
@@ -2666,6 +2746,9 @@ async fn unix_request(
     if let Some(person) = local_person {
         builder = builder.header("x-st3-person", person);
     }
+    if let Some(name) = client_name() {
+        builder = builder.header("x-st3-client", name);
+    }
     if body.is_some() {
         builder = builder.header("content-type", content_type);
     }
@@ -2745,6 +2828,14 @@ fn websocket_request(
             hyper::header::HeaderName::from_static("x-st3-person"),
             hyper::header::HeaderValue::from_str(person)
                 .map_err(|error| ClientError::Protocol(error.to_string()))?,
+        );
+    }
+    if let Some(name) = client_name()
+        && let Ok(value) = hyper::header::HeaderValue::from_str(name)
+    {
+        request.headers_mut().insert(
+            hyper::header::HeaderName::from_static("x-st3-client"),
+            value,
         );
     }
     Ok(request)
@@ -3098,7 +3189,11 @@ mod tests {
             "../../../docs/st3/client-v0/schemas/client-v0.schema.json"
         ))
         .unwrap();
-        for raw in schema["$defs"]["ErrorEnvelope"]["properties"]["code"]["enum"]
+        assert_eq!(
+            schema["$defs"]["ErrorEnvelope"]["properties"]["code"]["$ref"],
+            "#/$defs/ErrorCode"
+        );
+        for raw in schema["$defs"]["ErrorCode"]["anyOf"][0]["enum"]
             .as_array()
             .unwrap()
         {
@@ -3106,6 +3201,29 @@ mod tests {
             assert_ne!(code, ErrorCode::Unknown, "{raw}");
             assert_eq!(serde_json::to_value(code).unwrap(), *raw);
         }
+    }
+
+    #[test]
+    fn fence_carries_every_schema_fence_field() {
+        // runtime.stop/restart/reset require runtime_desired_revision; a missing typed field makes them unsendable.
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/schemas/client-v0.schema.json"
+        ))
+        .unwrap();
+        let declared: std::collections::BTreeSet<&str> = schema["$defs"]["Fence"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let typed = serde_json::to_value(Fence::default()).unwrap();
+        let typed: std::collections::BTreeSet<&str> = typed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(typed, declared);
     }
 
     const EMPTY_PAGE: &str = r#"{

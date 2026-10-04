@@ -66,7 +66,14 @@ struct ParseContext {
 }
 
 pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent, St3Error> {
-    let intent = parse_intent_with_owner(source, default_host, None, false)?;
+    let intent = parse_intent_with_owner(source, default_host, None, false, false)?;
+    validate_mission_runtimes(&intent, default_host)?;
+    Ok(intent)
+}
+
+/// Empty membership is meaningful only on the owned-set route; apply still requires explicit intent.
+pub fn parse_owned_set_intent(source: &str, default_host: &str) -> Result<NormalizedIntent, St3Error> {
+    let intent = parse_intent_with_owner(source, default_host, None, true, true)?;
     validate_mission_runtimes(&intent, default_host)?;
     Ok(intent)
 }
@@ -75,7 +82,7 @@ pub(crate) fn parse_internal_intent(
     source: &str,
     default_host: &str,
 ) -> Result<NormalizedIntent, St3Error> {
-    parse_intent_with_owner(source, default_host, None, true)
+    parse_intent_with_owner(source, default_host, None, true, false)
 }
 
 #[cfg(test)]
@@ -95,7 +102,7 @@ pub(crate) fn parse_execution_intent(
         "mission-run/{}",
         run_id.strip_prefix("mission-run/").unwrap_or(run_id)
     );
-    parse_intent_with_owner(source, default_host, Some(&owner), true)
+    parse_intent_with_owner(source, default_host, Some(&owner), true, false)
 }
 
 /// The placeholder variables a mission's declarations are interpolated with when they are
@@ -238,6 +245,7 @@ fn parse_intent_with_owner(
     default_host: &str,
     owner_run: Option<&str>,
     allow_execution_root: bool,
+    allow_empty: bool,
 ) -> Result<NormalizedIntent, St3Error> {
     if source.len() > 16 * 1024 * 1024 {
         return Err(St3Error::new(
@@ -259,7 +267,7 @@ fn parse_intent_with_owner(
         .iter()
         .filter(|node| node.name().value() != "version")
         .collect::<Vec<_>>();
-    if declarations.is_empty() {
+    if declarations.is_empty() && !allow_empty {
         return Err(St3Error::new(
             "invalid-root",
             "an st publication must contain at least one declaration after `version 2`",
@@ -373,11 +381,20 @@ fn resolve_node_documents(node: &mut KdlNode, bindings: &BTreeMap<String, String
             entry.set_value(replacement);
         }
     }
+    let gate = node.name().value() == "gate";
     if let Some(children) = node.children_mut() {
         for child in children.nodes_mut() {
-            resolve_node_documents(child, bindings);
+            if !(gate && is_document_gate(child)) {
+                resolve_node_documents(child, bindings);
+            }
         }
     }
+}
+
+/// A gate's `document` predicate waits for a document that may not exist yet, so publication
+/// neither requires nor pins it.
+fn is_document_gate(node: &KdlNode) -> bool {
+    node.name().value() == "document"
 }
 
 fn parse_desired_node(
@@ -1531,17 +1548,159 @@ fn validate_account(node: &KdlNode) -> Result<(), St3Error> {
         .ok_or_else(|| St3Error::new("missing-account-body", "an account needs a body"))?;
     reject_unknown_children(
         body,
-        &["provider", "external-account", "auth-type"],
+        &[
+            "provider",
+            "external-account",
+            "auth-type",
+            "owner",
+            "plan",
+            "login",
+        ],
         "account",
         "account",
     )?;
     required_child_string(body, "provider", "account")?;
-    required_child_string(body, "external-account", "account")?;
-    let auth = required_child_string(body, "auth-type", "account")?;
-    if !matches!(auth.as_str(), "subscription" | "api-key") {
+    child_string(body, "external-account")?;
+    if let Some(auth) = child_string(body, "auth-type")?
+        && !matches!(auth.as_str(), "subscription" | "api-key")
+    {
         return Err(St3Error::new(
             "invalid-auth-type",
             format!("invalid account auth type `{auth}`"),
+        ));
+    }
+    if let Some(owner) = child_string(body, "owner")? {
+        if !owner.starts_with("person/") {
+            return Err(St3Error::new(
+                "invalid-account-owner",
+                format!("an account owner is a person, like `person/ada`; got `{owner}`"),
+            ));
+        }
+        validate_name(&owner, true)?;
+    }
+    if let Some(plan) = child_string(body, "plan")?
+        && (plan.trim().is_empty() || plan.len() > 64)
+    {
+        return Err(St3Error::new(
+            "invalid-account-plan",
+            "an account plan is a short nonempty name",
+        ));
+    }
+    // A login is a credential directory, never a credential: its path is all an account holds.
+    let mut hosts = BTreeSet::new();
+    for login in body
+        .nodes()
+        .iter()
+        .filter(|child| child.name().value() == "login")
+    {
+        ensure_only_properties(login, &["host"])?;
+        ensure_no_children(login)?;
+        let path = one_string(login)?;
+        if !(path.starts_with('/') || path.starts_with("~/"))
+            || path.len() > 1024
+            || path.contains('\0')
+        {
+            return Err(St3Error::new(
+                "invalid-account-login",
+                format!(
+                    "an account login is an absolute directory or one under `~/`; got `{path}`"
+                ),
+            ));
+        }
+        let host = property_string(login, "host")?;
+        if let Some(host) = &host {
+            validate_name(host, false)?;
+        }
+        if !hosts.insert(host) {
+            return Err(St3Error::new(
+                "duplicate-account-login",
+                "an account has one login per host, and at most one for every host",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A harness block binds its seat to one account or a pool of its owner's accounts. Only a
+/// harness that st launches with a login directory can bind one.
+fn validate_account_binding(
+    harness: &KdlNode,
+    agent: &KdlDocument,
+    owner: &str,
+) -> Result<(), St3Error> {
+    let Some(body) = harness.children() else {
+        return Ok(());
+    };
+    let account = unique_child(body, "account")?;
+    let pool = unique_child(body, "account-pool")?;
+    if account.is_none() && pool.is_none() {
+        return Ok(());
+    }
+    if account.is_some() && pool.is_some() {
+        return Err(St3Error::new(
+            "account-and-pool",
+            format!("agent `{owner}` binds an account and a pool; choose one"),
+        ));
+    }
+    let provider = one_string_with_children(harness)?;
+    let variable = crate::accounts::login_environment_name(&provider).ok_or_else(|| {
+        St3Error::new(
+            "account-unsupported-harness",
+            format!("harness `{provider}` has no login directory st can select"),
+        )
+    })?;
+    if let Some(account) = account {
+        ensure_no_properties(account)?;
+        ensure_no_children(account)?;
+        validate_name(&one_string(account)?, false)?;
+    }
+    if let Some(pool) = pool {
+        ensure_no_properties(pool)?;
+        ensure_no_children(pool)?;
+        let person = one_string(pool)?;
+        if !person.starts_with("person/") {
+            return Err(St3Error::new(
+                "invalid-account-pool",
+                format!("an account pool names its owner, like `person/ada`; got `{person}`"),
+            ));
+        }
+        validate_name(&person, true)?;
+        // A pooled seat can restart on another account, whose login directory holds none of the
+        // old account's native sessions, so it cannot ask a harness to resume one.
+        if let Some(args) = unique_child(body, "args")? {
+            let resumes = positional_strings(args)?
+                .iter()
+                .take_while(|argument| argument.as_str() != "--")
+                .any(|argument| {
+                    if provider == "codex" {
+                        return matches!(argument.as_str(), "resume" | "fork");
+                    }
+                    matches!(
+                        argument.as_str(),
+                        "-c" | "--continue" | "-r" | "--resume" | "--session-id"
+                    ) || argument.starts_with("--resume=")
+                        || argument.starts_with("--session-id=")
+                });
+            if resumes {
+                return Err(St3Error::new(
+                    "account-pool-resume",
+                    format!(
+                        "agent `{owner}` is bound to a pool and cannot resume a native session: a restart on another account starts fresh, since its work lives in the graph"
+                    ),
+                ));
+            }
+        }
+    }
+    if let Some(env) = unique_child(agent, "env")?
+        && env.children().is_some_and(|map| {
+            map.nodes()
+                .iter()
+                .any(|entry| entry.name().value() == variable)
+        })
+    {
+        return Err(St3Error::new(
+            "account-env-conflict",
+            format!("agent `{owner}` binds an account, so st sets {variable}; remove it from env"),
         ));
     }
     Ok(())
@@ -1690,6 +1849,14 @@ pub(crate) fn parse_gate(node: &KdlNode, default_host: &str) -> Result<GateSpec,
             "only a human gate accepts a mode",
         ));
     }
+    if gate_type.is_none()
+        && body
+            .nodes()
+            .iter()
+            .any(|child| BUILT_IN_EXEC_GATES.contains(&child.name().value()))
+    {
+        return parse_built_in_gate(name, body, default_host);
+    }
     if gate_type
         .as_deref()
         .is_some_and(|kind| matches!(kind, "llm" | "human"))
@@ -1713,6 +1880,141 @@ pub(crate) fn parse_gate(node: &KdlNode, default_host: &str) -> Result<GateSpec,
         ));
     }
     parse_predicate_gate(&body.nodes()[0], name)
+}
+
+/// The built-in gate kinds that run as exec gates; see `crate::gate_kinds`.
+const BUILT_IN_EXEC_GATES: &[&str] = &["merged", "ci-passed", "cargo-test"];
+
+/// A built-in gate kind, stored as the exec gate it expands to: an `st gate` subcommand that
+/// exits 0 to pass, 1 for not yet and 3 when the gate cannot answer. `host` defaults to `local`,
+/// `workspace` to `${ST_WORKSPACE}`, and `time-limit` to two minutes, or an hour for `cargo-test`.
+fn parse_built_in_gate(
+    name: String,
+    body: &KdlDocument,
+    default_host: &str,
+) -> Result<GateSpec, St3Error> {
+    let kinds = body
+        .nodes()
+        .iter()
+        .filter(|child| BUILT_IN_EXEC_GATES.contains(&child.name().value()))
+        .collect::<Vec<_>>();
+    let [check] = kinds.as_slice() else {
+        return Err(St3Error::new(
+            "invalid-gate-shape",
+            format!("gate `{name}` needs exactly one built-in check"),
+        ));
+    };
+    let kind = check.name().value();
+    reject_unknown_children(
+        body,
+        &[kind, "host", "workspace", "time-limit"],
+        "gate",
+        &name,
+    )?;
+    for field in ["host", "workspace", "time-limit"] {
+        unique_child(body, field)?;
+    }
+    reject_type(check)?;
+    let word = |value: &str| crate::gate_kinds::shell_word(value);
+    let required = |property: &str| -> Result<String, St3Error> {
+        property_string(check, property)?.ok_or_else(|| {
+            St3Error::new(
+                "missing-gate-field",
+                format!("gate `{name}` needs {kind} {property}=\"...\""),
+            )
+        })
+    };
+    let (command, default_time_limit_ms) = match kind {
+        "merged" => {
+            ensure_no_properties(check)?;
+            let locator = one_string(check)?;
+            if !locator.contains("${") {
+                validate_pull_request_locator(&locator)?;
+            }
+            (
+                format!("\"$ST3_BIN\" gate merged {}", word(&locator)),
+                120_000,
+            )
+        }
+        "ci-passed" => {
+            ensure_only_properties(check, &["repo", "commit", "branch"])?;
+            let name_of_check = one_string(check)?;
+            let repository = required("repo")?;
+            let reference = match (
+                property_string(check, "commit")?,
+                property_string(check, "branch")?,
+            ) {
+                (Some(reference), None) | (None, Some(reference)) => reference,
+                _ => {
+                    return Err(St3Error::new(
+                        "invalid-gate-shape",
+                        format!("gate `{name}` needs ci-passed commit=\"SHA\" or branch=\"NAME\""),
+                    ));
+                }
+            };
+            (
+                format!(
+                    "\"$ST3_BIN\" gate ci-passed {} --repo {} --ref {}",
+                    word(&name_of_check),
+                    word(&repository),
+                    word(&reference)
+                ),
+                120_000,
+            )
+        }
+        _ => {
+            ensure_only_properties(check, &["package", "ref", "worktree"])?;
+            let target = one_string(check)?;
+            let package = required("package")?;
+            let reference = property_string(check, "ref")?.unwrap_or_else(|| "origin/main".into());
+            let worktree = property_string(check, "worktree")?
+                .map(|worktree| format!(" --worktree {}", word(&worktree)))
+                .unwrap_or_default();
+            (
+                format!(
+                    "\"$ST3_BIN\" gate cargo-test {} --package {} --ref {}{worktree}",
+                    word(&target),
+                    word(&package),
+                    word(&reference)
+                ),
+                3_600_000,
+            )
+        }
+    };
+    let time_limit_ms = child_string(body, "time-limit")?
+        .map(|value| parse_duration(&value, true))
+        .transpose()?
+        .unwrap_or(default_time_limit_ms);
+    Ok(GateSpec::Mechanical {
+        name,
+        command,
+        host: placement_host(
+            child_string(body, "host")?.unwrap_or_else(|| "local".into()),
+            default_host,
+        ),
+        workspace: child_string(body, "workspace")?.unwrap_or_else(|| "${ST_WORKSPACE}".into()),
+        environment: BTreeMap::new(),
+        time_limit_ms,
+    })
+}
+
+fn validate_pull_request_locator(locator: &str) -> Result<(), St3Error> {
+    let valid = locator
+        .rsplit_once('#')
+        .is_some_and(|(repository, number)| {
+            number.parse::<u64>().is_ok()
+                && repository.split_once('/').is_some_and(|(owner, name)| {
+                    !owner.is_empty() && !name.is_empty() && !name.contains('/')
+                })
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(St3Error::new(
+            "invalid-pull-request",
+            format!("`{locator}` is not a pull request; write OWNER/REPO#NUMBER"),
+        ))
+    }
 }
 
 pub(crate) fn gate_name(gate: &GateSpec) -> &str {
@@ -1744,6 +2046,22 @@ fn parse_predicate_gate(child: &KdlNode, name: String) -> Result<GateSpec, St3Er
             ensure_no_properties(child)?;
             let subject = one_string(child)?;
             validate_full_subject(&subject)?;
+            Ok(GateSpec::Exists { name, subject })
+        }
+        // A named document exists: any version of `doc/NAME`, or the exact `doc/NAME@SHA256`.
+        // Publication leaves the name as written; see `collect_document_refs`.
+        "document" => {
+            ensure_no_properties(child)?;
+            let subject = one_string(child)?;
+            if !subject.starts_with("doc/") {
+                return Err(St3Error::new(
+                    "invalid-document-reference",
+                    format!("gate `{name}` names `{subject}`; a document gate needs doc/NAME"),
+                ));
+            }
+            if !subject.contains("${") {
+                validate_document_ref(&subject)?;
+            }
             Ok(GateSpec::Exists { name, subject })
         }
         "empty" => {
@@ -2540,6 +2858,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         .filter(|node| node.name().value() == "harness")
     {
         validate_driver(driver)?;
+        validate_account_binding(driver, document, owner)?;
     }
     Ok(())
 }
@@ -2822,8 +3141,24 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
         )
     })?;
     let allowed: &[&str] = match provider.as_str() {
-        "claude" => &["model", "effort", "dev-channels", "args", "message"],
-        "codex" | "pi" | "omp" => &["model", "effort", "args", "message"],
+        "claude" => &[
+            "model",
+            "effort",
+            "dev-channels",
+            "args",
+            "message",
+            "account",
+            "account-pool",
+        ],
+        "codex" => &[
+            "model",
+            "effort",
+            "args",
+            "message",
+            "account",
+            "account-pool",
+        ],
+        "pi" | "omp" => &["model", "effort", "args", "message"],
         "opencode" => &["model", "args", "message"],
         _ => return Err(St3Error::new("unknown-driver", "unknown typed driver")),
     };
@@ -3214,6 +3549,71 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
                     "invalid-subscription-mention",
                     "only a batched delivery hears the mentions a `mention` names",
                 ));
+            }
+        }
+        // A seat's watch on one issue or pull request: every comment and review, each move of the
+        // required checks into pass or fail, and a final wake when it closes.
+        "watch" => {
+            let target = required_child_string(body, "to", "subscription")?;
+            validate_full_subject(&target)?;
+            if !target.starts_with("agent/") {
+                return Err(St3Error::new(
+                    "invalid-watch-delivery",
+                    "a watch wakes one agent",
+                ));
+            }
+            if unique_child(body, "when")?.is_some() || !logins.is_empty() {
+                return Err(St3Error::new(
+                    "invalid-watch-delivery",
+                    "a watch hears every event of its item, with no `when` or `mention`",
+                ));
+            }
+            if let Some(field) = fields
+                .iter()
+                .find(|field| !crate::github_watch::WATCH_FIELDS.contains(&field.as_str()))
+            {
+                return Err(St3Error::new(
+                    "invalid-watch-delivery",
+                    format!("a watch hears comments, issues and pull requests, not `{field}`"),
+                ));
+            }
+            let delivery_body = delivery.children().ok_or_else(|| {
+                St3Error::new(
+                    "invalid-watch-delivery",
+                    "a watch delivery names its `item` and `since`",
+                )
+            })?;
+            reject_unknown_children(
+                delivery_body,
+                &["item", "since", "until"],
+                "watch delivery",
+                "delivery",
+            )?;
+            let item = unique_child(delivery_body, "item")?
+                .and_then(|node| {
+                    positional_values(node)
+                        .first()
+                        .and_then(|value| value.as_integer())
+                })
+                .filter(|item| *item > 0);
+            if item.is_none() {
+                return Err(St3Error::new(
+                    "invalid-watch-delivery",
+                    "a watch delivery names one positive `item` number",
+                ));
+            }
+            for (name, required) in [("since", true), ("until", false)] {
+                unique_child(delivery_body, name)?;
+                match child_string(delivery_body, name)? {
+                    Some(at) if crate::github_watch::parse_rfc3339_ms(&at).is_some() => {}
+                    None if !required => {}
+                    _ => {
+                        return Err(St3Error::new(
+                            "invalid-watch-delivery",
+                            format!("a watch delivery's `{name}` is an RFC 3339 time"),
+                        ));
+                    }
+                }
             }
         }
         "mission" => {
@@ -4023,6 +4423,7 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             mentions: Vec::new(),
             text_input: None,
             batch_every_ms: None,
+            watch: None,
             stopped: true,
         });
     }
@@ -4043,6 +4444,19 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             |(mission, revision)| (Some(mission.to_owned()), Some(revision.to_owned())),
         )
     });
+    let watch = (delivery == "watch")
+        .then(|| {
+            Some(crate::model::WatchSpec {
+                item: canonical_child_value(delivery_node, "item")?.as_u64()?,
+                since_unix_ms: canonical_child_value(delivery_node, "since")
+                    .and_then(Value::as_str)
+                    .and_then(crate::github_watch::parse_rfc3339_ms)?,
+                until_unix_ms: canonical_child_value(delivery_node, "until")
+                    .and_then(Value::as_str)
+                    .and_then(crate::github_watch::parse_rfc3339_ms),
+            })
+        })
+        .flatten();
     Some(SubscriptionSpec {
         observer: canonical_child_value(value, "observer")?
             .as_str()?
@@ -4087,6 +4501,7 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
         batch_every_ms: canonical_child_value(delivery_node, "every")
             .and_then(Value::as_str)
             .and_then(|value| parse_duration(value, true).ok()),
+        watch,
         stopped: false,
     })
 }
@@ -4317,8 +4732,11 @@ fn collect_document_refs(node: &KdlNode, output: &mut BTreeSet<String>) -> Resul
         }
     }
     if let Some(children) = node.children() {
+        let gate = node.name().value() == "gate";
         for child in children.nodes() {
-            collect_document_refs(child, output)?;
+            if !(gate && is_document_gate(child)) {
+                collect_document_refs(child, output)?;
+            }
         }
     }
     Ok(())
@@ -5203,6 +5621,115 @@ version 2
     }
 
     #[test]
+    fn an_account_declares_an_owner_a_plan_and_a_login_per_host_and_never_a_credential() {
+        let account = |body: &str| {
+            format!("version 2\naccount \"ada/claude\" {{\n  provider \"anthropic\"\n{body}\n}}\n")
+        };
+        let intent = parse_intent(
+            &account(
+                "owner \"person/ada\"\nplan \"max\"\nlogin \"/srv/logins/ada\" host=\"alder\"\nlogin \"~/.claude-ada\"",
+            ),
+            "node",
+        )
+        .unwrap();
+        let declared = crate::accounts::parse_account(
+            "account/ada/claude",
+            &intent.subjects["account/ada/claude"].desired,
+        )
+        .unwrap();
+        assert_eq!(declared.owner.as_deref(), Some("person/ada"));
+        assert_eq!(declared.login_for("alder"), Some("/srv/logins/ada"));
+        assert_eq!(declared.login_for("birch"), Some("~/.claude-ada"));
+
+        for (body, code) in [
+            ("owner \"ada\"", "invalid-account-owner"),
+            ("login \"relative/dir\"", "invalid-account-login"),
+            (
+                "login \"/a\" host=\"alder\"\nlogin \"/b\" host=\"alder\"",
+                "duplicate-account-login",
+            ),
+            ("login \"/a\"\nlogin \"/b\"", "duplicate-account-login"),
+            ("token \"sk-not-a-field\"", "unknown-child"),
+        ] {
+            assert_eq!(
+                parse_intent(&account(body), "node").unwrap_err().code,
+                code,
+                "{body}"
+            );
+        }
+        // A declaration that predates owners and logins still parses.
+        parse_intent(
+            "version 2\naccount \"claude/team-a\" { provider \"anthropic\" }\n",
+            "node",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_harness_binds_an_account_or_a_pool_for_claude_and_codex_only() {
+        let seat = |harness: &str, extra: &str| {
+            format!(
+                "version 2\nagent \"worker\" {{\n  workspace \"/tmp\"\n{extra}\n  harness {harness}\n}}\n"
+            )
+        };
+        for ok in [
+            seat("\"claude\" { account \"ada/claude\" }", ""),
+            seat("\"codex\" { account-pool \"person/ada\" }", ""),
+            seat("\"codex\" { account-pool \"person/ada\"; args \"-c\" \"model=\\\"example\\\"\" }", ""),
+            seat(
+                "\"claude\" { account \"ada/claude\"; args \"--continue\" }",
+                "",
+            ),
+        ] {
+            parse_intent(&ok, "node").unwrap_or_else(|error| panic!("{ok}: {error:?}"));
+        }
+        for (source, code) in [
+            (
+                seat(
+                    "\"claude\" { account \"ada/a\"; account-pool \"person/ada\" }",
+                    "",
+                ),
+                "account-and-pool",
+            ),
+            (
+                seat("\"claude\" { account-pool \"ada\" }", ""),
+                "invalid-account-pool",
+            ),
+            (seat("\"pi\" { account \"ada/a\" }", ""), "unknown-child"),
+            (
+                seat(
+                    "\"codex\" { account \"ada/a\" }",
+                    "env { CODEX_HOME \"/x\" }",
+                ),
+                "account-env-conflict",
+            ),
+            (
+                seat(
+                    "\"claude\" { account-pool \"person/ada\"; args \"--resume\" \"x\" }",
+                    "",
+                ),
+                "account-pool-resume",
+            ),
+            (
+                seat("\"codex\" { account-pool \"person/ada\"; args \"resume\" \"x\" }", ""),
+                "account-pool-resume",
+            ),
+            (
+                seat("\"codex\" { account-pool \"person/ada\"; args \"fork\" \"x\" }", ""),
+                "account-pool-resume",
+            ),
+        ] {
+            assert_eq!(
+                parse_intent(&source, "node").unwrap_err().code,
+                code,
+                "{source}"
+            );
+        }
+        // A seat with no account runs on the harness's default login, and may set its own.
+        parse_intent(&seat("\"codex\" {}", "env { CODEX_HOME \"/x\" }"), "node").unwrap();
+    }
+
+    #[test]
     fn a_lane_is_a_mission_declaration_with_a_prefix_and_a_person_approver() {
         let source = |lane: &str| {
             format!(
@@ -5606,6 +6133,119 @@ version 2
             panic!("the test gate is not mechanical");
         };
         assert_eq!(host, "node-a");
+    }
+
+    #[test]
+    fn built_in_gates_expand_to_st_gate_commands() {
+        let source = r#"
+version 2
+
+  mission "proof" state="ready" {
+    goal "Land the change."
+    step "land" {
+      gate "the fix merged" { merged "acme/app#42" }
+      gate "CI passed on main" { ci-passed "linux-gate" repo="acme/app" branch="main" }
+      gate "CI passed on the release" {
+        ci-passed "st/ci" repo="acme/app" commit="${input.commit}"
+        host "builder"
+        time-limit "5m"
+      }
+      gate "the suite passes on main" {
+        cargo-test "log_diet" package="st3"
+        workspace "repo"
+      }
+      gate "the handoff is published" { document "doc/acme/handoff" }
+    }
+    input "commit" kind="text"
+  }
+"#;
+        let intent = parse_test_intent(source, "node-a").unwrap();
+        let gates = &intent.missions["proof"].steps["land"].gates;
+        let mechanical = |index: usize| match &gates[index] {
+            GateSpec::Mechanical {
+                command,
+                host,
+                workspace,
+                time_limit_ms,
+                ..
+            } => (
+                command.as_str(),
+                host.as_str(),
+                workspace.as_str(),
+                *time_limit_ms,
+            ),
+            other => panic!("gate {index} is not an exec gate: {other:?}"),
+        };
+        assert_eq!(
+            mechanical(0),
+            (
+                r#""$ST3_BIN" gate merged acme/app#42"#,
+                "node-a",
+                "${ST_WORKSPACE}",
+                120_000
+            )
+        );
+        assert_eq!(
+            mechanical(1).0,
+            r#""$ST3_BIN" gate ci-passed linux-gate --repo acme/app --ref main"#
+        );
+        assert_eq!(
+            mechanical(2),
+            (
+                r#""$ST3_BIN" gate ci-passed st/ci --repo acme/app --ref '${input.commit}'"#,
+                "builder",
+                "${ST_WORKSPACE}",
+                300_000
+            )
+        );
+        assert_eq!(
+            mechanical(3),
+            (
+                r#""$ST3_BIN" gate cargo-test log_diet --package st3 --ref origin/main"#,
+                "node-a",
+                "repo",
+                3_600_000
+            )
+        );
+        assert!(matches!(
+            &gates[4],
+            GateSpec::Exists { subject, .. } if subject == "doc/acme/handoff"
+        ));
+        // Publication neither requires nor pins the document a gate waits for.
+        assert!(intent.document_refs.is_empty());
+        let resolved = resolve_document_references(
+            source,
+            &BTreeMap::from([("doc/acme/handoff".into(), "a".repeat(64))]),
+        )
+        .unwrap();
+        assert!(
+            resolved.contains(r#"document "doc/acme/handoff""#),
+            "{resolved}"
+        );
+
+        for (gate, code) in [
+            (r#"merged "acme/app""#, "invalid-pull-request"),
+            (
+                r#"ci-passed "linux-gate" repo="acme/app""#,
+                "invalid-gate-shape",
+            ),
+            (r#"cargo-test "log_diet""#, "missing-gate-field"),
+            (r#"document "resource/acme""#, "invalid-document-reference"),
+            (
+                r#"merged "acme/app#1"
+        merged "acme/app#2""#,
+                "invalid-gate-shape",
+            ),
+        ] {
+            let source = format!(
+                "version 2\nmission \"bad\" state=\"ready\" {{\n  goal \"Reject it.\"\n  step \"one\" {{\n    gate \"bad\" {{\n        {gate}\n    }}\n  }}\n}}\n"
+            );
+            assert_eq!(
+                parse_test_intent(&source, "node-a").unwrap_err().code,
+                code,
+                "{gate}"
+            );
+        }
     }
 
     #[test]

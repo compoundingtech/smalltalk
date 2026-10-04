@@ -21,6 +21,8 @@ pub enum Hit {
     SidebarRow(usize),
     /// One of the sidebar's sections across its top.
     SidebarSection(usize),
+    /// Glasses: the top bar's usage slot, which shows and hides the sidebar's Usage.
+    Usage,
     Tab(usize),
     Row(usize),
     Key(char),

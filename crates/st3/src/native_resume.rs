@@ -34,6 +34,21 @@ pub fn requested() -> Option<String> {
         .filter(|id| !id.trim().is_empty())
 }
 
+/// The native session this launch continues when it can, with where the harness kept it: every
+/// relaunch of a seat other than a resume. A refusal here starts a new session instead.
+pub fn continued() -> Option<(String, Option<PathBuf>)> {
+    if requested().is_some() {
+        return None;
+    }
+    let session = std::env::var(crate::suspension::CONTINUE_ENV)
+        .ok()
+        .filter(|id| !id.trim().is_empty())?;
+    let path = std::env::var_os(crate::suspension::CONTINUE_PATH_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    Some((session, path))
+}
+
 fn valid_id(id: &str) -> Result<(), Refusal> {
     if id.is_empty() || id.contains(['/', '\\']) || id.starts_with('-') || id.contains("..") {
         return Err(Refusal::new(
@@ -67,6 +82,62 @@ fn refuse_authored(argv: &[String], flags: &[&str]) -> Result<(), Refusal> {
     }
 }
 
+/// Refuse authored session selectors before a rollout can stop the incumbent.
+pub fn rollout_support(member: &crate::model::MemberSpec) -> Result<(), Refusal> {
+    if !member.terminal {
+        return Err(Refusal::new(
+            "unsupported-rollout",
+            "native rollout requires its PTY session",
+        ));
+    }
+    let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+        return Err(Refusal::new(
+            "unsupported-rollout",
+            "rollout needs a typed native harness launch",
+        ));
+    };
+    let provider = argv
+        .iter()
+        .position(|argument| argument == "--")
+        .map_or(argv.as_slice(), |index| &argv[index + 1..]);
+    match member.driver.as_deref() {
+        Some("claude") => refuse_authored(
+            provider,
+            &[
+                "-c",
+                "--continue",
+                "-r",
+                "--resume",
+                "--session-id",
+                "--fork-session",
+                "--from-pr",
+                "--teleport",
+            ],
+        ),
+        Some("pi" | "omp") => refuse_authored(
+            provider,
+            &[
+                "-c",
+                "--continue",
+                "-r",
+                "--resume",
+                "--session",
+                "--session-id",
+                "--fork",
+                "--no-session",
+            ],
+        ),
+        Some("opencode") => {
+            refuse_authored(provider, &["-c", "--continue", "-s", "--session", "--fork"])
+        }
+        Some("codex") => codex_check(provider, "rollout-preflight"),
+        _ => Err(Refusal::new(
+            "unsupported-rollout",
+            "rollout needs a supported native harness",
+        )),
+    }
+}
+
 fn insert_after_program(mut argv: Vec<String>, arguments: &[&str]) -> Vec<String> {
     argv.splice(1..1, arguments.iter().map(|item| (*item).to_owned()));
     argv
@@ -97,6 +168,35 @@ pub fn claude_transcript(home: &Path, workspace: &Path, id: &str) -> PathBuf {
     home.join("projects")
         .join(project)
         .join(format!("{id}.jsonl"))
+}
+
+/// Bring Claude's transcript of `id` from `from`, where the seat's earlier workspace kept it,
+/// into this workspace's project directory, so a seat whose workspace changed continues its
+/// conversation there. A transcript already in place is left alone.
+pub fn claude_carry_transcript(
+    id: &str,
+    workspace: &Path,
+    home: Option<&Path>,
+    from: Option<&Path>,
+) -> std::io::Result<bool> {
+    let (Some(home), Some(from)) = (home, from) else {
+        return Ok(false);
+    };
+    if valid_id(id).is_err()
+        || from.file_name().and_then(|name| name.to_str()) != Some(&format!("{id}.jsonl"))
+        || !from.is_file()
+    {
+        return Ok(false);
+    }
+    let transcript = claude_transcript(home, workspace, id);
+    if transcript.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = transcript.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(from, &transcript)?;
+    Ok(true)
 }
 
 /// `claude --resume ID` for the workspace's own transcript of `id` under Claude's config
@@ -317,6 +417,37 @@ mod tests {
                 .code,
             "invalid-session-id"
         );
+    }
+
+    #[test]
+    fn a_seat_whose_workspace_changed_carries_its_claude_transcript_along() {
+        let root = tempfile::tempdir().unwrap();
+        let home = Some(root.path());
+        let before = Path::new("/work/first");
+        let after = Path::new("/work/second");
+        let earlier = claude_transcript(root.path(), before, "abc");
+        fs::create_dir_all(earlier.parent().unwrap()).unwrap();
+        fs::write(&earlier, "{\"turn\":1}\n").unwrap();
+        assert_eq!(
+            claude_argv(argv(&["claude"]), "abc", after, home)
+                .unwrap_err()
+                .code,
+            "transcript-missing"
+        );
+        // Only the session's own transcript is carried, and never over one already there.
+        let other = earlier.with_file_name("other.jsonl");
+        fs::write(&other, "{}\n").unwrap();
+        assert!(!claude_carry_transcript("abc", after, home, Some(&other)).unwrap());
+        assert!(!claude_carry_transcript("abc", after, home, None).unwrap());
+        assert!(claude_carry_transcript("abc", after, home, Some(&earlier)).unwrap());
+        assert_eq!(
+            claude_argv(argv(&["claude"]), "abc", after, home).unwrap(),
+            argv(&["claude", "--resume", "abc"])
+        );
+        let carried = claude_transcript(root.path(), after, "abc");
+        fs::write(&carried, "{\"turn\":2}\n").unwrap();
+        assert!(!claude_carry_transcript("abc", after, home, Some(&earlier)).unwrap());
+        assert_eq!(fs::read_to_string(&carried).unwrap(), "{\"turn\":2}\n");
     }
 
     #[test]

@@ -6,6 +6,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod rich;
+
 const RUST_MODELS_TEMPLATE: &str = include_str!("../templates/generated.rs.in");
 const RUST_CLIENT_TEMPLATE: &str = include_str!("../templates/lib.rs.in");
 const SWIFT_MODELS_TEMPLATE: &str = include_str!("../templates/Models.swift.in");
@@ -33,7 +35,7 @@ fn main() -> Result<()> {
         actions.keys().map(String::as_str),
         reads,
     )?)?;
-    let swift = swift_contract(&digest, actions.keys().map(String::as_str), reads)?;
+    let swift = swift_contract(actions.keys().map(String::as_str), reads)?;
     let rust_models = format_rust(&render_marker(
         RUST_MODELS_TEMPLATE,
         "    // @st3-codegen:rust-action-constructors",
@@ -54,7 +56,8 @@ fn main() -> Result<()> {
         "    // @st3-codegen:swift-operation-methods",
         &swift_operation_methods(reads, actions)?,
     )?;
-    let typescript_models = typescript_models(&schema, &operations, &digest)?;
+    let typescript_models = typescript_models(&schema, &operations)?;
+    let typescript_schema = rich::models(&schema)?;
     let typescript_client = render_marker(
         TYPESCRIPT_CLIENT_TEMPLATE,
         "    // @st3-codegen:typescript-operation-methods",
@@ -101,6 +104,11 @@ fn main() -> Result<()> {
     output(
         &root.join("clients/typescript/st3-client/Models.generated.ts"),
         &typescript_models,
+        check,
+    )?;
+    output(
+        &root.join("clients/typescript/st3-client/Schema.generated.ts"),
+        &typescript_schema,
         check,
     )?;
     output(
@@ -193,10 +201,20 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {{ self.capabilities_internal().await }}"
             )?;
+        } else if id == "host.repositories" {
+            writeln!(
+                out,
+                "    pub async fn host_repositories(&self, host: &str) -> Result<Envelope<HostRepositories>, ClientError> {{ self.get(&format!(\"/v1/client/hosts/{{}}/repositories\", percent_encode(host))).await }}"
+            )?;
         } else if id == "subject.definition" {
             writeln!(
                 out,
                 "    pub async fn subject_definition(&self, subject: &str, show_env_values: bool) -> Result<Envelope<SubjectDefinition>, ClientError> {{ self.get(&format!(\"/v1/client/subject-definition?subject={{}}&show_env_values={{show_env_values}}\", percent_encode(subject))).await }}"
+            )?;
+        } else if id == "clients.list" {
+            writeln!(
+                out,
+                "    pub async fn clients_list(&self) -> Result<Envelope<ClientConnections>, ClientError> {{ self.get(\"/v1/client/clients\").await }}"
             )?;
         } else if id == "usage.period" {
             writeln!(
@@ -242,6 +260,11 @@ fn rust_operation_methods(
             writeln!(
                 out,
                 "    pub async fn agent_declaration_get(&self, id: &str, revision: Option<&str>, show_env_values: bool) -> Result<Envelope<AgentDeclaration>, ClientError> {{ let path = format!(\"/v1/client/agent-declarations/{{}}?show_env_values={{show_env_values}}\", percent_encode(id)); let path = if let Some(revision) = revision {{ format!(\"{{path}}&revision={{}}\", percent_encode(revision)) }} else {{ path }}; self.get(&path).await }}"
+            )?;
+        } else if id == "resources.list" {
+            writeln!(
+                out,
+                "    pub async fn resources_list(&self, filters: &ResourcesFilter, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<ResourcesPage>, ClientError> {{ let values = [(\"opened_by\", filters.opened_by.as_deref()), (\"kind\", filters.kind.as_deref()), (\"subject_prefix\", filters.subject_prefix.as_deref())]; let mut filters = [(\"\", \"\"); 3]; let mut count = 0; for (name, value) in values {{ if let Some(value) = value {{ filters[count] = (name, value); count += 1; }} }} self.list_internal_with_filters(\"resources\", cursor, limit, false, &filters[..count]).await }}"
             )?;
         } else if id.ends_with(".get") {
             let collection = path
@@ -308,6 +331,11 @@ fn swift_operation_methods(
                 out,
                 "    public func conversationSearch(text: String, agent: String? = nil, since: String? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ConversationSearch> {{ var query: [URLQueryItem] = [.init(name: \"text\", value: text)]; for (name, value) in [(\"agent\", agent), (\"since\", since), (\"cursor\", cursor)] {{ if let value {{ query.append(.init(name: name, value: value)) }} }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/conversations/search\", query: query) }}"
             )?;
+        } else if id == "clients.list" {
+            writeln!(
+                out,
+                "    public func clientsList() async throws -> Envelope<ClientConnections> {{ try await get(\"v1/client/clients\") }}"
+            )?;
         } else if id == "usage.period" {
             writeln!(
                 out,
@@ -323,10 +351,20 @@ fn swift_operation_methods(
                 out,
                 "    public func agentDeclarationGet(id: String, revision: String? = nil, showEnvValues: Bool = false) async throws -> Envelope<AgentDeclaration> {{ var query: [URLQueryItem] = [.init(name: \"show_env_values\", value: showEnvValues ? \"true\" : \"false\")]; if let revision {{ query.append(.init(name: \"revision\", value: revision)) }}; return try await get(\"v1/client/agent-declarations/\\(id)\", query: query) }}"
             )?;
+        } else if id == "host.repositories" {
+            writeln!(
+                out,
+                "    public func hostRepositories(id: String) async throws -> Envelope<HostRepositories> {{ try await get(\"v1/client/hosts/\\(id)/repositories\") }}"
+            )?;
         } else if id == "subject.definition" {
             writeln!(
                 out,
                 "    public func subjectDefinition(subject: String, showEnvValues: Bool = false) async throws -> Envelope<SubjectDefinition> {{ try await get(\"v1/client/subject-definition\", query: [.init(name: \"subject\", value: subject), .init(name: \"show_env_values\", value: showEnvValues ? \"true\" : \"false\")]) }}"
+            )?;
+        } else if id == "resources.list" {
+            writeln!(
+                out,
+                "    public func resourcesList(filters: ResourcesFilter = .init(), cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ResourcesPage> {{ var query: [URLQueryItem] = []; if let openedBy = filters.openedBy {{ query.append(.init(name: \"opened_by\", value: openedBy)) }}; if let kind = filters.kind {{ query.append(.init(name: \"kind\", value: kind)) }}; if let subjectPrefix = filters.subjectPrefix {{ query.append(.init(name: \"subject_prefix\", value: subjectPrefix)) }}; if let cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/resources\", query: query) }}"
             )?;
         } else if id.ends_with(".get") {
             let collection = path
@@ -435,7 +473,17 @@ fn validate_model(
         .with_context(|| format!("client schema `{definition}` has no properties"))?;
     let rust_block = struct_block(rust, &format!("pub struct {rust_name} {{"))?;
     let swift_block = struct_block(swift, &format!("public struct {swift_name}:"))?;
-    for property in properties.keys().filter(|name| name.as_str() != "kind") {
+    // Resource branches may narrow a header field such as `id` to its family reference;
+    // generated clients model that field once through the shared header.
+    let header_backed = model["allOf"].as_array().is_some_and(|branches| {
+        branches
+            .iter()
+            .any(|branch| branch["$ref"] == "#/$defs/ResourceHeader")
+    }) && rust_block.contains("pub header: ResourceHeader,");
+    let header = &schema["$defs"]["ResourceHeader"]["properties"];
+    for property in properties.keys().filter(|name| {
+        name.as_str() != "kind" && !(header_backed && header.get(name.as_str()).is_some())
+    }) {
         let rust_field = rust_field(property);
         let rust_discriminated_timeline = definition == "TimelineEntry"
             && property == "type"
@@ -473,6 +521,11 @@ fn validate_surfaces(
             .as_str()
             .and_then(|value| value.rsplit('/').next())
             .context("Resource reference")?;
+        // The open schema branch preserves future kinds for schema consumers; it has no
+        // concrete generated resource model.
+        if definition == "UnknownResource" {
+            continue;
+        }
         validate_model(
             schema,
             definition,
@@ -488,14 +541,45 @@ fn validate_surfaces(
             bail!("Resource discriminator `{definition}` is absent from a generated client");
         }
     }
+    // An older client reads a newer kind as unknown; the kinds it knows are the schema's.
+    let known = schema["$defs"]["UnknownResource"]["allOf"][1]["properties"]["kind"]["not"]["enum"]
+        .as_array()
+        .context("UnknownResource names the known kinds")?;
+    for kind in known {
+        let kind = kind.as_str().context("a resource kind")?;
+        if !rust.contains(&format!("    \"{kind}\",\n")) {
+            bail!("KNOWN_RESOURCE_KINDS lacks `{kind}`");
+        }
+        if !swift.contains(&format!("case \"{kind}\": self = .")) {
+            bail!("Swift Resource does not decode `{kind}`");
+        }
+    }
+    let listed = rust
+        .split("pub const KNOWN_RESOURCE_KINDS: &[&str] = &[")
+        .nth(1)
+        .and_then(|rest| rest.split("];").next())
+        .context("KNOWN_RESOURCE_KINDS")?
+        .matches('"')
+        .count()
+        / 2;
+    if listed != known.len() {
+        bail!("KNOWN_RESOURCE_KINDS has {listed} kinds; the schema knows {}", known.len());
+    }
     for definition in [
+        "ResourceObservation",
+        "ResourcesFilter",
+        "ResourcesPage",
         "AttentionTargetState",
         "DocumentContent",
         "AgentDeclaration",
+        "AgentRepository",
+        "HostRepositories",
         "CanonicalNode",
         "SubjectDefinition",
         "UsagePeriod",
         "UsageRow",
+        "ClientConnections",
+        "ClientConnection",
         "UsageLimit",
         "LaunchPreview",
         "MissionRunSummary",
@@ -703,7 +787,9 @@ fn rust_contract<'a>(
     reads: &[Value],
 ) -> Result<String> {
     let actions = actions.collect::<Vec<_>>();
-    let mut out = format!("// @generated by st3-client-codegen; contract sha256 {digest}\n\n");
+    // The contract digest lives here alone: every generated file carrying it made any two
+    // schema changes conflict in each of them (#977).
+    let mut out = String::from("// @generated by st3-client-codegen; do not edit.\n\n");
     writeln!(
         out,
         "#[rustfmt::skip]\npub const CONTRACT_SHA256: &str = \"{digest}\";"
@@ -732,15 +818,13 @@ fn rust_contract<'a>(
 }
 
 fn swift_contract<'a>(
-    digest: &str,
     actions: impl Iterator<Item = &'a str>,
     reads: &[Value],
 ) -> Result<String> {
     let actions = actions.collect::<Vec<_>>();
     let mut out = format!(
-        "// @generated by st3-client-codegen; contract sha256 {digest}\n\nimport Foundation\n\n"
+        "// @generated by st3-client-codegen; do not edit.\n\nimport Foundation\n\n"
     );
-    writeln!(out, "public let st3ClientContractSHA256 = \"{digest}\"\n")?;
     writeln!(
         out,
         "public enum ActionType: String, Codable, CaseIterable, Sendable {{"
@@ -913,16 +997,26 @@ fn ts_conditional_body(value: &Value) -> Result<Option<String>> {
     }
 }
 
-fn typescript_models(schema: &Value, operations: &Value, digest: &str) -> Result<String> {
+fn typescript_models(schema: &Value, operations: &Value) -> Result<String> {
     let defs = schema["$defs"].as_object().context("schema definitions")?;
     let mut out = format!(
-        "// @generated by st3-client-codegen; contract sha256 {digest}\n// Source: docs/st3/client-v0/schemas/client-v0.schema.json\n\nexport const CONTRACT_SHA256 = '{digest}' as const;\nexport const API_VERSION = 'st3.client.v0' as const;\n\n"
+        "// @generated by st3-client-codegen; do not edit.\n// Source: docs/st3/client-v0/schemas/client-v0.schema.json\n\nexport const API_VERSION = 'st3.client.v0' as const;\n\n"
     );
     for (name, definition) in defs {
         if name == "ActionRequest" {
             continue;
         }
-        let shape = ts_conditional_body(definition)?.unwrap_or(ts_type(definition)?);
+        let shape = if name == "Resource" {
+            // UnknownResource's open `kind: string` would defeat discriminant narrowing in the
+            // raw union; like the Rust and Swift clients, raw TypeScript models known kinds only.
+            let mut known = definition.clone();
+            if let Some(branches) = known["oneOf"].as_array_mut() {
+                branches.retain(|branch| branch["$ref"] != "#/$defs/UnknownResource");
+            }
+            ts_type(&known)?
+        } else {
+            ts_conditional_body(definition)?.unwrap_or(ts_type(definition)?)
+        };
         writeln!(out, "export type {name} = {shape};\n")?;
     }
     let actions = operations["actions"]
@@ -1009,6 +1103,11 @@ fn typescript_operation_methods(
                 out,
                 "    async {method}(options: EventOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events'); }}"
             )?;
+        } else if id == "clients.list" {
+            writeln!(
+                out,
+                "    async {method}(): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}'); }}"
+            )?;
         } else if id == "usage.period" {
             writeln!(
                 out,
@@ -1019,10 +1118,20 @@ fn typescript_operation_methods(
                 out,
                 "    async {method}(name: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }})); }}"
             )?;
+        } else if id == "resources.list" {
+            writeln!(
+                out,
+                "    async resourcesList(filters: ResourcesFilter = {{}}, options: PageOptions = {{}}): Promise<EnvelopeOf<ResourcesPage>> {{ return this.get('{route}' + query({{ ...filters, ...options }})); }}"
+            )?;
         } else if id == "agent-declaration.get" {
             writeln!(
                 out,
                 "    async {method}(id: string, revision?: string, showEnvValues = false): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query({{ revision, show_env_values: showEnvValues }})); }}"
+            )?;
+        } else if id == "host.repositories" {
+            writeln!(
+                out,
+                "    async hostRepositories(id: string): Promise<EnvelopeOf<HostRepositories>> {{ return this.get(`{route}`); }}"
             )?;
         } else if id == "subject.definition" {
             writeln!(
@@ -1101,7 +1210,8 @@ mod tests {
             include_bytes!("../../../docs/st3/client-v0/schemas/client-v0.schema.json"),
             include_bytes!("../../../docs/st3/client-v0/schemas/operations.json"),
         ]);
-        let ts_models = typescript_models(&schema, &operations, &digest)?;
+        let ts_models = typescript_models(&schema, &operations)?;
+        let ts_schema = rich::models(&schema)?;
         let ts_client = render_marker(
             TYPESCRIPT_CLIENT_TEMPLATE,
             "    // @st3-codegen:typescript-operation-methods",
@@ -1145,6 +1255,15 @@ mod tests {
                 "Client.generated.ts",
                 ts_client.as_str(),
                 ts_client.replacen("async eventsList(", "async removedEventsList(", 1),
+            ),
+            (
+                "Schema.generated.ts",
+                ts_schema.as_str(),
+                ts_schema.replacen(
+                    "export const Resource =",
+                    "export const RemovedResource =",
+                    1,
+                ),
             ),
         ];
         for (name, expected, drifted) in cases {

@@ -104,6 +104,8 @@ pub struct Limits {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Capabilities {
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_version: Option<String>,
     pub session_actor: String,
     pub transport: TransportKind,
     pub capabilities: Vec<Capability>,
@@ -263,8 +265,6 @@ pub struct Operational {
     pub owner_generation: Option<String>,
     #[serde(default)]
     pub runtime_incarnation: Option<String>,
-    #[serde(default)]
-    pub runtime_desired_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -326,6 +326,40 @@ pub struct DocumentContent {
     pub bytes: Vec<u8>,
 }
 
+/// The clients connected to one member now and those seen in the last few minutes, newest first.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ClientConnections {
+    pub kind: String,
+    pub member: String,
+    pub items: Vec<ClientConnection>,
+}
+/// One client, person or agent, and way in: what it says it is, as it said it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ClientConnection {
+    /// The session acting: `person/NAME`, `person/NAME/session/ID` for a paired device, or an agent.
+    pub actor: String,
+    /// The person or agent whose authority the session uses.
+    pub person: String,
+    /// The client's own `x-st3-client` name and build; absent when it sent none.
+    #[serde(default)]
+    pub client: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    pub member: String,
+    /// `local`, `gateway` (a paired device over Tailscale or Fabric) or `tailscale`.
+    pub via: String,
+    /// An open stream right now.
+    pub connected: bool,
+    pub streams: u64,
+    pub since: String,
+    pub last_seen: String,
+    /// Windows, `conversation:ID` and `terminal:ID` it follows.
+    #[serde(default)]
+    pub follows: Vec<String>,
+}
+
 /// Token spend over a period, one row per agent, mission run, step, model, account and host.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsagePeriod {
@@ -340,6 +374,9 @@ pub struct UsagePeriod {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsageLimit {
     pub account: String,
+    /// The declared account the measuring seat ran on, when it was bound to one.
+    #[serde(default)]
+    pub account_ref: Option<String>,
     pub driver: String,
     #[serde(default)]
     pub plan: Option<String>,
@@ -713,6 +750,12 @@ pub struct Mission {
     #[serde(default)]
     pub active_runs: Option<usize>,
     #[serde(default)]
+    pub total_runs: Option<usize>,
+    #[serde(default)]
+    pub run_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub runs_truncated: bool,
+    #[serde(default)]
     pub run_generations: BTreeMap<String, String>,
     #[serde(default)]
     pub visualization: Option<Visualization>,
@@ -812,6 +855,16 @@ pub struct Work {
     pub readiness_epoch: u64,
     pub claimant: Option<String>,
     pub claim_incarnation: Option<String>,
+    #[serde(default)]
+    pub agentless: bool,
+    #[serde(default)]
+    pub claim_expires_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub execution_started_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub execution_elapsed_ms: u64,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     pub blocked_reason: Option<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
@@ -863,6 +916,8 @@ pub struct Agent {
     #[serde(default)]
     pub current_session_id: Option<String>,
     #[serde(default)]
+    pub todo: Option<AgentTodo>,
+    #[serde(default)]
     pub current_work_ids: Vec<String>,
     #[serde(default)]
     pub active_work_count: u64,
@@ -891,6 +946,56 @@ pub struct Agent {
     /// The seat's latest suspend or resume and its phase. An older daemon omits it.
     #[serde(default)]
     pub suspension: Option<AgentSuspension>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<Value>,
+}
+/// The latest accepted harness todo observation, including its provenance and freshness.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentTodo {
+    pub snapshot: HarnessTodoSnapshot,
+    pub claim_id: String,
+    pub accepted_at: String,
+    pub stale: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessTodoSnapshot {
+    pub harness: String,
+    pub session_id: String,
+    pub incarnation_id: String,
+    pub observed_at: String,
+    pub source_op: String,
+    pub phases: Vec<HarnessPhase>,
+    pub totals: HarnessTodoTotals,
+    pub truncated: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessPhase {
+    pub name: String,
+    pub tasks: Vec<HarnessTask>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessTask {
+    pub content: String,
+    pub status: HarnessTaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessTaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Blocked,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessTodoTotals {
+    pub pending: u64,
+    pub in_progress: u64,
+    pub completed: u64,
+    pub blocked: u64,
+    #[serde(default)]
+    pub abandoned: u64,
 }
 /// Where a seat's latest suspend or resume stands.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1211,7 +1316,54 @@ pub struct Session {
     pub ended_at: Option<String>,
     pub timeline_cursor: String,
     #[serde(default)]
+    pub runtime_incarnation: Option<String>,
+    #[serde(default)]
     pub usage: Option<UsageSummary>,
+}
+
+/// Latest canonical resource observation; not an operational resource projection.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResourceObservation {
+    pub id: String,
+    pub kind: String,
+    pub facts: BTreeMap<String, Value>,
+    pub observed_at: String,
+    pub opened_by: Option<String>,
+    pub opened_by_run: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ResourcesFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_prefix: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResourcesPage {
+    pub kind: String,
+    pub collection: String,
+    pub filters: BTreeMap<String, String>,
+    pub items: Vec<ResourceObservation>,
+    pub page: PageInfo,
+    #[serde(default)]
+    pub sync: Option<SyncNotice>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct OwnedSet {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    pub claim: String,
+    pub receipt: Value,
+    pub blockers: Vec<String>,
+    pub members_status: Vec<Value>,
+    pub visibility: Value,
+    #[serde(default)]
+    pub commit_status: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1236,6 +1388,74 @@ pub enum Resource {
     History(History),
     Session(Session),
     Glass(Glass),
+    OwnedSet(OwnedSet),
+    /// A kind this client does not know, from a member newer than it. It keeps the header and
+    /// the whole resource as sent, so an older client skips it or shows it plainly instead of
+    /// failing the page it came in.
+    #[serde(untagged)]
+    Unknown(UnknownResource),
+}
+
+/// The resource kinds this client models; any other kind reads as [`Resource::Unknown`].
+pub const KNOWN_RESOURCE_KINDS: &[&str] = &[
+    "attention",
+    "message",
+    "launch",
+    "launch-variant",
+    "launch-decision",
+    "launch-approval",
+    "mission",
+    "work",
+    "agent",
+    "runtime",
+    "observer",
+    "subscription",
+    "lane",
+    "machine",
+    "device",
+    "operation",
+    "history",
+    "session",
+    "glass",
+    "owned-set",
+];
+
+/// A resource of a kind this client does not model.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct UnknownResource {
+    pub kind: String,
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    /// Every other field, as sent.
+    #[serde(flatten)]
+    pub fields: serde_json::Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for UnknownResource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut fields = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let kind = match fields.remove("kind") {
+            Some(Value::String(kind)) => kind,
+            _ => return Err(D::Error::missing_field("kind")),
+        };
+        // A known kind that failed its own model is an error, never an unknown resource.
+        if KNOWN_RESOURCE_KINDS.contains(&kind.as_str()) {
+            return Err(D::Error::custom(format!(
+                "a `{kind}` resource does not match its model"
+            )));
+        }
+        let header =
+            ResourceHeader::deserialize(Value::Object(fields.clone())).map_err(D::Error::custom)?;
+        for name in ["id", "revision", "updated_at", "operational"] {
+            fields.remove(name);
+        }
+        Ok(Self {
+            kind,
+            header,
+            fields,
+        })
+    }
 }
 
 impl Resource {
@@ -1260,6 +1480,8 @@ impl Resource {
             Self::History(v) => &v.header,
             Self::Session(v) => &v.header,
             Self::Glass(v) => &v.header,
+            Self::OwnedSet(v) => &v.header,
+            Self::Unknown(v) => &v.header,
         }
     }
 }
@@ -2822,6 +3044,14 @@ pub struct AgentCreateParameters {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_at_run_end: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -2989,12 +3219,16 @@ pub struct TerminalLine {
     /// Styled runs from column zero. Their text, without trailing spaces, is `text`.
     #[serde(default)]
     pub runs: Vec<TerminalRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapped: Option<bool>,
     pub redacted: bool,
     pub truncated: bool,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct TerminalRun {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cells: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fg: Option<TerminalColor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3009,6 +3243,14 @@ pub struct TerminalRun {
     pub underline: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inverse: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strikethrough: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<TerminalLink>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TerminalLink {
+    pub uri: String,
 }
 /// A palette index (0-255) or a `#rrggbb` color. An absent color is the terminal default.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -3046,6 +3288,8 @@ pub struct TerminalModes {
     pub focus_events: bool,
     pub mouse_tracking: String,
     pub mouse_encoding: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kitty_keyboard: Option<u32>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TerminalScreen {
@@ -3165,4 +3409,17 @@ pub struct GlassPut {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct GlassDelete {
     pub base_revision: Option<String>,
+}
+
+/// Repositories already used by a host's declared agents, read from replicated graph evidence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HostRepositories {
+    pub host_id: String,
+    pub repositories: Vec<AgentRepository>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentRepository {
+    pub path: String,
+    pub workspaces: Vec<String>,
+    pub agent_ids: Vec<String>,
 }

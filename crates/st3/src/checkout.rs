@@ -6,8 +6,6 @@
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::process::Command;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -18,6 +16,22 @@ use serde_json::Value;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug)]
+pub(crate) struct BranchInUse {
+    branch: String,
+    workspace: String,
+}
+impl std::fmt::Display for BranchInUse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "branch {} is already checked out in {}; choose another branch or redeclare the seat after releasing that worktree",
+            self.branch, self.workspace
+        )
+    }
+}
+impl std::error::Error for BranchInUse {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Checkout {
     pub(crate) repository: PathBuf,
@@ -27,6 +41,26 @@ pub(crate) struct Checkout {
 }
 
 impl Checkout {
+    /// An existing directory satisfies a checkout only when it is the declared repository's
+    /// working tree on the declared branch. A plain directory must not bypass checkout creation.
+    pub(crate) fn validate_workspace(&self, workspace: &Path) -> Result<()> {
+        let repository = std::fs::canonicalize(&self.repository)
+            .with_context(|| format!("repository {} is unavailable", self.repository.display()))?;
+        let repository =
+            crate::repositories::workspace_repository(&repository).unwrap_or(repository);
+        anyhow::ensure!(
+            workspace.join(".git").exists()
+                && crate::repositories::workspace_repository(workspace).as_ref()
+                    == Some(&repository)
+                && crate::resource::checked_out_branch(workspace).as_deref() == Some(&self.branch),
+            "workspace {} is not a worktree of {} on branch {}; choose a new workspace or the matching branch",
+            workspace.display(),
+            self.repository.display(),
+            self.branch
+        );
+        Ok(())
+    }
+
     /// Read the checkout that an agent declaration asks for.
     pub(crate) fn from_desired(desired: &Value) -> Option<Self> {
         let node = desired
@@ -60,6 +94,28 @@ impl Checkout {
             workspace.display()
         );
         let mut warnings = Vec::new();
+        // Prune registrations whose worktree directory was deleted by hand.
+        self.git(&["worktree", "prune"], LOCAL_GIT_TIMEOUT)?;
+
+        // Report a configuration conflict before fetching or creating anything. The reconciler
+        // retains this failure until the declaration changes instead of retrying every 30s.
+        let worktrees = self.git(
+            &["worktree", "list", "--porcelain", "-z"],
+            LOCAL_GIT_TIMEOUT,
+        )?;
+        let mut other_workspace = "";
+        for field in worktrees.split('\0') {
+            if let Some(path) = field.strip_prefix("worktree ") {
+                other_workspace = path;
+            }
+            if field.strip_prefix("branch refs/heads/") == Some(self.branch.as_str()) {
+                return Err(BranchInUse {
+                    branch: self.branch.clone(),
+                    workspace: other_workspace.into(),
+                }
+                .into());
+            }
+        }
         if let Some((remote, branch)) = self.base.split_once('/') {
             let remotes = self.git(&["remote"], LOCAL_GIT_TIMEOUT)?;
             if remotes.lines().any(|line| line == remote)
@@ -71,8 +127,6 @@ impl Checkout {
                 ));
             }
         }
-        // A worktree directory deleted by hand stays registered until it is pruned.
-        self.git(&["worktree", "prune"], LOCAL_GIT_TIMEOUT)?;
         let workspace = workspace.to_string_lossy();
         let local_branch = format!("refs/heads/{}", self.branch);
         if self
@@ -162,10 +216,9 @@ impl Checkout {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     pub(crate) fn git(directory: &Path, arguments: &[&str]) {
-        let status = Command::new("git")
+        let status = crate::test_support::git()
             .arg("-C")
             .arg(directory)
             .args(arguments)
@@ -265,7 +318,7 @@ mod tests {
             "second\n",
             "the worktree starts from the fetched base"
         );
-        let head = Command::new("git")
+        let head = crate::test_support::git()
             .arg("-C")
             .arg(&workspace)
             .args(["branch", "--show-current"])
@@ -312,6 +365,44 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(workspace.join("README")).unwrap(),
             "first\n"
+        );
+    }
+
+    #[test]
+    fn an_existing_directory_must_match_the_checkout_repository_and_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = repository(root.path());
+        let checkout = Checkout {
+            repository,
+            base: "origin/main".into(),
+            branch: "parser".into(),
+            remove_at_run_end: false,
+        };
+        assert!(checkout.validate_workspace(root.path()).is_err());
+        let workspace = root.path().join("parser");
+        checkout.create(&workspace).unwrap();
+        checkout.validate_workspace(&workspace).unwrap();
+        let wrong_branch = Checkout {
+            branch: "other".into(),
+            ..checkout.clone()
+        };
+        assert!(
+            wrong_branch
+                .validate_workspace(&workspace)
+                .unwrap_err()
+                .to_string()
+                .contains("branch other")
+        );
+        let missing = Checkout {
+            repository: root.path().join("missing"),
+            ..checkout
+        };
+        assert!(
+            missing
+                .validate_workspace(&workspace)
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable")
         );
     }
 

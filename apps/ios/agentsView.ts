@@ -1,6 +1,6 @@
 import type { Agent } from '../../clients/typescript/st3-client';
 import { ago } from './presentation';
-import type { SessionView } from './sessionView';
+import type { SessionView } from '@smalltalk/st3-views';
 import { harnessColor, theme } from './theme';
 
 // The Agents tab, drawn the way stui draws it (crates/stui/src/ui/screens.rs agents_list and

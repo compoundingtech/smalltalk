@@ -160,6 +160,8 @@ order from the same admitted claims.
 | `documents` | Projection | `doc.bound` claims and blobs |
 | `desired` | Projection | Selected `intent.desired` heads |
 | `events` | Projection | Effective accepted claims |
+| `resource_observations` | Shared projection | Latest canonical `resource.observed` claim per resource subject; indexed by resource kind and opener |
+| `local_resource_projection_pending` | Local projection work queue | Resource subjects whose admitted observations changed in the current transaction; flushed before commit |
 | `mission_revisions` | Projection | `mission.published` claims |
 | `mission_definitions` | Projection | Selected `mission.published` heads |
 | `mission_runs` | Projection | `mission-run.*` claims |
@@ -170,6 +172,7 @@ order from the same admitted claims.
 | `local_latest_slots` | Local observation log | For each `latest` slot this node writes: its last replicated observation and time, and the newest local observation no claim carries yet |
 | `local_usage_seen` | Local deduplication index | Stable provider response IDs from local timeline observations; never replicated |
 | `local_usage_totals` | Local cumulative observation projection | Token buckets from accepted local response observations; never replicated and retained across log trimming |
+| `local_seat_accounts` | Local operational fact | The account chosen for each pooled seat on this node; retained across restarts, never replicated |
 | `revision_proposals` | Projection | `revision-proposal.*` claims |
 | `planning_sessions` | Projection | `planning-session.*` claims |
 | `planning_candidates` | Projection | `planning-session.candidate-submitted` claims |
@@ -188,6 +191,10 @@ order from the same admitted claims.
 | `peer_replica_cursors` | Legacy test state | The removed cursor protocol; production does not use this table |
 
 The store rebuilds operation and planning projections when it opens.
+The resource observation projection is backfilled once on the first open with its projection
+version and rebuilt from admitted claims during graph replay. Updates, out-of-order replication,
+repair, and retained-claim deletion refresh only affected resource subjects. Neither the
+projection nor its pending-subject queue is independent authority.
 
 Replication receipt stores an envelope before admission decodes its payload.
 
@@ -222,3 +229,8 @@ Eval history stays in the immutable claim log.
 A cleanup residue produces `eval.verdict` with `verdict=fail`.
 
 A cleanup infrastructure error produces `eval.verdict` with `verdict=void`.
+
+`workspace.observed` is a latest-only replicated observation written by the owning host during
+agent workspace reconciliation. It carries `host`, `workspace`, and an optional `repository`.
+The reconciler writes only changed values. Repository suggestions combine those observations
+with current checkout declarations; a gateway reads graph evidence and never scans host disks.

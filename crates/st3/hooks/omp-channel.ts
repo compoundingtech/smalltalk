@@ -97,6 +97,13 @@ type Stash = {
   lastCostUsd?: number;
   label?: string;
   accepted?: Map<string, { content: string; meta?: Record<string, unknown>; read?: boolean }>;
+  /** Todo observation state is fenced by the channel binding, not the extension instance. */
+  todoFingerprint?: string;
+  todoBranchKey?: string;
+  todoLeafKey?: string;
+  todoNextPollAt?: number;
+  todoSession?: string;
+  todoReady?: boolean;
 
   /** The structured `ask` tool call currently waiting for its matching result. */
   pendingAskToolCallId?: string;
@@ -204,6 +211,113 @@ const pinnedTelemetrySurface: {
 };
 void pinnedTelemetrySurface;
 
+type TodoStatus = "pending" | "in_progress" | "completed" | "blocked";
+type TodoTask = { content: string; status: TodoStatus; blocker?: string };
+type TodoPhase = { name: string; tasks: TodoTask[] };
+type TodoSnapshot = {
+  phases: TodoPhase[];
+  totals: Record<TodoStatus | "abandoned", number>;
+  truncated: boolean;
+};
+const record = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : undefined;
+const todoStatus = (value: unknown): value is TodoStatus =>
+  value === "pending" || value === "in_progress" || value === "completed" || value === "blocked";
+const utf8Prefix = (value: string, limit: number): string => {
+  let bytes = 0;
+  let prefix = "";
+  for (const character of value) {
+    bytes += Buffer.byteLength(character, "utf8");
+    if (bytes > limit) break;
+    prefix += character;
+  }
+  return prefix;
+};
+
+/** Count the full native snapshot before applying the claim's source-order bounds. */
+const boundedTodo = (raw: unknown): TodoSnapshot | undefined => {
+  if (!Array.isArray(raw)) return undefined;
+  const snapshot: TodoSnapshot = {
+    phases: [], totals: { pending: 0, in_progress: 0, completed: 0, blocked: 0, abandoned: 0 }, truncated: false,
+  };
+  let taskCount = 0;
+  for (const rawPhase of raw) {
+    const phase = record(rawPhase);
+    if (!phase || typeof phase.name !== "string" || !Array.isArray(phase.tasks)) return undefined;
+    const name = utf8Prefix(phase.name, 128);
+    const output: TodoPhase = { name, tasks: [] };
+    const includePhase = snapshot.phases.length < 16;
+    if (includePhase) snapshot.phases.push(output);
+    if (!includePhase || name !== phase.name) snapshot.truncated = true;
+    for (const rawTask of phase.tasks) {
+      const task = record(rawTask);
+      if (!task || typeof task.content !== "string" ||
+        (!todoStatus(task.status) && task.status !== "abandoned") ||
+        (task.blocker !== undefined && typeof task.blocker !== "string")) return undefined;
+      // OMP's dropped tasks have no corresponding approved claim status. Omit, never relabel.
+      if (task.status === "abandoned") { snapshot.totals.abandoned++; continue; }
+      if (!todoStatus(task.status)) return undefined;
+      snapshot.totals[task.status]++;
+      if (!includePhase || taskCount >= 100) { snapshot.truncated = true; continue; }
+      const content = utf8Prefix(task.content, 512);
+      const blocker = typeof task.blocker === "string" ? utf8Prefix(task.blocker, 512) : undefined;
+      if (content !== task.content || blocker !== task.blocker) snapshot.truncated = true;
+      output.tasks.push(blocker === undefined ? { content, status: task.status } : { content, status: task.status, blocker });
+      taskCount++;
+    }
+  }
+  // Reserve 4 KiB for authenticated session/incarnation provenance added by the Rust producer.
+  // JSON escaping can expand each byte sixfold; drop only trailing items, never alter totals.
+  let serializedBytes = Buffer.byteLength(JSON.stringify(snapshot), "utf8");
+  if (serializedBytes > 60 * 1024 && !snapshot.truncated) {
+    snapshot.truncated = true;
+    serializedBytes--; // `true` is one byte shorter than `false`.
+  }
+  while (serializedBytes > 60 * 1024) {
+    const last = snapshot.phases.at(-1);
+    if (!last) break;
+    const removed = last.tasks.length > 0 ? last.tasks.pop() : snapshot.phases.pop();
+    const siblings = last.tasks.length > 0 || (removed === last && snapshot.phases.length > 0);
+    serializedBytes -= Buffer.byteLength(JSON.stringify(removed), "utf8") + (siblings ? 1 : 0);
+  }
+  return snapshot;
+};
+
+type BranchTodo = { key: string; observedAt: string; sourceOp: string; snapshot: TodoSnapshot };
+const branchTodo = (ctx: ExtensionContext): BranchTodo | null | undefined => {
+  try {
+    // Native OMP's read-only session manager exposes getBranch(), root-to-current-leaf.
+    // Never use getEntries(): that includes unrelated branches.
+    const entries = ctx.sessionManager.getBranch();
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = record(entries[i]);
+      if (!entry) continue;
+      let details: Record<string, unknown> | undefined;
+      let sourceOp: string;
+      if (entry.type === "custom" && entry.customType === "user_todo_edit") {
+        details = record(entry.data);
+        sourceOp = "user_edit";
+      } else {
+        const message = record(entry.message);
+        if (entry.type !== "message" || message?.role !== "toolResult" ||
+          message.toolName !== "todo" || message.isError === true) continue;
+        details = record(message.details);
+        if (details?.op === "view" || typeof details?.op !== "string") continue;
+        sourceOp = details.op;
+      }
+      const snapshot = boundedTodo(details?.phases);
+      if (!snapshot || typeof entry.timestamp !== "string" || !Number.isFinite(Date.parse(entry.timestamp))) continue;
+      return {
+        key: `${entry.id}:${entry.timestamp}`, observedAt: new Date(entry.timestamp).toISOString(), sourceOp, snapshot,
+      };
+    }
+    return null; // Readable branch with no snapshot is known empty.
+  } catch {
+    return undefined; // An unreadable branch is not evidence of an empty list.
+  }
+};
+
 /**
  * Read the channel configuration once and unexport it.
  *
@@ -257,6 +371,17 @@ const seatLabel = (label: string): string => {
 
 export default function (pi: ExtensionAPI) {
   const state = stash();
+  let jobContext: ExtensionContext | undefined;
+  let lastStateFrame: Record<string, unknown> | undefined;
+  let lastBackgroundJobs: number | null | undefined;
+  const backgroundJobs = (): number | null => {
+    try {
+      const snapshot = (jobContext as ExtensionContext & {
+        getAsyncJobSnapshot?: () => { running?: unknown } | null;
+      } | undefined)?.getAsyncJobSnapshot?.();
+      return Array.isArray(snapshot?.running) ? snapshot.running.length : null;
+    } catch { return null; }
+  };
   const applyLabel = async (ctx: ExtensionContext) => {
     if (!state.label) return;
     try { await pi.setSessionName(state.label); }
@@ -331,6 +456,8 @@ export default function (pi: ExtensionAPI) {
       state.pendingAskToolCallId = undefined;
       state.pendingApproval = false;
       resetHold();
+      lastStateFrame = undefined;
+      lastBackgroundJobs = undefined;
     }
 
     cancelSettle();
@@ -348,6 +475,12 @@ export default function (pi: ExtensionAPI) {
       { stdio: ["pipe", "pipe", "inherit"], env: channelEnv },
     );
     state.child = child;
+    state.todoFingerprint = undefined;
+    state.todoBranchKey = undefined;
+    state.todoLeafKey = undefined;
+    state.todoNextPollAt = undefined;
+    state.todoSession = nativeSessionId;
+    state.todoReady = false;
 
     return new Promise<string>((resolve) => {
       let settled = false;
@@ -389,7 +522,9 @@ export default function (pi: ExtensionAPI) {
           if (keepalive !== undefined) clearInterval(keepalive);
           return;
         }
+        if (lastStateFrame && backgroundJobs() !== lastBackgroundJobs) sendFrame(lastStateFrame);
         if (legacyChannel) send({ type: "keepalive" });
+        if (state.todoReady) observeTodoBranch(ctx, false, true);
       }, 1000);
       keepalive.unref?.();
 
@@ -435,6 +570,8 @@ export default function (pi: ExtensionAPI) {
             if (accepted.read) send({ type: "read", meta: accepted.meta });
           }
           send({ type: "ready", sessionId: nativeSessionId });
+          state.todoReady = true;
+          observeTodoBranch(ctx, true);
           // Every fresh channel needs the provider's idle proof, including reconnects
           // during an idle session where no further turn boundary will arrive.
           watchSettle(ctx);
@@ -511,7 +648,59 @@ export default function (pi: ExtensionAPI) {
   const sendFrame = (frame: Record<string, unknown>) => {
     const child = state.child;
     if (!child || !child.stdin || child.stdin.destroyed) return;
+    if (frame.type === "state") {
+      lastStateFrame = frame;
+      lastBackgroundJobs = backgroundJobs();
+      frame = { ...frame, backgroundJobs: lastBackgroundJobs };
+    }
     child.stdin.write(JSON.stringify(frame) + "\n");
+  };
+  const emitTodo = (ctx: ExtensionContext, snapshot: TodoSnapshot, observedAt: string, sourceOp: string, force = false) => {
+    if (!state.todoReady || !state.child || state.child.stdin?.destroyed) return;
+    const nativeSession = ctx.sessionManager.getSessionId();
+    if (state.todoSession !== nativeSession) return;
+    const fingerprint = JSON.stringify(snapshot);
+    if (!force && state.todoFingerprint === fingerprint) return;
+    sendFrame({ type: "todo", session: nativeSession, observed_at: observedAt, source_op: sourceOp, ...snapshot });
+    state.todoFingerprint = fingerprint;
+  };
+  const observeTodoBranch = (ctx: ExtensionContext, hydrate = false, polling = false) => {
+    if (!state.todoReady || !state.child || state.child.stdin?.destroyed) return;
+    const nativeSession = ctx.sessionManager.getSessionId();
+    if (state.todoSession !== nativeSession) {
+      if (!hydrate) return;
+      // A branch hydration binds its observation provenance on the existing channel. It must
+      // not restart delivery, discard held mail, or reset ask/approval authority.
+      sendFrame({ type: "session", sessionId: nativeSession });
+      state.todoSession = nativeSession;
+      state.todoFingerprint = undefined;
+      state.todoBranchKey = undefined;
+      state.todoLeafKey = undefined;
+    }
+    let leafKey: string | undefined;
+    try {
+      // Native OMP exposes this O(1) index lookup on ReadonlySessionManager. /todo appends
+      // user_todo_edit through appendCustomEntry, which advances the same branch leaf.
+      if (typeof ctx.sessionManager.getLeafId === "function") {
+        leafKey = `${nativeSession}:${ctx.sessionManager.getLeafId() ?? ""}`;
+        if (!hydrate && state.todoLeafKey === leafKey) return;
+      }
+    } catch { return; }
+    // Older providers without a leaf indicator still observe events immediately, but never
+    // rebuild an unchanged idle branch every second.
+    if (polling && leafKey === undefined && Date.now() < (state.todoNextPollAt ?? 0)) return;
+    state.todoNextPollAt = Date.now() + 30_000;
+    const source = branchTodo(ctx);
+    if (source === undefined) return;
+    state.todoLeafKey = leafKey;
+    const key = source?.key ?? "";
+    if (!hydrate && state.todoBranchKey === key) return;
+    state.todoBranchKey = key;
+    const snapshot = source?.snapshot ?? {
+      phases: [], totals: { pending: 0, in_progress: 0, completed: 0, blocked: 0, abandoned: 0 }, truncated: false,
+    };
+    emitTodo(ctx, snapshot, source?.observedAt ?? new Date().toISOString(),
+      hydrate ? "hydrate" : source?.sourceOp ?? "hydrate", hydrate);
   };
   const boundedTimelineString = (value: unknown, limit = 16_384): string | undefined =>
     typeof value === "string" ? value.slice(0, limit) : undefined;
@@ -812,7 +1001,11 @@ export default function (pi: ExtensionAPI) {
   const onWidened = (
     event: string,
     handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
-  ) => register(event, (payload, ctx) => isSubagent(ctx) ? undefined : handler(payload, ctx));
+  ) => register(event, (payload, ctx) => {
+    if (isSubagent(ctx)) return;
+    jobContext = ctx;
+    return handler(payload, ctx);
+  });
 
   // Registered only now that every helper above is initialized: a use-before-declaration in this
   // file is the defect class that once shipped green through the type gate.
@@ -861,6 +1054,7 @@ export default function (pi: ExtensionAPI) {
       captureCost(event);
       sendContext(ctx);
       if (name === "message_end") sendTimeline(name, event);
+      if (name === "message_end") observeTodoBranch(ctx);
       if (name === "turn_end") endTurnToolCalls(event);
     });
   }
@@ -949,6 +1143,29 @@ export default function (pi: ExtensionAPI) {
     watchSettle(ctx);
   });
 
+  onWidened("tool_execution_end", async (rawEvent, ctx) => {
+    const event = record(rawEvent);
+    if (event?.toolName !== "todo") {
+      // Eval's native bridge persists successful nested todo calls as user_todo_edit entries.
+      // This is also the human-edit path; neither needs result-text parsing.
+      observeTodoBranch(ctx);
+      return;
+    }
+    const result = record(event.result);
+    const details = record(result?.details);
+    if (event.isError === true || result?.isError === true ||
+      typeof details?.op !== "string" || details.op === "view") return;
+    const snapshot = boundedTodo(details.phases);
+    if (!snapshot) return;
+    state.todoBranchKey = branchTodo(ctx)?.key ?? "";
+    try {
+      state.todoLeafKey = typeof ctx.sessionManager.getLeafId === "function"
+        ? `${ctx.sessionManager.getSessionId()}:${ctx.sessionManager.getLeafId() ?? ""}`
+        : undefined;
+    } catch { state.todoLeafKey = undefined; }
+    emitTodo(ctx, snapshot, new Date().toISOString(), details.op);
+  });
+
   // Approval events are an independent human-blocking surface. omp's pinned pi typings do not
   // declare them, so register through the same widened `on` view.
   type ApprovalFrame = { toolName?: unknown };
@@ -985,6 +1202,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("context", async (event, ctx) => {
     if (isSubagent(ctx)) return;
+    observeTodoBranch(ctx);
     const texts = event.messages.flatMap((message) => {
       if (message.role !== "user") return [];
       return typeof message.content === "string" ? [message.content] : message.content.flatMap((part: { type: string; text?: string }) =>
@@ -1003,6 +1221,11 @@ export default function (pi: ExtensionAPI) {
     await open(ctx);
     await applyLabel(ctx);
   });
+  for (const event of ["session_tree", "session_branch"]) {
+    onWidened(event, async (_event, ctx) => {
+      observeTodoBranch(ctx, true);
+    });
+  }
   onWidened("session_start", async (_event, ctx) => {
     // Awaited before the session's first turn, which is what makes restored context reach the boot
     // prompt rather than the turn after it.

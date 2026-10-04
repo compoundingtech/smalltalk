@@ -313,24 +313,35 @@ impl ClientRelay {
             .cloned()
             .collect::<Vec<_>>();
         let links = self.observed_links();
-        client_read_next_hops(&self.node, target, &names, visited, &links)
-            .into_iter()
-            .flat_map(|name| {
-                dialable
-                    .get(&name)
-                    .into_iter()
-                    .flatten()
-                    .map(move |route| PeerConfig {
-                        name: name.clone(),
-                        url: match route {
-                            Route::Http(url) => url.clone(),
-                            Route::Fabric { node, protocol } => {
-                                format!("fabric://{node}/{protocol}")
-                            }
-                        },
-                    })
-            })
-            .collect()
+        let owner_unreachable = self
+            .links
+            .as_ref()
+            .is_some_and(|store| store.replication_peer_up(target).is_ok_and(|(up, _)| !up));
+        client_read_next_hops(
+            &self.node,
+            target,
+            &names,
+            visited,
+            &links,
+            owner_unreachable,
+        )
+        .into_iter()
+        .flat_map(|name| {
+            dialable
+                .get(&name)
+                .into_iter()
+                .flatten()
+                .map(move |route| PeerConfig {
+                    name: name.clone(),
+                    url: match route {
+                        Route::Http(url) => url.clone(),
+                        Route::Fabric { node, protocol } => {
+                            format!("fabric://{node}/{protocol}")
+                        }
+                    },
+                })
+        })
+        .collect()
     }
 
     pub fn from_config(config: &Config) -> Result<Option<Self>> {
@@ -789,6 +800,23 @@ impl ClientRelay {
 /// node and the nodes already visited, nearest first. When the observations never name the target,
 /// every dialable peer is tried, since none can be ruled out.
 pub(crate) fn client_read_next_hops(
+    node: &str,
+    target: &str,
+    dialable: &[String],
+    visited: &[String],
+    links: &[(String, String)],
+    owner_unreachable: bool,
+) -> Vec<String> {
+    let mut ordered = client_read_hops(node, target, dialable, visited, links);
+    // A read waits out its whole timeout on an owner this node cannot reach before it tries a
+    // peer that can, so an owner this node has not exchanged with lately goes last.
+    if owner_unreachable && ordered.first().is_some_and(|first| first == target) {
+        ordered.rotate_left(1);
+    }
+    ordered
+}
+
+fn client_read_hops(
     node: &str,
     target: &str,
     dialable: &[String],
@@ -2049,7 +2077,8 @@ mod tests {
                 }],
             })
             .await
-            .unwrap();
+            .unwrap()
+            .message;
         assert_eq!(message.attachments[0].origin, "host/owner-node");
 
         // Sync carries the claim to the gateway; the bytes are not part of it.
@@ -2687,7 +2716,8 @@ mod tests {
                 "server",
                 &names(&["desktop"]),
                 &names(&["laptop"]),
-                &links(&[("desktop", "server"), ("laptop", "desktop")])
+                &links(&[("desktop", "server"), ("laptop", "desktop")]),
+                false
             ),
             names(&["desktop"])
         );
@@ -2697,7 +2727,8 @@ mod tests {
                 "server",
                 &names(&["desktop"]),
                 &names(&["laptop"]),
-                &links(&[("server", "desktop")])
+                &links(&[("server", "desktop")]),
+                false
             ),
             names(&["desktop"])
         );
@@ -2708,9 +2739,23 @@ mod tests {
                 "d",
                 &names(&["d", "c", "b", "island"]),
                 &names(&["a"]),
-                &links(&[("b", "d"), ("c", "b"), ("island", "elsewhere")])
+                &links(&[("b", "d"), ("c", "b"), ("island", "elsewhere")]),
+                false
             ),
             names(&["d", "b", "c"])
+        );
+        // An owner this node has not exchanged with lately is tried after the peers that
+        // reach it, rather than waiting out a read's whole timeout first (#898).
+        assert_eq!(
+            client_read_next_hops(
+                "a",
+                "d",
+                &names(&["d", "c", "b", "island"]),
+                &names(&["a"]),
+                &links(&[("b", "d"), ("c", "b"), ("island", "elsewhere")]),
+                true
+            ),
+            names(&["b", "c", "d"])
         );
         // A path through a node the read already passed is no path at all.
         assert_eq!(
@@ -2719,7 +2764,8 @@ mod tests {
                 "d",
                 &names(&["a", "c"]),
                 &names(&["a", "b"]),
-                &links(&[("a", "d"), ("c", "a")])
+                &links(&[("a", "d"), ("c", "a")]),
+                false
             ),
             Vec::<String>::new()
         );
@@ -2730,7 +2776,8 @@ mod tests {
                 "unseen",
                 &names(&["c", "b", "a"]),
                 &names(&["a", "b"]),
-                &links(&[("a", "c")])
+                &links(&[("a", "c")]),
+                false
             ),
             names(&["c"])
         );

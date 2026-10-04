@@ -278,7 +278,10 @@ fn mission_references(
             let Ok(resolved) = crate::mission::interpolate(agent, &variables) else {
                 continue;
             };
-            if !mission.revision_owners.contains(agent) && !scope.subject(graph, &resolved)? {
+            if !resolved.starts_with("person/")
+                && !mission.revision_owners.contains(agent)
+                && !scope.subject(graph, &resolved)?
+            {
                 refusals.push(format!(
                     "mission `{}` references missing eligible agent `{agent}`",
                     mission.subject
@@ -347,7 +350,10 @@ fn subject_references(
             if subscription.stopped {
                 return Ok(());
             }
-            if !scope.subject(graph, &subscription.observer)? {
+            // st declares a repository's standing observer for the first subscription to it.
+            if crate::github_watch::standing_locator(&subscription.observer).is_none()
+                && !scope.subject(graph, &subscription.observer)?
+            {
                 let scoped = subscription
                     .observer
                     .strip_prefix("observer/")

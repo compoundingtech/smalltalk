@@ -10,14 +10,11 @@ import { agentGlyph, agentName, agentState, agentWord, harnessColor, harnessName
 import { Banners } from '../chrome';
 import rules from '../../../fixtures/clients/conversation-style.json';
 import { tokenColor, type ConversationRules } from '../conversationStyle';
-import { COLLAPSED_TOOL_LINES, conversationEntries, staleLine, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry, type MailImage } from '../conversationView';
+import { COLLAPSED_TOOL_LINES, conversationEntries, staleLine, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry, type MailImage, simplify, type SimpleRow, sessionPerson, applyConversation, applyOlderPage, isUnresolved, olderFailed, olderLoading, olderNote, type Conversation } from '@smalltalk/st3-views';
 import { addImages, fromDataUri, MAX_IMAGES, megabytes, picked, type Picked } from '../images';
 import { rememberBounded } from '../boundedCache';
-import { simplify, type SimpleRow } from '../conversationSimple';
 import { dictationAvailable, startDictation } from '../modules/st-dictation';
-import { sessionPerson } from '../homeView';
 import type { RootScreen } from '../navigation';
-import { applyConversation, isUnresolved, type Conversation } from '../sessionView';
 import { useStore } from '../store';
 import { fonts, theme } from '../theme';
 import { Button, Field, LINE, Markdown, T } from '../ui';
@@ -26,7 +23,7 @@ import { Button, Field, LINE, Markdown, T } from '../ui';
 const RULES: ConversationRules = rules;
 const c = tokenColor;
 
-const empty: Conversation<TimelineEntry> = { entries: [], hasOlder: false, newestSequence: -1 };
+const empty: Conversation<TimelineEntry> = { entries: [], hasOlder: false, newestSequence: -1, older: { paged: false, start: false, loading: false } };
 type Pending = { id: string; text: string; at: string; failed?: string; images?: number };
 type Row = { kind: 'entry'; entry: ConversationEntry } | Exclude<SimpleRow, { kind: 'entry' }> | { kind: 'pending'; pending: Pending } | { kind: 'older' };
 
@@ -47,6 +44,22 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const unresolved = session ? isUnresolved(session) : false;
   const title = route.params.title ?? (agent ? agentName(agent) : session?.driver ?? target.split('/').pop() ?? target);
   const [timeline, setTimeline] = useState<Conversation<TimelineEntry>>(() => conversationCache.current.get(target) ?? empty);
+  const timelineNow = useRef(timeline);
+  timelineNow.current = timeline;
+  // Earlier pages load only when the person asks by scrolling (or tapping the line above the
+  // oldest entry), never on their own when a short conversation fits the screen.
+  const dragged = useRef(false);
+  const loadOlder = () => {
+    const current = timelineNow.current;
+    const sessionId = current.sessionId;
+    if (!dragged.current || !current.hasOlder || current.older.loading || !sessionId || status !== 'online') return;
+    const keep = (next: Conversation<TimelineEntry>) => { rememberBounded(conversationCache.current, target, next, 24); return next; };
+    setTimeline(previous => olderLoading(previous));
+    void actions.olderTimeline(sessionId, current.older, current.entries[0]).then(
+      page => setTimeline(previous => keep(applyOlderPage(previous, sessionId, page))),
+      error => setTimeline(previous => olderFailed(previous, error instanceof Error ? error.message : String(error))),
+    );
+  };
   // Whether st has answered at all: until it has, the screen says it is loading, never "nothing".
   const [loaded, setLoaded] = useState(() => conversationCache.current.has(target));
   const [issue, setIssue] = useState('');
@@ -111,6 +124,14 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     });
   }, [navigation, title, agent, status, actions]);
 
+  // st follows the session an agent had when the subscription started. After the agent restarts
+  // into a new session, subscribe again, once per new session, or this would keep showing the old
+  // one (and a message sent to the new one would never show up here).
+  const [followed, setFollowed] = useState<string | undefined>(undefined);
+  const currentSession = agent?.current_session_id ?? undefined;
+  useEffect(() => {
+    if (currentSession && timeline.sessionId && timeline.sessionId !== currentSession && followed !== currentSession) setFollowed(currentSession);
+  }, [currentSession, timeline.sessionId, followed]);
   // The socket sends the newest page, then each change; it never polls. Only while visible.
   useFocusEffect(useCallback(() => {
     if (!feed || unresolved) return;
@@ -126,7 +147,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       onIssue: setIssue,
     });
     return () => follow.close();
-  }, [feed, target, unresolved, conversationCache]));
+  }, [feed, target, unresolved, conversationCache, followed]));
 
   const names = useMemo(() => {
     const map = new Map(data.agents.map(candidate => [candidate.id, agentName(candidate)]));
@@ -166,8 +187,8 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     ...(simpleOn && !finding
       ? simplify(found, open).reverse().map((row): Row => row)
       : [...found].reverse().map(entry => ({ kind: 'entry' as const, entry }))),
-    ...(timeline.hasOlder && !finding ? [{ kind: 'older' as const }] : []),
-  ], [found, pending, timeline.hasOlder, finding, simpleOn, open]);
+    ...(olderNote(timeline) && !finding ? [{ kind: 'older' as const }] : []),
+  ], [found, pending, timeline, finding, simpleOn, open]);
 
   const canSend = !!agent && status === 'online';
   async function send(spoken?: string) {
@@ -243,6 +264,19 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     return () => { clearTimeout(typed); clearTimeout(sent); };
   }, [loaded, agent?.id]);
   useEffect(() => { if (devSend) void send(); }, [devSend]);
+  // Debug builds only: scroll back to the oldest entry every few seconds, as a person reading
+  // back would, so a recording can show earlier pages arriving (EXPO_PUBLIC_ST3_TEST_SCROLL_BACK
+  // is how many times).
+  useEffect(() => {
+    let left = __DEV__ ? Number(process.env.EXPO_PUBLIC_ST3_TEST_SCROLL_BACK ?? 0) : 0;
+    if (!left || !loaded) return;
+    const timer = setInterval(() => {
+      if (left-- <= 0) { clearInterval(timer); return; }
+      dragged.current = true;
+      list.current?.scrollToEnd({ animated: false });
+    }, 4_000);
+    return () => clearInterval(timer);
+  }, [loaded]);
   const toggle = useCallback((id: string) => setOpen(previous => { const next = new Set(previous); if (next.has(id)) next.delete(id); else next.add(id); return next; }), []);
 
   return <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={headerHeight}>
@@ -260,7 +294,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       data={rows}
       keyExtractor={row => row.kind === 'entry' ? row.entry.id : row.kind === 'call' ? `call:${row.entry.id}` : row.kind === 'bundle' ? row.id : row.kind === 'pending' ? row.pending.id : 'older'}
       renderItem={({ item: row }) => row.kind === 'older'
-        ? <View style={styles.entry}><T dim>older history is not shown here · `st conversations timeline` has all of it</T></View>
+        ? <Pressable accessibilityRole="button" onPress={() => { dragged.current = true; loadOlder(); }} style={styles.entry}><T dim>{olderNote(timeline)}</T></Pressable>
         : row.kind === 'pending' ? <PendingView pending={row.pending} />
         : row.kind === 'bundle' ? <BundleView row={row} onToggle={toggle} />
         : row.kind === 'call' && !open.has(row.entry.id) ? <CallView entry={row.entry} tool={row.tool} onToggle={toggle} />
@@ -272,6 +306,10 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       // A tap on the conversation puts the keyboard away, as in Messages; the next tap acts.
       keyboardShouldPersistTaps="never"
       onScroll={event => { offset.current = event.nativeEvent.contentOffset.y; setAway(offset.current > 240); }}
+      onScrollBeginDrag={() => { dragged.current = true; }}
+      // Inverted: the end is the oldest entry. Reaching it reads the page before.
+      onEndReached={loadOlder}
+      onEndReachedThreshold={0.5}
       scrollEventThrottle={100}
       contentContainerStyle={{ paddingVertical: 8 }}
     />

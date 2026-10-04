@@ -7,11 +7,18 @@
     "public_listener": false,
     "remote_mode": "online-thin-client"
   },
+  "streams": [
+    { "id": "collections.stream", "method": "GET", "path": "/v1/client/collections/stream", "websocket_protocol": "st3.client.collections.v0", "command": "CollectionCommand", "frame": "CollectionFrame", "max_subscriptions": 8 }
+  ],
   "reads": [
+    { "id": "host.repositories", "method": "GET", "path": "/v1/client/hosts/{id}/repositories", "response": "HostRepositories", "scope": "read.projections" },
+    { "id": "sets.list", "method": "GET", "path": "/v1/client/sets", "response": "Page" },
+    { "id": "sets.get", "method": "GET", "path": "/v1/client/sets/{id}", "response": "Resource" },
     { "id": "capabilities.get", "method": "GET", "path": "/v1/client/capabilities", "response": "Capabilities" },
     { "id": "document.get", "method": "GET", "path": "/v1/client/documents/content", "response": "DocumentContent" },
     { "id": "subject.definition", "method": "GET", "path": "/v1/client/subject-definition", "response": "SubjectDefinition" },
     { "id": "usage.period", "method": "GET", "path": "/v1/client/usage", "response": "UsagePeriod" },
+    { "id": "clients.list", "method": "GET", "path": "/v1/client/clients", "response": "ClientConnections" },
     { "id": "now.list", "method": "GET", "path": "/v1/client/now", "response": "Page" },
     { "id": "machines.list", "method": "GET", "path": "/v1/client/machines", "response": "Page" },
     { "id": "devices.list", "method": "GET", "path": "/v1/client/devices", "response": "Page" },
@@ -28,6 +35,7 @@
     { "id": "missions.get", "method": "GET", "path": "/v1/client/missions/{id}", "response": "Resource" },
     { "id": "work.list", "method": "GET", "path": "/v1/client/work", "response": "Page" },
     { "id": "work.get", "method": "GET", "path": "/v1/client/work/{id}", "response": "Resource" },
+    { "id": "resources.list", "method": "GET", "path": "/v1/client/resources", "response": "ResourcesPage" },
     { "id": "agents.list", "method": "GET", "path": "/v1/client/agents", "response": "Page" },
     { "id": "agents.get", "method": "GET", "path": "/v1/client/agents/{id}", "response": "Resource" },
     { "id": "agent-declaration.get", "method": "GET", "path": "/v1/client/agent-declarations/{id}", "response": "AgentDeclaration", "scope": "read.declarations" },
