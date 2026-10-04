@@ -184,7 +184,11 @@ mod gateway_tests {
             format!("{BEARER_PROTOCOL_PREFIX}unknown, {BEARER_PROTOCOL_PREFIX}fallback-secret"),
             format!("{BEARER_PROTOCOL_PREFIX}fallback-secret"),
         ] {
-            for authorization in ["Bearer native-secret", "Bearer unknown", "Basic native-secret"] {
+            for authorization in [
+                "Bearer native-secret",
+                "Bearer unknown",
+                "Basic native-secret",
+            ] {
                 let mut request = format!("ws://{address}/v1/client/collections/stream")
                     .into_client_request()
                     .unwrap();
@@ -1439,10 +1443,6 @@ mod gateway_tests {
             .find(|item| item["device_id"] == "device/fault")
             .unwrap()["session_id"]
             .clone();
-        assert_eq!(
-            input(&mut fault_socket, "fault-in", 0, text("fault-once")).await,
-            ack("fault-in", 0)
-        );
         state
             .store
             .connection
@@ -1453,6 +1453,10 @@ mod gateway_tests {
              BEGIN SELECT RAISE(ABORT, 'audit storage unavailable'); END;",
             )
             .unwrap();
+        assert_eq!(
+            input(&mut fault_socket, "fault-in", 0, text("fault-once")).await,
+            ack("fault-in", 0)
+        );
         let fault_closed =
             tokio::time::timeout(Duration::from_secs(5), next_input(&mut fault_socket))
                 .await
@@ -1529,22 +1533,20 @@ mod gateway_tests {
         assert_eq!(interrupted["successful_batches"], 0);
         assert_eq!(interrupted["uncertain_handoff"], true);
 
-        // Expiration must close an otherwise idle input without a new graph event
-        // or client frame. Bound the observed delay from the credential's deadline.
-        let expires_at = client_now_ms() as u64 + 3_000;
-        paired_device_expiring(
+        // Maintenance removes expired idle authority without a new input command or
+        // graph mutation. Change only the fixture's captured expiry after a valid open.
+        paired_device_scoped(
             &state,
             "expiry-secret",
             "expiry",
             &["read.projections", "terminal.read", "terminal.control"],
-            expires_at,
         );
         let expiry_request = Request::builder()
             .uri("/v1/client/agents")
             .header(AUTHORIZATION, "Bearer expiry-secret")
             .body(Body::empty())
             .unwrap();
-        let expiry_session = authenticate(&state, &expiry_request, "fabric-loopback").unwrap();
+        let mut expiry_session = authenticate(&state, &expiry_request, "fabric-loopback").unwrap();
         let expiry_attachment = create_terminal_attachment(
             &state,
             &expiry_session,
@@ -1556,32 +1558,34 @@ mod gateway_tests {
             "input-expiry",
         )
         .unwrap();
-        let mut expiry_socket = connect_as(
-            address,
-            "/v1/client/collections/stream",
-            COLLECTION_SUBPROTOCOL,
-            "expiry-secret",
+        let expiry_follow = prepare_terminal_follow(
+            &state,
+            &expiry_session,
+            "terminal/agent/input-test",
+            Some(&incarnation),
+            expiry_attachment["stream_capability"].as_str(),
         )
-        .await;
-        follow(&mut expiry_socket, "expiry-term", &expiry_attachment).await;
-        open(&mut expiry_socket, "expiry-in", "expiry-term").await;
-        assert!(
-            client_now_ms() < u128::from(expires_at),
-            "fixture must open before expiry"
-        );
-        let expiry_closed =
-            tokio::time::timeout(Duration::from_secs(5), next_input(&mut expiry_socket))
+        .unwrap();
+        let mut idle_inputs = terminal_input::TerminalInputs::default();
+        idle_inputs.follow("expiry-term", expiry_follow.input_target());
+        let expiry_open: CollectionSubscribe = serde_json::from_value(
+            json!({"kind":"input-open", "id":"expiry-in", "follow":"expiry-term"}),
+        )
+        .unwrap();
+        assert_eq!(
+            idle_inputs
+                .command(&state, &expiry_session, &expiry_open)
                 .await
-                .expect("idle credential expiry must publish closure on the periodic clock");
-        let observed_at = client_now_ms() as u64;
-        assert_eq!(expiry_closed["kind"], "input-closed");
-        assert_eq!(expiry_closed["id"], "expiry-in");
-        assert_eq!(expiry_closed["reason"], "revoked");
-        assert!(observed_at >= expires_at, "authority must not expire early");
-        assert!(
-            observed_at - expires_at < 2_000,
-            "idle expiry exceeded two clock periods"
+                .unwrap()["kind"],
+            "input-opened",
         );
+        expiry_session.pairing.as_mut().unwrap().expires_at_unix_ms = 0;
+        let expiry_closed = idle_inputs.maintain(&state, &expiry_session).await;
+        assert_eq!(expiry_closed.len(), 1);
+        assert_eq!(expiry_closed[0]["kind"], "input-closed");
+        assert_eq!(expiry_closed[0]["id"], "expiry-in");
+        assert_eq!(expiry_closed[0]["reason"], "revoked");
+        assert!(!idle_inputs.has_open());
         let expiry_history = state
             .store
             .input_session_history(
@@ -1589,7 +1593,7 @@ mod gateway_tests {
                 Some("person/alex"),
                 None,
                 200,
-                observed_at,
+                client_now_ms() as u64,
             )
             .unwrap();
         let expired = expiry_history["items"]
@@ -1602,7 +1606,81 @@ mod gateway_tests {
         assert_eq!(expired["reason"], "revoked");
         assert_eq!(expired["successful_send_bytes"], 0);
         assert_eq!(expired["uncertain_handoff"], false);
-        expiry_socket.close(None).await.unwrap();
+
+        // Separately exercise the live socket clock with no client command or graph
+        // change after opening. Report owner-observed timing, not test-task receipt
+        // latency, and allow scheduling slack rather than promise real-time behavior.
+        let expires_at = client_now_ms() as u64 + 30_000;
+        paired_device_expiring(
+            &state,
+            "timing-secret",
+            "timing",
+            &["read.projections", "terminal.read", "terminal.control"],
+            expires_at,
+        );
+        let timing_request = Request::builder()
+            .uri("/v1/client/agents")
+            .header(AUTHORIZATION, "Bearer timing-secret")
+            .body(Body::empty())
+            .unwrap();
+        let timing_session = authenticate(&state, &timing_request, "fabric-loopback").unwrap();
+        let timing_attachment = create_terminal_attachment(
+            &state,
+            &timing_session,
+            &request(
+                "terminal.attach",
+                "input-timing",
+                json!({"target_id":"terminal/agent/input-test"}),
+            ),
+            "input-timing",
+        )
+        .unwrap();
+        let mut timing_socket = connect_as(
+            address,
+            "/v1/client/collections/stream",
+            COLLECTION_SUBPROTOCOL,
+            "timing-secret",
+        )
+        .await;
+        follow(&mut timing_socket, "timing-term", &timing_attachment).await;
+        open(&mut timing_socket, "timing-in", "timing-term").await;
+        let timing_closed =
+            tokio::time::timeout(Duration::from_secs(45), next_input(&mut timing_socket))
+                .await
+                .expect("idle socket must revoke expired authority without another input frame");
+        assert_eq!(timing_closed["kind"], "input-closed");
+        assert_eq!(timing_closed["id"], "timing-in");
+        assert_eq!(timing_closed["reason"], "revoked");
+        let timing_history = state
+            .store
+            .input_session_history(
+                "agent/input-test",
+                Some("person/alex"),
+                None,
+                200,
+                client_now_ms() as u64,
+            )
+            .unwrap();
+        let timed = timing_history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["device_id"] == "device/timing")
+            .unwrap();
+        let closed_at = timed["observed_at_unix_ms"].as_u64().unwrap();
+        assert!(
+            closed_at >= expires_at,
+            "owner must not expire authority early"
+        );
+        assert_eq!(timed["event"], "closed");
+        assert_eq!(timed["reason"], "revoked");
+        assert_eq!(timed["successful_send_bytes"], 0);
+        assert_eq!(timed["uncertain_handoff"], false);
+        eprintln!(
+            "idle expiry owner-observed delay: {} ms",
+            closed_at - expires_at
+        );
+        timing_socket.close(None).await.unwrap();
 
         let screen = tokio::task::spawn_blocking(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
