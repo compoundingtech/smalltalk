@@ -326,6 +326,11 @@ the writer for longer than the budget, whatever a row costs to delete.** The tim
 row count, is the bound. The test `a_trim_never_makes_a_write_wait_long` in
 `crates/st3/src/store/tombstones_tests.rs` trims a production-sized history (150,000 claims and
 operations) with every row made slow, and fails without the budget.
+Its setup inserts the history in two bulk statements: inserting each row separately in one growing
+transaction repeatedly spilled SQLite statement journals and sustained 42–51 MB/s of temporary
+writes before the trim even started (#1145). The Linux regression
+`production_history_has_bounded_journal_writes` forces spill with a small cache and bounds the
+setup's write-syscall bytes, without reducing the production-sized trim proof.
 
 ## Where the proof lives
 

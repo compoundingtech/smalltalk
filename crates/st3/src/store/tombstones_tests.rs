@@ -779,30 +779,67 @@ fn production_history(store: &Store, claims: usize) {
             [],
         )
         .unwrap();
-    {
-        let mut claim = transaction
-            .prepare(
-                "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body,
-                                    predecessors, accepted_at_unix_ms)
-                 VALUES (?1, 'batch/elm/1/history', ?2, 'daemon.diagnostic', 'elm', NULL,
-                         '{\"fields\":{}}', '[]', '1')",
-            )
-            .unwrap();
-        let mut operation = transaction
-            .prepare(
-                "INSERT INTO operations(id, request_digest, canonical_claim_id, state)
-                 VALUES (?1, 'history', ?2, 'active')",
-            )
-            .unwrap();
-        for n in 0..claims {
-            let id = format!("{n:064x}");
-            claim
-                .execute(params![id, format!("daemon/elm-{}", n % 500)])
-                .unwrap();
-            operation.execute(params![format!("op/{n}"), id]).unwrap();
-        }
-    }
+    // One statement per table, not per row: after dirty pages spill, each separate INSERT
+    // journals pages again for statement rollback and fixture setup writes gigabytes.
+    transaction
+        .execute(
+            "WITH RECURSIVE history(n) AS (
+                 SELECT 0 WHERE ?1>0
+                 UNION ALL SELECT n+1 FROM history WHERE n+1<?1
+             )
+             INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body,
+                                predecessors, accepted_at_unix_ms)
+             SELECT printf('%064x', n), 'batch/elm/1/history',
+                    printf('daemon/elm-%d', n%500), 'daemon.diagnostic', 'elm', NULL,
+                    '{\"fields\":{}}', '[]', '1'
+             FROM history",
+            [claims],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "WITH RECURSIVE history(n) AS (
+                 SELECT 0 WHERE ?1>0
+                 UNION ALL SELECT n+1 FROM history WHERE n+1<?1
+             )
+             INSERT INTO operations(id, request_digest, canonical_claim_id, state)
+             SELECT printf('op/%d', n), 'history', printf('%064x', n), 'active'
+             FROM history",
+            [claims],
+        )
+        .unwrap();
     transaction.commit().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn production_history_has_bounded_journal_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("claims.sqlite3"), "alder").unwrap();
+    // Force dirty-page spill with a small fixture, rather than filling the normal 32 MiB cache.
+    store
+        .connection
+        .lock()
+        .unwrap()
+        .execute_batch("PRAGMA cache_size=-64")
+        .unwrap();
+    let written = || {
+        std::fs::read_to_string("/proc/thread-self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("wchar: "))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    // The borrowed connection writes on this thread; other parallel tests cannot affect its IO.
+    let before = written();
+    production_history(&store, 5_000);
+    let bytes = written() - before;
+    assert!(
+        bytes < 128 * 1024 * 1024,
+        "5,000 history rows wrote {bytes} bytes, including temporary statement journals"
+    );
 }
 
 #[test]
