@@ -22,19 +22,23 @@ jobs:
     if: vars.CI1_RUNNERS == 'on'
     runs-on: ubuntu-latest
     timeout-minutes: 3
-    permissions: {}
+    permissions:
+      pull-requests: read
     outputs:
       ci1: ${{ steps.pick.outputs.ci1 }}
     steps:
-      - name: Pick ci1 when it has room, else Namespace
+      - name: Use reserved ci1 for priority PRs and the queue; available ci1 for PRs
         id: pick
         env:
           GH_TOKEN: ${{ secrets.CI1_RUNNERS_READ_TOKEN }}
           EVENT: ${{ github.event_name }}
           REPOSITORY: ${{ github.repository }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          GH_REPO_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
-          NEED: ${{ vars.CI1_MIN_IDLE || '5' }}
+          NEED: ${{ vars.CI1_MIN_IDLE || '1' }}
         run: |
           namespace() {
             echo "$1: Namespace"
@@ -44,8 +48,27 @@ jobs:
           if [ "$EVENT" = pull_request ] && [ "$HEAD_REPOSITORY" != "$REPOSITORY" ]; then
             namespace "a pull request from a fork never runs on ci1"
           fi
+          if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_LABELS" >/dev/null 2>&1; then
+            printf 'ci1=["ci1-priority"]\n' >> "$GITHUB_OUTPUT"
+            echo "priority PR: reserved ci1-priority capacity"
+            printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$EVENT" = merge_group ]; then
+            label=ci1-merge
+            # A queue entry for an urgent PR uses the priority pool too, including when its PR checks passed.
+            if [ -n "$GH_REPO_TOKEN" ] && [[ "$QUEUE_REF" =~ ^refs/heads/gh-readonly-queue/main/pr-([0-9]+)-[0-9a-f]{40}$ ]]; then
+              queue_pr=${BASH_REMATCH[1]}
+              if labels=$(GH_TOKEN="$GH_REPO_TOKEN" timeout 20s gh api "repos/$REPOSITORY/pulls/$queue_pr" --jq '.labels | map(.name)' 2>/dev/null) && jq -e 'index("ci-priority") != null' <<< "$labels" >/dev/null 2>&1; then
+                label=ci1-priority
+              fi
+            fi
+            printf 'ci1=["%s"]\n' "$label" >> "$GITHUB_OUTPUT"
+            echo "merge queue: reserved $label runners"
+            printf 'Runner: **ci1** (%s, reserved merge-queue capacity)\n' "$label" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           label=ci1
-          [ "$EVENT" = merge_group ] && label=ci1-merge
           [ -n "$GH_TOKEN" ] || namespace "no runner status token"
           [[ "$NEED" =~ ^[1-9][0-9]*$ ]] || namespace "invalid minimum idle runner count"
           if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>&1); then
@@ -67,15 +90,112 @@ jobs:
         run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""
   namespace-capacity:
     name: namespace-capacity
-    if: github.event_name == 'workflow_dispatch'
-    runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
-    timeout-minutes: 5
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["namespace-profile-linux-x86-64","namespace-features:github.run-id={0}"]', github.run_id)) }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: write
     defaults:
       run:
         shell: bash
     steps:
+      - name: Cancel superseded merge groups
+        if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          QUEUE_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          python3 - <<'QUEUE_WATCH_PY'
+          #!/usr/bin/env python3
+          """Cancel only this merge-group run when its queue ref is superseded."""
+          import json
+          import os
+          import re
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+          REQUIRED = {"linux-gate", "typescript-client", "isolation-vm", "genie-freshness"}
+
+
+          def decision(jobs, ref_status, ref, sha):
+              completed = {job["name"] for job in jobs if job["status"] == "completed"}
+              if REQUIRED <= completed:
+                  return "finished"
+              ref_sha = ref.get("object", {}).get("sha")
+              if ref_status == 404 or (ref_status == 200 and ref_sha and ref_sha != sha):
+                  return "superseded"
+              return "wait"
+
+
+          def watch(api, repository, run_id, queue_ref, sha, pause=time.sleep):
+              stale = 0
+              while True:
+                  status, payload = api(f"repos/{repository}/actions/runs/{run_id}/jobs?per_page=100")
+                  # Check completion first: deletion after a successful merge must retain the run result.
+                  if status == 200 and REQUIRED <= {
+                      job["name"] for job in payload.get("jobs", []) if job["status"] == "completed"
+                  }:
+                      return "Required checks finished; queue watchdog completed normally."
+                  # A job lookup failure cannot establish that cancellation is still needed.
+                  if status != 200:
+                      stale = 0
+                      pause(15)
+                      continue
+                  ref_status, ref = api(f"repos/{repository}/git/ref/{quote(queue_ref.removeprefix('refs/'), safe='/')}")
+                  result = decision(payload.get("jobs", []), ref_status, ref, sha)
+                  stale = stale + 1 if result == "superseded" else 0
+                  if stale >= 2:
+                      status, _ = api(f"repos/{repository}/actions/runs/{run_id}/force-cancel", method="POST")
+                      if status == 202:
+                          return "Superseded queue ref confirmed twice; canceled this workflow and its pending jobs."
+                      if status == 409:
+                          return "Workflow already completed before cancellation."
+                      print(f"::warning::Queue cancellation returned HTTP {status}; retrying.", flush=True)
+                  pause(15)
+
+
+          def main():
+              repository, run_id, queue_ref, sha = (os.environ[key] for key in ("REPOSITORY", "RUN_ID", "QUEUE_REF", "QUEUE_SHA"))
+              assert re.fullmatch(r"[\w.-]+/[\w.-]+", repository)
+              assert run_id.isdigit()
+              assert re.fullmatch(r"refs/heads/gh-readonly-queue/main/pr-\d+-[0-9a-f]{40}", queue_ref)
+              assert re.fullmatch(r"[0-9a-f]{40}", sha)
+              token = os.environ["GH_TOKEN"]
+
+              def api(path, method="GET"):
+                  request = Request("https://api.github.com/" + path, method=method, headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  })
+                  try:
+                      with urlopen(request, timeout=20) as response:
+                          body = response.read()
+                          return response.status, json.loads(body) if body else {}
+                  except HTTPError as error:
+                      return error.code, {}
+                  except (URLError, TimeoutError, ValueError):
+                      return 0, {}
+
+              print("Watching the current merge-group ref; API lookup failures never cancel work.", flush=True)
+              result = watch(api, repository, run_id, queue_ref, sha)
+              print(result, flush=True)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                  summary.write(result + "\n")
+
+
+          if __name__ == "__main__":
+              main()
+
+          QUEUE_WATCH_PY
       - name: Record Namespace platform capacity
+        if: github.event_name == 'workflow_dispatch'
         run: |
           nsc workspace concurrency --output json | jq '{concurrency: [.concurrency[] | {platforms, limits, activeConcurrency}]}' > "$RUNNER_TEMP/namespace-capacity.json"
           cat "$RUNNER_TEMP/namespace-capacity.json"
@@ -84,6 +204,7 @@ jobs:
           cat "$RUNNER_TEMP/namespace-capacity.json" >> "$GITHUB_STEP_SUMMARY"
           printf '\n\x60\x60\x60\n' >> "$GITHUB_STEP_SUMMARY"
       - name: Retain Namespace capacity evidence
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: namespace-capacity
@@ -156,7 +277,7 @@ jobs:
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Check runner selection and generated files
         shell: bash
-        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'"
+        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'"
       - name: Save Nix outputs
         if: success() && env.CI_LOCAL_CACHES != '1'
         run: bash scripts/ci-nix-cache save
@@ -608,7 +729,7 @@ jobs:
     name: linux-gate
     needs: [pick-runner, linux-tests, linux-clippy, linux-fleet-compat]
     if: always()
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["namespace-profile-linux-x86-64","namespace-features:github.run-id={0}"]', github.run_id)) }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require every Linux stage to pass

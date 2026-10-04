@@ -55,9 +55,9 @@ export default githubRepoSettings({
           max_entries_to_merge: 5,
           min_entries_to_merge: 1,
           min_entries_to_merge_wait_minutes: 5,
-          // A required check that never reports (a lost Namespace job) fails the entry after this
-          // long instead of blocking the queue for the default hour.
-          check_response_timeout_minutes: 30,
+          // Preserve the incident's hour-long response window: a finished stage must not expire
+          // merely because its dependent gate was waiting for a runner.
+          check_response_timeout_minutes: 60,
         },
       },
     ],

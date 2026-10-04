@@ -1,5 +1,6 @@
 import { buildSnapshotSave } from './build-snapshot.ts'
 import { auditCaches } from './cache-audit.ts'
+import { readFileSync } from 'node:fs'
 import {
   defaultActionlintConfig,
   githubWorkflow,
@@ -112,17 +113,32 @@ export default githubWorkflow(auditCaches({
   },
   jobs: {
     [pickRunnerJobId]: pickRunnerJob,
-    // Namespace runners are already authenticated. Manual runs record the platform resource limits
-    // alongside the CI workload so queue concurrency can be chosen from the actual account capacity.
+    // Watch queue refs on GitHub-hosted capacity, even when both workload pools are occupied.
+    // Manual runs retain the existing Namespace capacity report.
     'namespace-capacity': {
       name: 'namespace-capacity',
-      if: "github.event_name == 'workflow_dispatch'",
-      'runs-on': linuxRunner,
-      'timeout-minutes': 5,
+      if: "github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'",
+      'runs-on': `\${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('${JSON.stringify(linuxRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)) }}`,
+      'timeout-minutes': 120,
+      permissions: { contents: 'read', actions: 'write' },
       defaults: { run: { shell: 'bash' } },
       steps: [
         {
+          name: 'Cancel superseded merge groups',
+          if: "github.event_name == 'merge_group'",
+          env: {
+            GH_TOKEN: '${{ github.token }}',
+            REPOSITORY: '${{ github.repository }}',
+            RUN_ID: '${{ github.run_id }}',
+            QUEUE_REF: '${{ github.event.merge_group.head_ref }}',
+            QUEUE_SHA: '${{ github.event.merge_group.head_sha }}',
+          },
+          // Embed trusted workflow source: this job never checks out or executes queued PR code.
+          run: `python3 - <<'QUEUE_WATCH_PY'\n${readFileSync(new URL('../../scripts/ci-queue-watch', import.meta.url), 'utf8')}\nQUEUE_WATCH_PY`,
+        },
+        {
           name: 'Record Namespace platform capacity',
+          if: "github.event_name == 'workflow_dispatch'",
           run: `nsc workspace concurrency --output json | jq '{concurrency: [.concurrency[] | {platforms, limits, activeConcurrency}]}' > "$RUNNER_TEMP/namespace-capacity.json"
 cat "$RUNNER_TEMP/namespace-capacity.json"
 printf 'Measured at %s\\n\\n' "$(date -u +%FT%TZ)" >> "$GITHUB_STEP_SUMMARY"
@@ -132,6 +148,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
         },
         {
           name: 'Retain Namespace capacity evidence',
+          if: "github.event_name == 'workflow_dispatch'",
           uses: 'actions/upload-artifact@v4',
           with: {
             name: 'namespace-capacity',
@@ -149,7 +166,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       'timeout-minutes': 20,
       steps: [
         ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
-        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
+        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
         ...buildSnapshotSave,
       ],
@@ -235,7 +252,8 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       needs: [pickRunnerJobId, 'linux-tests', 'linux-clippy', 'linux-fleet-compat'],
       // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
       if: 'always()',
-      'runs-on': linuxRunsOn,
+      // Aggregation needs no build caches and must not queue behind the work it summarizes.
+      'runs-on': 'ubuntu-latest',
       'timeout-minutes': 5,
       steps: [
         {

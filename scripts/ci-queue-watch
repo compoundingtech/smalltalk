@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Cancel only this merge-group run when its queue ref is superseded."""
+import json
+import os
+import re
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+REQUIRED = {"linux-gate", "typescript-client", "isolation-vm", "genie-freshness"}
+
+
+def decision(jobs, ref_status, ref, sha):
+    completed = {job["name"] for job in jobs if job["status"] == "completed"}
+    if REQUIRED <= completed:
+        return "finished"
+    ref_sha = ref.get("object", {}).get("sha")
+    if ref_status == 404 or (ref_status == 200 and ref_sha and ref_sha != sha):
+        return "superseded"
+    return "wait"
+
+
+def watch(api, repository, run_id, queue_ref, sha, pause=time.sleep):
+    stale = 0
+    while True:
+        status, payload = api(f"repos/{repository}/actions/runs/{run_id}/jobs?per_page=100")
+        # Check completion first: deletion after a successful merge must retain the run result.
+        if status == 200 and REQUIRED <= {
+            job["name"] for job in payload.get("jobs", []) if job["status"] == "completed"
+        }:
+            return "Required checks finished; queue watchdog completed normally."
+        # A job lookup failure cannot establish that cancellation is still needed.
+        if status != 200:
+            stale = 0
+            pause(15)
+            continue
+        ref_status, ref = api(f"repos/{repository}/git/ref/{quote(queue_ref.removeprefix('refs/'), safe='/')}")
+        result = decision(payload.get("jobs", []), ref_status, ref, sha)
+        stale = stale + 1 if result == "superseded" else 0
+        if stale >= 2:
+            status, _ = api(f"repos/{repository}/actions/runs/{run_id}/force-cancel", method="POST")
+            if status == 202:
+                return "Superseded queue ref confirmed twice; canceled this workflow and its pending jobs."
+            if status == 409:
+                return "Workflow already completed before cancellation."
+            print(f"::warning::Queue cancellation returned HTTP {status}; retrying.", flush=True)
+        pause(15)
+
+
+def main():
+    repository, run_id, queue_ref, sha = (os.environ[key] for key in ("REPOSITORY", "RUN_ID", "QUEUE_REF", "QUEUE_SHA"))
+    assert re.fullmatch(r"[\w.-]+/[\w.-]+", repository)
+    assert run_id.isdigit()
+    assert re.fullmatch(r"refs/heads/gh-readonly-queue/main/pr-\d+-[0-9a-f]{40}", queue_ref)
+    assert re.fullmatch(r"[0-9a-f]{40}", sha)
+    token = os.environ["GH_TOKEN"]
+
+    def api(path, method="GET"):
+        request = Request("https://api.github.com/" + path, method=method, headers={
+            "Authorization": "Bearer " + token,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        })
+        try:
+            with urlopen(request, timeout=20) as response:
+                body = response.read()
+                return response.status, json.loads(body) if body else {}
+        except HTTPError as error:
+            return error.code, {}
+        except (URLError, TimeoutError, ValueError):
+            return 0, {}
+
+    print("Watching the current merge-group ref; API lookup failures never cancel work.", flush=True)
+    result = watch(api, repository, run_id, queue_ref, sha)
+    print(result, flush=True)
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+        summary.write(result + "\n")
+
+
+if __name__ == "__main__":
+    main()

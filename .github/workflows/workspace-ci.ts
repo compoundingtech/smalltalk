@@ -17,11 +17,13 @@ export const linuxStageRunner = ['nscloud-ubuntu-24.04-amd64-8x16'] as const
 export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-arm64', runId: '${{ github.run_id }}' })
 
 /**
- * ci1, our own CI machine, takes a whole Workspace CI run when it has room for it; Namespace takes
- * every other run. GitHub has no overflow between runner labels, so the `pick-runner` job asks the
+ * ci1, our own CI machine, takes a Workspace CI run when any general runner is idle; Namespace takes
+ * runs when no general runner is available. The other jobs may wait briefly on ci1. GitHub has no
+ * overflow between runner labels, so the `pick-runner` job asks the
  * GitHub API how many ci1 runners are idle before the other jobs start, and their `runs-on` reads its
- * output. Merge-queue runs ask for `ci1-merge`, which a runner reserved for the queue also carries, so
- * queued merges never wait behind pull request pushes.
+ * output. Trusted PRs labelled `ci-priority` use the reserved `ci1-priority` lane.
+ * Merge-queue runs always use the reserved `ci1-merge` label and wait for that pool,
+ * instead of moving to a busy Namespace pool when a reserved runner is occupied.
  *
  * Off unless the repository variable `CI1_RUNNERS` is `on`: then `pick-runner` is skipped, its output
  * is empty and every job runs on Namespace exactly as before. A pull request from a fork never runs on
@@ -29,9 +31,8 @@ export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-a
  */
 export const pickRunnerJobId = 'pick-runner'
 
-/** Jobs a run starts at once (three stages, isolation-vm, genie-freshness).
- * typescript-client follows genie-freshness and reuses its slot. */
-const ci1JobsAtOnce = 5
+/** Start work on available ci1 capacity without requiring room for all five jobs at once. */
+const ci1MinIdle = 1
 
 export const pickRunnerJob = {
   name: pickRunnerJobId,
@@ -39,11 +40,11 @@ export const pickRunnerJob = {
   // GitHub-hosted, so the choice never waits for either pool it chooses between.
   'runs-on': 'ubuntu-latest',
   'timeout-minutes': 3,
-  permissions: {},
+  permissions: { 'pull-requests': 'read' },
   outputs: { ci1: '${{ steps.pick.outputs.ci1 }}' },
   steps: [
     {
-      name: 'Pick ci1 when it has room, else Namespace',
+      name: 'Use reserved ci1 for priority PRs and the queue; available ci1 for PRs',
       id: 'pick',
       env: {
         // A token that may only read the organization's self-hosted runners. Forks never receive it.
@@ -51,8 +52,11 @@ export const pickRunnerJob = {
         EVENT: '${{ github.event_name }}',
         REPOSITORY: '${{ github.repository }}',
         HEAD_REPOSITORY: '${{ github.event.pull_request.head.repo.full_name }}',
+        PR_LABELS: '${{ toJSON(github.event.pull_request.labels.*.name) }}',
+        QUEUE_REF: '${{ github.event.merge_group.head_ref }}',
+        GH_REPO_TOKEN: '${{ github.token }}',
         OWNER: '${{ github.repository_owner }}',
-        NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1JobsAtOnce}' }}`,
+        NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1MinIdle}' }}`,
       },
       run: `namespace() {
   echo "$1: Namespace"
@@ -62,8 +66,27 @@ export const pickRunnerJob = {
 if [ "$EVENT" = pull_request ] && [ "$HEAD_REPOSITORY" != "$REPOSITORY" ]; then
   namespace "a pull request from a fork never runs on ci1"
 fi
+if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_LABELS" >/dev/null 2>&1; then
+  printf 'ci1=["ci1-priority"]\\n' >> "$GITHUB_OUTPUT"
+  echo "priority PR: reserved ci1-priority capacity"
+  printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\\n' >> "$GITHUB_STEP_SUMMARY"
+  exit 0
+fi
+if [ "$EVENT" = merge_group ]; then
+  label=ci1-merge
+  # A queue entry for an urgent PR uses the priority pool too, including when its PR checks passed.
+  if [ -n "$GH_REPO_TOKEN" ] && [[ "$QUEUE_REF" =~ ^refs/heads/gh-readonly-queue/main/pr-([0-9]+)-[0-9a-f]{40}$ ]]; then
+    queue_pr=\${BASH_REMATCH[1]}
+    if labels=$(GH_TOKEN="$GH_REPO_TOKEN" timeout 20s gh api "repos/$REPOSITORY/pulls/$queue_pr" --jq '.labels | map(.name)' 2>/dev/null) && jq -e 'index("ci-priority") != null' <<< "$labels" >/dev/null 2>&1; then
+      label=ci1-priority
+    fi
+  fi
+  printf 'ci1=["%s"]\\n' "$label" >> "$GITHUB_OUTPUT"
+  echo "merge queue: reserved $label runners"
+  printf 'Runner: **ci1** (%s, reserved merge-queue capacity)\\n' "$label" >> "$GITHUB_STEP_SUMMARY"
+  exit 0
+fi
 label=ci1
-[ "$EVENT" = merge_group ] && label=ci1-merge
 [ -n "$GH_TOKEN" ] || namespace "no runner status token"
 [[ "$NEED" =~ ^[1-9][0-9]*$ ]] || namespace "invalid minimum idle runner count"
 if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>&1); then
