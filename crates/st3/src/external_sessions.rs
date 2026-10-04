@@ -2489,14 +2489,37 @@ fn normalize_omp(
         Some("custom_message") => {
             // An extension's message; `display: false` marks it hidden in the harness itself.
             if value.get("display") != Some(&Value::Bool(false)) {
-                push_omp_content(
-                    driver,
-                    items,
-                    value.get("content").unwrap_or(&Value::Null),
-                    sequence,
-                    &timestamp,
-                    "system",
-                );
+                if driver == ExternalDriver::Omp {
+                    // The role is transport-level. Consumers derive sender provenance from the
+                    // native attribution and details, not from display text or guessed labels.
+                    let envelope = json!({
+                        "_tag": "OmpEvent",
+                        "version": 1,
+                        "kind": value.get("customType").unwrap_or(&Value::Null),
+                        "attribution": value.get("attribution").unwrap_or(&Value::Null),
+                        "content": bounded_value(value.get("content").cloned().unwrap_or(Value::Null)),
+                        "details": bounded_value(value.get("details").cloned().unwrap_or(Value::Null))
+                    });
+                    items.push(timeline_item(
+                        sequence,
+                        &timestamp,
+                        "system",
+                        "content",
+                        json!({
+                            "media_type": "application/vnd.omp.event+json",
+                            "text": envelope.to_string()
+                        }),
+                    ));
+                } else {
+                    push_omp_content(
+                        driver,
+                        items,
+                        value.get("content").unwrap_or(&Value::Null),
+                        sequence,
+                        &timestamp,
+                        "system",
+                    );
+                }
             }
             return;
         }
@@ -2602,7 +2625,7 @@ fn push_omp_content(
                         part.get("name").and_then(Value::as_str).unwrap_or("tool"),
                         part.get("arguments").cloned().unwrap_or_else(|| json!({})),
                     ),
-                    Some("toolResult" | "tool_result") => push_tool_result(
+                    Some("toolResult" | "tool_result") => push_tool_result_with_status(
                         items,
                         item_sequence,
                         &timestamp,
@@ -2611,6 +2634,7 @@ fn push_omp_content(
                             .and_then(Value::as_str)
                             .unwrap_or("native-call"),
                         part.get("content").cloned().unwrap_or(Value::Null),
+                        part.get("isError") == Some(&Value::Bool(true)),
                     ),
                     Some(kind) if HIDDEN_REASONING_BLOCKS.contains(&kind) => {}
                     Some("image") => {
@@ -3385,6 +3409,116 @@ mod tests {
         assert_eq!(result["body"]["call_id"], call_id);
         assert_eq!(result["body"]["status"], "success");
         assert_eq!(result["body"]["content"], content);
+    }
+
+    #[test]
+    fn omp_native_capture_pairs_authoritative_result_and_preserves_irc_sender() {
+        // Captured 2026-10-01; input, output and sender text redacted, native IDs retained.
+        let fixture = include_str!("../fixtures/omp-native-events.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let mut items = Vec::new();
+        for (offset, entry) in fixture.iter().enumerate() {
+            normalize_native_line(ExternalDriver::Omp, entry, offset as u64 * 16, "", &mut items);
+        }
+        let call = items.iter().find(|item| item["type"] == "tool_call").unwrap();
+        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
+        assert_eq!(
+            call["body"]["call_id"],
+            fixture[0]["message"]["content"][0]["id"]
+        );
+        assert_eq!(result["body"]["call_id"], call["body"]["call_id"]);
+        assert_eq!(result["body"]["status"], "error");
+        assert_eq!(result["body"]["content"], fixture[1]["message"]["content"]);
+        assert!(!items.iter().any(|item| item["role"] == "tool" && item["type"] == "content"));
+        let event = items
+            .iter()
+            .find(|item| item["body"]["media_type"] == "application/vnd.omp.event+json")
+            .unwrap();
+        let envelope: Value = serde_json::from_str(event["body"]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            envelope,
+            json!({
+                "_tag": "OmpEvent",
+                "version": 1,
+                "kind": "irc:incoming",
+                "attribution": fixture[2]["attribution"],
+                "content": fixture[2]["content"],
+                "details": fixture[2]["details"]
+            })
+        );
+        assert_unique_ids(&items);
+    }
+
+    #[test]
+    fn omp_custom_events_preserve_native_provenance_and_hidden_visibility() {
+        for (offset, entry) in [
+            json!({"type":"custom_message","customType":"async-result","display":true,"attribution":"agent",
+                "content":"Task completed","details":{"jobs":[{"type":"task","id":"task-17","label":"worker"}]}}),
+            json!({"type":"custom_message","customType":"resource-observed","display":true,"attribution":"daemon",
+                "content":{"resource":"resource/example","status":"ready"},"details":{"revision":3}}),
+            json!({"type":"custom_message","customType":"notice","attribution":"human","content":"Steer"}),
+            json!({"type":"custom_message","customType":"notice","attribution":"system","content":"Note"}),
+            json!({"type":"custom_message","customType":"notice","content":"Unattributed"}),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut items = Vec::new();
+            normalize_native_line(ExternalDriver::Omp, entry, offset as u64 * 16, "", &mut items);
+            let envelope: Value =
+                serde_json::from_str(items[0]["body"]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(envelope["kind"], entry["customType"]);
+            assert_eq!(envelope["attribution"], entry["attribution"]);
+            assert_eq!(envelope["content"], entry["content"]);
+            assert_eq!(envelope["details"], entry["details"]);
+            let mut hidden = entry.clone();
+            hidden["display"] = json!(false);
+            let mut hidden_items = Vec::new();
+            normalize_native_line(ExternalDriver::Omp, &hidden, 0, "", &mut hidden_items);
+            assert!(hidden_items.is_empty());
+        }
+    }
+
+    #[test]
+    fn omp_oversized_custom_content_remains_decodable_with_sender_details() {
+        let mut items = Vec::new();
+        normalize_native_line(
+            ExternalDriver::Omp,
+            &json!({"type":"custom_message","customType":"irc:incoming","attribution":"agent",
+                "content":"x".repeat(MAX_TIMELINE_VALUE_BYTES + 1),
+                "details":{"from":"worker","id":"message-1"}}),
+            0,
+            "",
+            &mut items,
+        );
+        let envelope: Value = serde_json::from_str(items[0]["body"]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["details"]["from"], "worker");
+        assert_eq!(envelope["attribution"], "agent");
+        assert!(
+            envelope["content"]
+                .as_str()
+                .unwrap()
+                .ends_with("[st truncated this native timeline value]")
+        );
+    }
+
+    #[test]
+    fn omp_nested_tool_result_retains_error_status() {
+        let mut items = Vec::new();
+        normalize_native_line(
+            ExternalDriver::Omp,
+            &json!({"type":"message","message":{"role":"tool","content":[
+                {"type":"toolResult","toolCallId":"failed-call","content":"failure","isError":true}
+            ]}}),
+            0,
+            "",
+            &mut items,
+        );
+        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
+        assert_eq!(result["body"]["call_id"], "failed-call");
+        assert_eq!(result["body"]["status"], "error");
     }
 
     #[test]
