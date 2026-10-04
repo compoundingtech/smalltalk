@@ -14128,6 +14128,17 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let state = state(root.path());
         let subject = "agent/test/todo-seat";
         let incarnation = "4242:2026-10-04T20:00:00.000Z";
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(),
+            kind: "runtime.observed".into(),
+            actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({
+                "status":"running", "runtime_id":"todo-seat", "incarnation_id":incarnation,
+            })).unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }).unwrap();
         let app = router(state.clone());
         let report = |session: &str| {
             json!({"subject": subject, "actor": subject, "incarnation_id": incarnation,
@@ -14181,6 +14192,83 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             assert_eq!(repeated["id"], revisited["id"]);
         }
         assert_eq!(state.store.claims_for(subject, Some("harness.session-file")).unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn native_session_reports_cannot_replace_a_successor_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let subject = "agent/test/native-authority";
+        let app = router(state.clone());
+        let runtime = |incarnation: &str, status: &str| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: serde_json::from_value(json!({
+                    "status":status, "runtime_id":"native-authority", "incarnation_id":incarnation,
+                })).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap();
+        };
+        let report = |incarnation: &str, session: &str| {
+            json!({"subject":subject, "actor":subject, "incarnation_id":incarnation,
+                   "harness":"omp", "session_id":session})
+        };
+        let (status, unbound) = json_request(
+            app.clone(), "/v1/agents/native-session", report("runtime-a", "native-a"),
+        ).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{unbound}");
+        assert_eq!(unbound["code"], "stale-harness-event-session");
+        runtime("runtime-a", "running");
+        let (status, predecessor) = json_request(
+            app.clone(), "/v1/agents/native-session", report("runtime-a", "native-a"),
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{predecessor}");
+        runtime("runtime-b", "running");
+        let (status, successor) = json_request(
+            app.clone(), "/v1/agents/native-session", report("runtime-b", "native-b"),
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{successor}");
+        let (status, stale) = json_request(
+            app.clone(), "/v1/agents/native-session", report("runtime-a", "native-a"),
+        ).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{stale}");
+        assert_eq!(stale["code"], "stale-harness-event-session");
+        let mut reports = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            for (incarnation, session, accepted) in [
+                ("runtime-a", "native-a", false), ("runtime-b", "native-b", true),
+            ] {
+                let app = app.clone();
+                let request = report(incarnation, session);
+                reports.spawn(async move {
+                    (accepted, json_request(app, "/v1/agents/native-session", request).await)
+                });
+            }
+        }
+        while let Some(response) = reports.join_next().await {
+            let (accepted, (status, body)) = response.unwrap();
+            if accepted {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["id"], successor["id"]);
+            } else {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+                assert_eq!(body["code"], "stale-harness-event-session");
+            }
+        }
+        runtime("runtime-b", "exited");
+        let (status, ended) = json_request(
+            app, "/v1/agents/native-session", report("runtime-b", "native-b"),
+        ).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{ended}");
+        assert_eq!(ended["code"], "stale-harness-event-session");
+        let current = state.store.latest_claim(subject, Some("harness.session-file"))
+            .unwrap().unwrap();
+        assert_eq!(current.id, successor["id"].as_str().unwrap());
+        assert_eq!(state.store.claims_for(subject, Some("harness.session-file")).unwrap().len(), 2);
     }
 
     #[test]
