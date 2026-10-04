@@ -34,6 +34,21 @@ An agent can explicitly inspect that retained mail with `st conversations ls --a
 and read it with `st conversations read MESSAGE --as "$ST_AGENT"`. New mail on the live connection
 continues to arrive normally, with the channel's usual handoff deduplication and receipt handling.
 
+Claude distinguishes native queue acceptance (`queue-operation/enqueue`, which records
+`delivered`) from consumption (a user transcript entry, including `isMeta`, or an explicit
+`queue-operation/remove` with `reason: absorbed_mid_turn`, which records `read`). Receipt matching
+requires the complete immutable message envelope. Startup can precede transcript creation;
+the channel retries validation of the exact native session named by this wrapper's hook binding,
+with backoff capped at 30 seconds. It never chooses a transcript by recency. Existing native proof
+is reconciled before another notification is sent, including after a channel or seat restart.
+
+For already-staged Claude mail, durable native proof repairs the missing receipts. An uncertain
+handoff stays queued and retains its attempt ledger across restart; after 30 seconds without proof,
+`claude-handoff-unconfirmed` explains why another notification is held. Preparation, transcript
+lookup, and receipt publication failures have separate diagnostics and retry with backoff capped
+at 30 seconds. Retained handoffs are inspected only to recover missing receipts from exact native
+proof. Boot and reconnect never authorize a fresh offer of delivered-but-unread mail.
+
 Epochs are allocated by the daemon, independently of wall-clock time. An initial bind has a stable
 request token; a lost acknowledgement retries that same epoch, and retired tokens cannot allocate
 another epoch after replacement. Reexec carries the returned epoch and token. Only an explicit
