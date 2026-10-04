@@ -183,6 +183,63 @@ fn daemon_cannot_retire_an_unmarked_set_member_as_a_one_shot() {
 }
 
 #[test]
+fn uri_reference_targets_are_published_but_never_owned_or_retired_by_a_set() {
+    let store = Store::open_memory("amber").unwrap();
+    let source = r#"version 2
+agent "garden/orchard" {
+  command "true"
+  resource "issue" uri="https://example.com/issues/42"
+}
+mission "garden/harvest" state="ready" {
+  goal "Harvest the garden."
+  resource "issue" uri="https://example.com/issues/42"
+  step "work" { agentless }
+}
+"#;
+    let input = crate::graph::parse_owned_set_intent(source, "amber").unwrap();
+    let references = crate::graph::declared_resources(&input.subjects["agent/garden/orchard"].desired);
+    let target = &references[0].subject;
+    apply(&store, &input, 10);
+    let view = store.owned_sets().unwrap().remove(0);
+    assert_eq!(
+        view.receipt.members.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["agent/garden/orchard", "mission/garden/harvest"]
+    );
+    assert!(!view.receipt.retired.contains_key(target));
+    let original = store.claims_for(target, Some("intent.desired")).unwrap().remove(0);
+    assert!(original.body.get("owned_set").is_none());
+    assert!(super::owned_sets::owner(&store.readers.get(), target, None).unwrap().is_none());
+    assert_eq!(
+        store.declared_resource_uris(&references).unwrap()[target],
+        "https://example.com/issues/42"
+    );
+
+    let without_edges = crate::graph::parse_owned_set_intent(
+        &source.replace("  resource \"issue\" uri=\"https://example.com/issues/42\"\n", ""),
+        "amber",
+    ).unwrap();
+    apply(&store, &without_edges, 20);
+    assert!(store.declared_resource_referrers(target).unwrap().is_empty());
+
+    let empty = crate::graph::parse_owned_set_intent("version 2", "amber").unwrap();
+    let mut opts = options(&store, 30);
+    opts.allow_empty = true;
+    let preview = store.owned_set_preview(&empty, &opts).unwrap();
+    opts.expected_subjects = preview.expected_subjects;
+    opts.confirm_retire = Some(preview.digest);
+    store.apply_owned_set(&empty, &opts, "retire-resource-readers", "person/operator").unwrap();
+    let view = store.owned_sets().unwrap().remove(0);
+    assert!(!view.receipt.members.contains_key(target));
+    assert!(!view.receipt.retired.contains_key(target));
+    let claims = store.claims_for(target, Some("intent.desired")).unwrap();
+    assert_eq!(claims.iter().map(|c| &c.id).collect::<Vec<_>>(), vec![&original.id]);
+    assert_eq!(
+        store.declared_resource_uris(&references).unwrap()[target],
+        "https://example.com/issues/42"
+    );
+}
+
+#[test]
 fn a_staged_owned_set_member_check_seeks_tagged_claims() {
     let store = Store::open_memory("amber").unwrap();
     let unmanaged = parse_intent(
