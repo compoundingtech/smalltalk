@@ -52,6 +52,14 @@ case "$cmd" in
       xargs nix copy --to "$to" --no-check-sigs --no-recursive < "$cache.paths"
     fi
     roots=()
+    # A fresh runner otherwise rebuilds immutable PTY/collector tools before Cargo,
+    # even with a target-cache hit. Retain the complete shell, including its tools.
+    if [ -n "${CI_CACHE_DEV_SHELL:-}" ]; then
+      system=$(nix eval --impure --raw --expr builtins.currentSystem)
+      shell_root="$RUNNER_TEMP/ci-dev-shell"
+      nix build --no-update-lock-file --out-link "$shell_root" ".#devShells.$system.$CI_CACHE_DEV_SHELL"
+      roots+=("$shell_root")
+    fi
     [ -e "$RUNNER_TEMP/vm-driver" ] && roots+=("$RUNNER_TEMP/vm-driver")
     # Performance keeps its small devShell closure as well as downloads, avoiding cold tool setup.
     [ -n "${CI_PERF_SHELL_ROOT:-}" ] && roots+=("$CI_PERF_SHELL_ROOT")

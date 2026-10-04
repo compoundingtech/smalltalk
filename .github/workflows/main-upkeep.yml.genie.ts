@@ -26,7 +26,7 @@ const warmJob = (stage: string, setup: readonly unknown[], nixOnly = false) => (
   'runs-on': linuxStageRunner,
   'timeout-minutes': 120,
   defaults: { run: { shell: 'bash' } },
-  env: buildEnv,
+  env: { ...buildEnv, CI_CACHE_DEV_SHELL: stage === 'genie' ? 'genie' : 'default' },
   steps: [
     { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
     ...(nixOnly ? [nixCacheStep] : [cargoCacheStep, nixCacheStep]).map((step) => ({

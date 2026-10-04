@@ -29,7 +29,7 @@ export default githubWorkflow(auditCaches({
       'runs-on': macosRunner,
       'timeout-minutes': 120,
       defaults: { run: { shell: 'bash' } },
-      env: buildEnv,
+      env: { ...buildEnv, CI_CACHE_DEV_SHELL: 'default' },
       steps: [
         ...workspacePreparationSteps,
         {

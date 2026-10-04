@@ -95,23 +95,13 @@ jobs:
           key: "release-${{ matrix.target }}"
           cache-on-failure: true
         id: cache-4
-      - name: Restore the stable Zig object cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/zig
-            ~/Library/Caches/zig
-            .zig-cache
-          key: "zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
-          restore-keys: "zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-"
-        id: cache-5
       - name: Restore the pinned Zig compiler
         if: env.CI_BUILD_SNAPSHOT_ZIG_HIT != '1'
         uses: actions/cache@v4
         with:
           path: ${{ env.CI_ZIG_CACHE_DIR }}
           key: "zig-tool-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2"
-        id: cache-6
+        id: cache-5
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
         with:
           version: 0.15.2
@@ -152,7 +142,7 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Cargo release","outcome":"${{ steps.cache-4.outcome }}","hit":"${{ steps.cache-4.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the stable Zig object cache","outcome":"${{ steps.cache-5.outcome }}","hit":"${{ steps.cache-5.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the pinned Zig compiler","outcome":"${{ steps.cache-6.outcome }}","hit":"${{ steps.cache-6.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Cargo release","outcome":"${{ steps.cache-4.outcome }}","hit":"${{ steps.cache-4.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the pinned Zig compiler","outcome":"${{ steps.cache-5.outcome }}","hit":"${{ steps.cache-5.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   assemble:
     name: release-assemble

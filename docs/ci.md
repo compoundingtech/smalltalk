@@ -415,8 +415,10 @@ Cargo keys include the lockfiles, workspace manifests and linker configuration. 
 include the flake, Nix expressions and compatibility pins. Both cover macOS as well as
 Linux, with isolated Cargo and Nix-cache directories. Genie freshness and isolation have
 job-specific caches seeded on main; portable builds use the same pinned Rust cache action as native
-releases. Native releases retain Zig objects under a dependency key rather than making
-another cache entry for every run. The pinned Zig compiler has its own stable key and is also retained in matching native snapshots, so fresh nodes do not fetch it again.
+releases. Native releases keep the pinned Zig compiler under a stable version/platform key instead of
+per-run entries. Matching native snapshots also retain it, so fresh nodes do not fetch it
+again. These Cargo builds do not produce Zig object-cache directories; empty cache declarations
+would miss on every run and are omitted.
 
 Compiled outputs also have three-day artifact snapshots keyed by the actual full source SHA,
 job, platform, architecture, build flags and workflow contents. Native snapshots additionally
@@ -424,6 +426,8 @@ fingerprint the installed Rust compiler and, on macOS, the Swift compiler and SD
 runner restores a compatible completed run's outputs and the original tracked-source
 nanosecond timestamps only for that exact clean SHA. Git metadata is never restamped.
 Cargo still rebuilds dirty or changed source and embeds the genuine source identity.
+The signed Nix cache includes the complete job shell closure, so a target hit does not
+rebuild the immutable PTY and collector tools before Cargo starts.
 Persistent ci1 runners keep their source checkpoint beside the actual target directory.
 A first build of a new source warns that no snapshot exists and restores dependency caches;
 a repeat reuses its snapshot without consuming the shared dependency-cache quota.

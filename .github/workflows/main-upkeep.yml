@@ -73,6 +73,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      CI_CACHE_DEV_SHELL: default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -248,6 +249,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      CI_CACHE_DEV_SHELL: default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -401,6 +403,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      CI_CACHE_DEV_SHELL: default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -554,6 +557,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      CI_CACHE_DEV_SHELL: genie
     steps:
       - uses: actions/checkout@v4
         with:
@@ -675,6 +679,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      CI_CACHE_DEV_SHELL: default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -866,6 +871,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      CI_CACHE_DEV_SHELL: default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -939,7 +945,7 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-perf cost
       - name: Save Nix outputs to the local Nix cache
-        if: success()
+        if: success() && env.CI_LOCAL_CACHES != '1'
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - id: build-snapshot-save
         name: Keep valid same-source build outputs

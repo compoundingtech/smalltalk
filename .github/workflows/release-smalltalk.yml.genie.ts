@@ -124,15 +124,6 @@ export default githubWorkflow(auditCaches({
           }
         },
         {
-          name: 'Restore the stable Zig object cache',
-          uses: 'actions/cache@v4',
-          with: {
-            path: '~/.cache/zig\n~/Library/Caches/zig\n.zig-cache',
-            key: "zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-${{ hashFiles('Cargo.lock', 'flake.lock') }}",
-            'restore-keys': 'zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-',
-          },
-        },
-        {
           name: 'Restore the pinned Zig compiler',
           if: "env.CI_BUILD_SNAPSHOT_ZIG_HIT != '1'",
           uses: 'actions/cache@v4',

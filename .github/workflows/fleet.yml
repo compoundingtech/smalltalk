@@ -97,6 +97,8 @@ jobs:
         run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""
   genie-freshness:
     name: genie-freshness
+    env:
+      CI_CACHE_DEV_SHELL: genie
     needs: [pick-runner]
     if: ${{ !cancelled() }}
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["namespace-profile-linux-x86-64","namespace-features:github.run-id={0}"]', github.run_id)) }}
@@ -625,6 +627,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      CI_CACHE_DEV_SHELL: default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -698,7 +701,7 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-perf cost
       - name: Save Nix outputs to the local Nix cache
-        if: success()
+        if: success() && env.CI_LOCAL_CACHES != '1'
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
@@ -744,6 +747,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      CI_CACHE_DEV_SHELL: default
     steps:
       - uses: actions/checkout@v4
         with:
