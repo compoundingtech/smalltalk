@@ -4465,6 +4465,7 @@ dependencies = [
  "sha2",
  "smallclaims",
  "st3",
+ "st3-schema",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

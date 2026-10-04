@@ -188,6 +188,10 @@ pub struct CollectionStream {
 
 impl CollectionStream {
     pub async fn subscribe_glasses(&mut self, id: &str) -> Result<(), ClientError> { self.subscribe(id, "glasses", 100, None, None).await }
+    /// Select the owner's fleet explicitly; agent identity is not an owner selector.
+    pub async fn subscribe_arrangements(&mut self, id: &str, person: &str, limit: usize) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":"arrangements", "person":person, "limit":limit})).await
+    }
     pub async fn subscribe(
         &mut self,
         id: &str,

@@ -59,6 +59,8 @@
     { "id": "conversation.changes", "method": "GET", "path": "/v1/client/conversations/{id}/changes", "response": "ConversationChanges" },
     { "id": "events.list", "method": "GET", "path": "/v1/client/events", "response": "EventPage" },
     { "id": "terminal.screen", "method": "GET", "path": "/v1/client/terminals/{id}/screen", "response": "TerminalScreen" },
+    {"id": "arrangements.list", "method": "GET", "path": "/v1/client/arrangements", "response": "ArrangementPage", "scope": "read.arrangements"},
+    {"id": "arrangements.get", "method": "GET", "path": "/v1/client/arrangements/{person_name}/{uuid}", "response": "Arrangement", "scope": "read.arrangements"},
     {"id": "glasses.list", "method": "GET", "path": "/v1/client/glasses", "response": "Page", "scope": "read.glasses"},
     {"id": "glasses.get", "method": "GET", "path": "/v1/client/glasses/{id}", "response": "Glass", "scope": "read.glasses"}
   ],
@@ -72,6 +74,7 @@
     {"id": "glasses.delete", "method": "DELETE", "path": "/v1/client/glasses/{id}", "request": "GlassDelete", "response": "Glass", "scope": "control.glasses", "idempotency_header": "Idempotency-Key"}
   ],
   "actions": {
+    "arrangement.edit": { "capability": "control.arrangements", "parameters": "ArrangementEditParameters" },
     "review.approve": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.reject": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.request-changes": { "capability": "control.attention", "parameters": "TargetParameters" },
@@ -129,10 +132,18 @@
     "default_page_items": 50,
     "max_page_items": 200,
     "max_event_items": 500,
-    "max_response_bytes": 8388608,
+    "max_response_bytes": 1048576,
     "max_wait_ms": 30000,
     "event_retention_seconds": 86400,
     "idempotency_retention_seconds": 2592000,
+    "max_arrangement_body_bytes": 1048576,
+    "max_arrangement_resource_bytes": 524288,
+    "max_arrangements": 100,
+    "max_arrangement_name_bytes": 256,
+    "max_arrangement_key_bytes": 128,
+    "max_arrangement_operations": 1024,
+    "max_arrangement_folders": 1024,
+    "max_arrangement_placements": 4096,
     "pairing_ttl_seconds": 300
   }
 }

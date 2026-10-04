@@ -624,8 +624,10 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
 }
 
 /// Tables projected from claims, children before the tables their foreign keys name.
-pub(crate) const PROJECTION_TABLES: [&str; 18] = [
+pub(crate) const PROJECTION_TABLES: [&str; 20] = [
     "operations",
+    "arrangement_registers",
+    "arrangements",
     "resource_observations",
     "desired",
     "documents",
@@ -662,6 +664,7 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
     project_replicated_mission_runs(transaction)?;
     rebuild_planning_tx(transaction)?;
     resources::rebuild(transaction)?;
+    arrangements::rebuild(transaction)?;
     Ok(())
 }
 
@@ -678,6 +681,11 @@ pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128)
                 i64::MAX as u64
             )?),
         );
+    }
+    if subject.starts_with("arrangement/") {
+        let person = st3_schema::arrangements::owner(subject).map_err(anyhow::Error::new)?;
+        answers.insert("arrangements".into(), json!(super::arrangements::arrangements_at(connection, person, i64::MAX as u64)?));
+        answers.insert("arrangement".into(), json!(super::arrangements::arrangement_at(connection, subject, i64::MAX as u64)?));
     }
     answers.insert(
         "actual".into(),

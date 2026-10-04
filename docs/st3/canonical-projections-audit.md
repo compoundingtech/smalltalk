@@ -78,6 +78,28 @@ Mixed storage tables below are classified by their logical shared fields; local 
 
 The temporary tables write_clock, sealed_claims, sealed_envelopes, canonical_index, adopted_envelopes and adopted_claims are Local: clock simulation or checkpoint proof/adoption scratch state. SQLite sqlite_sequence is a local allocation counter. There are no persistent SQL views in the audited schema. Rust actual/subject/message/status/replication snapshot caches and exported mailbox files are Local disposable caches; their shared source selections are not exempt.
 
+### Arrangement heads added after the baseline audit
+
+Person arrangements are shared claim-derived projections, not local sidebar caches.
+`arrangements` stores subject-keyed owner/creation/retirement/revision heads with canonical
+winner keys and projected update time. `arrangements_owner_index(owner, subject)` indexes
+owner identity; `arrangements_live_owner_index(owner, subject)` selects created, unretired
+collection rows, and `arrangements_changed_index(changed_index)` supports local change seeks.
+`arrangements_owner_changed_index(owner, changed_index)` seeks each owner's stale frontier,
+including retired and pending heads without traversing them.
+`arrangement_registers` stores `(subject, register)`-keyed raw
+values, winning claim revisions and canonical winner keys. Admission updates these heads
+in the same transaction as the durable `arrangement.edited` claim. List/detail and write
+validation read heads without folding edit history.
+
+Both tables are graph-digest-covered. The local `arrangements.changed_index` invalidation
+frontier is excluded; owner, retirement, source revisions, raw register values and canonical
+winner keys are shared. Replay rebuilds both tables, and checkpoint proof readers compare
+the same arrangement read answers. There is no new checkpoint drop rule, including for
+agent-authored edits. Effective tombstone ancestors and concurrent-cycle cuts derive from
+raw position heads deterministically without rewriting their registers.
+
+
 ## Every store_index order
 
 Locations below refer to the audited commit, so later line-number changes do not invalidate the inventory. Shared rows must move to the canonical helper, including commutative enumerations whose returned ordering is observable. Local rows may retain arrival order only for the purpose stated.

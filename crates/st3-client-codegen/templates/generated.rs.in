@@ -99,6 +99,14 @@ pub struct Limits {
     pub max_glasses: Option<usize>,
     pub max_glass_depth: Option<usize>,
     pub max_glass_nodes: Option<usize>,
+    pub max_arrangement_body_bytes: Option<usize>,
+    pub max_arrangement_resource_bytes: Option<usize>,
+    pub max_arrangements: Option<usize>,
+    pub max_arrangement_name_bytes: Option<usize>,
+    pub max_arrangement_key_bytes: Option<usize>,
+    pub max_arrangement_operations: Option<usize>,
+    pub max_arrangement_folders: Option<usize>,
+    pub max_arrangement_placements: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1354,6 +1362,7 @@ pub enum Resource {
     History(History),
     Session(Session),
     Glass(Glass),
+    Arrangement(Arrangement),
     OwnedSet(OwnedSet),
     /// A kind this client does not know, from a member newer than it. It keeps the header and
     /// the whole resource as sent, so an older client skips it or shows it plainly instead of
@@ -1383,6 +1392,7 @@ pub const KNOWN_RESOURCE_KINDS: &[&str] = &[
     "history",
     "session",
     "glass",
+    "arrangement",
     "owned-set",
 ];
 
@@ -1446,6 +1456,7 @@ impl Resource {
             Self::History(v) => &v.header,
             Self::Session(v) => &v.header,
             Self::Glass(v) => &v.header,
+            Self::Arrangement(v) => &v.header,
             Self::OwnedSet(v) => &v.header,
             Self::Unknown(v) => &v.header,
         }
@@ -1868,6 +1879,8 @@ pub struct Fence {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum ActionType {
+    #[serde(rename = "arrangement.edit")]
+    ArrangementEdit,
     #[serde(rename = "attention.resolve")]
     AttentionResolve,
     #[serde(rename = "review.approve")]
@@ -2375,6 +2388,8 @@ pub struct ActionResult {
     pub snapshot_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_attachment: Option<TerminalAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrangement_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -2621,6 +2636,48 @@ pub struct Glass {
 pub struct GlassPut { pub body: GlassBody, pub base_revision: Option<String> }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct GlassDelete { pub base_revision: Option<String> }
+
+/// The durable claim operation type is shared with admission, not duplicated here.
+pub type ArrangementOperation = st3_schema::arrangements::Operation;
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArrangementEditParameters {
+    pub subject: String,
+    pub owner: String,
+    pub operations: Vec<ArrangementOperation>,
+}
+pub type ArrangementRegister<T> = st3_schema::arrangements::Register<T>;
+pub type ArrangementPosition = st3_schema::arrangements::Position;
+pub type ArrangementPlacement = st3_schema::arrangements::Placement;
+pub type ArrangementFolder = st3_schema::arrangements::Folder;
+pub type ArrangementBody = st3_schema::arrangements::Body;
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArrangementResolved {
+    pub parents: std::collections::BTreeMap<String, Option<String>>,
+    pub folders: std::collections::BTreeMap<String, Option<String>>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Arrangement {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    pub owner: String,
+    pub body: ArrangementBody,
+    pub deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<ArrangementResolved>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArrangementPage {
+    pub kind: String,
+    pub collection: String,
+    #[serde(default)]
+    pub filters: BTreeMap<String, String>,
+    pub items: Vec<Arrangement>,
+    pub page: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncNotice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicated: Option<ReplicatedNotice>,
+}
 
 /// Repositories already used by a host's declared agents, read from replicated graph evidence.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
