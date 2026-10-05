@@ -12,6 +12,12 @@ export default function(pi) {
   pi.registerCommand('exercise-control',{handler:async(_args,ctx)=>{
     const pause=()=>Bun.sleep(10);
     const awaitReceipt=async(id)=>{for(let i=0;i<500;i++){const r=frames.find(f=>f.type==='harness_control_receipt'&&f.operation_id===id);if(r)return r;await pause();}throw Error('Missing receipt '+id);};
+    const awaitNativeIdle=async()=>{
+      await ctx.waitForIdle();
+      // A completed turn can precede agent_end; admission requires native idle.
+      for(let i=0;i<500;i++){control.observe();if(ctx.isIdle())return;await pause();}
+      throw Error('Positive native idle not observed');
+    };
     const bind=()=>({desired_revision:'revision',incarnation_id:'incarnation',session_id:ctx.sessionManager.getSessionId(),turn_id:frames.filter(f=>f.type==='harness_control_state').at(-1)?.turn_id??null});
     control.handle({type:'harness_control_binding',binding:bind()},ctx);
     const steer=frames.filter(frame=>frame.type==='harness_control_state').at(-1)?.steer;
@@ -43,17 +49,19 @@ export default function(pi) {
     pi.sendUserMessage('branch seed');
     for(let i=0;i<500&&!seedObserved;i++)await pause();
     if(!seedObserved)throw Error('Native seed event missing');
-    await ctx.waitForIdle();
+    await awaitNativeIdle();
     const seed=ctx.sessionManager.getEntries().find(entry=>entry.type==='message'&&entry.message.role==='user');
     if(!seed)throw Error('Native branch seed entry missing');
     for(const id of ['input-a','input-b']){
       binding=bind();
       control.handle({type:'harness_control',command:{type:'input',operation_id:id,entry_id:id,actor:'person',content:'same text',lane:'follow_up',binding}},ctx);
+      const immediateReceipt=frames.find(f=>f.type==='harness_control_receipt'&&f.operation_id===id);
+      if(immediateReceipt)throw Error('Input was not pending before transition: '+JSON.stringify(immediateReceipt));
       const transitionAttempt=id==='input-a'?await ctx.branch(seed.id):await ctx.newSession();
       if(!transitionAttempt.cancelled)throw Error('Unsafe native branch or switch was allowed');
       const receipt=await awaitReceipt(id);
       if(receipt.status!=='applied'||ctx.sessionManager.getSessionId()!==binding.session_id)throw Error('Input lost exact session');
-      await ctx.waitForIdle();
+      await awaitNativeIdle();
     }
     const old=bind();
     frames=[];losing=true;control.replay();losing=false;control.replay();
