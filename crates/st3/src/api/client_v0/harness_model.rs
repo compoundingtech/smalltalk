@@ -248,7 +248,6 @@ pub(in crate::api) async fn models(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower::ServiceExt as _;
 
     fn state(root: &Path, node: &str) -> AppState {
         AppState {

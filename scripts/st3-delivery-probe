@@ -269,7 +269,7 @@ class Probe:
                     "error_type": type(error).__name__}
 
     async def receiver(self):
-        catalog = self.directory / "channel-catalog"
+        catalog = (self.directory / "channel-catalog").resolve()
         catalog.mkdir(exist_ok=True)
         while True:
             context = {"channel_id": str(uuid.uuid4()), "agent": self.actor, "host": self.source,
@@ -291,7 +291,11 @@ class Probe:
                     self.st3, "--catalog", str(catalog), "driver", "omp-channel",
                     "--identity", self.actor[6:], stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE, stderr=write_fd,
-                    env={**os.environ, "ST3_ENDPOINT": self.api.socket})
+                    env={**os.environ, "ST3_ENDPOINT": self.api.socket,
+                         "ST_DRIVER_ROOT": str(catalog),
+                         "ST_DRIVER_AGENT_DIR": str(catalog / "observations"),
+                         "ST_DRIVER_SESSION_DIR": str(catalog / "sessions"),
+                         "ST_DRIVER_IDENTITY": self.actor[6:]})
             except BaseException:
                 if stderr_transport:
                     stderr_transport.close()

@@ -71,10 +71,10 @@ fn validate_parameters(connection: &Connection, parameters: &ModelParameters) ->
     }
     let choice = state.models.choices.iter().find(|choice| choice.provider == parameters.provider && choice.id == parameters.model_id)
         .ok_or_else(|| St3Error::new("unavailable-harness-model", "the requested model is not in the available native catalog"))?;
-    if let Some(effort) = &parameters.effort {
-        if !choice.reasoning || !choice.supported_efforts.contains(effort) {
-            return Err(St3Error::new("unsupported-harness-effort", "the requested effort is not advertised for this native model"));
-        }
+    if let Some(effort) = &parameters.effort
+        && (!choice.reasoning || !choice.supported_efforts.contains(effort))
+    {
+        return Err(St3Error::new("unsupported-harness-effort", "the requested effort is not advertised for this native model"));
     }
     Ok(())
 }

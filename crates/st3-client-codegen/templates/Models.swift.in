@@ -39,6 +39,10 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case nativePreDequeueAPIUnavailable
+    case staleHarnessControl, unsupportedHarnessControl, missingQueueEntry, alreadyDispatched
+    case invalidQueueContent, invalidIdempotencyKey, staleQueue, queueFull, invalidQueueMove
+    case queueRevisionExhausted, staleQueueCursor, queueMetadataTooLarge, queueEntryTooLarge
+    case unsupportedHarnessModel, staleHarnessModel, unavailableHarnessModel, unsupportedHarnessEffort, harnessControlBusy
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired
     case unknown(String)
@@ -57,6 +61,15 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
         case "native-pre-dequeue-api-unavailable": .nativePreDequeueAPIUnavailable
+        case "stale-harness-control": .staleHarnessControl; case "unsupported-harness-control": .unsupportedHarnessControl
+        case "missing-queue-entry": .missingQueueEntry; case "already-dispatched": .alreadyDispatched
+        case "invalid-queue-content": .invalidQueueContent; case "invalid-idempotency-key": .invalidIdempotencyKey
+        case "stale-queue": .staleQueue; case "queue-full": .queueFull; case "invalid-queue-move": .invalidQueueMove
+        case "queue-revision-exhausted": .queueRevisionExhausted; case "stale-queue-cursor": .staleQueueCursor
+        case "queue-metadata-too-large": .queueMetadataTooLarge; case "queue-entry-too-large": .queueEntryTooLarge
+        case "unsupported-harness-model": .unsupportedHarnessModel; case "stale-harness-model": .staleHarnessModel
+        case "unavailable-harness-model": .unavailableHarnessModel; case "unsupported-harness-effort": .unsupportedHarnessEffort
+        case "harness-control-busy": .harnessControlBusy
         default: .unknown(raw)
         }
     }
@@ -73,6 +86,15 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
         case .nativePreDequeueAPIUnavailable: "native-pre-dequeue-api-unavailable"
+        case .staleHarnessControl: "stale-harness-control"; case .unsupportedHarnessControl: "unsupported-harness-control"
+        case .missingQueueEntry: "missing-queue-entry"; case .alreadyDispatched: "already-dispatched"
+        case .invalidQueueContent: "invalid-queue-content"; case .invalidIdempotencyKey: "invalid-idempotency-key"
+        case .staleQueue: "stale-queue"; case .queueFull: "queue-full"; case .invalidQueueMove: "invalid-queue-move"
+        case .queueRevisionExhausted: "queue-revision-exhausted"; case .staleQueueCursor: "stale-queue-cursor"
+        case .queueMetadataTooLarge: "queue-metadata-too-large"; case .queueEntryTooLarge: "queue-entry-too-large"
+        case .unsupportedHarnessModel: "unsupported-harness-model"; case .staleHarnessModel: "stale-harness-model"
+        case .unavailableHarnessModel: "unavailable-harness-model"; case .unsupportedHarnessEffort: "unsupported-harness-effort"
+        case .harnessControlBusy: "harness-control-busy"
         case .unknown(let value): value
         }
         var container = encoder.singleValueContainer(); try container.encode(raw)

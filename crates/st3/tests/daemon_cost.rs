@@ -262,6 +262,26 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "reports a live harness session",
     ),
     (
+        "GET /v1/client/harness-control-receipts/{*id}",
+        "requires a previously admitted native operation; both owner ledgers are read by operation primary key",
+    ),
+    (
+        "POST /v1/harness-control/state",
+        "reports a source-fenced live native control binding",
+    ),
+    (
+        "POST /v1/harness-control/next",
+        "dispatches only through a live source-fenced native control binding",
+    ),
+    (
+        "POST /v1/harness-control/receipts",
+        "settles an admitted operation from its exact live native binding",
+    ),
+    (
+        "POST /v1/harness-control/close",
+        "closes a live native binding and settles uncertain dispatches",
+    ),
+    (
         "POST /v1/repair/apply",
         "applies an operational repair plan",
     ),
@@ -534,6 +554,14 @@ const PROBES: &[Probe] = &[
     get(
         "GET /v1/client/publication-definition",
         "/v1/client/publication-definition?subject={seat}",
+    ),
+    get(
+        "GET /v1/client/harness-queue/{*id}",
+        "/v1/client/harness-queue/{seat}",
+    ),
+    get(
+        "GET /v1/client/harness-models/{*id}",
+        "/v1/client/harness-models/{seat}",
     ),
     get("GET /v1/client/now", "/v1/client/now"),
     get("GET /v1/client/machines", "/v1/client/machines"),

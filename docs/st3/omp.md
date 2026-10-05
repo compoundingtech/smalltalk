@@ -51,6 +51,10 @@ an outstanding human ask or approval keeps its blocking observation, including o
 The channel's control helper accepts only the current driver's desired revision and incarnation,
 the exact native session, and its observed turn binding. The turn is initially `null`; a new
 identifier is minted only on the native `agent_start` event.
+OMP channel callers carry the complete resolved driver-path contract: absolute `ST_DRIVER_ROOT`,
+`ST_DRIVER_AGENT_DIR`, `ST_DRIVER_SESSION_DIR`, and the matching `ST_DRIVER_IDENTITY`.
+Native controls persist their outbox in that session directory; a catalog alone is not a substitute.
+The Rust and Swift clients retain the schema's queue/model error codes as typed values.
 
 Input uses a displayable, user-attributed native custom message with an operation ID, actor, and
 entry ID in its details. Smalltalk retains follow-ups while native input is busy and dispatches
