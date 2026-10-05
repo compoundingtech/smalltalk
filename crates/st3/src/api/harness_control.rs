@@ -47,9 +47,9 @@ pub(super) async fn settle(State(state): State<AppState>, peer: Option<Extension
     let store = state.store.clone();
     let receipt = blocking_action(move || {
         if store.harness_model_receipt(&request.receipt.operation_id)?.is_some() {
-            serde_json::to_value(store.settle_harness_model(&request.receipt, &request.fence)?).map_err(|error| St3Error::new("internal", error))
+            serde_json::to_value(store.settle_harness_model(&request.receipt, &request.fence)?).map_err(|error| St3Error::new("internal", error.to_string()))
         } else {
-            serde_json::to_value(store.settle_harness_input(&request.receipt, &request.fence)?).map_err(|error| St3Error::new("internal", error))
+            serde_json::to_value(store.settle_harness_input(&request.receipt, &request.fence)?).map_err(|error| St3Error::new("internal", error.to_string()))
         }
     }).await?;
     signal_local_change(&state);

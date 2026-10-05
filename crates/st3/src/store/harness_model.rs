@@ -52,7 +52,7 @@ fn reconcile_runtime(connection: &Connection, subject: &str) -> Result<(), St3Er
         return invalidate_binding_tx(connection, subject, "native-binding-unavailable");
     };
     if let Err(error) = check_runtime(connection, subject, &state.binding) {
-        if !matches!(error.code.as_str(), "stale-harness-control" | "stale-mailbox-session") { return Err(error); }
+        if !matches!(error.code, "stale-harness-control" | "stale-mailbox-session") { return Err(error); }
         invalidate_binding_tx(connection, subject, "native-runtime-ended-or-replaced")?;
     }
     Ok(())
@@ -139,9 +139,9 @@ impl Store {
             let stored: String = tx.query_row("SELECT parameters FROM local_harness_model_operations WHERE id=?1", [&operation], |row| row.get(0)).map_err(internal)?;
             let parameters: ModelParameters = serde_json::from_str(&stored).map_err(internal)?;
             if let Err(error) = validate_parameters(tx, &parameters) {
-                if !matches!(error.code.as_str(), "stale-harness-control" | "stale-mailbox-session" | "unsupported-harness-control" | "unsupported-harness-model" | "stale-harness-model" | "unavailable-harness-model" | "unsupported-harness-effort") { return Err(error); }
+                if !matches!(error.code, "stale-harness-control" | "stale-mailbox-session" | "unsupported-harness-control" | "unsupported-harness-model" | "stale-harness-model" | "unavailable-harness-model" | "unsupported-harness-effort") { return Err(error); }
                 receipt.status = Outcome::Rejected;
-                receipt.reason = Some(error.code);
+                receipt.reason = Some(error.code.to_owned());
                 save_receipt(tx, &receipt)?;
                 release_dispatch_tx(tx, &fence.subject, &operation)?;
                 return Ok(None);

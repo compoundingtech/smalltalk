@@ -121,6 +121,8 @@ durable operation receipt. Its untagged queue/model union retains the original
 wire shape, exact binding, terminal outcome, and native proof. It requires
 `read.projections`, routes to the observed runtime owner, and never returns a
 receipt for another subject.
+The signed peer relay carries the requested receipt as `operation_id`, separate
+from its `operation` read-kind discriminator.
 
 
 ## Boundary and transport

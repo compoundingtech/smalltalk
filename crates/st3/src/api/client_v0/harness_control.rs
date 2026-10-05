@@ -75,7 +75,7 @@ pub(in crate::api) async fn queue(State(state): State<AppState>, Extension(sessi
 pub(in crate::api) async fn receipt(State(state): State<AppState>, Extension(session): Extension<ClientSession>, AxumPath(operation): AxumPath<String>, Query(query): Query<ReceiptQuery>) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
     let host = owner(&state, &query.subject)?;
-    if host != client_host_id(&state.node) { return Ok(Json(relay(&state, &session, &host, crate::peer::ClientReadOperation::HarnessControlReceipt { subject: query.subject, operation }).await?)); }
+    if host != client_host_id(&state.node) { return Ok(Json(relay(&state, &session, &host, crate::peer::ClientReadOperation::HarnessControlReceipt { subject: query.subject, operation_id: operation }).await?)); }
     let receipt = if let Some(receipt) = state.store.harness_control_receipt(&operation).map_err(ApiError::bad)?.filter(|receipt| receipt.subject == query.subject) {
         ControlOperationReceipt::Queue(receipt)
     } else if let Some(receipt) = state.store.harness_model_receipt(&operation).map_err(ApiError::bad)?.filter(|receipt| receipt.subject == query.subject) {

@@ -95,7 +95,7 @@ fn invalidate_pending(connection: &Connection, subject: &str, reason: &str) -> R
 fn reconcile_runtime(connection: &Connection, subject: &str) -> Result<(), St3Error> {
     let Some(mut state) = state_tx(connection, subject)? else { return Ok(()); };
     if let Err(error) = check_runtime(connection, subject, &state.binding) {
-        if !matches!(error.code.as_str(), "stale-harness-control" | "stale-mailbox-session") { return Err(error); }
+        if !matches!(error.code, "stale-harness-control" | "stale-mailbox-session") { return Err(error); }
         invalidate_pending(connection, subject, "native-runtime-ended-or-replaced")?;
         state.input_supported = false;
         state.models.available = false;
@@ -414,7 +414,7 @@ mod tests {
             let mut stale = request(&store, &state, field, QueueMutation::Enqueue { content: "stale".into(), lane: Lane::FollowUp });
             match field { "desired" => stale.binding.desired_revision = "old".into(), "incarnation" => stale.binding.incarnation_id = "old".into(), "session" => stale.binding.session_id = "old".into(), "turn" => stale.binding.turn_id = Some("old".into()), _ => stale.queue_revision += 1 }
             let error = store.mutate_harness_queue(&stale).unwrap_err();
-            assert!(matches!(error.code.as_str(), "stale-harness-control" | "stale-mailbox-session" | "stale-queue"), "{field}: {error}");
+            assert!(matches!(error.code, "stale-harness-control" | "stale-mailbox-session" | "stale-queue"), "{field}: {error}");
         }
         let mut unauthorized = request(&store, &state, "actor", QueueMutation::Enqueue { content: "actor".into(), lane: Lane::FollowUp });
         unauthorized.actor = "person/".into();

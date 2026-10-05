@@ -117,7 +117,7 @@ pub enum ClientReadOperation {
     },
     HarnessModelMutation { action_id: String, idempotency_key: String, parameters: Value },
     HarnessModels { subject: String, cursor: Option<String>, limit: Option<usize> },
-    HarnessControlReceipt { subject: String, operation: String },
+    HarnessControlReceipt { subject: String, operation_id: String },
     /// The directory this host gives a new agent that names no workspace.
     AgentWorkspace {
         identity: String,
@@ -1062,9 +1062,9 @@ async fn receive_client_read(
                 let native = Client::unix_as(state.backend().socket(), &request.authority_actor)?;
                 native.post("/v1/client/actions", &action).await
             }
-            ClientReadOperation::HarnessControlReceipt { subject, operation } => {
+            ClientReadOperation::HarnessControlReceipt { subject, operation_id } => {
                 let native = Client::unix_as(state.backend().socket(), &request.authority_actor)?;
-                native.get(&format!("/v1/client/harness-control-receipts/{}?subject={}", urlencoding::encode(&operation), urlencoding::encode(&subject))).await
+                native.get(&format!("/v1/client/harness-control-receipts/{}?subject={}", urlencoding::encode(&operation_id), urlencoding::encode(&subject))).await
             }
             ClientReadOperation::ConversationChanges {
                 session_id,
