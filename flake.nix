@@ -223,7 +223,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-wBca1KgQO1GWszaVktbwbYVESuP4u+uAcyN0er7mBPE=";
+              "pty-core-0.13.0-rust" = "sha256-iMnh/+jVGqMc2GE07n2nF0rBKiT49vMKb26+uGYKkfs=";
             };
           };
 
@@ -350,7 +350,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-wBca1KgQO1GWszaVktbwbYVESuP4u+uAcyN0er7mBPE=";
+              "pty-core-0.13.0-rust" = "sha256-iMnh/+jVGqMc2GE07n2nF0rBKiT49vMKb26+uGYKkfs=";
             };
           };
           cargoBuildFlags = [
@@ -587,7 +587,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-wBca1KgQO1GWszaVktbwbYVESuP4u+uAcyN0er7mBPE=";
+              "pty-core-0.13.0-rust" = "sha256-iMnh/+jVGqMc2GE07n2nF0rBKiT49vMKb26+uGYKkfs=";
             };
           };
           buildPhase = ''
