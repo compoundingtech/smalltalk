@@ -116,8 +116,31 @@ selectors unavailable through the native API remain unknown. The current extensi
 does not promise atomic model-and-effort updates. Approval policy is an observed
 unsupported capability, not a remote setter.
 
-`GET /v1/client/harness-control-receipts/{id}?subject=...` reads either ledger's
-durable operation receipt. Its untagged queue/model union retains the original
+`harness.answer_ask` answers a real pending native `ask` using its owner-signed opaque
+`askRef`. It requires `control.runtimes` and a concrete person; the browser does not
+choose the subject, native binding, tool-call ID or actor. Parameters are either
+`{ _tag: "Selection", askRef, answers: [{ questionId, options, text? }] }` or the
+single-question shorthand `{ _tag: "Text", askRef, text }`. Selection answers must
+include every original question in order, with labels drawn from its offered choices.
+Multi-choice supports an empty selection and selected options plus custom text.
+Custom LF is literal; TAB, CR, ESC and other control characters are invalid answers.
+
+The queue's native summary includes `pending_ask` (signed `ask_ref`, tool-call ID and
+questions), `ask_supported`, and `ask_reason`. Browser controls are available only
+when the actual pending ask and transcript tool call agree. Unsupported or blocked
+native dialogs require terminal handoff. Stale/settled references return
+`ask-no-longer-pending`; malformed atomic answers return `invalid-harness-answers`.
+
+Accepted/dispatched ask receipts are not answers. Applied receipts require the exact
+actual native `tool_result`. Competing terminal input revokes synthetic input and
+returns an indeterminate ask receipt whose optional `outcome` is
+`{ _tag: "Indeterminate", reason: "terminal-input-conflict" }`, also returned unchanged
+inside `ActionResult.harness_ask`. Complete or cancel the real dialog in the terminal;
+human input is not exclusively blocked, prior selections may remain visible, and the
+receipt itself never clears native pending/needs-you state.
+
+`GET /v1/client/harness-control-receipts/{id}?subject=...` reads the corresponding
+durable operation receipt. Its untagged queue/model/ask union retains the original
 wire shape, exact binding, terminal outcome, and native proof. It requires
 `read.projections`, routes to the observed runtime owner, and never returns a
 receipt for another subject.

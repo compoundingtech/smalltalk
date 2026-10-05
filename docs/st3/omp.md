@@ -73,8 +73,8 @@ return nor matching text proves acceptance: only the exact
 native `message_start` or `message_end` details settle the operation. Identical text with distinct
 operation IDs remains distinct.
 
-Native session switch, branch, and tree transitions are refused while an input admission or model
-mutation remains unresolved. There is no timeout that releases this fence. If another extension
+Native session switch, branch, and tree transitions are refused while an input admission, model
+mutation, or native ask answer remains unresolved. There is no timeout that releases this fence. If another extension
 cancels a transition after its before-event, controls stay unavailable until a native after-event
 proves the current binding. Shutdown without a settled operation reports `indeterminate`.
 
@@ -89,6 +89,38 @@ revision; a fresh native read rejects a stale selection, including a change made
 channel. The channel samples native selection changes on its keepalive; the extension API has no
 model/effort change hook. This is a pre-invocation fence, not a compare-and-swap guarantee across the
 native asynchronous setter.
+
+### Native ask answers
+
+The native control observation exposes `pending_ask` only for an actual main-agent `ask`
+tool execution, retaining its tool-call ID and original questions. Browser answers use the
+owner action `harness.answer_ask` with an owner-signed opaque `askRef`, not terminal text or
+browser-selected session bindings. All questions are answered together in original order.
+Single-choice, multi-choice (including an empty selection), and custom text use the actual
+native rich TUI. Custom text is inserted literally, not through image-aware paste; LF is
+supported, while TAB, CR, ESC and other control characters return `invalid-harness-answers`.
+
+The adapter uses public extension lifecycle/input APIs and a public raw-stdin observer.
+Each synthetic input has a one-use opaque token, the exact owner/native binding, and an
+observed question/custom/review surface. Mailbox takeover and the PTY handoff share the
+owner's writer fence. Neither a successful PTY write nor an accepted/dispatched receipt
+means the ask was answered: only the matching actual native `tool_result` can settle it
+as applied. Existing editor drafts, ambiguous/wrapped surfaces and unsupported runtimes
+are refused rather than submitting chat or pretending the dialog resolved.
+
+This is **conflict-to-terminal handoff, not exclusive terminal ownership**. Any competing
+raw input after the ask appears revokes browser automation before native clipboard/paste
+handlers run. The operation reports `indeterminate` with
+`outcome: { "_tag": "Indeterminate", "reason": "terminal-input-conflict" }`, including a
+submission racing an earlier native observation. No further synthetic key is authorized.
+Human input remains native input; already-started browser selections may still be visible,
+so complete or cancel the real dialog in the terminal. Pending/needs-you state is cleared
+only by real native completion, never by the conflict receipt.
+
+OMP's RPC-UI `set_ask_dialog`/`extension_ui_response` seam resolves RPC-owned requests;
+it is not a live TUI dialog-resolution API. The terminal adapter does not claim RPC support.
+
+### Native control receipts and smoke
 
 Receipt replay is process-local channel recovery, not durable native deduplication. The driver must
 not blindly replay an operation after a process replacement or an indeterminate result.
