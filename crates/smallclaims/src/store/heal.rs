@@ -649,23 +649,27 @@ impl Store {
                     )?;
                 }
                 let held = transaction
-                    .query_row(
+                    .prepare_cached(
                         "SELECT 1 FROM replica_envelopes
                          WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+                    )?
+                    .query_row(
                         params![envelope.writer, envelope.sequence, envelope.hash],
                         |_| Ok(()),
                     )
                     .optional()?
                     .is_some();
                 inserted |= !held;
-                transaction.execute(
-                    "INSERT INTO replica_envelopes(
+                transaction
+                    .prepare_cached(
+                        "INSERT INTO replica_envelopes(
                          writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms,
                          payload, relay, receipt_state, received_at_unix_ms
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)
                      ON CONFLICT(writer, sequence, envelope_hash) DO UPDATE SET
                          payload=excluded.payload, receipt_state='pending', validation_error=NULL",
-                    params![
+                    )?
+                    .execute(params![
                         envelope.writer,
                         envelope.sequence,
                         envelope.hash,
@@ -674,8 +678,7 @@ impl Store {
                         envelope.payload,
                         relay,
                         now,
-                    ],
-                )?;
+                    ])?;
             }
             transaction.commit()?;
         }

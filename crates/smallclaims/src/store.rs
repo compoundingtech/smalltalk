@@ -1583,7 +1583,7 @@ impl Store {
     /// Envelopes this node holds but cannot admit until their writer's signature arrives.
     pub fn replication_signature_requests(&self) -> Result<Vec<ReplicaEnvelopeId>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare_cached(
             "SELECT writer, sequence, envelope_hash FROM replica_envelope_holds
              WHERE reason='unsigned' ORDER BY writer, sequence, envelope_hash LIMIT ?1",
         )?;
@@ -1604,6 +1604,9 @@ impl Store {
         &self,
         requests: &[ReplicaEnvelopeId],
     ) -> Result<Vec<crate::claim::ReplicaEnvelopeSignature>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT member_key, signature FROM replica_envelope_signatures
@@ -1867,18 +1870,19 @@ pub fn envelope_carries_fleet_claims(
     connection: &Connection,
     envelope: &ReplicaEnvelope,
 ) -> Result<bool> {
-    Ok(connection.query_row(
-        &format!(
+    Ok(connection
+        .prepare_cached(&format!(
             "SELECT EXISTS(
                  SELECT 1 FROM replica_envelopes AS envelopes
                  JOIN claims ON claims.batch_id=envelopes.batch_id
                  WHERE envelopes.writer=?1 AND envelopes.sequence=?2 AND envelopes.envelope_hash=?3
                    AND claims.kind IN ({FLEET_CLAIM_KINDS})
              )"
-        ),
-        params![envelope.writer, envelope.sequence, envelope.hash],
-        |row| row.get(0),
-    )?)
+        ))?
+        .query_row(
+            params![envelope.writer, envelope.sequence, envelope.hash],
+            |row| row.get(0),
+        )?)
 }
 
 /// Verify one envelope signature and store it. Returns 1 when it is new. A signature that does
@@ -1899,12 +1903,20 @@ pub fn store_envelope_signature_tx(
     if !crate::fleet::verify_signature(member_key, &message, signature) {
         return Ok(0);
     }
-    Ok(transaction.execute(
-        "INSERT OR IGNORE INTO replica_envelope_signatures(
+    Ok(transaction
+        .prepare_cached(
+            "INSERT OR IGNORE INTO replica_envelope_signatures(
              writer, sequence, envelope_hash, member_key, signature, stored_at_unix_ms
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![writer, sequence, envelope_hash, member_key, signature, now],
-    )?)
+        )?
+        .execute(params![
+            writer,
+            sequence,
+            envelope_hash,
+            member_key,
+            signature,
+            now
+        ])?)
 }
 
 /// What `st fleet remove` did.
@@ -3904,22 +3916,21 @@ pub fn validate_and_admit_envelope_tx(
         );
         let valid = hex::encode(Sha256::digest(bytes)) == *hash;
         let previous_state = transaction
-            .query_row(
-                "SELECT state FROM replica_records WHERE record_ref=?1",
-                [&record_ref],
-                |row| row.get::<_, String>(0),
-            )
+            .prepare_cached("SELECT state FROM replica_records WHERE record_ref=?1")
+            .map_err(internal)?
+            .query_row([&record_ref], |row| row.get::<_, String>(0))
             .optional()
             .map_err(internal)?;
         if valid {
             transaction
-                .execute(
+                .prepare_cached(
                     "INSERT OR IGNORE INTO blobs(hash, bytes, size) VALUES (?1, ?2, ?3)",
-                    params![hash, bytes, bytes.len() as u64],
                 )
+                .map_err(internal)?
+                .execute(params![hash, bytes, bytes.len() as u64])
                 .map_err(internal)?;
             transaction
-                .execute(
+                .prepare_cached(
                     "INSERT INTO replica_records(
                          record_ref, writer, sequence, envelope_hash, position, raw, state,
                          subject_hint, kind_hint, updated_at_unix_ms
@@ -3930,7 +3941,9 @@ pub fn validate_and_admit_envelope_tx(
                             error_code=CASE WHEN state='repaired' THEN error_code ELSE NULL END,
                             error_message=CASE WHEN state='repaired' THEN error_message ELSE NULL END,
                         updated_at_unix_ms=excluded.updated_at_unix_ms",
-                    params![
+                )
+                .map_err(internal)?
+                .execute(params![
                         record_ref,
                         envelope.writer,
                         envelope.sequence,
@@ -3939,15 +3952,14 @@ pub fn validate_and_admit_envelope_tx(
                         bytes,
                         format!("blob/{hash}"),
                         now_ms().to_string(),
-                    ],
-                )
+                    ])
                 .map_err(internal)?;
             outcome.valid += 1;
             outcome.changed |= previous_state.as_deref() != Some("valid");
         } else {
             degraded = true;
             transaction
-                .execute(
+                .prepare_cached(
                     "INSERT INTO replica_records(
                          record_ref, writer, sequence, envelope_hash, position, raw, state,
                          subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
@@ -3956,7 +3968,9 @@ pub fn validate_and_admit_envelope_tx(
                      ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'invalid' END,
                         subject_hint=excluded.subject_hint, kind_hint='blob', error_code=excluded.error_code,
                         error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
-                    params![
+                )
+                .map_err(internal)?
+                .execute(params![
                         record_ref,
                         envelope.writer,
                         envelope.sequence,
@@ -3966,25 +3980,25 @@ pub fn validate_and_admit_envelope_tx(
                         format!("blob/{hash}"),
                         format!("replicated blob `{hash}` failed verification"),
                         now_ms().to_string(),
-                    ],
-                )
+                    ])
                 .map_err(internal)?;
             outcome.invalid += 1;
         }
     }
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT OR IGNORE INTO batches(id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
+        )
+        .map_err(internal)?
+        .execute(params![
                 batch.id,
                 batch.origin,
                 batch.replica_sequence,
                 batch.previous_hash,
                 batch.hash,
                 batch.accepted_at_unix_ms.to_string(),
-            ],
-        )
+            ])
         .map_err(internal)?;
     for (position, claim) in batch.claims.iter().enumerate() {
         let position = position as u64;
@@ -3997,11 +4011,9 @@ pub fn validate_and_admit_envelope_tx(
         let mut raw = Vec::new();
         ciborium::into_writer(claim, &mut raw).map_err(internal)?;
         let previous_state = transaction
-            .query_row(
-                "SELECT state FROM replica_records WHERE record_ref=?1",
-                [&record_ref],
-                |row| row.get::<_, String>(0),
-            )
+            .prepare_cached("SELECT state FROM replica_records WHERE record_ref=?1")
+            .map_err(internal)?
+            .query_row([&record_ref], |row| row.get::<_, String>(0))
             .optional()
             .map_err(internal)?;
         let started = std::time::Instant::now();
@@ -4040,7 +4052,7 @@ pub fn validate_and_admit_envelope_tx(
                         .map_err(internal)?;
                 }
                 transaction
-                    .execute(
+                    .prepare_cached(
                         "INSERT INTO replica_records(
                              record_ref, writer, sequence, envelope_hash, position, raw, state,
                              claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
@@ -4051,8 +4063,9 @@ pub fn validate_and_admit_envelope_tx(
                             error_code=CASE WHEN state='repaired' THEN error_code ELSE NULL END,
                             error_message=CASE WHEN state='repaired' THEN error_message ELSE NULL END,
                             updated_at_unix_ms=excluded.updated_at_unix_ms",
-                        params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, now],
                     )
+                    .map_err(internal)?
+                    .execute(params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, now])
                     .map_err(internal)?;
                 outcome.valid += 1;
                 outcome.changed |= inserted != 0 || previous_state.as_deref() != Some("valid");
@@ -4073,7 +4086,7 @@ pub fn validate_and_admit_envelope_tx(
                     ReplicatedClaimAdmission::Valid => unreachable!(),
                 };
                 transaction
-                    .execute(
+                    .prepare_cached(
                         "INSERT INTO replica_records(
                              record_ref, writer, sequence, envelope_hash, position, raw, state,
                              claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
@@ -4082,15 +4095,16 @@ pub fn validate_and_admit_envelope_tx(
                             error_code=CASE WHEN state='repaired' THEN error_code ELSE excluded.error_code END,
                             error_message=CASE WHEN state='repaired' THEN error_message ELSE excluded.error_message END,
                             updated_at_unix_ms=excluded.updated_at_unix_ms",
-                        params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, error_code, error_message, now],
                     )
+                    .map_err(internal)?
+                    .execute(params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, error_code, error_message, now])
                     .map_err(internal)?;
                 outcome.unknown += 1;
             }
             Err(error) => {
                 degraded = true;
                 transaction
-                    .execute(
+                    .prepare_cached(
                         "INSERT INTO replica_records(
                              record_ref, writer, sequence, envelope_hash, position, raw, state,
                              claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
@@ -4098,25 +4112,27 @@ pub fn validate_and_admit_envelope_tx(
                          ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'invalid' END,
                             error_code=excluded.error_code, error_message=excluded.error_message,
                             updated_at_unix_ms=excluded.updated_at_unix_ms",
-                        params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, error.code, error.message, now],
                     )
+                    .map_err(internal)?
+                    .execute(params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, error.code, error.message, now])
                     .map_err(internal)?;
                 outcome.invalid += 1;
             }
         }
     }
     transaction
-        .execute(
+        .prepare_cached(
             "UPDATE replica_envelopes SET receipt_state=?4, validation_error=NULL, batch_id=?5
              WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
-            params![
-                envelope.writer,
-                envelope.sequence,
-                envelope.hash,
-                if degraded { "degraded" } else { "validated" },
-                batch.id,
-            ],
         )
+        .map_err(internal)?
+        .execute(params![
+            envelope.writer,
+            envelope.sequence,
+            envelope.hash,
+            if degraded { "degraded" } else { "validated" },
+            batch.id,
+        ])
         .map_err(internal)?;
     Ok(())
 }
@@ -4273,8 +4289,7 @@ impl Store {
                 transaction
                     .execute(
                         "INSERT OR IGNORE INTO blobs(hash, bytes, size) VALUES (?1, ?2, ?3)",
-                        params![hash, bytes, bytes.len() as u64],
-                    )
+                        params![hash, bytes, bytes.len() as u64])
                     .map_err(internal)?;
                 if let Some(writer) = writer {
                     principals::rules_gate_tx(transaction, &self.origin, writer, "doc.bound", name)
@@ -5135,11 +5150,14 @@ impl Store {
                         .map_err(internal)?;
                     }
                     let inserted = transaction
-                        .execute(
+                        .prepare_cached(
                             "INSERT OR IGNORE INTO replica_envelopes(
                                  writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms,
                                  payload, relay, receipt_state, received_at_unix_ms
                              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+                        )
+                        .map_err(internal)?
+                        .execute(
                             params![
                                 envelope.writer,
                                 envelope.sequence,
@@ -5430,11 +5448,16 @@ impl Store {
                     );
                     match result {
                         Ok(()) => {
-                            savepoint.execute(
-                                "DELETE FROM replica_envelope_holds
+                            savepoint
+                                .prepare_cached(
+                                    "DELETE FROM replica_envelope_holds
                                  WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
-                                params![envelope.writer, envelope.sequence, envelope.hash],
-                            )?;
+                                )?
+                                .execute(params![
+                                    envelope.writer,
+                                    envelope.sequence,
+                                    envelope.hash
+                                ])?;
                             membership_changed |=
                                 envelope_carries_fleet_claims(&savepoint, envelope)?;
                             savepoint.commit()?;
@@ -5453,8 +5476,7 @@ impl Store {
                     // must distinguish the admitted log from a projection still catching up.
                     pass.execute(
                         "INSERT OR REPLACE INTO meta(key,value) VALUES('replication_admitted_index',?1)",
-                        [current_index_tx(&pass)?.to_string()],
-                    )?;
+                        [current_index_tx(&pass)?.to_string()])?;
                 }
                 pass.commit()?;
                 #[cfg(any(test, feature = "test-support"))]
