@@ -147,7 +147,7 @@ fn canary(harness: &str, scenario: &str) {
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
         .is_some_and(|result| result["verdict"] == "pass");
-    if scenario == "when-idle" {
+    if matches!(scenario, "when-idle" | "idle-hold") {
         eprintln!(
             "{}",
             result.as_ref().map(String::as_str).unwrap_or_default()
@@ -289,4 +289,20 @@ fn an_imported_codex_session_binds_exactly_on_first_launch_and_restart() {
         return;
     }
     canary("codex", "import");
+}
+
+#[test]
+fn codex_idle_minute_makes_no_hold_calls_then_delivers_with_hold_release_and_expiry() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    canary("codex", "idle-hold");
+}
+
+#[test]
+fn opencode_idle_minute_makes_no_hold_calls_then_delivers_with_hold_release_and_expiry() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    canary("opencode", "idle-hold");
 }

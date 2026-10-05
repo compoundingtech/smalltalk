@@ -17143,7 +17143,12 @@ async fn drive_st2_native(
     loop {
         tokio::select! {
             frame = mailbox.recv() => {
+                let mail_changed = matches!(&frame, Some(st3::mailbox::Frame::Mailbox { .. }));
                 mailbox.accept(frame, &runtime_id)?;
+                if driver == "opencode" && mail_changed
+                    && let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "opencode-server").await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
             }
             wake = observations.recv() => {
                 wake?;
@@ -17238,12 +17243,8 @@ async fn drive_st2_native(
                     }
                 }
 
-                if driver == "opencode" {
-                    if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths, |gate| {
-                        if let Some(subscription) = &mailbox.subscription {
-                            subscription.report(native_delivery_control_report("opencode-server", gate));
-                        }
-                    }).await {
+                if driver == "opencode" && mailbox.subscription.is_some() {
+                    if let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "opencode-server").await {
                         note_driver_tick_failure(subject, error, &mut last_control_warning);
                     }
                 }
@@ -17367,6 +17368,12 @@ async fn drive_st2_native(
                     )
                     .await;
                 }
+                }
+                // The older mailbox projection can create the first inbox file in this pass.
+                // Read control now so an idle gate adds no extra polling interval to delivery.
+                if driver == "opencode" && mailbox.subscription.is_none()
+                    && let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "opencode-server").await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 let tick: Result<()> = async {
                     if observations.enabled { return Ok(()) }
@@ -19845,6 +19852,43 @@ async fn refresh_native_delivery_control(
     refresh_graph_delivery_gate_with_report(client, subject, &paths.delivery_gate, report).await
 }
 
+/// Idle providers need no permit. Read graph control on mailbox arrival, then renew the
+/// existing short lease only while mail waits; a late provider handoff still fails closed.
+async fn sync_native_delivery_control(
+    client: &Client,
+    subject: &str,
+    paths: &mut NativePaths,
+    mailbox: &NativeMailbox,
+    inbox: &Path,
+    transport: &str,
+) -> Result<()> {
+    let report = |gate: &st_drivers::session_control::DeliveryGate| {
+        if let Some(subscription) = &mailbox.subscription {
+            subscription.report(native_delivery_control_report(transport, gate));
+        }
+    };
+    let waiting = if mailbox.subscription.is_some() {
+        mailbox.messages.iter().any(|message| {
+            matches!(message.status.as_str(), "sent" | "staged" | "delivered")
+        })
+    } else {
+        match st_drivers::message::list_dir(inbox) {
+            Ok(messages) => !messages.is_empty(),
+            Err(error) => {
+                paths.delivery_gate.unavailable();
+                report(&paths.delivery_gate);
+                return Err(error);
+            }
+        }
+    };
+    if !waiting && paths.pending_hold_adoption.is_none() {
+        paths.delivery_gate.update(true, Duration::ZERO);
+        report(&paths.delivery_gate);
+        return Ok(());
+    }
+    refresh_native_delivery_control(client, subject, paths, report).await
+}
+
 /// The only transitional status read: one fresh DND on an adopted predecessor, with no writes.
 fn legacy_delivery_hold(
     subject: &str,
@@ -20058,7 +20102,14 @@ async fn drive_codex_native(
     let mut replacement = DriverReplacement::new();
     loop {
         tokio::select! {
-            frame = mailbox.recv() => { mailbox.accept(frame, &runtime_id)?; }
+            frame = mailbox.recv() => {
+                let mail_changed = matches!(&frame, Some(st3::mailbox::Frame::Mailbox { .. }));
+                mailbox.accept(frame, &runtime_id)?;
+                if mail_changed
+                    && let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "app-server").await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
+            }
 
             wake = observations.recv() => {
                 wake?;
@@ -20153,11 +20204,8 @@ async fn drive_codex_native(
                     }
                 }
 
-                if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths, |gate| {
-                        if let Some(subscription) = &mailbox.subscription {
-                            subscription.report(native_delivery_control_report("app-server", gate));
-                        }
-                    }).await {
+                if mailbox.subscription.is_some()
+                    && let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "app-server").await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 // Delivery runs first and on its own: a failing observation publish must never
@@ -20184,6 +20232,9 @@ async fn drive_codex_native(
                     &mut delivery,
                 )
                 .await;
+                if let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "app-server").await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
                 }
                 let tick: Result<()> = async {
                     if !loop_state.ready && std::fs::read(state_dir.join("binding.json"))

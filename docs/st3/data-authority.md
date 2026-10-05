@@ -129,7 +129,10 @@ replicate and survive daemon/driver restart. Expiry enables delivery without ano
 
 Native wrappers no longer create or refresh legacy `status` files. Their observed-record
 heartbeats remain session-owned. Codex/OpenCode pumps receive graph control explicitly, start
-closed, and refresh it once per second with a 250 ms request deadline and three-second permit.
+closed, and read control on mailbox arrival, with a 250 ms request deadline and three-second permit.
+They renew the permit once per second only while native mail is waiting or a predecessor's hold
+needs adoption. An empty mailbox closes the gate and makes no delivery-hold requests. The next
+mailbox event obtains fresh control; idle time cannot leave a permit open or delay delivery.
 An unavailable, malformed, or mismatched response closes the gate; a stalled driver loop also
 loses its permit. Holds block new handoffs while providers, observations, and pending receipt
 reconciliation continue. Input already handed to a harness cannot be recalled.
