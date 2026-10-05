@@ -1068,6 +1068,7 @@ pub(crate) struct MissionGateRunner {
     pub subject: String,
     pub host: String,
     pub owner_run: String,
+    pub owner_step: Option<String>,
     pub retired: bool,
 }
 
@@ -10588,6 +10589,7 @@ impl Store {
                         subject: subject.clone(),
                         host: host.clone(),
                         owner_run: owner_run.clone(),
+                        owner_step: owner.starts_with("step-run/").then(|| owner.clone()),
                         retired,
                     }));
                 }
