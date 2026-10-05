@@ -59,6 +59,8 @@ The control lease activates only after an actual native control observation and 
 re-exec. It does not enable push-mail subscriptions on legacy OMP channels: their existing delivery
 and graph-lag behavior remains unchanged. Controls without an accepted lease cannot publish or
 dispatch; a legacy channel without control observations does not acquire a control lease.
+On reconnect, accepting the replayed native baseline acquires that lease before the channel consumes
+the following settlement receipts; it does not wait for a heartbeat or discard those receipts.
 
 Input uses a displayable, user-attributed native custom message with an operation ID, actor, and
 entry ID in its details. Smalltalk retains follow-ups while native input is busy and dispatches

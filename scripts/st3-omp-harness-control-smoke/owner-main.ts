@@ -32,6 +32,9 @@ try {
  const modelAction=await request('/v1/client/actions',modelBody);if(modelAction.status!==200||modelAction.value.status!=='accepted')throw Error('Model action not accepted '+JSON.stringify(modelAction));
  const modelReceipt=await poll(async()=>{const r=await receipt(modelAction.value.operation_id);return r.status==='applied'?r:false;},'durable model receipt');
  if(modelReceipt.result?.id!=='native-smoke'||modelReceipt.result?.effective_effort!=='high'||!modelReceipt.model_revision)throw Error('Model receipt lacks exact native proof');
+ if(!log.includes('OWNER_NATIVE_PIPE_LOSS '+modelAction.value.operation_id)||!log.includes('OWNER_CONTROL_REPLAY_RECEIPT '+modelAction.value.operation_id))throw Error('Model outcome did not survive actual native driver-pipe replay');
+ const modelCommands=log.split('\n').filter(line=>line==='OWNER_CONTROL_COMMAND '+modelAction.value.operation_id);
+ if(modelCommands.length!==1)throw Error('Owner resent a dispatched native model operation after pipe loss');
  const retainedQueue=await poll(async()=>{const q=await read();return q.native.models.selected?.effective_effort==='high'?q:false;},'observed high effort');
  const retainedCap=await request('/v1/client/capabilities');const retainedBody=structuredClone(modelBody);
  retainedBody.id='action/model-retained';retainedBody.idempotency_key='owner-smoke-model-retained';retainedBody.fence.snapshot_id=retainedCap.error.snapshot.id;retainedBody.parameters.binding=retainedQueue.native.binding;retainedBody.parameters.model_revision=retainedQueue.native.models.revision;retainedBody.parameters.model_id='native-initial';delete retainedBody.parameters.effort;

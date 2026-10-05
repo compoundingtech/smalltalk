@@ -18604,7 +18604,17 @@ async fn run_pi_channel(
                         while let Some(line) = state.lines.next_line() {
                             if driver == "omp" {
                                 match state.controls.accept(&line, subject, state.control_fence.as_ref().or(state.pending.fence.as_ref()).filter(|fence| fence.epoch != 0)) {
-                                    Ok(true) => continue,
+                                    Ok(true) => {
+                                        // Reconnect replay sends the baseline and receipts together.
+                                        // Acquire the control-only lease before consuming the next frame.
+                                        if state.controls.is_active() && state.pending.fence.is_none() {
+                                            let fence = state.control_fence.get_or_insert_with(|| {
+                                                st3::mailbox::Fence::new(subject, &incarnation, "delivery")
+                                            });
+                                            fence.bind(client).await?;
+                                        }
+                                        continue;
+                                    },
                                     Ok(false) => {},
                                     Err(error) => { warn_pi_channel(subject, &error, &mut last_warning); continue; }
                                 }
