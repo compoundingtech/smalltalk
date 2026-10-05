@@ -21972,8 +21972,15 @@ agent "seat" { workspace "/tmp"; command "true" }
         let (status, detail) = get_request(app.clone(), link).await;
         assert_eq!(status, StatusCode::OK, "{detail}");
         assert_eq!(detail["decision"]["answer_id"], "ans001");
-        let (status, _) = get_request(app, &format!("/v1/client/attention/{id}")).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        // A missing current card has an error envelope, not a successful snapshot.
+        let missing = app.oneshot(
+            Request::builder().uri(format!("/v1/client/attention/{id}"))
+                .body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(missing.into_body(), usize::MAX).await.unwrap();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["code"], "not-found");
     }
 
 }
