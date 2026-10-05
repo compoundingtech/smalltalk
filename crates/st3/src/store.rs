@@ -10363,7 +10363,11 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let scanned = raw.iter().take(limit).last().map(|event| event.store_index);
+        let scanned = raw
+            .iter()
+            .take(limit)
+            .next_back()
+            .map(|event| event.store_index);
         let items = raw
             .into_iter()
             .take(limit)
