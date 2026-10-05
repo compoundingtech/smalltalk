@@ -2237,7 +2237,7 @@
     {
       "effect": "TerminalKey",
       "tests": [
-        "crates/stui/src/ui/pty.rs::keys_are_the_bytes_a_terminal_sends",
+        "crates/stui/src/ui/pty.rs::protocol_modes_control_key_encoding",
         "crates/st3/tests/action_coverage.rs::terminal_controls_survive_stale_screens_and_daemon_restarts"
       ],
       "verification": "UI reducer and corresponding real daemon action; local effects have no graph fence"
