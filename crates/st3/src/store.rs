@@ -5841,6 +5841,59 @@ impl Store {
             .collect()
     }
 
+    /// When a loop first executed: a worker's first claim, or the creation of a round
+    /// with no claimable steps. Presentation details and other loops' rounds do not
+    /// affect this clock, including when an earlier round is already terminal.
+    pub fn loop_first_execution_at(&self, root: &str, parent_step: &str) -> Result<Option<u128>> {
+        let root = root.strip_prefix("mission-run/").unwrap_or(root);
+        smallclaims::touched::note_read(|| format!("children-of-step:{parent_step}"));
+        let connection = self.readers.get();
+        let mut children = connection.prepare_cached(
+            "SELECT id, current_generation_id, created_at_unix_ms FROM mission_runs
+             WHERE root_run_id=?1 AND parent_step_run=?2",
+        )?;
+        let mut steps = connection.prepare_cached(
+            "SELECT subject, agentless FROM step_runs WHERE run_id=?1 AND generation_id=?2",
+        )?;
+        let mut claims = connection.prepare_cached(
+            "SELECT accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='work.claimed'",
+        )?;
+        let mut started: Option<u128> = None;
+        let children = children.query_map(params![root, parent_step], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for child in children {
+            let (id, generation, created) = child?;
+            smallclaims::touched::note_read(|| format!("mission-run/{id}"));
+            smallclaims::touched::note_read(|| format!("run-generation/{generation}"));
+            smallclaims::touched::note_read(|| format!("generations:mission-run/{id}"));
+            let steps = steps
+                .query_map(params![id, generation], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (subject, _) in &steps {
+                smallclaims::touched::note_read(|| subject.clone());
+            }
+            if steps.iter().all(|(_, agentless)| *agentless) {
+                let created = created.parse::<u128>()?;
+                started = Some(started.map_or(created, |at| at.min(created)));
+            } else {
+                for (subject, _) in steps {
+                    for accepted in claims.query_map([subject], |row| row.get::<_, String>(0))? {
+                        let accepted = accepted?.parse::<u128>()?;
+                        started = Some(started.map_or(accepted, |at| at.min(accepted)));
+                    }
+                }
+            }
+        }
+        Ok(started)
+    }
+
     pub fn work(&self, actor: Option<&str>, include_terminal: bool) -> Result<Vec<StepRunView>> {
         self.work_at_snapshot(actor, include_terminal, now_ms())
     }
@@ -30620,6 +30673,212 @@ agent "test/empty" { command "true" }
             .next()
             .expect("published mission")
             .clone()
+    }
+
+    #[test]
+    fn loop_execution_clock_uses_only_its_direct_children_and_current_steps() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "clock-parent" state="ready" {
+  goal "Keep two independent loops open."
+  concurrent-runs max=20
+  step "first" { agentless }
+  step "other" { agentless }
+}
+mission "clock-worker" state="ready" {
+  goal "Start the loop clock when work is claimed."
+  concurrent-runs max=20
+  step "work" { assigned-to "agent/worker" }
+  step "automatic" { agentless }
+}
+mission "clock-automatic" state="ready" {
+  goal "Start an automatic round at creation."
+  concurrent-runs max=20
+  step "automatic" { agentless }
+}
+"#,
+            "clock-missions",
+        );
+        let request = |mission: &str, key: &str| MissionRunRequest {
+            mission: mission.into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: None,
+            mode: None,
+            inputs: BTreeMap::new(),
+            idempotency_key: key.into(),
+        };
+        let parent = store
+            .create_mission_run(&request("clock-parent", "clock-parent"))
+            .unwrap();
+        let other_root = store
+            .create_mission_run(&request("clock-parent", "other-root"))
+            .unwrap();
+        let parent_step = &parent
+            .steps
+            .iter()
+            .find(|step| step.step == "first")
+            .unwrap()
+            .subject;
+        let sibling_step = &parent
+            .steps
+            .iter()
+            .find(|step| step.step == "other")
+            .unwrap()
+            .subject;
+        let child = store
+            .create_child_mission_run(
+                &request("clock-worker", "clock-child"),
+                &parent,
+                parent_step,
+                None,
+            )
+            .unwrap();
+        let sibling = store
+            .create_child_mission_run(
+                &request("clock-automatic", "clock-sibling"),
+                &parent,
+                sibling_step,
+                None,
+            )
+            .unwrap();
+        let foreign = store
+            .create_child_mission_run(
+                &request("clock-automatic", "foreign-child"),
+                &other_root,
+                parent_step,
+                None,
+            )
+            .unwrap();
+        for excluded in [&sibling, &foreign] {
+            store
+                .connection
+                .write()
+                .execute(
+                    "UPDATE mission_runs SET created_at_unix_ms='1' WHERE id=?1",
+                    [&excluded.id],
+                )
+                .unwrap();
+        }
+        // A worker round that has not been claimed does not start the clock at creation.
+        assert_eq!(
+            store
+                .loop_first_execution_at(&parent.subject, parent_step)
+                .unwrap(),
+            None
+        );
+        let work = child.steps.iter().find(|step| !step.agentless).unwrap();
+        let automatic = child.steps.iter().find(|step| step.agentless).unwrap();
+        for (index, (step, at)) in [(work, "100"), (work, "90"), (automatic, "80")]
+            .into_iter()
+            .enumerate()
+        {
+            let claim = store
+                .append_claim(&ClaimInput {
+                    subject: step.subject.clone(),
+                    kind: "work.claimed".into(),
+                    actor: Some("agent/worker".into()),
+                    fields: BTreeMap::from([("attempt".into(), Value::from(index + 1))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("clock-claim-{index}")),
+                })
+                .unwrap();
+            store
+                .connection
+                .write()
+                .execute(
+                    "UPDATE claims SET accepted_at_unix_ms=?2 WHERE id=?1",
+                    params![claim.id, at],
+                )
+                .unwrap();
+        }
+        STEPS_ENRICHED.with(|enriched| enriched.set(0));
+        let (clock, reads) = smallclaims::touched::record(|| {
+            store
+                .loop_first_execution_at(&parent.subject, parent_step)
+                .unwrap()
+        });
+        assert_eq!(clock, Some(80));
+        assert_eq!(
+            STEPS_ENRICHED.with(std::cell::Cell::get),
+            0,
+            "the clock must not read presentation history"
+        );
+        assert!(reads.contains(&format!("children-of-step:{parent_step}")));
+        assert!(reads.contains(&child.subject));
+        assert!(reads.contains(&child.generation));
+        let generation_change = Change {
+            subject: "run-generation/new-round-generation".into(),
+            kind: "run-generation.created".into(),
+            actor: None,
+            body: json!({"fields": {"run": child.subject}}).to_string(),
+        };
+        assert!(
+            crate::incremental::change_keys(&generation_change)
+                .iter()
+                .any(|key| reads.contains(key)),
+            "a successor generation must invalidate the clock"
+        );
+        assert!(reads.contains(&work.subject));
+        assert!(reads.contains(&automatic.subject));
+        assert!(!reads.contains(&sibling.subject));
+        assert!(!reads.contains(&foreign.subject));
+        // Earlier terminal rounds still determine the clock.
+        store
+            .set_mission_run_state(&child.id, "completed", "terminal", None)
+            .unwrap();
+        assert_eq!(
+            store
+                .loop_first_execution_at(&parent.id, parent_step)
+                .unwrap(),
+            Some(80)
+        );
+        // Claims on predecessor-generation steps cannot start the current round.
+        store
+            .connection
+            .write()
+            .execute(
+                "UPDATE step_runs SET generation_id=?2 WHERE run_id=?1",
+                params![child.id, generation_id_from_subject(&parent.generation)],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .loop_first_execution_at(&parent.id, parent_step)
+                .unwrap(),
+            Some(child.created_at_unix_ms)
+        );
+        // No steps, like entirely agentless steps, means the round starts at creation.
+        let empty = store
+            .create_child_mission_run(
+                &request("clock-automatic", "clock-empty"),
+                &parent,
+                parent_step,
+                None,
+            )
+            .unwrap();
+        store
+            .connection
+            .write()
+            .execute("DELETE FROM step_runs WHERE run_id=?1", [&empty.id])
+            .unwrap();
+        store
+            .connection
+            .write()
+            .execute(
+                "UPDATE mission_runs SET created_at_unix_ms='50' WHERE id=?1",
+                [&empty.id],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .loop_first_execution_at(&parent.id, parent_step)
+                .unwrap(),
+            Some(50)
+        );
     }
 
     #[test]

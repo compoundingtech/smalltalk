@@ -7587,11 +7587,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ]),
             )?;
         }
-        let first_execution = self.loop_first_execution_at(run, view)?;
-        let timed_out = loop_spec.timeout_ms.is_some_and(|timeout| {
-            first_execution
+        let timed_out = if let Some(timeout) = loop_spec.timeout_ms {
+            self.loop_first_execution_at(run, view)?
                 .is_some_and(|started| now_ms().saturating_sub(started) >= timeout as u128)
-        });
+        } else {
+            false
+        };
         if timed_out {
             return self.finish_exhausted_loop(
                 run,
@@ -9076,29 +9077,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .root_mission_run
             .strip_prefix("mission-run/")
             .unwrap_or(&run.root_mission_run);
-        let mut started = None;
-        for child in self
-            .store
-            .mission_runs_for_root(root)?
-            .into_iter()
-            .filter(|child| child.parent_step_run.as_deref() == Some(view.subject.as_str()))
-        {
-            let has_claimable_work = child.steps.iter().any(|step| !step.agentless);
-            if !has_claimable_work {
-                started = Some(started.map_or(child.created_at_unix_ms, |current: u128| {
-                    current.min(child.created_at_unix_ms)
-                }));
-                continue;
-            }
-            for step in &child.steps {
-                for claim in self.store.claims_for(&step.subject, Some("work.claimed"))? {
-                    started = Some(started.map_or(claim.accepted_at_unix_ms, |current: u128| {
-                        current.min(claim.accepted_at_unix_ms)
-                    }));
-                }
-            }
-        }
-        Ok(started)
+        self.store.loop_first_execution_at(root, &view.subject)
     }
 
     fn loop_child_timed_out_without_claim(&self, child: &MissionRunView) -> Result<bool> {
@@ -24482,6 +24461,66 @@ mission "loop" state="ready" {
         assert_eq!(completed.loops[0].status, "completed");
         assert_eq!(completed.loops[0].round, 2);
         assert_eq!(completed.loops[0].results.len(), 2);
+    }
+
+    #[test]
+    fn an_untimed_loop_does_not_read_the_root_execution_history() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"version 2
+mission "untimed-clock" state="ready" {
+  goal "Wait for a round without a loop timeout."
+  loop "improve" {
+    max-rounds 2
+    round {
+      completion { when "all-steps-exhausted" }
+      step "work" { assigned-to "agent/worker" }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "untimed-clock-source");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "untimed-clock".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "untimed-clock-run".into(),
+            })
+            .unwrap();
+        let mission = store
+            .mission_spec("untimed-clock", Some(&run.revision))
+            .unwrap()
+            .unwrap();
+        let steps = flatten_mission_steps(&mission);
+        let step = &steps[0];
+        let view = &run.steps[0];
+        let loop_spec = step.spec.loop_spec.as_ref().unwrap();
+        assert!(loop_spec.timeout_ms.is_none());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        assert!(
+            reconciler
+                .evaluate_loop_step(&run, step, view, loop_spec)
+                .unwrap()
+        );
+        let (changed, reads) = smallclaims::touched::record(|| {
+            reconciler
+                .evaluate_loop_step(&run, step, view, loop_spec)
+                .unwrap()
+        });
+        assert!(!changed);
+        assert!(
+            !reads.contains(&format!("children:{}", run.root_mission_run))
+                && !reads.contains(&format!("children-of-step:{}", view.subject)),
+            "an untimed loop must not load the root's round history: {reads:?}"
+        );
     }
 
     #[test]
