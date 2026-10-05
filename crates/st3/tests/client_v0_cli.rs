@@ -156,6 +156,97 @@ async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_p
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn weekly_usage_survives_a_member_restart_with_a_partial_harness_report() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("claims.sqlite3");
+    let socket = root.path().join("st3.sock");
+    let now = st_drivers::message::now_ms();
+    let seat = "agent/client-v0-cli.worker";
+    for restarted in [false, true] {
+        let mut state = test_state(root.path());
+        state.store = Arc::new(Store::open(&path, "client-v0-cli").unwrap());
+        let store = state.store.clone();
+        if !restarted {
+            let intent = st3::graph::parse_intent(
+                "version 2\naccount \"avery/one\" { provider \"anthropic\"; login \"/tmp/example-login\"; }\nagent \"worker\" { workspace \"/tmp\"; harness \"claude\" { account \"avery/one\"; }; }",
+                store.origin(),
+            ).unwrap();
+            store.apply_internal(&intent, "weekly-restart").unwrap();
+        }
+        let mut fields = serde_json::json!({
+            "driver": "claude", "account": "claude/example", "account_ref": "avery/one",
+            "incarnation_id": if restarted { "inc-2" } else { "inc-1" },
+            "measured_at_unix_ms": if restarted { now } else { now - 60_000 },
+        });
+        if restarted {
+            fields["five_hour_percent"] = serde_json::json!(1.0);
+            store.append_claim(&ClaimInput {
+                subject: seat.into(), kind: "runtime.observed".into(), actor: None,
+                fields: serde_json::from_value(serde_json::json!({
+                    "status": "running", "runtime_id": "client-v0-cli.worker", "incarnation_id": "inc-2",
+                })).unwrap(), evidence: vec![], expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        } else {
+            // Weekly evidence is sufficient; no five-hour value is required.
+            fields["weekly_percent"] = serde_json::json!(95.0);
+            fields["weekly_resets_at_unix_ms"] = serde_json::json!(now + 3_600_000);
+        }
+        store
+            .append_claim(&ClaimInput {
+                subject: seat.into(),
+                kind: "harness.limits".into(),
+                actor: Some(seat.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            st3::api::serve_unix(&server_socket, st3::api::router(state))
+                .await
+                .unwrap();
+        });
+        for _ in 0..100 {
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cli = value(&run_cli(&socket, &["usage"]).await);
+        assert_eq!(cli["limits"][0]["weekly_percent"], 95.0);
+        assert_eq!(cli["limits"][0]["measured_at_unix_ms"], now - 60_000);
+        let report = st3_client::Client::unix_as(&socket, "person/avery")
+            .usage_period(None, None)
+            .await
+            .unwrap();
+        assert_eq!(report.value.limits[0].weekly_percent, Some(95.0));
+        assert_eq!(report.value.limits[0].measured_at_unix_ms, now - 60_000);
+        if restarted {
+            assert_eq!(
+                store
+                    .enforce_account_limits(
+                        &st3::store::LimitsPolicy {
+                            stop_at_weekly_percent: 95,
+                            keep: Default::default(),
+                            notify: "agent/example/operations".into(),
+                            fresh_ms: 3_600_000,
+                        },
+                        u128::from(now)
+                    )
+                    .unwrap()
+                    .stopped,
+                [seat]
+            );
+        }
+        server.abort();
+        let _ = server.await;
+        drop(store);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_seat_bootstraps_cancels_and_stops_with_its_own_cli_identity() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");

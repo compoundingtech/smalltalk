@@ -316,6 +316,11 @@ outside the hour cannot override it. This same selection serves `st usage`, stui
 account pools and the limits policy. The policy tests freshness against the selected source
 time, so a recent low publication cannot freshen an old high observation. Claim kinds and
 client fields remain compatible with older clients.
+Partial reports without a weekly percentage do not replace or refresh a prior weekly source.
+The durable reading survives member restarts. Consumers must check its original measurement time
+and reset window; missing or stale evidence is unknown, never zero. `st doctor` reports missing,
+stale, future-dated or already-reset weekly evidence for active accounts as `account-limits`.
+See [account limits](../accounts.md#at-the-limit) for the policy and external backstop behavior.
 The Rust method is `Client::usage_period(since_ms, until_ms)`;
 Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
 

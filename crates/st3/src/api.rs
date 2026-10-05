@@ -5567,6 +5567,16 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: format!("could not inspect terminal exec gates: {error}"),
         }),
     );
+    checks.push(
+        state
+            .store
+            .account_limits_check(client_now_ms(), 3_600_000)
+            .unwrap_or_else(|error| DoctorCheck {
+                name: "account-limits".into(),
+                status: "warn".into(),
+                message: format!("could not inspect weekly account readings: {error}"),
+            }),
+    );
     match tempfile::Builder::new()
         .prefix(".st3-doctor-")
         .tempfile_in(&state.state_dir)
@@ -16048,6 +16058,22 @@ agent "good" {{ workspace {:?}; command "true" }}
         );
         let retry = state.store.append_claim(&note("written here")).unwrap_err();
         assert_eq!(retry.code, "idempotency-conflict", "{retry:?}");
+    }
+
+    #[test]
+    fn doctor_reports_missing_weekly_evidence_for_a_declared_account() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let intent = parse_intent(
+            "version 2\naccount \"avery/one\" { provider \"anthropic\"; login \"/tmp/example-login\"; }\nagent \"worker\" { workspace \"/tmp\"; harness \"claude\" { account \"avery/one\"; }; }",
+            state.store.origin(),
+        ).unwrap();
+        state.store.apply_internal(&intent, "missing-weekly-doctor").unwrap();
+        let report = doctor_report(&state).unwrap().0;
+        let check = report.checks.iter().find(|check| check.name == "account-limits").unwrap();
+        assert_eq!(check.status, "warn");
+        assert!(check.message.contains("account/avery/one: no weekly reading"));
+        assert!(check.message.contains("not below the limit"));
     }
 
     #[test]

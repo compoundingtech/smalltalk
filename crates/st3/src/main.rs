@@ -20671,12 +20671,18 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
         let policy = policy.clone();
         match tokio::task::spawn_blocking(move || {
             st3::profile::task("task enforce-account-limits", || {
-                pass.enforce_account_limits(&policy, now_ms())
+                let now = now_ms();
+                let check = pass.account_limits_check(now, policy.fresh_ms)?;
+                let outcome = pass.enforce_account_limits(&policy, now)?;
+                Ok::<_, anyhow::Error>((outcome, check))
             })
         })
         .await
         {
-            Ok(Ok(outcome)) => {
+            Ok(Ok((outcome, check))) => {
+                if check.status == "warn" {
+                    eprintln!("st3: limits policy: {}", check.message);
+                }
                 for seat in outcome.stopped {
                     eprintln!("st3: limits policy stopped {seat}");
                 }
