@@ -13895,6 +13895,8 @@ mod tests {
         }
         server.abort();
         let _ = server.await;
+    }
+
     #[tokio::test]
     async fn replica_record_pages_expose_a_seek_cursor() {
         let root = tempfile::tempdir().unwrap();
