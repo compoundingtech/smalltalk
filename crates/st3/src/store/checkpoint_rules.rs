@@ -168,7 +168,7 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
         // The account fold compares source times and percentages across reset windows. A later
         // claim does not replace every use of an earlier reading (including a switched account).
         "harness.limits" => None,
-        "harness.todo.observed" => Some((Rule::Newest, slot(&[]))),
+        "harness.todo.observed" | "harness.plan.observed" => Some((Rule::Newest, slot(&[]))),
         // An observer records a resource's complete facts in every observation, so its newest
         // observation replaces the older ones. A repository observer records each item as its
         // own resource, so each item keeps its latest state. A version that a subscription request

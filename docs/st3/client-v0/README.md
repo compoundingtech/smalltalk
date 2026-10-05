@@ -32,6 +32,45 @@ The collections socket's `CollectionCommand` and `CollectionFrame` definitions l
 schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
 command/frame definitions, and subscription bound; see [collections](collections.md).
 
+### Focused harness state
+
+`GET /v1/client/harness/{id}` returns an envelope containing the `harness-state.v1`
+resource for one agent subject, including slash-containing IDs. It uses `read.projections`,
+not a new pairing scope. Subscribe on the existing collections socket with
+`{"kind":"subscribe","id":"seat","collection":"harness","agent":"agent/example/worker"}`.
+The `agent` filter is mandatory for harness and rejected for other collections; harness
+rejects person, actor and status filters. A missing subject gives HTTP 404 and an empty
+collection window. The initial snapshot and each incarnation, native-session or schema
+replacement are whole `snapshot` frames; replace the old window rather than merging bindings.
+Ordinary changes use the existing revisioned upsert/remove frames. Reconnect reads a fresh
+checkpointed snapshot, not replay.
+
+The focused resource retains the established todo, usage and leased running-subagent
+contracts. Fleet agent rows still carry their full todo and running subagents unchanged.
+`todo: null` and `plan: null` mean no accepted observation, not an empty list. An accepted
+empty snapshot has empty phases and zero totals. Old-binding snapshots remain visible with
+`stale: true`; unchanged todos do not become stale solely because their source timestamp ages.
+Codex plans are separate, version-1 `harness.plan.observed` snapshots using the same bounded
+phase/task shape as todos. Their replicated facts change only when the bound state changes,
+not when a source clock or reconnect repeats it. Plan changes reread only the matching focused
+subscription, including when unrelated fleet/attention/work windows share the same socket.
+
+Claude observes successful top-level `TodoWrite` full replacements (including clear), never
+subagent lists. `TaskCreate` and `TaskUpdate` cannot yet provide a supported coherent full-list
+snapshot and effective list/backend binding; they remain unobserved rather than being
+reconstructed from single-task deltas or guessed files. Codex observes the bound thread's full
+`turn/plan/updated` notifications. Neither producer reconstructs tasks from transcript text.
+OMP continues to use its existing native todo channel. Native OMP edit/clear/current-branch
+hydration and rebind coverage remain a separate producer coverage prerequisite.
+
+Cost and context use existing usage semantics without adding parent and included-subagent
+spend. Unknown prices and windows stay unknown. While a seat works, other nodes receive usage
+updates at most every five minutes; only clients on the seat's own node see them near-live.
+Nested subagent progress remains v1b: it requires a supported OMP registry snapshot and progress
+subscription hook. The extension identity/spawn hooks and internal collab bus are not that API.
+Asks, queue/input actions, jobs and new control scopes are not part of this read-only contract.
+
+
 ### Agent activity and human blocking
 
 An agent's `harness_state` describes activity independently of its optional `blocked_on`, `ask`,

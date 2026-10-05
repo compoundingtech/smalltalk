@@ -134,6 +134,13 @@ export type AgentMessageEstimate = {
   source: string;
 };
 
+export type AgentPlan = {
+  accepted_at: Timestamp;
+  claim_id: string;
+  snapshot: HarnessPlanSnapshot;
+  stale: boolean;
+};
+
 export type AgentQueue = {
   agent_id: Id;
   current_work_ids: Array<Id>;
@@ -385,6 +392,7 @@ export type ClientConnections = {
 
 export type CollectionCommand = ({
   actor?: string | null;
+  agent?: (AgentId | null);
   collection: CollectionName;
   id: string;
   kind: "subscribe";
@@ -455,7 +463,7 @@ export type CollectionFrame = ({
   retryable?: boolean;
 });
 
-export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses";
+export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses" | "harness";
 
 export type ConversationChanges = {
   items: Array<TimelineEntry>;
@@ -633,6 +641,32 @@ export type GoldenResourceSet = Array<Resource>;
 export type HarnessPhase = {
   name: string;
   tasks: Array<HarnessTask>;
+};
+
+export type HarnessPlanSnapshot = {
+  harness: string;
+  incarnation_id: string;
+  observed_at: Timestamp;
+  phases: Array<HarnessPhase>;
+  session_id: string;
+  source_op: string;
+  totals: HarnessTodoTotals;
+  truncated: boolean;
+  version: 1;
+};
+
+export type HarnessState = ResourceHeader & {
+  agent_id: AgentId;
+  driver: string | null;
+  incarnation_id: string | null;
+  kind: "harness-state";
+  plan: (AgentPlan | null);
+  schema: "harness-state.v1";
+  session_id: string | null;
+  state: string | null;
+  subagents: Array<AgentSubagent>;
+  todo: (AgentTodo | null);
+  usage: (UsageSummary | null);
 };
 
 export type HarnessTask = {
@@ -1147,7 +1181,7 @@ export type RequestSubject = {
   url?: string;
 };
 
-export type Resource = (Attention | Message | Launch | LaunchVariant | LaunchDecision | LaunchApproval | Mission | Work | Agent | Runtime | Observer | Subscription | Lane | Machine | Device | Operation | History | Session | Glass | OwnedSet);
+export type Resource = (Attention | Message | Launch | LaunchVariant | LaunchDecision | LaunchApproval | Mission | Work | Agent | HarnessState | Runtime | Observer | Subscription | Lane | Machine | Device | Operation | History | Session | Glass | OwnedSet);
 
 export type ResourceHeader = {
   id: Id;

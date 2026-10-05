@@ -4940,6 +4940,14 @@ fn pump_control(
                     _ => None,
                 };
                 delivery.observe_context(&message, state.thread_id(), active_turn);
+                if let Err(error) = crate::harness_tasks::observe_codex(
+                    &delivery.config.agent_dir,
+                    &message,
+                    state.thread_id(),
+                    runtime.incarnation(),
+                ) {
+                    tracing::warn!("st codex: harness-plan write failed: {error:#}");
+                }
                 // The subagent axis, for the same reason. Fail-open like the context record.
                 if let Err(error) = crate::subagents::observe_codex(
                     &delivery.config.agent_dir,

@@ -8932,7 +8932,7 @@ impl Store {
             || !matches!(
                 input.kind.as_str(),
                 "harness.observed" | "harness.usage" | "harness.limits" | "harness.timeline"
-                    | "harness.todo.observed"
+                    | "harness.todo.observed" | "harness.plan.observed"
             )
             || input.actor.as_deref() != Some(input.subject.as_str())
             || input.idempotency_key.is_none()
@@ -11406,6 +11406,34 @@ impl Store {
                 .insert(claim.kind.clone(), claim);
         }
         Ok(observations)
+    }
+
+    /// The accepted, canonical snapshot kinds for one focused harness read.
+    pub fn harness_snapshots_at(
+        &self,
+        subject: &str,
+        at_index: u64,
+    ) -> Result<BTreeMap<String, ClaimRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {CLAIM_COLUMNS} FROM (
+                 SELECT 'harness.todo.observed' AS kind
+                 UNION ALL SELECT 'harness.plan.observed'
+                 UNION ALL SELECT 'harness.session-file'
+             ) kinds
+             JOIN claims ON claims.id=(
+                 SELECT claims.id FROM claims INDEXED BY claims_subject_kind_accepted_index
+                 JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=?1 AND claims.kind=kinds.kind AND +claims.store_index<=?2
+                 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1
+             )
+             JOIN batches ON batches.id=claims.batch_id"
+        ))?;
+        let rows = statement.query_map(
+            params![subject, at_index.min(i64::MAX as u64)], claim_from_row,
+        )?;
+        rows.map(|row| row.map(|claim| (claim.kind.clone(), claim)))
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>().map_err(Into::into)
     }
 
     pub fn pending_observer_refresh_attempt(&self, observer: &str) -> Result<Option<String>> {
@@ -48049,6 +48077,14 @@ fn append_claim_with_fences(
     graph.connection
         .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
+            if input.kind == "harness.session-file" {
+                // A predecessor retry cannot replace a successor's binding, even if it
+                // was accepted before. Check authority under the same writer lock as dedup.
+                check_harness_event_runtime(
+                    transaction, &input.subject,
+                    input.fields.get("incarnation_id").and_then(Value::as_str),
+                )?;
+            }
             let settled_receipt = if let Some(fence) = fence {
                 check_mailbox_fence(transaction, fence)?;
                 let index = transaction.query_row(
@@ -48129,6 +48165,22 @@ fn append_claim_with_fences(
                     .with_detail("expected_head", json!(expected))
                     .with_detail("current_head", json!(actual)));
                 }
+            }
+            // A native session is a current binding, not an incarnation-wide operation ID:
+            // A -> B -> A must publish A again, while retries of the current A stay quiet.
+            if input.kind == "harness.session-file"
+                && input.idempotency_key.is_none()
+                && input.evidence.is_empty()
+                && let Some(existing) = latest_claim_of_kind_tx(
+                    transaction, &input.subject, "harness.session-file",
+                )?
+                && existing.actor == input.actor
+                && existing.body.get("fields").and_then(Value::as_object).is_some_and(|fields| {
+                    fields.len() == input.fields.len()
+                        && input.fields.iter().all(|(key, value)| fields.get(key) == Some(value))
+                })
+            {
+                return Ok((existing, false));
             }
             if input.kind == crate::placement::SOURCE_OFFLINE_KIND {
                 let current: Option<String> = transaction.query_row(
@@ -48356,6 +48408,22 @@ fn append_latest_observation_fenced(
                 }
                 "harness.usage" => {
                     publish_due_usage_tx(transaction, &graph.origin, input, &local, now)?
+                }
+                "harness.plan.observed" => {
+                    let previous = latest_claim_of_kind_tx(transaction, &input.subject, &input.kind)?;
+                    let unchanged = previous.as_ref().is_some_and(|claim| {
+                        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+                        ["version", "harness", "session_id", "incarnation_id", "phases", "totals", "truncated"]
+                            .iter().all(|key| fields.get(*key) == input.fields.get(*key))
+                    });
+                    if unchanged {
+                        None
+                    } else {
+                        Some(publish_latest_claim_tx(
+                            transaction, &graph.origin, &input.subject, &input.kind,
+                            input.actor.as_deref(), &json!(input.fields),
+                        )?)
+                    }
                 }
                 "harness.todo.observed" | "workspace.observed" => Some(publish_latest_claim_tx(
                     transaction,
@@ -48696,6 +48764,40 @@ mod harness_event_tests {
                 idempotency_key: Some("producer-event".into()),
             },
         }
+    }
+    #[test]
+    fn harness_plan_replicates_state_changes_not_source_clock_ticks() {
+        let store = Store::open_memory("amber").unwrap();
+        runtime(&store, "runtime-a", "running");
+        let mut input = event("harness.observed");
+        input.claim.kind = "harness.plan.observed".into();
+        input.claim.fields = serde_json::from_value(json!({
+            "version":1,"harness":"codex","session_id":"native-a","incarnation_id":"runtime-a",
+            "observed_at":"2026-10-04T20:00:00Z","source_op":"turn/plan/updated",
+            "phases":[],"totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0},
+            "truncated":false,
+        })).unwrap();
+        let first = store.append_harness_event(&input).unwrap().0;
+        let checkpoint = store.index().unwrap();
+        input.sequence = 2;
+        input.claim.fields.insert("observed_at".into(), json!("2026-10-04T20:01:00Z"));
+        input.claim.fields.insert("source_op".into(), json!("reconnect"));
+        let repeated = store.append_harness_event(&input).unwrap().0;
+        assert!(local_observation_position(&repeated).is_some());
+        assert_eq!(store.index().unwrap(), checkpoint);
+        assert_eq!(store.harness_snapshots_at(SEAT, checkpoint).unwrap()["harness.plan.observed"].id, first.id);
+        input.sequence = 3;
+        input.claim.fields.insert("phases".into(), json!([{"name":"","tasks":[{"content":"Verify","status":"pending"}]}]));
+        input.claim.fields.insert("totals".into(), json!({"pending":1,"in_progress":0,"completed":0,"blocked":0}));
+        let changed = store.append_harness_event(&input).unwrap().0;
+        assert!(local_observation_position(&changed).is_none());
+        assert_eq!(store.harness_snapshots_at(SEAT, changed.store_index).unwrap()["harness.plan.observed"].id, changed.id);
+        input.sequence = 4;
+        input.claim.fields.insert("version".into(), json!(2));
+        assert_eq!(store.append_harness_event(&input).unwrap_err().code, "invalid-harness-plan");
+        input.claim.fields.insert("version".into(), json!(1));
+        runtime(&store, "runtime-b", "running");
+        assert_eq!(store.append_harness_event(&input).unwrap_err().code, "stale-harness-event-session");
     }
     #[test]
     fn harness_todo_event_replay_and_runtime_fencing_preserve_latest_snapshot() {

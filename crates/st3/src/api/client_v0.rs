@@ -33,6 +33,7 @@ struct CollectionSubscribe {
     person: Option<String>,
     actor: Option<String>,
     status: Option<String>,
+    agent: Option<String>,
     /// A terminal subscription names the terminal, the incarnation `terminal.attach` fenced,
     /// and the single-use stream capability that attach returned.
     terminal: Option<String>,
@@ -64,7 +65,14 @@ const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 fn collection_ignores(collection: &str, kind: &str) -> bool {
     if collection == "glasses" { return !kind.starts_with("glass."); }
     matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
-        || (kind == "harness.usage" && collection != "agents")
+        || (kind == "harness.usage" && !matches!(collection, "agents" | "harness"))
+        || (kind == "harness.plan.observed" && collection != "harness")
+}
+
+fn collection_claim_relevant(request: &CollectionSubscribe, claim: &ClaimRecord) -> bool {
+    !collection_ignores(&request.collection, &claim.kind)
+        && (request.collection != "harness"
+            || request.agent.as_deref() == Some(claim.subject.as_str()))
 }
 
 pub(super) async fn collection_stream(
@@ -102,9 +110,18 @@ async fn collection_items(
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if !matches!(
         request.collection.as_str(),
-        "missions" | "attention" | "agents" | "work" | "glasses"
+        "missions" | "attention" | "agents" | "work" | "glasses" | "harness"
     ) {
         return Err(validation("unknown collection subscription"));
+    }
+    if request.collection == "harness" {
+        if request.agent.as_deref().is_none_or(|id| !id.starts_with("agent/") || id.len() <= 6)
+            || request.person.is_some() || request.actor.is_some() || request.status.is_some()
+        {
+            return Err(validation("harness requires one agent subject and no other filters"));
+        }
+    } else if request.agent.is_some() {
+        return Err(validation("agent filters are supported for harness only"));
     }
     if request.status.is_some() && request.collection != "agents" {
         return Err(validation("status filters are supported for agents only"));
@@ -128,6 +145,7 @@ async fn collection_items(
     let status = request.status.clone();
     let collection = request.collection.clone();
     let custom_forms = session.custom_forms;
+    let agent = request.agent.clone();
     let (snapshot, mut items, has_more) = super::blocking_store(move || {
         let store = state.store.clone();
         store.read_snapshot(|index| {
@@ -148,6 +166,8 @@ async fn collection_items(
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
                 "agents" => client_agent_resources(&store, false, &at, index)?,
+                "harness" => harness_value(&store, agent.as_deref().expect("validated agent"), index)?
+                    .into_iter().collect(),
                 "work" => client_work_resources(
                     &store,
                     actor.as_deref(),
@@ -228,7 +248,13 @@ async fn deliver_collection(
         .iter()
         .filter_map(|item| Some((item["id"].as_str()?.to_owned(), item.clone())))
         .collect();
-    let sent = if !subscription.delivered {
+    let reset = request.collection == "harness" && current.iter().any(|(id, value)| {
+        subscription.previous.get(id).is_some_and(|previous| {
+            ["schema", "incarnation_id", "session_id"].iter()
+                .any(|key| previous.get(*key) != value.get(*key))
+        })
+    });
+    let sent = if !subscription.delivered || reset {
         send_collection(socket, json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more})).await
     } else {
         let upserts = current
@@ -599,7 +625,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     let mut attention_clock = tokio::time::interval(ATTENTION_CLOCK_INTERVAL);
     attention_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut weighed = state.store.index().unwrap_or_default();
-    let mut reread_due = false;
+    let mut dirty = BTreeSet::<String>::new();
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
     loop {
         // The subscriptions to read after this wake-up.
@@ -628,6 +654,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         if request.kind == "unsubscribe" {
                             if let Some(presence) = &presence { presence.unfollow(&request.id); }
                             subscriptions.remove(&request.id);
+                            dirty.remove(&request.id);
                             terminals.remove(&request.id);
                             conversations.stop(&request.id);
                             break 'command;
@@ -691,20 +718,23 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 let index = state.store.index().unwrap_or(weighed);
                 if index > weighed {
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims).unwrap_or_default();
-                    let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
-                    reread_due |= glasses_changed || claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
-                        claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
-                    });
+                    let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses")
+                        && state.store.glasses_changed(weighed, index).unwrap_or(true);
+                    dirty.extend(subscriptions.iter().filter(|(_, subscription)| {
+                        (subscription.request.collection == "glasses" && glasses_changed)
+                            || claims.len() >= 10_000
+                            || claims.iter().any(|claim| collection_claim_relevant(&subscription.request, claim))
+                    }).map(|(id, _)| id.clone()));
                     weighed = index;
                 }
-                if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(subscriptions.keys().cloned());
+                if dirty.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                refresh.extend(dirty.iter().cloned());
             }
-            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
-                refresh.extend(subscriptions.keys().cloned());
+            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && !dirty.is_empty() => {
+                refresh.extend(dirty.iter().cloned());
             }
-            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "agents")) => {
-                refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "agents")).map(|(id, _)| id.clone()));
+            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "agents" | "harness")) => {
+                refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "agents" | "harness")).map(|(id, _)| id.clone()));
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
@@ -733,8 +763,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
         if refresh.is_empty() {
             continue;
         }
-        if refresh.len() >= subscriptions.len() && !subscriptions.is_empty() {
-            reread_due = false;
+        if !refresh.is_empty() {
+            for id in &refresh { dirty.remove(id); }
             last_reread = tokio::time::Instant::now();
         }
         // Read every due window at once, each in its own snapshot, then send them in order:
@@ -752,7 +782,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             match deliver_collection(&mut socket, subscription, read).await {
                 Refreshed::Current => {}
                 Refreshed::Retry => {
-                    reread_due = true;
+                    dirty.insert(id);
                 }
                 Refreshed::Dropped => {
                     subscriptions.remove(&id);
@@ -2916,6 +2946,79 @@ fn agent_todo(
         claims.and_then(|claims| claims.get("harness.session-file")),
         incarnation,
     ))
+}
+
+pub(super) async fn harness(
+    State(state): State<AppState>,
+    Extension(_snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    require_scope(&session, "read.projections")?;
+    let subject = client_detail_id("agent", &id);
+    let (snapshot, value) = super::blocking_store(move || {
+        state.store.read_snapshot(|index| {
+            Ok((client_snapshot_at(&state, index), harness_value(&state.store, &subject, index)?))
+        })
+    }).await?;
+    let value = value.ok_or_else(|| ApiError::not_found("agent not found"))?;
+    Ok((Extension(snapshot), Json(value)))
+}
+
+fn harness_value(store: &Store, subject: &str, index: u64) -> anyhow::Result<Option<Value>> {
+    let Some(status) = store.status_at(Some(subject), None, Some(index))?.subjects
+        .into_iter().find(|item| item.subject == subject)
+    else { return Ok(None); };
+    if status.desired.is_none() && status.actual.is_none() && status.claims.is_empty() {
+        return Ok(None);
+    }
+    let actual = status.actual.as_ref().map(|actual| actual.get("fields").unwrap_or(actual));
+    let moving = status.desired_token.as_deref()
+        .map(|token| crate::placement::handoff(store, subject, token, index))
+        .transpose()?.flatten().is_some_and(|handoff| handoff.phase != "running");
+    let incarnation = actual.filter(|_| !moving)
+        .and_then(|fields| fields["incarnation_id"].as_str());
+    let observations = store.harness_snapshots_at(subject, index)?;
+    let session = observations.get("harness.session-file").filter(|claim| {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        fields["incarnation_id"].as_str().is_none_or(|bound| Some(bound) == incarnation)
+    });
+    let native = session.and_then(|claim| claim.body.get("fields").unwrap_or(&claim.body)["session_id"].as_str());
+    let todo = agent_todo_value(observations.get("harness.todo.observed"), session, incarnation);
+    let plan = observations.get("harness.plan.observed").and_then(|claim| {
+        st3_schema::HarnessPlanSnapshot::deserialize(claim.body.get("fields").unwrap_or(&claim.body))
+            .ok().filter(|snapshot| snapshot.version == 1).map(|snapshot| {
+                let stale = incarnation != Some(snapshot.incarnation_id.as_str())
+                    || native != Some(snapshot.session_id.as_str());
+                json!({"snapshot": snapshot, "claim_id": claim.id,
+                    "accepted_at": client_timestamp(claim.accepted_at_unix_ms), "stale": stale})
+            })
+    });
+    let harness = store.observed_harness_at(subject, index)?;
+    let mut value = json!({
+        "id": subject, "kind": "harness-state", "schema": "harness-state.v1",
+        "agent_id": subject, "incarnation_id": incarnation, "session_id": native,
+        "state": harness.as_ref().map(|harness| harness.state.as_str()),
+        "driver": harness.as_ref().and_then(|harness| harness.driver.as_deref()),
+        "todo": todo, "plan": plan,
+        "usage": store.usage_summary_at(subject, None, Some(index))?,
+        "updated_at": observations.values().map(|claim| claim.accepted_at_unix_ms)
+            .chain(harness.as_ref().map(|harness| harness.observed_at_unix_ms))
+            .max().map(client_timestamp).unwrap_or_else(|| client_timestamp(0)),
+    });
+    overlay_subagents(store, std::slice::from_mut(&mut value))?;
+    struct DigestWriter(Sha256);
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut digest = DigestWriter(Sha256::new());
+    serde_json::to_writer(&mut digest, &value)?;
+    value["revision"] = hex::encode(digest.0.finalize()).into();
+    Ok(Some(value))
 }
 
 fn desired_child_arg(value: &Value, name: &str) -> Option<String> {
@@ -9253,6 +9356,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn focused_harness_collection_resets_bindings_and_isolates_plan_refreshes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/focused/read";
+        let append = |kind: &str, fields: Value| {
+            let claim = state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+                expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            signal_changed(&state);
+            claim
+        };
+        append("runtime.observed", json!({"status":"running","runtime_id":"focused-runtime","incarnation_id":"one"}));
+        append("harness.session-file", json!({"harness":"codex","agent":subject,"session_id":"native-one","incarnation_id":"one","path":"/tmp/focused"}));
+        state.store.append_claim(&ClaimInput {
+            subject: "step-run/focused/read".into(), kind: "work.claimed".into(),
+            actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"attempt":1,"status":"claimed","summary":"fixture",
+                "worker_reported":false,"claimant":subject,"claim_incarnation":"one",
+                "claim_expires_at_unix_ms":1,"readiness_epoch":1})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let unobserved = harness_value(&state.store, subject, state.store.index().unwrap()).unwrap().unwrap();
+        assert!(unobserved["todo"].is_null());
+        assert!(unobserved["plan"].is_null());
+        assert!(unobserved["state"].is_null());
+        assert!(unobserved["driver"].is_null());
+        let response = super::super::router(state.clone()).oneshot(
+            Request::builder().uri(format!("/v1/client/harness/{subject}"))
+                .body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap();
+        let read: st3_client::Envelope<st3_client::Resource> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(read.snapshot.store_index, state.store.index().unwrap());
+        let st3_client::Resource::HarnessState(typed) = read.value else {
+            panic!("focused read did not return a harness resource");
+        };
+        assert_eq!(typed.agent_id, subject);
+        assert_eq!(typed.incarnation_id.as_deref(), Some("one"));
+
+        let unrelated_reads = Arc::new(AtomicUsize::new(0));
+        let counted = unrelated_reads.clone();
+        let server_state = state.clone();
+        let app = axum::Router::new().route("/stream", axum::routing::get(move |upgrade: WebSocketUpgrade| {
+            let (state, reads) = (server_state.clone(), counted.clone());
+            async move {
+                upgrade.on_upgrade(move |socket| collection_stream_socket_with_reader(
+                    socket, state, ClientSession::local(None).unwrap(), None,
+                    move |state, session, request| {
+                        let reads = reads.clone();
+                        async move {
+                            if request.collection == "agents" { reads.fetch_add(1, Ordering::SeqCst); }
+                            collection_items(&state, &session, &request).await
+                        }
+                    },
+                ))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        for command in [
+            json!({"kind":"subscribe","id":"focus","collection":"harness","agent":subject}),
+            json!({"kind":"subscribe","id":"fleet","collection":"agents"}),
+        ] {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(command.to_string().into())).await.unwrap();
+        }
+        for _ in 0..2 {
+            let frame: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(frame["kind"], "snapshot");
+            assert_collection_frame_conforms(&frame);
+        }
+        let fleet_reads = unrelated_reads.load(Ordering::SeqCst);
+        let empty = json!({"version":1,"harness":"codex","session_id":"native-one","incarnation_id":"one",
+            "observed_at":"2026-10-04T20:00:00Z","source_op":"turn/plan/updated","phases":[],
+            "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0,"abandoned":0},"truncated":false});
+        append("harness.plan.observed", empty.clone());
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["kind"], "changes");
+        assert_eq!(frame["id"], "focus");
+        assert_eq!(frame["upserts"][0]["plan"]["snapshot"]["phases"], json!([]));
+        assert_eq!(frame["upserts"][0]["plan"]["stale"], false);
+        assert_collection_frame_conforms(&frame);
+        assert_eq!(unrelated_reads.load(Ordering::SeqCst), fleet_reads, "plan reread an unrelated window");
+        // A second change lands inside the refresh floor and exercises the delayed timer path.
+        let mut updated = empty;
+        updated["phases"] = json!([{"name":"","tasks":[{"content":"Verify","status":"in_progress"}]}]);
+        updated["totals"]["in_progress"] = json!(1);
+        append("harness.plan.observed", updated);
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "focus");
+        assert_eq!(frame["upserts"][0]["plan"]["snapshot"]["totals"]["in_progress"], 1);
+        assert_eq!(unrelated_reads.load(Ordering::SeqCst), fleet_reads);
+        append("runtime.observed", json!({"status":"running","runtime_id":"focused-runtime","incarnation_id":"two"}));
+        let mut reset = None;
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            if frame["id"] == "focus" { reset = Some(frame); }
+        }
+        let reset = reset.expect("focused subscription reset");
+        assert_eq!(reset["kind"], "snapshot");
+        assert_eq!(reset["items"][0]["incarnation_id"], "two");
+        assert!(reset["items"][0]["session_id"].is_null());
+        assert_eq!(reset["items"][0]["plan"]["stale"], true);
+        assert_collection_frame_conforms(&reset);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        append("subagent.appeared", json!({"subagent_id":"leased-child","driver":"claude",
+            "incarnation_id":"two","lease_expires_at_unix_ms":now + 5_000}));
+        let focused = async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if frame["id"] == "focus" { break frame; }
+            }
+        };
+        let appeared = tokio::time::timeout(Duration::from_secs(4), focused).await.unwrap();
+        assert_eq!(appeared["upserts"][0]["subagents"][0]["id"], "leased-child");
+        let expired = tokio::time::timeout(ATTENTION_CLOCK_INTERVAL + Duration::from_secs(8), async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if frame["id"] == "focus" && frame["upserts"][0]["subagents"] == json!([]) {
+                    break frame;
+                }
+            }
+        }).await.unwrap();
+        assert_collection_frame_conforms(&expired);
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn steady_collection_retries_a_failed_first_read_without_another_command_or_write() {
         use futures_util::{SinkExt as _, StreamExt as _};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13546,13 +13788,25 @@ mission "example/zero-run" state="ready" {
                     .transcript
                     .is_err()
             );
-            // Neither a stale binding nor no binding can justify guessing in a linked inventory.
+            // A previously accepted binding becomes stale when the successor starts;
+            // it cannot justify guessing another seat's transcript in the linked inventory.
+            write_session(
+                &authored,
+                id,
+                "2026-09-25T14:00:00Z",
+                "Seat A's bound conversation",
+            );
+            let successor = "successor-incarnation";
             append(
-                "harness.session-file",
-                json!({"harness":driver,"agent":owner,"incarnation_id":"old-incarnation","session_id":sibling_id,"path":legacy.join(format!("2026-09-25T16-00-00-000Z_{sibling_id}.jsonl"))}),
+                "runtime.observed",
+                json!({"status":"running","runtime_id":"example.resumed","incarnation_id":successor}),
+            );
+            append(
+                "harness.observed",
+                json!({"state":"idle","driver":driver,"incarnation_id":successor}),
             );
             assert!(
-                managed_transcript(&state, owner, incarnation)
+                managed_transcript(&state, owner, successor)
                     .unwrap()
                     .unwrap()
                     .transcript

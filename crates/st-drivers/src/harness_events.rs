@@ -254,9 +254,41 @@ fn current_token(connection: &Connection) -> Result<Option<String>> {
         .and_then(|state| state["incarnation"].as_str().map(str::to_owned)))
 }
 
+/// SessionStart and TodoWrite admission share the immediate outbox transaction. A `/clear`
+/// advances the native session without necessarily changing the wrapper's runtime token.
+/// Keep the existing file mirror under this transaction too, so concurrent SessionStart
+/// writers cannot leave it older than the committed session binding.
+pub fn bind_claude_session(agent_dir: &Path, runtime: &str, session: &str) -> Result<()> {
+    anyhow::ensure!(!runtime.is_empty() && !session.is_empty(), "Claude binding is incomplete");
+    let mut connection = enabled(agent_dir).then(|| open(agent_dir)).transpose()?;
+    let tx = connection.as_mut().map(|connection| {
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+    }).transpose()?;
+    if let Some(tx) = &tx {
+        anyhow::ensure!(
+            current_token(tx)?.as_deref() == Some(runtime),
+            "Claude session binding owner was superseded"
+        );
+        tx.execute(
+            "INSERT INTO metadata VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![format!("claude-session:{runtime}"), session],
+        )?;
+    }
+    crate::harness_state::write_json_atomic(
+        &agent_dir.join("claude-native-session"),
+        &serde_json::json!({"incarnation": runtime, "native_session_id": session}),
+        agent_dir,
+        ".claude-native-session",
+    )?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
     anyhow::ensure!(
-        matches!(kind, "harness-state" | "harness-context" | "harness-todo"),
+        matches!(kind, "harness-state" | "harness-context" | "harness-todo" | "harness-plan"),
         "unsupported observation kind"
     );
     let value: Value = serde_json::from_slice(body)?;
@@ -271,7 +303,7 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
     if kind == "harness-state" {
         let token = value["incarnation"].as_str().unwrap();
         if current_token(&tx)?.as_deref() != Some(token) {
-            tx.execute("DELETE FROM metadata WHERE key LIKE 'provider-runtime:%' OR key LIKE 'timeline-next:%'", [])?;
+            tx.execute("DELETE FROM metadata WHERE key LIKE 'provider-runtime:%' OR key LIKE 'timeline-next:%' OR key LIKE 'claude-session:%'", [])?;
             tx.execute(
                 "INSERT INTO metadata(key,value) SELECT ?1,value FROM metadata WHERE key='runtime'",
                 [format!("provider-runtime:{token}")],
@@ -280,10 +312,24 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
     }
     // Context writers used to have no ownership fence. Refuse a delayed predecessor now that
     // its snapshot and event are admitted in the same transaction as the ownership check.
-    if matches!(kind, "harness-context" | "harness-todo") {
+    if matches!(kind, "harness-context" | "harness-todo" | "harness-plan") {
         anyhow::ensure!(
             current_token(&tx)?.as_deref() == value["incarnation"].as_str(),
             "harness observation owner was superseded"
+        );
+    }
+    if kind == "harness-todo" && value["harness"].as_str() == Some("claude") {
+        let token = value["incarnation"].as_str().unwrap();
+        let session: Option<String> = tx.query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [format!("claude-session:{token}")],
+            |row| row.get(0),
+        ).optional()?;
+        anyhow::ensure!(
+            session.as_deref().is_some_and(|session| {
+                !session.is_empty() && value["session_id"].as_str() == Some(session)
+            }),
+            "Claude task snapshot native session is unbound or superseded"
         );
     }
     tx.execute(

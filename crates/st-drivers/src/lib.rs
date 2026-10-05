@@ -44,6 +44,7 @@ pub mod harness_context;
 pub mod harness_events;
 pub mod blocking_screen;
 pub mod harness_state;
+pub mod harness_tasks;
 pub mod harness_timeline;
 pub mod harness_version;
 pub mod hooks;

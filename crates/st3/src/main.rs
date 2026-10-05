@@ -17348,7 +17348,7 @@ impl NativeObservations {
                     )
                     .await?;
                 }
-                "harness-todo" => {
+                "harness-todo" | "harness-plan" => {
                     let mut fields: BTreeMap<String, Value> =
                         serde_json::from_value(event.payload.clone())?;
                     fields.remove("incarnation");
@@ -17357,13 +17357,13 @@ impl NativeObservations {
                         "/v1/claims",
                         &ClaimInput {
                             subject: subject.into(),
-                            kind: "harness.todo.observed".into(),
+                            kind: if event.kind == "harness-plan" { "harness.plan.observed" } else { "harness.todo.observed" }.into(),
                             actor: Some(subject.into()),
                             fields,
                             evidence: Vec::new(),
                             expected_subject: None,
                             idempotency_key: Some(format!(
-                                "harness-todo:{subject}:{}:{}", event.runtime_incarnation, event.sequence,
+                                "{}:{subject}:{}:{}", event.kind, event.runtime_incarnation, event.sequence,
                             )),
                         },
                     ).await?;

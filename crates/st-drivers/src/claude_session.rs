@@ -1314,7 +1314,9 @@ fn observe_payload(
                 .context("Claude hook resume generation is invalid")
         })
         .transpose()?;
-    if event == "SessionStart" {
+    if event == "SessionStart"
+        && payload["agent_id"].as_str().is_none_or(str::is_empty)
+    {
         let binding = match (runtime_id, exported_session.as_deref()) {
             (Some(runtime_id), Some(runtime_incarnation)) => Some(record_session_start_binding(
                 session_dir,
@@ -1359,11 +1361,16 @@ fn observe_payload(
         .or_else(|| wrapperless_token(&payload))
         .unwrap_or_else(|| format!("unattributed:{}", runtime_id.unwrap_or(identity)));
     let mut timeline =
-        crate::harness_timeline::Writer::new(agent_dir, "claude", timeline_incarnation);
+        crate::harness_timeline::Writer::new(agent_dir, "claude", timeline_incarnation.clone());
     if let Err(error) = crate::harness_timeline::observe_claude(&mut timeline, event, &payload) {
         // Timeline observability is fail-open just like state/context publication: a record fault
         // must not hold up the hook process Claude is waiting on.
         tracing::warn!("st claude-observe: harness-timeline write failed: {error:#}");
+    }
+    if let Err(error) =
+        crate::harness_tasks::observe_claude(agent_dir, event, &payload, &timeline_incarnation)
+    {
+        tracing::warn!("st claude-observe: harness-todo write failed: {error:#}");
     }
     // The seat's driver records each subagent from this ledger. Fail-open like the timeline.
     if let Err(error) = crate::subagents::observe_claude(agent_dir, event, &payload) {
@@ -1440,15 +1447,7 @@ fn write_native_session_binding(
     incarnation: &str,
     native_id: &str,
 ) -> Result<()> {
-    harness_state::write_json_atomic(
-        &agent_dir.join("claude-native-session"),
-        &serde_json::json!({
-            "incarnation": incarnation,
-            "native_session_id": native_id,
-        }),
-        agent_dir,
-        ".claude-native-session",
-    )
+    crate::harness_events::bind_claude_session(agent_dir, incarnation, native_id)
 }
 
 /// Select the ownership a hook write acts under. The wrapper's exported token makes hook writes
