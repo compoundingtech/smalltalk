@@ -3768,7 +3768,7 @@ fn managed_transcript(
     };
     let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
     let driver = fields["driver"].as_str().unwrap_or_default().to_owned();
-    if !matches!(driver.as_str(), "codex" | "claude" | "omp") {
+    if !matches!(driver.as_str(), "codex" | "claude" | "omp" | "pi") {
         return Ok(None);
     }
     let transcript = if fields["incarnation_id"] != incarnation {
@@ -3780,7 +3780,16 @@ fn managed_transcript(
         match driver.as_str() {
             "codex" => managed_codex_transcript(state, owner, evidence),
             "claude" => managed_claude_transcript(state, owner, evidence),
-            _ => managed_omp_transcript(state, owner, incarnation),
+            _ => managed_pi_family_transcript(
+                state,
+                owner,
+                incarnation,
+                if driver == "pi" {
+                    crate::external_sessions::ExternalDriver::Pi
+                } else {
+                    crate::external_sessions::ExternalDriver::Omp
+                },
+            ),
         }
     };
     Ok(Some(ManagedTranscript {
@@ -3951,39 +3960,45 @@ fn managed_claude_transcript(
     }
 }
 
-fn managed_omp_transcript(
+fn managed_pi_family_transcript(
     state: &AppState,
     owner: &str,
     incarnation: &str,
+    driver: crate::external_sessions::ExternalDriver,
 ) -> Result<crate::external_sessions::ExternalSession, Missing> {
-    let started_at = incarnation
-        .split_once(':')
-        .and_then(|(_, started_at)| chrono::DateTime::parse_from_rfc3339(started_at).ok())
-        .ok_or_else(|| {
-            format!("the OMP incarnation `{incarnation}` does not carry its start time")
-        })?;
     if let Some(claim) = state
         .store
         .latest_claim(owner, Some("harness.session-file"))
-        .map_err(|error| format!("reading the OMP session record failed: {error:#}"))?
+        .map_err(|error| format!("reading the pi-family session record failed: {error:#}"))?
     {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
-        if fields["harness"] == "omp"
+        if fields["harness"] == driver.as_str()
             && fields["agent"] == owner
-            && fields["source_session"].as_str().is_some()
-            && let (Some(path), Some(native_id)) =
-                (fields["path"].as_str(), fields["session_id"].as_str())
+            && (fields["incarnation_id"] == incarnation
+                || (fields["incarnation_id"].is_null()
+                    && fields["source_session"].as_str().is_some()))
         {
-            return match crate::external_sessions::find_imported_omp_transcript(
+            let (Some(path), Some(native_id)) =
+                (fields["path"].as_str(), fields["session_id"].as_str())
+            else {
+                return Err(Missing::not_yet(
+                    "the bound pi-family session has no transcript path",
+                ));
+            };
+            return match crate::external_sessions::find_bound_pi_family_transcript(
+                driver,
                 Path::new(path),
                 native_id,
             ) {
                 Ok(Some(session)) => Ok(session),
-                Ok(None) => {
-                    Err(format!("the imported OMP session {native_id} is not readable").into())
-                }
+                Ok(None) => Err(format!(
+                    "the bound {} session {native_id} is not readable",
+                    driver.as_str()
+                )
+                .into()),
                 Err(error) => Err(format!(
-                    "reading the imported OMP session {native_id} failed: {error:#}"
+                    "reading the bound {} session {native_id} failed: {error:#}",
+                    driver.as_str()
                 )
                 .into()),
             };
@@ -3993,8 +4008,11 @@ fn managed_omp_transcript(
         .state_dir
         .join("drivers")
         .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24]);
-    let native = root.join("sessions/omp/provider-sessions");
-    let directory = if root.join("sessions/omp").exists() {
+    let native = root
+        .join("sessions")
+        .join(driver.as_str())
+        .join("provider-sessions");
+    let directory = if root.join("sessions").join(driver.as_str()).exists() {
         native
     } else {
         crate::hooks::legacy_claude_agent_dir(
@@ -4004,6 +4022,20 @@ fn managed_omp_transcript(
         )
         .join("provider-sessions")
     };
+    if driver == crate::external_sessions::ExternalDriver::Pi
+        || std::fs::symlink_metadata(&directory)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(Missing::not_yet(
+            "the pi-family channel has not bound this incarnation's transcript",
+        ));
+    }
+    let started_at = incarnation
+        .split_once(':')
+        .and_then(|(_, started_at)| chrono::DateTime::parse_from_rfc3339(started_at).ok())
+        .ok_or_else(|| {
+            format!("the OMP incarnation `{incarnation}` does not carry its start time")
+        })?;
     match crate::external_sessions::find_managed_omp_transcript(
         &directory,
         (started_at.timestamp_millis().max(0) as u128).saturating_sub(2_000),
@@ -13255,6 +13287,146 @@ mission "example/zero-run" state="ready" {
                 .transcript
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_pi_family_conversation_ignores_newer_siblings_in_a_linked_inventory() {
+        for driver in ["omp", "pi"] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state_named(root.path(), "bound-pi-family-test");
+            let owner = "agent/example/resumed";
+            let incarnation = "123:2026-09-25T15:11:54.870Z";
+            let id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
+            let sibling_id = "9927ab58-9d80-4c97-b92d-0c17f688b331";
+            let legacy = root.path().join("legacy");
+            std::fs::create_dir(&legacy).unwrap();
+            let authored = legacy.join(format!("2026-09-25T14-00-00-000Z_{id}.jsonl"));
+            let write_session = |path: &Path, native: &str, timestamp: &str, text: &str| {
+                std::fs::write(path, format!("{}\n{}\n",
+                    json!({"type":"session","id":native,"timestamp":timestamp,"cwd":root.path()}),
+                    json!({"type":"message","id":"answer","timestamp":timestamp,"message":{"role":"assistant","content":[{"type":"text","text":text}]}})
+                )).unwrap();
+            };
+            write_session(
+                &authored,
+                id,
+                "2026-09-25T14:00:00Z",
+                "Seat A's bound conversation",
+            );
+            let managed = state
+                .state_dir
+                .join("drivers")
+                .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
+                .join("sessions")
+                .join(driver)
+                .join("provider-sessions");
+            std::fs::create_dir_all(&managed).unwrap();
+            assert!(
+                crate::native_resume::pi_family_link_transcript(
+                    &[
+                        driver.into(),
+                        "--resume".into(),
+                        authored.to_str().unwrap().into()
+                    ],
+                    &managed
+                )
+                .unwrap()
+            );
+            let append = |kind: &str, fields: Value| {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: owner.into(),
+                        kind: kind.into(),
+                        actor: Some(owner.into()),
+                        fields: serde_json::from_value(fields).unwrap(),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            };
+            append(
+                "runtime.observed",
+                json!({"status":"running","runtime_id":"example.resumed","incarnation_id":incarnation}),
+            );
+            append(
+                "harness.observed",
+                json!({"state":"idle","driver":driver,"incarnation_id":incarnation}),
+            );
+            // Ordinary native binding: intentionally no source_session import marker.
+            append(
+                "harness.session-file",
+                json!({"harness":driver,"agent":owner,"incarnation_id":incarnation,"session_id":id,"path":authored}),
+            );
+            let session = ClientSession::local(Some("person/alex")).unwrap();
+            let session_id = super::managed_session_id(owner, incarnation);
+            let timeline = || {
+                timeline_value(
+                    &state,
+                    &new_client_snapshot(&state),
+                    &session,
+                    &session_id,
+                    &ClientListQuery::default(),
+                )
+                .unwrap()
+                .0
+            };
+            let before = timeline();
+            assert!(
+                before["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["body"]["text"] == "Seat A's bound conversation")
+            );
+            // Another seat writes a newer session into the same linked directory.
+            write_session(
+                &legacy.join(format!("2026-09-25T16-00-00-000Z_{sibling_id}.jsonl")),
+                sibling_id,
+                "2026-09-25T16:00:00Z",
+                "Seat B's unrelated conversation",
+            );
+            assert_eq!(timeline()["items"], before["items"]);
+            // An unreadable/mismatched bound file must not fall back to B.
+            write_session(
+                &authored,
+                sibling_id,
+                "2026-09-25T14:00:00Z",
+                "Replaced transcript",
+            );
+            let missing = timeline();
+            assert!(
+                missing["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(
+                        |entry| entry["body"]["text"] != "Seat B's unrelated conversation"
+                            && entry["body"]["text"] != "Replaced transcript"
+                    )
+            );
+            assert!(
+                managed_transcript(&state, owner, incarnation)
+                    .unwrap()
+                    .unwrap()
+                    .transcript
+                    .is_err()
+            );
+            // Neither a stale binding nor no binding can justify guessing in a linked inventory.
+            append(
+                "harness.session-file",
+                json!({"harness":driver,"agent":owner,"incarnation_id":"old-incarnation","session_id":sibling_id,"path":legacy.join(format!("2026-09-25T16-00-00-000Z_{sibling_id}.jsonl"))}),
+            );
+            assert!(
+                managed_transcript(&state, owner, incarnation)
+                    .unwrap()
+                    .unwrap()
+                    .transcript
+                    .is_err()
+            );
+        }
     }
 
     #[test]
