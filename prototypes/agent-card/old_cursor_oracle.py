@@ -25,8 +25,9 @@ for agent, name in [(anchor, "Anchor"), (target, "Target")]:
 
 def fact(agent: str, version: int, observation: str) -> None:
     database.execute(
-        "INSERT INTO agent_card_local_fact_versions(agent,version,facts_json) VALUES(?,?,?)",
-        (agent, version, json.dumps({"observation": observation})),
+        "INSERT INTO agent_card_local_fact_versions"
+        "(agent,version,generation,facts_json) VALUES(?,?,?,?)",
+        (agent, version, version, json.dumps({"observation": observation})),
     )
     database.execute(
         "INSERT OR REPLACE INTO agent_card_local_current(agent,version) VALUES(?,?)",

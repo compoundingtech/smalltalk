@@ -13,14 +13,16 @@ guarantee height below `1.45 log2(fleet+2)`. The root table identifies a
 A page seeks after `(name, id)` and emits `limit+1`; a detail read follows a
 second persistent AVL tree keyed by agent subject from the same cut root.
 Card `version` is an opaque immutable row ID, not a store index. An epoch fork
-can reuse the old point root for unchanged agents; it does not copy their
-version intervals. A predecessor query on `version<=cut` would be incorrect.
+can reuse the old point root for unchanged agents without copying their
+versions. A predecessor query on `version<=cut` would be incorrect.
 
 Local facts use immutable `(agent, version) -> facts` rows. A separate current
 pointer stores the newest version and next deadline as 16-byte big-endian
-u128, so its index preserves time order. A retained presentation
-node names both its card and local-fact versions, so a cursor pinned before a
-local update still reads the exact prior fields. Facts for observation,
+u128, so its index preserves time order. A cursor freezes the local generation;
+an indexed predecessor lookup `(agent, generation DESC)` resolves its exact
+fact version. Presentation nodes retain the fact version that selected their
+status interval, while field-only changes append a local version without
+copying an ordered tree. Facts for observation,
 transport, subagents and step leases define disjoint per-agent intervals of
 final rendered status and fields over the full u128 millisecond domain. Each
 interval is inserted into at most 256 canonical nodes of a fixed-depth
@@ -31,6 +33,11 @@ path, seeks after the last key in each ordered root and merges them to produce
 same-agent duplicate. A mass expiry changes only which immutable roots are
 chosen; it cannot trigger synchronous catch-up or return stale status. The
 fixed time-depth factor and interval fanout still need measured work bounds.
+The executable invented fixture finds that after a deadline-shape change, a
+field-only update uses two SQL statements and zero new tree nodes. The
+deadline-shape change itself used about 2,451 statements and 1,018 copied
+nodes in the eight-agent fixture. That large writer constant is a design
+cost gap, not acceptance evidence.
 
 A cursor binds its exact time-root ID, projection epoch, canonical store cut,
 local generation, frozen u128 read time, history/status filters, page size and

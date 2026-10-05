@@ -6,7 +6,7 @@
 //! `Store::agent_working_since` without folding the incarnation each read.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WorkingRun {
+pub struct WorkingRun {
     empty: bool,
     all_working: bool,
     first_working_ms: Option<u128>,
@@ -14,7 +14,7 @@ struct WorkingRun {
 }
 
 impl WorkingRun {
-    const fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             empty: true,
             all_working: true,
@@ -23,7 +23,7 @@ impl WorkingRun {
         }
     }
 
-    fn event(state: &str, accepted_at_ms: u128) -> Self {
+    pub fn event(state: &str, accepted_at_ms: u128) -> Self {
         let working = state == "working";
         Self {
             empty: false,
@@ -33,7 +33,7 @@ impl WorkingRun {
         }
     }
 
-    fn then(self, next: Self) -> Self {
+    pub fn then(self, next: Self) -> Self {
         if self.empty {
             return next;
         }
@@ -50,6 +50,10 @@ impl WorkingRun {
                 next.suffix_working_start_ms
             },
         }
+    }
+
+    pub fn start(self) -> Option<u128> {
+        self.suffix_working_start_ms
     }
 }
 

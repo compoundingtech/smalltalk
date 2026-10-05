@@ -51,9 +51,12 @@ CREATE INDEX agent_card_root_cut_index
 CREATE TABLE agent_card_local_fact_versions (
     agent TEXT NOT NULL,
     version INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
     facts_json TEXT NOT NULL CHECK (json_valid(facts_json)),
     PRIMARY KEY(agent, version)
 );
+CREATE INDEX agent_card_fact_at_generation
+    ON agent_card_local_fact_versions(agent, generation DESC);
 CREATE TABLE agent_card_local_current (
     agent TEXT PRIMARY KEY,
     version INTEGER NOT NULL,
