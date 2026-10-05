@@ -5498,12 +5498,31 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .filter(|text| !text.trim().is_empty())
                 .map(|text| text.chars().take(2048).collect::<String>())
                 .unwrap_or_else(|| {
-                    let exit = observation.exit_code
+                    let exit = observation
+                        .exit_code
                         .map(|code| format!(" (exit code {code})"))
                         .unwrap_or_default();
-                    format!("the replacement {} before restart completed{exit}", observation.status)
+                    format!(
+                        "the replacement {} before restart completed{exit}",
+                        observation.status
+                    )
                 });
                 return self.fail_requested_restart(subject, member, &request, &detail);
+            }
+            if attempted.is_some()
+                && member.driver.is_some()
+                && !self
+                    .store
+                    .current_harness(&subject.subject)?
+                    .is_some_and(|harness| {
+                        Some(harness.incarnation_id.as_str())
+                            == observation.incarnation_id.as_deref()
+                            && harness.is_ready()
+                    })
+            {
+                // Continue ordinary observation and prompt handling while the new wrapper boots.
+                // Launch acceptance alone cannot prove the native provider passed its gate.
+                return Ok(false);
             }
             self.store.append_claim(&ClaimInput {
                 subject: subject.subject.clone(),

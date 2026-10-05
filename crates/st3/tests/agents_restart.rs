@@ -1621,6 +1621,51 @@ fn restart_result(fixture: &Fixture, request: &ClaimRecord) -> ClaimRecord {
         .expect("restart must have a durable result")
 }
 
+/// The stand-in reports native readiness just as a working provider would. Failed starts
+/// and exited wrappers report nothing, so they cannot turn a launcher receipt into success.
+fn reconcile_ready(fixture: &Fixture, daemon: &Reconciler<Runtime>, subject: &str) {
+    for _ in 0..4 {
+        daemon.reconcile_once().unwrap();
+        let member = fixture
+            .runtime
+            .starts
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        if let Some(driver) = member.driver.as_deref()
+            && let Some(observation) = fixture
+                .runtime
+                .observations
+                .lock()
+                .unwrap()
+                .get(&member.runtime_id)
+            && observation.status == "running"
+        {
+            fixture
+                .store
+                .append_claim(&st3::model::ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(subject.into()),
+                    fields: std::collections::BTreeMap::from([
+                        ("state".into(), json!("ready")),
+                        ("driver".into(), json!(driver)),
+                        ("incarnation_id".into(), json!(observation.incarnation_id)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(format!(
+                        "fixture-ready:{}",
+                        observation.incarnation_id.as_deref().unwrap()
+                    )),
+                })
+                .unwrap();
+        }
+    }
+}
+
 async fn parked_retry_succeeds(driver: &str) {
     let (fixture, subject) = Fixture::launching(
         Shape::TopLevel,
@@ -1636,14 +1681,10 @@ async fn parked_retry_succeeds(driver: &str) {
     park(&fixture, &subject, driver);
     // Ordinary reconciliation, including a new daemon, cannot break the automatic hold.
     let daemon = restarted_daemon(&fixture);
-    for _ in 0..4 {
-        daemon.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &daemon, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 1);
     let first = fixture.request(&subject, "parked-first").await;
-    for _ in 0..4 {
-        daemon.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &daemon, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 2);
     let result = restart_result(&fixture, &first);
     assert_eq!(result.kind, "runtime.action.succeeded");
@@ -1665,14 +1706,10 @@ async fn parked_retry_succeeds(driver: &str) {
     assert_eq!(fixture.request(&subject, "parked-first").await.id, first.id);
     hang_up(&fixture);
     let daemon = restarted_daemon(&fixture);
-    for _ in 0..4 {
-        daemon.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &daemon, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 2);
     let second = fixture.request(&subject, "parked-second").await;
-    for _ in 0..4 {
-        daemon.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &daemon, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 3);
     assert_eq!(
         restart_result(&fixture, &second).kind,
@@ -1747,14 +1784,10 @@ async fn a_failed_explicit_retry_is_completed_parked_and_visible_until_a_new_req
     // Restoring the launcher alone cannot reattempt a completed failure.
     *fixture.runtime.refuse_start.lock().unwrap() = false;
     let daemon = restarted_daemon(&fixture);
-    for _ in 0..4 {
-        daemon.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &daemon, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 3);
     let recovery = fixture.request(&subject, "recovered").await;
-    for _ in 0..4 {
-        daemon.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &daemon, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 4);
     assert_eq!(
         restart_result(&fixture, &recovery).kind,
@@ -1782,14 +1815,10 @@ async fn an_agent_restart_request_cannot_bypass_an_automatic_park() {
     let _: ClaimRecord = fixture.client().post("/v1/agents/restart", &json!({
         "subject": subject, "actor": "agent/example/operator", "idempotency_key": "agent-retry",
     })).await.unwrap();
-    for _ in 0..4 {
-        fixture.reconciler.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &fixture.reconciler, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 1);
     let person = fixture.request(&subject, "person-retry").await;
-    for _ in 0..4 {
-        fixture.reconciler.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &fixture.reconciler, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 2);
     assert_eq!(
         restart_result(&fixture, &person).kind,
@@ -1815,9 +1844,7 @@ async fn an_interrupted_explicit_attempt_is_not_launched_again_after_daemon_rest
         })
         .unwrap();
     let daemon = restarted_daemon(&fixture);
-    for _ in 0..4 {
-        daemon.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &daemon, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 1);
     let result = restart_result(&fixture, &request);
     assert_eq!(result.kind, "runtime.action.failed");
@@ -1829,9 +1856,7 @@ async fn an_interrupted_explicit_attempt_is_not_launched_again_after_daemon_rest
         "{result:?}"
     );
     let next = fixture.request(&subject, "after-interruption").await;
-    for _ in 0..4 {
-        daemon.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &daemon, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 2);
     assert_eq!(
         restart_result(&fixture, &next).kind,
@@ -1852,9 +1877,7 @@ async fn a_replacement_that_exits_during_startup_completes_as_failed_and_stays_p
     *fixture.runtime.exit_on_start.lock().unwrap() = true;
     let request = fixture.request(&subject, "exited-at-startup").await;
     let daemon = restarted_daemon(&fixture);
-    for _ in 0..4 {
-        daemon.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &daemon, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 2);
     let result = restart_result(&fixture, &request);
     assert_eq!(result.kind, "runtime.action.failed");
@@ -1866,12 +1889,44 @@ async fn a_replacement_that_exits_during_startup_completes_as_failed_and_stays_p
     );
     *fixture.runtime.exit_on_start.lock().unwrap() = false;
     let next = fixture.request(&subject, "working-replacement").await;
-    for _ in 0..4 {
-        daemon.reconcile_once().unwrap();
-    }
+    reconcile_ready(&fixture, &daemon, &subject);
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 3);
     assert_eq!(
         restart_result(&fixture, &next).kind,
         "runtime.action.succeeded"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_native_retry_that_exits_before_readiness_is_failed_even_after_observing_its_wrapper() {
+    let (fixture, subject) = Fixture::launching(
+        Shape::TopLevel,
+        r#"harness "omp" { model "example-model"; }"#,
+        "always",
+    )
+    .await;
+    hang_up(&fixture);
+    park(&fixture, &subject, "omp");
+    let request = fixture.request(&subject, "refused-after-spawn").await;
+    fixture.reconciler.reconcile_once().unwrap();
+    fixture.reconciler.reconcile_once().unwrap();
+    assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 2);
+    assert!(
+        fixture
+            .store
+            .operation_claim(&format!("agent-restart-completed:{}", request.id))
+            .unwrap()
+            .is_none(),
+        "a live wrapper has not yet proved native readiness"
+    );
+    hang_up(&fixture);
+    let daemon = restarted_daemon(&fixture);
+    for _ in 0..4 {
+        daemon.reconcile_once().unwrap();
+    }
+    assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 2);
+    assert_eq!(
+        restart_result(&fixture, &request).kind,
+        "runtime.action.failed"
     );
 }
