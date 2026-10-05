@@ -258,3 +258,32 @@ fn blob_bytes_and_first_forensic_representation_survive_readmission() {
         Some(forensic)
     );
 }
+
+#[test]
+fn healing_a_corrupt_or_malformed_envelope_keeps_its_original_forensic_bytes() {
+    let source = Store::open_memory("alder", Arc::new(Plain)).unwrap();
+    note(&source, 0);
+    let good = source
+        .export_replication_exchange("sample-fleet", &ReplicationInventory::default())
+        .unwrap();
+    for payload in [
+        vec![0xde, 0xad, 0xbe, 0xef].into(),
+        "%%% invalid base64".into(),
+    ] {
+        let target = Store::open_memory("birch", Arc::new(Plain)).unwrap();
+        let mut corrupt = good.clone();
+        corrupt.envelopes[0].payload = payload;
+        target
+            .receive_replication_exchange("alder", "sample-fleet", &corrupt)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        let original = make_legacy(&target);
+        while !target.convert_record_offsets().unwrap().done {}
+        target.readmit_envelopes("alder", &good.envelopes).unwrap();
+        assert_eq!(
+            raw(&target),
+            original,
+            "healing changed the first forensic representation"
+        );
+    }
+}

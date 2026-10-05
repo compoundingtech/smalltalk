@@ -69,11 +69,6 @@ impl Pointer {
         }
     }
     fn decode(&self, payload: &EnvelopePayload) -> Result<Value> {
-        if self.mode == "text" {
-            let text = payload.base64();
-            ensure!(self.offset == 0 && self.length == text.len(), "invalid whole-text record range");
-            return Ok(Value::Text(text));
-        }
         let bytes = payload.bytes()?;
         let end = self
             .offset
@@ -297,31 +292,55 @@ impl RecordRaw {
         Self::inline(Value::Blob(bytes.to_vec()))
     }
     pub(super) fn invalid(connection: &Connection, envelope: &ReplicaEnvelope) -> Result<Self> {
-        if matches_payload(
-            connection,
-            &envelope.writer,
-            envelope.sequence,
-            &envelope.hash,
-            &envelope.payload,
-        )? {
-            return Ok(Self::pointer(whole(&envelope.payload)));
+        let verified = envelope.payload.bytes().is_ok_and(|bytes| {
+            replica_envelope_hash(
+                &envelope.writer,
+                envelope.sequence,
+                envelope.previous_hash.as_deref(),
+                envelope.accepted_at_unix_ms,
+                bytes,
+            ) == envelope.hash
+        });
+        if verified
+            && matches_payload(
+                connection,
+                &envelope.writer,
+                envelope.sequence,
+                &envelope.hash,
+                &envelope.payload,
+            )?
+        {
+            return Ok(Self::pointer(
+                whole(&envelope.payload).expect("verified payload has bytes"),
+            ));
         }
         Ok(Self::inline(Value::Text(envelope.payload.base64())))
     }
 }
 
-fn whole(payload: &EnvelopePayload) -> Pointer {
-    match payload.bytes() {
-        Ok(bytes) => Pointer {
-            offset: 0,
-            length: bytes.len(),
-            mode: "base64",
-        },
-        Err(_) => Pointer {
-            offset: 0,
-            length: payload.base64().len(),
-            mode: "text",
-        },
+fn whole(payload: &EnvelopePayload) -> Option<Pointer> {
+    payload.bytes().ok().map(|bytes| Pointer {
+        offset: 0,
+        length: bytes.len(),
+        mode: "base64",
+    })
+}
+
+// Healing may replace an unverified stored payload with the bytes its identity commits to.
+// Such forensic values remain inline; only hash-verified bytes can back an immutable pointer.
+struct StoredPayload {
+    payload: EnvelopePayload,
+    previous_hash: Option<String>,
+    accepted_at: Option<u128>,
+}
+impl StoredPayload {
+    fn verified(&self, key: &(String, u64, String)) -> bool {
+        self.accepted_at
+            .zip(self.payload.bytes().ok())
+            .is_some_and(|(at, bytes)| {
+                replica_envelope_hash(&key.0, key.1, self.previous_hash.as_deref(), at, bytes)
+                    == key.2
+            })
     }
 }
 
@@ -362,7 +381,7 @@ impl Store {
     /// Read and validate representations away from the writer queue. Only the bounded
     /// pointer updates and their resumable cursor share the daemon's normal write queue.
     pub fn convert_record_offsets(&self) -> Result<RecordOffsetConversion> {
-        let (cursor, rows, payloads) = self.read_snapshot(|_| {
+        let (cursor, rows, mut payloads) = self.read_snapshot(|_| {
             let connection = self.readers.get();
             let cursor: Option<String> = connection.query_row(
                 "SELECT value FROM meta WHERE key=?1", [CURSOR], |r| r.get(0)
@@ -384,10 +403,12 @@ impl Store {
                 total_bytes += match &raw { Value::Blob(bytes) => bytes.len(), Value::Text(text) => text.len(), _ => 0 };
                 let pointed: bool = row.get(6)?;
                 if !pointed && let std::collections::btree_map::Entry::Vacant(entry) = payloads.entry(envelope.clone()) {
-                    let payload: Option<EnvelopePayload> = connection.prepare_cached(
-                        "SELECT payload FROM replica_envelopes WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3"
-                    )?.query_row(params![envelope.0,envelope.1,envelope.2], |r| r.get(0)).optional()?;
-                    total_bytes += payload.as_ref().map(|p| p.bytes().map(|b| b.len()).unwrap_or(0)).unwrap_or(0);
+                    let payload: Option<StoredPayload> = connection.prepare_cached(
+                        "SELECT payload,previous_hash,accepted_at_unix_ms FROM replica_envelopes WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3"
+                    )?.query_row(params![envelope.0,envelope.1,envelope.2], |r| Ok(StoredPayload {
+                        payload:r.get(0)?, previous_hash:r.get(1)?, accepted_at:r.get::<_,String>(2)?.parse().ok(),
+                    })).optional()?;
+                    total_bytes += payload.as_ref().map(|p| p.payload.bytes().map(|b| b.len()).unwrap_or(0)).unwrap_or(0);
                     entry.insert(payload);
                 }
                 rows.push(LegacyRecord { rowid: row.get(0)?, position: row.get(4)?, raw, pointed, envelope });
@@ -401,11 +422,16 @@ impl Store {
                 ..Default::default()
             });
         }
+        for (key, payload) in &mut payloads {
+            if payload.as_ref().is_some_and(|p| !p.verified(key)) {
+                *payload = None;
+            }
+        }
         let mut spans = BTreeMap::new();
         for (key, payload) in &payloads {
             let parsed = payload
                 .as_ref()
-                .and_then(|p| p.bytes().ok())
+                .and_then(|p| p.payload.bytes().ok())
                 .and_then(|bytes| Spans::parse(bytes).ok());
             spans.insert(key.clone(), parsed);
         }
@@ -417,14 +443,16 @@ impl Store {
                     .and_then(Option::as_ref)
                     .and_then(|payload| {
                         let candidate = match &record.raw {
-                            Value::Text(_) => Some(whole(payload)),
+                            Value::Text(_) => whole(&payload.payload),
                             Value::Blob(_) => spans
                                 .get(&record.envelope)
                                 .and_then(Option::as_ref)
                                 .and_then(|s| s.at(record.position)),
                             _ => None,
                         };
-                        candidate.filter(|p| p.decode(payload).ok().as_ref() == Some(&record.raw))
+                        candidate.filter(|p| {
+                            p.decode(&payload.payload).ok().as_ref() == Some(&record.raw)
+                        })
                     });
                 let retained = !record.pointed && pointer.is_none();
                 PlannedRecord {
@@ -495,7 +523,6 @@ impl Store {
             "claim-v0" => "claim-v0",
             "blob" => "blob",
             "base64" => "base64",
-            "text" => "text",
             _ => bail!("unknown record raw mode"),
         };
         let pointer = Pointer {
