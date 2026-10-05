@@ -1793,7 +1793,10 @@ async fn fixture(person: &Client, client: &Client, subjects: Subjects) -> Fixtur
         .get::<Value>("/v1/replication/records")
         .await
         .ok()
-        .and_then(|page| first_string(&page, "record").or_else(|| first_string(&page, "id")))
+        .and_then(|page| {
+            page.get("records")?.as_array()?.first()?
+                .get("record_ref")?.as_str().map(str::to_owned)
+        })
         .unwrap_or_else(|| "bench-missing-record".into());
     items.insert("record", urlencoding::encode(&record).into_owned());
 

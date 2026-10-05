@@ -28,7 +28,7 @@ use st3::model::{
     MissionRunView, MissionSpec, MissionState, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PersonAskRequest, PersonStepResponse,
     PlannerSpec, PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
-    PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest,
+    PlanningSessionView, ReplicaRecordView, ReplicaRecordsPage, ReplicationPeerStatus, ReplicationRepairRequest,
     ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
     RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
     SessionInputMode, SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse,
@@ -2549,6 +2549,12 @@ enum ReplicationCommand {
     Invalid {
         #[arg(long)]
         all: bool,
+        /// Maximum records to print in this invocation (1-512).
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Opaque cursor returned by a previous page.
+        #[arg(long)]
+        after: Option<String>,
     },
     /// Show one replicated record diagnostic.
     Inspect { record: String },
@@ -10422,24 +10428,29 @@ async fn run_replication(
             );
             Ok(())
         }
-        ReplicationCommand::Invalid { all } => {
-            let records: Vec<ReplicaRecordView> = client
+        ReplicationCommand::Invalid { all, limit, after } => {
+            anyhow::ensure!((1..=512).contains(&limit), "--limit must be between 1 and 512");
+            let after = after
+                .as_deref()
+                .map(|cursor| format!("&after={}", urlencoding::encode(cursor)))
+                .unwrap_or_default();
+            let page: ReplicaRecordsPage = client
                 .get(&format!(
-                    "/v1/replication/records?unresolved={}",
+                    "/v1/replication/records?unresolved={}&limit={limit}{after}",
                     if all { "false" } else { "true" }
                 ))
                 .await?;
             if json_output {
-                return print_value(&records, true);
+                return print_value(&page, true);
             }
-            if records.is_empty() {
+            if page.records.is_empty() {
                 println!(
                     "No {} replication records.",
                     if all { "stored" } else { "unresolved" }
                 );
                 return Ok(());
             }
-            for record in records {
+            for record in page.records {
                 println!(
                     "{}\t{}\t{}:{}\t{}\t{}",
                     record.state,
@@ -10448,6 +10459,12 @@ async fn run_replication(
                     record.sequence,
                     record.subject.as_deref().unwrap_or("unknown-subject"),
                     record.error_message.as_deref().unwrap_or("")
+                );
+            }
+            if let Some(next) = page.next {
+                println!(
+                    "Next page: st replication invalid{} --limit {limit} --after {next}",
+                    if all { " --all" } else { "" }
                 );
             }
             Ok(())
