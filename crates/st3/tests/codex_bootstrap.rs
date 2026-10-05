@@ -50,6 +50,294 @@ impl Drop for Cleanup {
     }
 }
 
+/// Delay only graph control reads; the mailbox and all other daemon routes stay responsive.
+/// The provider speaks the real app-server protocol, but never calls a model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    use std::sync::atomic::AtomicBool;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let on_path = |name: &str| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|p| p.is_file())
+    };
+    let (Some(pty), Some(python)) = (on_path("pty"), on_path("python3")) else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must provide pty and python3"
+        );
+        eprintln!("skipped: the delayed delivery proof needs pty and python3");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("api.sock");
+    let state_socket = root.path().join("state.sock");
+    let pty_root = root.path().join("pty");
+    let runtime = PtyRuntime::new(pty_root.clone()).with_binary(pty.to_string_lossy());
+    let _cleanup = Cleanup(runtime.clone());
+    let store = Arc::new(Store::open_memory("bootstrap").unwrap());
+    let source = format!(
+        "version 2\nagent \"eval.codex-bootstrap\" {{ host \"bootstrap\"; workspace {:?}; harness \"codex\" {{}} }}",
+        root.path(),
+    );
+    store
+        .apply_internal(
+            &st3::graph::parse_intent(&source, "bootstrap").unwrap(),
+            "delayed-control",
+        )
+        .unwrap();
+    runtime_claim(&store, "starting", None);
+    let delayed = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let state = AppState {
+        store: store.clone(),
+        notify: Arc::new(Notify::new()),
+        event_notify: watch::channel(0).0,
+        node: "bootstrap".into(),
+        state_dir: root.path().into(),
+        pty_root: pty_root.clone(),
+        pty_binary: pty.clone(),
+        fleet_id: None,
+        configured_peers: vec![],
+        client_relay: None,
+        native_session_home: None,
+        planner_default: Default::default(),
+    };
+    let delay = delayed.clone();
+    let read_count = reads.clone();
+    let app = st3::api::router(state).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let delay = delay.clone();
+            let read_count = read_count.clone();
+            async move {
+                if request.uri().path() == "/v1/delivery/hold" && request.method() == "GET" {
+                    read_count.fetch_add(1, Ordering::SeqCst);
+                    if delay.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(350)).await;
+                    }
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix_bound(&server_socket, &state_socket, app)
+            .await
+            .unwrap();
+    });
+    until(|| socket.exists(), "the isolated API did not start").await;
+    let provider = root.path().join("provider");
+    let stub = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/st3-boot-canaries/stub-codex.py");
+    std::fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nexec env PYTHONDONTWRITEBYTECODE=1 '{}' '{}' \"$@\"\n",
+            python.display(),
+            stub.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_st3-fixture"));
+    let environment = BTreeMap::from([
+        ("HOME", root.path().to_string_lossy().into_owned()),
+        ("PATH", path.to_string_lossy().into_owned()),
+        ("ST_AGENT", SUBJECT.to_owned()),
+        ("ST3_SUBJECT", SUBJECT.to_owned()),
+        ("ST3_BIN", binary.to_string_lossy().into_owned()),
+        ("ST3_ENDPOINT", socket.to_string_lossy().into_owned()),
+        (
+            "ST3_DRIVER_STATE_DIR",
+            root.path().join("drivers").to_string_lossy().into_owned(),
+        ),
+        ("ST3_MAILBOX_TRANSPORT", "push".to_owned()),
+    ]);
+    let launch_root = root.path().to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut command = std::process::Command::new(pty);
+        command
+            .env_clear()
+            .env("PTY_ROOT", pty_root)
+            .args(["run", "-d", "--force", "--id", RUNTIME, "--cwd"])
+            .arg(launch_root)
+            .args([
+                "--tag",
+                "keep=true",
+                "--tag",
+                &format!("st3.subject={SUBJECT}"),
+            ]);
+        for (key, value) in environment {
+            command.arg("--env").arg(format!("{key}={value}"));
+        }
+        command
+            .arg("--")
+            .arg(binary)
+            .args(["driver", "codex", "--subject", SUBJECT, "--"])
+            .arg(provider)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    until(
+        || {
+            store
+                .latest_claim(SUBJECT, Some("harness.observed"))
+                .unwrap()
+                .is_some()
+        },
+        "the driver did not publish startup",
+    )
+    .await;
+    let observation = runtime
+        .snapshot()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == RUNTIME)
+        .unwrap();
+    let incarnation = format!(
+        "{}:{}",
+        observation.pid.unwrap(),
+        observation.created_at.unwrap()
+    );
+    runtime_claim(&store, "running", Some(&incarnation));
+    let client = st3::client::Client::unix(&socket);
+    // The in-process API and fixture driver have different executable inodes. Establish
+    // the healthy assessment first, so recovery must restore it exactly, including that
+    // independent binary-version assessment.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let healthy: Value = loop {
+        let agent: Value = client
+            .get(&format!("/v1/client/agents/{SUBJECT}"))
+            .await
+            .unwrap();
+        if agent["delivery"]["state"] == "outdated" {
+            break agent;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "native control did not become ready: {agent}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    delayed.store(true, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let agent: Value = client
+            .get(&format!("/v1/client/agents/{SUBJECT}"))
+            .await
+            .unwrap();
+        if agent["delivery"]["state"] == "stale"
+            && agent["delivery"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("delivery-control-unavailable:"))
+        {
+            assert_eq!(agent["state"], "waiting");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held seat lost its visible reason: {agent}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let receipt: st3::model::MessageSendReceipt = client
+        .post(
+            "/v1/messages",
+            &st3::model::MessageSendRequest {
+                idempotency_key: "delayed-handoff".into(),
+                from: "person/eval".into(),
+                to: SUBJECT.into(),
+                content: "An invented delayed-control signal.".into(),
+                title: None,
+                in_reply_to: None,
+                tags: vec![],
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let reference = receipt.message.subject;
+    let receipts = root
+        .path()
+        .join("receipts-agent-eval-codex-bootstrap.jsonl");
+    let offers = || -> usize {
+        std::fs::read_to_string(&receipts)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|row| {
+                row["event"] == "turn"
+                    && row["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(&reference))
+            })
+            .count()
+    };
+    // Observe several further reads: healthy mailbox traffic cannot clear the block.
+    let before = reads.load(Ordering::SeqCst);
+    until(
+        || reads.load(Ordering::SeqCst) >= before + 4,
+        "control reads stopped retrying",
+    )
+    .await;
+    assert_eq!(offers(), 0, "a delayed response authorized native input");
+    let delivery: Value = client
+        .get(&format!("/v1/messages/delivery/{reference}"))
+        .await
+        .unwrap();
+    assert_eq!(delivery["delivery"]["state"], "waiting");
+    assert!(
+        delivery["delivery"]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("delivery-control-unavailable:")
+    );
+    delayed.store(false, Ordering::SeqCst);
+    until(
+        || store.message(&reference).unwrap().unwrap().status == "read",
+        "the recovered control never delivered input",
+    )
+    .await;
+    until(
+        || offers() == 1,
+        "the provider did not record the recovered offer",
+    )
+    .await;
+    let agent: Value = client
+        .get(&format!("/v1/client/agents/{SUBJECT}"))
+        .await
+        .unwrap();
+    assert_eq!(agent["delivery"]["state"], healthy["delivery"]["state"]);
+    assert_eq!(agent["delivery"]["reason"], healthy["delivery"]["reason"]);
+    // More control and mailbox cycles must neither replay the input nor duplicate its receipts.
+    let before = reads.load(Ordering::SeqCst);
+    until(
+        || reads.load(Ordering::SeqCst) >= before + 4,
+        "recovered control stopped refreshing",
+    )
+    .await;
+    assert_eq!(offers(), 1);
+    for kind in ["message.staged", "message.delivered", "message.read"] {
+        assert_eq!(
+            store.claims_for(&reference, Some(kind)).unwrap().len(),
+            1,
+            "duplicate {kind}"
+        );
+    }
+    server.abort();
+}
+
 async fn until(mut predicate: impl FnMut() -> bool, description: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !predicate() {
