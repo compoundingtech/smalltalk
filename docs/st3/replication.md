@@ -184,7 +184,7 @@ This changes no claim or resource vocabulary and requires no new replication pay
 ## Add any machine
 
 Install st on the new machine and configure the person who operates it, as described in the
-[README](../../README.md#run-the-daemon). On an existing listening member, invite the new name:
+[README](../getting-started.md#3-start-the-daemon). On an existing listening member, invite the new name:
 
 ```sh
 st fleet invite beacon

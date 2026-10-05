@@ -5,14 +5,14 @@
 Workspace CI runs on pull requests, merge groups and manual dispatch. The merge queue tests the
 exact commit that lands on `main`; its successful checks stay attached to that SHA, so a main push
 does not repeat the workspace gate. `Main upkeep` verifies those five checks, runs `perf-cost`
-(which the queue skips), and fills missing main-scope caches on Namespace. `macOS CI` still runs
-on main pushes. Each non-PR run uses its own `github.run_id` in the concurrency group, so
-successive pushes do not cancel checks or cache saves. PR updates still cancel stale checks;
-macOS checks on PRs require the `macos-ci` label.
+(which the queue skips), and fills missing main-scope caches on Namespace. macOS CI is currently
+disabled. Each non-PR run uses its own `github.run_id` in the concurrency group, so
+successive pushes do not cancel checks or cache saves. PR updates still cancel stale checks.
 
-The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
-(`.github/workflows/macos.yml`) replace the fleet's former Linux `st/ci` and optional `st/ci-macos`
-execution. The required checks on `main` are `linux-gate`, `isolation-vm`, `genie-freshness`,
+The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) replaces the fleet's
+former Linux `st/ci` execution. The retained macOS workflow (`.github/workflows/macos.yml`) is
+disabled in GitHub Actions; it does not currently run on PRs or main pushes. The required checks
+on `main` are `linux-gate`, `isolation-vm`, `genie-freshness`,
 `typescript-client` and `mail-redelivery-canaries`,
 and `main` lands through GitHub's merge queue (see [Merge queue](#merge-queue)).
 
@@ -20,12 +20,12 @@ Every pull request, including a fork and a draft, gets the Linux gate, the isola
 freshness check, the TypeScript client check and the mail redelivery canaries. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
 the required checks for each queued entry.
 Checkout uses GitHub's default `pull_request` merge ref, not the contributor's unmerged
-head: it tests that head merged with the current base. Strict branch protection also requires
-that the head itself contain the latest `main`. No `pull_request_target` job runs PR code,
+head: it tests that head merged with the current base. The merge queue combines the head with
+the current `main`; the head does not need to be rebased first. No `pull_request_target` job runs PR code,
 and the gate has only `contents: read` permission. Forks do not receive publishing secrets.
 
 The Linux gate runs two test partitions plus Clippy and fleet compatibility on separate runners.
-`linux-gate` is the single required check: it needs the three stage jobs and the named mail redelivery
+`linux-gate` is the aggregate Linux check: it needs the four stage jobs and the named mail redelivery
 check, and passes only when every one succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
 `nscloud-ubuntu-24.04-amd64-8x16-with-features`; `genie-freshness`, `isolation-vm` and `typescript-client`
 use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggregate uses GitHub-hosted
@@ -301,6 +301,9 @@ The main ruleset requires `typescript-client`. It was enabled after the new job 
 in [#1256](https://github.com/compoundingtech/smalltalk/pull/1256).
 
 ### macOS
+
+The macOS workflow is currently disabled in GitHub Actions. Its retained definition is described
+below for reference; adding a label does not enable it.
 
 The non-required `macos-ci` job uses `namespace-profile-macos-arm64` and runs on PR events while
 the PR bears the `macos-ci` label. It is a separate workflow so adding a
@@ -584,7 +587,8 @@ gh pr merge NUMBER --auto
 ```
 
 The queue tests the pull request on top of the current `main` and the entries ahead of it with
-`linux-gate`, `isolation-vm`, `genie-freshness` and `typescript-client` (these run on the `merge_group` event; see the
+`linux-gate`, `isolation-vm`, `genie-freshness`, `typescript-client`, and
+`mail-redelivery-canaries` (these run on the `merge_group` event; see the
 trigger in `fleet.yml.genie.ts`) and merges it with a merge commit when they pass. The pull
 request does not need to be rebased onto the latest `main` first. A draft cannot be queued. If a
 queued check fails, the entry leaves the queue and the pull request page says why: fix it and
@@ -595,7 +599,7 @@ by an administrator and never by CI) requires the five checks from GitHub Action
 bypass list, keeps the pull-request, deletion and force-push protections, and configures the queue:
 merge method MERGE, up to five entries build at once (see [Measured concurrency](#measured-concurrency)),
 up to five merge together, and a check that
-never reports fails its entry after 30 minutes. Repository settings enable native auto-merge and
+never reports fails its entry after 60 minutes. Repository settings enable native auto-merge and
 branch deletion after merge. Check the live settings against the file with `gh-check-settings`:
 
 ```sh
@@ -620,15 +624,15 @@ on 2026-10-01 recorded the workspace limits with `nsc workspace concurrency --ou
 | macOS arm64 | 96 | 224 GiB |
 
 Namespace limits CPU and memory per platform; a workflow run is not a fixed unit of capacity.
-With the current 8x16 stage runners, a merge-queue Workspace CI group initially starts three
-8-vCPU/16-GiB stage jobs and two 8-vCPU/16-GiB profile jobs: 40 vCPUs and 80 GiB at peak.
+With the current 8x16 stage runners, a merge-queue Workspace CI group initially starts four
+8-vCPU/16-GiB stage jobs and two 8-vCPU/16-GiB profile jobs: 48 vCPUs and 96 GiB at peak.
 The TypeScript client job follows generator freshness and reuses its runner slot.
-PR runs also start `perf-cost`, taking their initial peak to 48 vCPUs and 96 GiB. Main upkeep
-runs that check separately; its three cache-fill jobs normally finish after their lookup-only probes.
-Five complete merge-queue groups need 200 vCPUs and 400 GiB, within the Linux pool limit;
+PR runs also start `perf-cost`, taking their initial peak to 56 vCPUs and 112 GiB. Main upkeep
+runs that check separately; its cache-fill jobs normally finish after their lookup-only probes.
+Five complete merge-queue groups need 240 vCPUs and 480 GiB, within the Linux pool limit;
 `max_entries_to_build` remains 5 in both the generated and live main rulesets.
 PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
-are available. The `linux-gate` aggregate starts after the three stage jobs finish, so it does
+are available. The `linux-gate` aggregate starts after the four stage jobs finish, so it does
 not add to the initial peak. macOS uses its own pool.
 
 At 21:51:47 UTC, GitHub's job step timestamps showed seven PR, merge-group and main workflow
@@ -665,7 +669,7 @@ The `namespace-capacity` job also watches `merge_group` events on a GitHub-hoste
 independent of ci1 and Namespace availability. It polls the group's ref and required check statuses
 every 15 seconds. A missing ref or a changed SHA on two consecutive successful lookups force-cancels
 its own workflow, including queued Linux jobs and always-run summaries. Lookup failures retain work.
-Once all four required checks finish, the watcher exits normally; a ref removed by a successful
+Once all five required checks finish, the watcher exits normally; a ref removed by a successful
 merge therefore retains the completed workflow result used by main upkeep. It executes embedded
 workflow code without checking out queued PR code. Manual capacity reports still use Namespace.
 
