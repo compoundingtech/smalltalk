@@ -141,10 +141,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{offered}");
         let pairing_id = offered["value"]["pairing_id"].as_str().unwrap().strip_prefix("pairing/").unwrap();
         let complete_path = format!("/v1/client/pairings/{pairing_id}/complete");
-        let (status, completed) = request(app.clone(), "POST", &complete_path, json!({
+        let completion = json!({
             "api_version":"st3.client.v0", "code":offered["value"]["code"],
             "device_public_key":"legacy-notes-device-public-key-fixture",
-        })).await;
+        });
+        let (status, denied) = request(native_issuer, "POST", &complete_path, completion.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, completed) = request(app.clone(), "POST", &complete_path, completion).await;
         assert_eq!(status, StatusCode::OK, "{completed}");
         let credential = completed["value"]["credential"].as_str().unwrap();
         let (status, notes) = bearer(app.clone(), "GET", path, Value::Null, credential).await;
