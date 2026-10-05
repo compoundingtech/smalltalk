@@ -8,6 +8,9 @@ await mkdir(process.env.SMOKE_BULK_DIR, { recursive: true });
 const root = await mkdtemp(resolve(process.env.SMOKE_BULK_DIR, 'ask-owner-'));
 const sessions = root + '/.omp/agent/sessions/ask-project';
 await mkdir(root + '/agent'); await mkdir(sessions, { recursive: true });
+// This isolated provider fixture needs no interactive account onboarding.
+await mkdir(root + '/profile');
+await Bun.write(root + '/profile/config.yml', 'startup:\n  setupWizard: false\n  showSplash: false\n');
 const socket = root + '/daemon.sock', subject = 'agent/control-smoke';
 const clean = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('ST_') && !key.startsWith('ST3_') && !key.startsWith('AGENT_') && !key.startsWith('PTY_')));
 const providerRequests = [];
