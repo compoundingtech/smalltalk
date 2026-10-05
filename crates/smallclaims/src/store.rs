@@ -2745,6 +2745,7 @@ fn seed_replica_envelopes_signed_tx(
     through_rowid: Option<i64>,
     sign: Option<&dyn Fn(&principals::Unsealed<'_>) -> Option<crate::principal::ClaimSignature>>,
 ) -> Result<()> {
+    let _seal = crate::profile::span("replication/seal-envelopes");
     let order = if after_rowid.is_some() {
         "batches.rowid"
     } else {
@@ -2853,6 +2854,7 @@ fn seed_replica_envelopes_signed_tx(
                 relay
             ],
         )?;
+        let _records = crate::profile::span("replication/seal-records");
         let spans = if inserted != 0 || record_offsets::matches_payload(
             transaction,
             &writer,
@@ -3952,6 +3954,7 @@ fn validate_envelope_tx(
     verify_replica_batch_header(batch)?;
     let spans = std::cell::OnceCell::new();
     outcome.verify += started.elapsed();
+    let _records = crate::profile::span("replication/admit-records");
     let now = now_ms().to_string();
     let mut degraded = false;
     for (offset, (hash, bytes)) in payload.blobs.iter().enumerate() {
