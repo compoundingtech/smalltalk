@@ -61,6 +61,8 @@ use crate::store::Store;
 mod client_blobs;
 mod client_presence;
 mod client_v0;
+#[cfg(feature = "ivm-bakeoff")]
+pub use client_v0::ivm_bakeoff;
 mod custom;
 mod delivery_presence;
 mod delivery_probes;
@@ -1032,6 +1034,10 @@ fn new_request_id() -> String {
 }
 
 fn client_now_ms() -> u128 {
+    #[cfg(feature = "ivm-bakeoff")]
+    if let Some(now) = ivm_bakeoff::captured_now_ms() {
+        return now;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

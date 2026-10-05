@@ -12,6 +12,8 @@ autotests = false
 test-support = []
 # Opt in only in Performance; ordinary workspace checks need not build a second test binary.
 perf-load = []
+# Offline research driver; not enabled in daemon builds.
+ivm-bakeoff = []
 
 [dependencies]
 anyhow = "1"
@@ -78,6 +80,10 @@ proptest = "1"
 [[example]]
 name = "reader_cache"
 required-features = ["test-support"]
+
+[[example]]
+name = "ivm_bakeoff"
+required-features = ["ivm-bakeoff"]
 
 [[bin]]
 name = "st3"

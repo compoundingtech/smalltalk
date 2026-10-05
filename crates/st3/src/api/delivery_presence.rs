@@ -205,8 +205,12 @@ pub(crate) fn assess(recipient: &str, driver: &str) -> Assessment {
     {
         beat = Some((monitor.at, monitor.report.clone()));
     }
+    #[cfg(feature = "ivm-bakeoff")]
+    let elapsed = super::ivm_bakeoff::captured_elapsed;
+    #[cfg(not(feature = "ivm-bakeoff"))]
+    let elapsed = |at: Instant| at.elapsed();
     assess_beat(
-        presence.started.elapsed(),
+        elapsed(presence.started),
         presence.image.as_deref(),
         beat.map(|(at, mut report)| {
             report.follows_image = report.follows.as_deref().and_then(|path| {
@@ -214,7 +218,7 @@ pub(crate) fn assess(recipient: &str, driver: &str) -> Assessment {
                     .ok()
                     .map(|identity| identity.token())
             });
-            (at.elapsed(), report)
+            (elapsed(at), report)
         }),
         driver,
     )
