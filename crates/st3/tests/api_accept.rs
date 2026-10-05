@@ -34,6 +34,9 @@ fn set_descriptor_limit(soft: u64) -> u64 {
 
 #[test]
 fn the_api_keeps_serving_after_an_accept_runs_out_of_descriptors() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "descriptor_exhaustion_child", "--nocapture"])
         .env("ST_TEST_DESCRIPTOR_EXHAUSTION_CHILD", "1")

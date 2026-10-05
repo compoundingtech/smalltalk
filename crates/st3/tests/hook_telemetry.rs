@@ -89,6 +89,9 @@ fn hook(root: &Path, event: &str, collector: &str) -> tokio::process::Command {
 
 #[tokio::test]
 async fn an_event_hook_hands_count_and_warnings_to_the_daemon_without_contacting_the_collector() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let agent = seat(root.path());
     // A failed timeline write is fail-open and must still be observable with RUST_LOG=off.
@@ -133,6 +136,9 @@ async fn an_event_hook_hands_count_and_warnings_to_the_daemon_without_contacting
 
 #[tokio::test]
 async fn an_undeclared_application_and_the_status_line_create_no_hook_count_or_exporter() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     seat(root.path());
     let (daemon, server) = start_daemon(&root.path().join("daemon.sock"), Duration::ZERO).await;
@@ -172,6 +178,9 @@ async fn an_undeclared_application_and_the_status_line_create_no_hook_count_or_e
 
 #[tokio::test]
 async fn a_daemon_that_delays_telemetry_acknowledgement_cannot_fail_or_hold_up_the_hook() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     seat(root.path());
     let (daemon, server) =

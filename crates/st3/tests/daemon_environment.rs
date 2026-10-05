@@ -68,6 +68,9 @@ fn doctor_report(home: &Path, socket: &Path) -> serde_json::Value {
 
 #[test]
 fn a_fixture_listener_ignores_the_callers_host_seat_ancestry() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     std::fs::create_dir(&home).unwrap();
@@ -102,6 +105,9 @@ mission "hermetic" state="ready" {
 
 #[test]
 fn client_without_runtime_dir_reaches_daemon_with_different_socket() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -135,6 +141,9 @@ fn client_without_runtime_dir_reaches_daemon_with_different_socket() {
 
 #[test]
 fn bare_service_environment_loads_shell_path_and_rechecks_credentials() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let bin = home.join("orchid-bin");
@@ -195,6 +204,9 @@ fn bare_service_environment_loads_shell_path_and_rechecks_credentials() {
 
 #[test]
 fn doctor_reports_missing_build_tools_and_whether_a_small_crate_links() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let bin = home.join("orchid-bin");
@@ -261,6 +273,9 @@ fn doctor_reports_missing_build_tools_and_whether_a_small_crate_links() {
 /// daemon must retry with more patience and start, not exit.
 #[test]
 fn a_login_shell_too_slow_for_the_first_capture_still_lets_the_daemon_start() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let bin = home.join("orchid-bin");

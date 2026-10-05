@@ -356,10 +356,16 @@ mission "orchid/cancellation" state="ready" {
 
 #[test]
 fn cancellation_stops_execs_and_waiting_gates_before_finally_finishes() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     cancellation_stops_owned_work(false);
 }
 
 #[test]
 fn cancellation_adopts_and_stops_gate_processes_after_daemon_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     cancellation_stops_owned_work(true);
 }

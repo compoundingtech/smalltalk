@@ -95,6 +95,26 @@ Boot, delivery-probe and messaging-fault fixtures put large executable copies in
 directory, keeping their Unix sockets in short temporary paths. This avoids exhausting a
 host's temporary-filesystem quota when debug binaries are copied by parallel cases.
 
+On Linux, tests that launch isolated daemons, drivers, PTYs or long-lived CLI children call
+`st3::test_support::supervise_test()` before creating their fixtures. It runs that exact test
+under `scripts/st3_test_process.py`, a detached subreaper watching pidfds for the Rust runner
+and its launcher. Success, failure, panic, timeout, SIGTERM and SIGKILL of the runner all
+end the owned process tree. Each test has its own process group; detached children are
+adopted and killed and reaped before the supervisor returns the test's status. Exited adopted
+PTYs are also reaped while the test runs, so stop/suspend checks see their PIDs disappear. Cleanup
+uses only the supervisor's descendants, including when evidence collection fails or a
+temporary binary directory has already been removed. The Python boot, no-st2, subagent,
+messaging-fault and delivery-probe entrypoints use the same supervisor when run directly.
+
+The isolated-process audit covers `boot_canaries`, `broken_gates`, `daemon_environment`,
+`first_sync`, `fleet`, `getting_started`, `mission_cancellation`, `daemon_restart`,
+`idle_budget`, `driver_incarnation`, `codex_bootstrap`, `no_st2_seat`, `subagents_seat`,
+`delivery_probe`, and `messaging_faults`. The process-spawning tests in `action_coverage`,
+`agents_restart`, `hook_telemetry`, `terminal_attach` and `command_recorder` use it too.
+The separate `api_accept` target also supervises its descriptor-exhaustion subprocess.
+The remaining daemon fixtures serve their APIs in process or use fake runtime observations;
+their tasks end with their test runtime. New process-spawning fixtures should use this helper.
+
 The workspace suite still covers the token-free two-node messaging fault matrix. Its historical
 channel build remains independently pinned in `.github/messaging-compat-baseline.json`. Its
 provider stand-in runs the omp channel hook's TypeScript with Node 24's built-in type stripping;
@@ -113,6 +133,13 @@ seconds, so a race between a provider and the daemon fails here every time inste
 launch loses it. These cases never retry: a pass on the second attempt is the race the canary
 exists to catch (`.config/nextest.toml`). A failed case keeps its daemon log, the seat's terminal,
 its claim trace and the stand-in's receipts under `target/boot-canaries/`, which the stage uploads.
+
+`boot_canaries::every_exit_reaps_the_daemon_even_when_the_rust_test_is_killed` starts the real
+boot-canary Node in disposable Rust test processes. It covers success, assertion failure,
+Rust panic, SIGTERM and SIGKILL of the Rust process, and SIGKILL of the Python fixture. It
+requires both the daemon and a double-forked child in a new session to disappear within
+five seconds, and separately injects an evidence-collection error to prove `node.stop()`
+still runs. Existing canary assertions, phase bounds and zero retries remain unchanged.
 
 The Codex stand-in's schema files are generated from the protocol gate's own fixture; when the
 required Codex methods change, `ST_REGENERATE_CODEX_STUB_SCHEMAS=1 cargo test -p st-drivers
