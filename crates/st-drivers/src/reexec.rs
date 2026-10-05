@@ -581,30 +581,89 @@ impl StdinReader {
 }
 
 /// Splits newline-delimited frames out of the bytes a [`StdinReader`] delivers.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct LineBuffer {
     pending: Vec<u8>,
+    #[serde(skip)]
+    start: usize,
+    #[serde(skip)]
+    scanned: usize,
+    #[cfg(test)]
+    #[serde(skip)]
+    bytes_moved: usize,
+    #[cfg(test)]
+    #[serde(skip)]
+    bytes_scanned: usize,
+}
+
+impl Serialize for LineBuffer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Keep resume format 1 readable in both directions: older images know only
+        // `pending`, which must contain only the unconsumed bytes.
+        #[derive(Serialize)]
+        struct State<'a> {
+            pending: &'a [u8],
+        }
+        State {
+            pending: &self.pending[self.start..],
+        }
+        .serialize(serializer)
+    }
 }
 
 impl LineBuffer {
     pub fn push(&mut self, bytes: &[u8]) {
+        // Compact only when at least half the buffer has been consumed. Each
+        // byte moves at most amortized constant times, rather than once per line.
+        if self.start > 0 && self.start >= self.pending.len() - self.start {
+            let remaining = self.pending.len() - self.start;
+            self.pending.copy_within(self.start.., 0);
+            self.pending.truncate(remaining);
+            self.scanned -= self.start;
+            self.start = 0;
+            #[cfg(test)]
+            {
+                self.bytes_moved += remaining;
+            }
+        }
         self.pending.extend_from_slice(bytes);
     }
 
     /// The next complete line without its newline.
     pub fn next_line(&mut self) -> Option<String> {
-        let end = self.pending.iter().position(|byte| *byte == b'\n')?;
-        let line = self.pending.drain(..=end).take(end).collect::<Vec<_>>();
-        Some(String::from_utf8_lossy(&line).into_owned())
+        let end = self.pending[self.scanned..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|end| self.scanned + end);
+        #[cfg(test)]
+        {
+            self.bytes_scanned += end.map_or(self.pending.len(), |end| end + 1) - self.scanned;
+        }
+        let Some(end) = end else {
+            self.scanned = self.pending.len();
+            return None;
+        };
+        let line = String::from_utf8_lossy(&self.pending[self.start..end]).into_owned();
+        self.start = end + 1;
+        self.scanned = self.start;
+        if self.start == self.pending.len() {
+            self.pending.clear();
+            self.start = 0;
+            self.scanned = 0;
+        }
+        Some(line)
     }
 
     /// Whatever is left once the writer closed the pipe without a final newline.
     pub fn finish(&mut self) -> Option<String> {
-        if self.pending.is_empty() {
+        if self.start == self.pending.len() {
             return None;
         }
-        let line = std::mem::take(&mut self.pending);
-        Some(String::from_utf8_lossy(&line).into_owned())
+        let line = String::from_utf8_lossy(&self.pending[self.start..]).into_owned();
+        self.pending.clear();
+        self.start = 0;
+        self.scanned = 0;
+        Some(line)
     }
 }
 
@@ -704,6 +763,58 @@ mod tests {
         lines.push(b"tail");
         assert_eq!(lines.finish().as_deref(), Some("tail"));
         assert_eq!(lines.finish(), None);
+    }
+
+    #[test]
+    fn line_buffer_work_is_linear_for_many_lines_and_an_incremental_large_line() {
+        let mut lines = LineBuffer::default();
+        let batch = b"{\"a\":1}\n".repeat(128 * 1024);
+        lines.push(&batch);
+        for _ in 0..128 * 1024 {
+            assert_eq!(lines.next_line().as_deref(), Some("{\"a\":1}"));
+        }
+        assert!(lines.next_line().is_none());
+        assert_eq!(lines.bytes_scanned, batch.len());
+        assert_eq!(
+            lines.bytes_moved, 0,
+            "splitting must not move the unread suffix"
+        );
+
+        // A >1 MiB record arriving a few bytes at a time must not rescan the
+        // partial prefix on every push or every idle poll.
+        for _ in 0..256 * 1024 {
+            lines.push(b"tail");
+            assert!(lines.next_line().is_none());
+            assert!(lines.next_line().is_none());
+        }
+        lines.push(b"\n");
+        assert_eq!(lines.next_line().unwrap().len(), 1024 * 1024);
+        assert_eq!(lines.bytes_scanned, batch.len() + 1024 * 1024 + 1);
+        assert_eq!(lines.bytes_moved, 0);
+    }
+
+    #[test]
+    fn line_buffer_compaction_and_resume_keep_only_unconsumed_bytes() {
+        let mut lines = LineBuffer::default();
+        lines.push(b"first\nsecond\nlast");
+        assert_eq!(lines.next_line().as_deref(), Some("first"));
+        let state = serde_json::to_value(&lines).unwrap();
+        assert_eq!(state, serde_json::json!({"pending": b"second\nlast"}));
+        // This is also exactly the old image's resume representation.
+        let mut resumed: LineBuffer = serde_json::from_value(state).unwrap();
+        assert_eq!(resumed.next_line().as_deref(), Some("second"));
+        assert_eq!(resumed.finish().as_deref(), Some("last"));
+
+        assert_eq!(lines.next_line().as_deref(), Some("second"));
+        assert!(lines.next_line().is_none());
+        lines.push(b" part\n");
+        assert_eq!(lines.bytes_moved, 4);
+        assert_eq!(lines.next_line().as_deref(), Some("last part"));
+        assert!(lines.finish().is_none());
+        lines.push(b"\ninvalid\xff\nend");
+        assert_eq!(lines.next_line().as_deref(), Some(""));
+        assert_eq!(lines.next_line().as_deref(), Some("invalid\u{fffd}"));
+        assert_eq!(lines.finish().as_deref(), Some("end"));
     }
 
     #[test]

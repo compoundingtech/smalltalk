@@ -193,26 +193,25 @@ pub async fn run(
                     // User meta records and explicit mid-turn absorption are native
                     // consumption proof. An enqueue or writing stdout is not a receipt.
                     if !content.is_empty() && retry_ready(&retries, "transcript") {
-                        let records = (|| {
+                        let result = (|| {
                             let path = st_drivers::claude_session::channel_transcript_recovering(paths, identity, runtime_id, &wrapper)?
                                 .context("Claude has not bound this wrapper to a native transcript")?;
-                            transcript.appended(&path)
-                        })();
-                        match records {
-                            Ok(records) => {
-                                retries.remove("transcript");
-                                for record in records {
-                                    for (message, envelope) in &content {
-                                        if native_receipt(&record, envelope) {
-                                            dirty |= state.confirmed.insert(message.clone());
-                                            dirty |= state.accepted.insert(message.clone());
-                                            dirty |= state.attempted.insert(message.clone());
-                                        } else if native_acceptance(&record, envelope) {
-                                            dirty |= state.accepted.insert(message.clone());
-                                            dirty |= state.attempted.insert(message.clone());
-                                        }
+                            transcript.appended(&path, |record| {
+                                for (message, envelope) in &content {
+                                    if native_receipt(record, envelope) {
+                                        dirty |= state.confirmed.insert(message.clone());
+                                        dirty |= state.accepted.insert(message.clone());
+                                        dirty |= state.attempted.insert(message.clone());
+                                    } else if native_acceptance(record, envelope) {
+                                        dirty |= state.accepted.insert(message.clone());
+                                        dirty |= state.attempted.insert(message.clone());
                                     }
                                 }
+                            })
+                        })();
+                        match result {
+                            Ok(()) => {
+                                retries.remove("transcript");
                             },
                             Err(error) => {
                                 retry_failed(&mut retries, "transcript");
@@ -388,15 +387,21 @@ struct Transcript {
     path: std::path::PathBuf,
     offset: u64,
     lines: st_drivers::reexec::LineBuffer,
+    #[cfg(test)]
+    bytes_read: u64,
+    #[cfg(test)]
+    largest_read: usize,
 }
 impl Transcript {
     fn body_available(&mut self, uncertain: bool) {
         if uncertain {
+            // This body may match proof before the current offset. Retain the
+            // historical recovery scan; normal following never rewinds.
             self.offset = 0;
             self.lines = Default::default();
         }
     }
-    fn appended(&mut self, path: &Path) -> Result<Vec<Value>> {
+    fn appended(&mut self, path: &Path, mut record: impl FnMut(&Value)) -> Result<()> {
         use std::io::{Read as _, Seek as _};
         let mut file = std::fs::File::open(path)?;
         if self.path != path || file.metadata()?.len() < self.offset {
@@ -405,16 +410,38 @@ impl Transcript {
             self.lines = Default::default();
         }
         file.seek(std::io::SeekFrom::Start(self.offset))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        self.offset += bytes.len() as u64;
-        self.lines.push(&bytes);
-        let mut records = Vec::new();
-        while let Some(line) = self.lines.next_line() {
-            if let Ok(record) = serde_json::from_str(&line) {
-                records.push(record);
+        // Drain complete records before reading another bounded chunk. Only a
+        // partial trailing record carries over; records larger than a chunk still
+        // grow normally, preserving the oversized-record support from #1347.
+        let mut bytes = [0; 64 * 1024];
+        loop {
+            let read = match file.read(&mut bytes) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if read == 0 {
+                break;
+            }
+            self.offset += read as u64;
+            #[cfg(test)]
+            {
+                self.bytes_read += read as u64;
+                self.largest_read = self.largest_read.max(read);
+            }
+            self.lines.push(&bytes[..read]);
+            while let Some(line) = self.lines.next_line() {
+                if let Ok(value) = serde_json::from_str(&line) {
+                    record(&value);
+                }
             }
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn records(&mut self, path: &Path) -> Result<Vec<Value>> {
+        let mut records = Vec::new();
+        self.appended(path, |record| records.push(record.clone()))?;
         Ok(records)
     }
 }
@@ -553,7 +580,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_receipt_preparation_needs_no_backward_transition_and_read_or_closed_mail_is_final() {
+    async fn claude_receipt_preparation_needs_no_backward_transition_and_read_or_closed_mail_is_final()
+     {
         let client = Client::new(crate::client::Endpoint::Unix(std::path::PathBuf::from(
             "/absent-st889-daemon.sock",
         )));
@@ -626,18 +654,18 @@ mod tests {
         let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(b"{\"type\":\"user\",\"message\":").unwrap();
         let mut transcript = Transcript::default();
-        assert!(transcript.appended(&path).unwrap().is_empty());
+        assert!(transcript.records(&path).unwrap().is_empty());
         file.write_all(b"{\"role\":\"user\",\"content\":\"QUARTZ\"}}\n")
             .unwrap();
-        let records = transcript.appended(&path).unwrap();
+        let records = transcript.records(&path).unwrap();
         assert_eq!(records.len(), 1);
         assert!(native_receipt(&records[0], "QUARTZ"));
-        assert!(transcript.appended(&path).unwrap().is_empty());
+        assert!(transcript.records(&path).unwrap().is_empty());
         std::fs::write(&path, b"{\"type\":\"user\"}\n").unwrap();
-        assert_eq!(transcript.appended(&path).unwrap().len(), 1);
+        assert_eq!(transcript.records(&path).unwrap().len(), 1);
         let rebound = root.path().join("next-native.jsonl");
         std::fs::write(&rebound, b"{\"type\":\"user\"}\n").unwrap();
-        assert_eq!(transcript.appended(&rebound).unwrap().len(), 1);
+        assert_eq!(transcript.records(&rebound).unwrap().len(), 1);
         assert!(!root.path().join("resources").exists());
     }
 
@@ -657,16 +685,115 @@ mod tests {
         std::fs::write(&path, format!("{record}\n")).unwrap();
         let mut transcript = Transcript::default();
         // A different available message caused the initial scan after reexec.
-        transcript.appended(&path).unwrap();
-        assert!(transcript.appended(&path).unwrap().is_empty());
+        transcript.records(&path).unwrap();
+        assert!(transcript.records(&path).unwrap().is_empty());
         transcript.body_available(true);
         assert!(native_receipt(
-            &transcript.appended(&path).unwrap()[0],
+            &transcript.records(&path).unwrap()[0],
             &envelope
         ));
         transcript.body_available(false);
-        assert!(transcript.appended(&path).unwrap().is_empty());
+        assert!(transcript.records(&path).unwrap().is_empty());
         assert!(!root.path().join("resources").exists());
+    }
+
+    #[test]
+    fn claude_large_transcript_reads_only_new_bytes_per_append() {
+        use std::io::BufWriter;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large-native.jsonl");
+        let mut file = BufWriter::new(std::fs::File::create(&path).unwrap());
+        file.write_all(b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"QUARTZ HISTORICAL\"}}\n")
+            .unwrap();
+        let mut line =
+            serde_json::to_vec(&json!({"type":"assistant","padding":"x".repeat(4000)})).unwrap();
+        line.push(b'\n');
+        let count = (100_usize * 1024 * 1024).div_ceil(line.len());
+        for _ in 0..count {
+            file.write_all(&line).unwrap();
+        }
+        file.flush().unwrap();
+        let initial_size = std::fs::metadata(&path).unwrap().len();
+        let mut transcript = Transcript::default();
+        let started = Instant::now();
+        let mut seen = 0;
+        transcript.appended(&path, |_| seen += 1).unwrap();
+        let scan_time = started.elapsed();
+        assert_eq!(seen, count + 1);
+        assert_eq!(transcript.bytes_read, initial_size);
+        assert!(transcript.largest_read <= 64 * 1024);
+        // The old splitter shifts over a terabyte for this input. Keep a wide
+        // margin over a linear scan, alongside the deterministic work counters
+        // in LineBuffer's tests and the exact per-append read counts below.
+        assert!(
+            scan_time < Duration::from_secs(30),
+            "initial scan took {scan_time:?}"
+        );
+
+        let receipt =
+            b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"QUARTZ\"}}\n";
+        let started = Instant::now();
+        for _ in 0..1000 {
+            let before = transcript.bytes_read;
+            file.write_all(receipt).unwrap();
+            file.flush().unwrap();
+            let mut seen = 0;
+            transcript
+                .appended(&path, |record| {
+                    assert!(native_receipt(record, "QUARTZ"));
+                    seen += 1;
+                })
+                .unwrap();
+            assert_eq!(seen, 1);
+            assert_eq!(transcript.bytes_read - before, receipt.len() as u64);
+            transcript
+                .appended(&path, |_| panic!("idle poll replayed a record"))
+                .unwrap();
+            assert_eq!(transcript.bytes_read - before, receipt.len() as u64);
+        }
+        eprintln!(
+            "transcript: {initial_size} initial bytes in {scan_time:?}; 1000 appends + idle polls, {} new bytes in {:?}",
+            1000 * receipt.len(),
+            started.elapsed()
+        );
+        // A bounded look-back window would miss this proof over 100 MiB behind
+        // EOF. Late uncertain bodies must still recover it without another offer.
+        transcript.body_available(true);
+        let mut historical = 0;
+        transcript
+            .appended(&path, |record| {
+                if native_receipt(record, "QUARTZ HISTORICAL") {
+                    historical += 1;
+                }
+            })
+            .unwrap();
+        assert_eq!(historical, 1);
+    }
+
+    #[test]
+    fn claude_transcript_preserves_large_partial_receipts_across_chunks_and_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("oversized-native.jsonl");
+        let text = format!("{}QUARTZ", "x".repeat(2 * 1024 * 1024));
+        let record = json!({"type":"user","message":{"role":"user","content":text}});
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let split = bytes.len() / 2;
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&bytes[..split]).unwrap();
+        let mut transcript = Transcript::default();
+        assert!(transcript.records(&path).unwrap().is_empty());
+        // Resetting for an uncertain handoff must discard the partial prefix and
+        // recover all historical proof, including records larger than 1 MiB.
+        transcript.body_available(true);
+        assert!(transcript.records(&path).unwrap().is_empty());
+        file.write_all(&bytes[split..]).unwrap();
+        assert!(transcript.records(&path).unwrap().is_empty());
+        file.write_all(b"\n").unwrap();
+        let records = transcript.records(&path).unwrap();
+        assert_eq!(records, [record]);
+        assert!(native_receipt(&records[0], "QUARTZ"));
+        assert!(transcript.records(&path).unwrap().is_empty());
     }
 
     #[test]
