@@ -79,7 +79,10 @@ write('paired-plan.json', plan)
 # input; each executable is copied and hashed before the other source is built.
 executables = {}
 for side, head in HEADS.items():
-    subprocess.run(['git', 'cat-file', '-e', head + '^{commit}'], cwd=workspace, check=True)
+    present = subprocess.run(['git', 'cat-file', '-e', head + '^{commit}'], cwd=workspace,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if present.returncode:
+        subprocess.run(['git', 'fetch', '--no-tags', 'origin', head], cwd=workspace, check=True)
     source = temporary / ('record-paired-source-' + side)
     subprocess.run(['git', 'worktree', 'add', '--detach', str(source), head], cwd=workspace, check=True)
     assert git('rev-parse', 'HEAD', cwd=source) == head
@@ -112,6 +115,10 @@ for side, head in HEADS.items():
     assert len(artifacts) == 1, artifacts
     frozen = output / (side + '-perf-load')
     shutil.copy2(artifacts[0], frozen)
+    linked = subprocess.run(['ldd', str(frozen)], capture_output=True, text=True)
+    (output / (side + '-linked-libraries.txt')).write_text(linked.stdout + linked.stderr)
+    if 'not found' in linked.stdout:
+        raise RuntimeError(f'{side} frozen binary has an unavailable library')
     assert not git('status', '--porcelain', cwd=source)
     executables[side] = {'head': head, 'path': str(frozen), 'sha256': digest(frozen)}
     write('frozen-binaries.json', executables)
