@@ -485,8 +485,8 @@ pub(super) fn conflicts_at(
     }))
 }
 
-pub(super) fn guard_member(connection: &Connection, member: &str) -> Result<(), St3Error> {
-    if owner(connection, member, None)?.is_none() {
+fn guarded_set(connection: &Connection, member: &str) -> Result<Option<View>, St3Error> {
+    let Some(set) = owner(connection, member, None)? else {
         let staged: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND json_extract(body,'$.owned_set') IS NOT NULL)",
             [member], |row|row.get(0)).map_err(internal)?;
@@ -496,17 +496,20 @@ pub(super) fn guard_member(connection: &Connection, member: &str) -> Result<(), 
                 "staged member awaits its owning set revision",
             ));
         }
+        return Ok(None);
+    };
+    let view = selected(connection, None)?
+        .into_iter()
+        .find(|v| v.id == set)
+        .ok_or_else(|| St3Error::new("owned-set-pending", "missing owning set"))?;
+    if !view.blockers.is_empty() {
+        return Err(St3Error::new("owned-set-pending", view.blockers.join("; ")));
     }
-    if let Some(set) = owner(connection, member, None)? {
-        let view = selected(connection, None)?
-            .into_iter()
-            .find(|v| v.id == set)
-            .ok_or_else(|| St3Error::new("owned-set-pending", "missing owning set"))?;
-        if !view.blockers.is_empty() {
-            return Err(St3Error::new("owned-set-pending", view.blockers.join("; ")));
-        }
-    }
-    Ok(())
+    Ok(Some(view))
+}
+
+pub(super) fn guard_member(connection: &Connection, member: &str) -> Result<(), St3Error> {
+    guarded_set(connection, member).map(|_| ())
 }
 
 pub(super) fn guard_mission_start(connection: &Connection, mission: &str) -> Result<(), St3Error> {
@@ -1198,12 +1201,9 @@ impl Store {
     /// Fence an external effect prepared from a declaration against the selected set.
     pub fn owned_desired_guard(&self, desired: &DesiredSubject) -> Result<(), St3Error> {
         let connection = self.readers.get();
-        guard_member(&connection, &desired.subject)?;
-        if let Some(set) = owner(&connection, &desired.subject, None)? {
-            let view = selected(&connection, None)?
-                .into_iter()
-                .find(|v| v.id == set)
-                .ok_or_else(|| St3Error::new("owned-set-pending", "missing owning set"))?;
+        // The ownership and blocker check already selected this set. Reuse it for
+        // the declaration fence instead of rereading every set revision again.
+        if let Some(view) = guarded_set(&connection, &desired.subject)? {
             let members = effective_members(&connection, &view, None)?;
             let member = members.get(&desired.subject);
             if member.is_none_or(|(m, _, _)| m.revision != desired_revision(desired)) {
