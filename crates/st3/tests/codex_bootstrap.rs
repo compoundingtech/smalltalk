@@ -72,16 +72,20 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         eprintln!("skipped: the delayed delivery proof needs pty and python3");
         return;
     };
-    let root = tempfile::tempdir().unwrap();
-    let socket = root.path().join("api.sock");
-    let state_socket = root.path().join("state.sock");
-    let pty_root = root.path().join("pty");
+    let root_path = tempfile::tempdir().unwrap().keep();
+    let root = root_path.as_path();
+    eprintln!("isolated delivery-control evidence: {}", root.display());
+    let socket = root.join("api.sock");
+    let state_socket = root.join("state.sock");
+    let pty_root = root.join("pty");
     let runtime = PtyRuntime::new(pty_root.clone()).with_binary(pty.to_string_lossy());
     let _cleanup = Cleanup(runtime.clone());
-    let store = Arc::new(Store::open_memory("bootstrap").unwrap());
+    // Real driver publications run concurrently with views and mailbox reads. Use the
+    // daemon's WAL storage; shared-memory fixtures return SQLITE_LOCKED on that mix.
+    let store = Arc::new(Store::open(&root.join("claims.sqlite3"), "bootstrap").unwrap());
     let source = format!(
         "version 2\nagent \"eval.codex-bootstrap\" {{ host \"bootstrap\"; workspace {:?}; harness \"codex\" {{}} }}",
-        root.path(),
+        root,
     );
     store
         .apply_internal(
@@ -97,7 +101,7 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0).0,
         node: "bootstrap".into(),
-        state_dir: root.path().into(),
+        state_dir: root.into(),
         pty_root: pty_root.clone(),
         pty_binary: pty.clone(),
         fleet_id: None,
@@ -130,7 +134,7 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
             .unwrap();
     });
     until(|| socket.exists(), "the isolated API did not start").await;
-    let provider = root.path().join("provider");
+    let provider = root.join("provider");
     let stub = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/st3-boot-canaries/stub-codex.py");
     std::fs::write(
@@ -145,7 +149,7 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
     std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_st3-fixture"));
     let environment = BTreeMap::from([
-        ("HOME", root.path().to_string_lossy().into_owned()),
+        ("HOME", root.to_string_lossy().into_owned()),
         ("PATH", path.to_string_lossy().into_owned()),
         ("ST_AGENT", SUBJECT.to_owned()),
         ("ST3_SUBJECT", SUBJECT.to_owned()),
@@ -153,11 +157,11 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         ("ST3_ENDPOINT", socket.to_string_lossy().into_owned()),
         (
             "ST3_DRIVER_STATE_DIR",
-            root.path().join("drivers").to_string_lossy().into_owned(),
+            root.join("drivers").to_string_lossy().into_owned(),
         ),
         ("ST3_MAILBOX_TRANSPORT", "push".to_owned()),
     ]);
-    let launch_root = root.path().to_owned();
+    let launch_root = root.to_owned();
     let result = tokio::task::spawn_blocking(move || {
         let mut command = std::process::Command::new(pty);
         command
@@ -268,9 +272,7 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         .await
         .unwrap();
     let reference = receipt.message.subject;
-    let receipts = root
-        .path()
-        .join("receipts-agent-eval-codex-bootstrap.jsonl");
+    let receipts = root.join("receipts-agent-eval-codex-bootstrap.jsonl");
     let offers = || -> usize {
         std::fs::read_to_string(&receipts)
             .unwrap_or_default()
@@ -304,11 +306,21 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
             .starts_with("delivery-control-unavailable:")
     );
     delayed.store(false, Ordering::SeqCst);
-    until(
-        || store.message(&reference).unwrap().unwrap().status == "read",
-        "the recovered control never delivered input",
-    )
-    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = store.message(&reference).unwrap().unwrap().status;
+        if status == "read" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the recovered control never delivered input: status={status}, offers={}, receipts={}, evidence={}",
+            offers(),
+            std::fs::read_to_string(&receipts).unwrap_or_default(),
+            root.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     until(
         || offers() == 1,
         "the provider did not record the recovered offer",
@@ -336,6 +348,8 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         );
     }
     server.abort();
+    drop(_cleanup);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 async fn until(mut predicate: impl FnMut() -> bool, description: &str) {
