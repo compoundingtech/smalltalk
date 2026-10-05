@@ -110,6 +110,29 @@ export type AgentHandoff = {
 
 export type AgentId = string;
 
+export type AgentMessageDay = {
+  calibrated_messages: number;
+  day_start_ms: number;
+  high_microusd: number;
+  high_percent?: number | null;
+  low_microusd: number;
+  low_percent?: number | null;
+  messages: number;
+  since_ms: number;
+  unpriced_tokens: number;
+  until_ms: number;
+  usage_cost_microusd: number;
+};
+
+export type AgentMessageEstimate = {
+  calibration?: string | null;
+  days: Array<AgentMessageDay>;
+  fallback_high_microusd: number;
+  fallback_low_microusd: number;
+  method: string;
+  source: string;
+};
+
 export type AgentQueue = {
   agent_id: Id;
   current_work_ids: Array<Id>;
@@ -1549,6 +1572,7 @@ export type UsageLimit = {
 };
 
 export type UsagePeriod = {
+  agent_messages?: AgentMessageEstimate;
   limits?: Array<UsageLimit>;
   rows: Array<UsageRow>;
   since_ms: number;

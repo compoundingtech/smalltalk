@@ -391,6 +391,37 @@ pub struct UsagePeriod {
     /// Each account's freshest limits reading; empty from a daemon that reports none.
     #[serde(default)]
     pub limits: Vec<UsageLimit>,
+    /// Daily planning estimate, including useful work; absent on older daemons.
+    #[serde(default)]
+    pub agent_messages: Option<AgentMessageEstimate>,
+}
+/// Count times receiving-seat allowance, with a fleet fallback. Not causal overhead.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentMessageEstimate {
+    #[serde(default)]
+    pub calibration: Option<String>,
+    pub source: String,
+    pub method: String,
+    pub fallback_low_microusd: u64,
+    pub fallback_high_microusd: u64,
+    pub days: Vec<AgentMessageDay>,
+}
+/// One UTC day clipped to the period; percentage is unknown when priced usage is zero.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentMessageDay {
+    pub day_start_ms: u64,
+    pub since_ms: u64,
+    pub until_ms: u64,
+    pub messages: u64,
+    pub calibrated_messages: u64,
+    pub low_microusd: u64,
+    pub high_microusd: u64,
+    pub usage_cost_microusd: u64,
+    pub unpriced_tokens: u64,
+    #[serde(default)]
+    pub low_percent: Option<f64>,
+    #[serde(default)]
+    pub high_percent: Option<f64>,
 }
 /// An account's 5-hour and weekly limits, as the seat that measured it most recently read them.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

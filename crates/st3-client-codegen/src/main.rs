@@ -609,6 +609,8 @@ fn validate_surfaces(
         "CanonicalNode",
         "SubjectDefinition",
         "UsagePeriod",
+        "AgentMessageEstimate",
+        "AgentMessageDay",
         "MailBacklog",
         "UsageRow",
         "ClientConnections",

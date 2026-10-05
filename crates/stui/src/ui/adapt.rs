@@ -172,6 +172,10 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
             Some(Ok(period)) => period.limits.clone(),
             _ => Vec::new(),
         },
+        agent_messages: match &model.usage {
+            Some(Ok(period)) => period.agent_messages.clone(),
+            _ => None,
+        },
         clients: match &model.clients {
             Some(Ok(list)) => Load::Ready(
                 list.items

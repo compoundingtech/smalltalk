@@ -45,6 +45,7 @@ impl Runtime for SmalltalkRuntime {
         unread_mail::create_schema(connection)?;
         resources::create_schema(connection)?;
         custom::create_schema(connection)?;
+        agent_messages::create_schema(connection)?;
         glass_heads::create_schema(connection)
     }
 
@@ -52,6 +53,7 @@ impl Runtime for SmalltalkRuntime {
         custom::open(transaction)?;
         resources::open(transaction)?;
         glass_heads::open(transaction)?;
+        agent_messages::open(transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
@@ -158,6 +160,7 @@ impl Runtime for SmalltalkRuntime {
         custom::flush(transaction).map_err(internal)?;
         resources::flush(transaction).map_err(internal)?;
         glass_heads::flush(transaction).map_err(internal)?;
+        agent_messages::flush(transaction).map_err(internal)?;
         reapply_local_work_lease_renewals_tx(transaction)
     }
 

@@ -8477,6 +8477,54 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
             total[6]
         );
     }
+    if let Some(estimate) = report.get("agent_messages") {
+        output.push_str("\nAGENT MESSAGES · daily estimate · UTC · API-equivalent\n");
+        let _ = writeln!(
+            output,
+            "Count × recipient allowance; includes useful work, not measured waste."
+        );
+        let _ = writeln!(
+            output,
+            "Fleet fallback ${:.2}–${:.2}/message · {}",
+            estimate["fallback_low_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+            estimate["fallback_high_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+            estimate["source"].as_str().unwrap_or("fleet fallback")
+        );
+        output.push_str("DATE  MESSAGES  ESTIMATE  SHARE OF PRICED USAGE  CALIBRATED\n");
+        for day in estimate["days"].as_array().into_iter().flatten() {
+            let date = day["day_start_ms"]
+                .as_u64()
+                .and_then(|at| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at as i64))
+                .map_or_else(|| "?".into(), |at| at.format("%Y-%m-%d").to_string());
+            let partial = day["until_ms"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_sub(day["since_ms"].as_u64().unwrap_or(0))
+                < 86_400_000;
+            let share = match (day["low_percent"].as_f64(), day["high_percent"].as_f64()) {
+                (Some(low), Some(high)) => format!(
+                    "{low:.1}–{high:.1}%{}",
+                    if day["unpriced_tokens"].as_u64().unwrap_or(0) > 0 {
+                        "*"
+                    } else {
+                        ""
+                    }
+                ),
+                _ => "unknown (no priced usage)".into(),
+            };
+            let _ = writeln!(
+                output,
+                "{date}{}  {}  ${:.2}–${:.2}  {share}  {}/{}",
+                if partial { " (partial)" } else { "" },
+                day["messages"],
+                day["low_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+                day["high_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+                day["calibrated_messages"],
+                day["messages"]
+            );
+        }
+        output.push_str("* Unpriced tokens are excluded from the denominator. Latest 31 UTC days; edge days are clipped.\n");
+    }
     let limits = report["limits"]
         .as_array()
         .map(Vec::as_slice)
@@ -21524,6 +21572,24 @@ mod tests {
         let by_step = render_usage_report(&report, 24, Some(UsageBy::Step));
         assert_eq!(by_step.matches("USAGE  ").count(), 1);
         assert!(by_step.contains("by step"));
+    }
+
+    #[test]
+    fn usage_report_labels_the_daily_proxy_and_unknown_share() {
+        let report = json!({"rows":[],"agent_messages":{
+            "source":"dated audit", "fallback_low_microusd":220000,"fallback_high_microusd":330000,
+            "days":[{"day_start_ms":0,"since_ms":1,"until_ms":86400000,
+                "messages":2,"calibrated_messages":1,"low_microusd":440000,"high_microusd":660000,
+                "usage_cost_microusd":0,"unpriced_tokens":100,"low_percent":null,"high_percent":null}]
+        }});
+        let rendered = render_usage_report(&report, 24, None);
+        assert!(rendered.contains("daily estimate"));
+        assert!(rendered.contains("includes useful work"));
+        assert!(
+            rendered
+                .contains("1970-01-01 (partial)  2  $0.44–$0.66  unknown (no priced usage)  1/2"),
+            "{rendered}"
+        );
     }
 
     #[test]

@@ -112,6 +112,7 @@ mod document_index_tests;
 mod lanes;
 mod operations;
 mod unread_mail;
+mod agent_messages;
 mod runtime;
 #[cfg(test)]
 mod tombstones_tests;
@@ -13817,6 +13818,20 @@ impl Store {
     /// and step on one host, with its API-equivalent cost in millionths of a dollar. Tokens no
     /// price covers are counted in `unpriced_tokens`, never as free.
     pub fn usage_period_rows(&self, since_ms: u64, until_ms: u64) -> Result<Vec<Value>> {
+        Ok(self.usage_period_data(since_ms, until_ms)?.0)
+    }
+
+    /// Daily denominators share the existing snapshot pass; message counts are indexed rollups.
+    pub fn usage_period_report(&self, since_ms: u64, until_ms: u64) -> Result<(Vec<Value>, Value)> {
+        let (rows, days) = self.usage_period_data(since_ms, until_ms)?;
+        Ok((rows, self.agent_message_estimate(&days)?))
+    }
+
+    fn usage_period_data(
+        &self,
+        since_ms: u64,
+        until_ms: u64,
+    ) -> Result<(Vec<Value>, Vec<agent_messages::DailyUsage>)> {
         const BUCKETS: [&str; 9] = [
             "total_tokens",
             "input_tokens",
@@ -13847,7 +13862,23 @@ impl Store {
             ))
         })?;
         type Key = (String, String, String, String, String, String, String);
-        let mut groups = BTreeMap::<Key, (Option<Snapshot>, Option<Snapshot>, String)>::new();
+        let mut days = agent_messages::windows(since_ms, until_ms)
+            .into_iter()
+            .map(|(since, until)| agent_messages::DailyUsage {
+                since,
+                until,
+                cost: 0,
+                unpriced: 0,
+            })
+            .collect::<Vec<_>>();
+        #[derive(Default)]
+        struct Group {
+            baseline: Option<Snapshot>,
+            latest: Option<Snapshot>,
+            pricing: String,
+            days: Vec<(Option<Snapshot>, Option<Snapshot>)>,
+        }
+        let mut groups = BTreeMap::<Key, Group>::new();
         for row in rows {
             let (subject, _index, body) = row?;
             let body: Value = serde_json::from_str(&body)?;
@@ -13877,33 +13908,62 @@ impl Store {
                 text("owner_step"),
                 text("host"),
             );
-            let (baseline, latest, pricing) = groups.entry(key).or_default();
-            let target = if at <= since_ms { baseline } else { latest };
+            let group = groups.entry(key).or_insert_with(|| Group {
+                days: vec![(None, None); days.len()],
+                ..Group::default()
+            });
+            for (day, (baseline, latest)) in days.iter().zip(&mut group.days) {
+                if at > day.until {
+                    continue;
+                }
+                let target = if at <= day.since { baseline } else { latest };
+                if target.is_none_or(|previous| at >= previous.at) {
+                    *target = Some(snapshot);
+                }
+            }
+            let target = if at <= since_ms {
+                &mut group.baseline
+            } else {
+                &mut group.latest
+            };
             if target.is_none_or(|previous| at >= previous.at) {
                 *target = Some(snapshot);
                 if at > since_ms {
-                    *pricing = text("pricing");
+                    group.pricing = text("pricing");
                 }
             }
         }
         let mut result = Vec::new();
-        for (
-            (agent, _incarnation, model, account, mission_run, step, host),
-            (baseline, latest, pricing),
-        ) in groups
-        {
-            let Some(latest) = latest else {
+        for ((agent, _incarnation, model, account, mission_run, step, host), group) in groups {
+            for (day, (baseline, latest)) in days.iter_mut().zip(group.days) {
+                let Some(latest) = latest else {
+                    continue;
+                };
+                let baseline = baseline
+                    .filter(|b| b.buckets[0] <= latest.buckets[0])
+                    .unwrap_or_default();
+                if latest.buckets[0] > baseline.buckets[0] {
+                    day.cost = day
+                        .cost
+                        .saturating_add(latest.buckets[6].saturating_sub(baseline.buckets[6]));
+                    day.unpriced = day
+                        .unpriced
+                        .saturating_add(latest.buckets[8].saturating_sub(baseline.buckets[8]));
+                }
+            }
+            let Some(latest) = group.latest else {
                 continue;
             };
             // A series that went backwards restarted from zero, for example when a node's local
             // totals were rebuilt; everything after the restart is spend in the period.
-            let baseline = baseline
+            let baseline = group
+                .baseline
                 .filter(|baseline| baseline.buckets[0] <= latest.buckets[0])
                 .unwrap_or_default();
             let mut row = json!({
                 "agent": agent, "mission_run": mission_run, "step": step,
                 "model": model, "account": account, "host": host,
-                "pricing": pricing,
+                "pricing": group.pricing,
             });
             for (index, name) in BUCKETS.iter().enumerate() {
                 row[*name] =
@@ -13915,7 +13975,7 @@ impl Store {
             result.push(row);
         }
         result.sort_by(|a, b| b["total_tokens"].as_u64().cmp(&a["total_tokens"].as_u64()));
-        Ok(result)
+        Ok((result, days))
     }
 
     /// Resolve a terminal capability and its current-head fence with two indexed seeks, in
@@ -18424,6 +18484,9 @@ fn append_claim_tx(
     }
     if matches!(kind, "glass.upserted" | "glass.deleted") {
         glass_heads::flush(transaction)?;
+    }
+    if kind == "message.sent" {
+        agent_messages::flush(transaction)?;
     }
     normalize_local_projection_timestamps_tx(
         transaction,
