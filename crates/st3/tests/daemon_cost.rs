@@ -48,7 +48,7 @@ use smallclaims::sync::PeerResponse;
 use st3::api::AppState;
 use st3::client::Client;
 use st3::config::{Config, PeerConfig};
-use st3::peer::{ClientReadOperation, ClientReadRequest, ClientReadRoute, ClientRelay, FleetAuth};
+use st3::peer::{ClientReadOperation, ClientReadRequest, ClientRelay, FleetAuth};
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
 
