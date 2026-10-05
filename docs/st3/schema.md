@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `0ae56dbbffe32b240808b7c64ffaa25b09128f6301e1e99859d6314a7eba76f3`
+Digest: `0a533bd0042d118ee97083be7198981c4312e676c8ddf18d964187b6e63ee8d8`
 
 ## Subject families
 
@@ -209,6 +209,19 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 `resource.observed` validates facts against the resource kind. Custom resource facts remain open.
 
 A `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.
+
+## Arrangement operation vocabulary
+
+Replication retains unknown operation tags and unknown placement subject families as retryable `unknown-claim-field` records. Local edits still refuse them with `invalid-arrangement-operations` and `invalid-subject-reference`. Supported operation tags, included in this registry's digest:
+
+- `create`
+- `rename`
+- `folder.create`
+- `folder.rename`
+- `folder.move`
+- `folder.delete`
+- `subject.place`
+- `retire`
 
 ## Harness todo snapshots
 
