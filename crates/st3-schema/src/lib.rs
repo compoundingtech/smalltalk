@@ -515,8 +515,12 @@ impl Registry {
         actor: Option<&str>,
     ) -> Result<&ClaimSpec, ValidationError> {
         let spec = self.validate_claim(subject, kind, fields)?;
-        let allowed = spec.write_policy == WritePolicy::OrdinaryClient
-            || (spec.write_policy == WritePolicy::SameSubjectActor && actor == Some(subject));
+        // Pairing authority is minted only by the authenticated pairing handlers,
+        // never by open custom-claim input (including an owner-origin append).
+        let managed_pairing = matches!(kind,
+            "custom.client.pairing-begun" | "custom.client.pairing-completed" | "custom.client.pairing-revoked");
+        let allowed = !managed_pairing && (spec.write_policy == WritePolicy::OrdinaryClient
+            || (spec.write_policy == WritePolicy::SameSubjectActor && actor == Some(subject)));
         if !allowed {
             return Err(error(
                 "claim-write-forbidden",

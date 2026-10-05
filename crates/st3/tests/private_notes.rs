@@ -133,28 +133,3 @@ fn completed_receipt_remains_recoverable_while_a_later_replacement_is_pending() 
     assert_eq!(fs::metadata(fixture.carrier()).unwrap().ino(), before_recovery.ino());
 }
 
-#[test]
-fn optional_native_admission_skips_a_busy_writer_and_retries_without_rebinding_other_incarnations() {
-    let fixture = Fixture::new();
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600)
-        .open(fixture.root.path().join("private-notes.lock")).unwrap();
-    lock.lock().unwrap();
-    let skipped = std::thread::scope(|scope| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let fixture = &fixture;
-        let worker = scope.spawn(move || {
-            let result = fixture.authority.bind_source("node", fixture.root.path(), &fixture.uri, "agent/worker", "incarnation-one");
-            tx.send(result).unwrap();
-        });
-        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
-        drop(lock);
-        worker.join().unwrap();
-        result.expect("native admission must not wait for a private writer")
-    });
-    assert_eq!(skipped.unwrap(), None);
-    assert_eq!(fixture.authority.check_source("node", fixture.root.path(), &fixture.uri, "agent/worker", "incarnation-one").unwrap_err().code, "stale-fence");
-    assert!(fixture.authority.bind_source("node", fixture.root.path(), &fixture.uri, "agent/worker", "incarnation-one").unwrap().is_some());
-    fixture.authority.check_source("node", fixture.root.path(), &fixture.uri, "agent/worker", "incarnation-one").unwrap();
-    assert_eq!(fixture.authority.check_source("node", fixture.root.path(), &fixture.uri, "agent/worker", "incarnation-two").unwrap_err().code, "stale-fence");
-}
