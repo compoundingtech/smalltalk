@@ -36,6 +36,15 @@ snapshot's store index, so rows always match their fence. Commits that land
 while a window is read neither tear it nor delay it; they arrive in the next
 `changes` frame.
 
+Windows complete independently: a slow collection read does not prevent new
+subscription commands or ready conversation and terminal frames from being
+handled. Each subscription still delivers its snapshot before its changes.
+Replacing or removing a subscription discards its pending collection result;
+changes observed during a read schedule another read of that window.
+Each socket permits at most eight physical collection reads, including store
+work still finishing after cancellation. Replacements wait for a read slot
+without blocking command admission or unrelated ready frames.
+
 An `error` frame reports a permanent refusal and ends that subscription. A
 `resync` frame with `retryable: true` reports a temporary read failure; the server
 keeps the subscription and retries after its reread interval, including when the
