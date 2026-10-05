@@ -1,5 +1,10 @@
 import { defaultActionlintConfig, githubWorkflow, nixDevelopStep, plainFlakeSetupSteps } from '../../repos/effect-utils/genie/external.ts'
-import { buildEnv, linuxStageRunner, readOnlyBinaryCaches } from './workspace-ci.ts'
+import { buildEnv, readOnlyBinaryCaches } from './workspace-ci.ts'
+
+const performanceRunner = [
+  'nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1',
+  'namespace-features:github.run-id=${{ github.run_id }}',
+]
 
 const snapshotAttempt = "!cancelled() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (steps.load.outcome == 'success' || steps.load.outcome == 'failure')"
 const snapshotPublished = "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
@@ -37,12 +42,12 @@ export default githubWorkflow({
   },
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
+    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...performanceRunner],
   },
   jobs: {
     'perf-load': {
       name: 'perf-load',
-      'runs-on': linuxStageRunner,
+      'runs-on': performanceRunner,
       'timeout-minutes': 30,
       defaults: { run: { shell: 'bash' } },
       env: {
