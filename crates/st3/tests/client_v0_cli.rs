@@ -68,6 +68,7 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
     let http_server = tokio::spawn(async move { axum::serve(listener, app).await });
     let config = root.path().join("config");
     std::fs::create_dir_all(config.join("st3")).unwrap();
+    std::fs::set_permissions(config.join("st3"), std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(config.join("st3/config.toml"), "invalid local config [").unwrap();
     let profile = root.path().join("device/profile.json");
     let run = |args: Vec<String>, code: String| {
@@ -231,8 +232,6 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
         "complete".into(),
         base.clone(),
         challenge.pairing_id,
-        "--profile".into(),
-        profile.to_str().unwrap().into(),
     ];
     let output = run(args, challenge.code).await.unwrap();
     assert!(
@@ -240,7 +239,11 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let loaded = Profile::load(&profile).unwrap().unwrap();
+    // The default profile works beside non-secret configuration without chmod-ing its directory.
+    let default_profile = config.join("st3/stui-devices.json");
+    let loaded = Profile::load(&default_profile).unwrap().unwrap();
+    assert_eq!(std::fs::metadata(&default_profile).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(config.join("st3")).unwrap().permissions().mode() & 0o777, 0o755);
     assert!(loaded.devices[0].signing_key.is_none());
     assert!(loaded.devices[0].session.device_key_chain.is_empty());
     assert!(

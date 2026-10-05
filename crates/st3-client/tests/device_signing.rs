@@ -348,6 +348,24 @@ async fn shared_completion_persists_both_key_types_and_preserves_a_working_devic
         .unwrap()
         .value;
     let directory = path.parent().unwrap().to_owned();
+    // Refuse a directory another user can write before consuming the still-usable code.
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let result = complete(
+        &path,
+        &base,
+        &challenge.pairing_id,
+        &challenge.code,
+        SigningKey::generate(KeyAlgorithm::P256).unwrap(),
+    )
+    .await;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("not be writable by others")
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
     let write_failure =
         axum::middleware::map_response(move |response: axum::response::Response| {
             let directory = directory.clone();

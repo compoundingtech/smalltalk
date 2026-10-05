@@ -62,7 +62,9 @@ The import file is read without following symlinks and is never changed.
 
 The bearer credential, delegation chain and private key are stored together in one mode-0600
 profile, `$XDG_CONFIG_HOME/st3/stui-devices.json` (or `~/.config/st3/stui-devices.json`).
-`--profile /absolute/path/devices.json` selects another profile in a private directory.
+`--profile /absolute/path/devices.json` selects another profile in a directory owned by you
+and not writable by other users. New profile directories are created with mode 0700; an existing
+mode-0755 config directory is accepted without changing its permissions.
 One atomic rename replaces both credential and key together; concurrent updates are refused.
 Wrong or reused codes, invalid keys and failures before that commit leave the existing profile
 unchanged. If a member has consumed the code before a local failure, begin a new pairing to retry.

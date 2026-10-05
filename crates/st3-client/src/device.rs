@@ -390,8 +390,8 @@ fn prepare(path: &Path) -> Result<(File, File)> {
         .open(parent_path)?;
     let metadata = parent.metadata()?;
     ensure!(
-        metadata.permissions().mode() & 0o077 == 0 && metadata.uid() == unsafe { libc::geteuid() },
-        "Device profile directory must be private and owned by this user (chmod 700)"
+        metadata.permissions().mode() & 0o022 == 0 && metadata.uid() == unsafe { libc::geteuid() },
+        "Device profile directory must belong to this user and not be writable by others"
     );
     let lock_path = path.with_extension("lock");
     let lock = OpenOptions::new()
