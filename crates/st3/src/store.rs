@@ -891,6 +891,16 @@ fn subject_status_at(
     at_index: Option<u64>,
     owner_filter: Option<&str>,
 ) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
+    subject_status_at_details(connection, subject, at_index, owner_filter, true)
+}
+
+fn subject_status_at_details(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    owner_filter: Option<&str>,
+    details: bool,
+) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
     #[cfg(test)]
     SUBJECT_REDUCTIONS.with(|reductions| reductions.set(reductions.get() + 1));
     let desired = desired_row_at(connection, subject, at_index)?;
@@ -905,14 +915,18 @@ fn subject_status_at(
         at_index,
         member.as_ref().map(|member| member.host.as_str()),
     )?;
-    let harness = current_harness_at(connection, subject, at_index)?;
-    let claims = claim_ids_at(connection, subject, at_index)?;
-    let conflicts = desired_conflicts_at(
-        connection,
-        subject,
-        desired.as_ref().map(|row| row.claim_id.as_str()),
-        at_index,
-    )?;
+    let harness = if details { current_harness_at(connection, subject, at_index)? } else { None };
+    let claims = if details { claim_ids_at(connection, subject, at_index)? } else { Vec::new() };
+    let conflicts = if details {
+        desired_conflicts_at(
+            connection,
+            subject,
+            desired.as_ref().map(|row| row.claim_id.as_str()),
+            at_index,
+        )?
+    } else {
+        Vec::new()
+    };
     let kind = desired.as_ref().map(|row| row.kind.clone());
     let owner_run = desired.as_ref().and_then(|row| row.owner_run.clone());
     let owner_generation = desired
@@ -5961,9 +5975,41 @@ impl Store {
     /// One current-step scan for the whole roster. This avoids replaying wake
     /// history or querying the step table separately for every agent card.
     pub fn agent_work_queues(&self) -> Result<BTreeMap<String, AgentWorkQueue>> {
+        self.agent_work_queues_selected(None)
+    }
+
+    /// Queue cards for these seats only; labels and queue selection need no other seat's work.
+    pub(crate) fn agent_work_queues_for(
+        &self,
+        subjects: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, AgentWorkQueue>> {
+        self.agent_work_queues_selected(Some(subjects))
+    }
+
+    fn agent_work_queues_selected(
+        &self,
+        subjects: Option<&BTreeSet<String>>,
+    ) -> Result<BTreeMap<String, AgentWorkQueue>> {
         let connection = self.readers.get();
-        let orders = seat_run_orders_tx(&connection, None)?;
-        let rows = seat_step_rows_tx(&connection, None)?;
+        let (orders, rows) = if let Some(subjects) = subjects {
+            let mut orders = BTreeMap::new();
+            let mut rows = BTreeMap::new();
+            for subject in subjects {
+                orders.extend(seat_run_orders_tx(&connection, Some(subject))?);
+                for row in seat_step_rows_tx(&connection, Some(subject))? {
+                    rows.insert(row.subject.clone(), row);
+                }
+            }
+            let mut rows = rows.into_values().collect::<Vec<_>>();
+            rows.sort_by(|left, right| left.created_at_unix_ms.cmp(&right.created_at_unix_ms)
+                .then_with(|| left.subject.cmp(&right.subject)));
+            (orders, rows)
+        } else {
+            (
+                seat_run_orders_tx(&connection, None)?,
+                seat_step_rows_tx(&connection, None)?,
+            )
+        };
         let mut seats = BTreeMap::<&str, Vec<SeatStep<'_>>>::new();
         for row in &rows {
             let step = row.seat_step();
@@ -5972,7 +6018,9 @@ impl Store {
                 .flatten()
                 .collect::<BTreeSet<_>>()
             {
-                seats.entry(agent).or_default().push(step);
+                if subjects.is_none_or(|subjects| subjects.contains(agent)) {
+                    seats.entry(agent).or_default().push(step);
+                }
             }
         }
         let mut queues = BTreeMap::<String, AgentWorkQueue>::new();
@@ -9561,6 +9609,47 @@ impl Store {
             return Ok(status);
         }
         self.status_for_subject_prefix_uncached(prefix, at_index, include_history)
+    }
+
+    /// The roster's authority-aware inclusion and display-name order, without reducing cards.
+    pub(crate) fn agent_collection_keys_at(
+        &self,
+        store_index: u64,
+        history: bool,
+    ) -> Result<Vec<(String, String)>> {
+        let connection = self.readers.get();
+        let subjects = connection
+            .prepare_cached(RANGE_SUBJECTS)?
+            .query_map(params![store_index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let subjects = if history {
+            subjects
+        } else {
+            self.current_view_candidates(&connection, subjects, store_index, true)?
+        };
+        let mut keys = subjects
+            .into_iter()
+            .map(|subject| {
+                let desired = desired_row_at(&connection, &subject, Some(store_index))?
+                    .map(|row| serde_json::from_str::<Value>(&row.body))
+                    .transpose()?;
+                let name = crate::model::effective_agent_name(&subject, desired.as_ref()).to_owned();
+                Ok((name, subject))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// State-filter inputs only; claim history, conflicts, queues and card details are not read.
+    pub(crate) fn agent_state_subject_at(
+        &self,
+        subject: &str,
+        store_index: u64,
+    ) -> Result<SubjectStatus> {
+        subject_status_at_details(&self.readers.get(), subject, Some(store_index), None, false)?
+            .map(|(status, _)| status)
+            .context("agent metadata subject disappeared inside its read snapshot")
     }
 
     fn status_for_subject_prefix_uncached(

@@ -201,6 +201,17 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 | Sessions | `/sessions`, `/sessions/{id}` | updated time descending, ID |
 | Session timeline | `/sessions/{id}/timeline` | sequence ascending |
 
+Agents additionally support `GET /v1/client/agents?paging=keyset&limit=1`. This opt-in
+selects the presentation-name/ID window before joining card details, queues, todos, and
+subagents. Repeat `paging=keyset` and the same filters on continuation requests; the
+cursor also fences the page size. Each page uses a fresh read transaction and identifies
+its own snapshot. The sequence expires five minutes after its first page, without
+retaining a SQLite transaction between requests. Inserts or renames behind the cursor
+can be missed, and a previously returned agent renamed ahead of it can appear again.
+Restart the sequence for a fresh inventory, or use current collection subscriptions
+for live updates. Omitting `paging` retains cached-snapshot pagination; the two cursor
+modes cannot be interchanged.
+
 Work resources, mission steps (including `current_steps`), and agent work labels use the same
 `WorkState` vocabulary: `waiting-person`, `waiting`, `ready`, `claimed`, `blocked`, `verifying`, `completed`,
 `failed`, and `cancelled`. The API translates internal `pending` to `waiting` and `working` to

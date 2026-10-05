@@ -24,6 +24,11 @@ new `order`, `has_more`, and a new snapshot fence. Apply removals and upserts
 before displaying the new order. Rows leaving a bounded window appear in
 `removes`, even if they still exist beyond that window.
 
+Agent windows choose their presentation-name/ID order and apply the optional status
+filter before joining returned cards. Queues, todos, and subagents are joined only for
+the bounded window; finding matching roster keys can still inspect other agents.
+Status selection and returned cards evaluate observation freshness at the same time.
+
 Rows are joined in st so a client never joins collections itself. A mission's
 `run_details` carry `steps` for each open run and for its latest run, and every
 run's steps in a mission detail read. An agent names its queue in

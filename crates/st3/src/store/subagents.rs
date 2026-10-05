@@ -79,7 +79,7 @@ enum Scope<'a> {
     /// Recorded on this node from this claim on.
     RecordedOn(&'a str, u64),
     /// Whose lease runs past this time.
-    Running(u64),
+    Running(u64, Option<&'a str>),
     All,
 }
 
@@ -95,14 +95,16 @@ fn open_subagents_at(connection: &Connection, scope: Scope<'_>) -> Result<Vec<Su
         ),
         // Only a lease that runs on finds a running subagent, so the read starts from the
         // leases, through their indexes, and costs what runs rather than all history.
-        Scope::Running(_) => (
+        Scope::Running(..) => (
             "WITH live(subject, subagent_id) AS (
                  SELECT subject, json_extract(body, '$.fields.subagent_id') FROM claims
                  WHERE kind='subagent.appeared'
+                   AND (?2 IS NULL OR subject=?2)
                    AND CAST(json_extract(body, '$.fields.lease_expires_at_unix_ms') AS INTEGER)>?1
                  UNION
                  SELECT subject, json_extract(body, '$.fields.subagent_id') FROM claims
                  WHERE kind='subagent.renewed'
+                   AND (?2 IS NULL OR subject=?2)
                    AND CAST(json_extract(body, '$.fields.lease_expires_at_unix_ms') AS INTEGER)>?1)",
             "FROM live JOIN claims ON claims.subject=live.subject
                AND json_extract(claims.body, '$.fields.subagent_id')=live.subagent_id",
@@ -139,8 +141,8 @@ fn open_subagents_at(connection: &Connection, scope: Scope<'_>) -> Result<Vec<Su
     };
     let rows = match scope {
         Scope::Seat(agent) => statement.query_map([agent], read)?.collect::<Vec<_>>(),
-        Scope::Running(now) => statement
-            .query_map([i64::try_from(now).unwrap_or(i64::MAX)], read)?
+        Scope::Running(now, agent) => statement
+            .query_map(params![i64::try_from(now).unwrap_or(i64::MAX), agent], read)?
             .collect::<Vec<_>>(),
         Scope::RecordedOn(origin, after) => statement
             .query_map(params![origin, after], read)?
@@ -331,8 +333,15 @@ impl Store {
 
     /// Every subagent running at `now`: open, with a lease that runs past it. Oldest first.
     pub fn running_subagents(&self, now: u64) -> Result<Vec<SubagentView>> {
-        let mut running = open_subagents_at(&self.readers.get(), Scope::Running(now))?;
+        let mut running = open_subagents_at(&self.readers.get(), Scope::Running(now, None))?;
         // A renewal that ran out leaves only the appearance's lease to check.
+        running.retain(|subagent| !subagent.expired_at(now));
+        Ok(running)
+    }
+
+    /// One seat's running subagents, without reducing other seats' appearances.
+    pub(crate) fn running_subagents_for(&self, agent: &str, now: u64) -> Result<Vec<SubagentView>> {
+        let mut running = open_subagents_at(&self.readers.get(), Scope::Running(now, Some(agent)))?;
         running.retain(|subagent| !subagent.expired_at(now));
         Ok(running)
     }

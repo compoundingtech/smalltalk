@@ -151,6 +151,7 @@ struct ClientListQuery {
     status: Option<String>,
     #[serde(default)]
     native_only: bool,
+    paging: Option<ClientPaging>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -171,7 +172,15 @@ struct ClientPageCursor {
     before_index: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     after_key: Option<(u128, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_name_key: Option<(String, String)>,
     expires_at_unix_ms: u128,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum ClientPaging {
+    Keyset,
 }
 
 fn signal_changed(state: &AppState) {
@@ -1357,6 +1366,7 @@ fn client_page_read(
             items_digest,
             before_index: None,
             after_key: None,
+            last_name_key: None,
             expires_at_unix_ms,
         })?)
     } else {
@@ -1907,23 +1917,51 @@ fn client_agent_resources(
     at: &str,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut items = store.cached_agent_resources(snapshot_index, history, |changed| {
+    let items = store.cached_agent_resources(snapshot_index, history, |changed| {
         let mut items = client_agent_resources_selected(store, history, snapshot_index, changed)?;
-        let subjects = items
-            .iter()
-            .filter_map(|item| item["id"].as_str().map(str::to_owned))
-            .collect::<Vec<_>>();
-        let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
-        for item in &mut items {
-            let claims = observations.get(item["id"].as_str().unwrap_or_default());
-            item["todo"] = client_v0::agent_todo_value(
-                claims.and_then(|claims| claims.get("harness.todo.observed")),
-                claims.and_then(|claims| claims.get("harness.session-file")),
-                item["incarnation_id"].as_str(),
-            );
-        }
+        client_agent_todos(store, &mut items, snapshot_index)?;
         Ok(items)
     })?;
+    client_agent_finish(store, items, at, snapshot_index, false, client_now_ms())
+}
+
+fn client_agent_cards_for(
+    store: &Store,
+    history: bool,
+    at: &str,
+    snapshot_index: u64,
+    subjects: &BTreeSet<String>,
+    observation_unix_ms: u128,
+) -> anyhow::Result<Vec<Value>> {
+    let mut items = client_agent_resources_selected(store, history, snapshot_index, Some((subjects, &[])))?;
+    client_agent_todos(store, &mut items, snapshot_index)?;
+    client_agent_finish(store, items, at, snapshot_index, true, observation_unix_ms)
+}
+
+fn client_agent_todos(store: &Store, items: &mut [Value], snapshot_index: u64) -> anyhow::Result<()> {
+    let subjects = items.iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
+    for item in items {
+        let claims = observations.get(item["id"].as_str().unwrap_or_default());
+        item["todo"] = client_v0::agent_todo_value(
+            claims.and_then(|claims| claims.get("harness.todo.observed")),
+            claims.and_then(|claims| claims.get("harness.session-file")),
+            item["incarnation_id"].as_str(),
+        );
+    }
+    Ok(())
+}
+
+fn client_agent_finish(
+    store: &Store,
+    mut items: Vec<Value>,
+    at: &str,
+    snapshot_index: u64,
+    selected_only: bool,
+    observation_unix_ms: u128,
+) -> anyhow::Result<Vec<Value>> {
     let local_host = client_host_id(store.origin());
     for item in &mut items {
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
@@ -1935,23 +1973,100 @@ fn client_agent_resources(
             .remove("_status_source")
             .unwrap_or(Value::Null);
         let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
-        let observation = store.seat_observation_at(
-            item["id"].as_str().unwrap_or_default(),
-            harness.as_ref(),
-            snapshot_index,
-            client_now_ms(),
-        )?;
-        item["observation"] = json!(observation);
-        if observation == "stale" && item["harness_state"] == "idle" {
-            item["harness_state"] = json!("indeterminate");
-            if item["state"] == "running" {
-                item["state"] = json!("waiting");
-            }
-        }
-        overlay_delivery_presence(item, &local_host);
+        client_agent_observation(store, item, harness.as_ref(), snapshot_index, &local_host, observation_unix_ms)?;
     }
-    overlay_subagents(store, &mut items)?;
+    if selected_only {
+        overlay_subagents_selected(store, &mut items)?;
+    } else {
+        overlay_subagents(store, &mut items)?;
+    }
     Ok(items)
+}
+
+fn client_agent_observation(
+    store: &Store,
+    item: &mut Value,
+    harness: Option<&crate::model::CurrentHarnessView>,
+    snapshot_index: u64,
+    local_host: &str,
+    observation_unix_ms: u128,
+) -> anyhow::Result<()> {
+    let observation = store.seat_observation_at(
+        item["id"].as_str().unwrap_or_default(), harness, snapshot_index, observation_unix_ms,
+    )?;
+    item["observation"] = json!(observation);
+    if observation == "stale" && item["harness_state"] == "idle" {
+        item["harness_state"] = json!("indeterminate");
+        if item["state"] == "running" {
+            item["state"] = json!("waiting");
+        }
+    }
+    overlay_delivery_presence(item, local_host);
+    Ok(())
+}
+
+fn client_agent_filter_state(
+    store: &Store,
+    id: &str,
+    index: u64,
+    local_host: &str,
+    observation_unix_ms: u128,
+) -> anyhow::Result<Value> {
+    let mut subject = store.agent_state_subject_at(id, index)?;
+    subject.harness = store.observed_harness_at(id, index)?;
+    let driver = subject.harness.as_ref().and_then(|harness| harness.driver.clone())
+        .or_else(|| subject.desired.as_ref().and_then(desired_harness_driver));
+    let ids = [id.to_owned()];
+    let faults = store.member_reconcile_faults_for(&ids, index)?;
+    let handoff = subject.desired_token.as_deref()
+        .map(|token| crate::placement::handoff(store, id, token, index)).transpose()?.flatten();
+    let suspension = crate::suspension::current(store, id)?;
+    let host = store.desired_subjects_named(&ids)?.into_iter().next()
+        .and_then(|desired| desired.member).map(|member| client_host_id(&member.host));
+    let state = client_agent_state(
+        &subject, driver.as_deref(), faults.contains_key(id),
+        handoff.as_ref().is_some_and(|handoff| handoff.phase != "running"),
+        suspension.as_ref().map(|item| item.phase.as_str()),
+    );
+    let mut item = json!({
+        "id": id, "driver": driver, "host_id": host, "state": state,
+        "harness_state": subject.harness.as_ref().map(|harness| &harness.state),
+    });
+    client_agent_observation(store, &mut item, subject.harness.as_ref(), index, local_host, observation_unix_ms)?;
+    Ok(item)
+}
+
+/// Choose the bounded window from cheap roster keys, then hydrate just its returned cards.
+fn client_agent_window(
+    store: &Store,
+    query: &ClientListQuery,
+    at: &str,
+    index: u64,
+    after: Option<&(String, String)>,
+    limit: usize,
+) -> anyhow::Result<(Vec<Value>, bool, Option<(String, String)>)> {
+    let mut selected = Vec::new();
+    let mut has_more = false;
+    let local_host = client_host_id(store.origin());
+    let observation_unix_ms = client_now_ms();
+    for key in store.agent_collection_keys_at(index, query.history)? {
+        if after.is_some_and(|after| key <= *after) {
+            continue;
+        }
+        if let Some(status) = query.status.as_deref()
+            && client_agent_filter_state(store, &key.1, index, &local_host, observation_unix_ms)?["state"].as_str() != Some(status) {
+            continue;
+        }
+        if selected.len() == limit {
+            has_more = true;
+            break;
+        }
+        selected.push(key);
+    }
+    let after = selected.last().cloned();
+    let subjects = selected.into_iter().map(|(_, id)| id).collect::<BTreeSet<_>>();
+    let items = client_agent_cards_for(store, query.history, at, index, &subjects, observation_unix_ms)?;
+    Ok((items, has_more, after))
 }
 
 /// A seat's latest suspend or resume as client-v0 shows it.
@@ -1978,27 +2093,38 @@ fn client_suspension(suspension: &crate::suspension::Suspension) -> Value {
 fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
     let mut running = BTreeMap::<String, Vec<Value>>::new();
     for subagent in store.running_subagents(client_now_ms() as u64)? {
-        running
-            .entry(subagent.agent.clone())
-            .or_default()
-            .push(json!({
-                "id": subagent.subagent_id,
-                "subagent_type": subagent.subagent_type,
-                "description": subagent.description,
-                "driver": subagent.driver,
-                "session_id": subagent.session_id,
-                "work_id": subagent.step_run,
-                "started_at": (subagent.started_at_unix_ms > 0)
-                    .then(|| client_timestamp(u128::from(subagent.started_at_unix_ms))),
-                "lease_expires_at": client_timestamp(u128::from(subagent.lease_expires_at_unix_ms)),
-            }));
+        running.entry(subagent.agent.clone()).or_default().push(client_subagent_value(subagent));
     }
     for item in items {
         let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-        let subagents = running.remove(id).unwrap_or_default();
-        item["subagents"] = Value::Array(subagents);
+        item["subagents"] = Value::Array(running.remove(id).unwrap_or_default());
     }
     Ok(())
+}
+
+fn overlay_subagents_selected(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
+    let now = client_now_ms() as u64;
+    for item in items {
+        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        item["subagents"] = Value::Array(
+            store.running_subagents_for(id, now)?.into_iter().map(client_subagent_value).collect(),
+        );
+    }
+    Ok(())
+}
+
+fn client_subagent_value(subagent: crate::store::SubagentView) -> Value {
+    json!({
+        "id": subagent.subagent_id,
+        "subagent_type": subagent.subagent_type,
+        "description": subagent.description,
+        "driver": subagent.driver,
+        "session_id": subagent.session_id,
+        "work_id": subagent.step_run,
+        "started_at": (subagent.started_at_unix_ms > 0)
+            .then(|| client_timestamp(u128::from(subagent.started_at_unix_ms))),
+        "lease_expires_at": client_timestamp(u128::from(subagent.lease_expires_at_unix_ms)),
+    })
 }
 
 /// Delivery presence is independent of harness readiness: a local native seat waiting on a human
@@ -2041,6 +2167,51 @@ fn client_agent_resources_uncached(
     client_agent_resources_selected(store, history, snapshot_index, None)
 }
 
+/// The state filter and the card share one precedence rule; queues and history are irrelevant.
+fn client_agent_state(
+    subject: &crate::model::SubjectStatus,
+    driver: Option<&str>,
+    fault: bool,
+    moving: bool,
+    suspension_phase: Option<&str>,
+) -> &'static str {
+    let observed = subject.actual.as_ref()
+        .map(|actual| actual.get("fields").unwrap_or(actual))
+        .and_then(|fields| fields.get("status"))
+        .and_then(Value::as_str);
+    let harness_state = subject.harness.as_ref().map(|harness| harness.state.as_str());
+    // A live wrapper is necessary but not sufficient: native readiness belongs to its incarnation.
+    let state = match (observed, driver, harness_state, subject.reachability.as_str()) {
+        (Some("running" | "ready" | "working" | "idle"), _, _, reachability)
+            if reachability != "reachable" => "waiting",
+        (Some("running" | "ready" | "working" | "idle"), Some(_), Some("ready" | "working" | "idle"), _) => {
+            if subject.harness.as_ref().is_some_and(|harness| harness.blocked_on.as_deref() == Some("human")) {
+                "waiting"
+            } else {
+                "running"
+            }
+        }
+        (Some("running" | "ready" | "working" | "idle"), Some(_), Some("ended" | "failed"), _) => "failed",
+        (Some("running" | "ready" | "working" | "idle"), Some(_),
+            Some("indeterminate" | "unknown" | "unauthenticated" | "blocked"), _) => "waiting",
+        (Some("running" | "ready" | "working" | "idle"), Some(_), _, _) => "starting",
+        (Some("running" | "ready" | "working" | "idle"), None, _, _) => "running",
+        (Some("starting" | "pending"), _, _, _) => "starting",
+        (Some("waiting"), _, _, _) => "waiting",
+        (Some("failed"), _, _, _) => "failed",
+        (Some("stopped" | "exited" | "absent"), _, _, _) => "stopped",
+        _ if subject.desired.is_some() => "desired",
+        _ => "stopped",
+    };
+    let state = if fault { "failed" } else if moving { "waiting" } else { state };
+    // A suspended seat has no process by design: it is neither stopped nor failed.
+    match suspension_phase {
+        Some("suspended") if !fault => "suspended",
+        Some("snapshotting" | "fencing-source" | "transferring" | "restoring") if state == "stopped" => "suspended",
+        _ => state,
+    }
+}
+
 fn client_agent_resources_selected(
     store: &Store,
     history: bool,
@@ -2066,6 +2237,8 @@ fn client_agent_resources_selected(
     });
     let work_queues = if retain_queues {
         BTreeMap::new()
+    } else if let Some((subjects, _)) = changed {
+        store.agent_work_queues_for(subjects)?
     } else {
         store.agent_work_queues()?
     };
@@ -2131,9 +2304,6 @@ fn client_agent_resources_selected(
                 .actual
                 .as_ref()
                 .map(|actual| actual.get("fields").unwrap_or(actual));
-            let observed = fields
-                .and_then(|fields| fields.get("status"))
-                .and_then(Value::as_str);
             let driver = subject
                 .harness
                 .as_ref()
@@ -2167,69 +2337,18 @@ fn client_agent_resources_selected(
             } else {
                 None
             };
-            // A live wrapper is necessary but not sufficient for a running agent. Native
-            // harnesses only become running once the current runtime incarnation has produced a
-            // ready observation; an ended or indeterminate harness must never be painted green
-            // merely because its wrapper process still has a running observation.
-            let state = match (
-                observed,
-                driver.as_deref(),
-                harness_state.as_deref(),
-                subject.reachability.as_str(),
-            ) {
-                (Some("running" | "ready" | "working" | "idle"), _, _, reachability)
-                    if reachability != "reachable" =>
-                {
-                    "waiting"
-                }
-                (
-                    Some("running" | "ready" | "working" | "idle"),
-                    Some(_),
-                    Some("ready" | "working" | "idle"),
-                    _,
-                ) => {
-                    if subject.harness.as_ref().is_some_and(|harness| {
-                        harness.blocked_on.as_deref() == Some("human")
-                    }) {
-                        "waiting"
-                    } else {
-                        "running"
-                    }
-                }
-                (
-                    Some("running" | "ready" | "working" | "idle"),
-                    Some(_),
-                    Some("ended" | "failed"),
-                    _,
-                ) => "failed",
-                // A harness fenced at a login or trust prompt waits on a person.
-                (
-                    Some("running" | "ready" | "working" | "idle"),
-                    Some(_),
-                    Some("indeterminate" | "unknown" | "unauthenticated" | "blocked"),
-                    _,
-                ) => "waiting",
-                (Some("running" | "ready" | "working" | "idle"), Some(_), _, _) => "starting",
-                (Some("running" | "ready" | "working" | "idle"), None, _, _) => "running",
-                (Some("starting" | "pending"), _, _, _) => "starting",
-                (Some("waiting"), _, _, _) => "waiting",
-                (Some("failed"), _, _, _) => "failed",
-                (Some("stopped" | "exited" | "absent"), _, _, _) => "stopped",
-                _ if subject.desired.is_some() => "desired",
-                _ => "stopped",
-            };
             let handoff = subject.desired_token.as_deref()
                 .map(|token| crate::placement::handoff(store, &subject.subject, token, snapshot_index))
                 .transpose()?.flatten();
             let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
-            let state = if fault.is_some() { "failed" } else if moving { "waiting" } else { state };
             let suspension = crate::suspension::current(store, &subject.subject)?;
-            // A suspended seat has no process by design: it is neither stopped nor failed.
-            let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
-                Some("suspended") if fault.is_none() => "suspended",
-                Some("snapshotting" | "fencing-source" | "transferring" | "restoring") if state == "stopped" => "suspended",
-                _ => state,
-            };
+            let state = client_agent_state(
+                &subject,
+                driver.as_deref(),
+                fault.is_some(),
+                moving,
+                suspension.as_ref().map(|item| item.phase.as_str()),
+            );
             let runtime_id = fields
                 .and_then(|fields| fields.get("runtime_id"))
                 .and_then(Value::as_str);
@@ -3636,6 +3755,7 @@ async fn client_work_history(
                 items_digest: "sql-page".into(),
                 before_index: None,
                 after_key: None,
+                last_name_key: None,
                 expires_at_unix_ms,
             })
         })
@@ -3690,6 +3810,9 @@ async fn client_agents(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<ClientPageResponse, ApiError> {
+    if query.paging == Some(ClientPaging::Keyset) {
+        return client_agents_keyset(&state, snapshot, &query).await;
+    }
     let history = query.history;
     let status = query.status.clone();
     client_snapshot_page(
@@ -3711,6 +3834,89 @@ async fn client_agents(
         },
     )
     .await
+}
+
+/// Opt-in name/ID keyset pages. Each page is fresh; cached snapshot cursors keep their old promise.
+async fn client_agents_keyset(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    query: &ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    let (limit, expires_at_unix_ms, after) = if let Some(encoded) = &query.cursor {
+        let cursor = decode_client_cursor(encoded)?;
+        if cursor.collection != "agents"
+            || cursor.items_digest != "agent-keyset"
+            || cursor.last_name_key.is_none()
+            || !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&cursor.limit)
+            || cursor.snapshot.id != snapshot.id
+            || cursor.snapshot.store_index != snapshot.store_index
+            || cursor.history != query.history
+            || cursor.person != query.person
+            || cursor.actor != query.actor
+            || cursor.owner_run != query.owner_run
+            || cursor.status != query.status
+            || cursor.native_only != query.native_only
+            || query.limit.is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
+        {
+            return Err(client_page_expired("the page cursor does not match this collection, paging mode, or filter"));
+        }
+        if client_now_ms() > cursor.expires_at_unix_ms {
+            return Err(client_page_expired("the page cursor expired"));
+        }
+        (cursor.limit, cursor.expires_at_unix_ms, cursor.last_name_key)
+    } else {
+        (
+            query.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS).clamp(1, CLIENT_MAX_PAGE_ITEMS),
+            client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
+            None,
+        )
+    };
+    let reader = state.clone();
+    let selected = query.clone();
+    let (snapshot, items, has_more, last_name_key) = blocking_store(move || {
+        reader.store.clone().read_snapshot(|index| {
+            let snapshot = client_snapshot_at(&reader, index);
+            let (items, has_more, last) = client_agent_window(
+                &reader.store, &selected, &snapshot.created_at, index, after.as_ref(), limit,
+            )?;
+            Ok((snapshot, items, has_more, last))
+        })
+    }).await?;
+    let next_cursor = if has_more {
+        Some(encode_client_cursor(&ClientPageCursor {
+            snapshot: snapshot.clone(),
+            collection: "agents".into(),
+            offset: 0,
+            limit,
+            history: query.history,
+            person: query.person.clone(),
+            actor: query.actor.clone(),
+            owner_run: query.owner_run.clone(),
+            status: query.status.clone(),
+            native_only: query.native_only,
+            items_digest: "agent-keyset".into(),
+            before_index: None,
+            after_key: None,
+            last_name_key,
+            expires_at_unix_ms,
+        })?)
+    } else {
+        None
+    };
+    let mut filters = client_page_filters(query);
+    filters.insert("paging".into(), "keyset".into());
+    Ok((Extension(snapshot), Json(ClientResourcePage {
+        kind: "page".into(),
+        collection: "agents".into(),
+        filters,
+        items,
+        page: ClientPageInfo {
+            limit, has_more, next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+        },
+        sync: client_sync_notice(state),
+        replicated: None,
+    })))
 }
 
 async fn client_agents_detail(
@@ -4310,6 +4516,7 @@ async fn client_history(
                 items_digest: String::new(),
                 before_index: Some(next),
                 after_key: None,
+                last_name_key: None,
                 expires_at_unix_ms,
             })
         })
@@ -15696,9 +15903,11 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let envelope: Value = serde_json::from_slice(&bytes).unwrap();
         if path.starts_with("/v1/client/") {
             assert_eq!(envelope["api_version"], "st3.client.v0");
-            assert_eq!(envelope["snapshot"]["host_id"], "host/node");
+            if status.is_success() {
+                assert_eq!(envelope["snapshot"]["host_id"], "host/node");
+                assert!(envelope["snapshot"]["store_index"].is_u64());
+            }
             assert!(envelope["request_id"].as_str().unwrap().contains('-'));
-            assert!(envelope["snapshot"]["store_index"].is_u64());
         } else {
             assert_eq!(envelope["api_version"], "st3.v1");
             assert_eq!(envelope["snapshot_host"], "node");
@@ -19342,6 +19551,114 @@ mission "wake" state="ready" {
             "manual wakes must not use automatic attempts"
         );
         assert_eq!(wake.assignee_state, "idle");
+    }
+
+    #[tokio::test]
+    async fn agent_keyset_pages_preserve_order_filters_and_old_snapshot_cursors() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"version 2
+agent "test/z" { command "true"; name "Alpha" }
+agent "test/y" { command "true"; name "Beta" }
+agent "test/x" { command "true"; name "Beta" }
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        state.store.apply_internal(&intent, "keyset-agents").unwrap();
+        let observe = |id: &str, status: &str| {
+            state.store.append_claim(&ClaimInput {
+                subject: id.into(), kind: "runtime.observed".into(), actor: None,
+                fields: serde_json::from_value(json!({"status": status, "runtime_id": id})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        observe("agent/test/history", "stopped");
+        let index = state.store.index().unwrap();
+        for history in [false, true] {
+            let whole = client_agent_resources(&state.store, history, "snapshot", index).unwrap();
+            for status in [None, Some("desired"), Some("stopped"), Some("running")] {
+                let expected = whole.iter().filter(|item| status.is_none_or(|status|
+                    item["state"].as_str() == Some(status))).cloned().collect::<Vec<_>>();
+                for limit in [1, 2, 10] {
+                    let query = ClientListQuery {
+                        history, status: status.map(str::to_owned), ..Default::default()
+                    };
+                    let mut after = None;
+                    let mut actual = Vec::new();
+                    loop {
+                        let (items, more, last) = client_agent_window(
+                            &state.store, &query, "snapshot", index, after.as_ref(), limit,
+                        ).unwrap();
+                        actual.extend(items);
+                        if !more { break; }
+                        after = last;
+                    }
+                    assert_eq!(actual, expected, "{history} {status:?} {limit}");
+                }
+            }
+        }
+        let app = router(state.clone());
+        let (status, first) = get_request(app.clone(), "/v1/client/agents?paging=keyset&limit=1").await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["items"][0]["id"], "agent/test/z");
+        let cursor = first["page"]["next_cursor"].as_str().unwrap();
+        let (status, old_first) = get_request(app.clone(), "/v1/client/agents?limit=1").await;
+        assert_eq!(status, StatusCode::OK, "{old_first}");
+        let old_cursor = old_first["page"]["next_cursor"].as_str().unwrap();
+        observe("agent/test/x", "running");
+        let inserted = crate::graph::parse_test_intent(
+            r#"version 2
+agent "test/new" { command "true"; name "Aardvark" }
+"#, "node").unwrap();
+        state.store.apply_internal(&inserted, "keyset-insert-before").unwrap();
+        let second_path = format!("/v1/client/agents?paging=keyset&limit=1&cursor={}", urlencoding::encode(cursor));
+        let (status, second) = get_request(app.clone(), &second_path).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["items"][0]["id"], "agent/test/x");
+        assert_eq!(second["items"][0]["state"], "running");
+        let (status, old_second) = get_request(app.clone(), &format!(
+            "/v1/client/agents?limit=1&cursor={}", urlencoding::encode(old_cursor),
+        )).await;
+        assert_eq!(status, StatusCode::OK, "{old_second}");
+        assert_eq!(old_second["items"][0]["id"], "agent/test/x");
+        assert_eq!(old_second["items"][0]["state"], "desired");
+        let second_cursor = second["page"]["next_cursor"].as_str().unwrap();
+        let (status, last) = get_request(app.clone(), &format!(
+            "/v1/client/agents?paging=keyset&limit=1&cursor={}", urlencoding::encode(second_cursor),
+        )).await;
+        assert_eq!(status, StatusCode::OK, "{last}");
+        assert_eq!(last["items"][0]["id"], "agent/test/y");
+        assert_eq!(last["page"]["has_more"], false);
+        assert_eq!(last["page"]["next_cursor"], Value::Null);
+        for filter in ["status=desired", "person=person/other", "actor=agent/other",
+            "owner_run=mission-run/other", "history=true", "native_only=true", "limit=2"] {
+            let (status, error) = get_request(app.clone(), &format!(
+                "/v1/client/agents?paging=keyset&{filter}&cursor={}", urlencoding::encode(cursor),
+            )).await;
+            assert_eq!(status, StatusCode::GONE, "{filter}: {error}");
+            assert_eq!(error["code"], "page-cursor-expired");
+        }
+        let (status, _) = get_request(app.clone(), &format!(
+            "/v1/client/agents?limit=1&cursor={}", urlencoding::encode(cursor),
+        )).await;
+        assert_eq!(status, StatusCode::GONE);
+        let (status, _) = get_request(app.clone(), &format!(
+            "/v1/client/agents?paging=keyset&limit=1&cursor={}", urlencoding::encode(old_cursor),
+        )).await;
+        assert_eq!(status, StatusCode::GONE);
+        let mut invalid = decode_client_cursor(cursor).unwrap();
+        invalid.limit = 0;
+        let (status, _) = get_request(app.clone(), &format!(
+            "/v1/client/agents?paging=keyset&cursor={}",
+            urlencoding::encode(&encode_client_cursor(&invalid).unwrap()),
+        )).await;
+        assert_eq!(status, StatusCode::GONE);
+        let mut expired = decode_client_cursor(cursor).unwrap();
+        expired.expires_at_unix_ms = 0;
+        let (status, _) = get_request(app, &format!(
+            "/v1/client/agents?paging=keyset&limit=1&cursor={}",
+            urlencoding::encode(&encode_client_cursor(&expired).unwrap()),
+        )).await;
+        assert_eq!(status, StatusCode::GONE);
     }
 
     fn checked_agent_cache(store: &Store, history: bool, index: u64) -> Vec<Value> {

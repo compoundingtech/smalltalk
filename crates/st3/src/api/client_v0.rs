@@ -152,7 +152,12 @@ async fn collection_items(
                     store.glasses(person.as_deref().expect("authenticated glass owner"), index)?
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
-                "agents" => client_agent_resources(&store, false, &at, index)?,
+                "agents" => {
+                    let query = ClientListQuery { status, ..ClientListQuery::default() };
+                    let (items, has_more, _) =
+                        client_agent_window(&store, &query, &at, index, None, limit)?;
+                    return Ok((snapshot, items, has_more));
+                }
                 "work" => client_work_resources(
                     &store,
                     actor.as_deref(),
@@ -9060,6 +9065,71 @@ mod tests {
             &state.store, true, "2026-10-03T09:00:00Z", state.store.index().unwrap(),
         ).unwrap();
         assert!(items.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
+    }
+
+    #[tokio::test]
+    async fn agent_collection_windows_filter_before_limit_and_update_the_visible_order() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let intent = crate::graph::parse_test_intent(r#"version 2
+agent "window/z" { command "true"; name "Aardvark" }
+agent "window/y" { command "true"; name "Beta" }
+agent "window/x" { command "true"; name "Beta" }
+"#, "node").unwrap();
+        state.store.apply_internal(&intent, "agent-window-fixture").unwrap();
+        let observe = |id: &str, status: &str| {
+            state.store.append_claim(&ClaimInput {
+                subject: id.into(), kind: "runtime.observed".into(), actor: None,
+                fields: BTreeMap::from([("status".into(), json!(status)), ("runtime_id".into(), json!(id))]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        for id in ["agent/window/x", "agent/window/y"] { observe(id, "running"); }
+        let served = state.clone();
+        let app = axum::Router::new().route("/stream", axum::routing::get(
+            move |upgrade: WebSocketUpgrade| {
+                let state = served.clone();
+                async move { upgrade.on_upgrade(move |socket| collection_stream_socket_with_reader(
+                    socket, state, ClientSession::local(None).unwrap(), None,
+                    |state, session, request, permit| async move {
+                        collection_items(&state, &session, &request, permit).await
+                    },
+                )) }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        for (limit, expected, more) in [
+            (1, json!(["agent/window/x"]), true),
+            (2, json!(["agent/window/x", "agent/window/y"]), false),
+        ] {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"agents","collection":"agents","limit":limit,"status":"running"})
+                    .to_string().into(),
+            )).await.unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["kind"], "snapshot");
+            assert_eq!(frame["order"], expected);
+            assert_eq!(frame["items"].as_array().unwrap().iter().map(|item| &item["id"]).collect::<Vec<_>>(),
+                expected.as_array().unwrap().iter().collect::<Vec<_>>());
+            assert_eq!(frame["has_more"], more);
+        }
+        observe("agent/window/x", "waiting");
+        signal_visible_change(&state);
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["kind"], "changes");
+        assert_eq!(frame["order"], json!(["agent/window/y"]));
+        assert_eq!(frame["removes"], json!(["agent/window/x"]));
+        assert_eq!(frame["has_more"], false);
+        socket.close(None).await.unwrap();
+        server.abort();
     }
 
     #[tokio::test]
