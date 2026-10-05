@@ -1728,12 +1728,12 @@ async fn a_failed_explicit_retry_is_completed_parked_and_visible_until_a_new_req
         );
         // `st agents show` and clients consume the same agents read, including this fault.
         let agents: Value = fixture.client().get("/v1/client/agents").await.unwrap();
-        let agent = agents["value"]["items"]
+        let agent = agents["items"]
             .as_array()
             .unwrap()
             .iter()
             .find(|agent| agent["id"] == subject)
-            .unwrap();
+            .unwrap_or_else(|| panic!("missing {subject} in {agents}"));
         assert_eq!(agent["state"], "failed");
         assert_eq!(agent["fault"], reason);
         let show = st(
@@ -1807,7 +1807,7 @@ async fn an_interrupted_explicit_attempt_is_not_launched_again_after_daemon_rest
         .append_claim(&st3::model::ClaimInput {
             subject: subject.clone(),
             kind: "runtime.action.requested".into(),
-            actor: None,
+            actor: request.actor.clone(),
             fields: std::collections::BTreeMap::from([("action".into(), json!("start"))]),
             evidence: vec![request.id.clone()],
             expected_subject: None,
@@ -1825,7 +1825,8 @@ async fn an_interrupted_explicit_attempt_is_not_launched_again_after_daemon_rest
         result.body["fields"]["reason"]
             .as_str()
             .unwrap()
-            .contains("interrupted")
+            .contains("interrupted"),
+        "{result:?}"
     );
     let next = fixture.request(&subject, "after-interruption").await;
     for _ in 0..4 {

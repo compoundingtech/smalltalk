@@ -4847,11 +4847,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             let (_, appended) = self.store.append_claim_outcome(&ClaimInput {
                 subject: subject.subject.clone(),
                 kind: "runtime.action.requested".into(),
-                actor: None,
+                // Actor-bound control receipts survive checkpoint trimming.
+                actor: request.actor.clone(),
                 fields: BTreeMap::from([
                     ("action".into(), Value::String("start".into())),
                     ("reason".into(), Value::String(reason.into())),
-                    ("desired_token".into(), Value::String(desired_token.clone())),
                 ]),
                 evidence: vec![request.id.clone()],
                 expected_subject: None,

@@ -393,6 +393,12 @@ restart policy keeps the running process and takes effect the next time it start
 restart agent/example/worker --as person/ada` to apply it now. Restart preserves the declaration,
 works for top-level and mission seats, and waits for a new running incarnation.
 
+When repeated failed starts have automatically parked a seat, a person's explicit restart
+permits one launch attempt for that request. Replaying the request or restarting the daemon
+does not grant another attempt. If the retry fails, the seat parks again and its cause remains
+visible in `st agents show` and the agents read. A new restart request permits a new retry;
+provider version admission and native-session continuation still apply.
+
 Every relaunch of a seat continues its harness's last native session: `st agents restart`, a
 changed launch, a harness that hung up or crashed, a daemon restart, and a stop followed by a
 start. Claude, Codex, pi, omp and OpenCode each resume the session their driver last reported for
