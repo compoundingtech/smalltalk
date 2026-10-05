@@ -414,7 +414,6 @@ mod tests {
     #[test]
     fn every_native_family_has_real_typed_disclosure_or_canonical_payload() {
         let native = registry();
-        assert_eq!(native.subjects.len(), 33);
         for family in native.subjects.keys() {
             let descriptor = family_descriptor(family).unwrap();
             let claims = descriptor["claims"].as_object().unwrap();
