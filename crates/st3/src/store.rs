@@ -29322,7 +29322,7 @@ agent "test/empty" { command "true" }
             .query_row("PRAGMA cache_size", [], |row| row.get(0))
             .unwrap();
         assert_eq!(writer_cache_kib, -32768);
-        assert_eq!(reader_cache_kib, -8192);
+        assert_eq!(reader_cache_kib, -(smallclaims::sqlite::read_cache_kib() as i64));
     }
 
     #[test]
