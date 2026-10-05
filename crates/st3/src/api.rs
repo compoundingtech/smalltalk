@@ -347,6 +347,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/client/subject-definition",
             get(client_v0::subject_definition),
         )
+        .route("/v1/client/publication-definition", get(client_v0::publication_definition))
         .route("/v1/client/now", get(client_v0::now))
         .route("/v1/client/machines", get(client_v0::machines))
         .route("/v1/client/hosts/{*id}", get(client_v0::host_repositories))
