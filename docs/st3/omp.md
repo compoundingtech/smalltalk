@@ -62,22 +62,23 @@ recovery stub.
 
 ## Native replay outcomes
 
-Native assistant stop metadata is retained independently of content, including empty turns.
-`stop`, `length` and `toolUse` produce status entries whose JSON `detail` carries `stopReason`;
-length/tool continuation is not reported as completed. Provider failures and aborts produce
-typed error entries carrying `stopReason`, numeric `errorStatus`/`errorId`, and `outcome`.
-Explicit `willContinue: true` means `retrying`, false means `terminal_failure`; its absence
-means `unknown`, not an inferred retry or terminal failure. An abort does not imply a user
-cancellation.
+Native exceptional assistant stop metadata is retained independently of content, including empty
+turns. Routine `stop` and `toolUse` do not add redundant completion/waiting entries.
+`length` produces `native_output_truncated`: hitting an output limit means the answer may be
+incomplete, not that the assistant is waiting. Provider failures and aborts produce typed error
+entries carrying `stopReason`, numeric `errorStatus`/`errorId`, and `outcome`.
+Replay reports a provider error's retry outcome as `unknown`: `willContinue` belongs to the live
+`agent_end` event, not persisted assistant messages. An abort does not imply a user cancellation.
 
 Diagnostics use safe structural text, matching the live provider-error boundary. Native
 `errorMessage` prose is withheld with `diagnostic_availability: withheld` and
 `diagnostic_reason: provider_text_not_authorized`; it is neither copied nor hashed.
 Unsupported free-form stop values are explicitly withheld rather than exported.
 
-Native `custom/session_exit` checkpoints are distinct `native_process_exit` diagnostics.
-They preserve the closed exit kind and recognized signal/exit reason, plus at most 16 bounded
-pending-tool identities. Unknown reasons and pending-tool arguments/intent are withheld;
+Native `custom/session_exit` checkpoints preserve the closed exit kind and recognized signal/exit
+reason, plus at most 16 bounded, nonempty pending-tool identities. Recognized normal exits and
+`sigterm` stops produce status entries, not errors; fatal or unknown exits remain
+`native_process_exit` diagnostics. Unknown reasons and pending-tool arguments/intent are withheld;
 clipped identity sets are explicitly marked. A process exit proves neither user cancellation,
 tool completion nor the outcome of the next process.
 
