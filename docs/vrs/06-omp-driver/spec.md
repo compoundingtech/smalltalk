@@ -260,7 +260,11 @@ Captures, per measured release:
 - 18.6.0 — [`2026-10-04-omp-18-6-0-admission.md`](./.experiments/2026-10-04-omp-18-6-0-admission.md).
 
 Historical captures are evidence for their exact measured builds; automatic admission decides
-the currently installed identity independently of those release lists.
+the currently installed identity independently of those release lists. In particular, #1339's
+18.6.0 capture remains retained evidence, but it does not pre-admit every 18.6 patch or seed the
+installed-build cache. An installed 18.6 build launches after its five checks pass (or an explicit
+operator override); a failed boundary refuses a new launch even within that formerly admitted
+minor. Existing running providers remain unaffected.
 
 Behavioral captures outside the automatic admission contract:
 

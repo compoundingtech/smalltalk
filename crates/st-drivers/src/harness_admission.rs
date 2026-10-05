@@ -741,6 +741,10 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn fake_omp(directory: &Path) -> PathBuf {
+        fake_omp_with_version(directory, "99.42.7")
+    }
+
+    fn fake_omp_with_version(directory: &Path, version: &str) -> PathBuf {
         let python = resolve_executable("python3").unwrap();
         let path = directory.join("omp");
         fs::write(
@@ -755,6 +759,7 @@ pub(crate) mod tests {
                 "#!{}\n{}",
                 python.display(),
                 include_str!("../tests/fixtures/harness-admission/fake-omp.py")
+                    .replace("omp/99.42.7", &format!("omp/{version}"))
             ),
         )
         .unwrap();
@@ -861,6 +866,44 @@ pub(crate) mod tests {
             fs::read_to_string(directory.path().join("launches")).unwrap(),
             "probe\n"
         );
+    }
+
+    /// #1339 admitted the 18.6 minor on main. That historical capture must not bypass
+    /// this installed build's measurements, including a new patch in the same minor.
+    #[test]
+    fn omp_18_6_requires_all_measurements_instead_of_minor_admission() {
+        for version in ["18.6.0", "18.6.99"] {
+            for failure in
+                std::iter::once(None).chain(checks(Driver::Omp).iter().copied().map(Some))
+            {
+                let directory = tempfile::tempdir().unwrap();
+                fake_omp_with_version(directory.path(), version);
+                if let Some(check) = failure {
+                    let mut capture = measured_omp();
+                    fail_omp(&mut capture, check);
+                    fs::write(
+                        directory.path().join("capture.json"),
+                        serde_json::to_vec(&capture).unwrap(),
+                    )
+                    .unwrap();
+                }
+                let first = admit_fake(directory.path());
+                assert_eq!(first.version.as_deref(), Some(version));
+                assert_eq!(
+                    first.failed,
+                    failure.map(Check::reason),
+                    "{version}: {first:?}"
+                );
+                assert_eq!(first.passed(), failure.is_none());
+                let again = admit_fake(directory.path());
+                assert_eq!(again.failed, first.failed);
+                assert_eq!(again.cache_path, first.cache_path);
+                assert_eq!(
+                    fs::read_to_string(directory.path().join("launches")).unwrap(),
+                    "probe\n"
+                );
+            }
+        }
     }
 
     #[test]
