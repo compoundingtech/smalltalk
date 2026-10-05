@@ -3560,13 +3560,34 @@ fn session_message_body(claim: &ClaimRecord) -> Value {
     body
 }
 
-fn native_timeline_page(
+fn timeline_claim_entry_id(session_id: &str, claim: &ClaimRecord, suffix: &str) -> String {
+    let digest = hex::encode(Sha256::digest(format!("{}:{suffix}", claim.id).as_bytes()));
+    format!("timeline-entry/{}/{}", session_id.trim_start_matches("session/"), &digest[..24])
+}
+
+/// Sequence counters belong to their source, not to the merged conversation. Cache numeric
+/// RFC 3339 times once: native timestamps can use offsets or omit fractional seconds.
+fn order_timeline_items(items: Vec<Value>) -> Vec<Value> {
+    let mut stamped = items.into_iter().map(|item| {
+        let timestamp = item["timestamp"].as_str()
+            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+            .map(|stamp| stamp.timestamp_millis());
+        (timestamp, item)
+    }).collect::<Vec<_>>();
+    stamped.sort_by(|(left_time, left), (right_time, right)| {
+        left_time.cmp(right_time)
+            .then_with(|| left["sequence"].as_u64().cmp(&right["sequence"].as_u64()))
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+    stamped.into_iter().map(|(_, item)| item).collect()
+}
+
+fn native_timeline_items(
     state: &AppState,
     snapshot: &ClientSnapshot,
     session_id: &str,
-    query: &ClientListQuery,
     mut items: Vec<Value>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Vec<Value>, ApiError> {
     if let Some((owner, incarnation, _)) =
         super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
@@ -3591,28 +3612,8 @@ fn native_timeline_page(
             items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":session_message_body(&claim)}));
             items.push(json!({"id":format!("timeline-entry/{}/{}-content", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base+1, "revision":1, "timestamp":stamp, "role":role, "type":"content", "final":true, "body":{"media_type":"text/plain","text":fields.get("content").and_then(Value::as_str).unwrap_or_default()}}));
         }
-        items.sort_by(|a, b| {
-            a["timestamp"]
-                .as_str()
-                .cmp(&b["timestamp"].as_str())
-                .then_with(|| a["sequence"].as_u64().cmp(&b["sequence"].as_u64()))
-        });
     }
-    items.reverse();
-    let mut page = client_page(
-        state,
-        snapshot,
-        &format!("timeline/{session_id}"),
-        items,
-        query,
-    )?;
-    page.items.reverse();
-    Ok(Json(json!({
-        "kind": "timeline-page",
-        "session_id": session_id,
-        "items": page.items,
-        "page": page.page
-    })))
+    Ok(order_timeline_items(items))
 }
 
 /// What st3 established about a managed seat's native transcript.
@@ -3716,11 +3717,8 @@ fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str
         Err(_) => {}
     }
     let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
-    let digest = hex::encode(Sha256::digest(
-        format!("{}:transcript-not-bound", anchor.id).as_bytes(),
-    ));
     json!({
-        "id": format!("timeline-entry/{}/{}", session_id.trim_start_matches("session/"), &digest[..24]),
+        "id": timeline_claim_entry_id(session_id, anchor, "transcript-not-bound"),
         // Slot 2 of the observation's four sequence slots is otherwise unused.
         "sequence": anchor.store_index.saturating_mul(4).saturating_add(2),
         "revision": 1,
@@ -3959,32 +3957,39 @@ pub(super) fn timeline_value(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(session, "read.projections")?;
     let session_id = client_detail_id("session", id);
-    if query.cursor.is_some() {
-        let mut page = client_page(
-            state,
-            snapshot,
-            &format!("timeline/{session_id}"),
-            Vec::new(),
-            query,
-        )?;
-        page.items.reverse();
-        return Ok(Json(json!({
-            "kind": "timeline-page",
-            "session_id": session_id,
-            "items": page.items,
-            "page": page.page
-        })));
-    }
-    let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
+    let mut items = if query.cursor.is_some() {
+        // The page cursor resumes its frozen projection, not a freshly reordered timeline.
+        Vec::new()
+    } else {
+        timeline_items(state, snapshot, &session_id)?
+    };
+    // Open at the newest bounded window; continuation walks backward through the frozen copy.
+    items.reverse();
+    let mut page = client_page(state, snapshot, &format!("timeline/{session_id}"), items, query)?;
+    page.items.reverse();
+    Ok(Json(json!({
+        "kind": "timeline-page",
+        "session_id": session_id,
+        "items": page.items,
+        "page": page.page
+    })))
+}
+
+fn timeline_items(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session_id: &str,
+) -> Result<Vec<Value>, ApiError> {
+    let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
         .map_err(ApiError::internal)?;
     let Some((owner, incarnation, _)) = managed else {
         let conversation = crate::external_sessions::find_conversation(
             state.native_session_home.as_deref(),
-            &session_id,
+            session_id,
         )
         .map_err(ApiError::internal)?;
-        let items = external_conversation_items(conversation, &session_id)?;
-        return native_timeline_page(state, snapshot, &session_id, query, items);
+        let items = external_conversation_items(conversation, session_id)?;
+        return native_timeline_items(state, snapshot, session_id, items);
     };
     let owner = owner.as_str();
     let incarnation = incarnation.as_deref();
@@ -4003,9 +4008,9 @@ pub(super) fn timeline_value(
                     .map_err(|error| format!("the transcript could not be read: {error:#}"))
             });
         match read {
-            Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
+            Ok(items) => return native_timeline_items(state, snapshot, session_id, items),
             Err(reason) => {
-                transcript_notice_entry = Some(transcript_notice(&session_id, &managed, &reason));
+                transcript_notice_entry = Some(transcript_notice(session_id, &managed, &reason));
             }
         }
     }
@@ -4071,21 +4076,17 @@ pub(super) fn timeline_value(
         .claims;
     owner_claims.reverse();
     owner_claims.retain(|claim| claim.kind != "harness.timeline");
-    let mut message_claims = session_messages(state, owner, &session_id, incarnation, before)?;
+    let mut message_claims = session_messages(state, owner, session_id, incarnation, before)?;
     message_claims.reverse();
     let mut claims = timeline_claims;
     claims.extend(owner_claims);
     claims.extend(message_claims);
     claims.sort_by_key(crate::store::claim_log_order);
     claims.dedup_by_key(|claim| claim.id.clone());
-    let session_leaf = session_id.trim_start_matches("session/");
+    let entry_id = |claim: &ClaimRecord, suffix: &str| timeline_claim_entry_id(session_id, claim, suffix);
     let mut items = Vec::<Value>::new();
     let mut explicit = BTreeMap::<String, usize>::new();
     let mut tool_calls = BTreeSet::<String>::new();
-    let entry_id = |claim: &ClaimRecord, suffix: &str| {
-        let digest = hex::encode(Sha256::digest(format!("{}:{suffix}", claim.id).as_bytes()));
-        format!("timeline-entry/{session_leaf}/{}", &digest[..24])
-    };
     let applies_to_incarnation = |fields: &Value| {
         let observed = fields.get("incarnation_id").and_then(Value::as_str);
         observed.is_none() || incarnation.is_none() || observed == incarnation
@@ -4312,24 +4313,7 @@ pub(super) fn timeline_value(
         }
     }
     items.extend(transcript_notice_entry);
-    items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
-    // A conversation opens at its newest bounded window. The cursor walks toward older
-    // windows, while each individual page remains chronological for straightforward rendering.
-    items.reverse();
-    let mut page = client_page(
-        state,
-        snapshot,
-        &format!("timeline/{session_id}"),
-        items,
-        query,
-    )?;
-    page.items.reverse();
-    Ok(Json(json!({
-        "kind": "timeline-page",
-        "session_id": session_id,
-        "items": page.items,
-        "page": page.page
-    })))
+    Ok(order_timeline_items(items))
 }
 
 #[derive(Default, Deserialize)]
@@ -4443,30 +4427,22 @@ fn conversation_read_now(
         *rebuilds.entry(session_id.to_owned()).or_default() += 1;
     }
     let snapshot = new_client_snapshot(state);
-    let page = timeline_value(
-        state,
-        &snapshot,
-        session,
-        session_id,
-        &ClientListQuery {
-            limit: Some(200),
-            ..Default::default()
-        },
-    )?
-    .0;
-    let all = page["items"]
-        .as_array()
-        .ok_or_else(|| ApiError::internal("the timeline has no items"))?;
-    let native_latest = all
-        .iter()
-        .filter(|item| {
-            item["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("timeline-entry/native-"))
-        })
-        .filter_map(|item| item["sequence"].as_u64())
-        .max()
-        .unwrap_or(0);
+    require_scope(session, "read.projections")?;
+    let mut projection = timeline_items(state, &snapshot, session_id)?;
+    // Source watermarks must not go backward when graph events evict native rows from the
+    // newest display window. Read the native mark from the entire retained projection.
+    let native_sequence = |item: &Value| {
+        item["id"].as_str()
+            .filter(|id| id.starts_with("timeline-entry/native-"))
+            .and_then(|_| item["sequence"].as_u64())
+    };
+    let native_latest = projection.iter().filter_map(native_sequence).max().unwrap_or(0);
+    let position = after
+        .map(|cursor| conversation_position(state, session_id, cursor))
+        .transpose()?;
+    let native_changed = position.map_or(0, |(_, _, native)| {
+        projection.iter().filter_map(native_sequence).filter(|sequence| *sequence > native).count()
+    });
     let local_latest = state
         .store
         .local_observations_tail(1)
@@ -4474,9 +4450,6 @@ fn conversation_read_now(
         .first()
         .and_then(crate::store::local_observation_position)
         .unwrap_or(0);
-    let position = after
-        .map(|cursor| conversation_position(state, session_id, cursor))
-        .transpose()?;
     if let Some((store_index, local_position, native_sequence)) = position {
         if store_index > snapshot.store_index
             || local_position > local_latest
@@ -4493,7 +4466,7 @@ fn conversation_read_now(
             });
         }
     }
-    let mut changed_indexes = BTreeSet::new();
+    let mut changed_ids = BTreeSet::new();
     let mut explicit_ids = BTreeSet::new();
     let mut message_indexes = BTreeSet::new();
     if let Some((store_index, local_position, _)) = position {
@@ -4507,7 +4480,19 @@ fn conversation_read_now(
                 .map_err(ApiError::internal)?
                 .claims
             {
-                changed_indexes.insert(claim.store_index);
+                let suffix = match claim.kind.as_str() {
+                    "runtime.observed" => Some("runtime-status"),
+                    "harness.observed" => Some("harness-status"),
+                    "harness.diagnostic" => Some("diagnostic"),
+                    "harness.usage" => Some("usage"),
+                    _ => None,
+                };
+                if let Some(suffix) = suffix {
+                    changed_ids.insert(timeline_claim_entry_id(session_id, &claim, suffix));
+                }
+                if claim.kind == "harness.observed" {
+                    changed_ids.insert(timeline_claim_entry_id(session_id, &claim, "transcript-not-bound"));
+                }
                 if claim.kind == "harness.timeline" {
                     if let Some(id) = claim
                         .body
@@ -4536,7 +4521,12 @@ fn conversation_read_now(
                         || fields.get("to").and_then(Value::as_str) == Some(owner)
                 })
             {
-                changed_indexes.insert(claim.store_index);
+                let digest = hex::encode(Sha256::digest(claim.id.as_bytes()));
+                for suffix in ["message", "content"] {
+                    changed_ids.insert(timeline_claim_entry_id(session_id, &claim, suffix));
+                    changed_ids.insert(format!("timeline-entry/{}/{}-{suffix}",
+                                               session_id.trim_start_matches("session/"), &digest[..16]));
+                }
                 message_indexes.insert(claim.store_index);
             }
         }
@@ -4558,7 +4548,15 @@ fn conversation_read_now(
             }
         }
     }
-    let mut items = all
+    let graph_changed = projection.iter().filter(|item| {
+        item["id"].as_str().is_some_and(|id| changed_ids.contains(id))
+    }).count();
+    projection.reverse();
+    let mut page = client_page(state, &snapshot, &format!("timeline/{session_id}"), projection,
+                               &ClientListQuery { limit: Some(200), ..Default::default() })?;
+    page.items.reverse();
+    let all = &page.items;
+    let items = all
         .iter()
         .filter(|item| {
             let Some((_, _, native_sequence)) = position else {
@@ -4570,19 +4568,10 @@ fn conversation_read_now(
                     .as_u64()
                     .is_some_and(|sequence| sequence > native_sequence);
             }
-            explicit_ids.contains(id)
-                || item["sequence"]
-                    .as_u64()
-                    .is_some_and(|sequence| changed_indexes.contains(&(sequence / 4)))
+            explicit_ids.contains(id) || changed_ids.contains(id)
         })
         .cloned()
         .collect::<Vec<_>>();
-    items.sort_by(|a, b| {
-        a["timestamp"]
-            .as_str()
-            .cmp(&b["timestamp"].as_str())
-            .then_with(|| a["sequence"].as_u64().cmp(&b["sequence"].as_u64()))
-    });
     if message_indexes.iter().any(|index| {
         ![
             index.saturating_mul(4),
@@ -4592,22 +4581,16 @@ fn conversation_read_now(
         .all(|sequence| {
             items
                 .iter()
-                .any(|item| item["sequence"].as_u64() == Some(*sequence))
+                .any(|item| item["sequence"].as_u64() == Some(*sequence)
+                    && item["id"].as_str().is_some_and(|id| changed_ids.contains(id)))
         })
     }) || explicit_ids
         .iter()
         .any(|id| !items.iter().any(|item| item["id"].as_str() == Some(id)))
-        || (all.len() == 200
-            && position.is_some_and(|(_, _, native)| {
-                all.iter()
-                    .find(|item| {
-                        item["id"]
-                            .as_str()
-                            .is_some_and(|id| id.starts_with("timeline-entry/native-"))
-                    })
-                    .and_then(|item| item["sequence"].as_u64())
-                    .is_some_and(|first| first > native)
-            }))
+        || native_changed != items.iter().filter_map(native_sequence).count()
+        || graph_changed != items.iter().filter(|item| {
+            item["id"].as_str().is_some_and(|id| changed_ids.contains(id))
+        }).count()
     {
         return Err(ApiError {
             status: StatusCode::GONE,
@@ -13100,6 +13083,249 @@ mission "example/zero-run" state="ready" {
     }
 
     #[test]
+    fn mixed_timeline_windows_keep_source_sequences_and_original_revision_chronology() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "chronology-node");
+        let owner = "agent/chronology-owner";
+        let incarnation = "chronology-runtime:i1";
+        let stamp = |at: &str| {
+            chrono::DateTime::parse_from_rfc3339(at).unwrap().timestamp_millis() as u64
+        };
+        let append = |subject: &str, kind: &str, fields: BTreeMap<String, Value>| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: Some(owner.into()),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap()
+        };
+        // These graph claims have no producer timestamp field. Control only the
+        // private projection fixture's accepted clock, without forging their schema.
+        let graph_clock = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
+        smallclaims::store::configure_projection_writer(&graph_clock).unwrap();
+        let set_graph_time = |claim: ClaimRecord, at: &str| {
+            graph_clock.execute(
+                "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                rusqlite::params![stamp(at).to_string(), claim.id],
+            ).unwrap();
+        };
+        set_graph_time(append(owner, "runtime.observed", BTreeMap::from([
+            ("status".into(), json!("running")),
+            ("runtime_id".into(), json!("chronology-runtime")),
+            ("incarnation_id".into(), json!(incarnation)),
+            ("terminal".into(), json!(false)),
+        ])), "2026-10-04T17:15:16Z");
+        let native = |operation: &str, id: &str, sequence: u64, revision: u64,
+                      at: &str, role: &str, kind: &str, body: Value| {
+            append(owner, "harness.timeline", BTreeMap::from([
+                ("operation".into(), json!(operation)),
+                ("entry_id".into(), json!(id)),
+                ("sequence".into(), json!(sequence)),
+                ("revision".into(), json!(revision)),
+                ("role".into(), json!(role)),
+                ("entry_type".into(), json!(kind)),
+                ("final".into(), json!(kind != "content")),
+                ("body".into(), body),
+                ("driver".into(), json!("omp")),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("observed_at_unix_ms".into(), json!(stamp(at))),
+            ]))
+        };
+        native("append", "timeline-entry/answer", 1, 1, "2026-10-04T21:40:10Z",
+               "assistant", "content", json!({"media_type":"text/plain","text":"working"}));
+        // Old graph events have a larger local store-derived sequence than recent native prose.
+        append(owner, "harness.usage", BTreeMap::from([
+            ("input_tokens".into(), json!(7)),
+            ("semantics".into(), json!("response")),
+            ("driver".into(), json!("omp")),
+            ("incarnation_id".into(), json!(incarnation)),
+            ("observed_at_unix_ms".into(), json!(stamp("2026-10-04T21:40:11Z"))),
+        ]));
+        let session_id = managed_session_id(owner, incarnation);
+        set_graph_time(append("message/chronology", "message.sent", BTreeMap::from([
+            ("from".into(), json!("agent/peer")),
+            ("to".into(), json!(owner)),
+            ("session_id".into(), json!(session_id)),
+            ("content".into(), json!("continue")),
+            ("status".into(), json!("sent")),
+        ])), "2026-10-04T21:40:12Z");
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let initial = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        let collision_sequence = (state.store.index().unwrap() + 1) * 4;
+        native("finalize", "timeline-entry/answer", 999, 2, "2026-10-04T22:00:00Z",
+               "assistant", "content", json!({"media_type":"text/plain","text":"answer"}));
+        native("append", "timeline-entry/call", collision_sequence, 1, "2026-10-04T21:40:19Z",
+               "assistant", "tool_call", json!({"call_id":"call/chronology","name":"read","arguments":{}}));
+        native("append", "timeline-entry/result", collision_sequence + 1, 1, "2026-10-04T21:40:20Z",
+               "tool", "tool_result", json!({"call_id":"call/chronology","status":"success","media_type":"text/plain","content":"ok"}));
+        let page = timeline_value(&state, &new_client_snapshot(&state), &session, &session_id,
+                                  &ClientListQuery { limit: Some(6), ..Default::default() }).unwrap().0;
+        let entries = page["items"].as_array().unwrap();
+        assert_eq!(entries.iter().map(|entry| entry["type"].as_str().unwrap()).collect::<Vec<_>>(),
+                   ["content", "usage", "message", "content", "tool_call", "tool_result"]);
+        assert_eq!(entries[0]["id"], "timeline-entry/answer");
+        assert_eq!(entries[0]["sequence"], 1);
+        assert_eq!(entries[0]["revision"], 2);
+        assert_eq!(entries[0]["timestamp"], "2026-10-04T21:40:10.000Z");
+        assert_eq!(entries[0]["final"], true);
+        assert_eq!(entries[3]["sequence"].as_u64(), entries[2]["sequence"].as_u64().map(|sequence| sequence + 1));
+        let changes = conversation_read_now(&state, &session, &session_id,
+                                            initial["next_cursor"].as_str()).unwrap();
+        assert_eq!(changes["items"].as_array().unwrap().iter().map(|entry| entry["id"].as_str().unwrap()).collect::<Vec<_>>(),
+                   ["timeline-entry/answer", "timeline-entry/call", "timeline-entry/result"]);
+        let idle = conversation_read_now(&state, &session, &session_id,
+                                         changes["next_cursor"].as_str()).unwrap();
+        assert!(idle["items"].as_array().unwrap().is_empty());
+        let usage = append(owner, "harness.usage", BTreeMap::from([
+            ("input_tokens".into(), json!(77)),
+            ("semantics".into(), json!("response")),
+            ("driver".into(), json!("omp")),
+            ("incarnation_id".into(), json!(incarnation)),
+            ("observed_at_unix_ms".into(), json!(stamp("2026-10-04T21:40:21Z"))),
+        ]));
+        assert_eq!(usage.store_index * 4, collision_sequence, "fixture exercises a cross-namespace counter collision");
+        let usage_delta = conversation_read_now(&state, &session, &session_id,
+                                                idle["next_cursor"].as_str()).unwrap();
+        assert_eq!(usage_delta["items"].as_array().unwrap().iter().map(|entry| entry["type"].as_str().unwrap()).collect::<Vec<_>>(), ["usage"]);
+    }
+
+    #[test]
+    fn chronological_graph_changes_outside_window_resynchronize_before_cursor_advances() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "backdated-graph-node");
+        let owner = "agent/backdated-graph";
+        let incarnation = "backdated-runtime:i1";
+        state.store.append_claim(&ClaimInput {
+            subject: owner.into(), kind: "runtime.observed".into(), actor: Some(owner.into()),
+            fields: BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("backdated-runtime")),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("terminal".into(), json!(false)),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        state.store.append_local_observations_for_test(
+            &(1..=205).map(|sequence| ClaimInput {
+                subject: owner.into(), kind: "harness.timeline".into(), actor: Some(owner.into()),
+                fields: BTreeMap::from([
+                    ("operation".into(), json!("append")),
+                    ("entry_id".into(), json!(format!("timeline-entry/newer-{sequence}"))),
+                    ("sequence".into(), json!(sequence)),
+                    ("revision".into(), json!(1)),
+                    ("role".into(), json!("assistant")),
+                    ("entry_type".into(), json!("content")),
+                    ("final".into(), json!(true)),
+                    ("body".into(), json!({"media_type":"text/plain","text":format!("newer {sequence}")})),
+                    ("driver".into(), json!("omp")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("observed_at_unix_ms".into(), json!(1_791_151_200_000_u64)),
+                ]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).collect::<Vec<_>>(),
+        );
+        let session_id = managed_session_id(owner, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let initial = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        let usage = |semantics: &str| state.store.append_claim(&ClaimInput {
+            subject: owner.into(), kind: "harness.usage".into(), actor: Some(owner.into()),
+            fields: BTreeMap::from([
+                ("semantics".into(), json!(semantics)),
+                ("driver".into(), json!("omp")),
+                ("input_tokens".into(), json!(7)),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("observed_at_unix_ms".into(), json!(1_791_100_000_000_u64)),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        // A suppressed rollup is not an omitted conversation event.
+        usage("response_rollup");
+        let rollup = conversation_read_now(&state, &session, &session_id,
+                                           initial["next_cursor"].as_str()).unwrap();
+        assert!(rollup["items"].as_array().unwrap().is_empty());
+        usage("response");
+        let gap = conversation_read_now(&state, &session, &session_id,
+                                        rollup["next_cursor"].as_str()).unwrap_err();
+        assert_eq!(gap.code, "cursor-gap");
+        assert_eq!(gap.details["full_resync"], true);
+    }
+
+    #[test]
+    fn native_conversation_cursor_survives_a_graph_only_window_and_detects_real_loss() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "native-cursor-node");
+        let owner = "agent/native-cursor-owner";
+        let incarnation = "123:2000-01-01T00:00:00.000Z";
+        let directory = state.state_dir.join("drivers")
+            .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
+            .join("catalog/agents").join(st_drivers::run::detect_host())
+            .join(&hex::encode(Sha256::digest(owner.trim_start_matches("agent/").as_bytes()))[..16])
+            .join("provider-sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let transcript = directory.join("current.jsonl");
+        std::fs::write(&transcript, format!("{}\n{}\n",
+            json!({"type":"session","id":"native-cursor","timestamp":"2000-01-01T00:00:01Z","cwd":root.path()}),
+            json!({"type":"message","id":"old","timestamp":"2000-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"old native prose"}]}}),
+        )).unwrap();
+        for (kind, fields) in [
+            ("runtime.observed", BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("native-cursor-runtime")),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("terminal".into(), json!(false)),
+            ])),
+            ("harness.observed", BTreeMap::from([
+                ("state".into(), json!("working")),
+                ("driver".into(), json!("omp")),
+                ("incarnation_id".into(), json!(incarnation)),
+            ])),
+        ] {
+            state.store.append_claim(&ClaimInput {
+                subject: owner.into(), kind: kind.into(), actor: Some(owner.into()), fields,
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let session_id = managed_session_id(owner, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let before = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        let native_before = conversation_position(&state, &session_id, before["next_cursor"].as_str().unwrap()).unwrap().2;
+        for index in 0..101 {
+            state.store.append_claim(&ClaimInput {
+                subject: format!("message/native-cursor-{index}"), kind: "message.sent".into(),
+                actor: Some("person/example".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("person/example")),
+                    ("to".into(), json!(owner)),
+                    ("session_id".into(), json!(session_id)),
+                    ("content".into(), json!(format!("graph message {index}"))),
+                    ("status".into(), json!("sent")),
+                ]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let baseline = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        let cursor = baseline["next_cursor"].as_str().unwrap();
+        assert_eq!(conversation_position(&state, &session_id, cursor).unwrap().2, native_before);
+        assert!(conversation_read_now(&state, &session, &session_id, Some(cursor)).unwrap()["items"].as_array().unwrap().is_empty());
+        use std::io::Write as _;
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+        writeln!(writer, "{}", json!({"type":"message","id":"new","timestamp":"2099-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"new native prose"}]}})).unwrap();
+        let changed = conversation_read_now(&state, &session, &session_id, Some(cursor)).unwrap();
+        assert_eq!(changed["items"].as_array().unwrap().iter()
+            .filter_map(|item| item["body"]["text"].as_str()).collect::<Vec<_>>(), ["new native prose"]);
+        let after = changed["next_cursor"].as_str().unwrap();
+        // A changed native row omitted by the bounded projection is a real gap, even if a
+        // later native row remains visible; neither the high-water mark nor a first-row guess
+        // proves all changes were delivered.
+        writeln!(writer, "{}", json!({"type":"message","id":"backdated","timestamp":"2000-01-01T00:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"late old prose"}]}})).unwrap();
+        writeln!(writer, "{}", json!({"type":"message","id":"newest","timestamp":"2099-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"newest prose"}]}})).unwrap();
+        assert_eq!(conversation_read_now(&state, &session, &session_id, Some(after)).unwrap_err().code, "cursor-gap");
+    }
+
+    #[test]
     fn durable_timeline_is_cursor_paged_and_enforces_replace_finalize_identity() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "timeline-node");
@@ -13454,9 +13680,6 @@ mission "example/zero-run" state="ready" {
                 .all(|entry| entry["id"] != "timeline-entry/wrong-incarnation"),
             "explicit timeline claims are fenced to the live incarnation"
         );
-        assert!(entries.windows(2).all(|pair| {
-            pair[0]["sequence"].as_u64().unwrap() < pair[1]["sequence"].as_u64().unwrap()
-        }));
     }
 
     #[test]

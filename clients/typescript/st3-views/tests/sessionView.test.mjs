@@ -41,6 +41,17 @@ const restarted = await listSessionPages(async options => {
 assert.equal(firstPages, 2);
 assert.equal(secondPages, 2);
 assert.deepEqual(restarted.map(session => session.id), ['session/managed', 'session/exact']);
-assert.deepEqual(recentTimeline([{ sequence: 9 }, { sequence: 10 }, { sequence: 1 }], 2).map(entry => entry.sequence), [9, 10]);
+const mixedTimeline = [
+  { id: 'old-status', sequence: 177576, timestamp: '2026-10-04T17:15:16Z' },
+  { id: 'native-answer', sequence: 1682, timestamp: '2026-10-04T21:40:10Z' },
+  { id: 'usage', sequence: 194964, timestamp: '2026-10-04T21:40:11.000Z' },
+  { id: 'tool-call', sequence: 1684, timestamp: '2026-10-04T21:40:19.000Z' },
+];
+assert.deepEqual(recentTimeline(mixedTimeline, 3).map(entry => entry.id), ['native-answer', 'usage', 'tool-call']);
+assert.deepEqual(recentTimeline([
+  { id: 'call', sequence: 2, timestamp: '2026-10-04T21:40:19Z' },
+  { id: 'prose', sequence: 1, timestamp: '2026-10-04T23:40:19+02:00' },
+  { id: 'later', sequence: 0, timestamp: '2026-10-04T21:40:19.100Z' },
+]).map(entry => entry.id), ['prose', 'call', 'later']);
 assert.equal(timelineText({ media_type: 'text/plain', text: 'Hello' }), 'Hello');
 assert.equal(timelineText({ message_id: 'metadata-only' }), null);
