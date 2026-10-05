@@ -468,38 +468,14 @@ impl Emulator {
                     y: row as u32,
                 })
             };
-            let mut line = ScreenLine::default();
-            for column in 0..columns {
-                let Ok(cell_ref) = term.grid_ref(point(column)) else {
-                    continue;
-                };
-                let cell = cell_ref.cell().ok();
-                let cells = match cell.and_then(|cell| cell.wide().ok()) {
-                    Some(CellWide::Wide) => 2,
-                    Some(CellWide::SpacerTail | CellWide::SpacerHead) => continue,
-                    _ => 1,
-                };
-                let pen = cell_ref.style().unwrap_or_default();
-                let link = cell
-                    .and_then(|cell| cell.has_hyperlink().ok())
-                    .unwrap_or(false)
-                    .then(|| read_link(&cell_ref, &mut uri))
-                    .flatten();
-                let style = Style::of(&pen, cell, link);
-                if pen.invisible {
-                    line.push(style, if cells == 2 { "  " } else { " " }, cells);
-                } else {
-                    read_text(&cell_ref, &mut graphemes, &mut text);
-                    line.push(style, &text, cells);
-                }
-            }
+            let line = project_row(term, columns, &point, &mut graphemes, &mut uri, &mut text);
             let wrapped = term
                 .grid_ref(point(0))
                 .ok()
                 .and_then(|cell| cell.row().ok())
                 .and_then(|row| row.is_wrap_continuation().ok())
                 .unwrap_or(false);
-            lines.push(line.finish().value(row, wrapped));
+            lines.push(line.value(row, wrapped));
         }
         let (style, blinking) = self.cursor_style();
         let mode = |mode| term.mode(mode).unwrap_or(false);
@@ -551,6 +527,62 @@ impl Emulator {
         );
         Screen { body, revision }
     }
+}
+
+/// Project bounded owner history rows using the screen's exact styled-cell contract.
+pub(super) fn history_lines(
+    columns: u16,
+    rows: &[pty_core::protocol::HistoryRow],
+) -> Result<Vec<Value>, ViewEnd> {
+    let mut actor = TerminalActor::new(2, columns.max(1), 0);
+    let mut graphemes = vec![char::default(); 16];
+    let mut uri = vec![0_u8; 256];
+    let mut text = String::new();
+    let mut lines = Vec::with_capacity(rows.len());
+    for (row, retained) in rows.iter().enumerate() {
+        actor.reset();
+        actor.write(retained.ansi.as_bytes());
+        let point = |column: usize| Point::Active(PointCoordinate { x: column as u16, y: 0 });
+        let line = project_row(
+            actor.terminal(), usize::from(columns), &point, &mut graphemes, &mut uri, &mut text,
+        );
+        if line.truncated {
+            return Err(ViewEnd::Unavailable("a retained history row exceeds the styled-row limit".into()));
+        }
+        lines.push(line.value(row, retained.wrapped));
+    }
+    Ok(lines)
+}
+
+fn project_row(
+    term: &libghostty_vt::terminal::Terminal<'_, '_>,
+    columns: usize,
+    point: &impl Fn(usize) -> Point,
+    graphemes: &mut Vec<char>,
+    uri: &mut Vec<u8>,
+    text: &mut String,
+) -> ScreenLine {
+    let mut line = ScreenLine::default();
+    for column in 0..columns {
+        let Ok(cell_ref) = term.grid_ref(point(column)) else { continue };
+        let cell = cell_ref.cell().ok();
+        let cells = match cell.and_then(|cell| cell.wide().ok()) {
+            Some(CellWide::Wide) => 2,
+            Some(CellWide::SpacerTail | CellWide::SpacerHead) => continue,
+            _ => 1,
+        };
+        let pen = cell_ref.style().unwrap_or_default();
+        let link = cell.and_then(|cell| cell.has_hyperlink().ok()).unwrap_or(false)
+            .then(|| read_link(&cell_ref, uri)).flatten();
+        let style = Style::of(&pen, cell, link);
+        if pen.invisible {
+            line.push(style, if cells == 2 { "  " } else { " " }, cells);
+        } else {
+            read_text(&cell_ref, graphemes, text);
+            line.push(style, text, cells);
+        }
+    }
+    line.finish()
 }
 
 fn read_text(cell: &GridRef<'_>, buffer: &mut Vec<char>, text: &mut String) {
@@ -772,6 +804,28 @@ mod tests {
         let mut emulator = Emulator::new(rows, columns, Title::default());
         emulator.feed(bytes);
         emulator.screen("fallback").value("terminal/demo", "1:now")
+    }
+
+    #[test]
+    fn retained_history_preserves_links_wide_cells_backgrounds_and_wraps() {
+        use pty_core::protocol::{HistoryRequest, HistoryResponse};
+        let mut owner = TerminalActor::new(2, 8, 100);
+        owner.write("\x1b[1;9;31m\x1b]8;;https://example.test/history\x1b\\A界\x1b]8;;\x1b\\\x1b[0m\r\n\x1b[44m\x1b[2K\x1b[0m\r\n123456789\r\nDONE\r\nLAST".as_bytes());
+        let HistoryResponse::Page { columns, rows, .. } =
+            owner.history("owner", &HistoryRequest { expected_generation: "owner".into(), limit: 200, before: None })
+        else { panic!("expected retained main-buffer page") };
+        let lines = history_lines(columns, &rows).unwrap();
+        assert_eq!(lines[0]["text"], "A界");
+        assert_eq!(lines[0]["runs"], json!([{
+            "text": "A界", "cells": 3, "fg": 1, "bold": true,
+            "strikethrough": true, "link": { "uri": "https://example.test/history" },
+        }]));
+        assert_eq!(lines[1]["text"], "");
+        assert_eq!(lines[1]["runs"], json!([{ "text": "        ", "cells": 8, "bg": 4 }]));
+        assert_eq!(lines[2]["text"], "12345678");
+        assert_eq!(lines[2]["wrapped"], false);
+        assert_eq!(lines[3]["text"], "9");
+        assert_eq!(lines[3]["wrapped"], true);
     }
 
     #[test]

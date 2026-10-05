@@ -460,6 +460,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::terminal_screen),
         )
         .route(
+            "/v1/client/terminals/{id}/history",
+            get(client_v0::terminal_history),
+        )
+        .route(
             "/v1/client/terminals/{id}/stream",
             get(client_v0::terminal_stream),
         )
@@ -4053,6 +4057,11 @@ fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
         "page-cursor-expired"
             | "timeline-history-incomplete"
             | "cursor-gap"
+            | "history-cursor-gap"
+            | "history-alternate-screen"
+            | "history-too-large"
+            | "terminal-unavailable"
+            | "terminal-ended"
             | "not-found"
             | "stale-fence"
             | "validation-failed"

@@ -2277,6 +2277,19 @@ export const SubjectDefinition = /*#__PURE__*/ (() => Schema.Struct({
 export type SubjectDefinition = typeof SubjectDefinition.Type
 export type SubjectDefinitionEncoded = typeof SubjectDefinition.Encoded
 
+export const TerminalHistory = /*#__PURE__*/ (() => Schema.Struct({
+  "columns": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+  "kind": Schema.Literal("terminal-history"),
+  "lines": Schema.Array(TerminalLine).check(Schema.isMaxLength(200)),
+  "next_before": Schema.OptionFromNullOr(Schema.String.check(Schema.isMaxLength(128))),
+  "retained_rows": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "retention": Schema.Literal("owner-memory"),
+  "runtime_incarnation": Schema.String.check(Schema.isMinLength(1)),
+  "terminal_id": TerminalId
+}).annotate({ identifier: "TerminalHistory" }))()
+export type TerminalHistory = typeof TerminalHistory.Type
+export type TerminalHistoryEncoded = typeof TerminalHistory.Encoded
+
 export const TimelinePage = /*#__PURE__*/ (() => Schema.Struct({
   "items": Schema.Array(TimelineEntry),
   "kind": Schema.Literal("timeline-page"),

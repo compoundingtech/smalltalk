@@ -1540,6 +1540,17 @@ export type TerminalFacts = {
   uptime_s?: number;
 };
 
+export type TerminalHistory = {
+  columns: number;
+  kind: "terminal-history";
+  lines: Array<TerminalLine>;
+  next_before: string | null;
+  retained_rows: number;
+  retention: "owner-memory";
+  runtime_incarnation: string;
+  terminal_id: TerminalId;
+};
+
 export type TerminalId = string;
 
 export type TerminalLine = {

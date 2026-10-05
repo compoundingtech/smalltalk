@@ -6226,6 +6226,127 @@ async fn terminal_screen_value(
     Ok(screen.value(&client_detail_id("terminal", id), &live.incarnation_id))
 }
 
+#[derive(Deserialize)]
+pub(super) struct TerminalHistoryQuery {
+    runtime_incarnation: String,
+    before: Option<String>,
+    limit: Option<u16>,
+}
+
+fn history_error(code: &str, message: &str, status: StatusCode) -> ApiError {
+    ApiError { status, code: code.into(), message: message.into(), details: Box::default() }
+}
+
+/// The physical PTY incarnation and daemon generation come from one owner-local snapshot,
+/// never solely from a possibly lagging runtime claim.
+fn terminal_history_generation(root: &std::path::Path, runtime_id: &str, incarnation: &str) -> Result<String, ApiError> {
+    let metadata = pty_core::registry::read_metadata_in(root, runtime_id)
+        .ok_or_else(|| terminal_unavailable("the terminal owner identity metadata is unavailable"))?;
+    let pid = metadata.daemon_pid.filter(|pid| *pid > 0)
+        .ok_or_else(|| terminal_unavailable("the terminal owner identity has no daemon PID"))?;
+    if metadata.created_at.is_empty() {
+        return Err(terminal_unavailable("the terminal owner identity has no creation time"));
+    }
+    if format!("{pid}:{}", metadata.created_at) != incarnation {
+        return Err(stale("the physical terminal incarnation changed"));
+    }
+    metadata.generation.filter(|generation| !generation.is_empty())
+        .ok_or_else(|| terminal_unavailable("the terminal owner identity has no generation"))
+}
+
+async fn terminal_history_value(
+    state: &AppState,
+    id: &str,
+    incarnation: &str,
+    before: Option<String>,
+    limit: u16,
+) -> Result<Value, ApiError> {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let subject = terminal_subject(id);
+    let live = terminal_live_session(state, &subject, Some(incarnation))?;
+    if !live.terminal {
+        return Err(validation("the requested runtime does not expose a terminal"));
+    }
+    let root = state.pty_root.clone();
+    let runtime_id = live.runtime_id;
+    let expected_incarnation = incarnation.to_owned();
+    let response = tokio::task::spawn_blocking(move || {
+        let expected_generation = terminal_history_generation(&root, &runtime_id, &expected_incarnation)?;
+        let response = pty_client::history::read_in(
+            &root, &runtime_id, &HistoryRequest { expected_generation: expected_generation.clone(), limit, before }, Duration::from_secs(5),
+        ).map_err(|error| terminal_unavailable(error.to_string()))?;
+        if terminal_history_generation(&root, &runtime_id, &expected_incarnation)? != expected_generation {
+            return Err(stale("the physical terminal generation changed during the history read"));
+        }
+        match response {
+            HistoryResponse::Page { columns, retained_rows, rows, next_before } => {
+                let lines = terminal_view::history_lines(columns, &rows).map_err(terminal_view_error)?;
+                Ok(json!({
+                    "kind": "terminal-history",
+                    "columns": columns,
+                    "retained_rows": retained_rows,
+                    "lines": lines,
+                    "next_before": next_before,
+                    "retention": "owner-memory",
+                }))
+            }
+            HistoryResponse::CursorGap => Err(history_error("history-cursor-gap", "the history cursor expired or its retained boundary was discarded; restart pagination", StatusCode::CONFLICT)),
+            HistoryResponse::StaleGeneration => Err(stale("the physical terminal generation changed before the history read")),
+            HistoryResponse::AlternateScreen => Err(history_error("history-alternate-screen", "main-buffer history is unavailable while the alternate screen is active", StatusCode::CONFLICT)),
+            HistoryResponse::InvalidRequest => Err(validation("history limit must be 1..200 and the cursor at most 128 bytes")),
+            HistoryResponse::Unavailable => Err(terminal_unavailable("the terminal owner could not read retained history")),
+            HistoryResponse::TooLarge => Err(history_error("history-too-large", "the retained history page exceeds the response limit", StatusCode::PAYLOAD_TOO_LARGE)),
+        }
+    }).await.map_err(ApiError::internal)??;
+    terminal_live_session(state, &subject, Some(incarnation))?;
+    let mut value = response;
+    value["terminal_id"] = client_detail_id("terminal", id).into();
+    value["runtime_incarnation"] = incarnation.into();
+    if serde_json::to_vec(&value).map_err(ApiError::internal)?.len()
+        > CLIENT_MAX_RESPONSE_BYTES.saturating_sub(128_000)
+    {
+        return Err(history_error("history-too-large", "the styled history page exceeds the response limit; request fewer rows", StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    Ok(value)
+}
+
+pub(super) async fn terminal_history(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<TerminalHistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "terminal.read")?;
+    let limit = query.limit.unwrap_or(100);
+    if limit == 0 || limit > 200 || query.runtime_incarnation.is_empty()
+        || query.before.as_ref().is_some_and(|cursor| cursor.len() > 128)
+    {
+        return Err(validation("history requires an incarnation, limit 1..200, and cursor at most 128 bytes"));
+    }
+    match terminal_history_value(&state, &id, &query.runtime_incarnation, query.before.clone(), limit).await {
+        Ok(value) => Ok(Json(value)),
+        Err(error) if error.code == "runtime-not-local" => {
+            if !acting_party(&session) {
+                return Err(forbidden("remote terminal history requires a concrete person or agent"));
+            }
+            let live = remote_terminal_live_session(&state, &terminal_subject(&id), &query.runtime_incarnation)?;
+            let relay = state.client_relay.as_ref().ok_or_else(|| remote_unavailable(&live.owner_host_id))?;
+            let value = relay.read(&live.owner_host_id, &crate::peer::ClientReadRequest {
+                authority_actor: session.authority_actor.clone(),
+                relay: None,
+                request: crate::peer::ClientReadOperation::TerminalHistory {
+                    terminal_id: client_detail_id("terminal", &id),
+                    runtime_incarnation: query.runtime_incarnation,
+                    before: query.before,
+                    limit,
+                },
+            }).await.map_err(|error| remote_read_error(&live.owner_host_id, error))?;
+            Ok(Json(value))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Default, Deserialize)]
 pub(super) struct TerminalScreenQuery {
     after: Option<String>,

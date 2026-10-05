@@ -2268,6 +2268,30 @@ impl Client {
         self.get(&format!("/v1/client/agent-queues/{agent_id}"))
             .await
     }
+    async fn terminal_history_internal(
+        &self,
+        terminal_id: &str,
+        runtime_incarnation: &str,
+        before: Option<&str>,
+        limit: u16,
+    ) -> Result<Envelope<TerminalHistory>, ClientError> {
+        let mut query = vec![
+            format!(
+                "runtime_incarnation={}",
+                percent_encode(runtime_incarnation)
+            ),
+            format!("limit={limit}"),
+        ];
+        if let Some(before) = before {
+            query.push(format!("before={}", percent_encode(before)));
+        }
+        self.get(&format!(
+            "/v1/client/terminals/{}/history?{}",
+            percent_encode_segment(terminal_id.trim_start_matches("terminal/")),
+            query.join("&"),
+        ))
+        .await
+    }
     async fn terminal_screen_internal(
         &self,
         terminal_id: &str,
