@@ -198,8 +198,8 @@ The Claude no-st2 seat eval and all five harness boot canaries inspect fresh sea
 for `ST2_*` exports and st2 program/path references. They also inspect generated state, home
 and PTY paths, text records, SQLite schemas/semantic rows and logs for st2 labels. Fixtures use
 neutral identities and payloads, so authored text cannot hide an owned label. Base64 replication
-payloads/signatures are opaque; their stored semantic claims are checked separately. Historical
-binary-upgrade canaries retain predecessor records and are outside this fresh-generation rule.
+payloads and replication/claim signatures are opaque; stored semantic claims remain checked.
+Historical binary-upgrade canaries retain predecessor records and are outside this fresh-generation rule.
 The mutation suite injects every prohibited category and requires rejection; source/dependency
 mutations also exercise the guard's CLI exit status.
 
