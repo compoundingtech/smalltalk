@@ -35,7 +35,12 @@ with tempfile.TemporaryDirectory() as temporary:
       outputs = { nixpkgs, ... }: let
         system = "%s";
         pkgs = import nixpkgs { inherit system; };
-        package = pkgs.runCommand "%s" {} "echo example-one > $out";
+        dependencies = pkgs.runCommand "example-dependencies" {} "echo dependencies > $out";
+        package = pkgs.runCommand "%s" {
+          outputs = [ "out" "cargoBuildArtifacts" ];
+          meta.outputsToInstall = [ "out" ];
+          passthru.cargoDependencyArtifacts = dependencies;
+        } "echo example-one > $out; echo production-artifacts > $cargoBuildArtifacts";
         check = pkgs.runCommand "%s-check" {} "echo example-check > $out";
       in {
         packages.${system}.default = package;
@@ -53,11 +58,14 @@ with tempfile.TemporaryDirectory() as temporary:
     subprocess.run([str(script), 'build'], cwd=fixture, env=env, check=True)
     assert '⚠️ **P0: Nix store cache MISS before build' in (root / 'summary').read_text()
     report = json.loads((root / 'nix-release-build.json').read_text())
-    assert len(report['targets']) == 3, report
+    assert len(report['targets']) == 7, report
     contents = {Path(path).read_text().strip() for result in report['results']
                 for path in result['outputs'].values()}
-    assert contents == {'example-one', 'example-check'}, contents
-    assert list((cache / 'smalltalk-nix-release').glob('result*'))
+    assert contents == {'example-one', 'example-check', 'dependencies', 'production-artifacts'}, contents
+    roots = list((cache / 'smalltalk-nix-release').glob('result*'))
+    assert {str(path.resolve()) for path in roots} == {
+        path for result in report['results'] for path in result['outputs'].values()
+    }, 'all build caches must have persistent GC roots'
     subprocess.run([str(script), 'verify-cache'], cwd=fixture, env=env, check=True)
 
     (root / 'summary').write_text('')

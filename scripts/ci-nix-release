@@ -31,6 +31,19 @@ def main():
         if not checks:
             raise SystemExit('ci-nix-release: the flake has no native checks')
         targets = [f'.#packages.{system}.default', *[f'.#checks.{system}.{check}' for check in checks]]
+        # Compiled Cargo caches are build inputs, not runtime dependencies. Root
+        # them explicitly so Nix GC cannot discard them with the checkout.
+        attributes = '[ "cargoDependencyArtifacts" "cargoBuildArtifacts" ]'
+        package_caches = json.loads(output(
+            'nix', 'eval', '--json', '--no-update-lock-file', f'.#packages.{system}.default',
+            '--apply', f'package: builtins.filter (name: builtins.hasAttr name package) {attributes}'))
+        check_caches = json.loads(output(
+            'nix', 'eval', '--json', '--no-update-lock-file', f'.#checks.{system}', '--apply',
+            'checks: builtins.concatLists (map (name: '
+            f'map (attr: name + "." + attr) (builtins.filter (attr: builtins.hasAttr attr checks.${{name}}) {attributes})'
+            ') (builtins.attrNames checks))'))
+        targets += [f'.#packages.{system}.default.{attr}' for attr in package_caches]
+        targets += [f'.#checks.{system}.{attr}' for attr in check_caches]
         # Probe the actual output paths before building. A post-build warm proof alone
         # cannot reveal whether this run first downloaded or compiled a missing output.
         derivations = json.loads(output('nix', 'derivation', 'show', '--no-update-lock-file', *targets))
