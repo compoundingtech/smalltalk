@@ -723,7 +723,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         result = Err(error);
                     }
                     if !subscription.delivered && subscription.request.subject_ref.is_some()
-                        && result.as_ref().is_ok_and(|(_, items, _)| items.is_empty())
+                        && result.as_ref().is_ok_and(|(_, items, _): &(ClientSnapshot, Vec<Value>, bool)| items.is_empty())
                     {
                         result = Err(ApiError::not_found("the native subject is not available"));
                     }
