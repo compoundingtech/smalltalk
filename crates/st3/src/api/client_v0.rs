@@ -3980,16 +3980,16 @@ fn timeline_items(
     snapshot: &ClientSnapshot,
     session_id: &str,
 ) -> Result<Vec<Value>, ApiError> {
-    let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
+    let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
         .map_err(ApiError::internal)?;
     let Some((owner, incarnation, _)) = managed else {
         let conversation = crate::external_sessions::find_conversation(
             state.native_session_home.as_deref(),
-            &session_id,
+            session_id,
         )
         .map_err(ApiError::internal)?;
-        let items = external_conversation_items(conversation, &session_id)?;
-        return native_timeline_items(state, snapshot, &session_id, items);
+        let items = external_conversation_items(conversation, session_id)?;
+        return native_timeline_items(state, snapshot, session_id, items);
     };
     let owner = owner.as_str();
     let incarnation = incarnation.as_deref();
@@ -4008,9 +4008,9 @@ fn timeline_items(
                     .map_err(|error| format!("the transcript could not be read: {error:#}"))
             });
         match read {
-            Ok(items) => return native_timeline_items(state, snapshot, &session_id, items),
+            Ok(items) => return native_timeline_items(state, snapshot, session_id, items),
             Err(reason) => {
-                transcript_notice_entry = Some(transcript_notice(&session_id, &managed, &reason));
+                transcript_notice_entry = Some(transcript_notice(session_id, &managed, &reason));
             }
         }
     }
@@ -4076,7 +4076,7 @@ fn timeline_items(
         .claims;
     owner_claims.reverse();
     owner_claims.retain(|claim| claim.kind != "harness.timeline");
-    let mut message_claims = session_messages(state, owner, &session_id, incarnation, before)?;
+    let mut message_claims = session_messages(state, owner, session_id, incarnation, before)?;
     message_claims.reverse();
     let mut claims = timeline_claims;
     claims.extend(owner_claims);
