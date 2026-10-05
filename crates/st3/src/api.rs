@@ -67,6 +67,7 @@ mod github_watch;
 mod harness_events;
 mod mailbox;
 mod owned_sets;
+mod private_notes_login;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
@@ -4498,6 +4499,7 @@ async fn serve_unix_with_ancestor(
         };
         // Every local connection names its caller, so request counts by client are always on.
         let peer_pid = local_peer_pid(&stream);
+        let notes_peer = bind_ancestry.then(|| private_notes_login::Peer::capture(&stream)).flatten();
         let app = app.clone();
         tokio::spawn(async move {
             // /proc ancestry may fault in pages on a loaded host. Keep that work
@@ -4516,19 +4518,21 @@ async fn serve_unix_with_ancestor(
                 .unwrap_or_default(),
                 None => (None, None, None),
             };
-            let notes_principal = match peer_pid {
-                Some(pid) if bind_ancestry && bound_agent.is_none() =>
-                    tokio::task::spawn_blocking(move || notes_pairing_principal_ancestor(pid)).await.unwrap_or(false),
-                _ => false,
-            };
+            let notes_peer = notes_peer.filter(|_| bound_agent.is_none()).map(Arc::new);
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
                 let bound_agent = bound_agent.clone();
                 let caller = caller.clone();
                 let delivery_peer = delivery_peer.clone();
+                let notes_peer = notes_peer.clone();
                 async move {
                     let mut request = request.map(Body::new);
-                    if notes_principal { request.extensions_mut().insert(VerifiedNotesPairingPrincipal); }
+                    if bound_agent.is_none() && request.method() == axum::http::Method::POST
+                        && request.uri().path() == "/v1/client/pairings"
+                        && let Some(peer) = notes_peer
+                        && peer.admitted().await {
+                        request.extensions_mut().insert(VerifiedNotesPairingPrincipal);
+                    }
                     if let Some(peer) = delivery_peer {
                         request.extensions_mut().insert(peer);
                     }
@@ -4614,39 +4618,10 @@ mod gateway_listener_tests {
 }
 
 /// Bootstrap authority only: a configured-person notes pairing requires a
-/// positive authenticated login anchor. This never grants uncredentialed notes access.
+/// current root-issued PAM login. This never grants uncredentialed notes access.
 #[derive(Clone, Copy)]
 struct VerifiedNotesPairingPrincipal;
 
-#[cfg(target_os = "linux")]
-fn notes_pairing_principal_ancestor(mut pid: u32) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    let mut seen = std::collections::BTreeSet::new();
-    while pid > 1 && seen.insert(pid) {
-        let root = format!("/proc/{pid}");
-        let Ok(metadata) = fs::metadata(&root) else { return false };
-        // SAFETY: getuid has no inputs and no memory safety requirements.
-        if metadata.uid() != unsafe { libc::getuid() } {
-            if metadata.uid() != 0 { return false; }
-            let Ok(executable) = fs::read_link(format!("{root}/exe")) else { return false };
-            let Ok(image) = fs::metadata(format!("{root}/exe")) else { return false };
-            return image.uid() == 0 && image.mode() & 0o022 == 0
-                && matches!(executable.file_name().and_then(|name| name.to_str()), Some("sshd" | "sshd-session"));
-        }
-        let Ok(environment) = fs::read(format!("{root}/environ")) else { return false };
-        if environment.split(|byte| *byte == 0).any(|entry| entry.starts_with(b"ST_AGENT=agent/")) {
-            return false;
-        }
-        let Ok(stat) = fs::read_to_string(format!("{root}/stat")) else { return false };
-        let Some(parent) = stat.rsplit_once(") ").and_then(|(_, fields)| fields.split_whitespace().nth(1))
-            .and_then(|parent| parent.parse().ok()) else { return false };
-        pid = parent;
-    }
-    false
-}
-
-#[cfg(not(target_os = "linux"))]
-fn notes_pairing_principal_ancestor(_pid: u32) -> bool { false }
 
 #[cfg(target_os = "linux")]
 fn harness_ancestor(mut pid: u32) -> Option<String> {

@@ -1034,7 +1034,7 @@ export type PlannerConfig = {
 };
 
 export type PrivateNotesAction = {
-  fence: Fence;
+  fence: Fence & Required<Pick<Fence, 'private_notes'>>;
   id: "private-notes.write";
 };
 

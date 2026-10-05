@@ -62,11 +62,15 @@ remain checked on every authenticated request.
 
 Bootstrap delegation requires a positively admitted authenticated local login,
 the configured person, and an unbound client; another already-attested notes
-credential may delegate only its existing notes scopes. The login admission is
-Linux-only and fails closed when its protected SSH login executable cannot be
-inspected. PID 1, detached processes, mutable person headers and native process
-environment are not positive authority. Other platforms require an existing
-attested credential; no uncredentialed content access is available.
+credential may delegate only its existing notes scopes. Linux admission
+revalidates the kernel socket-peer lifetime and current parent chain on each
+bootstrap. A root-owned system-bus login issuer must report a live PAM `sshd`
+session for the daemon OS-owner UID with the exact ancestor leader lifetime.
+Recognized native agents cannot begin or complete notes delegation.
+PID 1, detached processes, mutable person headers, user-service cgroups and
+native process environment are not positive authority. Missing kernel pidfd or
+system login support fails closed. Other platforms require an existing attested
+credential; no uncredentialed content access is available.
 
 Native agents never write or delegate notes authority. Optional native
 self-read is unavailable without admitted reader-incarnation provenance:

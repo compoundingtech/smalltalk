@@ -916,6 +916,25 @@ fn ts_type(value: &Value) -> Result<String> {
             ));
         }
     }
+    // A required-only allOf branch refines optional fields on its referenced
+    // object. Dropping that branch makes returned action fences unusable by
+    // the corresponding typed write method.
+    if let Some(parts) = value.get("allOf").and_then(Value::as_array)
+        && parts.len() == 2
+        && let Some(reference) = parts.iter().find(|part| part.get("$ref").is_some())
+        && let Some(required) = parts.iter()
+            .find(|part| part.as_object().is_some_and(|object| object.len() == 1 && object.contains_key("required")))
+            .and_then(|part| part["required"].as_array())
+    {
+        let keys = required.iter()
+            .map(|key| key.as_str().map(|key| format!("'{key}'")).context("required property"))
+            .collect::<Result<Vec<_>>>()?;
+        let base = ts_type(reference)?;
+        if keys.is_empty() {
+            return Ok(base);
+        }
+        return Ok(format!("{base} & Required<Pick<{base}, {}>>", keys.join(" | ")));
+    }
     if let Some(types) = value.get("type").and_then(Value::as_array) {
         return Ok(types
             .iter()
