@@ -54,6 +54,62 @@ token buckets, model, and reported cost; context occupancy is a separate measure
 A `turn` frame carries a terminal result, not usage: provider errors become timeline errors.
 `session` and `ready` frames report the native session ID and transcript for resume.
 
+Native transcript tool results use the message-level `toolCallId` and `isError` to produce
+one typed result paired with its exact call, preserving composite IDs and failure status.
+Text blocks within that result remain its content, not separate plain tool messages.
+
+Visible native OMP `custom_message` records are content entries with
+`body.media_type = "application/vnd.omp.event+json"` and `body.text` containing this JSON envelope:
+
+```json
+{
+  "_tag": "OmpEvent",
+  "version": 1,
+  "kind": "irc:incoming",
+  "attribution": "agent",
+  "content": "An incoming message",
+  "details": {"from": "worker", "message": "An incoming message", "id": "message-id"}
+}
+```
+
+`kind`, `attribution`, `content`, and `details` retain the native values; missing values are
+`null`. The timeline role remains `system` as a transport role. Consumers derive provenance
+from the envelope, not display-text heuristics: IRC senders come from `details.from`; async
+task identities stay in `details.jobs` with their native `type`, `label`, and `id`. Mixed or
+multiple jobs remain one native event unless their body has an authoritative partition.
+Human, daemon, system, and absent attribution are not inferred to be agents.
+Structured resource observations retain their content and details in the same envelope.
+`display: false` stays hidden; an absent `display` retains the native reader's visible behavior.
+The existing native-value byte bound applies separately to content and details; oversized
+fields become marked truncated text without corrupting the envelope's JSON.
+Timeline page limits are item-count upper bounds: a page can contain fewer entries to stay
+within the gateway response budget. Pagination preserves each complete envelope and advances
+the continuation cursor by the number actually returned; following it does not skip entries.
+Consumers must opt into this media type. Legacy conversation adapters may omit these system
+entries rather than render their JSON.
+Pi's existing plain custom-message projection is unchanged.
+
+The observed administrative entry types `model_usage`, `title_change`, `session_init`, and
+`ttsr_injection` use the same envelope rather than an unrecognized-entry text fallback.
+Their `kind` is the native entry type, `content` is `null`, and `details` contains the bounded
+native record, including its IDs and timestamp. Native attribution is retained when present;
+otherwise it stays `null`. The timeline timestamp uses the same native/predecessor rule as
+conversation entries. `display: false` remains hidden.
+Existing bookkeeping (`session`, `model_change`, `custom`, `credential_pin`, and `title`)
+stays hidden; compaction still contributes its summary. This whitelist applies only to OMP:
+Pi and genuinely unknown entry types retain their existing behavior.
+
+`crates/st3/fixtures/omp-admin-events.jsonl` preserves one native shape per administrative kind
+from a session resumed on 2026-10-04. Native IDs and timestamps remain exact, but every payload
+string and numeric usage value is redacted. No bootstrap prompt, injected rule, task, model
+label, or tool name from that capture is published.
+
+`crates/st3/fixtures/omp-native-events.jsonl` contains a redacted 2026-10-01 OMP capture:
+the native tool call/result IDs and error flag, plus an incoming IRC event's envelope.
+Tool arguments, result text, sender name and incoming text are redacted; no credentials,
+machine paths, or host metadata are retained. Task-job and structured-resource boundary
+cases are synthetic regression inputs, not additional claims about that capture.
+
 Unsupported frames, including `pre_compact`, produce a structured debug event with
 `frame_type` and `observer_enabled`; frame payloads are not logged. When the managed observation
 outbox is unavailable, unforwarded `timeline`, `context`, and `turn` frames produce the same
