@@ -85,7 +85,7 @@ class Native:
         self.transcript = self.sessions / f"2000-01-01T00-00-00-000Z_{self.session_id}.jsonl"
         self.transcript.write_text("".join(json.dumps(row) + "\n" for row in original))
         environment = {"PATH": os.environ.get("PATH", os.defpath), "TERM": "xterm-256color",
-                       "PI_OFFLINE": "1", "NO_COLOR": "1", "PROBE_CHANNEL_ROOT": str(root),
+                       "NO_COLOR": "1", "PROBE_CHANNEL_ROOT": str(root),
                        # Admit the fixture's model without reading any real credentials.
                        # A post-result continuation can contact only this refused local port.
                        "ANTHROPIC_API_KEY": "native-ask-probe-inert",
@@ -95,7 +95,7 @@ class Native:
                        "ST_OMP_CHANNEL_RUNTIME_ID": f"native-ask-{incarnation}",
                        "ST_OMP_CHANNEL_SESSION": incarnation, "ST_OMP_CHANNEL_SEQ": "1"}
         for name in ["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
-                     "XDG_DATA_HOME", "XDG_RUNTIME_DIR"]:
+                     "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "TMPDIR"]:
             directory = root / name.lower()
             directory.mkdir()
             environment[name] = str(directory)

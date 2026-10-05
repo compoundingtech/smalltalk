@@ -68,8 +68,9 @@ node --experimental-strip-types crates/st-drivers/hooks/typecheck/omp-smoke.mjs 
 ```
 
 The standalone real-OMP probe drives the native picker in a disposable PTY with an
-isolated offline HOME, preserving real answer, cancellation, timeout and interruption
-records. It covers live start/completion, channel reconnect, shutdown and a hard-crash
+isolated credential-free HOME and native temporary directory, preserving real answer,
+cancellation, timeout and interruption records. It covers live start/completion, channel
+reconnect, shutdown and a hard-crash
 restart whose transcript still has an unresolved ask but whose new incarnation has no picker:
 
 ```sh
@@ -77,7 +78,20 @@ OMP_BIN=/path/to/raw/omp python3 crates/st3/fixtures/omp-resume/native-active-as
 ```
 
 Use the raw pinned OMP executable, not a fleet launcher. The probe needs no provider
-credential, daemon or production seat. It exits nonzero on any failed lifecycle assertion.
+credential, st daemon or production seat. It exits nonzero on any failed lifecycle assertion.
+
+For a cold-start proof on a busy Linux disk, put the disposable profile on an executable
+tmpfs:
+
+```sh
+TMPDIR=/dev/shm OMP_BIN=/path/to/raw/omp python3 crates/st3/fixtures/omp-resume/native-active-ask-probe.py
+```
+
+Native OMP
+extracts roughly 380 MB of addons into each fresh HOME and initializes its SQLite caches;
+disk I/O contention can exhaust the unchanged startup deadline before any ask executes.
+The tmpfs lane preserves every native startup, history, idle and lifecycle assertion;
+it does not retry startup, add sleeps or extend the deadline.
 
 ## Channel telemetry
 
