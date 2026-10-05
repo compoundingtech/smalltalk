@@ -122,6 +122,30 @@ fn flush_pending(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// A pinned diagnostic snapshot cannot write. Apply the queued subjects' exact delta
+/// to that snapshot's cached count without changing either the snapshot or the queue.
+pub(super) fn count_in_snapshot(connection: &Connection, before_unix_ms: u128) -> Result<u64> {
+    let before = i64::try_from(before_unix_ms).unwrap_or(i64::MAX);
+    let base: i64 = connection
+        .prepare_cached(COUNT_SQL)?
+        .query_row([before], |row| row.get(0))?;
+    let delta: i64 = connection
+        .prepare_cached(
+            "SELECT COALESCE(SUM(
+            CASE WHEN (SELECT MAX(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
+                       WHERE subject=pending.subject AND kind='message.sent') < ?1
+                 AND NOT EXISTS (SELECT 1 FROM claims WHERE subject=pending.subject
+                                 AND kind IN ('message.read','message.closed'))
+                 THEN 1 ELSE 0 END
+            - CASE WHEN EXISTS (SELECT 1 FROM unread_mail
+                                 WHERE subject=pending.subject AND sent_time < ?1)
+                   THEN 1 ELSE 0 END
+         ),0) FROM unread_mail_pending pending",
+        )?
+        .query_row([before], |row| row.get(0))?;
+    Ok(u64::try_from(base + delta)?)
+}
+
 pub(super) fn count_before(transaction: &Transaction<'_>, before_unix_ms: u128) -> Result<u64> {
     // The caller holds one writer transaction: pending changes and their exact age count
     // become visible together, and a concurrent message cannot disappear between the two.
@@ -184,11 +208,27 @@ mod tests {
             assert_eq!(pending, times.len() as u64);
         }
         let check = |expected: &[u128]| {
+            // Check before any ordinary count flushes the queue: both newly unread messages
+            // and pending terminal transitions must be exact inside a read-only snapshot.
+            assert_eq!(
+                store
+                    .read_snapshot(|_| store.unread_mail_count_before(u128::MAX))
+                    .unwrap(),
+                expected.len() as u64
+            );
             for cutoff in times
                 .into_iter()
                 .flat_map(|time| [time - 1, time, time + 1])
                 .chain([0, i64::MAX as u128, u128::MAX])
             {
+                let count_in_snapshot = store
+                    .read_snapshot(|_| store.unread_mail_count_before(cutoff))
+                    .unwrap();
+                assert_eq!(
+                    count_in_snapshot,
+                    expected.iter().filter(|time| **time < cutoff).count() as u64,
+                    "pinned cutoff {cutoff}"
+                );
                 assert_eq!(
                     store.unread_mail_count_before(cutoff).unwrap(),
                     expected.iter().filter(|time| **time < cutoff).count() as u64,

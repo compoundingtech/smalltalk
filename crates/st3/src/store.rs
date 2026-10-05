@@ -10749,6 +10749,13 @@ impl Store {
 
     pub fn unread_mail_count_before(&self, before_unix_ms: u128) -> Result<u64> {
         smallclaims::touched::note_read(|| "kind:message.sent".to_owned());
+        if PINNED_READER.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|(pool, _)| *pool == self.readers.key())
+        }) {
+            return unread_mail::count_in_snapshot(&self.readers.get(), before_unix_ms);
+        }
         let mut connection = self.connection.write();
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
