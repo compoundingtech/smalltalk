@@ -407,6 +407,45 @@ def forget_native_session(node, harness, session):
         path.unlink()
 
 
+def native_offer_count(node, reference):
+    """Count provider handoffs, independently of idempotent graph receipt claims."""
+    return sum((row.get("event") == "channel" and reference in row.get("content", ""))
+               or (row.get("event") == "turn" and reference in row.get("text", ""))
+               for row in receipts(node, "a"))
+
+
+def age_mail_fixture(node, subject):
+    """Backdate isolated mail while preserving the store's transactional row digest."""
+    import hashlib
+    import sqlite3
+
+    def projection_change(accumulator, table, columns, old, new, version):
+        # Matches smallclaims::store::projection_digest's version-one row accumulator.
+        if version != 1:
+            raise ValueError("unsupported fixture projection digest version")
+        total = int.from_bytes(accumulator, "big")
+        for row, sign in ((old, -1), (new, 1)):
+            if row is None:
+                continue
+            digest = hashlib.sha512(b"st3-projection-row-v1\0")
+            for value in (table, columns, row):
+                data = value.encode()
+                digest.update(len(data).to_bytes(8, "big"))
+                digest.update(data)
+            total += sign * int.from_bytes(digest.digest(), "big")
+        return (total % (1 << 512)).to_bytes(64, "big")
+
+    with sqlite3.connect(node.root / "state/claims.sqlite3", timeout=10) as connection:
+        connection.execute("PRAGMA recursive_triggers=ON")
+        connection.create_function("st_projection_change", 6, projection_change, deterministic=True)
+        changed = connection.execute(
+            "UPDATE claims SET accepted_at_unix_ms=? WHERE subject=? AND kind='message.sent'",
+            (str(time.time_ns() // 1_000_000 - 3_600_001), subject),
+        ).rowcount
+        if changed != 1:
+            fail("the hour-old fixture has no unique sent claim")
+
+
 def suspend_and_resume(node, seats, harness):
     subject = seat_subject("a")
     step = seats.step("a")
@@ -438,6 +477,8 @@ def suspend_and_resume(node, seats, harness):
     # Mail to a suspended seat waits, and its restart policy does not wake it.
     sent = node.json("conversations", "send", subject, "--from", "person/eval",
                      "--subject", "while suspended", "--body", "boot canary suspended")["subject"]
+    # Old means the same one-hour age as the backlog; only this isolated fixture is changed.
+    age_mail_fixture(node, sent)
     time.sleep(5)
     held = node.api("/v1/messages/read/" + sent) or {}
     if held.get("status") in ("read", "closed"):
@@ -445,6 +486,8 @@ def suspend_and_resume(node, seats, harness):
     if node.json("agents", "show", subject)["value"].get("state") != "suspended":
         fail("a suspended seat did not stay suspended")
 
+    recent = node.json("conversations", "send", subject, "--from", "person/eval",
+                       "--subject", "recent while suspended", "--body", "boot canary recent resume")["subject"]
     resumed = json.loads(node.cli("agents", "resume", subject, "--as", "person/eval",
                                   "--timeout", f"{seats.bound:.0f}s", "--json"))
     after = resumed.get("suspension") or {}
@@ -453,6 +496,11 @@ def suspend_and_resume(node, seats, harness):
     latest = native_sessions(node, "a")[-1]
     if latest != (native, True):
         fail(f"the resumed harness ran {latest}, not session {native} resumed")
+    # Recent never-offered mail survives the boot, while hour-old mail stays listable.
+    until(lambda: (node.api("/v1/messages/read/" + recent) or {}).get("status") in ("read", "closed"),
+          seats.bound, "the resumed seat did not recover recent unoffered mail")
+    if native_offer_count(node, recent) != 1:
+        fail("recent unoffered mail was not consumed exactly once after resume")
     # Resuming a native session is still a new seat boot. Its old mail remains listable,
     # and a fresh message proves that the resumed provider's delivery path works.
     until(lambda: (node.json("agents", "show", subject).get("value", {}).get("delivery") or {}).get("state") in ("current", "legacy"),
@@ -463,9 +511,10 @@ def suspend_and_resume(node, seats, harness):
           seats.bound, "the resumed seat did not read fresh mail")
     if (node.api("/v1/messages/read/" + sent) or {}).get("status") != held.get("status"):
         fail("resuming a seat automatically advanced its old mail")
-    if any(row.get("subject") == sent and row.get("event") in ("received", "read")
-           for row in receipts(node, "a")):
+    if native_offer_count(node, sent) != 0:
         fail("resuming a seat offered old mail to the provider")
+    if native_offer_count(node, recent) != 1:
+        fail("recovered recent mail reached the provider again")
     wait_drained(list((node.root / "state/drivers").rglob("st-harness-events.sqlite")), seats.bound)
     check_boundary(node)
 
