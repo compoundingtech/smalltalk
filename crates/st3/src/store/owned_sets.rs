@@ -2,6 +2,39 @@
 use super::*;
 use crate::model::MemberSpec;
 use serde::Deserialize;
+use std::cell::RefCell;
+
+struct SnapshotRows {
+    connection: usize,
+    rows: BTreeMap<Option<u64>, Vec<View>>,
+}
+
+thread_local! {
+    static SNAPSHOT_ROWS: RefCell<Option<SnapshotRows>> = const { RefCell::new(None) };
+}
+
+/// Reuse validated receipts only on the connection held by this fixed read snapshot. Other
+/// connections and writer transactions still read authority directly. The guard restores an
+/// enclosing scope on every exit, including errors and panics.
+fn with_snapshot_rows<T>(connection: &Connection, read: impl FnOnce() -> T) -> T {
+    debug_assert!(
+        !connection.is_autocommit(),
+        "receipt reuse requires a read snapshot"
+    );
+    struct Restore(Option<SnapshotRows>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SNAPSHOT_ROWS.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(SNAPSHOT_ROWS.with(|slot| {
+        slot.replace(Some(SnapshotRows {
+            connection: connection as *const Connection as usize,
+            rows: BTreeMap::new(),
+        }))
+    }));
+    read()
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Source {
@@ -127,6 +160,15 @@ pub fn subject(name: &str) -> Result<String, St3Error> {
 
 fn rows(connection: &Connection, at: Option<u64>) -> Result<Vec<View>, St3Error> {
     smallclaims::touched::note_read(|| "kind:owned-set.revised".into());
+    let connection_key = connection as *const Connection as usize;
+    if let Some(rows) = SNAPSHOT_ROWS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|snapshot| snapshot.connection == connection_key)
+            .and_then(|snapshot| snapshot.rows.get(&at).cloned())
+    }) {
+        return Ok(rows);
+    }
     let mut statement = connection.prepare(
         "SELECT id,subject,body,accepted_at_unix_ms FROM claims WHERE kind='owned-set.revised' AND store_index<=?1
          AND NOT EXISTS (SELECT 1 FROM replica_records WHERE replica_records.claim_id=claims.id AND replica_records.state='repaired')"
@@ -167,6 +209,15 @@ fn rows(connection: &Connection, at: Option<u64>) -> Result<Vec<View>, St3Error>
             blockers: Vec::new(),
         });
     }
+    SNAPSHOT_ROWS.with(|slot| {
+        if let Some(snapshot) = slot
+            .borrow_mut()
+            .as_mut()
+            .filter(|snapshot| snapshot.connection == connection_key)
+        {
+            snapshot.rows.insert(at, views.clone());
+        }
+    });
     Ok(views)
 }
 
@@ -1165,6 +1216,13 @@ pub(super) fn validate_receipt(subject_name: &str, body: &Value) -> Result<(), S
 }
 
 impl Store {
+    /// Called inside `read_snapshot`; holding this guard keeps the connection identity alive
+    /// until the receipt cache is discarded, before the snapshot returns it to the pool.
+    pub(crate) fn with_owned_set_snapshot_reads<T>(&self, read: impl FnOnce() -> T) -> T {
+        let connection = self.readers.get();
+        with_snapshot_rows(&connection, read)
+    }
+
     pub fn owned_sets(&self) -> Result<Vec<View>, St3Error> {
         selected(&self.readers.get(), None)
     }

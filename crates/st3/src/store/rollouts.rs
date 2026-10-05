@@ -47,6 +47,14 @@ fn operation(connection: &Connection, subject: &str) -> Result<Option<Operation>
     let Some(selected) = selection(connection, subject)? else {
         return Ok(None);
     };
+    operation_for_selection(connection, subject, &selected)
+}
+
+fn operation_for_selection(
+    connection: &Connection,
+    subject: &str,
+    selected: &Selection,
+) -> Result<Option<Operation>, St3Error> {
     smallclaims::touched::note_read(|| subject.to_owned());
     let mut query = connection.prepare_cached(&canonical_sql(
         "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
@@ -307,12 +315,27 @@ impl Store {
         selection(&self.readers.get(), subject)
     }
     pub fn rollout(&self, subject: &str) -> Result<Option<Operation>, St3Error> {
-        let mut selected = operation(&self.readers.get(), subject)?;
-        if let Some(operation) = selected.as_mut().filter(|o| o.phase == "draining") {
+        self.rollout_and_selection(subject)
+            .map(|(operation, _)| operation)
+    }
+    /// A status read uses the publication that selected its operation, including when that
+    /// operation is absent or superseded, rather than selecting the declaration a second time.
+    pub(crate) fn rollout_and_selection(
+        &self,
+        subject: &str,
+    ) -> Result<(Option<Operation>, Option<Selection>), St3Error> {
+        let connection = self.readers.get();
+        let selected = selection(&connection, subject)?;
+        let mut operation = selected
+            .as_ref()
+            .map(|selected| operation_for_selection(&connection, subject, selected))
+            .transpose()?
+            .flatten();
+        if let Some(operation) = operation.as_mut().filter(|o| o.phase == "draining") {
             operation.blocking =
                 crate::rollout::blockers(self, subject, operation).map_err(internal)?;
         }
-        Ok(selected)
+        Ok((operation, selected))
     }
     /// Capture publication and incarnation fences atomically with the durable request.
     #[allow(clippy::too_many_arguments)]
