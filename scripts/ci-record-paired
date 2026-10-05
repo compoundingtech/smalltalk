@@ -9,11 +9,11 @@ import subprocess
 import time
 
 HEADS = {
-    'main': 'e4062387fd5bd5538158f63e11bbf5aedc3ebe2c',
-    'after': '481d4988cadac2ad6d679a6ba2d7dbe84f3160ed',
+    'main': '01766bf84d4ce0bfb5d216449267d1387c1e4e86',
+    'after': 'dac9593d689dc776879443ab5885d5342d2f5dec',
 }
 BASELINES = [37276978494, 37273736714, 37265290064, 37257137831, 37256435588]
-MEASURED_PAIRS = 5
+MEASURED_PAIRS = 3
 workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
 temporary = pathlib.Path(os.environ['RUNNER_TEMP'])
 output = temporary / 'perf'
@@ -68,7 +68,8 @@ plan = {
     'baseline_runs': BASELINES,
     'baseline_file_sha256': baseline_hashes,
     'assertions_and_budgets_unchanged': True,
-    'profiling_disabled': True,
+    'profiling_disabled': False,
+    'all_diagnostic_timings_excluded_from_accepted_evidence': True,
     'workload_seconds': 120,
     'workload_scale': 1,
     'runner': machine(),
@@ -133,6 +134,8 @@ for pair in range(MEASURED_PAIRS + 1):
         assert digest(pathlib.Path(executable['path'])) == executable['sha256']
         directory = output / f'pair-{pair}-{side}'
         directory.mkdir()
+        profile = directory / 'profile'
+        profile.mkdir()
         report = directory / 'load.json'
         environment = os.environ.copy()
         for key in list(environment):
@@ -140,7 +143,8 @@ for pair in range(MEASURED_PAIRS + 1):
                 environment.pop(key)
         environment.update(ST_LOAD_GATE='1', ST_LOAD_SCALE='1', ST_LOAD_SECONDS='120',
                            ST_LOAD_REPORT=str(report), ST_LOAD_BASELINE=str(baseline),
-                           ST_BENCH_DIR=str(fixture), TMPDIR=str(temporary))
+                           ST_BENCH_DIR=str(fixture), TMPDIR=str(temporary),
+                           ST3_PROFILE_DIR=str(profile), ST3_PROFILE_SLOW_MS='50')
         before = machine()
         with (directory / 'load.log').open('w') as log:
             trial = subprocess.run([executable['path'], 'daemon_load::', '--nocapture'],
@@ -172,7 +176,7 @@ write('paired-summary.json', {
     'historical_gate_failures': sum(row['exit_code'] != 0 for row in samples),
 })
 with pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
-    summary.write('Single-runner record comparison: one warmup pair and five alternating measured pairs.\n\n')
+    summary.write('Single-runner record comparison: one warmup pair and three alternating diagnostic pairs. All timings excluded from accepted evidence.\n\n')
     summary.write('All runs use unchanged historical assertions/budgets. Nonzero outcomes remain failures.\n\n')
     summary.write('| Pair | Side | Warmup | Exit | CPU cores | Claim p99 ms | Wake p99 ms |\n')
     summary.write('|---|---|---|---:|---:|---:|---:|\n')
