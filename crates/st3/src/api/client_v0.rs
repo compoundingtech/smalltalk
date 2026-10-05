@@ -1145,6 +1145,7 @@ const LIMITED_PAIRING_SCOPES: &[&str] = &[
 const ACTIONS: &[&str] = &[
     "harness.model.set",
     "harness.queue.mutate",
+    "harness.answer_ask",
     "attention.resolve",
     "review.approve",
     "review.reject",
@@ -1203,6 +1204,7 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "custom.reply",
     "harness.model.set",
     "harness.queue.mutate",
+    "harness.answer_ask",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -7267,6 +7269,7 @@ pub(super) struct ActionRequest {
 
 fn action_scope(action: &str) -> Option<&'static str> {
     if action == "harness.model.set" { return Some("control.runtimes"); }
+    if action == "harness.answer_ask" { return Some("control.runtimes"); }
     if action == "harness.queue.mutate" {
         return Some("control.runtimes");
     }
@@ -8965,6 +8968,10 @@ pub(super) async fn action(
     if request.action_type == "harness.model.set" {
         validate_fence(&state, &request.fence)?;
         return Ok(Json(harness_model::mutate(&state, &session, &request).await?));
+    }
+    if request.action_type == "harness.answer_ask" {
+        validate_fence(&state, &request.fence)?;
+        return Ok(Json(harness_control::answer_ask(&state, &session, &request).await?));
     }
     // Snapshot provenance is checked, while freshness belongs to the action's own
     // revision, generation, incarnation, or screen checks.

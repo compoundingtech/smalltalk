@@ -48,7 +48,13 @@ pub(in crate::api) async fn queue(State(state): State<AppState>, Extension(sessi
         return Ok(Json(relay(&state, &session, &host, crate::peer::ClientReadOperation::HarnessQueue { subject, cursor: query.cursor, limit: query.limit }).await?));
     }
     let mut queue = state.store.harness_control_queue(&subject).map_err(ApiError::bad)?;
-    let native = state.store.harness_control_state(&subject).map_err(ApiError::bad)?.map(|native| ControlState { subject: native.subject, binding: native.binding, idle: native.idle, input_supported: native.input_supported, steer: native.steer, models: ModelsSummary { selected: native.models.selected, revision: native.models.revision, available: native.models.available, complete: native.models.complete, atomic_model_effort: native.models.atomic_model_effort, source: native.models.source, catalog_path: format!("/v1/client/harness-models/{}", urlencoding::encode(&subject)) }, approval: native.approval, reason: native.reason });
+    let native = state.store.harness_control_state(&subject).map_err(ApiError::bad)?.map(|native| -> Result<ControlState, ApiError> {
+        let pending_ask = native.pending_ask.map(|ask| -> Result<st3_schema::harness_control::PendingAskView, ApiError> {
+            let reference = AskReference { owner: client_host_id(&state.node), subject: subject.clone(), binding: native.binding.clone(), tool_call_id: ask.tool_call_id.clone() };
+            Ok(st3_schema::harness_control::PendingAskView { ask_ref: encode_ask_reference(&state, &reference)?, tool_call_id: ask.tool_call_id, questions: ask.questions })
+        }).transpose()?;
+        Ok(ControlState { subject: native.subject, binding: native.binding, idle: native.idle, input_supported: native.input_supported, steer: native.steer, models: ModelsSummary { selected: native.models.selected, revision: native.models.revision, available: native.models.available, complete: native.models.complete, atomic_model_effort: native.models.atomic_model_effort, source: native.models.source, catalog_path: format!("/v1/client/harness-models/{}", urlencoding::encode(&subject)) }, approval: native.approval, pending_ask, ask_supported: native.ask_supported, ask_reason: native.ask_reason, reason: native.reason })
+    }).transpose()?;
     let total = queue.entries.len();
     let offset = if let Some(cursor) = query.cursor {
         let cursor = decode_queue_cursor(&state, &cursor)?;
@@ -80,6 +86,8 @@ pub(in crate::api) async fn receipt(State(state): State<AppState>, Extension(ses
         ControlOperationReceipt::Queue(receipt)
     } else if let Some(receipt) = state.store.harness_model_receipt(&operation).map_err(ApiError::bad)?.filter(|receipt| receipt.subject == query.subject) {
         ControlOperationReceipt::Model(receipt)
+    } else if let Some(receipt) = state.store.harness_ask_receipt(&operation).map_err(ApiError::bad)?.filter(|receipt| receipt.subject == query.subject) {
+        ControlOperationReceipt::Ask(receipt)
     } else {
         return Err(ApiError::not_found("harness operation does not exist on this owner"));
     };
@@ -99,4 +107,64 @@ pub(super) async fn mutate(state: &AppState, session: &ClientSession, request: &
     let receipt = state.store.mutate_harness_queue(&QueueRequest { subject: parameters.subject, actor: session.authority_actor.clone(), idempotency_key: request.idempotency_key.clone(), binding: parameters.binding, queue_revision: parameters.queue_revision, mutation: parameters.mutation }).map_err(ApiError::bad)?;
     signal_local_change(state);
     Ok(json!({"kind":"action-result", "action_id":request.id, "operation_id":receipt.operation_id,"status":receipt.status,"affected_ids":receipt.entry_id.iter().collect::<Vec<_>>(),"harness_control":receipt,"snapshot_id":new_client_snapshot(state).id}))
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AskReference {
+    owner: String,
+    subject: String,
+    binding: st3_schema::harness_control::Binding,
+    tool_call_id: String,
+}
+fn encode_ask_reference(state: &AppState, reference: &AskReference) -> Result<String, ApiError> {
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(reference).map_err(ApiError::internal)?);
+    let signature = derive_terminal_capability(state, "harness-ask-reference.v1", &payload, &reference.owner)?;
+    Ok(format!("harness-ask/{payload}.{signature}"))
+}
+fn decode_ask_reference(encoded: &str) -> Result<(AskReference, &str, &str), ApiError> {
+    if encoded.len() > 16384 { return Err(validation("ask reference exceeds its bound")); }
+    let (payload, signature) = encoded.strip_prefix("harness-ask/").and_then(|value| value.split_once('.')).ok_or_else(|| validation("invalid ask reference"))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).map_err(|_| validation("invalid ask reference"))?;
+    let reference: AskReference = serde_json::from_slice(&bytes).map_err(|_| validation("invalid ask reference"))?;
+    if !reference.subject.starts_with("agent/") || !reference.owner.starts_with("host/") { return Err(validation("invalid ask reference target")); }
+    Ok((reference, payload, signature))
+}
+pub(super) async fn answer_ask(state: &AppState, session: &ClientSession, request: &ActionRequest) -> Result<Value, ApiError> {
+    use st3_schema::harness_control::{AskAnswer, AskParameters, AskRequest, PublicAskParameters};
+    if !session.authority_actor.starts_with("person/") || session.authority_actor.matches('/').count() != 1 || session.authority_actor == "person/" { return Err(forbidden("native ask answers require a concrete person")); }
+    let public: PublicAskParameters = serde_json::from_value(request.parameters.clone()).map_err(|error| validation(error.to_string()))?;
+    let ask_ref = match &public { PublicAskParameters::Selection { ask_ref, .. } | PublicAskParameters::Text { ask_ref, .. } => ask_ref };
+    let (reference, payload, signature) = decode_ask_reference(ask_ref)?;
+    if reference.owner != client_host_id(&state.node) {
+        let mut value = relay(state, session, &reference.owner, crate::peer::ClientReadOperation::HarnessAskMutation { action_id: request.id.clone(), idempotency_key: request.idempotency_key.clone(), parameters: request.parameters.clone() }).await?;
+        value["snapshot_id"] = json!(new_client_snapshot(state).id);
+        return Ok(value);
+    }
+    let expected = derive_terminal_capability(state, "harness-ask-reference.v1", payload, &reference.owner)?;
+    if expected.len() != signature.len() || expected.bytes().zip(signature.bytes()).fold(0_u8, |difference, (left, right)| difference | (left ^ right)) != 0 { return Err(validation("invalid ask reference signature")); }
+    if let Some((original, receipt)) = state.store.harness_ask_replay(&session.authority_actor, &request.idempotency_key).map_err(ApiError::bad)? {
+        let matching = original.subject == reference.subject && original.binding == reference.binding && original.tool_call_id == reference.tool_call_id && match &public {
+            PublicAskParameters::Selection { answers, .. } => answers.len() == original.answers.len() && answers.iter().zip(&original.answers).all(|(answer, original)| answer.question_id == original.id && answer.options == original.selected_options && answer.text == original.custom_input),
+            PublicAskParameters::Text { text, .. } => original.answers.len() == 1 && original.answers[0].selected_options.is_empty() && original.answers[0].custom_input.as_ref() == Some(text),
+        };
+        if !matching { return Err(ApiError::bad(St3Error::new("idempotency-conflict", "this operation key identifies different answers"))); }
+        return Ok(json!({"kind":"action-result","action_id":request.id,"operation_id":receipt.operation_id,"status":receipt.status,"affected_ids":[receipt.subject],"harness_ask":receipt,"snapshot_id":new_client_snapshot(state).id}));
+    }
+    let native = state.store.harness_control_state(&reference.subject).map_err(ApiError::bad)?.ok_or_else(|| ApiError::bad(St3Error::new("ask-no-longer-pending", "the native ask is no longer pending")))?;
+    if native.binding != reference.binding || !native.pending_ask.as_ref().is_some_and(|ask| ask.tool_call_id == reference.tool_call_id) {
+        return Err(ApiError::bad(St3Error::new("ask-no-longer-pending", "the native ask is no longer pending")));
+    }
+    let answers = match public {
+        PublicAskParameters::Selection { answers, .. } => answers.into_iter().map(|answer| AskAnswer { id: answer.question_id, selected_options: answer.options, custom_input: answer.text }).collect(),
+        PublicAskParameters::Text { text, .. } => {
+            let ask = native.pending_ask.ok_or_else(|| ApiError::bad(St3Error::new("ask-no-longer-pending", "the native ask is no longer pending")))?;
+            if ask.questions.len() != 1 { return Err(validation("text shorthand requires exactly one pending question")); }
+            vec![AskAnswer { id: ask.questions[0].id.clone(), selected_options: Vec::new(), custom_input: Some(text) }]
+        }
+    };
+    let parameters = AskParameters { subject: reference.subject, binding: reference.binding, tool_call_id: reference.tool_call_id, answers };
+    let receipt = state.store.reserve_harness_ask(&AskRequest { actor: session.authority_actor.clone(), idempotency_key: request.idempotency_key.clone(), parameters }).map_err(ApiError::bad)?;
+    signal_local_change(state);
+    Ok(json!({"kind":"action-result","action_id":request.id,"operation_id":receipt.operation_id,"status":receipt.status,"affected_ids":[receipt.subject],"harness_ask":receipt,"snapshot_id":new_client_snapshot(state).id}))
 }

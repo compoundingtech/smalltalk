@@ -94,6 +94,7 @@ mod backup;
 mod checkpoint_rules;
 mod harness_control;
 mod harness_model;
+mod harness_ask;
 mod limits;
 mod person_work;
 mod adhoc_work;

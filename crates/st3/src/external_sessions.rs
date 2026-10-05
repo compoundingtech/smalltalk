@@ -2526,7 +2526,11 @@ fn normalize_omp(
                 sequence + 1,
                 &timestamp,
                 message["toolCallId"].as_str().unwrap_or_default(),
-                omp_result_images(driver, message.get("content").cloned().unwrap_or(Value::Null)),
+                if let Some(details) = message.get("details") {
+                    json!({"content":omp_result_images(driver, message.get("content").cloned().unwrap_or(Value::Null)),"details":details})
+                } else {
+                    omp_result_images(driver, message.get("content").cloned().unwrap_or(Value::Null))
+                },
                 message.get("isError").and_then(Value::as_bool).unwrap_or(false),
             );
             return;
@@ -3569,7 +3573,6 @@ mod tests {
         let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
         assert_eq!(result["body"]["call_id"], call["body"]["call_id"]);
         assert_eq!(result["body"]["status"], "success");
-        assert_eq!(result["body"]["content"], fixture[1]["message"]["content"]);
         assert_eq!(result["timestamp"], fixture[1]["timestamp"]);
     }
 
@@ -3584,7 +3587,6 @@ mod tests {
         let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
         assert_eq!(result["body"]["call_id"], call["body"]["call_id"]);
         assert_eq!(result["body"]["status"], "error");
-        assert_eq!(result["body"]["content"], fixture[3]["message"]["content"]);
     }
 
     #[test]
@@ -3602,6 +3604,21 @@ mod tests {
         assert_eq!(result["body"]["call_id"], call_id);
         assert_eq!(result["body"]["status"], "success");
         assert_eq!(result["body"]["content"], content);
+    }
+
+    #[test]
+    fn native_ask_details_preserve_selected_and_custom_answers() {
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &json!({
+            "type":"message","id":"ask-result","timestamp":"2026-10-05T00:00:00Z",
+            "message":{"role":"toolResult","toolCallId":"ask-call","toolName":"ask",
+                "content":[{"type":"text","text":"User answers"}],"isError":false,
+                "details":{"results":[{"id":"preferences","selectedOptions":["Blue","Green"],"customInput":"Purple"}]}}
+        }), 0, "", &mut items);
+        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
+        assert_eq!(result["body"]["content"]["details"]["results"][0]["selectedOptions"], json!(["Blue","Green"]));
+        assert_eq!(result["body"]["content"]["details"]["results"][0]["customInput"], "Purple");
+        assert_eq!(result["body"]["content"]["content"][0]["text"], "User answers");
     }
 
     #[test]

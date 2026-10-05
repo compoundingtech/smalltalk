@@ -90,6 +90,7 @@ fn invalidate_pending(connection: &Connection, subject: &str, reason: &str) -> R
     }
     connection.execute("DELETE FROM local_harness_control_dispatch WHERE subject=?1 AND kind='input'", [subject]).map_err(internal)?;
     harness_model::invalidate_binding_tx(connection, subject, reason)?;
+    harness_ask::invalidate_binding_tx(connection, subject, reason)?;
     Ok(())
 }
 fn reconcile_runtime(connection: &Connection, subject: &str) -> Result<(), St3Error> {
@@ -318,7 +319,7 @@ mod tests {
         store.apply_as(&intent, &planned.subject_tokens, "control-test-declaration", Some("person/operator")).unwrap();
         store.append_claim(&ClaimInput { subject: SUBJECT.into(), kind: "runtime.observed".into(), actor: Some(SUBJECT.into()), fields: BTreeMap::from([("status".into(), json!("running")), ("incarnation_id".into(), json!("incarnation-1")), ("runtime_id".into(), json!("native-runtime"))]), evidence: Vec::new(), expected_subject: None, idempotency_key: None }).unwrap();
         let fence = store.bind_mailbox(&crate::mailbox::Fence::new(SUBJECT, "incarnation-1", "delivery")).unwrap();
-        let state = NativeState { subject: SUBJECT.into(), binding: Binding { desired_revision: store.harness_control_desired_revision(&fence).unwrap(), incarnation_id: "incarnation-1".into(), session_id: "session-1".into(), turn_id: None }, idle: false, input_supported: true, steer: Default::default(), models: Models { choices: Vec::new(), selected: None, atomic_model_effort: false, revision: "models-1".into(), available: false, complete: true, source: "native-extension-model-registry".into() }, approval: Approval { supported: false, reason: "native-live-approval-api-unavailable".into() }, reason: None };
+        let state = NativeState { subject: SUBJECT.into(), binding: Binding { desired_revision: store.harness_control_desired_revision(&fence).unwrap(), incarnation_id: "incarnation-1".into(), session_id: "session-1".into(), turn_id: None }, idle: false, input_supported: true, steer: Default::default(), pending_ask: None, ask_supported: false, ask_reason: None, models: Models { choices: Vec::new(), selected: None, atomic_model_effort: false, revision: "models-1".into(), available: false, complete: true, source: "native-extension-model-registry".into() }, approval: Approval { supported: false, reason: "native-live-approval-api-unavailable".into() }, reason: None };
         store.observe_harness_control(&state, &fence).unwrap();
         (state, fence)
     }

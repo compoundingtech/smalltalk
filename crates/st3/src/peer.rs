@@ -116,6 +116,7 @@ pub enum ClientReadOperation {
         parameters: Value,
     },
     HarnessModelMutation { action_id: String, idempotency_key: String, parameters: Value },
+    HarnessAskMutation { action_id: String, idempotency_key: String, parameters: Value },
     HarnessModels { subject: String, cursor: Option<String>, limit: Option<usize> },
     HarnessControlReceipt { subject: String, operation_id: String },
     /// The directory this host gives a new agent that names no workspace.
@@ -1059,6 +1060,12 @@ async fn receive_client_read(
                 let desired = parameters.pointer("/binding/desired_revision").and_then(Value::as_str).context("harness binding requires desired revision")?;
                 let action_type = if queue_mutation { "harness.queue.mutate" } else { "harness.model.set" };
                 let action = serde_json::json!({"api_version":st3_client::API_VERSION,"id":action_id,"type":action_type,"idempotency_key":idempotency_key,"fence":{"snapshot_id":snapshot.id,"runtime_incarnation":incarnation,"runtime_desired_revision":desired},"parameters":parameters});
+                let native = Client::unix_as(state.backend().socket(), &request.authority_actor)?;
+                native.post("/v1/client/actions", &action).await
+            }
+            ClientReadOperation::HarnessAskMutation { action_id, idempotency_key, parameters } => {
+                let snapshot = client.capabilities().await?.snapshot;
+                let action = serde_json::json!({"api_version":st3_client::API_VERSION,"id":action_id,"type":"harness.answer_ask","idempotency_key":idempotency_key,"fence":{"snapshot_id":snapshot.id},"parameters":parameters});
                 let native = Client::unix_as(state.backend().socket(), &request.authority_actor)?;
                 native.post("/v1/client/actions", &action).await
             }
@@ -2706,6 +2713,7 @@ mod tests {
             subject: "agent/queue-owner.queue-worker".into(), binding: binding.clone(), idle: false,
             input_supported: true,
             steer: Default::default(),
+            pending_ask: None, ask_supported: false, ask_reason: None,
             models: Models {
                 choices: Vec::new(), selected: None, atomic_model_effort: false,
                 revision: "models-one".into(), available: false, complete: true,

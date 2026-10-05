@@ -567,6 +567,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/harness-control/next", post(harness_control::next))
         .route("/v1/harness-control/receipts", post(harness_control::settle))
         .route("/v1/harness-control/close", post(harness_control::close))
+        .route("/v1/harness-control/ask-terminal-input", post(harness_control::ask_terminal_input))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/read/{*subject}", get(read_message))
         .route("/v1/messages/delivery/{*subject}", get(message_delivery))
