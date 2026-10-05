@@ -52,9 +52,11 @@ CREATE TABLE claims(id TEXT PRIMARY KEY,store_index INTEGER NOT NULL UNIQUE,
                     accepted_at_unix_ms TEXT NOT NULL);
 CREATE INDEX claims_subject_kind ON claims(subject,kind,store_index);
 CREATE INDEX claims_batch_index ON claims(batch_id,store_index);
-CREATE TABLE replica_records(claim_id TEXT PRIMARY KEY REFERENCES claims(id),
+CREATE TABLE replica_records(record_ref TEXT PRIMARY KEY,
+                             claim_id TEXT NOT NULL REFERENCES claims(id),
                              position INTEGER NOT NULL,
                              state TEXT NOT NULL DEFAULT 'active');
+CREATE INDEX replica_records_claim_position ON replica_records(claim_id,position);
 CREATE TABLE desired(subject TEXT PRIMARY KEY,kind TEXT NOT NULL,body TEXT NOT NULL);
 CREATE TABLE reply_assignments(
   claim_id TEXT PRIMARY KEY,child TEXT NOT NULL,parent TEXT,
@@ -79,14 +81,10 @@ def triggers(db: sqlite3.Connection) -> None:
              length(claims.accepted_at_unix_ms),claims.accepted_at_unix_ms,
              batches.origin,batches.replica_sequence,claims.batch_id,
              COALESCE((SELECT MIN(position) FROM replica_records WHERE claim_id=claims.id),
-               (SELECT COUNT(*) FROM claims AS previous
-                WHERE previous.batch_id=claims.batch_id
-                  AND previous.store_index<claims.store_index))
+               claims.store_index)
       FROM claims JOIN batches ON batches.id=claims.batch_id
       WHERE claims.id={claim_id} AND claims.kind='message.sent'
-        AND json_type(claims.body,'$.fields.in_reply_to') IS NOT NULL
-        AND NOT EXISTS(SELECT 1 FROM replica_records
-                       WHERE claim_id=claims.id AND state='repaired');
+        AND json_type(claims.body,'$.fields.in_reply_to') IS NOT NULL;
     """
     db.executescript(f"""
       CREATE TRIGGER reply_claim_insert AFTER INSERT ON claims
@@ -155,8 +153,57 @@ def selected(db: sqlite3.Connection, child: str) -> str | None:
     return None if row is None else row[0]
 
 
+def exact_parent(db: sqlite3.Connection, child: str) -> str | None:
+    """Small-fixture independent fold using canonical.rs's COUNT fallback."""
+    candidates = []
+    rows = db.execute(
+        "SELECT claims.id,claims.store_index,claims.batch_id,claims.body,"
+        "claims.accepted_at_unix_ms,batches.origin,batches.replica_sequence "
+        "FROM claims JOIN batches ON batches.id=claims.batch_id "
+        "WHERE claims.subject=? AND claims.kind='message.sent'", (child,))
+    for claim_id, store_index, batch, body, accepted, origin, sequence in rows:
+        value = json.loads(body).get("fields", {})
+        if "in_reply_to" not in value:
+            continue
+        records = db.execute(
+            "SELECT position FROM replica_records WHERE claim_id=?", (claim_id,)
+        ).fetchall()
+        position = min((position for (position,) in records), default=None)
+        if position is None:
+            position = db.execute(
+                "SELECT COUNT(*) FROM claims WHERE batch_id=? AND store_index<?",
+                (batch, store_index),
+            ).fetchone()[0]
+        key = (len(accepted), accepted, origin, sequence, batch, position, claim_id)
+        candidates.append((key, value["in_reply_to"]))
+    if candidates:
+        parent = max(candidates)[1]
+    else:
+        row = db.execute("SELECT body FROM desired WHERE subject=? AND kind='message'",
+                         (child,)).fetchone()
+        parent = None
+        if row:
+            for edge in json.loads(row[0]).get("children", []):
+                if edge.get("name") == "in-reply-to":
+                    first = edge.get("arguments", [None])
+                    parent = first[0] if first else None
+                    break
+    if not isinstance(parent, str):
+        return None
+    return parent if parent.startswith("message/") else "message/" + parent
+
+
+def assert_complete_batch_modes(db: sqlite3.Connection) -> None:
+    for batch, total, recorded in db.execute(
+        "SELECT batches.id,COUNT(*),SUM(EXISTS(SELECT 1 FROM replica_records "
+        "WHERE replica_records.claim_id=claims.id)) "
+        "FROM batches JOIN claims ON claims.batch_id=batches.id GROUP BY batches.id"
+    ):
+        assert recorded in (0, total), (batch, total, recorded)
+
+
 def rebuild(db: sqlite3.Connection) -> None:
-    """Model a versioned local-cache rebuild, including repaired-source exclusion."""
+    """Model a versioned local-cache rebuild from the current message fold."""
     subjects = [row[0] for row in db.execute(
         "SELECT subject FROM desired UNION SELECT subject FROM claims "
         "WHERE kind='message.sent'")]
@@ -169,14 +216,10 @@ def rebuild(db: sqlite3.Connection) -> None:
              length(claims.accepted_at_unix_ms),claims.accepted_at_unix_ms,
              batches.origin,batches.replica_sequence,claims.batch_id,
              COALESCE((SELECT MIN(position) FROM replica_records WHERE claim_id=claims.id),
-               (SELECT COUNT(*) FROM claims AS previous
-                WHERE previous.batch_id=claims.batch_id
-                  AND previous.store_index<claims.store_index))
+               claims.store_index)
       FROM claims JOIN batches ON batches.id=claims.batch_id
       WHERE claims.kind='message.sent'
-        AND json_type(claims.body,'$.fields.in_reply_to') IS NOT NULL
-        AND NOT EXISTS(SELECT 1 FROM replica_records
-                       WHERE claim_id=claims.id AND state='repaired');
+        AND json_type(claims.body,'$.fields.in_reply_to') IS NOT NULL;
     """
     for subject in subjects:
         quoted = db.execute("SELECT quote(?)", (subject,)).fetchone()[0]
@@ -209,6 +252,7 @@ def main() -> None:
         db.execute("INSERT INTO desired VALUES(?,?,?)",
                    (child, "message", desired("root")))
         assert selected(db, child) == "message/root"
+        assert selected(db, child) == exact_parent(db, child)
         first = claim(db, 1, child, "other", at=100)
         assert selected(db, child) == "message/other"
         second = claim(db, 2, child, "root", at=100, batch="b")
@@ -217,16 +261,35 @@ def main() -> None:
         # same batch can reorder without a claim insert/delete.
         third = claim(db, 3, child, "later", at=100, batch="b")
         assert selected(db, child) == "message/later"
-        db.execute("INSERT INTO replica_records(claim_id,position) VALUES(?,?)", (third, -1))
+        assert selected(db, child) == exact_parent(db, child)
+        assert_complete_batch_modes(db)
+        db.execute("INSERT INTO replica_records(record_ref,claim_id,position) VALUES('r2',?,0)",
+                   (second,))
+        db.execute("INSERT INTO replica_records(record_ref,claim_id,position) VALUES('r3a',?,-1)",
+                   (third,))
         assert selected(db, child) == "message/root"
-        db.execute("UPDATE replica_records SET position=3 WHERE claim_id=?", (third,))
-        assert selected(db, child) == "message/later"
-        db.execute("UPDATE replica_records SET state='repaired' WHERE claim_id=?", (third,))
+        assert selected(db, child) == exact_parent(db, child)
+        assert_complete_batch_modes(db)
+        db.execute("INSERT INTO replica_records(record_ref,claim_id,position) VALUES('r3b',?,-2)",
+                   (third,))
         assert selected(db, child) == "message/root"
-        db.execute("UPDATE replica_records SET state='active' WHERE claim_id=?", (third,))
+        db.execute("UPDATE replica_records SET position=3 WHERE record_ref='r3a'")
+        assert selected(db, child) == "message/root"  # second record still selects -2
+        db.execute("UPDATE replica_records SET position=4 WHERE record_ref='r3b'")
         assert selected(db, child) == "message/later"
-        db.execute("DELETE FROM replica_records WHERE claim_id=?", (third,))
+        assert selected(db, child) == exact_parent(db, child)
+        db.execute("UPDATE replica_records SET state='repaired' WHERE record_ref='r3b'")
+        assert selected(db, child) == "message/later"  # repair retains the claim in the fold
+        assert selected(db, child) == exact_parent(db, child)
+        db.execute("UPDATE replica_records SET state='active' WHERE record_ref='r3b'")
         assert selected(db, child) == "message/later"
+        db.execute("DELETE FROM replica_records WHERE record_ref='r3b'")
+        assert selected(db, child) == "message/later"
+        db.execute("DELETE FROM replica_records WHERE record_ref='r3a'")
+        db.execute("DELETE FROM replica_records WHERE record_ref='r2'")
+        assert selected(db, child) == "message/later"
+        assert selected(db, child) == exact_parent(db, child)
+        assert_complete_batch_modes(db)
         db.execute("DELETE FROM claims WHERE id=?", (third,))
         assert selected(db, child) == "message/root"
         db.execute("DELETE FROM claims WHERE id=?", (second,))
@@ -239,11 +302,36 @@ def main() -> None:
         db.execute("UPDATE desired SET body=? WHERE subject=?", (desired("root"), child))
         null = claim(db, 4, child, None, at=110)
         assert selected(db, child) is None  # explicit null masks desired
+        assert selected(db, child) == exact_parent(db, child)
         db.execute("DELETE FROM claims WHERE id=?", (null,))
         assert selected(db, child) == "message/root"
         missing = claim(db, 5, child, None, at=111, present=False)
         assert selected(db, child) == "message/root"  # absent field falls back
+        assert selected(db, child) == exact_parent(db, child)
         db.execute("DELETE FROM claims WHERE id=?", (missing,))
+
+        legacy = "message/legacy-delete"
+        for number, parent in [(6, "root"), (7, "other"), (8, "root")]:
+            claim(db, number, legacy, parent, at=120, batch="legacy")
+        assert selected(db, legacy) == exact_parent(db, legacy) == "message/root"
+        db.execute("DELETE FROM claims WHERE id='claim-000006'")
+        assert selected(db, legacy) == exact_parent(db, legacy) == "message/root"
+        db.commit()
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("INSERT INTO replica_records(record_ref,claim_id,position) "
+                   "VALUES('invalid-mixed','claim-000008',2)")
+        assert selected(db, legacy) == "message/other"
+        assert exact_parent(db, legacy) == "message/root"
+        try:
+            assert_complete_batch_modes(db)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("mixed recorded/legacy batch must fail mode validation")
+        db.rollback()
+        assert_complete_batch_modes(db)
+        db.execute("DELETE FROM claims WHERE subject=?", (legacy,))
+        assert selected(db, legacy) is None
 
         db.commit()
         db.execute("BEGIN IMMEDIATE")
@@ -309,10 +397,31 @@ def main() -> None:
         assert history_costs[1][1] < history_costs[0][1] * 4, history_costs
         assert history_costs[1][2] < history_costs[0][2] * 4, history_costs
         print("1k→10k one-child assignments: scale/delete-VM-steps/insert-VM-steps", history_costs)
+
+        legacy_history = "message/large-legacy-batch"
+        large_batch_costs = []
+        for scale, previous in [(1000, 0), (10000, 1000)]:
+            for index in range(previous, scale):
+                claim(db, 40000 + index, legacy_history,
+                      "root" if index % 2 == 0 else "other",
+                      at=30000, batch="huge")
+            assert selected(db, legacy_history) == "message/other"
+            _, insert_steps = vm_steps(db, lambda: claim(
+                db, 40000 + scale, legacy_history, "root", at=30000, batch="huge"))
+            assert selected(db, legacy_history) == "message/root"
+            added = f"claim-{40000 + scale:06}"
+            _, delete_steps = vm_steps(db, lambda: db.execute(
+                "DELETE FROM claims WHERE id=?", (added,)))
+            assert selected(db, legacy_history) == "message/other"
+            large_batch_costs.append((scale, insert_steps, delete_steps))
+        assert large_batch_costs[1][1] < large_batch_costs[0][1] * 4, large_batch_costs
+        assert large_batch_costs[1][2] < large_batch_costs[0][2] * 4, large_batch_costs
+        print("1k→10k one legacy batch: scale/insert-VM-steps/delete-VM-steps", large_batch_costs)
         db.commit()
         rebuild(db)
         assert children() == [child]
         assert selected(db, history) == "message/other"
+        assert selected(db, legacy_history) == "message/other"
         db.close()
     print("selected precedence, null masking, reorder, deletion, desired, reopen and indexed seek passed")
 

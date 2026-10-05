@@ -16,8 +16,9 @@ prefix. The actual message view still validates every returned child.
 
 The model uses SQLite triggers on claim insert/delete, selected desired
 insert/update/delete, and replica-record insert/update/delete. Each refresh
-replaces one child row inside the writer transaction. Replica-record state
-`repaired` removes that claim's assignment; reopening uses persisted rows;
+replaces one child row inside the writer transaction. A `repaired` replica
+record still contributes its retained claim to `message_view_tx`, and its
+position remains part of canonical order. Reopening uses persisted rows;
 the versioned rebuild reads claims and desired before publishing. The oracle
 checks replacement ordering, explicit null, invalid first desired child,
 repair and unrepair, deletion predecessor, rollback, rebuild and reopen.
@@ -30,6 +31,26 @@ These numbers include the prototype's indexes, especially the existing
 `claims_batch_index`. They are source-model evidence only; real Store work,
 startup/backfill, bytes, durability and p99 remain unmeasured.
 
+The first prototype recomputed a legacy claim's position by counting earlier
+claims in its batch on every insert. A fixed 1k→10k batch made that write scan
+grow to 3,301→30,301 VM steps in independent review. The revised model stores
+`store_index` as the position key for **legacy-only** batches. Among those
+claims it has exactly the same order as the canonical COUNT rank, including
+after deletion. For **fully recorded** batches it uses MIN(replica-record
+position); the oracle now exercises two records for one claim and repair
+state. In a single legacy batch with 1k→10k assignments, sampled insert and
+delete work is 249→249 and 158→158 VM steps. A small independent canonical
+COUNT fold checks the selected answer after order, repair and deletion
+changes. A deliberately mixed recorded/legacy batch gives the wrong selected
+parent under this shortcut; the model detects it and rolls the write back.
+
+This is conditional source evidence: current production code has no enforced
+batch mode invariant. Prove complete recorded batches across local append,
+replica admission, repair, checkpoint and reopen, and validate existing stores
+before using the order-equivalent key. If a mixed batch is possible, use an
+indexed exact rank source or keep the projection unready until it is repaired;
+never silently publish this model's key for that batch.
+
 Before production integration, use current-main `store.rs` schema near
 `message_reply_edges`, its open/backfill path and runtime projection hook;
 classify the new table as a rebuildable local cache in canonical audit.
@@ -38,7 +59,8 @@ append, selected declaration and repair, projection replay, checkpoint,
 rollback and retirement without edits to common record/admission/sealer
 methods. The production key must match `smallclaims::store::canonical` exactly,
 including legacy batch position and multiple replica records per claim; this
-model uses one replica record per claim. A versioned migration must build in
+model now uses multiple replica records per claim but simplifies their full
+envelope lifecycle. A versioned migration must build in
 bounded chunks or expose explicit readiness rather than scan all history at
 every open. Test each mutation against `message_view_tx`, then record indexed
 1k/10k read and writer growth on the real schema before replacing the
