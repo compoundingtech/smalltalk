@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sys
 import time
 from urllib.parse import urlencode
 import uuid
@@ -113,6 +114,7 @@ class Probe:
         self.last_publish = 0
         self.changed = True
         self.presence_reading = None
+        self.alert_reading = None
         self.tasks = set()
         self.measuring = {}
 
@@ -257,7 +259,7 @@ class Probe:
                 route.pop("previous_read", None)
                 self.measuring[target] = time.monotonic_ns()
             self.persist()
-        if route and route["status"] == "read" and (route.get("attention") or route.get("agent_alert")):
+        if route and route["status"] == "read" and (route.get("attention") or route.get("agent_alert") or route.get("reviewer_alert")):
             # Finish a recovery whose response was lost before starting the next interval.
             await self.withdraw(route)
         # A recipient that boots or reconnects holds all earlier mail. An accepted overdue
@@ -269,7 +271,7 @@ class Probe:
             if route:
                 previous_read = ({key: route[key] for key in ("message", "latency_ms", "late")}
                                  if route.get("status") == "read" else route.get("previous_read"))
-            alerts = {key: route[key] for key in ("attention", "agent_alert")
+            alerts = {key: route[key] for key in ("attention", "agent_alert", "reviewer_alert", "alert_warning")
                       if route and key in route}
             nonce = str(uuid.uuid4())
             key = f"delivery-probe:{self.actor}:{target}:{nonce}"
@@ -299,7 +301,7 @@ class Probe:
                 route["error"] = str(error)[:1000]
                 self.persist()
         if route["status"] == "read":
-            if route.get("attention") or route.get("agent_alert"):
+            if route.get("attention") or route.get("agent_alert") or route.get("reviewer_alert"):
                 await self.withdraw(route)
             return
         try:
@@ -330,19 +332,64 @@ class Probe:
                 route["status"] = "overdue"
                 self.persist()
             if not route.get("attention"):
-                if route.get("agent_alert") or self.alert_agent:
+                if route.get("agent_alert"):
                     await self.send_alert(route)
                     return
-                attention = await self.api.post("/v1/work/ask", {
-                    "actor": self.actor, "person": self.config["reviewer"],
-                    "new_run": f"delivery-probe-{route['nonce']}",
-                    "title": f"Delivery probe {self.source} → {self.peers[target]} has no read receipt",
-                    "reason": f"{route['message']} was not read within {self.deadline // 1000}s. The native probe sends fresh probes after its interval; a real read cancels this person step automatically. Inspect the node's probe seat, replication and daemon.",
-                    "idempotency_key": f"delivery-probe-overdue:{route['message']}:{route['started_at_unix_ms']}",
-                })
-                route["attention"] = attention["subject"]
-                self.persist()
-                self.event("attention", message=route["message"], attention=route["attention"])
+                if not route.get("reviewer_alert") and self.alert_agent:
+                    problem = await self.alert_problem()
+                    if not problem:
+                        route.pop("alert_warning", None)
+                        await self.send_alert(route)
+                        return
+                    warning = f"Alert agent {self.alert_agent} is unavailable: {problem}."
+                    warning += (" Falling back to the configured reviewer person ask."
+                                if self.config.get("reviewer") else " No reviewer is configured; retaining the alert for retry.")
+                    if route.get("alert_warning") != warning:
+                        route["alert_warning"] = warning
+                        self.persist()
+                        self.event("alert-warning", message=route["message"], warning=warning)
+                        print(warning, file=sys.stderr, flush=True)
+                    if not self.config.get("reviewer"):
+                        return
+                await self.send_reviewer_alert(route)
+
+    async def alert_problem(self):
+        # Share one recipient inspection across routes while the reading is fresh.
+        reading = self.alert_reading
+        if reading is None or time.monotonic() - reading[0] >= self.presence_ttl / 1000:
+            reading = (time.monotonic(), asyncio.ensure_future(
+                self.api.get("/v1/client/agents/" + self.alert_agent)))
+            self.alert_reading = reading
+        try:
+            agent = await asyncio.shield(reading[1])
+        except Exception as error:
+            return f"cannot inspect recipient ({error})"
+        if not agent.get("driver"):
+            return "no live driver"
+        if agent.get("observation") in (None, "missing"):
+            return "observation is missing"
+        if agent.get("state") != "running" or agent.get("harness_state") not in ("ready", "working", "idle"):
+            return "driver is not running and ready"
+        return None
+
+    async def send_reviewer_alert(self, route):
+        if not route.get("reviewer_alert"):
+            route["reviewer_alert"] = {
+                "actor": self.actor, "person": self.config["reviewer"],
+                "new_run": f"delivery-probe-{route['nonce']}",
+                "title": f"Delivery probe {self.source} → {route['target']} has no read receipt",
+                "reason": (f"{route['message']} was not read within {self.deadline // 1000}s. "
+                           "The native probe sends fresh probes after its interval; a real read cancels this person step automatically. "
+                           "Inspect the node's probe seat, replication and daemon."
+                           + (" " + route["alert_warning"] if route.get("alert_warning") else "")),
+                "idempotency_key": f"delivery-probe-overdue:{route['message']}:{route['started_at_unix_ms']}",
+            }
+            self.persist()
+        attention = await self.api.post("/v1/work/ask", route["reviewer_alert"])
+        route["attention"] = attention["subject"]
+        route.pop("reviewer_alert")
+        self.persist()
+        self.event("attention", message=route["message"], attention=route["attention"])
 
     async def send_alert(self, route):
         if not route.get("agent_alert"):
@@ -365,6 +412,10 @@ class Probe:
         self.event("attention", message=route["message"], attention=route["attention"])
 
     async def clear_alert(self, route, summary, key):
+        if route.get("reviewer_alert"):
+            await self.send_reviewer_alert(route)
+        if route.pop("alert_warning", None):
+            self.persist()
         if route.get("agent_alert"):
             # Replay an uncertain alert before clearing it, even if recovery won the race.
             if not route.get("attention"):

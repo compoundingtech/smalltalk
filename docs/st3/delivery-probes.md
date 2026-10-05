@@ -58,7 +58,7 @@ private state directory. Use the following JSON as a template for node `amber`:
   "host": "amber",
   "agent": "agent/probe/delivery/amber",
   "state_dir": "/srv/example/delivery-probe/state",
-  "alert_agent": "agent/operations/amber",
+  "alert_agent": "agent/REPLACE_WITH_LIVE_OPERATIONS_SEAT",
   "interval_ms": 180000,
   "deadline_ms": 60000,
   "peers": [
@@ -72,17 +72,27 @@ The daemon supplies `ST_AGENT`, `ST3_BIN`, and `ST3_ENDPOINT` to its declared
 seat. Optional `binary` and `socket` JSON fields override the latter two, for an
 isolated fixture.
 
-`alert_agent` must be an agent identity. When set, it receives an idempotent message
-with the route, nonce, probe message and inspection hint; no person ask is created,
-even if `reviewer` is also present. Fresh probes and restarts retain the same alert
+`alert_agent` must be an agent identity. There is no default recipient: replace the
+placeholder with an existing live operations seat selected for this node before
+applying the config. The probe checks the recipient's driver, observation and
+running harness before sending. A live recipient receives an idempotent message
+with the route, nonce, probe message and inspection hint, taking precedence over
+`reviewer`. Fresh probes and restarts retain the same alert
 until a real recipient read sends one short recovery message and clears local alert
 state. A last-seen member clears the alert with a pause message instead.
 Operations handles these alerts and asks a person only for decisions they must make.
 
-For deployments that want person asks, omit `alert_agent` and set
-`"reviewer": "person/operator"` instead. This preserves the existing reviewer route,
-including automatic cancellation after a real read. Operations chooses and updates
-the deployed recipients; adding this option does not change existing configs.
+Optionally keep `"reviewer": "person/operator"` as a fallback. If the alert agent
+has no live driver, its observation is missing, or its status cannot be inspected,
+the probe logs a warning and creates one reviewer ask explaining the fallback.
+That ask still cancels after a real recipient read. Without a reviewer, the probe
+logs the warning, retains the overdue route and retries until the agent is live or
+the probe recovers; it never silently drops the alert.
+
+For deployments that want person asks directly, omit `alert_agent` and set
+`reviewer` instead. This preserves the existing reviewer route, including automatic
+cancellation after a real read. Operations chooses and updates the deployed
+recipients; adding this option does not change existing configs.
 
 Declare and preview the dedicated seat before applying it:
 
@@ -123,12 +133,14 @@ matrix exercises the actual omp extension without model calls.
 stable idempotency across retry, crash replay of pending receipts, a delivered
 claim without a read, a replay after a competing native acknowledgement, a closed
 message without a read, incorrect read actors, person asks and operations messages,
-alert deduplication and recovery.
+alert deduplication, recovery and fallback for an unavailable alert agent.
 Its isolated two-node tests use the real native channels and replication, stop
 only their own test recipient, observe an overdue alert and a doctor
 warning, then restore that recipient and verify exactly one read claim.
 Shorter test intervals make the outage proof bounded; production uses the
-60-second deadline. The native proof runs in the normal Linux Cargo test suite.
+60-second deadline. The operations recipient fixture uses a token-free omp provider
+stand-in, requiring Node.js; probe recipients remain dedicated Python consumers.
+The native proof runs in the normal Linux Cargo test suite.
 
 A member shown as last seen pauses its route: the probe queues no new sends, withdraws
 route attention, and retains any pending message. After a new replication exchange,
