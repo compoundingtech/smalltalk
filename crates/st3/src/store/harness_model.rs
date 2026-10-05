@@ -286,7 +286,7 @@ mod tests {
                 "turn" => stale.parameters.binding.turn_id = None,
                 _ => stale.parameters.model_revision = "old".into()
             }
-            assert!(matches!(store.reserve_harness_model(&stale).unwrap_err().code.as_str(), "stale-harness-control" | "stale-mailbox-session" | "stale-harness-model"));
+            assert!(matches!(store.reserve_harness_model(&stale).unwrap_err().code, "stale-harness-control" | "stale-mailbox-session" | "stale-harness-model"));
         }
         let accepted = store.reserve_harness_model(&request(&state, "catalog-changes")).unwrap();
         state.models.revision = "models-2".into();
