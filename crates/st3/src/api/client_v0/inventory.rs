@@ -365,7 +365,7 @@ mod tests {
             let mut continuation = query("files");
             match field {
                 "expires_at" => forged["expires_at"] = json!(client_now_ms() + 50_000),
-                "actor" => forged["actor"] = "person/mallory".into(),
+                "actor" => forged["actor"] = "person/intruder".into(),
                 _ => { forged["query"]["limit"] = 2.into(); continuation.limit = Some(2); },
             }
             continuation.cursor = Some(format!("inventory-page/{}.{}", encoding.encode(
