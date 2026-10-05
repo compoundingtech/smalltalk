@@ -6672,7 +6672,7 @@ async fn load_mission_run_tree(
     selected: &MissionRunView,
     limit: usize,
 ) -> Result<(Vec<MissionRunView>, bool)> {
-    #[derive(Deserialize)]
+    #[derive(serde::Deserialize)]
     struct Page {
         runs: Vec<MissionRunView>,
         has_more: bool,
@@ -7523,7 +7523,7 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
     if !args.follow {
         return Ok(());
     }
-    #[derive(Deserialize)]
+    #[derive(serde::Deserialize)]
     struct EventPage {
         items: Vec<EventRecord>,
         next_after: Option<u64>,
