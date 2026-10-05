@@ -20,6 +20,7 @@ struct Runtime {
     stops: Mutex<Vec<String>>,
     refuse_start: Mutex<bool>,
     attempts: Mutex<Vec<MemberSpec>>,
+    exit_on_start: Mutex<bool>,
     snapshot_unavailable: Mutex<bool>,
 }
 impl RuntimeControl for Runtime {
@@ -49,8 +50,17 @@ impl RuntimeControl for Runtime {
             RuntimeObservation {
                 runtime_id: member.runtime_id.clone(),
                 terminal: member.terminal,
-                status: "running".into(),
-                exit_code: None,
+                status: if *self.exit_on_start.lock().unwrap() {
+                    "exited"
+                } else {
+                    "running"
+                }
+                .into(),
+                exit_code: if *self.exit_on_start.lock().unwrap() {
+                    Some(1)
+                } else {
+                    None
+                },
                 incarnation_id: Some(format!("fixture:{}", starts.len())),
             },
         );
@@ -1822,6 +1832,43 @@ async fn an_interrupted_explicit_attempt_is_not_launched_again_after_daemon_rest
         daemon.reconcile_once().unwrap();
     }
     assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 2);
+    assert_eq!(
+        restart_result(&fixture, &next).kind,
+        "runtime.action.succeeded"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacement_that_exits_during_startup_completes_as_failed_and_stays_parked() {
+    let (fixture, subject) = Fixture::launching(
+        Shape::TopLevel,
+        r#"harness "omp" { model "example-model"; }"#,
+        "always",
+    )
+    .await;
+    hang_up(&fixture);
+    park(&fixture, &subject, "omp");
+    *fixture.runtime.exit_on_start.lock().unwrap() = true;
+    let request = fixture.request(&subject, "exited-at-startup").await;
+    let daemon = restarted_daemon(&fixture);
+    for _ in 0..4 {
+        daemon.reconcile_once().unwrap();
+    }
+    assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 2);
+    let result = restart_result(&fixture, &request);
+    assert_eq!(result.kind, "runtime.action.failed");
+    assert!(
+        result.body["fields"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("exit code 1")
+    );
+    *fixture.runtime.exit_on_start.lock().unwrap() = false;
+    let next = fixture.request(&subject, "working-replacement").await;
+    for _ in 0..4 {
+        daemon.reconcile_once().unwrap();
+    }
+    assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 3);
     assert_eq!(
         restart_result(&fixture, &next).kind,
         "runtime.action.succeeded"

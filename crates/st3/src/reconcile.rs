@@ -5465,6 +5465,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             return Ok(false);
         }
+        let attempted = self
+            .store
+            .operation_claim(&format!("agent-restart-attempt:{}", request.id))?;
         let previous = request.body["fields"]["incarnation_id"]
             .as_str()
             .unwrap_or("");
@@ -5475,6 +5478,33 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .as_deref()
                 .is_some_and(|value| value != previous)
         {
+            // A launcher can succeed while its wrapper immediately refuses the provider (for
+            // example, the version gate). Observe that replacement before completing restart.
+            if attempted.is_some()
+                && matches!(
+                    observation.status.as_str(),
+                    "exited" | "vanished" | "stopped"
+                )
+            {
+                self.record_member(subject, observation, false)?;
+                let detail = if member.terminal {
+                    self.runtime.screen(&member.runtime_id).ok()
+                } else {
+                    self.runtime
+                        .read_exec_log(&member.runtime_id)
+                        .ok()
+                        .flatten()
+                }
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| text.chars().take(2048).collect::<String>())
+                .unwrap_or_else(|| {
+                    let exit = observation.exit_code
+                        .map(|code| format!(" (exit code {code})"))
+                        .unwrap_or_default();
+                    format!("the replacement {} before restart completed{exit}", observation.status)
+                });
+                return self.fail_requested_restart(subject, member, &request, &detail);
+            }
             self.store.append_claim(&ClaimInput {
                 subject: subject.subject.clone(),
                 kind: "runtime.action.succeeded".into(),
@@ -5531,11 +5561,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 &format!("restart blocked: {error:#}"),
             );
         }
-        if self
-            .store
-            .operation_claim(&format!("agent-restart-attempt:{}", request.id))?
-            .is_some()
-        {
+        if attempted.is_some() {
             return self.fail_requested_restart(
                 subject,
                 member,
@@ -5560,21 +5586,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             Ok(true) => {}
         }
-        self.store.append_claim(&ClaimInput {
-            subject: subject.subject.clone(),
-            kind: "runtime.action.succeeded".into(),
-            actor: request.actor.clone(),
-            fields: BTreeMap::from([
-                ("action".into(), Value::String("restart".into())),
-                (
-                    "reason".into(),
-                    Value::String("the explicit restart launched a replacement".into()),
-                ),
-            ]),
-            evidence: vec![request.id],
-            expected_subject: None,
-            idempotency_key: Some(completion),
-        })?;
+        // A subsequent runtime observation completes the request. This also catches wrappers
+        // that exit at startup after the physical launcher accepted the attempt.
         self.signal_changed();
         Ok(true)
     }
