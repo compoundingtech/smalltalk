@@ -126,13 +126,27 @@ pub(crate) fn owner(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn local_lock(path: &Path) -> io::Result<File> {
+fn lock_file(path: &Path) -> io::Result<File> {
     let file = std::fs::OpenOptions::new().read(true).write(true).create(true)
         .truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?;
     owner(&file)?;
     if !file.metadata()?.is_file() { return Err(io::Error::other("notes lock must be a regular file")); }
+    Ok(file)
+}
+
+pub(crate) fn local_lock(path: &Path) -> io::Result<File> {
+    let file = lock_file(path)?;
     file.lock()?;
     Ok(file)
+}
+
+pub(crate) fn local_try_lock(path: &Path) -> io::Result<Option<File>> {
+    let file = lock_file(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 fn cstring(name: &[u8]) -> io::Result<CString> {
