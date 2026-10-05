@@ -80,10 +80,21 @@ def guardian(command, watched, result):
         os.write(result, str(code).encode())
 
 
-def run_supervised(command, owner=None):
+def run_supervised(command, owners=None):
+    owners = owners or [os.getppid()]
+    if "ST_AGENT" in os.environ or "ST3_SUBJECT" in os.environ:
+        # /proc ancestry reads the process's original environment. Removing an
+        # os.environ key after fork does not erase it there; exec a clean launcher
+        # before detaching, while retaining watches for both original callers.
+        env = dict(os.environ)
+        for name in ("ST_AGENT", "ST3_SUBJECT"):
+            env.pop(name, None)
+        owner_args = [arg for pid in [*owners, os.getpid()] for arg in ("--owner", str(pid))]
+        return subprocess.call([sys.executable, str(Path(__file__).resolve()),
+                                *owner_args, "--", *command], env=env)
     # Open both before forking. The launcher waits for the guardian's result;
     # killing either the launcher or its Rust test runner cancels the whole tree.
-    watched = [os.pidfd_open(owner or os.getppid()), os.pidfd_open(os.getpid())]
+    watched = [os.pidfd_open(pid) for pid in [*owners, os.getpid()]]
     reader, writer = os.pipe()
     intermediate = os.fork()
     if intermediate == 0:
@@ -121,7 +132,7 @@ def supervised_main(main):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--owner", type=int)
+    parser.add_argument("--owner", type=int, action="append")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command

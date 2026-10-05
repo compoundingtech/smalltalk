@@ -79,15 +79,20 @@ class OwnershipTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="guardian-argv-") as directory:
             script = Path(directory) / "fixture.py"
             script.write_text(f"""
-import sys
+import os, sys
 sys.path.insert(0, {str(HERE)!r})
 from st3_test_process import supervised_main
 argument = sys.argv.pop()
+def check():
+    assert 'ST_AGENT' not in os.environ
+    print(argument)
+    return 0
 if __name__ == '__main__':
-    raise SystemExit(supervised_main(lambda: print(argument) or 0))
+    raise SystemExit(supervised_main(check))
 """)
             env = dict(os.environ)
             env.pop("SMALLTALK_TEST_SUPERVISOR", None)
+            env["ST_AGENT"] = "agent/fixture/host"
             result = subprocess.run([sys.executable, str(script), "preserved-fixture-argument"],
                                     env=env, capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
