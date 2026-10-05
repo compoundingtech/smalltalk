@@ -10,9 +10,11 @@ import ctypes
 import os
 from pathlib import Path
 import select
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -57,7 +59,7 @@ def reap_descendants():
         time.sleep(0.01)
 
 
-def guardian(command, watched, result):
+def guardian(command, watched, result, temporary_roots=(), keep=False):
     libc = ctypes.CDLL(None, use_errno=True)
     # PR_SET_CHILD_SUBREAPER, before launching any descendants.
     if libc.prctl(36, 1, 0, 0, 0) != 0:
@@ -71,9 +73,18 @@ def guardian(command, watched, result):
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, interrupt)
     task = None
+    roots = []
     code = 1
     try:
         env = {**os.environ, "SMALLTALK_TEST_SUPERVISOR": str(os.getpid())}
+        # Allocate under the guardian, not the killable controller. Remove only
+        # these freshly created roots, and only after their processes are reaped.
+        for name, prefix, parent in temporary_roots:
+            root = tempfile.mkdtemp(prefix=prefix, dir=parent)
+            roots.append(root)
+            env[name] = root
+            if keep:
+                print(f"isolated test keeping {root}", file=sys.stderr, flush=True)
         task = subprocess.Popen(command, env=env, start_new_session=True)
         with os.fdopen(os.pidfd_open(task.pid), "rb") as task_fd:
             poller = select.poll()
@@ -88,11 +99,14 @@ def guardian(command, watched, result):
             kill_group(task.pid)
             code = task.wait()
         reap_descendants()
+        if not keep:
+            for root in roots:
+                shutil.rmtree(root)
         # Return status only AFTER every daemon, worker, driver and PTY is gone.
         os.write(result, str(code).encode())
 
 
-def run_supervised(command, owners=None):
+def run_supervised(command, owners=None, temporary_roots=(), keep=False):
     owners = owners or [os.getppid()]
     if "ST_AGENT" in os.environ or "ST3_SUBJECT" in os.environ:
         # /proc ancestry reads the process's original environment. Removing an
@@ -102,8 +116,10 @@ def run_supervised(command, owners=None):
         for name in ("ST_AGENT", "ST3_SUBJECT"):
             env.pop(name, None)
         owner_args = [arg for pid in [*owners, os.getpid()] for arg in ("--owner", str(pid))]
+        root_args = [arg for root in temporary_roots for arg in ("--temporary-root", *map(str, root))]
         return subprocess.call([sys.executable, str(Path(__file__).resolve()),
-                                *owner_args, "--", *command], env=env)
+                                *owner_args, *root_args, *(["--keep"] if keep else []),
+                                "--", *command], env=env)
     # Open both before forking. The launcher waits for the guardian's result;
     # killing either the launcher or its Rust test runner cancels the whole tree.
     watched = [os.pidfd_open(pid) for pid in [*owners, os.getpid()]]
@@ -115,7 +131,7 @@ def run_supervised(command, owners=None):
         if os.fork() != 0:
             os._exit(0)
         try:
-            guardian(command, watched, writer)
+            guardian(command, watched, writer, temporary_roots, keep)
         except BaseException as error:
             print(f"isolated test guardian: {error}", file=sys.stderr)
         finally:
@@ -145,6 +161,9 @@ def supervised_main(main):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--owner", type=int, action="append")
+    parser.add_argument("--temporary-root", nargs=3, action="append", default=[],
+                        metavar=("ENV", "PREFIX", "PARENT"))
+    parser.add_argument("--keep", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command
@@ -152,4 +171,4 @@ if __name__ == "__main__":
         command = command[1:]
     if not command:
         parser.error("a command is required")
-    raise SystemExit(run_supervised(command, args.owner))
+    raise SystemExit(run_supervised(command, args.owner, args.temporary_root, args.keep))
