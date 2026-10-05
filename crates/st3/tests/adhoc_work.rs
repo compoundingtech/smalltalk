@@ -90,6 +90,7 @@ impl Daemon {
             client_relay: None,
             native_session_home: None,
             planner_default: st3::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let socket = self.socket();
         self.server = Some(tokio::spawn(async move {
