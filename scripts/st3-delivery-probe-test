@@ -807,9 +807,6 @@ agent "probe/{node.name}" {{
             # Probe recipients use Python and the native channel; the operations fixture
             # alone uses a token-free provider stand-in, never a real model.
             for node in nodes:
-                if getattr(node, "last_probe_doctor", None):
-                    failed = [check for check in node.last_probe_doctor["checks"] if check["status"] == "fail"]
-                    print(f"{node.name} last observed failed doctor checks: {json.dumps(failed)[-8000:]}", file=sys.stderr)
                 events = [json.loads(line) for line in (node.root / "probe/events.jsonl").read_text().splitlines()]
                 self.assertTrue(any(event["event"] == "consumed" for event in events))
                 await node.cli("agents", "stop", f"agent/probe/{node.name}", "--as", "person/eval")
@@ -818,6 +815,9 @@ agent "probe/{node.name}" {{
         except Exception:
             print(f"failed native probe fixture retained: {directory}", file=sys.stderr)
             for node in nodes:
+                if getattr(node, "last_probe_doctor", None):
+                    failed = [check for check in node.last_probe_doctor["checks"] if check["status"] == "fail"]
+                    print(f"{node.name} last observed failed doctor checks: {json.dumps(failed)[-8000:]}", file=sys.stderr)
                 # cli(check=True) discards stdout on doctor failure. Retain a
                 # separately labelled follow-up snapshot without accepting that failure.
                 try:
