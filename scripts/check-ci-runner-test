@@ -92,11 +92,18 @@ check("malformed queue ref never requests a PR", [], "ci1-merge", EVENT="merge_g
 # Supporting jobs must never spend ordinary CI work on priority/merge capacity.
 import re
 blocks = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow.split("\njobs:\n", 1)[1]))
-for job in ("linux-tests-shard-2", "linux-clippy", "linux-fleet-compat", "genie-freshness", "typescript-client", "isolation-vm", "perf-cost"):
+for job in ("linux-tests-shard-2", "linux-clippy", "linux-fleet-compat", "genie-freshness", "typescript-client", "isolation-vm", "perf-cost", "mail-redelivery-canaries"):
     assert "outputs.ci1" not in blocks[job], (job, "supporting job consumes reserved cores")
     assert ";job.priority=1" in blocks[job], (job, "one class prevents perpetual benchmark starvation")
     assert "namespace-features:github.run-id=" in blocks[job], (job, "prevent cross-run assignment")
 assert "outputs.ci1" in blocks["linux-tests"], "primary shard must retain reserved routing"
+canaries = blocks['mail-redelivery-canaries']
+assert 'needs: [pick-runner]' in canaries and 'needs: [linux-tests]' not in canaries, "canaries must run beside both test shards"
+assert 'scripts/ci-linux mail-redelivery-canaries' in canaries, "the required check must execute the canaries itself"
+assert 'cargo-linux-tests-' in canaries and 'nix5-linux-tests-' in canaries, "reuse protected-main test dependency caches"
+assert 'CI_TEST_PARTITION' not in canaries, "every required canary must run"
+assert 'mail_redelivery' not in blocks['linux-tests'] and 'scripts/ci-mail-redelivery-canaries' not in blocks['linux-tests'], "canaries cannot serialize the primary shard"
+assert 'needs.mail-redelivery-canaries.result' in blocks['linux-gate'], "failures and skips must still fail the Linux gate"
 assert "job.priority=1" in blocks["linux-tests"] and "github.run-id={0}" in blocks["linux-tests"], "same class for Namespace fallback with an evaluated run id"
 for path in ("perf.yml", "main-upkeep.yml", "public-repo.yml", "release-daily.yml", "release-portable.yml", "release-smalltalk.yml"):
     generated = (ROOT / ".github/workflows" / path).read_text()
