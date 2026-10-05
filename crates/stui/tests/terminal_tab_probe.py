@@ -33,7 +33,7 @@ BARRIER = b"\x02\x01\x02"  # Cannot be mistaken for a tilde at the end of a key 
 # Restore the main screen, default cursor mode and every mode used by the probe.
 RESET = (b"\x1b[?1049l\x1b[?1l\x1b[?66l" + b"".join(
     f"\x1b[?{mode}l".encode() for mode in
-    (1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 2004, 2026)
+    (1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 2004, 2026, 2031, 2048, 5522)
 ) + b"\x1b[>4;0m\x1b[<u\x1b[0m\x1b[2J\x1b[H")
 
 
@@ -319,6 +319,11 @@ def matrix(tab):
         tab.emit(RESET + mode)
         case(f"keyboard-protocol/{name}/shift-enter", b"\x1b[13;2u")
         case(f"keyboard-protocol/{name}/ctrl-alt-shift-a", b"\x1b[97;8u")
+    # terminal-browser also asks for pixel mouse coordinates and keyboard event kinds.
+    tab.emit(RESET + b"\x1b[?1003h\x1b[?1006h\x1b[?1016h\x1b[>27u")
+    case("terminal-browser/pixel-mouse-click", tab.mouse(0) + tab.mouse(0, release=True))
+    for name, kind in (("press", 1), ("repeat", 2), ("release", 3)):
+        case("terminal-browser/key-" + name, f"\x1b[97;1:{kind}u".encode())
     # The query's reply comes from the real PTY daemon, not the outer handshake.
     for name, raw in (("DA1", b"\x1b[c"), ("DA2", b"\x1b[>c"), ("XTVERSION", b"\x1b[>0q"),
                       ("DSR", b"\x1b[5n"), ("cursor", b"\x1b[6n"), ("window-pixels", b"\x1b[14t"),
@@ -331,7 +336,7 @@ def matrix(tab):
         tab.emit(RESET)
         received = tab.query(raw)
         rows.append({"case": "queries/" + name, "sent": raw.hex(), "received": received.hex()})
-    for mode in (1, 66, 1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1049, 2004, 2026):
+    for mode in (1, 66, 1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 1049, 2004, 2026, 2031, 2048, 5522):
         for enabled in (False, True):
             tab.emit(RESET + f"\x1b[?{mode}{'h' if enabled else 'l'}".encode())
             raw = f"\x1b[?{mode}$p".encode()

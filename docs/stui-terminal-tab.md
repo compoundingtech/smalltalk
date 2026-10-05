@@ -9,7 +9,7 @@ UI is its graph data. No display server or real agent/person graph is involved.
 It emits requested mode changes and queries, logs every input byte as hex, and logs SIGWINCH
 geometry. File control keeps test commands out of its input log.
 [`terminal_tab_probe.py`](../crates/stui/tests/terminal_tab_probe.py) drives the outer PTY and
-observes both the program log and a transparent tap of the real session socket. The 532-scenario
+observes both the program log and a transparent tap of the real session socket. The 544-scenario
 [byte matrix](../crates/stui/tests/fixtures/terminal-tab-baseline.json) records every scenario;
 known failures in that matrix describe the baseline, rather than desired terminal behavior.
 Future fixes should update the affected expectations and keep the scenario coverage.
@@ -56,6 +56,7 @@ The matrix exercises all eight combinations, with both normal and application cu
 | Mouse without tracking mode | No reports; left drag selects locally | Selection is stui's |
 | Mouse Alt/Ctrl and Alt+Ctrl | Modifier bits 8/16/24 reach clicks and drags | Wheel loses them behind routing fault |
 | Mouse Shift and every combination containing Shift | No child reports; local selection | Explicit selection override in `terminal_mouse` |
+| Pixel mouse 1016 (terminal-browser) | Click remains `CSI <0;5;3M` in cell coordinates | Daemon reports 1016 set, but stui has no pixel mouse encoder |
 | SGR encoding 1006 | `CSI <button;x;y M` (press/drag), `CSI <button;x;y m` (release) | Correct pane-relative positions for buttons |
 | Legacy mouse encoding | `ESC [ M`, code+32, x+32, y+32 | Coordinates clamp at 223 |
 | UTF-8 mouse encoding 1005 | Legacy bytes even past column 223 | Mode tracked, but encoder ignores `UTF8_MOUSE`; large coordinate becomes `ff` |
@@ -77,6 +78,7 @@ The matrix exercises all eight combinations, with both normal and application cu
 | Numeric keypad, normal/application mode | Ordinary digits/operators and CR | Application keypad mode is not used by `key_bytes` |
 | Enhanced keypad input | Digits/operators and CR, flattened to ordinary keys | Crossterm's keypad state is ignored by encoder |
 | Kitty keyboard protocol (`CSI >31u`) | Shift+Enter still CR; Ctrl+Alt+Shift+A still ESC + `01` | Inner alacritty config disables kitty keyboard; encoder is always legacy |
+| Kitty press / repeat / release events | Press becomes ordinary text; repeat and release disappear | `Ui::key` accepts only `KeyEventKind::Press`, and re-encodes it as legacy |
 | modifyOtherKeys (`CSI >4;2m`) | Same legacy encoding | Mode is not stored or used by stui |
 | Bracketed paste 2004 enabled | `CSI 200~`, payload, `CSI 201~` | LF and CRLF normalize to CR |
 | Paste with 2004 disabled | Payload only | Same newline normalization |
@@ -103,7 +105,7 @@ That distinction matters when diagnosing a program that waits for a reply.
 | Window cells `CSI 18t` | `CSI 8;36;118t` | Actual child PTY geometry |
 | Screen cells `CSI 19t` | No answer | Neither daemon nor stui supplies it |
 | OSC 10 / 11 color query | `rgb:c0c0/c0c0/c0c0` / `rgb:0000/0000/0000`, terminated by ST | Daemon constants; not the outer palette |
-| DECRQM mode queries | `CSI ?mode;1$y` when set, `;2$y` when reset | Daemon tracks 1, 66, 1000/1002/1003/1004/1005/1006/1007/1015, 1049, 2004, 2026; may disagree with stui's implementation |
+| DECRQM mode queries | `CSI ?mode;1$y` when set, `;2$y` when reset | Daemon tracks 1, 66, 1000/1002/1003/1004/1005/1006/1007/1015/1016, 1049, 2004, 2026, 2031, 2048; 5522 returns unsupported (`;0$y`); may disagree with stui's implementation |
 | Kitty keyboard query `CSI ?u` | `CSI ?0u` after reset; `CSI ?31u` after enabling flags 31 | Daemon advertises flags stui's legacy input encoder does not honor |
 | modifyOtherKeys query `CSI ?4m` | No answer even after setting level 2 | No query-reply path |
 | OSC 52 clipboard write | Requested text decodes to `copper` | Native request reaches stui; live UI copies it through outer OSC 52 |
@@ -133,6 +135,63 @@ state, pane-relative positioning and clipping, and a resource lifecycle that mov
 and deletes placements on resize, scroll, detach, and tab switches. It also needs to control
 the daemon's capability replies so the child only learns a protocol the complete tab path
 can support. Today neither kitty nor sixel support should be claimed for terminal tabs.
+
+## terminal-browser reproduction
+
+The official Linux **terminal-browser 0.13.4** bundle ran against the same real terminal tab,
+with Electron's headless Ozone backend, an invented local HTML document, isolated storage,
+and no display connection. `TERM=xterm-kitty` selected its kitty renderer; this does not
+emulate or launch kitty. The [receipt](../crates/stui/tests/fixtures/terminal-browser-baseline.json)
+records actual output: 71 graphics APCs from the live app, **zero** at the outer PTY, no wheel
+input, and Ctrl+Alt+Shift+A arriving as legacy `ESC 01`. Frame counts vary with run duration.
+
+The app enabled 1003, 1006, 1016, 1004, 2004, 2048, 2031, synchronized output, and kitty flags
+1 then 27. Its [release source](https://github.com/zenbu-labs/terminal-browser/blob/v0.13.4/pixel/engine/crates/pixel-core/src/terminal.rs)
+also probes keyboard support, pixel mouse, extended clipboard 5522, graphics transport,
+cell size, and colors. The session daemon consumes query bytes when replying, so the
+transparent output tap's request list contains the mode changes that it passes onward.
+
+| terminal-browser requirement | Gap confirmed by the byte matrix / real app |
+| --- | --- |
+| Kitty image frames | App emits frames, but native tab drops every frame before outer rendering |
+| Pixel mouse 1016 | Daemon claims it; clicks still use cells, wheel is lost |
+| Kitty keyboard flags 27, repeat/release | Legacy encoding loses modifiers; repeat/release disappear |
+| Focus 1004 | Focus events are not forwarded |
+| Clipboard 5522 | DECRQM reports unsupported |
+| Colors and color-change mode 2031 | Fixed daemon colors; no outer palette or color-change event path |
+| In-band resize 2048 | Daemon claims mode set; ordinary SIGWINCH is verified, an in-band pixel report is not |
+
+Use the optional [`terminal_browser_probe.py`](../crates/stui/tests/terminal_browser_probe.py)
+with an already installed Linux bundle. It starts the daemon directly to avoid CLI host
+AppArmor setup, forces headless operation, and closes only its own temporary session:
+
+```sh
+python3 crates/stui/tests/terminal_browser_probe.py --worker TEST_EXECUTABLE \
+  --app /path/to/terminal-browser-bundle --record /tmp/browser-probe.json
+```
+
+The download was checked against the release SHA-256. On a Nix host the downloaded Electron
+needed a compatible ELF interpreter/RPATH and libstdc++/libgbm; `--library-path` supplies
+those app libraries without changing the worker's environment. This optional check is not a
+CI dependency; the CI byte matrix independently covers these protocol requests.
+
+## Selection and mode recovery
+
+| Situation | Current behavior | Remaining gap |
+| --- | --- | --- |
+| Child has no mouse tracking | Left drag selects and copies through stui | Available |
+| Child has mouse tracking, Shift+drag reaches stui | Local selection overrides reporting | Depends on the outer terminal delivering Shift |
+| Kitty with its default mouse mapping | Kitty keeps Shift+drag for its own selection | stui cannot receive that gesture |
+| Alt/Option+drag while child has mouse tracking | Forwarded as an Alt-modified mouse report | No dependable local-selection override |
+| Selection-toggle chord and footer hint | Absent | A stui-owned toggle and hint are needed |
+| Recover modes after a crashed child | No user-facing terminal-mode reset | Need to reset parser/daemon mouse, keyboard and paste state without removing detach |
+
+Kitty documents that Shift selects in the outer terminal even when an application has
+requested mouse reporting ([overview](https://sw.kovidgoyal.net/kitty/overview/),
+[mouse configuration](https://sw.kovidgoyal.net/kitty/conf/#mouse-actions)). The PTY matrix
+can inject Shift and verify stui's override, but cannot prove that a terminal application
+will deliver it. The follow-on fix needs Alt/Option selection, an explicit selection toggle,
+and mode recovery; this baseline does not claim those exist.
 
 ## Keys stui owns
 
