@@ -8,7 +8,9 @@ It launches no model provider and never polls a mailbox to manufacture a read.
 Python 3.9 or newer and the installed `st3` binary are the only dependencies.
 
 Each direction measures one active message. An accepted unread message becomes
-overdue after 60 seconds and raises one attention item. At the next probe interval,
+overdue after 60 seconds and sends one alert to the configured operations agent,
+or raises one person ask for deployments configured with a reviewer. At the next
+probe interval,
 the sender creates a fresh message and retains that alert until a recipient's real
 read claim proves recovery. A send whose acceptance is uncertain keeps retrying
 its original idempotency key. Completing the mission that installed the probe does
@@ -56,7 +58,7 @@ private state directory. Use the following JSON as a template for node `amber`:
   "host": "amber",
   "agent": "agent/probe/delivery/amber",
   "state_dir": "/srv/example/delivery-probe/state",
-  "reviewer": "person/operator",
+  "alert_agent": "agent/operations/amber",
   "interval_ms": 180000,
   "deadline_ms": 60000,
   "peers": [
@@ -68,11 +70,26 @@ private state directory. Use the following JSON as a template for node `amber`:
 
 The daemon supplies `ST_AGENT`, `ST3_BIN`, and `ST3_ENDPOINT` to its declared
 seat. Optional `binary` and `socket` JSON fields override the latter two, for an
-isolated fixture. Declare and preview the dedicated seat before applying it:
+isolated fixture.
+
+`alert_agent` must be an agent identity. When set, it receives an idempotent message
+with the route, nonce, probe message and inspection hint; no person ask is created,
+even if `reviewer` is also present. Fresh probes and restarts retain the same alert
+until a real recipient read sends one short recovery message and clears local alert
+state. A last-seen member clears the alert with a pause message instead.
+Operations handles these alerts and asks a person only for decisions they must make.
+
+For deployments that want person asks, omit `alert_agent` and set
+`"reviewer": "person/operator"` instead. This preserves the existing reviewer route,
+including automatic cancellation after a real read. Operations chooses and updates
+the deployed recipients; adding this option does not change existing configs.
+
+Declare and preview the dedicated seat before applying it:
 
 ```kdl
 version 2
 agent "probe/delivery/amber" {
+  name "Delivery probe (amber)"
   host "amber"
   workspace "/srv/example/delivery-probe"
   restart "always"
@@ -105,10 +122,11 @@ matrix exercises the actual omp extension without model calls.
 `scripts/st3-delivery-probe-test --binary /path/to/st3` tests a lost send response,
 stable idempotency across retry, crash replay of pending receipts, a delivered
 claim without a read, a replay after a competing native acknowledgement, a closed
-message without a read, incorrect read actors, attention deduplication and recovery.
-Its isolated two-node test uses the real native channels and replication, stops
-only its own test recipient, observes an overdue attention item and a doctor
-warning, then restores that recipient and verifies exactly one read claim.
+message without a read, incorrect read actors, person asks and operations messages,
+alert deduplication and recovery.
+Its isolated two-node tests use the real native channels and replication, stop
+only their own test recipient, observe an overdue alert and a doctor
+warning, then restore that recipient and verify exactly one read claim.
 Shorter test intervals make the outage proof bounded; production uses the
 60-second deadline. The native proof runs in the normal Linux Cargo test suite.
 

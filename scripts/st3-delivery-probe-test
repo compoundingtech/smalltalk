@@ -118,6 +118,113 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fresh["status"], "read")
         self.assertNotIn("attention", fresh)
 
+    def restart_monitor(self):
+        api = self.monitor.api
+        self.monitor.lock.close()
+        with patch.dict(os.environ, ST_AGENT=self.config["agent"]):
+            self.monitor = probe.Probe(self.config)
+        self.monitor.api = api
+
+    def alert_posts(self, tag):
+        return [body for path, body in self.monitor.api.posts
+                if path == "/v1/messages" and tag in body.get("tags", [])]
+
+    async def test_agent_alert_overrides_reviewer_and_survives_refresh_and_restart(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        original = self.monitor.state["routes"][self.target]
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        alert = self.alert_posts("delivery-probe-alert")[0]
+        self.assertEqual(alert["to"], self.config["alert_agent"])
+        for hint in (self.monitor.actor, self.target, original["nonce"], original["message"], "st doctor --json"):
+            self.assertIn(hint, alert["content"])
+        self.assertFalse(any(path == "/v1/work/ask" for path, _ in self.monitor.api.posts))
+        original["started_at_unix_ms"] -= self.monitor.interval
+        self.monitor.persist()
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        fresh = self.monitor.state["routes"][self.target]
+        self.assertNotEqual(fresh["message"], original["message"])
+        self.assertEqual(fresh["attention"], original["attention"])
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        self.assertEqual(len(self.alert_posts("delivery-probe-alert")), 1)
+        self.monitor.api.records = [{"kind": "message.delivered", "actor": self.target,
+                                     "accepted_at_unix_ms": 1},
+                                    {"kind": "message.read", "actor": "agent/probe/other",
+                                     "accepted_at_unix_ms": 2}]
+        await self.monitor.route(self.target)
+        self.assertIn("attention", fresh)
+        self.assertFalse(self.alert_posts("delivery-probe-recovery"))
+        self.monitor.api.records.append({"kind": "message.read", "actor": self.target,
+                                         "accepted_at_unix_ms": 3})
+        await self.monitor.route(self.target)
+        await self.monitor.route(self.target)
+        self.assertNotIn("attention", fresh)
+        self.assertNotIn("agent_alert", fresh)
+        recoveries = self.alert_posts("delivery-probe-recovery")
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual(recoveries[0]["to"], alert["to"])
+        self.assertIn(original["attention"], recoveries[0]["content"])
+        self.assertIn(fresh["message"], recoveries[0]["content"])
+        self.assertFalse(any(path == "/v1/work/cancel-ask" for path, _ in self.monitor.api.posts))
+
+    async def test_agent_alert_and_recovery_replay_exact_bodies_after_lost_responses(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        post = self.monitor.api.post
+        lost = {"delivery-probe-alert", "delivery-probe-recovery"}
+        async def timeout_once(path, body):
+            result = await post(path, body)
+            tags = set(body.get("tags", [])) & lost
+            if tags:
+                lost.difference_update(tags)
+                raise TimeoutError("committed; response lost")
+            return result
+        self.monitor.api.post = timeout_once
+        with self.assertRaises(TimeoutError):
+            await self.monitor.route(self.target)
+        self.restart_monitor()
+        route = self.monitor.state["routes"][self.target]
+        route["started_at_unix_ms"] -= self.monitor.interval
+        # Recovery can arrive before the uncertain alert has been acknowledged locally.
+        self.monitor.api.records = [{"kind": "message.read", "actor": self.target,
+                                     "accepted_at_unix_ms": 3}]
+        with self.assertRaises(TimeoutError):
+            await self.monitor.route(self.target)
+        self.assertEqual(self.alert_posts("delivery-probe-alert")[0], self.alert_posts("delivery-probe-alert")[1])
+        self.restart_monitor()
+        route = self.monitor.state["routes"][self.target]
+        route["next_at_unix_ms"] = 0
+        await self.monitor.route(self.target)
+        recoveries = self.alert_posts("delivery-probe-recovery")
+        self.assertEqual(len(recoveries), 2)
+        self.assertEqual(recoveries[0], recoveries[1])
+        self.assertNotIn("agent_alert", self.monitor.state["routes"][self.target])
+
+    async def test_agent_alert_absence_sends_pause_without_claiming_recovery(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        self.monitor.api.online = False
+        await self.monitor.route(self.target)
+        await self.monitor.route(self.target)
+        self.assertEqual(len(self.alert_posts("delivery-probe-paused")), 1)
+        self.assertFalse(self.alert_posts("delivery-probe-recovery"))
+        self.assertNotIn("attention", self.monitor.state["routes"][self.target])
+
+    def test_alert_agent_rejects_person_and_empty_identities(self):
+        for value in ("person/eval", "agent/", "", None, 3):
+            with self.subTest(value=value), patch.dict(os.environ, ST_AGENT=self.config["agent"]):
+                with self.assertRaisesRegex(ValueError, "alert_agent must be an agent identity"):
+                    probe.Probe({**self.config, "alert_agent": value})
+
     async def test_routes_share_one_replication_status_read_while_it_is_fresh(self):
         reads = []
         get = self.monitor.api.get
@@ -235,6 +342,12 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
 @unittest.skipUnless(BINARY, "pass --binary to prove the actual native path")
 class NativeProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_read_outage_attention_and_recovery(self):
+        await self.native_read_outage_and_recovery(agent_alert=False)
+
+    async def test_native_read_outage_agent_message_and_recovery(self):
+        await self.native_read_outage_and_recovery(agent_alert=True)
+
+    async def native_read_outage_and_recovery(self, agent_alert):
         # This is a receipt/attention regression, not a latency benchmark. Leave room for
         # parallel CI's scheduling and fsyncs while retaining a real bounded deadline.
         deadline_ms = 10_000
@@ -279,10 +392,13 @@ url = "http://127.0.0.1:{ports[1 - index]}"
                           "state_dir": str(node.root / "probe"), "reviewer": "person/eval",
                           "interval_ms": 12_000, "deadline_ms": deadline_ms,
                           "peers": [{"host": other.name, "agent": f"agent/probe/{other.name}"}]}
+                if agent_alert:
+                    config["alert_agent"] = "agent/operations/amber"
                 (node.root / "probe.json").write_text(json.dumps(config))
                 argv = [sys.executable, str(HERE / "st3-delivery-probe"), "--config", str(node.root / "probe.json")]
                 (node.root / "seat.kdl").write_text(f'''version 2
 agent "probe/{node.name}" {{
+  name "Delivery probe ({node.name})"
   workspace "{node.root / 'ws'}"
   restart "always"
   argv {' '.join(json.dumps(arg) for arg in argv)}
@@ -321,7 +437,16 @@ agent "probe/{node.name}" {{
             blocked = await faults.until(alerted, 30)
             self.assertEqual(blocked["status"], "overdue")
             attention = await nodes[0].api("/v1/attention?person=person%2Feval")
-            self.assertTrue(any(item["subject"] == blocked["attention"] for item in attention), attention)
+            if agent_alert:
+                self.assertFalse(attention, attention)
+                alert = await nodes[0].api("/v1/messages/read/" + blocked["attention"])
+                self.assertEqual(alert["to"], "agent/operations/amber")
+                self.assertIn(blocked["nonce"], alert["content"])
+                self.assertIn("st doctor --json", alert["content"])
+                alert_claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": blocked["attention"]}))
+                self.assertEqual(sum(claim["kind"] == "message.sent" for claim in alert_claims["claims"]), 1)
+            else:
+                self.assertTrue(any(item["subject"] == blocked["attention"] for item in attention), attention)
             doctor = json.loads(await nodes[0].cli("doctor", "--json"))
             self.assertTrue(any(check["name"] == "delivery-probes" and check["status"] == "warn" for check in doctor["checks"]))
             # This probe is seconds old and was never offered while its recipient was
@@ -337,6 +462,18 @@ agent "probe/{node.name}" {{
                 return row if row and row["message"] != blocked["message"] and row["status"] == "read" and not row.get("attention") else None
 
             recovered_row = await faults.until(recovered, 30)
+            if agent_alert:
+                key = "delivery-probe-recovered:" + blocked["attention"]
+                recovery_id = "message/" + probe.hashlib.sha256(key.encode()).hexdigest()[:16]
+                recovery = await nodes[0].api("/v1/messages/read/" + recovery_id)
+                self.assertEqual(recovery["to"], "agent/operations/amber")
+                self.assertIn(blocked["attention"], recovery["content"])
+                recovery_claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": recovery_id}))
+                self.assertEqual(sum(claim["kind"] == "message.sent" for claim in recovery_claims["claims"]), 1)
+                self.assertFalse(await nodes[0].api("/v1/attention?person=person%2Feval"))
+            else:
+                self.assertFalse(any(item["subject"] == blocked["attention"]
+                                     for item in await nodes[0].api("/v1/attention?person=person%2Feval")))
             self.assertFalse(recovered_row["late"])
             self.assertLess(recovered_row["latency_ms"], deadline_ms)
             async def recovered_outage_probe():
