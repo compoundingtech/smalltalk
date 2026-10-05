@@ -711,6 +711,9 @@ async def main(args):
 
 
 if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from st3_test_process import supervised_main
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("out", type=Path)
@@ -730,4 +733,4 @@ if __name__ == "__main__":
         parser.error("run detached outside an st seat; see the eval README")
     if not shutil.which("node") or not shutil.which("pty"):
         parser.error("node (with native TypeScript support) and pty must be on PATH")
-    raise SystemExit(asyncio.run(main(args)))
+    raise SystemExit(supervised_main(lambda: asyncio.run(main(args))))

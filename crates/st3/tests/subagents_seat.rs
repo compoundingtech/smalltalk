@@ -7,6 +7,9 @@
 #[cfg(target_os = "linux")]
 #[test]
 fn a_seats_subagents_appear_renew_and_end() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use std::path::PathBuf;
     use std::process::Command;
 

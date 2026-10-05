@@ -13,6 +13,7 @@ import { rememberBounded } from './boundedCache';
 import { withFreshTerminalFence } from './terminalControls';
 import { Feed } from './feed';
 import { ForegroundGate } from './foreground';
+import type { FabricProfile } from './fabricProof';
 import { gatewayFetch } from './gatewayFetch';
 import { normalizeGatewayUrl } from './gatewayUrl';
 import { tabOrder, type Tab } from './tabs';
@@ -69,14 +70,15 @@ function items<K extends Resource['kind']>(page: { items: Resource[] }, kind: K)
 }
 function actionId() { return `action/ios-${Crypto.randomUUID()}`; }
 
-function useAppStore() {
+function useAppStore(proof?: FabricProfile) {
+  const proofRef = useRef(proof); proofRef.current = proof;
   const [order, setOrder] = useState<Tab[]>(tabOrder(null));
-  const [url, setUrl] = useState(''), [urlDraft, setUrlDraft] = useState('');
-  const [credential, setCredential] = useState<string | null>(null);
+  const [url, setUrl] = useState(proof?.url ?? ''), [urlDraft, setUrlDraft] = useState('');
+  const [credential, setCredential] = useState<string | null>(proof?.credential ?? null);
   const [data, setData] = useState<Data>(emptyData);
   const [truncated, setTruncated] = useState<Partial<Record<keyof Data, boolean>>>({});
   const [loadErrors, setLoadErrors] = useState<Partial<Record<keyof Data, string>>>({});
-  const foreground = useRef(new ForegroundGate(AppState.currentState));
+  const foreground = useRef(new ForegroundGate(proof && !proof.ready ? 'background' : AppState.currentState));
   const [feed, setFeed] = useState<Feed | null>(null), [connectionIssue, setConnectionIssue] = useState('');
   const [cachedHostId, setCachedHostId] = useState('');
   const [caps, setCaps] = useState<Capabilities | null>(null), [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -103,7 +105,7 @@ function useAppStore() {
   // Image bytes go up through Expo's fetch: React Native's cannot send a byte array as a body.
   const uploader = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(expoFetch as unknown as typeof fetch), client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) }) : null, [url, credential]);
 
-  useEffect(() => { Promise.allSettled([AsyncStorage.getItem(URL_KEY), AsyncStorage.getItem(ORDER_KEY), SecureStore.getItemAsync(CREDENTIAL_KEY), AsyncStorage.getItem(PROJECTION_CACHE_KEY)]).then(([u, o, c, p]) => {
+  useEffect(() => { if (proof) return; Promise.allSettled([AsyncStorage.getItem(URL_KEY), AsyncStorage.getItem(ORDER_KEY), SecureStore.getItemAsync(CREDENTIAL_KEY), AsyncStorage.getItem(PROJECTION_CACHE_KEY)]).then(([u, o, c, p]) => {
     if (u.status === 'fulfilled' && u.value) { setUrl(u.value); setUrlDraft(u.value); }
     // A stored order may use earlier tab names; they still count.
     if (o.status === 'fulfilled' && o.value) { try { setOrder(tabOrder(JSON.parse(o.value))); } catch { /* use default */ } }
@@ -117,19 +119,25 @@ function useAppStore() {
     if (c.status === 'rejected') setError('Secure credential storage is unavailable on this build.');
   }); }, []);
 
+  useEffect(() => {
+    if (!proof) return;
+    setUrl(proof.url); setCredential(proof.credential);
+    foreground.current.update('background');
+  }, [proof?.url, proof?.credential]);
+
   function clearCaches() {
     cachedActor.current = ''; cacheSavedAt.current = 0;
     conversationCache.current.clear(); draftCache.current.clear(); missionDetailCache.current.clear();
     setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null);
   }
-  async function clearCachedProjection() { cacheGeneration.current++; clearCaches(); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
+  async function clearCachedProjection() { cacheGeneration.current++; clearCaches(); if (!proof) await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
 
   // Capabilities once per connection: limits, the session's actor, and what it may control.
   const loadCapabilities = useCallback(async () => {
     if (!client) return;
     try {
       const capability = await client.capabilities();
-      if (cachedActor.current && cachedActor.current !== capability.value.session_actor) { clearCaches(); void AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
+      if (cachedActor.current && cachedActor.current !== capability.value.session_actor) { clearCaches(); if (!proofRef.current) void AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
       cachedActor.current = capability.value.session_actor;
       setCaps(capability.value);
     } catch (e) { if (e instanceof ClientError && e.status >= 400 && e.status < 500) setError(errorText(e)); }
@@ -149,15 +157,18 @@ function useAppStore() {
         setData(previous => ({ ...previous, [name]: shown }));
         setTruncated(previous => ({ ...previous, [name]: hasMore }));
         setLoadErrors(previous => { if (!(name in previous)) return previous; const rest = { ...previous }; delete rest[name]; return rest; });
+        proofRef.current?.record('window', { name, rows: shown.length });
         setSnapshot(at); setCachedHostId(at.host_id); setHasSynced(true);
       },
       onConnection: (state, issue) => {
         if (!current()) return;
+        proofRef.current?.record('feed', { state });
         setStatus(state === 'live' ? 'online' : state === 'connecting' ? 'connecting' : 'offline');
         setConnectionIssue(issue ?? '');
         if (state === 'live') { setError(''); void loadCapabilities(); }
       },
       onWindowError: (name, message) => { if (current()) setLoadErrors(previous => ({ ...previous, [name]: message })); },
+      onConversationFrame: (rows, replace) => { if (current()) proofRef.current?.record('conversation', { rows, replace }); },
     }, foreground.current, actionId);
     // Paired: connecting from here on, even while the app waits to be active before it dials.
     setStatus(previous => previous === 'setup' ? 'connecting' : previous);
@@ -165,7 +176,10 @@ function useAppStore() {
     return () => { opened.close(); setFeed(held => held === opened ? null : held); };
   }, [client, credential, loadCapabilities]);
   useEffect(() => {
-    const subscription = AppState.addEventListener('change', state => foreground.current.update(state));
+    if (proof) foreground.current.update(proof.ready && url === proof.url ? AppState.currentState : 'background');
+  }, [url, proof?.url, proof?.ready]);
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', state => foreground.current.update(proofRef.current && !proofRef.current.ready ? 'background' : state));
     return () => subscription.remove();
   }, []);
 
@@ -181,7 +195,7 @@ function useAppStore() {
   }, [feed, glassesOn, glassesGranted]);
   // Keep the last data for an offline start, saved at most every 10 s while it changes.
   useEffect(() => {
-    if (!hasSynced || !snapshot || !caps) return;
+    if (proof || !hasSynced || !snapshot || !caps) return;
     const timer = setTimeout(() => {
       cacheSavedAt.current = Date.now();
       const truncatedKeys = (Object.keys(truncated) as Array<keyof Data>).filter(key => truncated[key]);
@@ -223,12 +237,13 @@ function useAppStore() {
   }
   /** Run an action, trying again (with a fresh fence each time) while st refused it only because it raced a busy store. */
   async function runAction(action: () => Promise<unknown>, reload: readonly OnDemand[] = []): Promise<boolean> {
-    if (status !== 'online') { setError('Still connecting; try again in a moment.'); return false; }
+    if (status !== 'online' || (proof && !proof.ready)) { setError('Still connecting; try again in a moment.'); return false; }
     setBusy(true);
     try { await retryTransient(8, action, notApplied); setError(''); await loadLists(reload); return true; } catch (e) { setError(errorText(e)); return false; } finally { setBusy(false); }
   }
 
   async function completePairing(gatewayClient: St3Client, id: string, code: string, gateway?: string) {
+    if (proof) throw new Error('Close the fabric proof to change ordinary device pairing.');
     // Each pairing enrolls a new signing key (docs/st3/device-signing.md). A build without the key
     // module, or a phone that cannot make one, pairs unsigned as before.
     const made = await createDeviceKey().catch(() => null);
@@ -250,6 +265,7 @@ function useAppStore() {
 
   const actions = {
     async saveUrl() {
+      if (proof) { setError('Close the fabric proof to change the saved gateway.'); return; }
       const normalized = normalizeGatewayUrl(urlDraft);
       if (!normalized) { setError('Enter the paired gateway HTTPS URL, or http:// with a Tailscale address (100.x), a .local name, or a private LAN address (10.x, 172.16-31.x, 192.168.x).'); return; }
       if (normalized !== url) await clearCachedProjection();
@@ -268,6 +284,7 @@ function useAppStore() {
       try { await completePairing(new St3Client({ baseUrl: gateway, client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) }), id, code, gateway); } catch (e) { setPairingIssue(`Pairing failed: ${errorText(e)}`); } finally { setBusy(false); }
     },
     async forget() {
+      if (proof) { proof.close(); return; }
       await SecureStore.deleteItemAsync(CREDENTIAL_KEY); await SecureStore.deleteItemAsync(SIGNING_KEY); await removeDeviceKey(); await clearCachedProjection();
       setCredential(null); setCaps(null); setPairingIssue(''); setHistoricalSessions([]); setStatus('setup');
     },
@@ -297,7 +314,7 @@ function useAppStore() {
     /** Send Small Talk to an agent, as stui does: fenced to a fresh snapshot, once more if it moved. */
     async send(to: string, content: string, sessionId?: string, tags?: string[], images: Picked[] = []): Promise<string | null> {
       if (!client || !uploader) return 'not connected';
-      if (status !== 'online') return 'offline';
+      if (status !== 'online' || (proof && !proof.ready)) return 'offline';
       // Images are kept on this member first; the message names them, and st fetches each from
       // here for a reader on another machine (docs/st3/attachments.md).
       const attachments: AttachmentInput[] = [];
@@ -310,11 +327,13 @@ function useAppStore() {
           return `the image could not be sent: ${errorText(e)}`;
         }
       }
+      const began = performance.now();
       try {
         // Each try is a new request on a fresh fence, made only after st said the last applied nothing.
         await retryTransient(8, async () => {
           const id = actionId();
-          const parameters = await signMessage(id, { to, content, ...(sessionId ? { session_id: sessionId } : {}), ...(tags?.length ? { tags } : {}), ...(attachments.length ? { attachments } : {}) });
+          const unsigned = { to, content, ...(sessionId ? { session_id: sessionId } : {}), ...(tags?.length ? { tags } : {}), ...(attachments.length ? { attachments } : {}) };
+          const parameters = proof ? unsigned : await signMessage(id, unsigned);
           const request = { id, idempotency_key: id, fence: await fence(), parameters };
           try {
             await client.messageSend(request);
@@ -326,8 +345,9 @@ function useAppStore() {
             await client.messageSend(request);
           }
         }, notApplied);
+        proof?.record('message-accepted', { elapsedMs: performance.now() - began });
         return null;
-      } catch (e) { return errorText(e); }
+      } catch (e) { proof?.record('message-failed', { elapsedMs: performance.now() - began }); return errorText(e); }
     },
     /** A plain shell, named as stui names one; its terminal id, or null with the reason shown. */
     async createTerminal(name: string): Promise<string | null> {
@@ -435,16 +455,16 @@ function useAppStore() {
       const updated = [...order];
       [updated[index], updated[next]] = [updated[next], updated[index]];
       setOrder(updated);
-      void AsyncStorage.setItem(ORDER_KEY, JSON.stringify(updated));
+      if (!proof) void AsyncStorage.setItem(ORDER_KEY, JSON.stringify(updated));
     },
     reconnect() { feed?.reconnect(); },
     setSimpleOn(on: boolean) {
       setSimpleOn(on);
-      void AsyncStorage.setItem(SIMPLE_KEY, on ? '1' : '0').catch(() => {});
+      if (!proof) void AsyncStorage.setItem(SIMPLE_KEY, on ? '1' : '0').catch(() => {});
     },
     setGlassesOn(on: boolean) {
       setGlassesOn(on);
-      void AsyncStorage.setItem(GLASSES_KEY, on ? '1' : '0').catch(() => {});
+      if (!proof) void AsyncStorage.setItem(GLASSES_KEY, on ? '1' : '0').catch(() => {});
     },
   };
 
@@ -464,8 +484,8 @@ function useAppStore() {
 
 export type Store = ReturnType<typeof useAppStore>;
 const StoreContext = createContext<Store | null>(null);
-export function StoreProvider({ children }: { children: ReactNode }) {
-  const store = useAppStore();
+export function StoreProvider({ children, proof }: { children: ReactNode; proof?: FabricProfile }) {
+  const store = useAppStore(proof);
   return <StoreContext.Provider value={store}>{children}</StoreContext.Provider>;
 }
 export function useStore(): Store {

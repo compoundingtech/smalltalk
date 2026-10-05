@@ -88,3 +88,23 @@ check("priority merge group uses the urgent pool", [], "ci1-priority", EVENT="me
 check("ordinary merge group retains reserved merge capacity", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_RESPONSE='["area:ci"]')
 check("merge-label API failure retains reserved capacity", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_EXIT="1")
 check("malformed queue ref never requests a PR", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/unrelated", api=False)
+
+# Supporting jobs must never spend ordinary CI work on priority/merge capacity.
+import re
+blocks = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow.split("\njobs:\n", 1)[1]))
+for job in ("linux-tests-shard-2", "linux-clippy", "linux-fleet-compat", "genie-freshness", "typescript-client", "isolation-vm", "perf-cost"):
+    assert "outputs.ci1" not in blocks[job], (job, "supporting job consumes reserved cores")
+    if job != "perf-cost":
+        assert ";job.priority=" in blocks[job], (job, "required work must precede optional Namespace jobs")
+        assert "namespace-features:github.run-id=" in blocks[job], (job, "prevent cross-run assignment")
+        assert "github.event_name == 'merge_group'" in blocks[job] and "'ci-priority'" in blocks[job], job
+assert ";job.priority=" not in blocks["perf-cost"], "optional benchmarks must not claim required-job priority"
+assert "outputs.ci1" in blocks["linux-tests"], "primary shard must retain reserved routing"
+assert "job.priority={0}" in blocks["linux-tests"] and "github.run-id={1}" in blocks["linux-tests"], "prioritize Namespace fallback without embedding unevaluated expressions"
+assert "linux-tests-shard-2" in blocks["linux-gate"], "both shards must be required"
+assert 'CI_TEST_PARTITION: "hash:1/2"' in blocks["linux-tests"]
+assert 'CI_TEST_PARTITION: "hash:2/2"' in blocks["linux-tests-shard-2"]
+for job in ("linux-tests", "linux-tests-shard-2"):
+    assert 'CI_TEST_THREADS: "8"' in blocks[job], "bound each shard's test concurrency"
+assert "vars.CI1_MIN_IDLE || '4'" in picker, "leave CPU capacity for reserved lanes"
+print("passed: bounded test shards, reserved primary lane, independent support jobs, and required aggregation")

@@ -178,7 +178,10 @@ struct Output {
 
 fn pipe() -> (OwnedFd, OwnedFd) {
     let mut fds = [0; 2];
-    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    for fd in fds {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
     unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
 }
 

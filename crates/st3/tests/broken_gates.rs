@@ -205,6 +205,9 @@ fn wait_for(label: &str, mut condition: impl FnMut() -> bool) {
 
 #[test]
 fn mission_publish_dry_run_prints_the_preview_without_gates_or_publication() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(root.path());
     let file = root.path().join("preview.kdl");
@@ -285,6 +288,9 @@ mission "example/preview" state="ready" {
 
 #[test]
 fn mission_publish_dry_run_prints_blockers_before_refusing_publication() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(root.path());
     let file = root.path().join("blocked.kdl");
@@ -327,6 +333,9 @@ fn mission_publish_dry_run_prints_blockers_before_refusing_publication() {
 
 #[test]
 fn a_terminal_exec_fails_its_unsatisfied_field_gate() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(root.path());
     let file = root.path().join("mission.kdl");
@@ -397,6 +406,9 @@ mission "orchid/replay" state="ready" {
 
 #[test]
 fn missions_and_doctor_surface_a_terminal_field_gate_behind_a_pending_gate() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(root.path());
     let file = root.path().join("mission.kdl");
@@ -618,6 +630,9 @@ fn replay_host(root: &Path) -> Daemon {
 
 #[test]
 fn broken_gates_wait_for_a_revision_that_then_passes_their_steps() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let daemon = replay_host(root.path());
 
@@ -728,6 +743,9 @@ fn broken_gates_wait_for_a_revision_that_then_passes_their_steps() {
 
 #[test]
 fn a_check_answers_for_each_gate_and_publish_refuses_a_broken_one() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let daemon = replay_host(root.path());
     let workspace = root.path().to_str().unwrap();

@@ -276,6 +276,9 @@ fn delta(after: &BTreeMap<String, u64>, before: &BTreeMap<String, u64>) -> Vec<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_daemon_stays_under_its_cpu_and_request_budget() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let workspace = root.join("workspace");

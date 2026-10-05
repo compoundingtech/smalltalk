@@ -62,8 +62,8 @@ gh pr merge NUMBER --auto
 ```
 
 The queue checks the exact commit that lands. Main upkeep verifies those checks, runs `perf-cost`,
-and fills missing main caches. ci1 provides our self-hosted runners, with Namespace as overflow
-for ordinary PRs. Trusted PRs labelled `ci-priority` and their queue entries use the reserved
+and fills missing main caches. The primary Linux test job uses our self-hosted ci1 runners, with
+Namespace as overflow for ordinary PRs. The second test shard and supporting jobs use Namespace. Trusted PRs labelled `ci-priority` and their queue entries use the reserved
 `ci1-priority` lane; other merge groups use `ci1-merge`. Forks run on Namespace.
 macOS CI is currently disabled; its retained workflow is not a required check.
 See [CI operations](ci.md) for stage scope, routing, caches, and failure inspection.

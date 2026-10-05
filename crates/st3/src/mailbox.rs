@@ -101,6 +101,12 @@ pub struct Receipt {
     pub lifecycle: String,
 }
 
+/// Positive attachment requires a live, initialized channel under the current delivery fence.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Attachment {
+    pub attached: bool,
+}
+
 /// A single stream task owns reconnection. Dropping it ends the subscription.
 pub struct Subscription {
     pub receiver: tokio::sync::mpsc::Receiver<Frame>,
@@ -210,6 +216,91 @@ pub(crate) mod tests {
                 &format!("harness:{incarnation}"),
             ))
             .unwrap();
+    }
+    #[test]
+    fn claude_attachment_fences_idle_hooks_and_clears_only_on_attach_or_replacement() {
+        let store = Store::open_memory("node").unwrap();
+        ready(&store, "current");
+        let diagnostic = |code: &str, status: &str, incarnation: &str, key: &str| {
+            store
+                .append_claim(&claim(
+                    "agent/eval.worker",
+                    "harness.diagnostic",
+                    json!({"severity":"warning","code":code,"status":status,
+                    "reason":"attachment probe","incarnation_id":incarnation}),
+                    key,
+                ))
+                .unwrap();
+        };
+        diagnostic(
+            "claude-channel-unattached",
+            "starting",
+            "current",
+            "starting",
+        );
+        assert_eq!(
+            store
+                .current_harness("agent/eval.worker")
+                .unwrap()
+                .unwrap()
+                .state,
+            "starting"
+        );
+        diagnostic("claude-channel-unattached", "blocked", "current", "blocked");
+        store
+            .append_claim(&claim(
+                "agent/eval.worker",
+                "harness.observed",
+                json!({"state":"idle","driver":"claude","incarnation_id":"current"}),
+                "idle-hook",
+            ))
+            .unwrap();
+        let blocked = store.current_harness("agent/eval.worker").unwrap().unwrap();
+        assert_eq!(blocked.state, "blocked");
+        assert_eq!(blocked.reason.as_deref(), Some("claude-channel-unattached"));
+        diagnostic(
+            "claude-channel-attached",
+            "recovered",
+            "previous",
+            "foreign-recovery",
+        );
+        assert_eq!(
+            store
+                .current_harness("agent/eval.worker")
+                .unwrap()
+                .unwrap()
+                .state,
+            "blocked"
+        );
+        diagnostic(
+            "claude-channel-attached",
+            "recovered",
+            "current",
+            "recovered",
+        );
+        assert_eq!(
+            store
+                .current_harness("agent/eval.worker")
+                .unwrap()
+                .unwrap()
+                .state,
+            "idle"
+        );
+        diagnostic(
+            "claude-channel-unattached",
+            "blocked",
+            "current",
+            "blocked-again",
+        );
+        ready(&store, "replacement");
+        assert_eq!(
+            store
+                .current_harness("agent/eval.worker")
+                .unwrap()
+                .unwrap()
+                .state,
+            "ready"
+        );
     }
     #[test]
     fn seat_label_appends_launcher_persona_short_without_space_and_strips_controls() {

@@ -318,6 +318,9 @@ fn assert_attached(output: &Output) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_terminal_on_this_host_attaches_through_its_pty_session() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
     observe_terminal(&state.store, &incarnation(CREATED_AT));
@@ -343,6 +346,9 @@ async fn a_terminal_on_this_host_attaches_through_its_pty_session() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_terminal_behind_an_http_endpoint_attaches_through_the_websocket() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
     observe_terminal(&state.store, &incarnation(CREATED_AT));
@@ -367,6 +373,9 @@ async fn a_terminal_behind_an_http_endpoint_attaches_through_the_websocket() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replaced_pty_session_receives_nothing_from_a_local_attach() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
     // st observed an earlier session; a replacement now serves the same socket path.
@@ -391,6 +400,9 @@ async fn a_replaced_pty_session_receives_nothing_from_a_local_attach() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_terminal_on_this_host_attaches_without_st_while_its_daemon_is_down() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     // The configured daemon's socket under XDG_RUNTIME_DIR never listens.
     let registry = ConfiguredRegistry::new(root.path());
@@ -443,6 +455,9 @@ async fn a_terminal_on_this_host_attaches_without_st_while_its_daemon_is_down() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_terminal_on_this_host_attaches_while_its_daemon_never_answers() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     // The configured daemon takes every connection and never answers, as a daemon stuck behind
     // a saturated disk does.
@@ -524,6 +539,9 @@ impl SilentDaemon {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_terminal_on_this_host_attaches_whatever_endpoint_never_answers() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     // An explicit endpoint, not the configured daemon's socket, that never answers.
     let socket = root.path().join("elsewhere.sock");
@@ -559,6 +577,9 @@ async fn a_terminal_on_this_host_attaches_whatever_endpoint_never_answers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn waiting_on_a_daemon_that_does_not_answer_says_so() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("elsewhere.sock");
     let daemon = SilentDaemon::unix(&socket);
@@ -619,6 +640,9 @@ async fn waiting_on_a_daemon_that_does_not_answer_says_so() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_terminal_another_host_owns_is_not_attached_through_a_local_pty() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
     // Another host runs the terminal; this daemon knows it only through replication.
@@ -764,6 +788,9 @@ fn owner_session(root: &Path, created_at: &str) -> std::thread::JoinHandle<Optio
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_terminal_another_host_owns_attaches_pty_to_pty_over_fabric() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let state = remote_terminal(root.path(), &incarnation(CREATED_AT));
     let socket = root.path().join("st3.sock");
@@ -799,6 +826,9 @@ async fn a_terminal_another_host_owns_attaches_pty_to_pty_over_fabric() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replaced_pty_session_on_another_host_receives_nothing_over_fabric() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     // st selected an earlier session; a replacement now serves the same name on the owner.
     let state = remote_terminal(root.path(), &incarnation("2026-09-29T07:00:00.000Z"));
@@ -833,6 +863,9 @@ async fn a_replaced_pty_session_on_another_host_receives_nothing_over_fabric() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_terminal_another_host_owns_falls_back_to_the_client_gateway_without_fabric() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let state = remote_terminal(root.path(), &incarnation(CREATED_AT));
     let socket = root.path().join("st3.sock");

@@ -1,5 +1,6 @@
 //! The authoritative st3 subject, resource, and claim registry.
 
+pub mod custom;
 pub mod glasses;
 pub mod owned_terminals;
 
@@ -3427,6 +3428,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("kind", string()),
             ("state", any()),
             ("observed_at", integer()),
+            ("attribution_only", boolean()),
         ],
         _ => &[],
     };

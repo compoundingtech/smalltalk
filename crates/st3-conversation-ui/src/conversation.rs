@@ -511,6 +511,13 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 None => style,
             };
             let bar = run(bar.text, on(bar.style));
+            // Mail to the person leads with a bullet where their own mail has the bar's first
+            // row, so the two read apart at a glance (Nathan, 2026-10-05).
+            let lead = if to_you {
+                run("● ", on(fg(look.edge, theme)))
+            } else {
+                bar.clone()
+            };
             let mut from_style = fg(look.from, theme);
             if look.from_bold {
                 from_style = from_style.add_modifier(Modifier::BOLD);
@@ -546,7 +553,7 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                     run(progress.text, on(progress.style)),
                 ],
                 inner,
-                std::slice::from_ref(&bar),
+                std::slice::from_ref(&lead),
                 std::slice::from_ref(&bar),
                 tint,
             ));

@@ -24,6 +24,8 @@ st agents restart agent/garden/worker --as person/ada
 st agents show agent/garden/worker
 ```
 
+When repeated failed starts have parked a seat, a person's explicit restart permits one launch attempt for that request. Replaying the request or restarting the daemon does not grant another attempt. If the retry fails, the seat parks again and its cause stays visible in `st agents show` and the agents view. A new restart request permits a new retry. Provider version checks and native-session continuation still apply.
+
 The graph retains claimed work and pending mail. A relaunch continues the previous native session when the harness can; otherwise it starts a new session and recovers work from the graph. Stop and start explicitly when you want it off between uses:
 
 ```sh

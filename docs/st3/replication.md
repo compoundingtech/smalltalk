@@ -38,11 +38,11 @@ an upgrade. Equal envelope inventories alone cannot prove equal claim admission.
 
 `store::tests::canonical_audit::every_shared_projection_agrees_after_shuffle_restart_and_checkpoint`
 checks both invariants by comparing shared rows, selected readers and per-table digest oracles
-across isolated stores. `shared_folds_never_order_by_local_arrival` rejects raw shared arrival
-folds, and `every_persistent_table_has_a_projection_scope` rejects unclassified tables. A new
-shared table must join the shuffle test's inventory and history fixture,
-the canonical ordering guard, and the production digest registry in the same change. A new
-shared claim-derived view must compare its answer at the same explicit time and recipients.
+across isolated stores. `every_persistent_table_has_a_projection_scope` rejects unclassified
+tables. A new shared table must join the shuffle test's inventory and history fixture and the
+production digest registry in the same change. A new shared claim-derived view must compare
+its answer at the same explicit time and recipients. Local pagination metadata may order by
+local arrival; shared winner selection must remain independent of that order.
 
 The [canonical projections audit](canonical-projections-audit.md) records the original gaps and
 local exceptions. Modern status reports a graph digest over the complete projection registry,

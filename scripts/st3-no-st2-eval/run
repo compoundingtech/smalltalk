@@ -333,4 +333,6 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from st3_test_process import supervised_main
+    raise SystemExit(supervised_main(main))

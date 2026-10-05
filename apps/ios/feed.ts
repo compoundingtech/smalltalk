@@ -21,6 +21,8 @@ export type FeedHandlers = {
   onConnection: (state: 'connecting' | 'live' | 'reconnecting', issue?: string) => void;
   /** The server refused a window; the others keep going. */
   onWindowError?: (name: FeedWindow, message: string) => void;
+  /** Development measurement hook; never carries transcript content or a target. */
+  onConversationFrame?: (rows: number, replace: boolean) => void;
 };
 
 /** The person's glasses, all of them, after each frame that changed them. */
@@ -265,6 +267,7 @@ export class Feed {
       if (id === CONVERSATION && this.conversation) {
         this.conversation.failures = 0;
         this.conversation.handlers.onIssue('');
+        this.handlers.onConversationFrame?.(frame.items.length, frame.replace);
         this.conversation.handlers.onEntries({ replace: frame.replace, items: frame.items, hasMore: !!frame.has_more, sessionId: frame.session_id });
       }
     } else if (frame.kind === 'error') {

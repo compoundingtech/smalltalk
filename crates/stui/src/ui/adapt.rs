@@ -22,7 +22,6 @@ pub struct Extras {
     pub bodies: BTreeMap<String, (String, Option<String>, String)>,
     pub live: bool,
     pub offline: Option<String>,
-    pub mail_backlog: Option<Result<st3_client::MailBacklog, String>>,
 }
 
 fn now() -> String {
@@ -142,11 +141,6 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         host,
         link,
         diverged,
-        mail_backlog: match &extras.mail_backlog {
-            Some(Ok(value)) => Load::Ready(value.clone()),
-            Some(Err(error)) => Load::Failed(error.clone()),
-            None => Load::Loading,
-        },
         attention: loaded(model.now.snapshot.is_some(), attention),
         agents: loaded(model.agents.snapshot.is_some(), agents(model)),
         missions: loaded(model.missions.snapshot.is_some(), missions),
@@ -330,6 +324,20 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         structured: item.request.clone().map(Box::new),
                     },
                 ),
+                custom if custom.starts_with("custom.") => (
+                    Tier::Today,
+                    AttentionKind::Request {
+                        from: requester_name(model, item.requester_id.as_deref()),
+                        from_id: item.requester_id.clone().unwrap_or_default(),
+                        question: format!(
+                            "{}\n\n{}\nSource: {}",
+                            item.detail,
+                            crate::custom_form_hint(item.custom_form.as_ref()),
+                            item.source_id
+                        ),
+                        structured: None,
+                    },
+                ),
                 // Home holds only requests and reviews. Messages stay in conversations, and st
                 // sends each fault to the agent that owns it.
                 _ => return None,
@@ -415,6 +423,10 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                 agent,
                 related,
                 raised_by,
+                blocked: item.blocked.as_ref().map(|blocked| Blocked {
+                    step: blocked.step.clone(),
+                    goal: clean_message_text(&blocked.goal),
+                }),
                 tier,
                 title: extras
                     .bodies
@@ -567,6 +579,15 @@ fn agents(model: &Model) -> Vec<Agent> {
                     AgentState::NeedsYou
                 }
                 ("waiting", Some("blocked")) => AgentState::NeedsYou,
+                // st withdraws an idle claim it has not heard renewed lately: the harness reads
+                // "indeterminate" and the seat "waiting", though it is up and reachable. That is an
+                // idle seat nobody has spoken to, not one starting (Nathan, 2026-10-05).
+                ("waiting", Some("indeterminate"))
+                    if agent.observation.as_deref() == Some("stale")
+                        && matches!(agent.reachability.as_str(), "reachable" | "local") =>
+                {
+                    AgentState::Idle
+                }
                 ("waiting" | "starting" | "desired", _) => AgentState::Starting,
                 ("stopped", _) => AgentState::Stopped,
                 _ => AgentState::Unknown,
@@ -1521,6 +1542,32 @@ mod tests {
         model.agents = window(vec![resource("failed", "working", Some("human"))]);
         assert_eq!(agents(&model)[0].state, AgentState::Fault);
         model.agents = window(vec![resource("waiting", "indeterminate", Some("human"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+    }
+
+    #[test]
+    fn an_idle_seat_st_has_not_heard_from_lately_reads_idle_not_starting() {
+        let mut model = Model::default();
+        let resource = |state: &str, harness: &str, observation: Option<&str>| {
+            serde_json::json!({
+                "id": "agent/example/quiet", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-10-05T12:00:00Z", "name": "example/quiet",
+                "state": state, "reachability": "reachable", "harness_state": harness,
+                "observation": observation, "blocked_on": "none", "runtime_ids": [], "under": [],
+            })
+        };
+        // Its idle claim went stale: st says waiting/indeterminate; the seat is just idle.
+        model.agents = window(vec![resource("waiting", "indeterminate", Some("stale"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::Idle);
+        // Without that staleness, an indeterminate waiting seat is still starting.
+        model.agents = window(vec![resource("waiting", "indeterminate", Some("current"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+        model.agents = window(vec![resource("waiting", "indeterminate", None)]);
+        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+        // A stale observation on an unreachable seat is no news that it is idle.
+        let mut gone = resource("waiting", "indeterminate", Some("stale"));
+        gone["reachability"] = "unreachable".into();
+        model.agents = window(vec![gone]);
         assert_eq!(agents(&model)[0].state, AgentState::Starting);
     }
 
