@@ -19,6 +19,24 @@ image adds a few hundred bytes to sync, not megabytes. The reference field is `s
 `blob_hash`: the graph replicates and requires every blob a claim's `blob_hash`, `hash` or
 `bundle_hash` field names, which is the opposite of what an attachment wants.
 
+## Native OMP image availability
+
+Native `blob:sha256:<64 hex>` references belong to OMP's blob store, not automatically to
+st's authorized message attachment service. Replay preserves their exact safe identity,
+supported MIME type and supplied numeric dimensions, but does not manufacture an st
+`attachment_id`, origin, upload authority or successful fetch.
+
+Standalone image blocks become typed `native_image_unavailable` timeline diagnostics.
+Their details use `{ "_tag": "OmpImage", "version": 1, "availability": "unavailable",
+"reason": "native_blob_not_fetchable", "native_ref": "blob:sha256:…", "mime_type": "image/webp" }`.
+Images inside message-level or nested tool results use the same descriptor in result content;
+other result content and call correlation remain unchanged.
+
+Inline pixels, remote URLs and malformed references are never copied into these descriptors.
+They report `availability: withheld` and `reason: image_payload_not_authorized`. Unsupported
+MIME values report `mime_availability: unknown` rather than leaking free text. No image is
+fetched or uploaded by native normalization, and no image bytes enter timeline claims.
+
 ## Limits
 
 | Limit | Value |

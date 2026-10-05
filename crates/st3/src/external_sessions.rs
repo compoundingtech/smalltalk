@@ -2522,7 +2522,7 @@ fn normalize_omp(
                 sequence + 1,
                 &timestamp,
                 message["toolCallId"].as_str().unwrap_or_default(),
-                message.get("content").cloned().unwrap_or(Value::Null),
+                omp_result_images(driver, message.get("content").cloned().unwrap_or(Value::Null)),
                 message.get("isError").and_then(Value::as_bool).unwrap_or(false),
             );
             return;
@@ -2611,9 +2611,17 @@ fn push_omp_content(
                             .or_else(|| part.get("call_id"))
                             .and_then(Value::as_str)
                             .unwrap_or("native-call"),
-                        part.get("content").cloned().unwrap_or(Value::Null),
+                        omp_result_images(driver, part.get("content").cloned().unwrap_or(Value::Null)),
                     ),
                     Some(kind) if HIDDEN_REASONING_BLOCKS.contains(&kind) => {}
+                    Some("image") if driver == ExternalDriver::Omp => {
+                        items.push(timeline_item(item_sequence, &timestamp, "system", "error", json!({
+                            "code":"native_image_unavailable",
+                            "message":"Native image is unavailable through the conversation attachment service.",
+                            "retryable":false,
+                            "details":omp_image_availability(part),
+                        })));
+                    }
                     Some("image") => {
                         push_content(items, item_sequence, &timestamp, role, "[image]")
                     }
@@ -2640,6 +2648,52 @@ fn push_omp_content(
             other,
         ),
     }
+}
+
+fn omp_image_availability(image: &Value) -> Value {
+    let reference = image.get("data").and_then(Value::as_str).filter(|reference| {
+        reference.strip_prefix("blob:sha256:").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    });
+    let mut details = json!({
+        "_tag":"OmpImage","version":1,
+        "availability":if reference.is_some() { "unavailable" } else { "withheld" },
+        "reason":if reference.is_some() { "native_blob_not_fetchable" } else { "image_payload_not_authorized" },
+    });
+    if let Some(reference) = reference {
+        // This is not a st attachment ID: no origin/authorization evidence exists to fetch it.
+        details["native_ref"] = json!(reference);
+    }
+    if let Some(mime) = image.get("mimeType").and_then(Value::as_str)
+        .filter(|mime| matches!(*mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp"))
+    {
+        details["mime_type"] = json!(mime);
+    } else {
+        details["mime_availability"] = json!("unknown");
+    }
+    for key in ["width", "height"] {
+        if let Some(value) = image.get(key).filter(|value| value.is_u64()) {
+            details[key] = value.clone();
+        }
+    }
+    details
+}
+
+fn omp_result_images(driver: ExternalDriver, mut content: Value) -> Value {
+    if driver != ExternalDriver::Omp {
+        return content;
+    }
+    if let Some(parts) = content.as_array_mut() {
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("image") {
+                *part = omp_image_availability(part);
+            }
+        }
+    } else if content.get("type").and_then(Value::as_str) == Some("image") {
+        content = omp_image_availability(&content);
+    }
+    content
 }
 
 fn normalized_role(role: Option<&str>) -> &'static str {
@@ -3340,6 +3394,57 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn omp_images_keep_safe_identity_and_typed_unavailability_without_pixels() {
+        let reference = format!("blob:sha256:{}", "a".repeat(64));
+        let image = json!({"type":"image","data":reference,"mimeType":"image/webp","width":640,"height":480});
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &json!({
+            "type":"message","id":"image-message","message":{"role":"user","content":[image.clone()]}
+        }), 0, "", &mut items);
+        let notice = items.iter().find(|item| item["type"] == "error").unwrap();
+        assert_eq!(notice["body"]["code"], "native_image_unavailable");
+        assert_eq!(notice["body"]["details"]["native_ref"], reference);
+        assert_eq!(notice["body"]["details"]["mime_type"], "image/webp");
+        assert_eq!(notice["body"]["details"]["availability"], "unavailable");
+        assert_eq!(notice["body"]["details"]["reason"], "native_blob_not_fetchable");
+        assert_eq!(notice["body"]["details"]["width"], 640);
+        assert_eq!(notice["body"]["details"]["height"], 480);
+
+        for data in ["planted-image-bytes", "https://user:secret@example.invalid/image", "blob:sha256:secret"] {
+            items.clear();
+            normalize_omp(ExternalDriver::Omp, &json!({
+                "type":"message","id":"image-tool","message":{
+                    "role":"toolResult","toolCallId":"image-call","isError":false,
+                    "content":[{"type":"text","text":"kept"},{"type":"image","data":data,"mimeType":"image/png"}]
+                }
+            }), 0, "", &mut items);
+            let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
+            assert_eq!(result["body"]["call_id"], "image-call");
+            assert_eq!(result["body"]["content"][0]["text"], "kept");
+            assert_eq!(result["body"]["content"][1]["_tag"], "OmpImage");
+            assert_eq!(result["body"]["content"][1]["availability"], "withheld");
+            assert_eq!(result["body"]["content"][1]["mime_type"], "image/png");
+            assert!(!serde_json::to_string(&items).unwrap().contains(data));
+        }
+    }
+
+    #[test]
+    fn omp_nested_result_images_withhold_bytes_and_unknown_mime() {
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &json!({
+            "type":"message","id":"nested-image","message":{"role":"tool","content":[{
+                "type":"toolResult","toolCallId":"nested-call","content":[{
+                    "type":"image","data":"planted-image-bytes","mimeType":"planted-mime-secret"
+                }]
+            }]}
+        }), 0, "", &mut items);
+        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
+        assert_eq!(result["body"]["content"][0]["mime_availability"], "unknown");
+        assert_eq!(result["body"]["content"][0]["reason"], "image_payload_not_authorized");
+        assert!(!serde_json::to_string(&items).unwrap().contains("planted-"));
     }
 
     #[test]
