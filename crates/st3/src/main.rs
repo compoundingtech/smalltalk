@@ -16919,55 +16919,57 @@ async fn drive_st2_native(
                     task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
                     continue;
                 }
-                // A refused omp never reaches the session loop. Publish its durable named
-                // admission boundary before recording exit, retrying through daemon outages.
-                if matches!(driver, "omp" | "opencode") {
-                    let observed = st_drivers::driver_diagnostic::read(
-                        &st_drivers::driver_diagnostic::path(&agent_dir));
-                    if let Some(input) = admission_diagnostic(subject, &incarnation, &observed) {
-                        let _: ClaimRecord = retry_while_daemon_unreachable(subject, || {
-                            client.post("/v1/claims", &input)
-                        }).await?;
-                    }
-                }
-                if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
-                    note_driver_tick_failure(subject, error, &mut last_control_warning);
-                }
-                // The harness is gone, and its subagents with it. The reconciler ends any this
-                // cannot record once it sees the runtime exit.
-                if let Some(subagents) = subagents.as_mut() {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        subagents.end_all(client, "harness-exited", "its harness exited"),
-                    )
-                    .await;
-                }
-                loop {
-                    let result: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
-                        subject: subject.into(),
-                        kind: "runtime.observed".into(),
-                        actor: Some(subject.into()),
-                        fields: BTreeMap::from([
-                            ("status".into(), Value::String("exited".into())),
-                            ("runtime_id".into(), Value::String(runtime_id.clone())),
-                            (
-                                "incarnation_id".into(),
-                                Value::String(incarnation.clone()),
-                            ),
-                            ("exit_code".into(), Value::from(if outcome.is_ok() { 0 } else { 1 })),
-                        ]),
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: Some(native_exit_key(subject, &runtime_id, &incarnation)),
-                    }).await;
-                    match result {
-                        Ok(_) => break,
-                        Err(error) => {
-                            tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
-                            tokio::time::sleep(Duration::from_millis(250)).await;
+                finish_native_exit_report(subject, async {
+                    // A refused omp never reaches the session loop. Publish its durable named
+                    // admission boundary before recording exit, retrying through daemon outages.
+                    if matches!(driver, "omp" | "opencode") {
+                        let observed = st_drivers::driver_diagnostic::read(
+                            &st_drivers::driver_diagnostic::path(&agent_dir));
+                        if let Some(input) = admission_diagnostic(subject, &incarnation, &observed) {
+                            let _: ClaimRecord = retry_while_daemon_unreachable(subject, || {
+                                client.post("/v1/claims", &input)
+                            }).await?;
                         }
                     }
-                }
+                    if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
+                    // The harness is gone, and its subagents with it. The reconciler ends any this
+                    // cannot record once it sees the runtime exit.
+                    if let Some(subagents) = subagents.as_mut() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            subagents.end_all(client, "harness-exited", "its harness exited"),
+                        )
+                        .await;
+                    }
+                    loop {
+                        let result: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
+                            subject: subject.into(),
+                            kind: "runtime.observed".into(),
+                            actor: Some(subject.into()),
+                            fields: BTreeMap::from([
+                                ("status".into(), Value::String("exited".into())),
+                                ("runtime_id".into(), Value::String(runtime_id.clone())),
+                                (
+                                    "incarnation_id".into(),
+                                    Value::String(incarnation.clone()),
+                                ),
+                                ("exit_code".into(), Value::from(if outcome.is_ok() { 0 } else { 1 })),
+                            ]),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(native_exit_key(subject, &runtime_id, &incarnation)),
+                        }).await;
+                        match result {
+                            Ok(_) => return Ok(()),
+                            Err(error) => {
+                                tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                            }
+                        }
+                    }
+                }).await?;
                 return outcome;
             }
             _ = interval.tick() => {
@@ -20197,6 +20199,37 @@ async fn publish_provider_capacity_diagnostic(
         )
         .await?;
     Ok(())
+}
+
+/// Once the provider is gone, retain unlimited exit-report retries across ordinary daemon
+/// outages. A stop (including one arriving during a request) instead allows two seconds for
+/// the final observation drain, subagent cleanup and terminal claim together. Polling the stop
+/// flag takes at most 250 ms; timing out drops the in-flight request, not just the retry sleep.
+async fn finish_native_exit_report(
+    subject: &str,
+    report: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::pin!(report);
+    tokio::select! {
+        result = &mut report => result,
+        _ = async {
+            while !st_drivers::provider_session::stop_requested() {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        } => {
+            match tokio::time::timeout(Duration::from_secs(2), report).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // The provider is already gone. The reconciler observes runtime liveness
+                    // when the daemon returns; an unavailable API must not keep a stopped seat
+                    // alive forever. Keep this note off the provider's shared terminal.
+                    let _ = write_driver_log(subject,
+                        "stopped driver reached its two-second exit-report deadline; exiting without an acknowledged terminal report");
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 fn tolerate_driver_api_outage(
