@@ -1430,7 +1430,9 @@ where
     let (snapshot, items) = blocking_store(move || {
         reader.store.clone().read_snapshot(|index| {
             let snapshot = client_snapshot_at(&reader, index);
-            let items = read(&reader, &snapshot)?;
+            let items = reader
+                .store
+                .with_owned_set_snapshot_reads(|| read(&reader, &snapshot))?;
             Ok((snapshot, items))
         })
     })
