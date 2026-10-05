@@ -703,6 +703,8 @@ async fn anonymous_pairing_advertisement_is_static_and_never_notes_presence() {
                     fields: BTreeMap::from([
                         ("content".into(), json!("changed")),
                         ("to".into(), json!(PERSON)),
+                        ("from".into(), json!(PERSON)),
+                        ("status".into(), json!("sent")),
                     ]),
                     evidence: vec![],
                     expected_subject: None,
