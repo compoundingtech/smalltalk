@@ -1348,6 +1348,35 @@ async fn cli_person_ask_is_completed_by_its_assigned_person() {
     let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
     assert_eq!(listed["value"]["items"][0]["source_id"], subject);
     assert_eq!(listed["value"]["items"][0]["attention_kind"], "person-step");
+    let attention_id = listed["value"]["items"][0]["id"].as_str().unwrap();
+    let printed = run_cli_human(&socket, &["attention", "ls", "--as", "person/avery"]).await;
+    assert!(printed.status.success(), "{printed:?}");
+    assert!(String::from_utf8_lossy(&printed.stdout).contains(attention_id));
+    let canonical = value(
+        &run_cli(
+            &socket,
+            &["attention", "show", subject, "--as", "person/avery"],
+        )
+        .await,
+    );
+    let aliased = value(
+        &run_cli(
+            &socket,
+            &["attention", "show", attention_id, "--as", "person/avery"],
+        )
+        .await,
+    );
+    assert_eq!(aliased, canonical);
+    assert_eq!(aliased["subject"], subject);
+    for target in [attention_id, subject] {
+        let refused = run_cli(
+            &socket,
+            &["attention", "show", target, "--as", "person/robin"],
+        )
+        .await;
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("not currently actionable"));
+    }
     let wrong = run_cli(
         &socket,
         &[
@@ -1375,6 +1404,15 @@ async fn cli_person_ask_is_completed_by_its_assigned_person() {
     ];
     assert_eq!(value(&run_cli(&socket, &done).await)["status"], "completed");
     assert_eq!(value(&run_cli(&socket, &done).await)["status"], "completed");
+    for target in [attention_id, subject] {
+        let refused = run_cli(
+            &socket,
+            &["attention", "show", target, "--as", "person/avery"],
+        )
+        .await;
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("not currently actionable"));
+    }
     let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
     assert!(listed["value"]["items"].as_array().unwrap().is_empty());
     assert!(
@@ -1513,6 +1551,15 @@ async fn cli_structured_choice_returns_the_selected_option_as_data() {
 /// poster, only for the person's own work, and opening it reads it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_update_reaches_home_only_for_asked_work_and_opening_reads_it() {
+    assert_update_opening_reads(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_update_public_attention_id_reads_only_when_the_person_opens_it() {
+    assert_update_opening_reads(true).await;
+}
+
+async fn assert_update_opening_reads(public_id: bool) {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = test_state(root.path());
@@ -1598,9 +1645,35 @@ mission "release-report" state="ready" {
         serde_json::json!({"id": "read"})
     );
 
+    let attention_id = item["id"].as_str().unwrap();
+    // Merely resolving the public card cannot read the update for the person.
+    let client = st3_client::Client::unix_as(&socket, "person/avery");
+    client.attention_get(attention_id).await.unwrap();
+    for target in [attention_id, subject.as_str()] {
+        let inspected = value(
+            &run_cli_with_agent_env(
+                &socket,
+                &actor,
+                &["attention", "show", target, "--as", "person/avery"],
+            )
+            .await,
+        );
+        assert_eq!(inspected["subject"], subject);
+        assert_eq!(inspected["request"]["type"], "update");
+    }
+    let still_open = client.attention_list(None, None, false).await.unwrap();
+    assert_eq!(still_open.value.items.len(), 1);
+    assert_eq!(store.step_run(&subject).unwrap().unwrap().status, "ready");
+
     let opened = run_cli_human(
         &socket,
-        &["attention", "show", &subject, "--as", "person/avery"],
+        &[
+            "attention",
+            "show",
+            if public_id { attention_id } else { &subject },
+            "--as",
+            "person/avery",
+        ],
     )
     .await;
     assert!(opened.status.success(), "{opened:?}");
@@ -1616,6 +1689,15 @@ mission "release-report" state="ready" {
     );
     let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
     assert_eq!(listed["value"]["items"], serde_json::json!([]));
+    for target in [attention_id, subject.as_str()] {
+        let refused = run_cli(
+            &socket,
+            &["attention", "show", target, "--as", "person/avery"],
+        )
+        .await;
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("not currently actionable"));
+    }
     let shown = value(&run_cli(&socket, &["work", "show", &subject]).await);
     assert_eq!(
         shown["value"]["person_answers"][0]["answer"],
