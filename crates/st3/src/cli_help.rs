@@ -107,6 +107,9 @@ pub(super) fn root_help(all: bool) -> String {
     output.push('\n');
     output.push_str(&options.render_help().to_string());
     output.push_str("\nUse st help COMMAND for command help; st help --all also lists plumbing.\n");
+    output.push_str(
+        "\nIssues and suggestions are welcome. Please file an upstream issue:\n  gh issue create --repo compoundingtech/smalltalk\nPull requests are welcome too: https://github.com/compoundingtech/smalltalk\n",
+    );
     output
 }
 

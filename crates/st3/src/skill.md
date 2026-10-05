@@ -52,3 +52,9 @@ A fault arrives as a message to the agent that owns it, which retries, revises o
 ## Other agents' terminals
 
 st reaches every seat through its harness's own channel. Keys typed into another agent's terminal land in whatever that terminal shows, such as a person's unsent draft or a permission prompt, and st cannot see or record them. `conversations send` reaches another agent through the graph.
+
+## Upstream feedback
+
+Issues and suggestions are welcome at https://github.com/compoundingtech/smalltalk.
+File an upstream issue with `gh issue create --repo compoundingtech/smalltalk`.
+Pull requests are welcome too.

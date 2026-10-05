@@ -44,6 +44,9 @@ struct CollectionSubscribe {
 
 struct CollectionSubscription {
     request: CollectionSubscribe,
+    generation: u64,
+    reading: Option<tokio::sync::oneshot::Sender<()>>,
+    dirty: bool,
     /// Whether the client has this subscription's first snapshot.
     delivered: bool,
     previous: BTreeMap<String, Value>,
@@ -99,6 +102,7 @@ async fn collection_items(
     state: &AppState,
     session: &ClientSession,
     request: &CollectionSubscribe,
+    read_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if !matches!(
         request.collection.as_str(),
@@ -129,6 +133,8 @@ async fn collection_items(
     let collection = request.collection.clone();
     let custom_forms = session.custom_forms;
     let (snapshot, mut items, has_more) = super::blocking_store(move || {
+        // Keep the physical read slot even if its awaiting subscription is canceled.
+        let _read_permit = read_permit;
         let store = state.store.clone();
         store.read_snapshot(|index| {
             let snapshot = client_snapshot_at(&state, index);
@@ -572,7 +578,7 @@ async fn collection_stream_socket(
         state,
         session,
         Some(presence),
-        |state, session, request| async move { collection_items(&state, &session, &request).await },
+        |state, session, request, permit| async move { collection_items(&state, &session, &request, permit).await },
     )
     .await;
 }
@@ -584,8 +590,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     presence: Option<super::client_presence::StreamGuard>,
     read: F,
 ) where
-    F: Fn(AppState, ClientSession, CollectionSubscribe) -> Fut + Clone + Send + 'static,
-    Fut: std::future::Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
+    F: Fn(AppState, ClientSession, CollectionSubscribe, tokio::sync::OwnedSemaphorePermit) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
 {
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
@@ -601,6 +607,9 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     let mut weighed = state.store.index().unwrap_or_default();
     let mut reread_due = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
+    let mut reads = futures_util::stream::FuturesUnordered::new();
+    let read_slots = Arc::new(tokio::sync::Semaphore::new(COLLECTION_MAX_SUBSCRIPTIONS));
+    let mut generation = 0_u64;
     loop {
         // The subscriptions to read after this wake-up.
         let mut refresh = Vec::<String>::new();
@@ -678,10 +687,24 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             break 'command;
                         }
                         refresh.push(request.id.clone());
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
+                        generation += 1;
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, generation, reading: None, dirty: false, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
+                }
+            }
+            Some(result) = reads.next(), if !command_waiting && !reads.is_empty() => {
+                let Some((id, generation, result)): Option<(String, u64, _)> = result else { continue; };
+                let Some(subscription) = subscriptions.get_mut(&id) else { continue; };
+                if subscription.generation != generation { continue; }
+                subscription.reading = None;
+                if std::mem::take(&mut subscription.dirty) { refresh.push(id.clone()); }
+                match deliver_collection(&mut socket, subscription, result).await {
+                    Refreshed::Current => {}
+                    Refreshed::Retry => { reread_due = true; }
+                    Refreshed::Dropped => { subscriptions.remove(&id); }
+                    Refreshed::Closed => return,
                 }
             }
             result = changed.changed(), if !command_waiting => {
@@ -730,6 +753,10 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 continue;
             }
         }
+        refresh.sort_unstable();
+        refresh.dedup();
+        // A permanently refused dirty window no longer counts toward held-window refreshes.
+        refresh.retain(|id| subscriptions.contains_key(id));
         if refresh.is_empty() {
             continue;
         }
@@ -737,28 +764,32 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             reread_due = false;
             last_reread = tokio::time::Instant::now();
         }
-        // Read every due window at once, each in its own snapshot, then send them in order:
-        // one slow window never holds back the others' reads.
-        let reads = futures_util::future::join_all(refresh.into_iter().filter_map(|id| {
-            let request = subscriptions.get(&id)?.request.clone();
-            let (state, session, read) = (state.clone(), session.clone(), read.clone());
-            Some(async move { (id, read(state, session, request).await) })
-        }))
-        .await;
-        for (id, read) in reads {
-            let Some(subscription) = subscriptions.get_mut(&id) else {
+        // Keep admission, conversation and terminal delivery live while each window reads.
+        // Replaced/unsubscribed windows are fenced by their subscription generation.
+        for id in refresh {
+            let Some(subscription) = subscriptions.get_mut(&id) else { continue; };
+            if subscription.reading.is_some() {
+                subscription.dirty = true;
                 continue;
-            };
-            match deliver_collection(&mut socket, subscription, read).await {
-                Refreshed::Current => {}
-                Refreshed::Retry => {
-                    reread_due = true;
-                }
-                Refreshed::Dropped => {
-                    subscriptions.remove(&id);
-                }
-                Refreshed::Closed => return,
             }
+            let (cancel, canceled) = tokio::sync::oneshot::channel::<()>();
+            subscription.reading = Some(cancel);
+            let request = subscription.request.clone();
+            let generation = subscription.generation;
+            let (state, session, read) = (state.clone(), session.clone(), read.clone());
+            let read_slots = read_slots.clone();
+            reads.push(async move {
+                tokio::select! {
+                    biased;
+                    _ = canceled => None,
+                    result = async {
+                        let permit = read_slots.acquire_owned().await.expect("socket read slots stay open");
+                        read(state, session, request, permit).await
+                    } => {
+                        Some((id, generation, result))
+                    }
+                }
+            });
         }
     }
 }
@@ -930,9 +961,11 @@ pub(super) async fn usage_period(
         )));
     }
     let store = state.store.clone();
-    let (mut rows, limits) = blocking_store(move || {
+    let (mut rows, agent_messages, limits) = blocking_store(move || {
+        let (rows, agent_messages) = store.usage_period_report(since_ms, until_ms)?;
         Ok((
-            store.usage_period_rows(since_ms, until_ms)?,
+            rows,
+            agent_messages,
             store.account_limits()?,
         ))
     })
@@ -954,7 +987,7 @@ pub(super) async fn usage_period(
         })
         .collect::<Vec<_>>();
     Ok(Json(
-        json!({ "since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits }),
+        json!({ "since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages }),
     ))
 }
 
@@ -9251,6 +9284,388 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn obsolete_collection_results_are_dropped_after_replace_or_unsubscribe() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() { let _ = sender.send(()); }
+            }
+        }
+        for replace in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state(root.path());
+            let (release, held) = tokio::sync::watch::channel(false);
+            let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+            let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+            let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
+            let app = axum::Router::new().route(
+                "/stream",
+                axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                    let (state, held, dropped, entered, completed) =
+                        (state.clone(), held.clone(), dropped.clone(), entered.clone(), completed.clone());
+                    async move {
+                        upgrade.on_upgrade(move |socket| {
+                            collection_stream_socket_with_reader(
+                                socket, state, ClientSession::local(None).unwrap(), None,
+                                move |state, session, request, permit| {
+                                    let (mut held, dropped, entered, completed) =
+                                        (held.clone(), dropped.clone(), entered.clone(), completed.clone());
+                                    async move {
+                                        let result = collection_items(&state, &session, &request, permit).await;
+                                        if request.id != "held" || request.collection != "work" { return result; }
+                                        let (sender, receiver) = tokio::sync::oneshot::channel();
+                                        tokio::spawn(async move { let _ = receiver.await; let _ = dropped.send(()); });
+                                        let _dropped = Dropped(Some(sender));
+                                        tokio::task::spawn_blocking(move || {
+                                            entered.send(()).unwrap();
+                                            let _ = tokio::runtime::Handle::current().block_on(held.wait_for(|released| *released));
+                                            completed.send(()).unwrap();
+                                            result
+                                        }).await.unwrap()
+                                    }
+                                },
+                            )
+                        })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"held","collection":"work","limit":2}).to_string().into(),
+            )).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), entries.recv()).await.unwrap().unwrap();
+            if !replace {
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"unsubscribe","id":"held"}).to_string().into(),
+                )).await.unwrap();
+            }
+            let visible = if replace { "held" } else { "visible" };
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":visible,"collection":"missions","limit":2}).to_string().into(),
+            )).await.unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["id"], visible);
+            assert_eq!(frame["collection"], "missions");
+            assert_eq!(frame["kind"], "snapshot");
+            // Confirm the obsolete awaiter is gone, then complete its uncancellable
+            // physical worker. A ready marker lets us inspect post-release wire delivery.
+            tokio::time::timeout(Duration::from_secs(5), drops.recv()).await.unwrap().unwrap();
+            release.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), completions.recv()).await.unwrap().unwrap();
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"barrier","collection":"work","limit":2}).to_string().into(),
+            )).await.unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["id"], "barrier", "obsolete result arrived after release: {frame}");
+            assert_eq!(frame["kind"], "snapshot");
+            socket.close(None).await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_during_collection_read_delivers_snapshot_then_followup_changes() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let writer = state.clone();
+        let release = Arc::new(Notify::new());
+        let held = release.clone();
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let (refreshed, mut refreshes) = tokio::sync::mpsc::unbounded_channel();
+        let first = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, held, entered, refreshed, first, probe) =
+                    (state.clone(), held.clone(), entered.clone(), refreshed.clone(), first.clone(), probe.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let (held, entered, refreshed, first, probe) =
+                                    (held.clone(), entered.clone(), refreshed.clone(), first.clone(), probe.clone());
+                                async move {
+                                    let result = collection_items(&state, &session, &request, permit).await;
+                                    if request.id == "held" && first.fetch_add(1, Ordering::SeqCst) == 0 {
+                                        entered.send(()).unwrap();
+                                        held.notified().await;
+                                    } else if request.id == "probe" && probe.fetch_add(1, Ordering::SeqCst) > 0 {
+                                        // A second work read can only come from the all-window
+                                        // commit refresh; the same pass marks held dirty.
+                                        refreshed.send(()).unwrap();
+                                    }
+                                    result
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"held","collection":"missions","limit":2}).to_string().into(),
+        )).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entries.recv()).await.unwrap().unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"probe","collection":"work","limit":2}).to_string().into(),
+        )).await.unwrap();
+        let frame = socket.next().await.unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "probe");
+        let source = "version 2\nmission \"during-read\" state=\"ready\" { goal \"Observed after the fence.\"; step \"check\" { agentless; goal \"Check.\" } }\n";
+        let intent = crate::graph::parse_intent(source, "during-read").unwrap();
+        let planned = writer.store.mission(&intent, IntentInput { kdl: source.into(), source_name: None }).unwrap();
+        writer.store.apply(&intent, &planned.subject_tokens, "during-read").unwrap();
+        signal_changed(&writer);
+        tokio::time::timeout(Duration::from_secs(5), refreshes.recv()).await.unwrap().unwrap();
+        release.notify_one();
+        let mut frames = Vec::new();
+        while frames.len() < 2 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            if frame["id"] == "held" { frames.push(frame); }
+        }
+        assert_eq!(frames[0]["kind"], "snapshot");
+        assert_eq!(frames[0]["items"], json!([]));
+        assert_eq!(frames[1]["kind"], "changes");
+        assert_eq!(frames[1]["upserts"][0]["id"], "mission/during-read");
+        assert_eq!(frames[1]["order"], json!(["mission/during-read"]));
+        assert_ne!(frames[0]["snapshot"], frames[1]["snapshot"]);
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_collection_does_not_block_new_windows_or_conversation_frames() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state(root.path());
+        state.native_session_home = Some(root.path().join("native"));
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/dispatch-chat".into(),
+            kind: "runtime.observed".into(),
+            actor: Some("agent/dispatch-chat".into()),
+            fields: BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("dispatch-runtime")),
+                ("incarnation_id".into(), json!("dispatch-runtime:i1")),
+                ("terminal".into(), json!(false)),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (started, blocked) = (entered.clone(), release.clone());
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, entered, release) = (state.clone(), started.clone(), blocked.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let (entered, release) = (entered.clone(), release.clone());
+                                async move {
+                                    if request.limit == Some(1) {
+                                        entered.notify_one();
+                                        release.notified().await;
+                                    }
+                                    collection_items(&state, &session, &request, permit).await
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"slow","collection":"agents","limit":1})
+                .to_string().into(),
+        )).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified()).await.unwrap();
+        for command in [
+            json!({"kind":"subscribe","id":"fast","collection":"work","limit":2}),
+            json!({"kind":"subscribe","id":"chat","collection":"conversation","conversation":"agent/dispatch-chat"}),
+        ] {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(command.to_string().into()))
+                .await.unwrap();
+        }
+        let mut received = BTreeMap::new();
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            received.insert(frame["id"].as_str().unwrap().to_owned(), frame);
+        }
+        assert_eq!(received["fast"]["kind"], "snapshot");
+        assert_eq!(received["chat"]["kind"], "conversation");
+        assert_eq!(received["chat"]["collection"], "conversation");
+        assert_eq!(received["chat"]["replace"], true);
+        assert_eq!(received["chat"]["session_id"], managed_session_id("agent/dispatch-chat", "dispatch-runtime:i1"));
+        // A held ID can be replaced while its previous read is still blocked.
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"slow","collection":"agents","limit":2})
+                .to_string().into(),
+        )).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "slow");
+        assert_eq!(frame["kind"], "snapshot");
+        release.notify_one();
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn replacing_collection_bounds_detached_blocking_reads() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let (release, held) = tokio::sync::watch::channel(false);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, gate, started) = (state.clone(), held.clone(), started.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let (mut gate, started) = (gate.clone(), started.clone());
+                                async move {
+                                    let permit = tokio::task::spawn_blocking(move || {
+                                        started.send(permit.semaphore().clone()).unwrap();
+                                        let _ = tokio::runtime::Handle::current().block_on(gate.wait_for(|released| *released));
+                                        permit
+                                    }).await.unwrap();
+                                    collection_items(&state, &session, &request, permit).await
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        let command = json!({"kind":"subscribe","id":"replace","collection":"work","limit":2}).to_string();
+        let mut slots = None;
+        for _ in 0..COLLECTION_MAX_SUBSCRIPTIONS {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(command.clone().into())).await.unwrap();
+            slots = Some(tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap());
+        }
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(command.into())).await.unwrap();
+        // A conversation outbox frame positively confirms command/frame dispatch is live
+        // while all eight physical workers are held; no wall-clock negative wait.
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"admission","collection":"conversation","conversation":"session/missing"}).to_string().into(),
+        )).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        // Worker-owned permit signals prove capacity is exhausted independently
+        // of whether the queued read happened to be polled before the outbox frame.
+        let available = slots.unwrap().available_permits();
+        release.send(true).unwrap();
+        assert_eq!(frame["id"], "admission");
+        assert_eq!(frame["kind"], "error");
+        assert_eq!(available, 0, "canceled awaiters released live physical read slots");
+        tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "replace");
+        assert_eq!(frame["kind"], "snapshot");
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dirty_refused_collection_does_not_erase_another_windows_retry() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let release = Arc::new(Notify::new());
+        let refused = release.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, release, attempts) = (state.clone(), refused.clone(), attempts.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let (release, attempts) = (release.clone(), attempts.clone());
+                                async move {
+                                    if request.collection == "agents" {
+                                        release.notified().await;
+                                        Err(validation("injected permanent refusal"))
+                                    } else if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                                        Err(ApiError::internal("injected transient failure"))
+                                    } else {
+                                        collection_items(&state, &session, &request, permit).await
+                                    }
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        for (id, collection) in [("retry", "work"), ("refused", "agents")] {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":id,"collection":collection,"limit":2}).to_string().into(),
+            )).await.unwrap();
+        }
+        let frame = socket.next().await.unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "retry");
+        assert_eq!(frame["kind"], "resync");
+        // Let the immediately-ready attention tick mark the pending agents read dirty.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release.notify_one();
+        let mut frames = BTreeMap::new();
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            frames.insert(frame["id"].as_str().unwrap().to_owned(), frame);
+        }
+        assert_eq!(frames["refused"]["kind"], "error");
+        assert_eq!(frames["retry"]["kind"], "snapshot");
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn steady_collection_retries_a_failed_first_read_without_another_command_or_write() {
         use futures_util::{SinkExt as _, StreamExt as _};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9269,7 +9684,7 @@ mod tests {
                             state,
                             ClientSession::local(None).unwrap(),
                             None,
-                            move |state, session, request| {
+                            move |state, session, request, permit| {
                                 let reads = reads.clone();
                                 async move {
                                     if request.id == "refused" {
@@ -9277,7 +9692,7 @@ mod tests {
                                     } else if reads.fetch_add(1, Ordering::SeqCst) == 0 {
                                         Err(ApiError::internal("injected first read failure"))
                                     } else {
-                                        collection_items(&state, &session, &request).await
+                                        collection_items(&state, &session, &request, permit).await
                                     }
                                 }
                             },

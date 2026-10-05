@@ -112,6 +112,7 @@ mod document_index_tests;
 mod lanes;
 mod operations;
 mod unread_mail;
+mod agent_messages;
 mod runtime;
 #[cfg(test)]
 mod tombstones_tests;
@@ -13932,6 +13933,20 @@ impl Store {
     /// and step on one host, with its API-equivalent cost in millionths of a dollar. Tokens no
     /// price covers are counted in `unpriced_tokens`, never as free.
     pub fn usage_period_rows(&self, since_ms: u64, until_ms: u64) -> Result<Vec<Value>> {
+        Ok(self.usage_period_data(since_ms, until_ms)?.0)
+    }
+
+    /// Daily denominators share the existing snapshot pass; message counts are indexed rollups.
+    pub fn usage_period_report(&self, since_ms: u64, until_ms: u64) -> Result<(Vec<Value>, Value)> {
+        let (rows, days) = self.usage_period_data(since_ms, until_ms)?;
+        Ok((rows, self.agent_message_estimate(&days)?))
+    }
+
+    fn usage_period_data(
+        &self,
+        since_ms: u64,
+        until_ms: u64,
+    ) -> Result<(Vec<Value>, Vec<agent_messages::DailyUsage>)> {
         #[derive(Clone, Default)]
         struct Snapshot {
             at: u64,
@@ -13939,6 +13954,11 @@ impl Store {
             pricing: String,
             native_session_id: Option<String>,
             provenance: Option<Vec<Value>>,
+        }
+        #[derive(Clone, Copy, Default)]
+        struct DailySnapshot {
+            at: u64,
+            buckets: [u64; USAGE_BUCKETS.len()],
         }
         let connection = self.readers.get();
         let mut statement = connection.prepare(&canonical_sql(
@@ -13954,7 +13974,22 @@ impl Store {
             ))
         })?;
         type Key = (String, String, String, String, String, String, String);
-        let mut groups = BTreeMap::<Key, (Option<Snapshot>, Option<Snapshot>)>::new();
+        let mut days = agent_messages::windows(since_ms, until_ms)
+            .into_iter()
+            .map(|(since, until)| agent_messages::DailyUsage {
+                since,
+                until,
+                cost: 0,
+                unpriced: 0,
+            })
+            .collect::<Vec<_>>();
+        #[derive(Default)]
+        struct Group {
+            baseline: Option<Snapshot>,
+            latest: Option<Snapshot>,
+            days: Vec<(Option<DailySnapshot>, Option<DailySnapshot>)>,
+        }
+        let mut groups = BTreeMap::<Key, Group>::new();
         for row in rows {
             let (subject, _index, body) = row?;
             let body: Value = serde_json::from_str(&body)?;
@@ -13987,22 +14022,56 @@ impl Store {
                 text("owner_step"),
                 text("host"),
             );
-            let (baseline, latest) = groups.entry(key).or_default();
-            let target = if at <= since_ms { baseline } else { latest };
+            let group = groups.entry(key).or_insert_with(|| Group {
+                days: vec![(None, None); days.len()],
+                ..Group::default()
+            });
+            for (day, (baseline, latest)) in days.iter().zip(&mut group.days) {
+                if at > day.until {
+                    continue;
+                }
+                let target = if at <= day.since { baseline } else { latest };
+                if target.is_none_or(|previous| at >= previous.at) {
+                    *target = Some(DailySnapshot {
+                        at,
+                        buckets: snapshot.buckets,
+                    });
+                }
+            }
+            let target = if at <= since_ms {
+                &mut group.baseline
+            } else {
+                &mut group.latest
+            };
             if target.as_ref().is_none_or(|previous| at >= previous.at) {
                 *target = Some(snapshot);
             }
         }
         let mut result = Vec::new();
-        for ((agent, _incarnation, model, account, mission_run, step, host), (baseline, latest)) in
-            groups
-        {
-            let Some(latest) = latest else {
+        for ((agent, _incarnation, model, account, mission_run, step, host), group) in groups {
+            for (day, (baseline, latest)) in days.iter_mut().zip(group.days) {
+                let Some(latest) = latest else {
+                    continue;
+                };
+                let baseline = baseline
+                    .filter(|b| b.buckets[0] <= latest.buckets[0])
+                    .unwrap_or_default();
+                if latest.buckets[0] > baseline.buckets[0] {
+                    day.cost = day
+                        .cost
+                        .saturating_add(latest.buckets[6].saturating_sub(baseline.buckets[6]));
+                    day.unpriced = day
+                        .unpriced
+                        .saturating_add(latest.buckets[8].saturating_sub(baseline.buckets[8]));
+                }
+            }
+            let Some(latest) = group.latest else {
                 continue;
             };
             // A series that went backwards restarted from zero, for example when a node's local
             // totals were rebuilt; everything after the restart is spend in the period.
-            let baseline = baseline
+            let baseline = group
+                .baseline
                 .filter(|baseline| baseline.buckets[0] <= latest.buckets[0])
                 .unwrap_or_default();
             let mut row = json!({
@@ -14029,7 +14098,7 @@ impl Store {
             result.push(row);
         }
         result.sort_by(|a, b| b["total_tokens"].as_u64().cmp(&a["total_tokens"].as_u64()));
-        Ok(result)
+        Ok((result, days))
     }
 
     /// Resolve a terminal capability and its current-head fence with two indexed seeks, in
@@ -14925,6 +14994,20 @@ impl Store {
         smallclaims::touched::note_read(|| format!("actor:{subject}"));
         let connection = self.readers.get();
         current_harness_at(&connection, subject, None)
+    }
+
+    /// Positive attachment proof under the indexed current-incarnation diagnostic fence.
+    pub(crate) fn claude_channel_attached(&self, subject: &str, incarnation: &str) -> Result<bool> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        let body: Option<String> = connection
+            .prepare_cached(&claude_attachment_query())?
+            .query_row(params![subject, i64::MAX, incarnation], |row| row.get(1))
+            .optional()?;
+        Ok(body
+            .map(|body| serde_json::from_str::<Value>(&body))
+            .transpose()?
+            .is_some_and(|body| body["fields"]["code"] == "claude-channel-attached"))
     }
 
     pub fn harness_was_ready(&self, subject: &str, incarnation: &str) -> Result<bool> {
@@ -19032,6 +19115,9 @@ fn append_claim_tx(
     }
     if matches!(kind, "glass.upserted" | "glass.deleted") {
         glass_heads::flush(transaction)?;
+    }
+    if kind == "message.sent" {
+        agent_messages::flush(transaction)?;
     }
     normalize_local_projection_timestamps_tx(
         transaction,
@@ -42010,6 +42096,9 @@ mission "nested-work" state="ready" {
                 .unwrap();
         }
         let rows = local.usage_period_rows(10, 20).unwrap();
+        let (reported_rows, estimate) = local.usage_period_report(10, 20).unwrap();
+        assert_eq!(reported_rows, rows);
+        assert_eq!(estimate["days"][0]["usage_cost_microusd"], 40);
         assert_eq!(rows[0]["total_tokens"], 20);
         assert_eq!(rows[0]["cost_microusd"], 40);
         let provenance = rows[0]["pricing_provenance"].as_array().unwrap();
@@ -45737,6 +45826,62 @@ mission "review-guardrail" state="ready" {
                 "an explicitly historical item must not deliver"
             );
         }
+    }
+
+    #[test]
+    fn relocated_items_keep_subjects_and_resolution_through_partial_observations() {
+        let repository = "resource/github/acme/garden";
+        let previous = json!({"repository_id": 7});
+        let current = json!({"repository_id": 7, "issues": [{
+            "number": 1, "node_id": "I_orchid", "state": "closed", "new": false,
+            "moved_to": "resource/github/acme/greenhouse/issue/77",
+            "closed_by": "fern", "closed_by_resource": "resource/github/acme/greenhouse/pull-request/2",
+            "state_reason": "completed"
+        }]});
+        let old =
+            json!({"repository": repository, "number": 1, "node_id": "I_orchid", "state": "open"});
+        let changed = discovered_collection_items(
+            repository,
+            "issues",
+            Some(&previous),
+            &current,
+            &mut |_| Some(old.clone()),
+        );
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].subject, "resource/github/acme/garden/issue/1");
+        assert!(!changed[0].deliver);
+        assert_eq!(changed[0].facts["repository"], repository);
+        assert_eq!(changed[0].facts["number"], 1);
+        assert_eq!(
+            changed[0].facts["moved_to"],
+            "resource/github/acme/greenhouse/issue/77"
+        );
+        let partial = Value::Object(item_facts(
+            repository,
+            "issues",
+            1,
+            Some(&changed[0].facts),
+            &json!({"number": 1, "comments": 4}),
+        ));
+        for name in [
+            "node_id",
+            "moved_to",
+            "closed_by",
+            "closed_by_resource",
+            "state_reason",
+        ] {
+            assert_eq!(partial[name], changed[0].facts[name]);
+        }
+        assert!(
+            discovered_collection_items(
+                repository,
+                "issues",
+                Some(&previous),
+                &current,
+                &mut |_| Some(changed[0].facts.clone())
+            )
+            .is_empty()
+        );
     }
 
     #[test]

@@ -450,6 +450,22 @@ fn structured_request(
             ("↑↓", "Another", Hit::Key('a'), theme::OVERLAY1),
             ("esc", "Not now", Hit::Escape, theme::OVERLAY1),
         ]);
+    } else if request.answers.is_empty() {
+        // A feedback ask has no answers to choose: words are the answer, and it can be set
+        // aside, with word to its asker, when there is nothing to say (Nathan, 2026-10-05: a
+        // feedback card offered "Choose an answer" and no way to answer or dismiss it).
+        let label = format!("Close this: tell {from} there is nothing for you to do");
+        if !confirm_row(card, drafts, &label) {
+            card.buttons(&[
+                ("c", "Answer in words", Hit::Key('c'), theme::ACCENT),
+                (
+                    "x",
+                    "Dismiss: nothing to do",
+                    Hit::Key('x'),
+                    theme::OVERLAY1,
+                ),
+            ]);
+        }
     } else {
         let mut buttons = vec![("a", "Choose an answer", Hit::Key('a'), theme::ACCENT)];
         if request.custom {

@@ -1,6 +1,6 @@
 # Build and run the iOS app
 
-The Small Talk iOS app is a client for your fleet: it shows Home, Agents, Missions, and Fleet, and lets you talk to seats. It connects through a paired gateway; the phone does not run an agent or replicate the graph.
+The Smalltalk iOS app is a client for your fleet: it shows Home, Agents, Missions, and Fleet, and lets you talk to seats. It connects through a paired gateway; the phone does not run an agent or replicate the graph.
 
 Use a Mac with **full Xcode**, its command-line tools selected, and an installed iOS Simulator runtime. This walkthrough uses Xcode 27; [Expo's simulator setup](https://docs.expo.dev/workflow/ios-simulator/) shows where to select the tools and download a runtime. Open Xcode once and finish its first-run setup. The native Xcode, CocoaPods, simulator, and device steps are **not yet verified on a fresh Mac**.
 

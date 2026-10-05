@@ -1,6 +1,6 @@
 # GitHub integration
 
-Small Talk can observe a repository and start finite review and triage missions for new pull requests and issues. A durable seat serves those runs; a curator groups what needs a person before it reaches Home.
+Smalltalk can observe a repository and start finite review and triage missions for new pull requests and issues. A durable seat serves those runs; a curator groups what needs a person before it reaches Home.
 
 Use the worker and workspace from [getting started](getting-started.md), and a repository you are allowed to inspect. Install [GitHub CLI](https://cli.github.com/), then log in as the OS user who runs the daemon:
 

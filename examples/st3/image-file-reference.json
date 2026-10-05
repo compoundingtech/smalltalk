@@ -1,0 +1,45 @@
+{
+  "kind": "reference.image-file",
+  "namespace": "reference",
+  "version": 1,
+  "language": "custom-projection.v1",
+  "subject_prefix": "custom/reference/image-file/v1/",
+  "creation_kind": "custom.reference.image-file.v1.created",
+  "claims": {
+    "custom.reference.image-file.v1.created": {
+      "authority": "creator",
+      "additional_fields": false,
+      "fields": {
+        "file": {
+          "value_type": "subject-reference",
+          "required": true,
+          "reference_families": ["file"],
+          "max_bytes": 1024
+        },
+        "content_hash": {
+          "value_type": "string",
+          "required": true,
+          "max_bytes": 66,
+          "pattern": "[0-9a-f]{64}"
+        },
+        "media_type": {
+          "value_type": "string",
+          "max_bytes": 128,
+          "pattern": "image/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*"
+        }
+      }
+    }
+  },
+  "slots": {
+    "reference": {
+      "kind": "custom.reference.image-file.v1.created",
+      "select": "first"
+    }
+  },
+  "fields": {
+    "owner": {"op": "actor", "slot": "reference"},
+    "file": {"op": "field", "slot": "reference", "field": "file"},
+    "content_hash": {"op": "field", "slot": "reference", "field": "content_hash"},
+    "media_type": {"op": "field", "slot": "reference", "field": "media_type"}
+  }
+}

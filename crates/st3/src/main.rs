@@ -8582,6 +8582,54 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
             total[6]
         );
     }
+    if let Some(estimate) = report.get("agent_messages") {
+        output.push_str("\nAGENT MESSAGES · daily estimate · UTC · API-equivalent\n");
+        let _ = writeln!(
+            output,
+            "Count × recipient allowance; includes useful work, not measured waste."
+        );
+        let _ = writeln!(
+            output,
+            "Fleet fallback ${:.2}–${:.2}/message · {}",
+            estimate["fallback_low_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+            estimate["fallback_high_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+            estimate["source"].as_str().unwrap_or("fleet fallback")
+        );
+        output.push_str("DATE  MESSAGES  ESTIMATE  SHARE OF PRICED USAGE  CALIBRATED\n");
+        for day in estimate["days"].as_array().into_iter().flatten() {
+            let date = day["day_start_ms"]
+                .as_u64()
+                .and_then(|at| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at as i64))
+                .map_or_else(|| "?".into(), |at| at.format("%Y-%m-%d").to_string());
+            let partial = day["until_ms"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_sub(day["since_ms"].as_u64().unwrap_or(0))
+                < 86_400_000;
+            let share = match (day["low_percent"].as_f64(), day["high_percent"].as_f64()) {
+                (Some(low), Some(high)) => format!(
+                    "{low:.1}–{high:.1}%{}",
+                    if day["unpriced_tokens"].as_u64().unwrap_or(0) > 0 {
+                        "*"
+                    } else {
+                        ""
+                    }
+                ),
+                _ => "unknown (no priced usage)".into(),
+            };
+            let _ = writeln!(
+                output,
+                "{date}{}  {}  ${:.2}–${:.2}  {share}  {}/{}",
+                if partial { " (partial)" } else { "" },
+                day["messages"],
+                day["low_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+                day["high_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+                day["calibrated_messages"],
+                day["messages"]
+            );
+        }
+        output.push_str("* Unpriced tokens are excluded from the denominator. Latest 31 UTC days; edge days are clipped.\n");
+    }
     let limits = report["limits"]
         .as_array()
         .map(Vec::as_slice)
@@ -20302,7 +20350,7 @@ async fn check_claude_attachment(
         "starting"
     };
     let reason = match checked {
-        Ok(_) => "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. Check the plugin load, trust or update screen, and channel process; restart the seat if the plugin did not load.".into(),
+        Ok(_) => "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. The driver rechecks attachment and st will restart the harness with bounded retries if the channel stays missing.".into(),
         Err(error) => format!("claude-channel-unattached: attachment could not be verified; mail is held while the driver retries: {error:#}"),
     };
     let mut report: Value = serde_json::from_str(&native_delivery_report("claude-channel", None))?;
@@ -21718,6 +21766,44 @@ mod tests {
     }
 
     #[test]
+    fn cli_timeline_folds_claude_skill_and_raw_preserves_the_expansion() {
+        let items: Vec<ClientTimelineEntry> = serde_json::from_str(include_str!(
+            "../../../fixtures/clients/transcripts/claude-skill.json"
+        ))
+        .unwrap();
+        for density in [
+            st3_conversation_ui::Density::Full,
+            st3_conversation_ui::Density::Simple,
+        ] {
+            let pretty = conversation_text("session/example", &items, 100, false, density);
+            assert!(pretty.contains("Skill st"), "{pretty}");
+            assert!(!pretty.contains("## Messages"), "{pretty}");
+            assert!(pretty.contains("I have loaded the st skill."), "{pretty}");
+        }
+        let raw = timeline_entries_text("session/example", &items);
+        assert!(raw.contains("# st\n\nThis applies only"), "{raw}");
+        assert!(raw.contains("When\nit prints nothing"), "{raw}");
+        assert!(
+            raw.contains("`<smalltalk-message>`, followed by a bounded preview."),
+            "{raw}"
+        );
+        // Paging can start after Skill: the expansion remains one block, with intact rows.
+        let orphan = conversation_text(
+            "session/example",
+            &items[2..3],
+            100,
+            false,
+            st3_conversation_ui::Density::Full,
+        );
+        assert!(orphan.lines().any(|line| line.trim() == "## Messages"), "{orphan}");
+        assert!(
+            orphan.contains("<smalltalk-message>, followed by a bounded preview."),
+            "{orphan}"
+        );
+        assert!(!orphan.contains("Whenit"), "{orphan}");
+    }
+
+    #[test]
     fn usage_report_ranks_each_group_by_cost_and_marks_unpriced_tokens() {
         let report = json!({"rows": [
             {"agent":"agent/cheap","mission_run":"mission-run/one","step":"step-run/one/build","model":"model-a","account":"claude/aaaa","host":"host/a","cost_microusd":250000,"total_tokens":900,"input_tokens":200,"output_tokens":100,"cache_write_tokens":0,"cached_tokens":600,"unpriced_tokens":0},
@@ -21756,6 +21842,24 @@ mod tests {
         let by_step = render_usage_report(&report, 24, Some(UsageBy::Step));
         assert_eq!(by_step.matches("USAGE  ").count(), 1);
         assert!(by_step.contains("by step"));
+    }
+
+    #[test]
+    fn usage_report_labels_the_daily_proxy_and_unknown_share() {
+        let report = json!({"rows":[],"agent_messages":{
+            "source":"dated audit", "fallback_low_microusd":220000,"fallback_high_microusd":330000,
+            "days":[{"day_start_ms":0,"since_ms":1,"until_ms":86400000,
+                "messages":2,"calibrated_messages":1,"low_microusd":440000,"high_microusd":660000,
+                "usage_cost_microusd":0,"unpriced_tokens":100,"low_percent":null,"high_percent":null}]
+        }});
+        let rendered = render_usage_report(&report, 24, None);
+        assert!(rendered.contains("daily estimate"));
+        assert!(rendered.contains("includes useful work"));
+        assert!(
+            rendered
+                .contains("1970-01-01 (partial)  2  $0.44–$0.66  unknown (no priced usage)  1/2"),
+            "{rendered}"
+        );
     }
 
     #[test]

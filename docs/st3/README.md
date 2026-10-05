@@ -1,6 +1,9 @@
 # st documentation
 
-The root [README](../../README.md) explains the product and the normal command workflow.
+The root [README](../../README.md) introduces the product and links its guides.
+[Getting started](../getting-started.md) walks through installation and a first mission.
+[Development](../development.md) covers source builds, CI, shared UI models, and repository layout.
+[Home Manager](../home-manager.md) covers declarative installation and user services.
 
 Use these documents for implementation details:
 

@@ -73,6 +73,12 @@ mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
 
+/// Recheck the initialized live delivery owner before replacing an unattached seat.
+pub(crate) fn claude_channel_attached(store: &Store, subject: &str, incarnation: &str) -> bool {
+    delivery_presence::attachment(subject, incarnation)
+        .is_some_and(|fence| store.check_mailbox(&fence).is_ok())
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
@@ -9995,15 +10001,17 @@ async fn get_usage(
         )));
     }
     let store = state.store.clone();
-    let (rows, limits) = blocking_store(move || {
+    let (rows, agent_messages, limits) = blocking_store(move || {
+        let (rows, agent_messages) = store.usage_period_report(since_ms, until_ms)?;
         Ok((
-            store.usage_period_rows(since_ms, until_ms)?,
+            rows,
+            agent_messages,
             store.account_limits()?,
         ))
     })
     .await?;
     Ok(Json(
-        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits}),
+        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages}),
     ))
 }
 

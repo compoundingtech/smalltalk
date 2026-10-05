@@ -263,6 +263,11 @@ fn claude_uninitialized_channel_blocks_until_native_attachment() {
 }
 
 #[test]
+fn claude_permanent_channel_failure_parks_after_three_attempts_without_a_restart_loop() {
+    canary("claude", "channel-parked");
+}
+
+#[test]
 fn omp_when_idle_replacement_binds_its_original_native_session() {
     if st3::test_support::supervise_test() {
         return;

@@ -4,6 +4,9 @@ use crate::model::LoopSpec;
 
 /// How long a run whose cleanup failed shows that fault after it finishes.
 const FINAL_STEP_FAULT_MS: u128 = 24 * 60 * 60 * 1000;
+/// How long a declared seat may go without any runtime observation before that is a fault. A seat
+/// that never starts parks nothing and fails nothing, so nobody finds it by looking.
+const SEAT_NOT_STARTED_MS: u128 = 10 * 60 * 1000;
 
 impl Store {
     /// The mission context of a person ask a mission step made: its mission, and the step that
@@ -662,13 +665,92 @@ impl Store {
                 continue;
             }
             let source = desired.subject;
+            let diagnostic = self.last_driver_diagnostic(&source)?;
             items.push(AttentionItemView {
                 episode: decision.id.clone(), priority: "high".into(), kind: "fault".into(), review_mode: None,
                 subject: source.clone(), person: reviewer.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None,
                 title: if codex { "A Codex agent stopped after repeated failures" } else { "An agent stopped after repeated runtime failures" }.into(),
-                detail: format!("{source}: {}. Inspect the seat and revise its desired declaration before restarting.", decision.body["fields"]["reason"].as_str().unwrap_or("the runtime is parked")),
+                detail: format!("{source}: {}.{} Inspect the seat and revise its desired declaration before restarting.", decision.body["fields"]["reason"].as_str().unwrap_or("the runtime is parked"), diagnostic.map(|diagnostic| format!(" The driver's last diagnostic: {diagnostic}.")).unwrap_or_default()),
                 mission: None, mission_run: desired.owner_run, step: None, targets: vec![source.clone()], requested_at_unix_ms: decision.accepted_at_unix_ms,
                 actions: vec![attention_action("inspect source", &["st", "subject", &source])],
+                request: None,
+            });
+        }
+        Ok(items)
+    }
+
+    /// The newest word a seat's driver left: its `harness.diagnostic` code and reason. The first
+    /// thing anyone asks of a seat that will not start, and the reason a fault should carry it.
+    fn last_driver_diagnostic(&self, subject: &str) -> Result<Option<String>> {
+        Ok(self
+            .latest_observation(subject, "harness.diagnostic")?
+            .and_then(|claim| {
+                let fields = claim.body.get("fields").unwrap_or(&claim.body);
+                let reason = fields.get("reason").and_then(Value::as_str)?;
+                Some(match fields.get("code").and_then(Value::as_str) {
+                    Some(code) => format!("{code}: {reason}"),
+                    None => reason.to_owned(),
+                })
+            }))
+    }
+
+    /// A seat that is declared to run and that no runtime observation has ever described, for
+    /// ten minutes: `st agents ls` shows it as `desired`, and nothing else says it is not coming.
+    /// Parking and failing both leave a record; this leaves none, so it is found by looking, or
+    /// not at all. The fault ends when the first observation appears.
+    fn unstarted_seat_attention_items(
+        &self,
+        person: Option<&str>,
+        as_of: u128,
+    ) -> Result<Vec<AttentionItemView>> {
+        const REVIEWER: &str = "person/operator";
+        if person.is_some_and(|person| person != REVIEWER) {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut items = Vec::new();
+        for desired in self
+            .desired_subjects()?
+            .into_iter()
+            .filter(|desired| desired.kind == "agent" && desired.member.is_some())
+        {
+            if !person_work::declaration_live(&connection, &desired.subject)? {
+                continue;
+            }
+            let Some(token) = self.selected_desired_token(&desired.subject)? else {
+                continue;
+            };
+            let Some(declared) = self.claim_by_id(&token)? else {
+                continue;
+            };
+            let due = declared
+                .accepted_at_unix_ms
+                .saturating_add(SEAT_NOT_STARTED_MS);
+            if due > as_of
+                || self
+                    .latest_observation(&desired.subject, "runtime.observed")?
+                    .is_some()
+                || crate::suspension::current(self, &desired.subject)?.is_some()
+            {
+                continue;
+            }
+            let source = desired.subject;
+            let host = desired
+                .member
+                .as_ref()
+                .map(|member| member.host.clone())
+                .unwrap_or_default();
+            let diagnostic = match self.last_driver_diagnostic(&source)? {
+                Some(diagnostic) => format!(" The driver's last diagnostic: {diagnostic}."),
+                None => " The driver has left no diagnostic: it never ran.".into(),
+            };
+            items.push(AttentionItemView {
+                episode: token.clone(), priority: "high".into(), kind: "fault".into(), review_mode: None,
+                subject: source.clone(), person: REVIEWER.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None,
+                title: "An agent seat has not started".into(),
+                detail: format!("{source} has been declared to run on {host} for over {} minutes and no runtime has ever been observed for it, so it is still `desired`.{diagnostic} Check that the host is up and its daemon can start the seat.", SEAT_NOT_STARTED_MS / 60_000),
+                mission: None, mission_run: desired.owner_run, step: None, targets: vec![source.clone()], requested_at_unix_ms: due,
+                actions: vec![attention_action("inspect seat", &["st", "agents", "show", &source])],
                 request: None,
             });
         }
@@ -896,6 +978,7 @@ impl Store {
         items.extend(self.observer_attention_items(person, as_of)?);
         items.extend(self.loop_attention_items(person, as_of)?);
         items.extend(self.parked_runtime_attention_items(person, as_of)?);
+        items.extend(self.unstarted_seat_attention_items(person, as_of)?);
         for failure in self.operational_failures()? {
             if failure.status != "pending"
                 || failure.requested_at_unix_ms > as_of

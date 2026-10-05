@@ -1,6 +1,6 @@
 # st architecture
 
-st is the Small Talk claims-graph runtime. KDL declarations are its human authoring surface. Claims
+st is the Smalltalk claims-graph runtime. KDL declarations are its human authoring surface. Claims
 are its durable fact surface. Projections, process observations, and caches are derived state.
 
 This document defines the stable system shape. The linked technical documents define the complete
@@ -213,7 +213,7 @@ The daemon's other loops keep the same rule:
 
 ## Messages and attention
 
-Small Talk messages are durable claims. Delivery is a separate lifecycle with sent, delivered,
+Smalltalk messages are durable claims. Delivery is a separate lifecycle with sent, delivered,
 read, and closed facts.
 
 The reconciler creates ready-work messages. A driver transports them and renews claimed work. This

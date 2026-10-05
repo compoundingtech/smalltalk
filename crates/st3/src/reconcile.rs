@@ -33,6 +33,7 @@ use crate::resource::{
 };
 use crate::store::Store;
 
+mod channel_recovery;
 mod placement;
 
 /// The actor of every attention request the reconciler raises.
@@ -2314,6 +2315,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 blocked,
                                 &suspension,
                             );
+                        }
+                        if self.reconcile_claude_channel_recovery(
+                            subject,
+                            member,
+                            observed.as_ref(),
+                            blocked.as_ref(),
+                            now_ms(),
+                        )? {
+                            return Ok(());
                         }
                         if self.reconcile_requested_restart(
                             subject,
@@ -5694,7 +5704,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             if attempted.is_some()
                 && member.driver.is_some()
-                && !self
+                && (!self
                     .store
                     .current_harness(&subject.subject)?
                     .is_some_and(|harness| {
@@ -5702,6 +5712,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                             == observation.incarnation_id.as_deref()
                             && harness.is_ready()
                     })
+                    || (request.body["fields"]["operation"] == "claude-channel-recovery"
+                        && !self.store.claude_channel_attached(
+                            &subject.subject,
+                            observation.incarnation_id.as_deref().unwrap(),
+                        )?))
             {
                 // Continue ordinary observation and prompt handling while the new wrapper boots.
                 // Launch acceptance alone cannot prove the native provider passed its gate.
@@ -15176,6 +15191,7 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    mod channel_recovery;
     mod differential;
     mod incremental_deadlines;
     mod rollout_tests;
@@ -25421,6 +25437,176 @@ mission "alert-exhaustion" state="ready" {
         );
     }
 
+    fn diagnostic(store: &Store, subject: &str, code: &str, reason: &str) {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("code".into(), Value::String(code.into())),
+                    ("reason".into(), Value::String(reason.into())),
+                    ("severity".into(), Value::String("error".into())),
+                    ("status".into(), Value::String("failed".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("diagnostic:{subject}:{code}")),
+            })
+            .unwrap();
+    }
+
+    /// A seat that is declared and that nothing ever observed leaves no record of failing, so
+    /// after ten minutes it becomes a fault for the fleet's fault agent, with the driver's last
+    /// word if it said any, and the fault ends with the first observation.
+    #[test]
+    fn a_seat_that_never_starts_becomes_a_fault_after_ten_minutes() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+agent "node.ops" { workspace "/tmp"; command "true"; handles-faults }
+agent "node.lonely" { workspace "/tmp"; command "true" }
+"#,
+            "unstarted-seats",
+        );
+        let faults = |after_minutes: u128| {
+            store
+                .fault_snapshot(now_ms() + after_minutes * 60_000)
+                .unwrap()
+                .into_iter()
+                .filter(|fault| fault.item.title == "An agent seat has not started")
+                .map(|fault| (fault.item.subject.clone(), fault))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert!(faults(9).is_empty(), "nine minutes is not yet a fault");
+        let lonely = "agent/node.lonely";
+        let fault = faults(11)
+            .remove(lonely)
+            .expect("no fault after ten minutes");
+        assert_eq!(fault.owner.as_deref(), Some("agent/node.ops"));
+        assert!(
+            fault.item.detail.contains("still `desired`"),
+            "{}",
+            fault.item.detail
+        );
+        assert!(
+            fault.item.detail.contains("has left no diagnostic"),
+            "{}",
+            fault.item.detail
+        );
+        assert_eq!(fault.item.actions[0].argv, ["st", "agents", "show", lonely]);
+        // The driver's last word travels with the fault.
+        diagnostic(
+            &store,
+            lonely,
+            "codex-driver-failed",
+            "Codex control failed while the TUI was live: waiting for the daemon mailbox replay",
+        );
+        let fault = faults(11).remove(lonely).unwrap();
+        assert!(
+            fault
+                .item
+                .detail
+                .contains("codex-driver-failed: Codex control failed while the TUI was live"),
+            "{}",
+            fault.item.detail
+        );
+        // The faults go to an agent, never to a person's now.
+        assert!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .is_empty()
+        );
+        // The first runtime observation ends it, whatever it says.
+        store
+            .append_claim(&ClaimInput {
+                subject: lonely.into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("starting".into())),
+                    ("runtime_id".into(), Value::String("node.lonely".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("lonely-starting".into()),
+            })
+            .unwrap();
+        assert!(faults(11).remove(lonely).is_none());
+    }
+
+    /// A parked seat is already a fault; it now carries what its driver last said, which is the
+    /// first thing anyone asks.
+    #[test]
+    fn a_parked_seat_fault_carries_the_drivers_last_diagnostic() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+agent "node.ops" { workspace "/tmp"; command "true"; handles-faults }
+agent "node.parked" { workspace "/tmp"; command "true" }
+"#,
+            "parked-seat",
+        );
+        let parked = "agent/node.parked";
+        let token = store.selected_desired_token(parked).unwrap().unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: parked.into(),
+                kind: "runtime.reconcile-decision".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("decision".into(), Value::String("raise".into())),
+                    (
+                        "key".into(),
+                        Value::String(format!("runtime-crash-loop:{token}")),
+                    ),
+                    (
+                        "reason".into(),
+                        Value::String("the runtime failed three times in a row".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("parked-decision".into()),
+            })
+            .unwrap();
+        let find = || {
+            store
+                .fault_snapshot(now_ms())
+                .unwrap()
+                .into_iter()
+                .find(|fault| {
+                    fault.item.title == "An agent stopped after repeated runtime failures"
+                })
+                .expect("a parked seat is not a fault")
+        };
+        let before = find();
+        assert_eq!(before.owner.as_deref(), Some("agent/node.ops"));
+        assert!(
+            !before.item.detail.contains("last diagnostic"),
+            "{}",
+            before.item.detail
+        );
+        diagnostic(
+            &store,
+            parked,
+            "driver-exited",
+            "the provider exited before it was ready",
+        );
+        let after = find();
+        assert!(
+            after.item.detail.contains(
+                "The driver's last diagnostic: driver-exited: the provider exited before it was ready."
+            ),
+            "{}",
+            after.item.detail
+        );
+    }
     /// A person's now holds only requests and reviews. A message stays in conversations, and
     /// each fault, on a live run or a terminal one, goes once to the agent that owns it.
     #[test]

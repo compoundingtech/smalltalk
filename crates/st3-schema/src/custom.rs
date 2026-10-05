@@ -58,6 +58,9 @@ pub struct Field {
     pub max_items: usize,
     #[serde(default = "default_bytes")]
     pub max_bytes: usize,
+    /// A bounded regex matched against the entire string, never a substring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
 }
 fn default_items() -> usize {
     256
@@ -353,7 +356,24 @@ pub fn validate_field_spec(name: &str, f: &Field) -> Result<(), ValidationError>
             "a field cannot be both document and claim reference",
         ));
     }
+    if let Some(pattern) = &f.pattern {
+        if f.value_type != ValueType::String {
+            return Err(invalid("patterns require string fields"));
+        }
+        field_pattern(pattern)?;
+    }
     Ok(())
+}
+fn field_pattern(pattern: &str) -> Result<regex::Regex, ValidationError> {
+    if pattern.len() > 512 {
+        return Err(invalid("field pattern exceeds 512 bytes"));
+    }
+    regex::RegexBuilder::new(&format!(r"\A(?:{pattern})\z"))
+        .size_limit(256 * 1024)
+        .dfa_size_limit(256 * 1024)
+        .nest_limit(16)
+        .build()
+        .map_err(|_| invalid("invalid or over-complex field pattern"))
 }
 pub fn validate_fields(
     schema: &ClaimSchema,
@@ -414,6 +434,13 @@ pub fn validate_field(name: &str, v: &Value, f: &Field) -> Result<(), Validation
     } else if !f.values.is_empty() && !v.as_str().is_some_and(|s| f.values.iter().any(|a| a == s)) {
         return Err(invalid(format!("invalid value for {name}")));
     }
+    if let Some(pattern) = &f.pattern
+        && !v
+            .as_str()
+            .is_some_and(|s| field_pattern(pattern).is_ok_and(|pattern| pattern.is_match(s)))
+    {
+        return Err(invalid(format!("invalid shape for {name}")));
+    }
     if f.value_type == ValueType::SubjectReference {
         let s = v.as_str().unwrap();
         let subject = registry().validate_subject(s)?;
@@ -442,4 +469,76 @@ pub fn validate_field(name: &str, v: &Value, f: &Field) -> Result<(), Validation
 }
 fn invalid(message: impl Into<String>) -> ValidationError {
     error("invalid-custom-schema", message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn field(pattern: &str) -> Field {
+        serde_json::from_value(json!({"value_type":"string", "max_bytes":1024, "pattern":pattern}))
+            .unwrap()
+    }
+
+    #[test]
+    fn string_patterns_match_whole_values_and_bound_the_descriptor() {
+        let f = field("keep|discard");
+        validate_field_spec("choice", &f).unwrap();
+        for value in ["keep", "discard"] {
+            validate_field("choice", &json!(value), &f).unwrap();
+        }
+        for value in [
+            "prefix-keep",
+            "discard-suffix",
+            "keep\n",
+            "",
+            "discard\nkeep",
+        ] {
+            assert!(validate_field("choice", &json!(value), &f).is_err());
+        }
+        let mut not_string = f.clone();
+        not_string.value_type = ValueType::Array;
+        assert!(validate_field_spec("choice", &not_string).is_err());
+        for pattern in [
+            "[".to_owned(),
+            "a".repeat(513),
+            format!("{}a{}", "(".repeat(20), ")".repeat(20)),
+            "[a-z]{100000}".into(),
+        ] {
+            assert!(
+                validate_field_spec("choice", &field(&pattern)).is_err(),
+                "accepted {pattern}"
+            );
+        }
+        // Even inline flags cannot weaken the absolute start/end anchors.
+        let f = field("(?m)keep$");
+        assert!(validate_field("choice", &json!("keep\nextra"), &f).is_err());
+    }
+
+    #[test]
+    fn optional_patterns_preserve_existing_manifest_hash_inputs() {
+        for source in [
+            include_str!("../../../examples/st3/custom-review.json"),
+            include_str!("../../../examples/st3/decision-tree.json"),
+        ] {
+            let manifest: Manifest = serde_json::from_str(source).unwrap();
+            manifest.validate().unwrap();
+            let serialized = serde_json::to_value(manifest).unwrap();
+            for schema in serialized["claims"].as_object().unwrap().values() {
+                for field in schema["fields"].as_object().unwrap().values() {
+                    assert!(field.get("pattern").is_none());
+                }
+            }
+        }
+        // The old field defaults and serialization remain byte-for-byte identical.
+        let f: Field = serde_json::from_value(json!({"value_type":"string"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(f).unwrap(),
+            json!({
+                "value_type":"string", "required":false, "values":[], "reference_families":[],
+                "document":false, "claim":false, "min_items":0, "max_items":256, "max_bytes":65536
+            })
+        );
+    }
 }
