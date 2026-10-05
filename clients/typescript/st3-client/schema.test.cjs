@@ -299,6 +299,42 @@ test('native message claims preserve absent and null fields and reject wrong sca
     assert.deepEqual(Effect.runSync(Rich.decodeNativeSubjectProjection(subject)), unavailable);
 });
 
+test('unknown native head descriptors still require canonical projection and claim headers', async () => {
+    const [{ Effect }, Rich] = await modules;
+    const [Raw, artifact] = await nativeContracts;
+    const entry = artifact.families.find(entry => entry.family === 'message');
+    const claim = {
+        ...nativeClaim(entry, 'message.sent', { unvalidated: 'never disclose' }),
+        schema_id: 'future-head-descriptor',
+    };
+    const subject = {
+        kind: 'subject', id: claim.ref, ref: claim.ref, family: entry.family, schema_id: entry.schema_id,
+        heads: [claim], heads_complete: true, local_fence: { node: 'host/proof', position: 0 },
+    };
+    assert.deepEqual(Raw.decodeSubjectProjection(subject), unavailableClaim(subject));
+    assert.deepEqual(Effect.runSync(Rich.decodeNativeSubjectProjection(subject)), unavailableClaim(subject));
+    assert.deepEqual(Raw.decodeSubjectClaim(claim), unavailableClaim(claim));
+    for (const malformed of [
+        { ...subject, id: 'message/different' },
+        { ...subject, id: 'message/', ref: 'message/' },
+        { ...subject, local_fence: { node: 'host/proof', position: -1 } },
+        { ...subject, heads: [{ ...claim, ref: 'message/' }] },
+        { ...subject, heads: [{ ...claim, provenance: undefined }] },
+    ]) {
+        assert.throws(() => Raw.decodeSubjectProjection(malformed), Raw.SubjectDecodeError);
+        await assert.rejects(Effect.runPromise(Rich.decodeNativeSubjectProjection(malformed)));
+    }
+    for (const malformed of [
+        { ...claim, ref: 'message/' },
+        { ...claim, id: '' },
+        { ...claim, retention: 'future-retention' },
+        { ...claim, provenance: undefined },
+    ]) {
+        assert.throws(() => Raw.decodeSubjectClaim(malformed), Raw.SubjectDecodeError);
+        await assert.rejects(Effect.runPromise(Rich.decodeNativeSubjectClaim(malformed)));
+    }
+});
+
 test('native concrete custom hashes match registry descriptors and reject cross-kind substitution', async () => {
     const [{ Schema, Effect }, Rich] = await modules;
     const [Raw, artifact] = await nativeContracts;

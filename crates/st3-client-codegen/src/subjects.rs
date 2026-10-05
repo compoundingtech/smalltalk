@@ -57,6 +57,9 @@ impl Contract {
         for name in needed {
             writeln!(out,"function is{name}(value: unknown): value is Models.{name} {{ return {}; }}",ts_guard(&defs[&name],"value")?)?;
         }
+        for (name,header) in self.native_headers()? {
+            writeln!(out,"function is{name}(value: unknown): boolean {{ return {}; }}",ts_guard(&header,"value")?)?;
+        }
         Ok(out)
     }
 }

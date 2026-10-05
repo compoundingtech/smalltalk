@@ -93,14 +93,16 @@ const claimSupported = (value: unknown): boolean => {
     return binding !== undefined && value.kind === binding.kind && value.ref.startsWith(binding.family + '/');
 };
 export const decodeSubjectClaim = (value: unknown): SubjectClaimResult => {
+    if (!isNativeClaimHeader(value)) throw new SubjectDecodeError();
     if (!claimSupported(value)) return unsupported(value);
     if (!isSubjectClaim(value)) throw new SubjectDecodeError();
     return value;
 };
 export const decodeSubjectProjection = (value: unknown): SubjectProjectionResult => {
-    if (!isObject(value) || typeof value.schema_id !== 'string' || typeof value.family !== 'string' || typeof value.ref !== 'string') throw new SubjectDecodeError();
+    if (!isObject(value) || typeof value.schema_id !== 'string' || typeof value.family !== 'string' || typeof value.ref !== 'string' ||
+        !isNativeSubjectHeader(value) || value.id !== value.ref) throw new SubjectDecodeError();
     if (familyBindings[value.schema_id] !== value.family || !value.ref.startsWith(value.family + '/') || !Array.isArray(value.heads) || !value.heads.every(claimSupported)) return unsupported(value);
-    if (!isSubjectProjection(value) || value.id !== value.ref) throw new SubjectDecodeError();
+    if (!isSubjectProjection(value)) throw new SubjectDecodeError();
     return value;
 };
 export const decodeSubjectsPage = (value: unknown): SubjectsPageResult => {

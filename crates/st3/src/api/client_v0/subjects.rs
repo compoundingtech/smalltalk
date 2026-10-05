@@ -402,7 +402,7 @@ impl Reader<'_> {
         match audience {
             Audience::Denied => Ok(false),
             Audience::Shared => Ok(true),
-            Audience::RecordedActor => Ok(record.actor.as_deref() == Some(self.session.actor.as_str())),
+            Audience::RecordedActor => Ok(record.actor.as_deref() == Some(self.session.authority_actor.as_str())),
             Audience::Person => Ok(self.party(&record.subject)),
             Audience::Account => Ok(acting_party(self.session) && self.session.allows("read.declarations")),
             Audience::Glass => self.identity_visible(&record.subject, "glass"),
@@ -633,9 +633,12 @@ type NativeResponse = (Extension<ClientSnapshot>, Json<Value>);
 async fn read_native<T: Send + 'static>(
     state: AppState,
     session: ClientSession,
+    read_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     operation: impl FnOnce(&Reader<'_>) -> Result<T, ApiError> + Send + 'static,
 ) -> Result<(ClientSnapshot, T), ApiError> {
     tokio::task::spawn_blocking(move || {
+        // A canceled awaiter must not release a slot while its SQLite worker still runs.
+        let _read_permit = read_permit;
         state.store.read_snapshot(|index| {
             Ok((|| {
                 revalidate_session(&state, &session)?;
@@ -728,7 +731,7 @@ impl Reader<'_> {
         match subject {
             Some(subject) => self.state.store.native_subject_retention_version(subject, kind, fence),
             None => self.state.store.native_family_retention_version(family, prefix, fence,
-                (family == "custom").then_some(self.session.actor.as_str())),
+                (family == "custom").then_some(self.session.authority_actor.as_str())),
         }.map_err(ApiError::internal)
     }
 
@@ -830,7 +833,7 @@ impl Reader<'_> {
         'pages: loop {
             let references = self.state.store.native_subject_refs(
                 &query.family, query.ref_prefix.as_deref(), after.as_deref(), &reader.fence,
-                (query.family == "custom").then_some(self.session.actor.as_str()), SOURCE_PAGE,
+                (query.family == "custom").then_some(self.session.authority_actor.as_str()), SOURCE_PAGE,
             ).map_err(ApiError::internal)?;
             if references.is_empty() { break; }
             let full = references.len() == SOURCE_PAGE;
@@ -929,7 +932,7 @@ pub(in crate::api) async fn get(
     Query(query): Query<SubjectQuery>,
 ) -> Result<NativeResponse, ApiError> {
     let family = validate_ref(&query.subject)?;
-    let (snapshot, subject) = read_native(state, session, move |reader| {
+    let (snapshot, subject) = read_native(state, session, None, move |reader| {
         reader.subject(&query.subject, &family)?
             .ok_or_else(|| ApiError::not_found("the native subject is not available"))
     }).await?;
@@ -940,7 +943,7 @@ pub(in crate::api) async fn list(
     State(state): State<AppState>, Extension(session): Extension<ClientSession>,
     Query(query): Query<SubjectsQuery>,
 ) -> Result<NativeResponse, ApiError> {
-    let (_, (snapshot, page)) = read_native(state, session, move |reader| {
+    let (_, (snapshot, page)) = read_native(state, session, None, move |reader| {
         let page = reader.subjects_page(&query)?;
         let index = query.cursor.as_deref().map(decode_cursor).transpose()?
             .map_or(reader.fence.graph_index, |cursor| cursor.graph_index);
@@ -953,7 +956,7 @@ pub(in crate::api) async fn claims(
     State(state): State<AppState>, Extension(session): Extension<ClientSession>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<NativeResponse, ApiError> {
-    let (_, (snapshot, page)) = read_native(state, session, move |reader| {
+    let (_, (snapshot, page)) = read_native(state, session, None, move |reader| {
         let page = reader.history_page(&query, "subject-claims")?;
         let index = query.cursor.as_deref().map(decode_cursor).transpose()?
             .map_or(reader.fence.graph_index, |cursor| cursor.graph_index);
@@ -966,7 +969,7 @@ pub(in crate::api) async fn history(
     State(state): State<AppState>, Extension(session): Extension<ClientSession>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<NativeResponse, ApiError> {
-    let (_, (snapshot, page)) = read_native(state, session, move |reader| {
+    let (_, (snapshot, page)) = read_native(state, session, None, move |reader| {
         let page = reader.history_page(&query, "subject-history")?;
         let index = query.cursor.as_deref().map(decode_cursor).transpose()?
             .map_or(reader.fence.graph_index, |cursor| cursor.graph_index);
@@ -978,7 +981,7 @@ pub(in crate::api) async fn history(
 pub(in crate::api) async fn schemas(
     State(state): State<AppState>, Extension(session): Extension<ClientSession>,
 ) -> Result<NativeResponse, ApiError> {
-    let (snapshot, payload) = read_native(state, session, |_reader| {
+    let (snapshot, payload) = read_native(state, session, None, |_reader| {
         static DISCOVERY: std::sync::LazyLock<Result<Value, String>> = std::sync::LazyLock::new(|| {
             let base = serde_json::from_str(include_str!(
                 "../../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
@@ -992,12 +995,12 @@ pub(in crate::api) async fn schemas(
 
 pub(super) async fn collection_window(
     state: AppState, session: ClientSession, family: Option<String>, reference: Option<String>,
-    prefix: Option<String>, limit: usize,
+    prefix: Option<String>, limit: usize, read_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if family.is_some() == reference.is_some() || (reference.is_some() && prefix.is_some()) {
         return Err(validation("subjects requires exactly one family or ref; ref_prefix requires family"));
     }
-    let (snapshot, (items, more)) = read_native(state, session, move |reader| {
+    let (snapshot, (items, more)) = read_native(state, session, Some(read_permit), move |reader| {
         if let Some(reference) = reference {
             let family = validate_ref(&reference)?;
             let item = reader.subject(&reference, &family)?.map(serde_json::to_value)
@@ -1018,7 +1021,7 @@ pub(super) async fn collection_window(
 }
 
 pub(super) async fn validate_live_session(state: AppState, session: ClientSession) -> Result<(), ApiError> {
-    read_native(state, session, |_| Ok(())).await.map(|_| ())
+    read_native(state, session, None, |_| Ok(())).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -1047,6 +1050,41 @@ mod disclosure_tests {
 
     fn source(record: ClaimRecord) -> NativeSourceRecord {
         NativeSourceRecord { record, local_position: None }
+    }
+
+    #[tokio::test]
+    async fn canceled_native_readers_keep_slots_until_their_sqlite_workers_finish() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        append(&state, "custom/team/held", "custom.team.record", json!({"value":"held"}));
+        let slots = Arc::new(tokio::sync::Semaphore::new(COLLECTION_MAX_SUBSCRIPTIONS));
+        let mut releases = Vec::new();
+        for _ in 0..COLLECTION_MAX_SUBSCRIPTIONS {
+            let permit = slots.clone().acquire_owned().await.unwrap();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            let worker = tokio::spawn(read_native(
+                state.clone(), ClientSession::local(Some("person/ada")).unwrap(), Some(permit),
+                move |reader| {
+                    let subject = reader.subject("custom/team/held", "custom")?;
+                    assert_eq!(subject.unwrap().subject, "custom/team/held");
+                    started.send(()).unwrap();
+                    held.recv().unwrap();
+                    Ok(())
+                },
+            ));
+            tokio::time::timeout(Duration::from_secs(5), ready).await.unwrap().unwrap();
+            worker.abort();
+            assert!(worker.await.unwrap_err().is_cancelled());
+            releases.push(release);
+        }
+        let available = slots.available_permits();
+        for release in releases { release.send(()).unwrap(); }
+        assert_eq!(available, 0, "canceling awaiters released live native SQLite read slots");
+        let restored = tokio::time::timeout(
+            Duration::from_secs(5), slots.acquire_many_owned(u32::try_from(COLLECTION_MAX_SUBSCRIPTIONS).unwrap()),
+        ).await.unwrap().unwrap();
+        drop(restored);
     }
 
     #[test]
@@ -1314,7 +1352,7 @@ mod disclosure_tests {
             let altered = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(serde_json::to_vec(&altered).unwrap());
             assert!(decode_cursor(&format!("subject-page/{altered}.{signature}")).is_err());
-            let other = ClientSession::for_tests("person/alex/session/test", "person/alex", "unix");
+            let other = ClientSession::for_tests("person/ada/session/other", "person/ada", "unix");
             assert!(Reader { session: &other, ..reader }.cursor(Some(&encoded), CursorBoundary {
                 collection: "subjects", family: "agent", subject: None,
                 prefix: None, kind: None, limit: 1,

@@ -12,6 +12,7 @@ for (const name of ['Models.generated', 'Subjects.generated', 'Client.generated'
     fs.writeFileSync(path.join(temporary, `${name}.js`), output);
 }
 const { St3Client, ClientError, applyWindow, applySubjectWindow } = require(path.join(temporary, 'Client.generated.js'));
+const { decodeSubjectCollectionFrame, SubjectDecodeError } = require(path.join(temporary, 'Subjects.generated.js'));
 require(path.join(temporary, 'fetch-receiver.test.js'));
 fs.rmSync(temporary, { recursive: true, force: true });
 
@@ -241,9 +242,14 @@ test('native subject socket keeps unknown schemas payload-free through snapshot,
         schema_id: entry.schema_id, heads: [], heads_complete: true,
         local_fence: { node: 'host/test', position: 0 },
     };
+    const unknownHead = {
+        id: 'claim/future', ref: 'message/future', kind: 'message.sent',
+        schema_id: 'future-head-descriptor', retention: entry.descriptor.claims['message.sent'].retention,
+        provenance: { source: 'replicated', claim_id: 'claim/future', origin: 'host/test', accepted_at: '2026-10-05T00:00:00Z', store_index: 1 },
+        payload_availability: 'available', omitted_fields: [], fields: { private: 'never disclose' },
+    };
     const unknown = {
-        kind: 'subject', id: 'future/proof', ref: 'future/proof', family: 'future',
-        schema_id: 'future-descriptor-v1', heads: [{ fields: { private: 'never disclose' } }],
+        ...known, id: unknownHead.ref, ref: unknownHead.ref, heads: [unknownHead],
     };
     const unavailable = {
         kind: 'unsupported-subject-schema', id: unknown.id, ref: unknown.ref,
@@ -259,12 +265,23 @@ test('native subject socket keeps unknown schemas payload-free through snapshot,
     });
     const header = { id: 'native', collection: 'subjects', snapshot, has_more: false };
     try {
+        for (const malformed of [
+            { ...unknown, id: 'message/wrong' },
+            { ...unknown, id: 'message/', ref: 'message/' },
+        ]) {
+            assert.throws(() => decodeSubjectCollectionFrame({
+                ...header, kind: 'snapshot', items: [malformed], order: [unknown.ref],
+            }), SubjectDecodeError);
+            assert.throws(() => decodeSubjectCollectionFrame({
+                ...header, kind: 'changes', upserts: [malformed], removes: [], order: [unknown.ref],
+            }), SubjectDecodeError);
+        }
         socket.onopen();
         stream.subscribeSubjects('native', { family: 'message' }, 2);
         socket.onmessage({ data: JSON.stringify({ ...header, kind: 'snapshot', items: [unknown, known], order: [known.id, unknown.id] }) });
         assert.deepEqual(window.items, [known, unavailable]);
         assert.deepEqual(frames[0].items, [unavailable, known]);
-        const changed = { ...unknown, schema_id: 'future-descriptor-v2', heads: [{ fields: { private: 'changed hidden payload' } }] };
+        const changed = { ...unknown, heads: [{ ...unknownHead, schema_id: 'future-head-descriptor-v2', fields: { private: 'changed hidden payload' } }] };
         socket.onmessage({ data: JSON.stringify({
             ...header, kind: 'changes', upserts: [changed], removes: [],
             order: [unknown.id, known.id], snapshot: { ...snapshot, store_index: 2 },

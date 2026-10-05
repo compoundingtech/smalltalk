@@ -120,7 +120,7 @@ async fn collection_items(
             return Err(validation("collection limit must be 1 through 200"));
         }
         return subjects::collection_window(state.clone(), session.clone(), request.family.clone(),
-            request.subject_ref.clone(), request.ref_prefix.clone(), limit).await;
+            request.subject_ref.clone(), request.ref_prefix.clone(), limit, read_permit).await;
     }
     if !matches!(
         request.collection.as_str(),
@@ -9272,6 +9272,41 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
+    #[test]
+    fn canceled_native_subscription_keeps_its_queued_physical_read_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"native", "collection":"subjects", "family":"custom",
+        })).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all().max_blocking_threads(1).build().unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            held.recv().unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        runtime.block_on(async {
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = slots.clone().acquire_owned().await.unwrap();
+            let mut read = Box::pin(collection_items(&state, &session, &request, permit));
+            // The sole blocking worker is held, so polling queues the real native SQLite read.
+            assert!(futures_util::poll!(read.as_mut()).is_pending());
+            drop(read);
+            let available = slots.available_permits();
+            release.send(()).unwrap();
+            assert_eq!(available, 0, "subscription cancellation released a queued native read slot");
+            let restored = tokio::time::timeout(
+                Duration::from_secs(5), slots.acquire_owned(),
+            ).await.unwrap().unwrap();
+            drop(restored);
+        });
+        runtime.block_on(blocker).unwrap();
+    }
+
     #[tokio::test]
     async fn native_subject_projection_hides_other_actor_heads_and_internal_refs() {
         let root = tempfile::tempdir().unwrap();
@@ -9331,13 +9366,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
         let subject = "custom/team/history";
-        let append = |value: &str| state.store.append_claim(&ClaimInput {
-            subject: subject.into(), kind: "custom.team.record".into(), actor: Some("person/alex".into()),
+        let append = |reference: &str, actor: &str, value: &str| state.store.append_claim(&ClaimInput {
+            subject: reference.into(), kind: "custom.team.record".into(), actor: Some(actor.into()),
             fields: BTreeMap::from([("value".into(), json!(value))]), evidence: Vec::new(),
             expected_subject: None, idempotency_key: None,
         }).unwrap();
-        let first = append("first");
-        let second = append("second");
+        let first = append(subject, "person/alex", "first");
+        append(subject, "person/ada", "foreign-history");
+        let second = append(subject, "person/alex", "second");
+        append(subject, "person/ada", "foreign-head");
+        append("custom/team/other", "person/alex", "own-other");
+        append("custom/team/private", "person/ada", "foreign-only");
         let credential = "subject-test-credential";
         let pairing_ref = "custom/client/subject-test";
         state.store.append_claim(&ClaimInput {
@@ -9345,7 +9384,7 @@ mod tests {
             actor: Some("person/alex".into()),
             fields: BTreeMap::from([
                 ("credential_hash".into(), json!(credential_digest(credential))),
-                ("session_actor".into(), json!("person/alex")),
+                ("session_actor".into(), json!("person/alex/session/subject-test-device")),
                 ("person_id".into(), json!("person/alex")),
                 ("scopes".into(), json!(["read.projections"])),
                 ("expires_at_unix_ms".into(), json!(client_now_ms() as u64 + 60_000)),
@@ -9363,12 +9402,29 @@ mod tests {
                 (status, serde_json::from_slice::<Value>(&bytes).unwrap())
             }
         };
+        let (status, projection) = read("/v1/client/subject?ref=custom%2Fteam%2Fhistory".into()).await;
+        assert_eq!(status, StatusCode::OK, "{projection}");
+        assert_eq!(projection["value"]["heads"][0]["id"], second.id);
+        assert_eq!(projection["value"]["heads"][0]["fields"]["value"], "second");
+        let (status, hidden) = read("/v1/client/subject?ref=custom%2Fteam%2Fprivate".into()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+        let (status, family) = read("/v1/client/subjects?family=custom&ref_prefix=custom%2Fteam%2F&limit=1".into()).await;
+        assert_eq!(status, StatusCode::OK, "{family}");
+        assert_eq!(family["value"]["items"], json!([projection["value"]]));
+        assert_eq!(family["value"]["page"]["has_more"], true);
+        let family_cursor = urlencoding::encode(family["value"]["page"]["next_cursor"].as_str().unwrap());
+        let (status, family_continuation) = read(format!(
+            "/v1/client/subjects?family=custom&ref_prefix=custom%2Fteam%2F&limit=1&cursor={family_cursor}"
+        )).await;
+        assert_eq!(status, StatusCode::OK, "{family_continuation}");
+        assert_eq!(family_continuation["value"]["items"][0]["ref"], "custom/team/other");
+        assert_eq!(family_continuation["value"]["page"]["has_more"], false);
         let filter = "ref=custom%2Fteam%2Fhistory&limit=1";
         let (status, page) = read(format!("/v1/client/subject-history?{filter}")).await;
         assert_eq!(status, StatusCode::OK, "{page}");
         assert_eq!(page["value"]["items"][0]["id"], second.id);
         assert_eq!(page["value"]["page"]["has_more"], true);
-        append("after-fence");
+        append(subject, "person/alex", "after-fence");
         let cursor = urlencoding::encode(page["value"]["page"]["next_cursor"].as_str().unwrap());
         let (status, continuation) = read(format!("/v1/client/subject-history?{filter}&cursor={cursor}")).await;
         assert_eq!(status, StatusCode::OK, "{continuation}");
@@ -9405,7 +9461,7 @@ mod tests {
             actor: Some("person/alex".into()),
             fields: BTreeMap::from([
                 ("credential_hash".into(), json!(credential_digest(credential))),
-                ("session_actor".into(), json!("person/alex")),
+                ("session_actor".into(), json!("person/alex/session/native-stream-device")),
                 ("person_id".into(), json!("person/alex")),
                 ("scopes".into(), json!(["read.projections"])),
                 ("expires_at_unix_ms".into(), json!(client_now_ms() as u64 + 60_000)),

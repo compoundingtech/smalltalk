@@ -172,12 +172,7 @@ fn swift_field(name:&str)->String {
     if matches!(name.as_str(),"ref"|"type"|"default"|"class"|"struct"|"enum"|"case"|"repeat"|"operator"|"protocol"|"extension"|"internal"|"private"|"public"|"switch"|"where"|"let"|"var"|"is"|"as"|"in"|"import"|"return") {format!("`{name}`")} else {name}
 }
 impl Contract {
-    pub fn native_models(&self,schema:&Value)->Result<(String,String)> {
-        let mut models=Models {definitions:self.definitions.clone(),pending:self.definitions.keys().cloned().collect(),emitted:BTreeSet::new(),rust:String::new(),swift:String::new()};
-        while let Some(name)=models.pending.pop_first() { let definition=models.definitions[&name].clone(); models.model(&name,&definition)?; }
-        // Existing semantic base types stay owned by the original operational client contract.
-        let mut runtime=schema["$defs"].as_object().context("client schema definitions")?.clone();
-        runtime.extend(models.definitions);
+    pub fn native_headers(&self)->Result<[(&'static str,Value);2]> {
         let claim_headers=self.claims.keys().map(|name|self.definitions[name].clone()).collect::<Vec<_>>();
         let mut claim_header=claim_headers.first().context("native claim header")?.clone();
         claim_header["additionalProperties"]=json!(true);
@@ -188,7 +183,6 @@ impl Contract {
         let retentions=claim_headers.iter().filter_map(|header|header["properties"]["retention"]["const"].as_str()).collect::<BTreeSet<_>>();
         properties.insert("retention".into(),json!({"enum":retentions}));
         claim_header["required"].as_array_mut().context("claim header required")?.retain(|field|field!="fields");
-        runtime.insert("NativeClaimHeader".into(),claim_header);
         let subject_name=self.families.keys().next().context("native subject header")?;
         let mut subject_header=self.definitions[subject_name].clone();
         subject_header["additionalProperties"]=json!(true);
@@ -196,7 +190,16 @@ impl Contract {
         subject_header["properties"]["family"]=json!({"type":"string","pattern":"^[a-z][a-z0-9-]*$"});
         subject_header["properties"]["ref"]=st3_schema::subject_reference_schema(&[]);
         subject_header["properties"]["heads"]["items"]=json!({"$ref":"#/$defs/NativeClaimHeader"});
-        runtime.insert("NativeSubjectHeader".into(),subject_header);
+        Ok([("NativeClaimHeader",claim_header),("NativeSubjectHeader",subject_header)])
+    }
+
+    pub fn native_models(&self,schema:&Value)->Result<(String,String)> {
+        let mut models=Models {definitions:self.definitions.clone(),pending:self.definitions.keys().cloned().collect(),emitted:BTreeSet::new(),rust:String::new(),swift:String::new()};
+        while let Some(name)=models.pending.pop_first() { let definition=models.definitions[&name].clone(); models.model(&name,&definition)?; }
+        // Existing semantic base types stay owned by the original operational client contract.
+        let mut runtime=schema["$defs"].as_object().context("client schema definitions")?.clone();
+        runtime.extend(models.definitions);
+        runtime.extend(self.native_headers()?.into_iter().map(|(name,header)|(name.to_owned(),header)));
         let schemas_json=serde_json::to_string(&runtime)?;
         let custom_json=serde_json::to_string(&self.custom_effective)?;
         let mut rust=super::render_marker(include_str!("../templates/Subjects.rs.in"),"// @st3-codegen:native-rust-models",&models.rust)?;

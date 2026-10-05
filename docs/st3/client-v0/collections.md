@@ -71,6 +71,9 @@ bound and its 1–200 item limit. Their snapshot/change frames use native subjec
 `upserts`, and `removes`; they do not turn operational resources into native claims.
 Per-row descriptor validation permits explicit payload-free unsupported-schema rows while
 rejecting malformed known rows. Retained claim/history pages are separate HTTP reads.
+Native SQLite workers retain their physical read slot until they finish, even when a
+replacement or unsubscribe cancels delivery. Canceled workers cannot exceed the socket's
+eight-read bound.
 
 Every native reread applies current identity visibility, claim audience, and positive field
 disclosure before choosing heads or computing diffs. Glass upserts/deletions and local observation
@@ -78,6 +81,12 @@ changes wake native windows even when the operational claim feed omits them. Del
 hidden identities leave an already delivered window through `removes`; reconnect starts with an
 authoritative snapshot. An initial subscription to a missing or hidden ref instead ends with the
 same `not-found` error, without disclosing whether that identity exists.
+
+Recorded-actor claims and custom-family enumeration are restricted to the session's
+delegated graph authority, for both local and paired reads. A paired device's transport
+actor (`person/<name>/session/<device>`) authenticates and binds its cursors; it does not
+replace the concrete `person/<name>` recorded by authorized writers. Other actors'
+claims remain hidden, including newer heads on the same subject.
 
 Paired native subscriptions retain their authenticated pairing/device/session binding. The server
 rechecks revocation and scopes before reads and again before delivering their results, and enforces
