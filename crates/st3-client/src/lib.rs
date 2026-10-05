@@ -220,6 +220,10 @@ impl CollectionStream {
     ) -> Result<(), ClientError> {
         self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":collection, "limit":limit, "actor":actor, "status":status})).await
     }
+    /// Follow exactly one agent's accepted harness state. A new snapshot resets its binding.
+    pub async fn subscribe_harness(&mut self, id: &str, agent: &str) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":"harness", "agent":agent, "limit":1})).await
+    }
     /// Follow a terminal on this socket. `terminal.attach` returns the incarnation and the
     /// single-use capability; screens then arrive as [`CollectionEvent::Screen`], the latest
     /// only, and a `stale-fence` error ends only this subscription.
@@ -1386,6 +1390,9 @@ impl Client {
             percent_encode(id)
         ))
         .await
+    }
+    pub async fn harness_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.resource_internal("harness", id).await
     }
     pub async fn agent_declaration_get(
         &self,
