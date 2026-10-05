@@ -55,7 +55,7 @@ impl Store {
             FROM claims WHERE kind='decision.observed'
             AND NOT EXISTS (SELECT 1 FROM replica_records WHERE claim_id=claims.id AND state='repaired')
             ORDER BY CANONICAL_ASC(claims)"))?;
-        let claims = query.query_map([], row_to_claim)?;
+        let claims = query.query_map([], claim_from_row)?;
         let mut decisions = BTreeMap::<(String, String), DecisionAttention>::new();
         for claim in claims {
             let mut claim = claim?;
