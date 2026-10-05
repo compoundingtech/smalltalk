@@ -36,6 +36,18 @@ The driver logs the active exception. `st admission revoke omp --binary /path/to
 same state directory, if customized) restores normal admission on the next launch. An override
 cannot supply a runtime missing from the real harness installation or repair incompatible APIs.
 
+## Stopping during an API outage
+
+After its provider ends, a native driver retries the final `runtime.observed` exit claim until
+it is acknowledged, including across daemon restarts. SIGTERM or SIGHUP requests a stop instead:
+once the provider is gone, the driver checks for that request every 250 ms and allows two seconds
+for the final observation drain, subagent cleanup and exit claim together. The deadline also
+cancels an in-flight API request. If it expires, the driver records a private log note and exits;
+the daemon's reconciler observes runtime liveness when it returns. The provider's existing
+five-second stop grace precedes this reporting budget, so a stopped driver does not wait
+indefinitely for a daemon that is down. An ordinary API outage without a stop has no exit-report
+deadline.
+
 ## What runs in a seat
 
 Each seat runs in its own PTY. The daemon starts `st3 driver HARNESS` there, and the driver starts
