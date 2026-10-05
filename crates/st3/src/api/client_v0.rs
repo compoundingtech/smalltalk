@@ -5609,6 +5609,7 @@ pub(super) async fn pairing_complete(
     State(state): State<AppState>,
     Extension(_session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
+    bound: Option<Extension<BoundAgent>>,
     Json(request): Json<PairingComplete>,
 ) -> Result<Json<Value>, ApiError> {
     if request.api_version != CLIENT_API_VERSION || request.device_public_key.len() < 32 {
@@ -5682,6 +5683,9 @@ pub(super) async fn pairing_complete(
         Some(_) => return Err(validation("the pairing has invalid delegated scopes")),
     };
     let grants_notes = scopes.iter().any(|scope| scope.starts_with("notes."));
+    if grants_notes && bound.is_some() {
+        return Err(forbidden("native agents cannot complete notes authority delegation"));
+    }
     if grants_notes
         && (state.private_notes.person.as_deref() != Some(person_id.as_str()) || begun.origin != state.store.origin()
             || !state.private_notes.pairing_attested(&state.state_dir, &begun).map_err(ApiError::bad)?) {
