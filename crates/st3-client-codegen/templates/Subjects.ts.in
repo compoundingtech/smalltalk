@@ -1,0 +1,143 @@
+
+/** Unknown or mismatched native descriptor IDs never expose an unvalidated field payload. */
+export type UnsupportedSubjectSchema = {
+    kind: 'unsupported-subject-schema'; id: string; ref: string; schema_id: string;
+    payload_availability: 'unsupported-schema';
+};
+export type SubjectProjectionResult = Models.SubjectProjection | UnsupportedSubjectSchema;
+export type SubjectClaimResult = Models.SubjectClaim | UnsupportedSubjectSchema;
+export const isUnsupportedSubjectSchema = (value: SubjectProjectionResult | SubjectClaimResult): value is UnsupportedSubjectSchema =>
+    'payload_availability' in value && value.payload_availability === 'unsupported-schema';
+export type SubjectsPageResult = Omit<Models.SubjectsPage, 'items'> & { items: SubjectProjectionResult[] };
+export type SubjectClaimsPageResult = Omit<Models.SubjectClaimsPage, 'items'> & { items: SubjectClaimResult[] };
+export type SubjectHistoryPageResult = Omit<Models.SubjectHistoryPage, 'items'> & { items: SubjectClaimResult[] };
+export type SubjectCollectionFrameResult =
+    | { kind: 'snapshot'; id: string; collection: 'subjects'; snapshot: Models.Snapshot; items: SubjectProjectionResult[]; order: string[]; has_more: boolean }
+    | { kind: 'changes'; id: string; collection: 'subjects'; snapshot: Models.Snapshot; upserts: SubjectProjectionResult[]; removes: string[]; order: string[]; has_more: boolean };
+export type SubjectsSelector = { family: string; ref_prefix?: string; ref?: never } | { ref: string; family?: never; ref_prefix?: never };
+export class SubjectDecodeError extends Error {
+    readonly code = 'validation-failed';
+    constructor() { super('Malformed native subject projection'); this.name = 'SubjectDecodeError'; }
+}
+const isObject = (value: unknown): value is { [key: string]: unknown } => typeof value === 'object' && value !== null && !Array.isArray(value);
+const hasOwn = (value: object, key: string): boolean => Object.prototype.hasOwnProperty.call(value, key);
+const unsupported = (value: unknown): UnsupportedSubjectSchema => {
+    if (!isObject(value) || typeof value.id !== 'string' || typeof value.ref !== 'string' || typeof value.schema_id !== 'string') throw new SubjectDecodeError();
+    return { kind: 'unsupported-subject-schema', id: value.id, ref: value.ref, schema_id: value.schema_id, payload_availability: 'unsupported-schema' };
+};
+/** Canonical object ordering matches the native recursive sorted-key JSON authority. */
+const canonical = (value: unknown): string => {
+    if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
+    if (isObject(value)) return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}';
+    if (typeof value === 'number' && !Number.isFinite(value)) throw new SubjectDecodeError();
+    const result = JSON.stringify(value);
+    if (result === undefined) throw new SubjectDecodeError();
+    return result;
+};
+export const isExactJson = (value: unknown, expected: unknown): boolean => {
+    try { return canonical(value) === canonical(expected); } catch { return false; }
+};
+/** Generated from the native authority, including the UTF-8 byte bound. */
+export const isNativeSubjectReference = (value: unknown, families: readonly string[] = []): value is string => {
+    if (typeof value !== 'string' || new TextEncoder().encode(value).length > nativeReferenceContract.max_utf8_bytes ||
+        new RegExp(nativeReferenceContract.forbidden_pattern, 'u').test(value)) return false;
+    const parts = value.split('/');
+    const family = parts[0];
+    if (!(nativeReferenceContract.families as readonly string[]).includes(family) ||
+        (families.length !== 0 && !families.includes(family)) || parts.length < 2 || parts.some(part => part.length === 0)) return false;
+    const suffix = value.slice(family.length + 1);
+    if (family === 'custom') return new RegExp('^(?:' + nativeReferenceContract.custom_suffix_pattern + ')(?![\\s\\S])', 'u').test(suffix);
+    if (family === 'file') {
+        const colon = suffix.indexOf(':');
+        if (colon < 0) return false;
+        const host = suffix.slice(0, colon), path = suffix.slice(colon + 1);
+        return new RegExp('^(?:' + nativeReferenceContract.file_host_pattern + ')(?![\\s\\S])', 'u').test(host) &&
+            path.startsWith('/') && !path.includes('/../') && !path.endsWith('/..');
+    }
+    return true;
+};
+// Portable synchronous SHA-256 keeps custom descriptor checks independent of Node, WebCrypto,
+// and ambient network execution. The input is the locally compiled effective descriptor only.
+const sha256 = (text: string): string => {
+    const bytes = new TextEncoder().encode(text);
+    const size = Math.ceil((bytes.length + 9) / 64) * 64;
+    const data = new Uint8Array(size); data.set(bytes); data[bytes.length] = 0x80;
+    const view = new DataView(data.buffer); const bits = bytes.length * 8;
+    view.setUint32(size - 8, Math.floor(bits / 0x100000000)); view.setUint32(size - 4, bits >>> 0);
+    const h = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+    const k = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+    const rotate = (value: number, count: number): number => (value >>> count) | (value << (32 - count));
+    const w = new Uint32Array(64);
+    for (let offset = 0; offset < size; offset += 64) {
+        for (let i = 0; i < 16; i++) w[i] = view.getUint32(offset + i * 4);
+        for (let i = 16; i < 64; i++) { const x = w[i - 15], y = w[i - 2]; w[i] = (w[i - 16] + (rotate(x,7) ^ rotate(x,18) ^ (x >>> 3)) + w[i - 7] + (rotate(y,17) ^ rotate(y,19) ^ (y >>> 10))) >>> 0; }
+        let [a,b,c,d,e,f,g,j] = h;
+        for (let i = 0; i < 64; i++) { const t1 = (j + (rotate(e,6) ^ rotate(e,11) ^ rotate(e,25)) + ((e & f) ^ (~e & g)) + k[i] + w[i]) >>> 0; const t2 = ((rotate(a,2) ^ rotate(a,13) ^ rotate(a,22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0; j=g; g=f; f=e; e=(d+t1)>>>0; d=c; c=b; b=a; a=(t1+t2)>>>0; }
+        for (const [i,value] of [a,b,c,d,e,f,g,j].entries()) h[i] = (h[i] + value) >>> 0;
+    }
+    return Array.from(h, value => value.toString(16).padStart(8,'0')).join('');
+};
+export const customClaimSchemaId = (kind: string): string | undefined => {
+    if (!/^custom\.[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)+$/.test(kind) || kind.startsWith('custom.client.')) return undefined;
+    return `subject-claim-schema/${sha256(canonical({ ...customEffective, kind }))}/custom/${kind}`;
+};
+/** Shared by the raw boundary and direct rich custom codecs; a shaped ID is not proof of its hash. */
+export const isSupportedCustomClaim = (value: { readonly kind: string; readonly schema_id: string; readonly ref: string }): boolean =>
+    isNativeSubjectReference(value.ref, ['custom']) && value.ref !== 'custom/client' && !value.ref.startsWith('custom/client/') && customClaimSchemaId(value.kind) === value.schema_id;
+const claimSupported = (value: unknown): boolean => {
+    if (!isObject(value) || typeof value.schema_id !== 'string' || typeof value.kind !== 'string' || typeof value.ref !== 'string') return false;
+    if (value.kind.startsWith('custom.')) return isSupportedCustomClaim({ kind: value.kind, schema_id: value.schema_id, ref: value.ref });
+    const binding = claimBindings[value.schema_id];
+    return binding !== undefined && value.kind === binding.kind && value.ref.startsWith(binding.family + '/');
+};
+export const decodeSubjectClaim = (value: unknown): SubjectClaimResult => {
+    if (!claimSupported(value)) return unsupported(value);
+    if (!isSubjectClaim(value)) throw new SubjectDecodeError();
+    return value;
+};
+export const decodeSubjectProjection = (value: unknown): SubjectProjectionResult => {
+    if (!isObject(value) || typeof value.schema_id !== 'string' || typeof value.family !== 'string' || typeof value.ref !== 'string') throw new SubjectDecodeError();
+    if (familyBindings[value.schema_id] !== value.family || !value.ref.startsWith(value.family + '/') || !Array.isArray(value.heads) || !value.heads.every(claimSupported)) return unsupported(value);
+    if (!isSubjectProjection(value) || value.id !== value.ref) throw new SubjectDecodeError();
+    return value;
+};
+export const decodeSubjectsPage = (value: unknown): SubjectsPageResult => {
+    if (!isObject(value) || !Array.isArray(value.items)) throw new SubjectDecodeError();
+    const header = { ...value, items: [] };
+    if (!isSubjectsPage(header)) throw new SubjectDecodeError();
+    return { ...header, items: value.items.map(decodeSubjectProjection) };
+};
+export const decodeSubjectClaimsPage = (value: unknown): SubjectClaimsPageResult => {
+    if (!isObject(value) || !Array.isArray(value.items)) throw new SubjectDecodeError();
+    const header = { ...value, items: [] };
+    if (!isSubjectClaimsPage(header)) throw new SubjectDecodeError();
+    return { ...header, items: value.items.map(decodeSubjectClaim) };
+};
+export const decodeSubjectHistoryPage = (value: unknown): SubjectHistoryPageResult => {
+    if (!isObject(value) || !Array.isArray(value.items)) throw new SubjectDecodeError();
+    const header = { ...value, items: [] };
+    if (!isSubjectHistoryPage(header)) throw new SubjectDecodeError();
+    return { ...header, items: value.items.map(decodeSubjectClaim) };
+};
+export const decodeSubjectSchemas = (value: unknown): Models.SubjectSchemas => {
+    if (!isSubjectSchemas(value)) throw new UnsupportedSubjectDescriptorError();
+    return value;
+};
+export class UnsupportedSubjectDescriptorError extends Error {
+    readonly code = 'unsupported-schema';
+    constructor() { super('Native subject descriptors do not match the locally compiled registry/policy'); this.name = 'UnsupportedSubjectDescriptorError'; }
+}
+export const decodeSubjectCollectionFrame = (value: unknown): SubjectCollectionFrameResult => {
+    if (!isObject(value)) throw new SubjectDecodeError();
+    if (value.kind === 'snapshot' && Array.isArray(value.items)) {
+        const header = { ...value, items: [] };
+        if (!isSubjectCollectionFrame(header) || header.kind !== 'snapshot') throw new SubjectDecodeError();
+        return { ...header, items: value.items.map(decodeSubjectProjection) };
+    }
+    if (value.kind === 'changes' && Array.isArray(value.upserts)) {
+        const header = { ...value, upserts: [] };
+        if (!isSubjectCollectionFrame(header) || header.kind !== 'changes') throw new SubjectDecodeError();
+        return { ...header, upserts: value.upserts.map(decodeSubjectProjection) };
+    }
+    throw new SubjectDecodeError();
+};

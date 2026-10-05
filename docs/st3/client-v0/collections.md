@@ -10,8 +10,9 @@ Send one JSON command per subscription:
 {"kind":"subscribe","id":"missions-tab","collection":"missions","limit":50}
 ```
 
-Collections are `missions`, `attention`, `agents`, and `work`, plus `terminal` (below). The optional
-`actor` filter applies to work, `person` to attention, and `status` to agents.
+Collections are `missions`, `attention`, `agents`, and `work`, plus native `subjects`, `terminal`,
+and `conversation` (below). The optional `actor` filter applies to work, `person` to attention,
+and `status` to agents.
 A window contains 1–200 current items. History remains on the
 corresponding paged HTTP reads. Send `{"kind":"unsubscribe","id":"missions-tab"}`
 to remove a subscription. IDs are chosen by the client and unique on the socket.
@@ -46,6 +47,31 @@ fresh snapshot. If the socket closes, including during a daemon
 restart, open a new socket and subscribe again; the new snapshot is authoritative.
 Each socket subscribes to store changes before taking its first snapshot, so a
 write racing that snapshot is visible in the snapshot or a subsequent frame.
+
+## Native subjects
+
+Select either one canonical native ref or one registered family, never both:
+
+```json
+{"kind":"subscribe","id":"native-resource","collection":"subjects","family":"resource","ref_prefix":"resource/github/","limit":50}
+{"kind":"subscribe","id":"native-agent","collection":"subjects","ref":"agent/example/worker","limit":1}
+```
+
+The family prefix is literal, not a wildcard. Native windows share the socket's eight-subscription
+bound and its 1–200 item limit. Their snapshot/change frames use native subject IDs for `order`,
+`upserts`, and `removes`; they do not turn operational resources into native claims.
+Per-row descriptor validation permits explicit payload-free unsupported-schema rows while
+rejecting malformed known rows. Retained claim/history pages are separate HTTP reads.
+
+Every native reread applies current identity visibility, claim audience, and positive field
+disclosure before choosing heads or computing diffs. Glass upserts/deletions and local observation
+changes wake native windows even when the operational claim feed omits them. Deleted or newly
+hidden identities leave the window through `removes`; reconnect starts with an authoritative
+snapshot.
+
+Paired native subscriptions retain their authenticated pairing/device/session binding. The server
+rechecks revocation and scopes before reads and enforces expiry even on an idle socket.
+Revoked or expired authority ends the subscription before any further native data is sent.
 
 ## Terminals
 

@@ -9,7 +9,7 @@
     "test:schema": "node --test schema.test.cjs",
     "typecheck": "npm run typecheck:client && npm run typecheck:schema",
     "typecheck:client": "tsc --strict --noEmit --allowImportingTsExtensions --target ES2020 --module esnext --moduleResolution bundler --lib es2020,dom index.ts types.test.ts",
-    "typecheck:schema": "tsc --strict --exactOptionalPropertyTypes --noEmit --target ES2024 --module esnext --moduleResolution bundler --lib esnext,dom Schema.generated.ts"
+    "typecheck:schema": "tsc --strict --exactOptionalPropertyTypes --noEmit --allowImportingTsExtensions --target ES2024 --module esnext --moduleResolution bundler --lib esnext,dom Schema.generated.ts"
   },
   "exports": {
     ".": "./index.ts",

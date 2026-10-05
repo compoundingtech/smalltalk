@@ -25,6 +25,14 @@
       }
     },
     "CustomReplyParameters": {"type": "object", "additionalProperties": false, "required": ["target_id", "registration", "revision", "episode", "fields"], "properties": {"target_id": {"$ref": "#/$defs/Id"}, "registration": {"type": "string"}, "revision": {"type": "string"}, "episode": {"type": "string"}, "fields": {"type": "object"}}},
+    "SubjectProjection": { "$ref": "./subject-projection.schema.json#/$defs/SubjectProjection" },
+    "SubjectClaim": { "$ref": "./subject-projection.schema.json#/$defs/SubjectClaim" },
+    "SubjectsPage": { "$ref": "./subject-projection.schema.json#/$defs/SubjectsPage" },
+    "SubjectClaimsPage": { "$ref": "./subject-projection.schema.json#/$defs/SubjectClaimsPage" },
+    "SubjectHistoryPage": { "$ref": "./subject-projection.schema.json#/$defs/SubjectHistoryPage" },
+    "SubjectSchemas": { "$ref": "./subject-projection.schema.json#/$defs/SubjectSchemas" },
+    "SubjectSubscription": { "$ref": "./subject-projection.schema.json#/$defs/SubjectSubscription" },
+    "SubjectCollectionFrame": { "$ref": "./subject-projection.schema.json#/$defs/SubjectCollectionFrame" },
     "ConversationSearchHit": {"type": "object", "additionalProperties": false, "required": ["conversation_id", "entry_id", "agent_id", "timestamp", "entry_type", "excerpt"], "properties": {"conversation_id": {"$ref": "#/$defs/Id"}, "entry_id": {"$ref": "#/$defs/Id"}, "agent_id": {"type": ["string", "null"]}, "timestamp": {"$ref": "#/$defs/Timestamp"}, "entry_type": {"type": "string"}, "excerpt": {"type": "string", "maxLength": 512}}},
     "ConversationSearch": {"type": "object", "additionalProperties": false, "required": ["kind", "items", "page", "indexed_at", "host_id", "incomplete_sources", "refreshing"], "properties": {"kind": {"const": "conversation-search"}, "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/ConversationSearchHit"}}, "page": {"$ref": "#/$defs/PageInfo"}, "indexed_at": {"$ref": "#/$defs/Timestamp"}, "host_id": {"$ref": "#/$defs/Id"}, "incomplete_sources": {"type": "array", "items": {"type": "string"}}, "refreshing": {"type": "boolean"}}},
 
@@ -138,7 +146,12 @@
             { "$ref": "#/$defs/StatusHistory" },
             { "$ref": "#/$defs/AgentQueue" },
             { "$ref": "#/$defs/UsagePeriod" },
-            { "$ref": "#/$defs/MailBacklog" }
+            { "$ref": "#/$defs/MailBacklog" },
+            { "$ref": "#/$defs/SubjectProjection" },
+            { "$ref": "#/$defs/SubjectsPage" },
+            { "$ref": "#/$defs/SubjectClaimsPage" },
+            { "$ref": "#/$defs/SubjectHistoryPage" },
+            { "$ref": "#/$defs/SubjectSchemas" }
           ]
         }
       }
@@ -1436,7 +1449,7 @@
       "required": ["kind", "collection", "filters", "items", "page"],
       "properties": {
         "kind": { "const": "page" },
-        "collection": { "type": "string", "not": { "const": "resources" } },
+        "collection": { "type": "string", "not": { "enum": ["resources", "subjects", "subject-claims", "subject-history"] } },
         "filters": { "type": "object", "additionalProperties": { "type": "string" } },
         "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
         "page": { "$ref": "#/$defs/PageInfo" },
@@ -2292,7 +2305,8 @@
           "additionalProperties": false,
           "required": ["kind", "id"],
           "properties": { "kind": { "const": "unsubscribe" }, "id": { "type": "string", "minLength": 1, "maxLength": 128 } }
-        }
+        },
+        { "$ref": "#/$defs/SubjectSubscription" }
       ]
     },
     "CollectionFrame": {
@@ -2377,7 +2391,8 @@
             "message": { "type": "string" },
             "retryable": { "type": "boolean" }
           }
-        }
+        },
+        { "$ref": "#/$defs/SubjectCollectionFrame" }
       ]
     }
   }

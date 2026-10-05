@@ -98,6 +98,13 @@ fn compile_contract_validator(mut schema: Value, definition: &str) -> jsonschema
     jsonschema::options()
         .with_draft(jsonschema::Draft::Draft202012)
         .should_validate_formats(true)
+        .with_resource(
+            "https://st3.local/schemas/subject-projection.schema.json",
+            jsonschema::Resource::from_contents(json(
+                asset_root().join("schemas/subject-projection.schema.json"),
+            ))
+            .expect("parse native subject projection schema resource"),
+        )
         .build(&schema)
         .unwrap_or_else(|error| panic!("compile {definition} contract: {error}"))
 }

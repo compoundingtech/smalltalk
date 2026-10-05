@@ -296,6 +296,46 @@ unambiguous predecessor return `validation-failed`. No directory is inferred fro
 
 For the full attach, stop/start, and suspend/resume recipe, see
 [seat lifecycle](../../seat-lifecycle.md#find-a-workspace-and-return-to-an-interactive-seat).
+### Native subject projections
+
+Native identities are separate from operational resources and applied agent definitions:
+
+| Read | Route | Selector |
+| --- | --- | --- |
+| Family page | `/subjects` | required `family`, optional literal `ref_prefix` |
+| One native identity | `/subject` | required canonical `ref` |
+| Retained claims | `/subject-claims` | required `ref`, optional native `kind` |
+| Retained history | `/subject-history` | required `ref`, optional native `kind` |
+| Compiled discovery | `/subject-schemas` | none |
+
+Refs are URL-encoded query values, not path segments. Family and history pages accept bounded
+`limit` and opaque `cursor`; repeat the same selectors when continuing. All reads require
+`read.projections`. Private glasses additionally require `read.glasses` and their concrete owner.
+Absent and dynamically hidden identities are indistinguishable; internal `custom/client` identities
+and `custom.client.*` claims are never disclosed. Existing claim audiences and positive field
+policies apply before head selection, pagination, and live diffs.
+Registered families without a reviewed client identity policy, including `sekret`, default to
+denied reads while remaining represented in static discovery. New claim kinds and fields likewise
+remain withheld until explicitly selected by policy.
+
+A `SubjectProjection` carries the native `ref` (also its `id`), family, content-addressed `schema_id`,
+typed authorized claim `heads`, `heads_complete`, and an answering-host `local_fence`. Heads are
+observations, not a field-by-field reduced declaration. Missing fields remain distinct from null.
+Unsafe or unsupported payloads retain honest availability/omission metadata, never arbitrary bags.
+History merges retained replicated claims and local observations in host source-log order; its
+coverage declares actual local retention, checkpoint-prunable replicated retention, and projection
+bounds. It does not promise lifetime or fleet-wide history.
+
+Cursors bind the host, authenticated session, policy/descriptors, selectors, visibility, source
+watermarks, and retained membership. They reauthorize every continuation and expire when relevant
+retained sources disappear; a cursor is not a grant.
+
+Discovery accounts for every registered native family and includes registry/projected-schema
+digests, family/claim/resource descriptors, and the full projected JSON Schema. Rust, Swift, raw
+TypeScript, and Effect clients derive their validators from the same contract. Unknown descriptors
+become explicit payload-free unsupported-schema values; known malformed payloads fail decoding.
+Use the native `subjects` collection for bounded current windows, described in
+[`collections.md`](collections.md); retained history remains on these paged HTTP reads.
 
 ### Applied subject definitions
 

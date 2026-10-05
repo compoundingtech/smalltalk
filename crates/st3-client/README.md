@@ -17,6 +17,20 @@ parameters, and manually paired action discriminators are private implementation
 Mutation callers pass the latest response snapshot and exact resource fences. `ClientError::Api`
 preserves stable error codes such as `stale-fence`, `runtime-not-local`, and `cursor-gap`.
 
+## Native subjects
+
+`subject_get`, `subjects_list`, `subject_claims`, `subject_history`, and `subject_schemas` read
+native registry identities independently of operational resources and applied agent definitions.
+Use `SubjectsSelector` with `subscribe_subjects` for an exact ref or a bounded family window.
+Discovery includes all registered families, effective descriptors, registry/projected-schema
+digests, and the full projected JSON Schema.
+
+Native models validate canonical references, claim kinds, and descriptor IDs when deserialized.
+Known malformed payloads fail decoding; unknown descriptors return the payload-free
+`Unsupported` union case, including inside collection frames. `ProjectedField` preserves absent,
+null, and present native values. Claims/history declare retained answering-host coverage and
+local evidence provenance; they are not complete fleet-wide lifetime histories.
+
 ## Raw PTY connectors
 
 `raw_terminal_attachment(terminal_id, runtime_incarnation, RawTerminalMode::Attach)` acquires

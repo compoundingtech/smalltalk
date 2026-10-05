@@ -4417,7 +4417,6 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hex",
- "hmac",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -4475,6 +4474,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "regex",
  "reqwest",
  "ring",
  "serde",
@@ -4497,6 +4497,7 @@ dependencies = [
  "anyhow",
  "serde_json",
  "sha2",
+ "st3-schema",
 ]
 
 [[package]]

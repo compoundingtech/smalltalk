@@ -5343,6 +5343,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         None => st_runtime::resolve_executable("pty", &login_environment)?,
     };
     let recorder = install_recorder(&config, &login_environment);
+    store.configure_native_retention(&config.observations, config.checkpoint.enabled)?;
     if let Some(person) = &config.person {
         let _ = st3::sekrets::daemon::PERSON.set(person.clone());
     }

@@ -205,3 +205,138 @@ test('resource pages decode only through ResourcesPage, never the generic Page',
     assert.equal(Rich.decodeUnknownSync(Rich.Page, 'strict')(page('missions')).collection, 'missions');
     assert.throws(() => Rich.decodeUnknownSync(Rich.Page)(page('resources')));
 });
+
+const nativeContracts = Promise.all([
+    import('./index.ts'),
+    Promise.resolve().then(() => require('../../../docs/st3/client-v0/schemas/subject-projection.schema.json')),
+]);
+const nativeProvenance = {
+    source: 'replicated', claim_id: 'claim/native-proof', origin: 'host/proof',
+    accepted_at: '2026-10-05T00:00:00.000Z', store_index: 1,
+};
+const nativeClaim = (entry, kind, fields) => ({
+    id: nativeProvenance.claim_id, ref: `${entry.family}/proof`, kind,
+    schema_id: entry.claim_schema_ids[kind], retention: entry.descriptor.claims[kind].retention,
+    provenance: nativeProvenance, payload_availability: 'available', fields, omitted_fields: [],
+});
+const changedHash = (id) => {
+    const start = 'subject-claim-schema/'.length;
+    return id.slice(0, start) + (id[start] === '0' ? '1' : '0') + id.slice(start + 1);
+};
+const unavailableClaim = (claim) => ({
+    kind: 'unsupported-subject-schema', id: claim.id, ref: claim.ref,
+    schema_id: claim.schema_id, payload_availability: 'unsupported-schema',
+});
+
+test('native subjects decode every registry family and reject changed descriptor contracts', async () => {
+    const [{ Schema, Effect }, Rich] = await modules;
+    const [Raw, artifact] = await nativeContracts;
+    const catalog = {
+        kind: 'subject-schemas', wire_version: artifact.wire_version, families: artifact.families,
+        native_registry_digest: artifact.native_registry_digest,
+        projected_schema_sha256: artifact.projected_schema_sha256,
+        projected_digest_convention: artifact.projected_digest_convention,
+        resources: artifact.resources,
+        projected_json_schema: artifact.$defs.SubjectSchemas.properties.projected_json_schema.const,
+    };
+    assert.deepEqual(Raw.decodeSubjectSchemas(catalog), catalog);
+    const richCatalog = Effect.runSync(Schema.decodeUnknownEffect(Rich.SubjectSchemas, { onExcessProperty: 'error' })(catalog));
+    assert.deepEqual(Schema.encodeSync(Rich.SubjectSchemas)(richCatalog), catalog);
+    for (const [index, entry] of artifact.families.entries()) {
+        const ref = entry.family === 'file' ? 'file/proof:/proof'
+            : entry.family === 'custom' ? 'custom/team/proof' : `${entry.family}/proof`;
+        const subject = {
+            kind: 'subject', id: ref, ref, family: entry.family, schema_id: entry.schema_id,
+            heads: [], heads_complete: false, local_fence: { node: 'host/proof', position: 7 },
+        };
+        assert.deepEqual(Raw.decodeSubjectProjection(subject), subject);
+        const rich = Effect.runSync(Rich.decodeNativeSubjectProjection(subject));
+        assert.deepEqual(Schema.encodeSync(Rich.SUBJECT_FAMILY_CODECS[entry.schema_id])(rich), subject);
+        assert.throws(() => Raw.decodeSubjectProjection({ ...subject, id: `${ref}/different` }), Raw.SubjectDecodeError);
+        const changed = structuredClone(catalog);
+        changed.families[index].descriptor.identity = { unreviewed_access: true };
+        assert.throws(() => Raw.decodeSubjectSchemas(changed), Raw.UnsupportedSubjectDescriptorError);
+        assert.throws(() => Rich.decodeUnknownSync(Rich.SubjectSchemas, 'strict')(changed));
+    }
+});
+
+test('native message claims preserve absent and null fields and reject wrong scalars and references', async () => {
+    const [{ Schema, Effect }, Rich] = await modules;
+    const [Raw, artifact] = await nativeContracts;
+    const entry = artifact.families.find(entry => entry.family === 'message');
+    const absent = nativeClaim(entry, 'message.sent', { from: 'person/alex', to: 'agent/proof', status: 'sent' });
+    const nullable = { ...absent, fields: { ...absent.fields, content: null, title: null, tags: null } };
+    for (const wire of [absent, nullable]) {
+        assert.deepEqual(Raw.decodeSubjectClaim(wire), wire);
+        const decoded = Effect.runSync(Rich.decodeNativeSubjectClaim(wire));
+        const encoded = Schema.encodeSync(Rich.SUBJECT_CLAIM_CODECS[wire.schema_id])(decoded);
+        assert.deepEqual(encoded, wire);
+        assert.equal(Object.hasOwn(decoded.fields, 'content'), Object.hasOwn(wire.fields, 'content'));
+    }
+    for (const fields of [
+        { ...absent.fields, content: 42 },
+        { ...absent.fields, to: 'person/' },
+        { ...absent.fields, status: 'future-status' },
+        { ...absent.fields, hidden_payload: 'must not become typed' },
+    ]) {
+        const malformed = { ...absent, fields };
+        assert.throws(() => Raw.decodeSubjectClaim(malformed), Raw.SubjectDecodeError);
+        await assert.rejects(Effect.runPromise(Rich.decodeNativeSubjectClaim(malformed)));
+    }
+    const changed = { ...absent, schema_id: changedHash(absent.schema_id), fields: { unvalidated: 'never disclose' } };
+    assert.deepEqual(Raw.decodeSubjectClaim(changed), unavailableClaim(changed));
+    assert.deepEqual(Effect.runSync(Rich.decodeNativeSubjectClaim(changed)), unavailableClaim(changed));
+    const ref = absent.ref;
+    const subject = {
+        kind: 'subject', id: ref, ref, family: entry.family, schema_id: entry.schema_id,
+        heads: [changed], heads_complete: true, local_fence: { node: 'host/proof', position: 0 },
+    };
+    const unavailable = {
+        kind: 'unsupported-subject-schema', id: ref, ref, schema_id: entry.schema_id,
+        payload_availability: 'unsupported-schema',
+    };
+    assert.deepEqual(Raw.decodeSubjectProjection(subject), unavailable);
+    assert.deepEqual(Effect.runSync(Rich.decodeNativeSubjectProjection(subject)), unavailable);
+});
+
+test('native concrete custom hashes match registry descriptors and reject cross-kind substitution', async () => {
+    const [{ Schema, Effect }, Rich] = await modules;
+    const [Raw, artifact] = await nativeContracts;
+    const { createHash } = require('node:crypto');
+    const entry = artifact.families.find(entry => entry.family === 'custom');
+    const canonical = value => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
+        : value !== null && typeof value === 'object'
+            ? '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+            : JSON.stringify(value);
+    const nativeId = kind => {
+        const effective = {
+            wire_version: artifact.wire_version, family: entry.family, kind,
+            identity: entry.descriptor.identity, claim: entry.descriptor.claims['custom.*'],
+            value_semantics: entry.descriptor.value_semantics, custom_payload: entry.descriptor.custom_payload,
+        };
+        return `subject-claim-schema/${createHash('sha256').update(canonical(effective)).digest('hex')}/custom/${kind}`;
+    };
+    const kind = 'custom.team.note';
+    assert.equal(Raw.customClaimSchemaId(kind), nativeId(kind));
+    assert.equal(Raw.customClaimSchemaId('custom.team.other'), nativeId('custom.team.other'));
+    const claim = {
+        id: nativeProvenance.claim_id, ref: 'custom/team/proof', kind, schema_id: nativeId(kind),
+        retention: 'durable', provenance: nativeProvenance, payload_availability: 'available',
+        fields: { explicit_null: null, nested: { flags: [false, 0, 'text'] } }, omitted_fields: [],
+    };
+    assert.deepEqual(Raw.decodeSubjectClaim(claim), claim);
+    const decoded = Rich.decodeUnknownSync(Rich.NativeCustomCustomClaim, 'strict')(claim);
+    assert.deepEqual(Schema.encodeSync(Rich.NativeCustomCustomClaim)(decoded), claim);
+    const otherHash = nativeId('custom.team.other').split('/')[1];
+    for (const schema_id of [changedHash(claim.schema_id), `subject-claim-schema/${otherHash}/custom/${kind}`]) {
+        const mismatched = { ...claim, schema_id };
+        assert.throws(() => Schema.decodeUnknownSync(Rich.NativeCustomCustomClaim)(mismatched));
+        assert.throws(() => Schema.decodeUnknownSync(Rich.SUBJECT_CUSTOM_CLAIM_CODEC)(mismatched));
+        assert.deepEqual(Raw.decodeSubjectClaim(mismatched), unavailableClaim(mismatched));
+        assert.deepEqual(Effect.runSync(Rich.decodeNativeSubjectClaim(mismatched)), unavailableClaim(mismatched));
+    }
+    for (const ref of ['custom/client', 'custom/client/private', 'agent/proof']) {
+        assert.throws(() => Schema.decodeUnknownSync(Rich.NativeCustomCustomClaim)({ ...claim, ref }));
+    }
+    assert.equal(Raw.customClaimSchemaId('custom.client.private'), undefined);
+});

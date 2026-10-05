@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 pub(super) mod raw_terminal;
 pub(super) mod resources;
 pub(super) mod search;
+pub(super) mod subjects;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -40,6 +41,11 @@ struct CollectionSubscribe {
     capability: Option<String>,
     /// A conversation subscription names an agent or a session.
     conversation: Option<String>,
+    /// Native subject collections select one family or one canonical ref.
+    family: Option<String>,
+    ref_prefix: Option<String>,
+    #[serde(rename = "ref")]
+    subject_ref: Option<String>,
 }
 
 struct CollectionSubscription {
@@ -62,6 +68,7 @@ const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
+    if collection == "subjects" { return false; }
     if collection == "glasses" { return !kind.starts_with("glass."); }
     matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
         || (kind == "harness.usage" && collection != "agents")
@@ -100,6 +107,17 @@ async fn collection_items(
     session: &ClientSession,
     request: &CollectionSubscribe,
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+    if request.collection == "subjects" {
+        if request.person.is_some() || request.actor.is_some() || request.status.is_some() {
+            return Err(validation("native subjects use the paired session's disclosure policy"));
+        }
+        let limit = request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
+        if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
+            return Err(validation("collection limit must be 1 through 200"));
+        }
+        return subjects::collection_window(state.clone(), session.clone(), request.family.clone(),
+            request.subject_ref.clone(), request.ref_prefix.clone(), limit).await;
+    }
     if !matches!(
         request.collection.as_str(),
         "missions" | "attention" | "agents" | "work" | "glasses"
@@ -687,11 +705,13 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 // Weigh only the commits since the last look: a reread is due when one of them
+                // Local observations can change native heads without advancing the graph index.
+                reread_due |= subscriptions.values().any(|s| s.request.collection == "subjects");
                 // can change a held window.
                 let index = state.store.index().unwrap_or(weighed);
                 if index > weighed {
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims).unwrap_or_default();
-                    let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
+                    let glasses_changed = subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "glasses" | "subjects")) && state.store.glasses_changed(weighed, index).unwrap_or(true);
                     reread_due |= glasses_changed || claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
                         claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
                     });
@@ -705,6 +725,9 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             }
             _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "agents")) => {
                 refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "agents")).map(|(id, _)| id.clone()));
+            }
+            () = tokio::time::sleep(subjects::expiry_delay(&session)), if !command_waiting && subscriptions.values().any(|s| s.request.collection == "subjects") => {
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "subjects").map(|(id, _)| id.clone()));
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
@@ -745,10 +768,20 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             Some(async move { (id, read(state, session, request).await) })
         }))
         .await;
-        for (id, read) in reads {
+        for (id, mut read) in reads {
             let Some(subscription) = subscriptions.get_mut(&id) else {
                 continue;
             };
+            if subscription.request.collection == "subjects" {
+                if let Err(error) = subjects::validate_live_session(state.clone(), session.clone()).await {
+                    read = Err(error);
+                }
+                if !subscription.delivered && subscription.request.subject_ref.is_some()
+                    && read.as_ref().is_ok_and(|(_, items, _)| items.is_empty())
+                {
+                    read = Err(ApiError::not_found("the native subject is not available"));
+                }
+            }
             match deliver_collection(&mut socket, subscription, read).await {
                 Refreshed::Current => {}
                 Refreshed::Retry => {
@@ -1175,6 +1208,8 @@ pub(super) struct ClientSession {
     pub(super) transport: &'static str,
     pub(super) custom_forms: bool,
     scopes: std::collections::BTreeSet<String>,
+    /// Server-derived authority retained by native-subject subscriptions, never a client assertion.
+    pairing_binding: Option<subjects::PairingBinding>,
 }
 
 impl ClientSession {
@@ -1186,6 +1221,7 @@ impl ClientSession {
             transport,
             custom_forms: true,
             scopes: std::collections::BTreeSet::new(),
+            pairing_binding: None,
         }
     }
 
@@ -1209,6 +1245,7 @@ impl ClientSession {
                     .into_iter()
                     .map(str::to_owned)
                     .collect(),
+                pairing_binding: None,
             });
         };
         // Free mode: an agent's local session holds every scope a person's does. Its actions
@@ -1219,6 +1256,7 @@ impl ClientSession {
             transport: "unix",
             custom_forms,
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
+            pairing_binding: None,
         })
     }
 
@@ -1229,6 +1267,7 @@ impl ClientSession {
             transport: "fabric-loopback",
             custom_forms: false,
             scopes: std::collections::BTreeSet::new(),
+            pairing_binding: None,
         }
     }
 
@@ -1423,6 +1462,11 @@ pub(super) fn authenticate(
         transport,
         custom_forms,
         scopes,
+        pairing_binding: Some(subjects::PairingBinding {
+            claim_id: paired.id.clone(),
+            subject: paired.subject.clone(),
+            expires_at_unix_ms: expires_at,
+        }),
     };
     if request.method() == axum::http::Method::GET {
         let scope = if request
@@ -9110,6 +9154,116 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
+    #[tokio::test]
+    async fn native_subject_projection_hides_other_actor_heads_and_internal_refs() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let append = |subject: &str, actor: &str, value: &str| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "custom.team.record".into(),
+                actor: Some(actor.into()), fields: BTreeMap::from([
+                    ("value".into(), json!(value)), ("nullable".into(), Value::Null),
+                    ("nested".into(), json!({"arbitrary":[1, true, "writer-owned"]})),
+                ]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        let own = append("custom/team/shared", "client/local/read-only", "own-head");
+        append("custom/team/shared", "client/other", "private-newer");
+        append("custom/team/other", "client/other", "private-only");
+        append("custom/client/private", "client/local/read-only", "internal");
+        let app = super::super::router(state.clone());
+        let read = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let (status, subject) = read("/v1/client/subject?ref=custom%2Fteam%2Fshared".into()).await;
+        assert_eq!(status, StatusCode::OK, "{subject}");
+        assert_eq!(subject["value"]["heads"][0]["id"], own.id);
+        assert_eq!(subject["value"]["heads"][0]["fields"]["value"], "own-head");
+        assert_eq!(subject["value"]["heads"][0]["fields"]["nullable"], Value::Null);
+        assert!(subject["value"]["heads"][0]["fields"].get("absent").is_none());
+        assert_eq!(subject["value"]["heads"][0]["fields"]["nested"],
+            json!({"arbitrary":[1,true,"writer-owned"]}));
+        let (status, page) = read("/v1/client/subjects?family=custom".into()).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["value"]["items"], json!([subject["value"]]));
+        for reference in ["custom%2Fteam%2Fother", "custom%2Fteam%2Fmissing"] {
+            let (status, hidden) = read(format!("/v1/client/subject?ref={reference}")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+            assert_eq!(hidden["error"]["code"], "not-found");
+        }
+        let (status, internal) = read("/v1/client/subject?ref=custom%2Fclient%2Fprivate".into()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{internal}");
+        let (status, history) = read("/v1/client/subject-history?ref=custom%2Fteam%2Fshared".into()).await;
+        assert_eq!(status, StatusCode::OK, "{history}");
+        assert_eq!(history["value"]["items"].as_array().unwrap().iter()
+            .map(|claim| claim["id"].as_str().unwrap()).collect::<Vec<_>>(), [own.id.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn native_subject_history_fences_continuation_and_revalidates_pairing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "custom/team/history";
+        let append = |value: &str| state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "custom.team.record".into(), actor: Some("client/subject-test".into()),
+            fields: BTreeMap::from([("value".into(), json!(value))]), evidence: Vec::new(),
+            expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let first = append("first");
+        let second = append("second");
+        let credential = "subject-test-credential";
+        let pairing_ref = "custom/client/subject-test";
+        state.store.append_claim(&ClaimInput {
+            subject: pairing_ref.into(), kind: "custom.client.pairing-completed".into(),
+            actor: Some("person/alex".into()),
+            fields: BTreeMap::from([
+                ("credential_hash".into(), json!(credential_digest(credential))),
+                ("session_actor".into(), json!("client/subject-test")),
+                ("person_id".into(), json!("person/alex")),
+                ("scopes".into(), json!(["read.projections"])),
+                ("expires_at_unix_ms".into(), json!(client_now_ms() as u64 + 60_000)),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let app = super::super::fabric_router(state.clone());
+        let read = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(Request::builder().uri(uri)
+                    .header(AUTHORIZATION, format!("Bearer {credential}")).body(Body::empty()).unwrap())
+                    .await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let filter = "ref=custom%2Fteam%2Fhistory&limit=1";
+        let (status, page) = read(format!("/v1/client/subject-history?{filter}")).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["value"]["items"][0]["id"], second.id);
+        assert_eq!(page["value"]["page"]["has_more"], true);
+        append("after-fence");
+        let cursor = urlencoding::encode(page["value"]["page"]["next_cursor"].as_str().unwrap());
+        let (status, continuation) = read(format!("/v1/client/subject-history?{filter}&cursor={cursor}")).await;
+        assert_eq!(status, StatusCode::OK, "{continuation}");
+        assert_eq!(continuation["value"]["items"][0]["id"], first.id);
+        assert_eq!(continuation["value"]["page"]["has_more"], false);
+        state.store.append_claim(&ClaimInput {
+            subject: pairing_ref.into(), kind: "custom.client.pairing-revoked".into(),
+            actor: Some("person/alex".into()), fields: BTreeMap::new(), evidence: Vec::new(),
+            expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let (status, revoked) = read(format!("/v1/client/subject-history?{filter}")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{revoked}");
+    }
+
     fn assert_collection_frame_conforms(frame: &Value) {
         let mut schema: Value = serde_json::from_str(include_str!(
             "../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
@@ -9119,6 +9273,16 @@ mod tests {
         schema["$ref"] = json!("#/$defs/CollectionFrame");
         let validator = jsonschema::options()
             .with_draft(jsonschema::Draft::Draft202012)
+            .with_resource(
+                "https://st3.local/schemas/subject-projection.schema.json",
+                jsonschema::Resource::from_contents(
+                    serde_json::from_str(include_str!(
+                        "../../../../docs/st3/client-v0/schemas/subject-projection.schema.json"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
             .build(&schema)
             .unwrap();
         let errors: Vec<_> = validator
@@ -14988,6 +15152,7 @@ mission "example/zero-run" state="ready" {
             transport: "paired",
             custom_forms: false,
             scopes: ["terminal.read".into()].into_iter().collect(),
+            pairing_binding: None,
         };
         let mut remote_request = request.clone();
         remote_request.idempotency_key = "fleet-terminal-attach-device-one".into();

@@ -341,6 +341,11 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/client/subject-definition",
             get(client_v0::subject_definition),
         )
+        .route("/v1/client/subjects", get(client_v0::subjects::list))
+        .route("/v1/client/subject", get(client_v0::subjects::get))
+        .route("/v1/client/subject-claims", get(client_v0::subjects::claims))
+        .route("/v1/client/subject-history", get(client_v0::subjects::history))
+        .route("/v1/client/subject-schemas", get(client_v0::subjects::schemas))
         .route("/v1/client/now", get(client_v0::now))
         .route("/v1/client/machines", get(client_v0::machines))
         .route("/v1/client/hosts/{*id}", get(client_v0::host_repositories))

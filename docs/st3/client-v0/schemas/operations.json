@@ -1,6 +1,7 @@
 {
   "contract": "st3.client.v0",
   "schema": "./client-v0.schema.json",
+  "native_subject_schema": "./subject-projection.schema.json",
   "transport": {
     "local": "unix",
     "remote": "fabric-loopback",
@@ -20,6 +21,11 @@
     { "id": "document.get", "method": "GET", "path": "/v1/client/documents/content", "response": "DocumentContent" },
     { "id": "subject.definition", "method": "GET", "path": "/v1/client/subject-definition", "response": "SubjectDefinition" },
     { "id": "mail-backlog.summary", "method": "GET", "path": "/v1/client/mail-backlog", "response": "MailBacklog", "scope": "read.projections" },
+    { "id": "subjects.list", "method": "GET", "path": "/v1/client/subjects", "response": "SubjectsPage", "scope": "read.projections" },
+    { "id": "subject.get", "method": "GET", "path": "/v1/client/subject", "response": "SubjectProjection", "scope": "read.projections" },
+    { "id": "subject.claims", "method": "GET", "path": "/v1/client/subject-claims", "response": "SubjectClaimsPage", "scope": "read.projections" },
+    { "id": "subject.history", "method": "GET", "path": "/v1/client/subject-history", "response": "SubjectHistoryPage", "scope": "read.projections" },
+    { "id": "subject.schemas", "method": "GET", "path": "/v1/client/subject-schemas", "response": "SubjectSchemas", "scope": "read.projections" },
     { "id": "usage.period", "method": "GET", "path": "/v1/client/usage", "response": "UsagePeriod" },
     { "id": "clients.list", "method": "GET", "path": "/v1/client/clients", "response": "ClientConnections" },
     { "id": "now.list", "method": "GET", "path": "/v1/client/now", "response": "Page" },

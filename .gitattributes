@@ -4,7 +4,9 @@ evals/**/_git/objects/** binary
 crates/st3-client/src/generated.rs linguist-generated=true
 crates/st3-client/src/contract.rs linguist-generated=true
 crates/st3-client/src/lib.rs linguist-generated=true
+crates/st3-client/src/subjects.generated.rs linguist-generated=true
 clients/typescript/st3-client/*.generated.ts linguist-generated=true
 clients/swift/St3Client/Sources/St3Client/*.generated.swift linguist-generated=true
 clients/swift/St3Client/Sources/St3Client/Models.swift linguist-generated=true
 clients/swift/St3Client/Sources/St3Client/Client.swift linguist-generated=true
+docs/st3/client-v0/schemas/subject-projection.schema.json linguist-generated=true

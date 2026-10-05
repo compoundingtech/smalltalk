@@ -4,6 +4,12 @@ import Foundation
 import FoundationNetworking
 #endif
 
+public enum SubjectsSelector: Sendable {
+    case family(String, refPrefix: String? = nil)
+    case ref(String)
+}
+private struct SubjectStreamControl: Decodable { let kind: String; let message: String? }
+
 public actor St3Client {
     public let baseURL: URL
     private let session: URLSession
@@ -103,6 +109,40 @@ public actor St3Client {
             }
         }
     }
+    public func subscribeSubjects(subscriptionID: String, selector: SubjectsSelector, limit: Int = 50) -> AsyncThrowingStream<SubjectCollectionFrame, Error> {
+        var components = URLComponents(url: baseURL.appending(path: "v1/client/collections/stream"), resolvingAgainstBaseURL: false)!
+        components.scheme = components.scheme == "https" ? "wss" : "ws"
+        var request = URLRequest(url: components.url!)
+        request.setValue("st3.client.collections.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol")
+        request.setValue("custom-subjects.v1", forHTTPHeaderField: "x-st3-features")
+        if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
+        let task = session.webSocketTask(with: request)
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
+            task.resume()
+            Task {
+                do {
+                    var fields: [String: JSONValue] = ["kind": .string("subscribe"), "id": .string(subscriptionID), "collection": .string("subjects"), "limit": .number(Double(limit))]
+                    switch selector {
+                    case .family(let family, let prefix):
+                        fields["family"] = .string(family)
+                        if let prefix { fields["ref_prefix"] = .string(prefix) }
+                    case .ref(let reference): fields["ref"] = .string(reference)
+                    }
+                    let command = try JSONEncoder().encode(JSONValue.object(fields))
+                    try await task.send(.string(String(decoding: command, as: UTF8.self)))
+                    while true {
+                        let data = try Self.websocketData(from: try await task.receive())
+                        let control = try JSONDecoder().decode(SubjectStreamControl.self, from: data)
+                        if control.kind == "error" { throw NSError(domain: "St3Client", code: 0, userInfo: [NSLocalizedDescriptionKey: control.message ?? "Native subject subscription failed"]) }
+                        if control.kind == "resync" { try await task.send(.string(String(decoding: command, as: UTF8.self))); continue }
+                        continuation.yield(try JSONDecoder().decode(SubjectCollectionFrame.self, from: data))
+                    }
+                } catch { continuation.finish(throwing: error); task.cancel(with: .normalClosure, reason: nil) }
+            }
+        }
+    }
     /// Keep one image (PNG, JPEG, GIF or WebP, at most 10 MiB) on the member this client talks to. Name the answer's `blob` in a `message.send` attachment.
     public func uploadBlob(_ bytes: Data, mediaType: String) async throws -> Envelope<BlobUpload> { try await request("v1/client/blobs", query: [], method: "POST", body: bytes, contentType: mediaType) }
     /// Up to 512 KiB of an attachment from `offset`, base64 in `data`.
@@ -130,6 +170,11 @@ public actor St3Client {
     public func documentGet(name: String) async throws -> Envelope<DocumentContent> { try await get("v1/client/documents/content", query: [.init(name: "name", value: name)]) }
     public func subjectDefinition(subject: String, showEnvValues: Bool = false) async throws -> Envelope<SubjectDefinition> { try await get("v1/client/subject-definition", query: [.init(name: "subject", value: subject), .init(name: "show_env_values", value: showEnvValues ? "true" : "false")]) }
     public func mailBacklogSummary() async throws -> Envelope<MailBacklog> { try await get("v1/client/mail-backlog") }
+    public func subjectsList(family: String, refPrefix: String? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<SubjectsPage> { var query = [URLQueryItem(name: "family", value: family)]; for (name,value) in [("ref_prefix",refPrefix),("cursor",cursor)] { if let value { query.append(.init(name: name, value: value)) } }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/subjects", query: query) }
+    public func subjectGet(reference: String) async throws -> Envelope<SubjectProjection> { try await get("v1/client/subject", query: [.init(name: "ref", value: reference)]) }
+    public func subjectClaims(reference: String, kind: String? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<SubjectClaimsPage> { var query = [URLQueryItem(name: "ref", value: reference)]; for (name,value) in [("kind",kind),("cursor",cursor)] { if let value { query.append(.init(name: name, value: value)) } }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/subject-claims", query: query) }
+    public func subjectHistory(reference: String, kind: String? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<SubjectHistoryPage> { var query = [URLQueryItem(name: "ref", value: reference)]; for (name,value) in [("kind",kind),("cursor",cursor)] { if let value { query.append(.init(name: name, value: value)) } }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/subject-history", query: query) }
+    public func subjectSchemas() async throws -> Envelope<SubjectSchemas> { try await get("v1/client/subject-schemas") }
     public func usagePeriod(sinceMS: UInt64? = nil, untilMS: UInt64? = nil) async throws -> Envelope<UsagePeriod> { var query: [URLQueryItem] = []; if let sinceMS { query.append(.init(name: "since_ms", value: String(sinceMS))) }; if let untilMS { query.append(.init(name: "until_ms", value: String(untilMS))) }; return try await get("v1/client/usage", query: query) }
     public func clientsList() async throws -> Envelope<ClientConnections> { try await get("v1/client/clients") }
     public func nowList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("now", cursor: cursor, limit: limit, history: history) }

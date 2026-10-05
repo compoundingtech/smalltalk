@@ -498,6 +498,10 @@ async fn connected(
                             terminal_failed(updates, following, code, message);
                         }
                     }
+                    // This feed subscribes only to operational windows, conversations, and
+                    // terminal screens; native subject projections are not feed rows.
+                    CollectionEvent::SubjectsSnapshot { .. }
+                    | CollectionEvent::SubjectsChanges { .. } => {}
                     CollectionEvent::Screen { id, screen } => {
                         if id != TERMINAL {
                             continue;

@@ -468,3 +468,226 @@ fn a_kind_this_client_does_not_know_reads_as_unknown_and_the_page_still_reads() 
         .is_err()
     );
 }
+
+fn native_projection_artifact() -> serde_json::Value {
+    serde_json::from_slice(&fixture("../schemas/subject-projection.schema.json")).unwrap()
+}
+
+fn native_family_entry<'a>(
+    artifact: &'a serde_json::Value,
+    family: &str,
+) -> &'a serde_json::Value {
+    artifact["families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["family"] == family)
+        .unwrap()
+}
+
+fn native_message_claim() -> serde_json::Value {
+    let artifact = native_projection_artifact();
+    let entry = native_family_entry(&artifact, "message");
+    serde_json::json!({
+        "id": "claim/message-1",
+        "ref": "message/example",
+        "kind": "message.sent",
+        "schema_id": entry["claim_schema_ids"]["message.sent"],
+        "retention": "durable",
+        "provenance": {
+            "source": "replicated", "claim_id": "claim/message-1",
+            "origin": "host/example", "accepted_at": "2026-10-05T00:00:00Z",
+            "store_index": 1
+        },
+        "payload_availability": "available",
+        "fields": {"from": "person/ada", "to": "agent/helper", "content": "Hello", "status": "sent"},
+        "omitted_fields": []
+    })
+}
+
+fn native_message_subject(claim: serde_json::Value) -> serde_json::Value {
+    let artifact = native_projection_artifact();
+    serde_json::json!({
+        "kind": "subject", "id": "message/example", "ref": "message/example",
+        "family": "message",
+        "schema_id": native_family_entry(&artifact, "message")["schema_id"],
+        "heads": [claim], "heads_complete": true,
+        "local_fence": {"node": "host/example", "position": 1}
+    })
+}
+
+#[test]
+fn native_message_fields_preserve_absent_null_and_value() {
+    let mut input = native_message_claim();
+    for value in [None, Some(serde_json::Value::Null), Some(serde_json::json!("Hello again"))] {
+        input["fields"].as_object_mut().unwrap().remove("title");
+        if let Some(value) = value {
+            input["fields"]["title"] = value;
+        }
+        let claim: SubjectClaim = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(claim).unwrap(), input);
+        let subject = native_message_subject(input.clone());
+        let decoded: SubjectProjection = serde_json::from_value(subject.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), subject);
+    }
+}
+
+#[test]
+fn concrete_native_models_reject_wrong_descriptors_literals_and_refs() {
+    let valid = native_message_claim();
+    let decoded: NativeMessageMessageSentClaim = serde_json::from_value(valid.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), valid);
+    for (field, invalid) in [
+        ("schema_id", "future-claim-descriptor"),
+        ("kind", "message.received"),
+        ("ref", "person/ada"),
+        ("ref", "message/"),
+    ] {
+        let mut claim = valid.clone();
+        claim[field] = serde_json::json!(invalid);
+        assert!(serde_json::from_value::<NativeMessageMessageSentClaim>(claim).is_err(), "{field}: {invalid}");
+    }
+    let valid = native_message_subject(valid);
+    let decoded: NativeMessageSubject = serde_json::from_value(valid.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), valid);
+    for (field, invalid) in [
+        ("schema_id", "future-family-descriptor"),
+        ("kind", "claim"),
+        ("ref", "person/ada"),
+        ("id", "message/different"),
+    ] {
+        let mut subject = valid.clone();
+        subject[field] = serde_json::json!(invalid);
+        assert!(serde_json::from_value::<NativeMessageSubject>(subject).is_err(), "{field}: {invalid}");
+    }
+}
+
+#[test]
+fn native_known_claims_reject_wrong_types_and_invalid_reference_fields() {
+    for invalid in [
+        serde_json::json!(42), serde_json::json!("person/has whitespace"),
+        serde_json::json!("unregistered/example"), serde_json::json!("person/has\u{0001}control"),
+        serde_json::json!(format!("person/{}", "a".repeat(512))),
+        serde_json::json!(format!("person/{}", "é".repeat(256))),
+        serde_json::json!("custom/team//example"), serde_json::json!("file/not-absolute"),
+    ] {
+        let mut claim = native_message_claim();
+        claim["fields"]["from"] = invalid;
+        assert!(serde_json::from_value::<SubjectClaim>(claim.clone()).is_err());
+        assert!(serde_json::from_value::<NativeMessageMessageSentClaim>(claim.clone()).is_err());
+        assert!(serde_json::from_value::<SubjectProjection>(native_message_subject(claim)).is_err());
+    }
+    let mut claim = native_message_claim();
+    claim["ref"] = serde_json::json!("message/has whitespace");
+    assert!(serde_json::from_value::<SubjectClaim>(claim).is_err());
+}
+
+#[test]
+fn native_unknown_descriptors_expose_only_validated_unavailable_metadata() {
+    let mut claim = native_message_claim();
+    claim["schema_id"] = serde_json::json!("future-claim-descriptor");
+    claim["fields"] = serde_json::json!({"secret": {"unvalidated": true}});
+    let decoded: SubjectClaim = serde_json::from_value(claim.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), serde_json::json!({
+        "kind": "unsupported-subject-schema", "id": "claim/message-1",
+        "ref": "message/example", "schema_id": "future-claim-descriptor",
+        "payload_availability": "unsupported-schema"
+    }));
+    claim.as_object_mut().unwrap().remove("fields");
+    let decoded: SubjectClaim = serde_json::from_value(claim.clone()).unwrap();
+    assert!(matches!(decoded, SubjectClaim::Unsupported(_)));
+    for key in ["id", "ref", "kind", "schema_id", "retention", "provenance", "payload_availability", "omitted_fields"] {
+        let mut malformed = claim.clone();
+        malformed.as_object_mut().unwrap().remove(key);
+        assert!(serde_json::from_value::<SubjectClaim>(malformed).is_err(), "{key}");
+    }
+    let mut subject = native_message_subject(claim);
+    subject["schema_id"] = serde_json::json!("future-family-descriptor");
+    let decoded: SubjectProjection = serde_json::from_value(subject.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), serde_json::json!({
+        "kind": "unsupported-subject-schema", "id": "message/example",
+        "ref": "message/example", "schema_id": "future-family-descriptor",
+        "payload_availability": "unsupported-schema"
+    }));
+    for key in ["id", "ref", "family", "schema_id", "heads", "heads_complete", "local_fence"] {
+        let mut malformed = subject.clone();
+        malformed.as_object_mut().unwrap().remove(key);
+        assert!(serde_json::from_value::<SubjectProjection>(malformed).is_err(), "{key}");
+    }
+    subject["id"] = serde_json::json!("message/different");
+    assert!(serde_json::from_value::<SubjectProjection>(subject).is_err());
+}
+
+#[test]
+fn native_custom_claims_bind_the_concrete_kind_hash() {
+    use sha2::{Digest as _, Sha256};
+    let artifact = native_projection_artifact();
+    let descriptor = &native_family_entry(&artifact, "custom")["descriptor"];
+    let kind = "custom.team.record";
+    let mut effective = serde_json::json!({
+        "wire_version": artifact["wire_version"], "family": "custom", "kind": kind,
+        "identity": descriptor["identity"], "claim": descriptor["claims"]["custom.*"],
+        "value_semantics": descriptor["value_semantics"], "custom_payload": descriptor["custom_payload"]
+    });
+    effective.sort_all_objects();
+    let schema_id = format!(
+        "subject-claim-schema/{:x}/custom/{kind}",
+        Sha256::digest(serde_json::to_vec(&effective).unwrap())
+    );
+    let mut claim = native_message_claim();
+    claim["ref"] = serde_json::json!("custom/team/example");
+    claim["kind"] = serde_json::json!(kind);
+    claim["schema_id"] = serde_json::json!(schema_id);
+    claim["fields"] = serde_json::json!({"nested": {"value": [null, true, 3]}});
+    let decoded: SubjectClaim = serde_json::from_value(claim.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), claim);
+    let concrete: NativeCustomCustomClaim = serde_json::from_value(claim.clone()).unwrap();
+    assert_eq!(serde_json::to_value(concrete).unwrap(), claim);
+    for (field, invalid) in [
+        ("schema_id", "subject-claim-schema/0000000000000000000000000000000000000000000000000000000000000000/custom/custom.team.record"),
+        ("kind", "custom.team.other"),
+        ("ref", "custom/client/example"),
+        ("ref", "custom/team//example"),
+        ("ref", "message/example"),
+    ] {
+        let mut invalid_claim = claim.clone();
+        invalid_claim[field] = serde_json::json!(invalid);
+        assert!(serde_json::from_value::<NativeCustomCustomClaim>(invalid_claim).is_err(), "{field}: {invalid}");
+    }
+    claim["kind"] = serde_json::json!("custom.team.other");
+    let decoded: SubjectClaim = serde_json::from_value(claim).unwrap();
+    let unavailable = serde_json::to_value(decoded).unwrap();
+    assert_eq!(unavailable["kind"], "unsupported-subject-schema");
+    assert_eq!(unavailable["payload_availability"], "unsupported-schema");
+    assert!(unavailable.get("fields").is_none());
+}
+
+#[test]
+fn native_collection_frames_keep_unknown_descriptor_rows_without_payloads() {
+    let mut subject = native_message_subject(native_message_claim());
+    subject["schema_id"] = serde_json::json!("future-family-descriptor");
+    subject["heads"][0]["fields"] = serde_json::json!({"secret": 123});
+    for (kind, rows) in [("snapshot", "items"), ("changes", "upserts")] {
+        let mut frame = serde_json::json!({
+            "kind": kind, "id": "native-window", "collection": "subjects",
+            "snapshot": {
+                "id": "snapshot/example/1", "host_id": "host/example", "store_index": 1,
+                "projection_version": "client-projection.v0", "created_at": "2026-10-05T00:00:00Z"
+            },
+            "order": ["message/example"], "has_more": false
+        });
+        frame[rows] = serde_json::json!([subject]);
+        if kind == "changes" {
+            frame["removes"] = serde_json::json!([]);
+        }
+        let decoded: SubjectCollectionFrame = serde_json::from_value(frame.clone()).unwrap();
+        let encoded = serde_json::to_value(decoded).unwrap();
+        assert_eq!(encoded[rows][0], serde_json::json!({
+            "kind": "unsupported-subject-schema", "id": "message/example",
+            "ref": "message/example", "schema_id": "future-family-descriptor",
+            "payload_availability": "unsupported-schema"
+        }));
+        frame[rows][0].as_object_mut().unwrap().remove("id");
+        assert!(serde_json::from_value::<SubjectCollectionFrame>(frame).is_err());
+    }
+}

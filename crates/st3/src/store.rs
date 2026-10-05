@@ -7,6 +7,10 @@ mod owned_sets_tests;
 mod resources;
 mod rollouts;
 mod seat_status;
+mod subjects;
+pub(crate) use subjects::{
+    NativeSourceFence, NativeSourceRecord, native_source_log_order, normalize_native_claim_fields,
+};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -1121,6 +1125,7 @@ pub type IdempotencyConflict = Vec<(String, String)>;
 pub struct Store {
     graph: GraphStore,
     smalltalk: Arc<SmalltalkRuntime>,
+    native_retention: Mutex<subjects::NativeRetentionLimits>,
 }
 
 impl std::borrow::Borrow<GraphStore> for Store {
@@ -2344,7 +2349,7 @@ impl Store {
         {
             graph.heal_replay_backoff_ms = 0;
         }
-        Ok(Self { graph, smalltalk })
+        Ok(Self { graph, smalltalk, native_retention: Mutex::new(Default::default()) })
     }
 
     /// Open a shared-memory store for sequential fixtures and short-lived tools.
@@ -2359,7 +2364,7 @@ impl Store {
         {
             graph.heal_replay_backoff_ms = 0;
         }
-        Ok(Self { graph, smalltalk })
+        Ok(Self { graph, smalltalk, native_retention: Mutex::new(Default::default()) })
     }
 
     /// Simulate a different build's registry on this node.
