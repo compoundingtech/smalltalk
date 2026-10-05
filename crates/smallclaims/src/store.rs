@@ -1785,7 +1785,8 @@ pub fn fleet_membership_tx_with_local_signer(
         {
             signers.insert(key.to_owned());
         }
-        if let Some(existing) = claims.iter_mut().find(|claim| claim.id == id) {
+        // ORDER BY claims.id makes rows for one claim contiguous, including envelope forks.
+        if let Some(existing) = claims.last_mut().filter(|claim| claim.id == id) {
             existing.signers.extend(signers);
             continue;
         }
