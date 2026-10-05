@@ -97,6 +97,13 @@ export function isConversational(entry: Entry): boolean {
   return entry.type !== 'status' && entry.type !== 'usage';
 }
 
+// Session-stable availability notices are not evidence that two history windows overlap.
+function isProjectionNotice(entry: Entry): boolean {
+  return entry.type === 'error' && typeof entry.body === 'object' && entry.body !== null
+    && 'code' in entry.body
+    && (entry.body.code === 'timeline-query-limited' || entry.body.code === 'timeline-history-incomplete');
+}
+
 /** st's order: by time, then by sequence. */
 function before(a: Entry, b: Entry): number {
   const at = (a.timestamp ?? '').localeCompare(b.timestamp ?? '');
@@ -126,9 +133,9 @@ export function applyConversation<T extends Entry>(
   else if (frame.replace) {
     live = frame.hasMore;
     const held = previous && !otherSession ? previous.entries : [];
-    const meets = frame.items.some(item => held.some(entry => entry.id === item.id));
-    const oldest = [...frame.items].sort(before)[0];
-    if (older.paged && (meets || !frame.hasMore)) base = held.filter(entry => oldest && before(entry, oldest) < 0);
+    const meets = frame.items.some(item => !isProjectionNotice(item) && held.some(entry => !isProjectionNotice(entry) && entry.id === item.id));
+    const oldest = frame.items.filter(item => !isProjectionNotice(item)).sort(before)[0];
+    if (older.paged && (meets || !frame.hasMore)) base = held.filter(entry => !isProjectionNotice(entry) && oldest && before(entry, oldest) < 0);
     else older = noOlder;
   }
   const found = new Map<string, T>(base.map(entry => [entry.id, entry]));
