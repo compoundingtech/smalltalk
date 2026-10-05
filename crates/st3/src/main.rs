@@ -262,6 +262,11 @@ enum Command {
     },
     /// Print the st agent skill bundled in this binary, or install it for each harness.
     Skill(SkillArgs),
+    /// Allow or revoke a local exact-build harness admission exception.
+    Admission {
+        #[command(subcommand)]
+        command: AdmissionCommand,
+    },
     #[command(hide = true)]
     ReplicationWorker(ReplicationWorkerArgs),
     #[command(hide = true)]
@@ -4205,6 +4210,95 @@ struct DriverArgs {
     argv: Vec<String>,
 }
 
+#[derive(Subcommand)]
+enum AdmissionCommand {
+    /// Explicitly allow this installed build without running its admission probes.
+    Override {
+        #[command(flatten)]
+        build: AdmissionBuildArgs,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Revoke this installed build's exception; retained measurements apply again.
+    Revoke {
+        #[command(flatten)]
+        build: AdmissionBuildArgs,
+    },
+}
+
+#[derive(Args)]
+struct AdmissionBuildArgs {
+    #[arg(value_parser = ["omp", "opencode"])]
+    harness: String,
+    /// Exact executable used by the affected seat; defaults to the harness on PATH.
+    #[arg(long)]
+    binary: Option<String>,
+    /// This machine's st state directory; defaults to the configured state directory.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+}
+
+fn run_admission(command: AdmissionCommand, json_output: bool) -> Result<()> {
+    anyhow::ensure!(
+        std::env::var_os("ST_AGENT").is_none(),
+        "admission exceptions must be managed from a person's terminal, outside an agent seat"
+    );
+    let (build, reason) = match command {
+        AdmissionCommand::Override { build, reason } => (build, Some(reason)),
+        AdmissionCommand::Revoke { build } => (build, None),
+    };
+    let state_dir = match build.state_dir {
+        Some(path) => path,
+        None => Config::load_unvalidated(None)?.state_dir,
+    };
+    let cache = state_dir.join("drivers/sessions/harness-admission");
+    let driver = if build.harness == "omp" {
+        st_drivers::driver_diagnostic::Driver::Omp
+    } else {
+        st_drivers::driver_diagnostic::Driver::OpenCode
+    };
+    // Use the immutable asset the managed launch also exports. Installing hooks here would
+    // mutate a managed seat; this disposable file only supplies the adapter identity bytes.
+    let adapter = tempfile::NamedTempFile::new()?;
+    let extension = if driver == st_drivers::driver_diagnostic::Driver::Omp {
+        let (_, bytes) = st3::hooks::FILES
+            .iter()
+            .find(|(name, _)| *name == "omp-channel.ts")
+            .expect("the managed hook set includes omp");
+        fs::write(adapter.path(), bytes)?;
+        Some(adapter.path())
+    } else {
+        None
+    };
+    let binary = build.binary.as_deref().unwrap_or(&build.harness);
+    let path = if let Some(reason) = &reason {
+        st_drivers::harness_admission::override_build(binary, driver, extension, &cache, reason)?
+    } else {
+        st_drivers::harness_admission::revoke_override(binary, driver, extension, &cache)?
+    };
+    if json_output {
+        println!(
+            "{}",
+            json!({"harness":build.harness,"executable":binary,"overridden":reason.is_some(),"reason":reason,"record":path})
+        );
+    } else if reason.is_some() {
+        println!(
+            "{} installed build explicitly allowed; admission checks bypassed. Record: {}\nRestart only the affected seat to apply. A changed executable or shipped extension needs its own exception. Revoke with `st admission revoke {} --binary {}`.",
+            build.harness,
+            path.display(),
+            build.harness,
+            shell_argument(binary)
+        );
+    } else {
+        println!(
+            "{} installed-build exception revoked. Retained measurements apply on the next launch. Record: {}",
+            build.harness,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[derive(Args)]
 struct SkillArgs {
     #[command(subcommand)]
@@ -4622,6 +4716,9 @@ async fn run(cli: Cli) -> Result<()> {
         let _ = std::io::stdout().flush();
         std::process::exit(code);
     }
+    if let Command::Admission { command } = cli.command {
+        return run_admission(command, cli.json);
+    }
     if let Command::ReplicationWorker(args) = cli.command {
         let mut config = Config::load_unvalidated(args.config.as_deref())?;
         if let Some(value) = args.node {
@@ -4668,6 +4765,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
         Command::Sekrets(_) => unreachable!(),
+        Command::Admission { .. } => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
         Command::Usage(args) => run_usage(&immediate, args, cli.json).await,
@@ -16778,6 +16876,7 @@ async fn drive_st2_native(
     let mut last_usage_fingerprint = None;
     let mut last_limits_fingerprint = None;
     let mut last_control_warning = None;
+    let mut last_admission_fingerprint = None;
     let mut last_capacity_fingerprint = None;
     let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
     let mut replacement = DriverReplacement::new();
@@ -16819,6 +16918,17 @@ async fn drive_st2_native(
                     loop_state = resume.loop_state;
                     task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
                     continue;
+                }
+                // A refused omp never reaches the session loop. Publish its durable named
+                // admission boundary before recording exit, retrying through daemon outages.
+                if matches!(driver, "omp" | "opencode") {
+                    let observed = st_drivers::driver_diagnostic::read(
+                        &st_drivers::driver_diagnostic::path(&agent_dir));
+                    if let Some(input) = admission_diagnostic(subject, &incarnation, &observed) {
+                        let _: ClaimRecord = retry_while_daemon_unreachable(subject, || {
+                            client.post("/v1/claims", &input)
+                        }).await?;
+                    }
                 }
                 if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
@@ -17006,6 +17116,12 @@ async fn drive_st2_native(
                 }
                 let tick: Result<()> = async {
                     if observations.enabled { return Ok(()) }
+                    // The wrapper writes admission before claiming a new harness session. Wait
+                    // for that claim so a predecessor's record cannot fence a successor.
+                    if matches!(driver, "omp" | "opencode") && loop_state.harness_record_started {
+                        publish_admission_diagnostic(client, subject, &incarnation, &agent_dir,
+                            &mut last_admission_fingerprint).await?;
+                    }
                     if native_file_may_override_channel(driver)
                         && loop_state.harness_record_started
                         && let Some(observed) = st_drivers::harness_state::read(&harness_state_path, None)
@@ -17398,6 +17514,19 @@ impl NativeObservations {
                     };
                     let observed = st_drivers::harness_state::read_raw_at(&raw, None, decode_at);
                     if event.runtime_incarnation == self.runtime && source_driver == driver {
+                        // Admission precedes the provider claim. Only a state event fenced to
+                        // this runtime can expose its diagnostic; an old snapshot cannot fence
+                        // a successor. Refused omp launches are handled on the exit path.
+                        if matches!(driver, "omp" | "opencode") {
+                            publish_admission_diagnostic(
+                                client,
+                                subject,
+                                &self.runtime,
+                                &self.dir,
+                                &mut None,
+                            )
+                            .await?;
+                        }
                         self.provider_incarnation = observed.evidence_incarnation.clone();
                         self.evidence_deadline =
                             (event.kind != "harness-state-expired").then(|| event.payload.clone());
@@ -20361,6 +20490,83 @@ impl NativeDeliverySupervisor {
         self.degraded_recorded = false;
         self.last_warning = None;
     }
+}
+
+fn admission_diagnostic(
+    subject: &str,
+    incarnation: &str,
+    observed: &st_drivers::driver_diagnostic::Observed,
+) -> Option<ClaimInput> {
+    use st_drivers::driver_diagnostic::{Driver, Observed, Stage};
+    let Observed::Failure(failure) = observed else {
+        return None;
+    };
+    if failure.stage != Stage::VersionGate {
+        return None;
+    }
+    let reason = format!(
+        "{} {} admission failed at {}; native delivery is unavailable. {}",
+        failure.driver.as_str(),
+        failure
+            .producer_version
+            .as_deref()
+            .unwrap_or("unknown version"),
+        failure.reason.as_str(),
+        st_drivers::driver_diagnostic::repair_text(observed)
+    );
+    Some(ClaimInput {
+        subject: subject.into(),
+        kind: "harness.diagnostic".into(),
+        actor: Some(subject.into()),
+        fields: BTreeMap::from([
+            (
+                "severity".into(),
+                json!(if failure.driver == Driver::Omp {
+                    "error"
+                } else {
+                    "warning"
+                }),
+            ),
+            (
+                "status".into(),
+                json!(if failure.driver == Driver::Omp {
+                    "failed"
+                } else {
+                    "degraded"
+                }),
+            ),
+            ("code".into(), json!("harness-admission-failed")),
+            ("reason".into(), json!(reason)),
+            ("incarnation_id".into(), json!(incarnation)),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some(format!(
+            "harness-admission:{subject}:{incarnation}:{}:{}",
+            failure.reason.as_str(),
+            failure.observed_at
+        )),
+    })
+}
+
+async fn publish_admission_diagnostic(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    agent_dir: &Path,
+    last: &mut Option<String>,
+) -> Result<()> {
+    let observed =
+        st_drivers::driver_diagnostic::read(&st_drivers::driver_diagnostic::path(agent_dir));
+    let Some(input) = admission_diagnostic(subject, incarnation, &observed) else {
+        return Ok(());
+    };
+    if *last == input.idempotency_key {
+        return Ok(());
+    }
+    let _: ClaimRecord = client.post("/v1/claims", &input).await?;
+    *last = input.idempotency_key;
+    Ok(())
 }
 
 async fn record_native_delivery_diagnostic(
@@ -24173,6 +24379,49 @@ mod tests {
     }
 
     #[test]
+    fn admission_failure_projection_names_boundary_and_driver_policy() {
+        use st_drivers::driver_diagnostic::{
+            Driver, Observed, Publisher, Reason, Source, Stage, Support,
+        };
+        for (driver, severity, status) in [
+            (Driver::Omp, "error", "failed"),
+            (Driver::OpenCode, "warning", "degraded"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut publisher = Publisher::new(
+                directory.path(),
+                driver,
+                Some("99.42.7".into()),
+                Support::Unsupported,
+            );
+            publisher.publish(
+                Stage::VersionGate,
+                Reason::AdmissionNativeConsumption,
+                Source::AdmissionProbe,
+            );
+            let observed = st_drivers::driver_diagnostic::read(
+                &st_drivers::driver_diagnostic::path(directory.path()),
+            );
+            let claim = admission_diagnostic("agent/node.fixture", "first", &observed).unwrap();
+            assert_eq!(claim.fields["code"], "harness-admission-failed");
+            assert_eq!(claim.fields["severity"], severity);
+            assert_eq!(claim.fields["status"], status);
+            assert_eq!(claim.fields["incarnation_id"], "first");
+            let reason = claim.fields["reason"].as_str().unwrap();
+            assert!(reason.contains("admissionNativeConsumption") && reason.contains("99.42.7"));
+            assert!(reason.contains(driver.as_str()));
+            assert!(reason.contains(&format!("st admission override {} --binary", driver.as_str())));
+            assert_eq!(
+                claim.idempotency_key,
+                admission_diagnostic("agent/node.fixture", "first", &observed)
+                    .unwrap()
+                    .idempotency_key
+            );
+        }
+        assert!(admission_diagnostic("agent/node.fixture", "first", &Observed::Absent).is_none());
+    }
+
+    #[test]
     fn harness_diagnostic_requires_and_derives_the_agent_identity() {
         let cli = Cli::try_parse_from([
             "st3",
@@ -27156,6 +27405,93 @@ mission "review" state="ready" {
             Some("provider-new")
         );
         assert!(observations.evidence_deadline.is_some());
+    }
+
+    #[tokio::test]
+    async fn admission_outbox_waits_for_current_runtime_and_retries_failed_publication() {
+        use axum::{Json, Router, routing::post};
+        use st_drivers::driver_diagnostic::{Driver, Publisher, Reason, Source, Stage, Support};
+        use std::sync::{Arc, Mutex};
+
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "old-runtime").unwrap();
+        st_drivers::harness_state::claim(root.path(), "example/seat", "opencode", "old-provider")
+            .unwrap();
+        st_drivers::harness_events::enable(root.path(), "current-runtime").unwrap();
+        let mut publisher = Publisher::new(
+            root.path(),
+            Driver::OpenCode,
+            Some("99.42.7".into()),
+            Support::Unsupported,
+        );
+        publisher.publish(
+            Stage::VersionGate,
+            Reason::AdmissionIdleEdge,
+            Source::AdmissionProbe,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = Client::new(st3::client::Endpoint::Http(format!("http://{address}")));
+        let mut observations = NativeObservations::start(root.path(), "current-runtime").unwrap();
+        let mut ready = false;
+        // A predecessor's claim must neither publish the diagnostic nor require the daemon.
+        observations
+            .drain(&client, "agent/example/seat", "opencode", &mut ready)
+            .await
+            .unwrap();
+        st_drivers::harness_state::claim(root.path(), "example/seat", "opencode", "current-provider")
+            .unwrap();
+        assert!(
+            observations
+                .drain(&client, "agent/example/seat", "opencode", &mut ready)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            st_drivers::harness_events::pending(root.path(), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let captured = Arc::new(Mutex::new(Vec::<ClaimInput>::new()));
+        let app = Router::new().route(
+            "/v1/claims",
+            post({
+                let captured = captured.clone();
+                let store = Arc::new(Store::open_memory("amber").unwrap());
+                move |Json(input): Json<ClaimInput>| {
+                    captured.lock().unwrap().push(input.clone());
+                    let record = store.append_claim(&input).unwrap();
+                    async move { Json(json!({"api_version":"st3.v1", "value":record})) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        observations
+            .drain(&client, "agent/example/seat", "opencode", &mut ready)
+            .await
+            .unwrap();
+        assert!(
+            st_drivers::harness_events::pending(root.path(), 10)
+                .unwrap()
+                .is_empty()
+        );
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].fields["incarnation_id"], "current-runtime");
+        assert_eq!(captured[0].fields["status"], "degraded");
+        assert!(
+            captured[0].fields["reason"]
+                .as_str()
+                .unwrap()
+                .contains("admissionIdleEdge")
+        );
+        assert!(!ready);
+        server.abort();
     }
 
     #[tokio::test]
