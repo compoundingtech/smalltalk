@@ -31,6 +31,18 @@ export function money(microusd: number): string {
 /** A cost, with a + when some tokens had no price: the true cost is higher, never lower. */
 export const cost = (total: Total) => `${money(total.costMicrousd)}${total.unpriced > 0 ? '+' : ''}`;
 
+/** `part` of `whole` as a percentage: whole numbers (rounded down, so 99.6% never reads 100%) from
+ * 10% up, a decimal below, and `<0.1%` for a sliver, so a small bucket never reads as none. */
+export function tokenShare(part: number, whole: number): string {
+  if (!whole || !part) return '0%';
+  const percent = part * 100 / whole;
+  if (percent >= 10) return `${Math.floor(percent)}%`;
+  return percent >= 0.1 ? `${percent.toFixed(1)}%` : '<0.1%';
+}
+/** What a period's tokens were: re-read from the cache, written to it, fresh input, or output. */
+export const mix = (total: Total) =>
+  `${tokenShare(total.cached, total.tokens)} cached · ${tokenShare(total.cacheWrite, total.tokens)} written to cache · ${tokenShare(total.input, total.tokens)} fresh input · ${tokenShare(total.output, total.tokens)} output`;
+
 export function tokens(count: number): string {
   for (const [size, unit] of [[1e9, 'B'], [1e6, 'M'], [1e3, 'k']] as const) {
     if (count >= size) { const value = count / size; return value < 10 ? `${value.toFixed(1)}${unit}` : `${Math.round(value)}${unit}`; }

@@ -143,15 +143,15 @@ pub fn money(microusd: u64) -> String {
     }
 }
 
-/// `part` of `whole` as a percentage: whole numbers from 10% up, a decimal below, and `<0.1%`
-/// for a sliver, so a small bucket never reads as none.
+/// `part` of `whole` as a percentage: whole numbers (rounded down, so 99.6% never reads 100%) from
+/// 10% up, a decimal below, and `<0.1%` for a sliver, so a small bucket never reads as none.
 pub fn share(part: u64, whole: u64) -> String {
     if whole == 0 || part == 0 {
         return "0%".into();
     }
     let percent = part as f64 * 100.0 / whole as f64;
     if percent >= 10.0 {
-        format!("{percent:.0}%")
+        format!("{:.0}%", percent.floor())
     } else if percent >= 0.1 {
         format!("{percent:.1}%")
     } else {
@@ -302,7 +302,7 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
             row(
                 &mut items,
                 id.clone(),
-                vec![span(format!(" {}", label(world, &id)), theme::bold())],
+                cached_beside(format!(" {}", label(world, &id)), &spent),
                 vec![span(spent.money(), theme::fg(theme::ACCENT))],
                 limit_line(limit, &spent),
             );
@@ -361,11 +361,7 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
         });
     }
     for (id, total) in grouped {
-        let cached = if total.tokens > 0 {
-            total.cached * 100 / total.tokens
-        } else {
-            0
-        };
+        let cached = share(total.cached, total.tokens);
         row(
             &mut items,
             id.clone(),
@@ -373,7 +369,7 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
             vec![span(total.money(), theme::fg(theme::ACCENT))],
             vec![span(
                 format!(
-                    "   {} tokens · {} out · {cached}% cached",
+                    "   {} tokens · {cached} cached · {} out",
                     tokens(total.tokens),
                     tokens(total.output)
                 ),
@@ -429,10 +425,26 @@ fn accounts(world: &World) -> Vec<(String, Total, Option<&UsageLimit>)> {
 }
 
 /// An account's limits as one line: weekly first, since that is the one that stops seats.
+/// An account's name with its cache share beside it, dim, once it has spent anything.
+fn cached_beside(name: String, spent: &Total) -> Vec<Span<'static>> {
+    let mut spans = vec![span(name, theme::bold())];
+    if spent.tokens > 0 {
+        spans.push(span(
+            format!("  {} cached", share(spent.cached, spent.tokens)),
+            theme::dim(),
+        ));
+    }
+    spans
+}
+
 fn limit_line(limit: Option<&UsageLimit>, spent: &Total) -> Vec<Span<'static>> {
     let Some(limit) = limit else {
         return vec![span(
-            format!("   {} tokens · no limits reported", tokens(spent.tokens)),
+            format!(
+                "   {} tokens · {} cached · no limits reported",
+                tokens(spent.tokens),
+                share(spent.cached, spent.tokens)
+            ),
             theme::dim(),
         )];
     };
@@ -529,8 +541,9 @@ pub fn detail(world: &World, id: Option<&str>, hours: u64, width: usize) -> Doc 
         span(total.money(), theme::strong(theme::ACCENT)),
         span(
             format!(
-                " API-equivalent · {} tokens · {}",
+                " API-equivalent · {} tokens · {} cached · {}",
                 tokens(total.tokens),
+                share(total.cached, total.tokens),
                 period_name(hours)
             ),
             theme::dim(),
@@ -552,7 +565,12 @@ pub fn detail(world: &World, id: Option<&str>, hours: u64, width: usize) -> Doc 
         ("to cache", total.cache_write),
         ("cached", total.cached),
     ] {
-        doc.field(name, &tokens(count), width, theme::text());
+        doc.field(
+            name,
+            &format!("{} · {}", tokens(count), share(count, total.tokens)),
+            width,
+            theme::text(),
+        );
     }
     for by in [By::Step, By::Agent, By::Model, By::Host] {
         if Some(by) == own {
@@ -703,6 +721,7 @@ mod tests {
         assert_eq!(share(0, 100), "0%");
         assert_eq!(share(5, 0), "0%");
         assert_eq!(share(98_260, 100_000), "98%");
+        assert_eq!(share(99_600, 100_000), "99%", "never rounded up to 100%");
         assert_eq!(share(890, 100_000), "0.9%");
         assert_eq!(share(40, 100_000), "<0.1%");
         let total = Total {
@@ -730,6 +749,35 @@ mod tests {
             .join("\n");
         assert!(summary.contains("cached ·"), "{summary}");
         assert!(summary.contains("written to cache"), "{summary}");
+        // Every account and group row says how much of its tokens were cached, before the
+        // output so a narrow panel never cuts it off.
+        let listing = list(&world, By::Agent, 24);
+        let rows = listing
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Row { first, second, .. } => Some((
+                    text::plain(&Line::from(first.clone())),
+                    text::plain(&Line::from(second.clone())),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .any(|(first, _)| first.contains("% cached") && !first.contains(" tokens")),
+            "an account row carries its cache share: {rows:?}"
+        );
+        let grouped = rows
+            .iter()
+            .filter(|(_, second)| second.contains(" out"))
+            .collect::<Vec<_>>();
+        assert!(!grouped.is_empty());
+        for (_, second) in grouped {
+            let cached = second.find("% cached").expect(second);
+            assert!(cached < second.find(" out").unwrap(), "{second}");
+        }
     }
 
     #[test]
