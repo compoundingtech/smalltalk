@@ -165,7 +165,7 @@ pub(super) async fn answer_ask(state: &AppState, session: &ClientSession, reques
     };
     let parameters = AskParameters { subject: reference.subject, binding: reference.binding, tool_call_id: reference.tool_call_id, answers };
     let receipt = state.store.reserve_harness_ask(&AskRequest { actor: session.authority_actor.clone(), idempotency_key: request.idempotency_key.clone(), parameters }).map_err(|error| {
-        if matches!(error.code, "stale-harness-ask" | "already-settled" | "stale-harness-control") {
+        if matches!(error.code, "stale-harness-ask" | "already-settled" | "stale-harness-control" | "stale-mailbox-session" | "mailbox-session-starting") {
             ApiError::bad(St3Error::new("ask-no-longer-pending", error.message))
         } else {
             ApiError::bad(error)

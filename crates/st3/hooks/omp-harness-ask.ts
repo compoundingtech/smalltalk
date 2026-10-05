@@ -66,7 +66,7 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
   const install = (ctx: ExtensionContext) => {
     if (unsubscribe) return;
     unsubscribe = ctx.ui.onTerminalInput(data => {
-      const match = /^\x1b\[200~(st-ask-[a-zA-Z0-9-]+)\x1b\[201~$/.exec(data);
+      const match = /^\x1b\[200~(st-ask-[a-zA-Z0-9-]+)\x1b\[201~/.exec(data);
       if (match) {
         const token = match[1];
         const live = current(); const command = guarded; const step = steps[stepIndex];
@@ -85,6 +85,7 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
     });
   };
   const reset = (reason: string) => {
+    unsubscribe?.(); unsubscribe = undefined;
     if (guarded) settle(guarded, "indeterminate", reason);
     ask = undefined; unsafe = undefined; activeCalls.clear(); observe();
   };
@@ -100,7 +101,9 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
     if (!questions) return;
     ask = { tool_call_id: event.toolCallId, questions };
     const terminal = process.stdin.isTTY === true && process.stdout.isTTY === true && !process.argv.some((argument, index) => argument.startsWith("--mode=rpc") || (argument === "--mode" && process.argv[index + 1]?.startsWith("rpc")));
-    unsafe = terminal && typeof ctx.ui.askDialog === "function" && ctx.hasUI ? undefined : "native-rich-ask-terminal-unavailable";
+    // Public onTerminalInput runs after native clipboard/enhanced-paste handlers.
+    // Without a pre-native exclusive input fence, do not advertise safe automation.
+    unsafe = terminal && typeof ctx.ui.askDialog === "function" && ctx.hasUI ? "native-exclusive-input-guard-unavailable" : "native-rich-ask-terminal-unavailable";
     if (questions.some(q => new Set(q.options.map(option => option.label)).size !== q.options.length)) unsafe = "ambiguous-native-ask-options";
     try { install(ctx); } catch { unsafe = "native-terminal-input-guard-unavailable"; }
     observe();
@@ -127,7 +130,10 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
     }
     ask = undefined; unsafe = undefined; observe();
   });
-  for (const name of ["session_start", "session_switch", "session_branch", "session_tree"] as const) pi.on(name, () => reset("native-session-replaced"));
+  for (const name of ["session_start", "session_switch", "session_branch", "session_tree"] as const) pi.on(name, (_event, ctx) => {
+    reset("native-session-replaced");
+    try { install(ctx); } catch { unsafe = "native-terminal-input-guard-unavailable"; }
+  });
   pi.on("session_shutdown", () => reset("native-process-shutdown"));
   return {
     state: () => ({ pending_ask: ask ?? null, ask_supported: !!ask && !unsafe && !guarded, ask_reason: unsafe ?? (guarded ? "native-ask-answer-in-flight" : ask ? null : "no-pending-native-ask") }),
@@ -152,11 +158,21 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
         const key = (data: string, surface: Step["surface"] = "question") => steps.push({ data, question_index: index, surface });
         const move = (target: number) => { for (let i = 0; i <= q.options.length; i += 1) key("\x1b[A"); for (let i = 0; i < target; i += 1) key("\x1b[B"); };
         for (const label of answer.selected_options) { move(q.options.findIndex(option => option.label === label)); key(q.multi ? " " : "\r"); }
-        if (answer.custom_input !== undefined) { move(q.options.length); key("\r"); key(`\x1b[200~${answer.custom_input}\x1b[201~`, "custom"); key("\r", "custom"); }
-        else if (q.multi) { move(0); key("\r"); }
+        if (answer.custom_input !== undefined) {
+          move(q.options.length); key("\r");
+          // Ordinary text is literal in the native prompt editor. Bracketed paste
+          // is image-aware and must not reinterpret e.g. /tmp/answer.png.
+          const lines = answer.custom_input.split("\n");
+          for (let line = 0; line < lines.length; line += 1) {
+            if (line) key("\x1b[13;2u", "custom");
+            if (lines[line]) key(lines[line]!, "custom");
+          }
+          key("\r", "custom");
+        }
+        else if (q.multi) { if (q.options.length) { move(0); key("\r"); } else key("\t"); }
       }
       // Ordinary one-question Enter submits directly; custom multi jumps to Review.
-      if (ask.questions.length > 1 || (ask.questions[0]?.multi && answers[0]?.custom_input !== undefined)) steps.push({ data: "\r", question_index: ask.questions.length - 1, surface: "review" });
+      if (ask.questions.length > 1 || (ask.questions[0]?.multi && (answers[0]?.custom_input !== undefined || !ask.questions[0].options.length))) steps.push({ data: "\r", question_index: ask.questions.length - 1, surface: "review" });
       guarded = command; stepIndex = 0; observe(); requestStep();
       return true;
     },

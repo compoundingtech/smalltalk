@@ -24,6 +24,9 @@ const scenarios = [
   { id: 'native-ask-single', questions: [{ id: 'single', question: 'Choose the next answer', options: [{ label: 'Keep' }, { label: 'Change' }] }], answers: [{ questionId: 'single', options: ['Change'] }] },
   { id: 'native-ask-text', questions: [{ id: 'text', question: 'Supply free text', options: [{ label: 'Preset' }] }], text: 'Literal free text' },
   { id: 'native-ask-empty-multi', questions: [{ id: 'none', question: 'Select no extras', options: [{ label: 'Alpha' }, { label: 'Beta' }], multi: true }], answers: [{ questionId: 'none', options: [] }] },
+  { id: 'native-ask-optionless-multi', questions: [{ id: 'optionless', question: 'Confirm no listed extras', options: [], multi: true }], answers: [{ questionId: 'optionless', options: [] }] },
+  { id: 'native-ask-literal-image-path', questions: [{ id: 'literal', question: 'Supply a literal file path', options: [{ label: 'Preset' }] }], text: root + '/literal-answer.png' },
+  { id: 'native-ask-after-new', switchSession: true, questions: [{ id: 'after-new', question: 'Answer in the new native session', options: [{ label: 'Continue' }] }], answers: [{ questionId: 'after-new', options: ['Continue'] }] },
   { id: 'native-ask-edited', questions: [{ id: 'edited', question: 'Edit this in the terminal', options: [{ label: 'First' }, { label: 'Second' }] }], answers: [{ questionId: 'edited', options: ['First'] }] },
 ];
 let scenarioIndex = 0;
@@ -68,6 +71,8 @@ const answer = async (key, parameters, person = true) => {
 let daemonProcess;
 const deadline = setTimeout(() => { daemonProcess?.kill(); void pty('kill', 'native-smoke').catch(() => {}); }, process.env.SMOKE_BROWSER_HOLD ? 1800000 : 150000);
 try {
+  // A real image path must remain literal custom text, never attach this file.
+  await Bun.write(root + '/literal-answer.png', Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=', 'base64'));
   // Start the PTY before the owner reads its actual PID/creation incarnation. The
   // launcher waits for the owner's socket before starting OMP and its production channel.
   const command = ['bash', '-c', 'while [ ! -S "$SMOKE_SOCKET" ]; do sleep 0.05; done; exec "$@"', 'ask-launcher', omp, '--no-lsp', '--no-extensions', '--no-skills', '--no-rules', '--no-title', '--tools', 'ask', '--extension', resolve(import.meta.dir, 'ask-owner-extension.ts'), '--extension', resolve(import.meta.dir, '../../crates/st3/hooks/omp-channel.ts'), '--session-dir', sessions, '--model', 'control-smoke/native-smoke', '--thinking', 'off'];
@@ -82,6 +87,11 @@ try {
   let oldRef;
   for (scenarioIndex = 0; scenarioIndex < scenarios.length; scenarioIndex += 1) {
     const scenario = scenarios[scenarioIndex];
+    if (scenario.switchSession) {
+      const previousSession = (await read()).native.binding.session_id;
+      await pty('send', 'native-smoke', '--seq', '/new', '--seq', 'key:return');
+      await poll(async () => { const native = (await read()).native; return native.idle && native.binding.session_id !== previousSession; }, 'actual native session switch');
+    }
     await pty('send', 'native-smoke', '--seq', 'Start isolated ask ' + scenario.id, '--seq', 'key:return');
     const queued = await poll(async () => { const q = await read(); return q.native?.pending_ask?.tool_call_id === scenario.id ? q : false; }, 'native pending ' + scenario.id);
     const pending = queued.native.pending_ask;
