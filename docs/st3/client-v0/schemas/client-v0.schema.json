@@ -1992,7 +1992,8 @@
         "credential": { "x-st-codec": "redacted", "type": "string", "minLength": 32 },
         "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "expires_at": { "$ref": "#/$defs/Timestamp" },
-        "device_key_chain": { "type": "array", "items": { "type": "string" } }
+        "device_key_chain": { "type": "array", "items": { "type": "string" } },
+        "device_key_proofs": { "type": "array", "items": { "type": "object" }, "maxItems": 2 }
       }
     },
     "DeviceSignature": {

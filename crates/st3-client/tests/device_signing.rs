@@ -271,7 +271,7 @@ async fn shared_completion_persists_both_key_types_and_preserves_a_working_devic
                     .unwrap(),
                 public
             );
-            let client = loaded.clients().pop().unwrap();
+            let client = loaded.clients().unwrap().pop().unwrap();
             let idem = format!("shared-completion-{algorithm:?}-{import}");
             let snapshot = client.capabilities().await.unwrap().snapshot.id;
             let result = client
@@ -332,6 +332,136 @@ async fn shared_completion_persists_both_key_types_and_preserves_a_working_devic
             member.judge_claims(true).unwrap();
             assert_eq!(member.claim_verdict(&claim.id).unwrap(), Verdict::Verified);
         }
+    }
+    // A proxy that substitutes the key gets real, valid server-issued grants for its key.
+    // The client must reject those grants, as well as malformed responses after consumption,
+    // without losing its previous working device or exposing either credential/private key.
+    let saved = std::fs::read(&path).unwrap();
+    for mode in [
+        "swap-key",
+        "wrong-person",
+        "tampered-proof",
+        "secret-in-malformed-proof",
+    ] {
+        let challenge = local
+            .pairing_begin(&PairingBegin {
+                api_version: st3_client::API_VERSION.into(),
+                device_name: "Proxy regression".into(),
+                person_id: PERSON.into(),
+                full_control: Some(true),
+                scopes: None,
+            })
+            .await
+            .unwrap()
+            .value;
+        let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
+        let private = serde_json::to_value(&key).unwrap()["pkcs8"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let other_public = SigningKey::generate(KeyAlgorithm::P256)
+            .unwrap()
+            .public_key()
+            .unwrap();
+        let substitute = other_public.clone();
+        let observed = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let capture = observed.clone();
+        let proxy = axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let substitute = substitute.clone();
+                let capture = capture.clone();
+                async move {
+                    let (mut parts, body) = request.into_parts();
+                    let body = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    let mut request: Value = serde_json::from_slice(&body).unwrap();
+                    if mode == "swap-key" {
+                        request["device_public_key"] = json!(substitute);
+                    }
+                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                    let response = next
+                        .run(axum::http::Request::from_parts(
+                            parts,
+                            axum::body::Body::from(serde_json::to_vec(&request).unwrap()),
+                        ))
+                        .await;
+                    let (mut parts, body) = response.into_parts();
+                    let body = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    let mut response: Value = serde_json::from_slice(&body).unwrap();
+                    if parts.status.is_success() {
+                        *capture.lock().unwrap() = Some(response["value"].clone());
+                        match mode {
+                            "wrong-person" => {
+                                response["value"]["person_id"] = json!("person/blair")
+                            }
+                            "tampered-proof" => {
+                                response["value"]["device_key_proofs"][0]["body"]["fields"]["key"] =
+                                    json!(substitute)
+                            }
+                            "secret-in-malformed-proof" => {
+                                response["value"]["device_key_proofs"][0]["signature"]["signed_at_unix_ms"] =
+                                    response["value"]["credential"].clone()
+                            }
+                            _ => {}
+                        }
+                    }
+                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                    axum::http::Response::from_parts(
+                        parts,
+                        axum::body::Body::from(serde_json::to_vec(&response).unwrap()),
+                    )
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_base = format!("http://{}", listener.local_addr().unwrap());
+        let app = st3::api::fabric_router(state.clone()).layer(proxy);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let error = complete(
+            &path,
+            &proxy_base,
+            &challenge.pairing_id,
+            &challenge.code,
+            key.clone(),
+        )
+        .await
+        .unwrap_err();
+        let error = format!("{error:#}");
+        let session = observed.lock().unwrap().take().unwrap();
+        assert!(error.contains(session["device_id"].as_str().unwrap()));
+        assert!(error.contains("st devices revoke"));
+        assert!(error.contains("server consumed the pairing code"));
+        assert!(!error.contains(session["credential"].as_str().unwrap()));
+        assert!(!error.contains(&private));
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert!(
+            Profile::load(&path).unwrap().unwrap().clients().unwrap()[0]
+                .capabilities()
+                .await
+                .is_ok()
+        );
+        assert!(
+            complete(&path, &base, &challenge.pairing_id, &challenge.code, key)
+                .await
+                .is_err()
+        );
+        if mode == "swap-key" {
+            let grant = state
+                .store
+                .claim_by_id(session["device_key_chain"][0].as_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(grant.body["fields"]["key"], other_public);
+            state.store.replication_snapshot().unwrap();
+            assert_eq!(
+                state.store.claim_verdict(&grant.id).unwrap(),
+                Verdict::Verified
+            );
+            assert!(error.contains("does not bind our public key"));
+        }
+        if mode == "tampered-proof" {
+            assert!(error.contains("content does not match its claim ID"));
+        }
+        server.abort();
     }
     // A local commit failure after remote success must retain the previous key and credential.
     // The member's consumed code is a separate outcome, not a client-side rollback.
@@ -394,10 +524,13 @@ async fn shared_completion_persists_both_key_types_and_preserves_a_working_devic
         std::fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    assert!(result.unwrap_err().to_string().contains("not writable"));
+    let failure = format!("{:#}", result.unwrap_err());
+    assert!(failure.contains("not writable"));
+    assert!(failure.contains("Possible orphaned device device/"));
+    assert!(failure.contains("st devices revoke"));
     assert_eq!(std::fs::read(&path).unwrap(), saved);
     assert!(
-        Profile::load(&path).unwrap().unwrap().clients()[0]
+        Profile::load(&path).unwrap().unwrap().clients().unwrap()[0]
             .capabilities()
             .await
             .is_ok()

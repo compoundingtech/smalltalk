@@ -132,6 +132,15 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
                 None
             };
             let previous = std::fs::read(&profile).ok();
+            let mut blocked_args = args.clone();
+            blocked_args[3] = "http://203.0.113.1".into();
+            let blocked = run(blocked_args, challenge.code.clone()).await.unwrap();
+            assert!(!blocked.status.success());
+            assert!(String::from_utf8_lossy(&blocked.stderr).contains("--allow-public-http"));
+            assert_eq!(std::fs::read(&profile).ok(), previous);
+            if import {
+                args.push("--allow-public-http".into());
+            }
             let refused = run(args.clone(), "wrong-code".into()).await.unwrap();
             assert!(!refused.status.success());
             assert!(
@@ -148,6 +157,8 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
                 0o600
             );
             let loaded = Profile::load(&profile).unwrap().unwrap();
+            assert_eq!(loaded.devices[0].allow_public_http, import);
+            assert!(String::from_utf8_lossy(&output.stderr).contains("must already be an encrypted path"));
             assert_eq!(
                 receipt["signing_key"],
                 loaded.devices[0]
@@ -170,7 +181,7 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
             let saved = std::fs::read(&profile).unwrap();
             assert!(!run(args, challenge.code).await.unwrap().status.success());
             assert_eq!(std::fs::read(&profile).unwrap(), saved);
-            let client = loaded.clients().pop().unwrap();
+            let client = loaded.clients().unwrap().pop().unwrap();
             let snapshot = client.capabilities().await.unwrap().snapshot.id;
             let idem = format!("cli-device-proof-{algorithm}-{import}");
             let result = client
@@ -230,7 +241,7 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
     let args = vec![
         "devices".into(),
         "complete".into(),
-        base.clone(),
+        base.replace("127.0.0.1", "localhost"),
         challenge.pairing_id,
     ];
     let output = run(args, challenge.code).await.unwrap();
@@ -245,6 +256,7 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
     assert_eq!(std::fs::metadata(&default_profile).unwrap().permissions().mode() & 0o777, 0o600);
     assert_eq!(std::fs::metadata(config.join("st3")).unwrap().permissions().mode() & 0o777, 0o755);
     assert!(loaded.devices[0].signing_key.is_none());
+    assert!(!loaded.devices[0].allow_public_http);
     assert!(loaded.devices[0].session.device_key_chain.is_empty());
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains(&loaded.devices[0].session.credential)

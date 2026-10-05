@@ -5642,7 +5642,22 @@ pub(super) async fn pairing_complete(
     signal_changed(&state);
     let mut session = json!({ "kind": "paired-session", "device_id": device_id, "person_id": person_id, "session_actor": session_actor, "credential": credential, "scopes": scopes, "expires_at": client_timestamp(expires_at) });
     if let Some(chain) = chain {
+        // Return public, signed evidence for the exact enrolled key. Opaque IDs alone do not
+        // let a completing client detect a substituted key. Seal before reading signatures;
+        // this never repairs an already sealed unsigned grant.
+        state.store.seal_local_batches().map_err(ApiError::internal)?;
+        let mut proofs = Vec::new();
+        for id in &chain {
+            let grant = state.store.claim_by_id(id).map_err(ApiError::internal)?;
+            let signature = state.store.claim_signature(id).map_err(ApiError::internal)?;
+            proofs.push(grant.map(|grant| json!({
+                "id": grant.id, "batch_id": grant.batch_id, "subject": grant.subject,
+                "kind": grant.kind, "origin": grant.origin, "actor": grant.actor,
+                "body": grant.body, "predecessors": grant.predecessors, "signature": signature,
+            })).unwrap_or(Value::Null));
+        }
         session["device_key_chain"] = json!(chain);
+        session["device_key_proofs"] = json!(proofs);
     }
     Ok(Json(session))
 }

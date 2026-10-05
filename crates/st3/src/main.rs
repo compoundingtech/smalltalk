@@ -2338,6 +2338,9 @@ enum DevicesCommand {
         /// Credential and private-key profile, shared with stui by default.
         #[arg(long)]
         profile: Option<PathBuf>,
+        /// Allow a public HTTP address only when it is already an encrypted path.
+        #[arg(long)]
+        allow_public_http: bool,
     },
     /// Revoke one paired device.
     Revoke {
@@ -4401,6 +4404,7 @@ async fn run(cli: Cli) -> Result<()> {
                 algorithm,
                 key_file,
                 profile,
+                allow_public_http,
             }),
         ..
     }) = &cli.command
@@ -4411,6 +4415,7 @@ async fn run(cli: Cli) -> Result<()> {
             algorithm,
             key_file.as_deref(),
             profile.as_deref(),
+            *allow_public_http,
             cli.json,
         )
         .await;
@@ -7735,6 +7740,7 @@ async fn run_devices_complete(
     algorithm: &str,
     key_file: Option<&Path>,
     profile: Option<&Path>,
+    allow_public_http: bool,
     json_output: bool,
 ) -> Result<()> {
     use st3_client::device::{KeyAlgorithm, SigningKey};
@@ -7752,7 +7758,10 @@ async fn run_devices_complete(
         .map(Ok)
         .unwrap_or_else(st3_client::device::profile_path)?;
     let code = st3_client::device::read_pairing_code()?;
-    let device = st3_client::device::complete(&path, member_url, pairing_id, &code, key).await?;
+    let device = st3_client::device::complete_with_http_policy(
+        &path, member_url, pairing_id, &code, key, allow_public_http,
+    )
+    .await?;
     // Always choose explicit safe fields, including --json. PairedSession contains a bearer.
     if json_output {
         println!(

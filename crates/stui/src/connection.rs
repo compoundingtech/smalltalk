@@ -3,9 +3,23 @@ use anyhow::Result;
 pub use st3_client::device::{Profile, profile_path, read_pairing_code as read_code};
 use std::path::Path;
 
-pub async fn pair(path: &Path, endpoint: &str, pairing_id: &str, code: &str) -> Result<String> {
+pub async fn pair(
+    path: &Path,
+    endpoint: &str,
+    pairing_id: &str,
+    code: &str,
+    allow_public_http: bool,
+) -> Result<String> {
     let key = st3_client::device::SigningKey::generate(st3_client::device::KeyAlgorithm::P256)?;
-    let device = st3_client::device::complete(path, endpoint, pairing_id, code, key).await?;
+    let device = st3_client::device::complete_with_http_policy(
+        path,
+        endpoint,
+        pairing_id,
+        code,
+        key,
+        allow_public_http,
+    )
+    .await?;
     Ok(device.session.person_id)
 }
 
@@ -25,6 +39,7 @@ mod tests {
         Profile {
             devices: vec![Device {
                 endpoint: "https://member.example".into(),
+                allow_public_http: false,
                 signing_key: None,
                 session: PairedSession {
                     kind: "paired-session".into(),
@@ -35,6 +50,7 @@ mod tests {
                     scopes: vec!["read.projections".into()],
                     expires_at: "2026-10-30T12:00:00Z".into(),
                     device_key_chain: Vec::new(),
+                    device_key_proofs: Vec::new(),
                 },
             }],
         }
@@ -61,7 +77,8 @@ mod tests {
         let loaded = Profile::load(&path).unwrap().unwrap();
         assert_eq!(loaded.person().unwrap(), "person/avery");
         assert!(
-            !format!("{:?}", loaded.clients()).contains(&profile.devices[0].session.credential)
+            !format!("{:?}", loaded.clients().unwrap())
+                .contains(&profile.devices[0].session.credential)
         );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(Profile::load(&path).is_err());

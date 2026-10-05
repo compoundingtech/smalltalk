@@ -1,5 +1,7 @@
 //! Software device keys and paired credentials share one atomic, private profile.
 //! This is client state, never a graph replica or a peer configuration.
+mod grant_proof;
+mod transport;
 use crate::{Client, DeviceSignature, MessageSendParameters, PairedSession, PairingComplete};
 use anyhow::{Context as _, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -146,6 +148,9 @@ impl SigningKey {
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Device {
     pub endpoint: String,
+    /// Explicit HTTP public-address override, retained as private profile configuration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_public_http: bool,
     pub session: PairedSession,
     /// Old observer and legacy stui profiles have no signing key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,12 +169,13 @@ impl std::fmt::Debug for Device {
 }
 
 impl Device {
-    pub fn client(&self) -> Client {
+    pub fn client(&self) -> Result<Client> {
         let mut client = Client::fabric_loopback(&self.endpoint, &self.session.credential);
+        client.http = transport::client(&self.endpoint, self.allow_public_http)?;
         if self.signing_key.is_some() {
             client.signing_device = Some(Arc::new(self.clone()));
         }
-        client
+        Ok(client)
     }
 
     /// Sign the seven fields in device-signing-v1, including the canonical message subject.
@@ -283,7 +289,7 @@ impl Profile {
         Ok(person)
     }
 
-    pub fn clients(&self) -> Vec<Client> {
+    pub fn clients(&self) -> Result<Vec<Client>> {
         self.devices.iter().map(Device::client).collect()
     }
 
@@ -298,7 +304,8 @@ impl Profile {
         let mut profile: Self = serde_json::from_reader(file).context("Read device profile")?;
         profile.person()?;
         for device in &mut profile.devices {
-            device.endpoint = validate_endpoint(&device.endpoint)?;
+            device.endpoint =
+                validate_endpoint_with_http_policy(&device.endpoint, device.allow_public_http)?;
             ensure!(
                 device.session.credential.len() >= 32,
                 "Invalid device credential"
@@ -429,6 +436,10 @@ pub fn profile_path() -> Result<PathBuf> {
 }
 
 pub fn validate_endpoint(endpoint: &str) -> Result<String> {
+    validate_endpoint_with_http_policy(endpoint, false)
+}
+
+fn validate_endpoint_with_http_policy(endpoint: &str, allow_public_http: bool) -> Result<String> {
     let url =
         reqwest::Url::parse(endpoint).context("Member gateway must be an HTTP or HTTPS URL")?;
     ensure!(
@@ -441,6 +452,7 @@ pub fn validate_endpoint(endpoint: &str) -> Result<String> {
             && url.path() == "/",
         "Use the member gateway's HTTP or HTTPS origin, without credentials or a path"
     );
+    transport::validate(&url, allow_public_http)?;
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
@@ -462,58 +474,89 @@ pub async fn complete(
     code: &str,
     key: SigningKey,
 ) -> Result<Device> {
-    let endpoint = validate_endpoint(endpoint)?;
+    complete_with_http_policy(path, endpoint, pairing_id, code, key, false).await
+}
+
+/// Explicitly allow public HTTP only when its address is already an encrypted path.
+pub async fn complete_with_http_policy(
+    path: &Path,
+    endpoint: &str,
+    pairing_id: &str,
+    code: &str,
+    key: SigningKey,
+    allow_public_http: bool,
+) -> Result<Device> {
+    let endpoint = validate_endpoint_with_http_policy(endpoint, allow_public_http)?;
+    let mut client = Client::fabric_pairing(&endpoint);
+    client.http = transport::client(&endpoint, allow_public_http)?;
     ensure!(!code.trim().is_empty(), "A pairing code is required");
     key.prove(pairing_id, code.trim())?;
     let public = key.public_key()?;
     let (parent, _lock) = prepare(path)?;
     let mut profile = Profile::load(path)?.unwrap_or_default();
-    let session = Client::fabric_pairing(&endpoint)
+    let session = client
         .pairing_complete(
             pairing_id,
             &PairingComplete {
                 api_version: crate::API_VERSION.into(),
                 code: code.trim().into(),
-                device_public_key: public,
+                device_public_key: public.clone(),
                 key_storage: Some("software".into()),
             },
         )
         .await
         .context("Complete device pairing")?
         .value;
-    if let Some(existing) = profile.devices.first() {
+    let created_device = session.device_id.clone();
+    let committed = (|| -> Result<Device> {
+        if let Some(existing) = profile.devices.first() {
+            ensure!(
+                existing.session.person_id == session.person_id,
+                "This member delegates a different person; use a separate profile"
+            );
+        }
         ensure!(
-            existing.session.person_id == session.person_id,
-            "This member delegates a different person; use a separate profile"
+            session.credential.len() >= 32,
+            "Pairing returned an invalid credential"
         );
-    }
-    ensure!(
-        session.credential.len() >= 32,
-        "Pairing returned an invalid credential"
-    );
-    let signs = session
-        .scopes
-        .iter()
-        .any(|scope| scope == "control.messages");
-    ensure!(
-        !signs || !session.device_key_chain.is_empty(),
-        "Pairing granted messages without enrolling the signing key; upgrade the member"
-    );
-    ensure!(
-        signs || session.device_key_chain.is_empty(),
-        "Read-only pairing unexpectedly enrolled a signing key"
-    );
-    let device = Device {
-        endpoint,
-        session,
-        signing_key: signs.then_some(key),
-    };
-    profile
-        .devices
-        .retain(|existing| existing.endpoint != device.endpoint);
-    profile.devices.push(device.clone());
-    profile.save_in(path, &parent)?;
-    Ok(device)
+        let signs = session
+            .scopes
+            .iter()
+            .any(|scope| scope == "control.messages");
+        ensure!(
+            !signs || !session.device_key_chain.is_empty(),
+            "Pairing granted messages without enrolling the signing key; upgrade the member"
+        );
+        ensure!(
+            signs || (session.device_key_chain.is_empty() && session.device_key_proofs.is_empty()),
+            "Read-only pairing unexpectedly enrolled a signing key"
+        );
+        if signs {
+            grant_proof::validate(&session, &public)?;
+        }
+        let device = Device {
+            endpoint,
+            allow_public_http,
+            session,
+            signing_key: signs.then_some(key),
+        };
+        profile
+            .devices
+            .retain(|existing| existing.endpoint != device.endpoint);
+        profile.devices.push(device.clone());
+        profile.save_in(path, &parent)?;
+        Ok(device)
+    })();
+    committed.with_context(|| {
+        let safe_id = created_device.strip_prefix("device/").filter(|suffix| {
+            suffix.len() == 24 && suffix.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+        if safe_id.is_some() {
+            format!("The server consumed the pairing code, but local completion failed. Possible orphaned device {created_device}; inspect it on the trusted member and revoke with `st devices revoke {created_device} --as <your-person-id>` before starting a new pairing. The previous profile was retained")
+        } else {
+            "The server consumed the pairing code, but local completion failed and returned an unusable device ID. Inspect `st devices ls --as <your-person-id>` on the trusted member and revoke the new device before starting a new pairing. The previous profile was retained".into()
+        }
+    })
 }
 
 pub fn read_pairing_code() -> Result<String> {
@@ -596,6 +639,7 @@ mod tests {
         for case in vectors["cases"].as_array().unwrap() {
             let device = Device {
                 endpoint: "https://member.example".into(),
+                allow_public_http: false,
                 session: PairedSession {
                     kind: "paired-session".into(),
                     device_id: "device/vector".into(),
@@ -605,6 +649,7 @@ mod tests {
                     scopes: vec!["control.messages".into()],
                     expires_at: "2026-11-01T00:00:00Z".into(),
                     device_key_chain: serde_json::from_value(case["chain"].clone()).unwrap(),
+                    device_key_proofs: Vec::new(),
                 },
                 signing_key: Some(key.clone()),
             };
@@ -640,7 +685,7 @@ mod tests {
                 .unwrap();
             let debug = format!(
                 "{device:?} {:?} {:?}",
-                device.client(),
+                device.client().unwrap(),
                 Profile {
                     devices: vec![device.clone()]
                 }

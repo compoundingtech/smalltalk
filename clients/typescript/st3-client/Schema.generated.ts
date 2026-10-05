@@ -1940,6 +1940,7 @@ export const PairedSession = /*#__PURE__*/ (() => Schema.Struct({
   "credential": Schema.RedactedFromValue(Schema.String.check(Schema.isMinLength(32))),
   "device_id": Id,
   "device_key_chain": optionalKey(Schema.Array(Schema.String)),
+  "device_key_proofs": optionalKey(Schema.Array(Schema.Record(Schema.String, Schema.Unknown)).check(Schema.isMaxLength(2))),
   "expires_at": Timestamp,
   "kind": Schema.Literal("paired-session"),
   "person_id": Schema.String.check(Schema.isPattern(new RegExp("^person/[^/]+$", "u"))),

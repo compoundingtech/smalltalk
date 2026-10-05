@@ -946,6 +946,9 @@ export type PairedSession = {
   credential: string;
   device_id: Id;
   device_key_chain?: Array<string>;
+  device_key_proofs?: Array<{
+
+}>;
   expires_at: Timestamp;
   kind: "paired-session";
   person_id: string;

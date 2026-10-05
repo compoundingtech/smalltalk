@@ -302,7 +302,7 @@ async fn stui_pair_persists_a_real_signing_key_and_leaves_read_only_devices_with
             smallclaims::principal::Verdict::Verified
         );
     }
-    let client = profile.clients().pop().unwrap();
+    let client = profile.clients().unwrap().pop().unwrap();
     let snapshot = client.capabilities().await.unwrap().snapshot.id;
     let result = client
         .message_send(
