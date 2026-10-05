@@ -100,9 +100,12 @@ pub(super) async fn ask_terminal_input(State(state): State<AppState>, peer: Opti
             AskSurface::Review => screen.contains("Review answers") && screen.contains("Submit"),
         };
         if presented {
-            state.store.reserve_harness_ask_token(&request.input, &request.fence).map_err(ApiError::bad)?;
             let data = format!("\u{1b}[200~{}\u{1b}[201~", request.input.token);
-            daemon_pty(&state).and_then(|runtime| runtime.send_raw_if(&session.runtime_id, data.as_bytes(), Some(&session.incarnation_id))).map_err(ApiError::internal)?;
+            let store = state.store.clone();
+            let runtime = daemon_pty(&state).map_err(ApiError::internal)?;
+            // bind_mailbox takes this same writer lock: a same-incarnation lease
+            // takeover cannot cross the authenticated reservation and actual write.
+            blocking_action(move || store.send_harness_ask_token(&request.input, &request.fence, move || runtime.send_raw_if(&session.runtime_id, data.as_bytes(), Some(&session.incarnation_id)))).await?.map_err(ApiError::internal)?;
             return Ok(Json(json!({"transport":"written","answered":false})));
         }
         if tokio::time::Instant::now() >= deadline {

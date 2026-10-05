@@ -92,10 +92,11 @@ impl Store {
             Ok(Some(AskCommand { operation_id: operation, binding: p.binding, tool_call_id: p.tool_call_id, answers: p.answers }))
         }).map_err(|error| St3Error::new("internal", error))?
     }
-    /// Reserve each opaque token once before touching the PTY. Transport acknowledgements
-    /// never settle answers; only the authenticated native tool_result can do that.
-    pub fn reserve_harness_ask_token(&self, input: &AskTerminalInput, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
-        self.connection.batched(|tx| -> Result<(), St3Error> {
+    /// Hold the mailbox writer fence through the PTY handoff. An uncertain transport
+    /// error is an inner result so its one-use token still commits and cannot replay.
+    /// Transport acknowledgements never settle the actual native answer.
+    pub fn send_harness_ask_token(&self, input: &AskTerminalInput, fence: &crate::mailbox::Fence, send: impl FnOnce() -> anyhow::Result<()> + Send) -> Result<anyhow::Result<()>, St3Error> {
+        self.connection.batched(|tx| -> Result<anyhow::Result<()>, St3Error> {
             check_mailbox_fence(tx, fence)?;
             let receipt = receipt_tx(tx, &input.operation_id)?.ok_or_else(|| St3Error::new("missing-harness-operation", "ask operation does not exist"))?;
             if receipt.subject != fence.subject || receipt.binding != input.binding || receipt.tool_call_id != input.tool_call_id || receipt.status != Outcome::Dispatched { return Err(St3Error::new("stale-harness-ask", "terminal token does not belong to the dispatched ask")); }
@@ -103,7 +104,7 @@ impl Store {
             if !state.pending_ask.as_ref().is_some_and(|ask| ask.tool_call_id == input.tool_call_id) { return Err(St3Error::new("stale-harness-ask", "native ask already ended")); }
             if !(32..=128).contains(&input.token.len()) || !input.token.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'-') { return Err(St3Error::new("invalid-harness-token", "invalid native terminal input token")); }
             if tx.execute("INSERT OR IGNORE INTO local_harness_ask_tokens(token,operation_id) VALUES(?1,?2)", params![input.token, input.operation_id]).map_err(internal)? != 1 { return Err(St3Error::new("already-dispatched", "terminal token is never replayed")); }
-            Ok(())
+            Ok(send())
         }).map_err(|error| St3Error::new("internal", error))?
     }
     pub fn settle_harness_ask(&self, native: &NativeReceipt, fence: &crate::mailbox::Fence) -> Result<AskReceipt, St3Error> {
@@ -188,6 +189,25 @@ mod tests {
         assert!(store.harness_control_queue(SUBJECT).unwrap().entries.is_empty());
         assert_eq!(store.reserve_harness_ask(&request(&state, "duplicate")).unwrap_err().code, "already-settled");
         assert_eq!(store.harness_control_state(SUBJECT).unwrap().unwrap().pending_ask.unwrap().tool_call_id, "call-one");
+    }
+    #[test]
+    fn uncertain_terminal_write_cannot_replay_and_replaced_delivery_cannot_write() {
+        let (store, state, fence) = baseline();
+        let receipt = store.reserve_harness_ask(&request(&state, "terminal")).unwrap();
+        store.take_harness_ask(&fence).unwrap().unwrap();
+        let mut input = AskTerminalInput {
+            operation_id: receipt.operation_id.clone(), binding: state.binding.clone(), tool_call_id: "call-one".into(),
+            token: "st-ask-00000000-0000-0000-0000-000000000001".into(), question_index: 0,
+            surface: st3_schema::harness_control::AskSurface::Question,
+        };
+        let transport = store.send_harness_ask_token(&input, &fence, || Err(anyhow::anyhow!("write acknowledgement lost"))).unwrap();
+        assert!(transport.is_err());
+        assert_eq!(store.send_harness_ask_token(&input, &fence, || panic!("uncertain input must never replay")).unwrap_err().code, "already-dispatched");
+        assert_eq!(store.harness_ask_receipt(&receipt.operation_id).unwrap().unwrap().status, Outcome::Dispatched);
+        let replacement = store.bind_mailbox(&crate::mailbox::Fence::new(SUBJECT, "incarnation-1", "delivery")).unwrap();
+        input.token = "st-ask-00000000-0000-0000-0000-000000000002".into();
+        assert_eq!(store.send_harness_ask_token(&input, &fence, || panic!("replaced delivery must never write")).unwrap_err().code, "stale-mailbox-session");
+        assert!(store.send_harness_ask_token(&input, &replacement, || Ok(())).unwrap().is_ok());
     }
     #[test]
     fn only_matching_native_result_settles_and_stale_answer_cannot_touch_new_ask() {

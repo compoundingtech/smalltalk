@@ -164,7 +164,13 @@ pub(super) async fn answer_ask(state: &AppState, session: &ClientSession, reques
         }
     };
     let parameters = AskParameters { subject: reference.subject, binding: reference.binding, tool_call_id: reference.tool_call_id, answers };
-    let receipt = state.store.reserve_harness_ask(&AskRequest { actor: session.authority_actor.clone(), idempotency_key: request.idempotency_key.clone(), parameters }).map_err(ApiError::bad)?;
+    let receipt = state.store.reserve_harness_ask(&AskRequest { actor: session.authority_actor.clone(), idempotency_key: request.idempotency_key.clone(), parameters }).map_err(|error| {
+        if matches!(error.code, "stale-harness-ask" | "already-settled" | "stale-harness-control") {
+            ApiError::bad(St3Error::new("ask-no-longer-pending", error.message))
+        } else {
+            ApiError::bad(error)
+        }
+    })?;
     signal_local_change(state);
     Ok(json!({"kind":"action-result","action_id":request.id,"operation_id":receipt.operation_id,"status":receipt.status,"affected_ids":[receipt.subject],"harness_ask":receipt,"snapshot_id":new_client_snapshot(state).id}))
 }

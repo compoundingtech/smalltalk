@@ -1183,6 +1183,9 @@ fn client_error_code(code: Option<&str>) -> String {
         | "stale-harness-model"
         | "unavailable-harness-model"
         | "unsupported-harness-effort"
+        | "ask-no-longer-pending"
+        | "invalid-harness-answers"
+        | "unsupported-harness-ask"
         | "harness-control-busy"
         | "native-pre-dequeue-api-unavailable"
         | "internal" => code.unwrap_or("internal").to_owned(),
