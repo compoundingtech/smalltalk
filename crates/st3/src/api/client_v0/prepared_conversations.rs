@@ -88,13 +88,17 @@ fn current(prepared: &Prepared, state: &AppState) -> Result<bool, ApiError> {
     if binding != prepared.binding { return Ok(false); }
     let mut mark = prepared.mark.lock();
     let Some(since) = mark.as_mut() else { return Ok(false); };
-    let lost_message = if index != since.store_index {
+    let previous_index = since.store_index;
+    let changed = since.changed(state)?;
+    // Check the floor at exactly the watermark relevance advanced to, not an
+    // earlier live index that could miss a concurrent unrelated message.
+    let lost_message = if previous_index != since.store_index {
         prepared.oldest_message.map(|oldest| {
-            state.store.conversation_message_floor_at(index, 10_000)
+            state.store.conversation_message_floor_at(since.store_index, 10_000)
                 .map(|floor| oldest < floor).map_err(ApiError::internal)
         }).transpose()?.unwrap_or(false)
     } else { false };
-    if lost_message || since.changed(state)? {
+    if changed || lost_message {
         // A relevance check advances its watermarks. Never let that make an invalid
         // page look current again on the next preparation pass.
         *mark = None;
