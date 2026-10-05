@@ -4080,11 +4080,15 @@ async fn terminal_owner_lookup_finds_a_seat_beyond_the_default_page() {
         args.extend(filters);
         let refused = run_cli(&socket, &args).await;
         assert!(!refused.status.success());
-        assert!(String::from_utf8_lossy(&refused.stderr).contains("page cursor"));
+        let error = String::from_utf8_lossy(&refused.stderr);
+        assert!(error.contains("list changed"), "{error}");
     }
     let human = run_cli_human(&socket, &["terminals", "ls", "--state", "running"]).await;
     assert!(human.status.success());
     let rendered = String::from_utf8(human.stdout).unwrap();
-    assert!(rendered.contains("st terminals ls --state 'running' --cursor"), "{rendered}");
+    assert!(
+        rendered.contains("st terminals ls --state 'running' --cursor"),
+        "{rendered}"
+    );
     server.abort();
 }

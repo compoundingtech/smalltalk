@@ -2321,13 +2321,13 @@ mod tests {
                 requests
             });
             let client = Client::unix(&socket);
-            for (owner, state) in [(Some("agent/lookup/seat-064"), None), (None, Some("running"))] {
+            for (owner, state) in [(Some("agent/lookup/seat+064"), None), (None, Some("running"))] {
                 let error = client.terminals_list_filtered(None, Some(1), false, owner, state).await.unwrap_err();
                 assert!(matches!(error, ClientError::Protocol(message) if message.contains("upgrade the server")));
             }
             client.terminals_list(None, None, false).await.unwrap();
             assert_eq!(server.await.unwrap(), [
-                "GET /v1/client/terminals?limit=1&owner=agent%2Flookup%2Fseat-064 HTTP/1.1",
+                "GET /v1/client/terminals?limit=1&owner=agent/lookup/seat%2B064 HTTP/1.1",
                 "GET /v1/client/terminals?limit=1&state=running HTTP/1.1",
                 "GET /v1/client/terminals HTTP/1.1",
             ]);
