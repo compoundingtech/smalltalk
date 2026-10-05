@@ -11255,12 +11255,14 @@ async fn events_page(
     }
     let store = state.store.clone();
     let (items, next_after) = blocking_store(move || {
-        store.events_page(
-            query.after,
-            query.subject.as_deref(),
-            query.owner_run.as_deref(),
-            limit,
-        )
+        store.read_snapshot(|_| {
+            store.events_page(
+                query.after,
+                query.subject.as_deref(),
+                query.owner_run.as_deref(),
+                limit,
+            )
+        })
     })
     .await?;
     Ok(Json(EventPage { items, next_after }))

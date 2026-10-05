@@ -179,6 +179,7 @@ const MAX_STEP_EXTENSION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// smalltalk's projection tables, and the indexes its folds read the claim log through. The
 /// graph creates its own tables first; see `smallclaims::store::SCHEMA`.
 const SCHEMA: &str = r#"
+CREATE INDEX IF NOT EXISTS events_subject_page_index ON events(subject, store_index);
 -- An unmanaged member's staging check needs tagged claims, not its runtime history.
 CREATE INDEX IF NOT EXISTS claims_owned_set_subject_index ON claims(subject)
 WHERE json_extract(body,'$.owned_set') IS NOT NULL;
@@ -10350,11 +10351,14 @@ impl Store {
         limit: usize,
     ) -> Result<(Vec<EventRecord>, Option<u64>)> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(
+        let sql = if subject.is_some() {
+            "SELECT store_index, kind, subject, body FROM events INDEXED BY events_subject_page_index
+             WHERE subject=?2 AND store_index>?1 ORDER BY store_index LIMIT ?3"
+        } else {
             "SELECT store_index, kind, subject, body FROM events
-             WHERE store_index>?1 AND (?2 IS NULL OR subject=?2)
-             ORDER BY store_index LIMIT ?3",
-        )?;
+             WHERE store_index>?1 ORDER BY store_index LIMIT ?3"
+        };
+        let mut statement = connection.prepare_cached(sql)?;
         let raw = statement
             .query_map(params![after, subject, limit.saturating_add(1) as i64], |row| {
                 let body = row.get::<_, String>(3)?;
