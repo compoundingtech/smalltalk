@@ -19,7 +19,7 @@ const scenarios = [
   ], answers: [
     { questionId: 'color', options: ['Red'] },
     { questionId: 'extras', options: ['Beta', 'Alpha'], text: 'Gamma extra' },
-    { questionId: 'note', options: [], text: 'Custom text with a newline\nsecond line' },
+    { questionId: 'note', options: [], text: process.env.SMOKE_BROWSER_HOLD ? 'Custom text from the browser' : 'Custom text with a newline\nsecond line' },
   ] },
   { id: 'native-ask-single', questions: [{ id: 'single', question: 'Choose the next answer', options: [{ label: 'Keep' }, { label: 'Change' }] }], answers: [{ questionId: 'single', options: ['Change'] }] },
   { id: 'native-ask-text', questions: [{ id: 'text', question: 'Supply free text', options: [{ label: 'Preset' }] }], text: 'Literal free text' },
