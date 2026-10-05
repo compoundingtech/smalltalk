@@ -13825,7 +13825,6 @@ mod tests {
             page["sync"]["peers"][0]["estimated_catch_up_seconds"],
             Value::Null
         );
-        println!("SYNC_ESTIMATE_RESOURCES_PROOF={page}");
 
         // Guard the API boundary too: a pre-existing measurement can contain an unsafe value.
         for (forecast, expected) in [
