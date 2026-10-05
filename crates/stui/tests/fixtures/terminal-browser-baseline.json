@@ -1,0 +1,27 @@
+{
+  "program": "terminal-browser",
+  "version": "0.13.4",
+  "headless": true,
+  "started": true,
+  "mode": "TermMode(BRACKETED_PASTE | SGR_MOUSE | MOUSE_MOTION | LINE_WRAP | FOCUS_IN_OUT | ALT_SCREEN | ALTERNATE_SCROLL | URGENCY_HINTS)",
+  "graphics_apc_count": 71,
+  "outer_graphics_apc_count": 0,
+  "wheel_received": "",
+  "ctrl_alt_shift_a_received": "1b01",
+  "output_requests": [
+    "\u001b[>1u",
+    "\u001b[>27u",
+    "\u001b[?1003h",
+    "\u001b[?1004h",
+    "\u001b[?1006h",
+    "\u001b[?1016h",
+    "\u001b[?1049h",
+    "\u001b[?2004h",
+    "\u001b[?2026h",
+    "\u001b[?2026l",
+    "\u001b[?2031h",
+    "\u001b[?2048h",
+    "\u001b[?25l",
+    "\u001b[H"
+  ]
+}

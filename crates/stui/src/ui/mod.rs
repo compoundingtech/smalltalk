@@ -14,6 +14,9 @@ pub mod demo;
 pub mod doc;
 mod edit;
 mod glass;
+#[cfg(test)]
+#[path = "../../tests/support/terminal_tab.rs"]
+mod terminal_tab;
 pub use glass::set_glasses_version;
 mod glass_store;
 mod lastrun;
@@ -3000,6 +3003,16 @@ impl Ui {
         }
     }
 
+    /// Dispatch the outer terminal's decoded input, shared by the live and demo loops.
+    fn input_event(&mut self, event: Event) {
+        match event {
+            Event::Key(key) => self.key(key),
+            Event::Paste(text) => self.paste(text),
+            Event::Mouse(mouse) => self.mouse(mouse),
+            _ => {}
+        }
+    }
+
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -5225,12 +5238,7 @@ pub fn run_demo(args: &[String]) -> Result<()> {
             // Drain everything queued so a fast wheel does not lag behind. crossterm's read never
             // returns on a closed terminal, so check for one before each read.
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
-                match event::read()? {
-                    Event::Key(key) => ui.key(key),
-                    Event::Paste(text) => ui.paste(text),
-                    Event::Mouse(mouse) => ui.mouse(mouse),
-                    _ => {}
-                }
+                ui.input_event(event::read()?);
                 if !event::poll(Duration::ZERO)? {
                     break;
                 }
