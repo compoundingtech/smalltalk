@@ -232,6 +232,7 @@ mod tests {
     async fn selected_arrangement_survives_byte_window_edits_and_retirement() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "selected-arrangement");
+        let read_slots = Arc::new(tokio::sync::Semaphore::new(1));
         let session = ClientSession::local(Some("person/ada")).unwrap();
         let sidebar = "arrangement/person/ada/019a0000-0000-7000-8000-000000000002";
         for (subject, name) in [(SUBJECT, "Earlier"), (sidebar, "Sidebar")] {
@@ -249,32 +250,32 @@ mod tests {
         let mut subscription: CollectionSubscribe = serde_json::from_value(json!({
             "kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":100
         })).unwrap();
-        let (_, prefix, has_more) = collection_items(&state, &session, &subscription).await.unwrap();
+        let (_, prefix, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(prefix.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(), [SUBJECT]);
         assert!(has_more);
         subscription.subject = Some(sidebar.into());
-        let (_, selected, has_more) = collection_items(&state, &session, &subscription).await.unwrap();
+        let (_, selected, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(selected.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(), [sidebar]);
         assert!(!has_more);
         assert_eq!(selected[0]["body"]["name"]["value"], "Sidebar");
         let mut rename = request(&state, "selected-rename", json!([{"op":"rename","name":"Selected edit"}]));
         rename.parameters["subject"] = json!(sidebar);
         edit(&state, &session, &rename).await.unwrap();
-        let (_, updated, has_more) = collection_items(&state, &session, &subscription).await.unwrap();
+        let (_, updated, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(updated[0]["body"]["name"]["value"], "Selected edit");
         assert_ne!(updated[0]["revision"], selected[0]["revision"]);
         assert!(!has_more);
         let mut wrong_owner = subscription.clone();
         wrong_owner.subject = Some(sidebar.replace("person/ada", "person/other"));
-        assert_eq!(collection_items(&state, &session, &wrong_owner).await.unwrap_err().code, "validation-failed");
+        assert_eq!(collection_items(&state, &session, &wrong_owner, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap_err().code, "validation-failed");
         let mut retire = request(&state, "selected-retire", json!([{"op":"retire"}]));
         retire.parameters["subject"] = json!(sidebar);
         edit(&state, &session, &retire).await.unwrap();
-        let (_, removed, has_more) = collection_items(&state, &session, &subscription).await.unwrap();
+        let (_, removed, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert!(removed.is_empty());
         assert!(!has_more);
         subscription.subject = None;
-        let (_, unfiltered, has_more) = collection_items(&state, &session, &subscription).await.unwrap();
+        let (_, unfiltered, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(unfiltered, prefix);
         assert!(!has_more);
     }
@@ -383,6 +384,7 @@ mod tests {
     async fn arrangement_routes_and_collection_require_owner_and_remove_retired_ids() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "arrangement-reads");
+        let read_slots = Arc::new(tokio::sync::Semaphore::new(1));
         let agent = ClientSession::local(Some("agent/sidebar-reader")).unwrap();
         let _ = action(State(state.clone()), Extension(new_client_snapshot(&state)), Extension(agent.clone()),
             Json(request(&state, "create", json!([{"op":"create","name":"Main"}])))).await.unwrap();
@@ -400,17 +402,17 @@ mod tests {
         let subscription: CollectionSubscribe = serde_json::from_value(json!({
             "kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":10
         })).unwrap();
-        let (_, before, _) = collection_items(&state, &agent, &subscription).await.unwrap();
+        let (_, before, _) = collection_items(&state, &agent, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(before[0]["id"], SUBJECT);
         let mut omitted = subscription.clone();
         omitted.person = None;
-        assert!(collection_items(&state, &agent, &omitted).await.is_err());
+        assert!(collection_items(&state, &agent, &omitted, read_slots.clone().acquire_owned().await.unwrap()).await.is_err());
         let other = ClientSession::local(Some("person/other")).unwrap();
-        assert_eq!(collection_items(&state, &other, &subscription).await.unwrap_err().code, "forbidden");
+        assert_eq!(collection_items(&state, &other, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap_err().code, "forbidden");
         assert_eq!(person(&ClientSession::local(None).unwrap(), Some("person/ada"), false).unwrap_err().code, "forbidden");
         let _ = action(State(state.clone()), Extension(new_client_snapshot(&state)), Extension(agent.clone()),
             Json(request(&state, "retire", json!([{"op":"retire"}])))).await.unwrap();
-        let (_, after, _) = collection_items(&state, &agent, &subscription).await.unwrap();
+        let (_, after, _) = collection_items(&state, &agent, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert!(after.is_empty());
         let response = app.oneshot(Request::builder()
             .uri("/v1/client/arrangements/ada/019a0000-0000-7000-8000-000000000001")
@@ -422,6 +424,7 @@ mod tests {
     async fn arrangement_collection_rechecks_revoked_paired_grants() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "arrangement-grants");
+        let read_slots = Arc::new(tokio::sync::Semaphore::new(1));
         let append = |kind: &str, fields: Value| state.store.append_claim(&ClaimInput {
             subject:"custom/client/pairing-arrangement-test".into(), kind:kind.into(),
             actor:Some("person/ada".into()),
@@ -433,13 +436,13 @@ mod tests {
             "credential_hash":"test-not-a-secret", "expires_at_unix_ms":u64::MAX,
             "scopes":["read.projections","read.arrangements"]
         }));
-        let session = paired_client_session(&state, &paired, "fabric-loopback").unwrap();
+        let session = paired_client_session(&state, &paired, "fabric-loopback", false).unwrap();
         let subscription: CollectionSubscribe = serde_json::from_value(json!({
             "kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada"
         })).unwrap();
-        collection_items(&state, &session, &subscription).await.unwrap();
+        collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         append("custom.client.pairing-revoked", json!({"reason":"person revoked"}));
-        assert_eq!(collection_items(&state, &session, &subscription).await.unwrap_err().code, "forbidden");
+        assert_eq!(collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap_err().code, "forbidden");
     }
 
     #[tokio::test]
