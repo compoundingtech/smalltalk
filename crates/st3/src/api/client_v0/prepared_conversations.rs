@@ -47,12 +47,12 @@ struct Prepared {
     store: Weak<Store>,
     authority: String,
     session_id: String,
-    store_index: u64,
-    local_position: u64,
+    mark: Mutex<Option<ConversationMark>>,
     verdict: SourceVerdict,
     binding: Option<(String, Option<String>)>,
     stamp: Option<NativeStamp>,
     value: Arc<Value>,
+    page: Option<CachedClientPage>,
     bytes: usize,
     created: std::time::Instant,
 }
@@ -73,13 +73,26 @@ fn same_store(prepared: &Prepared, state: &AppState) -> bool {
 }
 
 fn current(prepared: &Prepared, state: &AppState) -> Result<bool, ApiError> {
-    // Conservatively invalidate on every store/local commit. In particular, unrelated
-    // message.sent claims can move session_messages' global 10,000-claim retention bound.
-    Ok(prepared.created.elapsed() < PREPARED_TTL
-        && prepared.store_index == state.store.index().map_err(ApiError::internal)?
-        && prepared.local_position == local_latest_position(state)?
-        && prepared.verdict.path().and_then(native_stamp) == prepared.stamp
-        && source_verdict(state, prepared.binding.as_ref(), &prepared.session_id)? == prepared.verdict)
+    if prepared.created.elapsed() >= PREPARED_TTL
+        || prepared.page.as_ref().is_some_and(|page| page.expires_at_unix_ms <= client_now_ms())
+        || prepared.verdict.path().and_then(native_stamp) != prepared.stamp
+        || source_verdict(state, prepared.binding.as_ref(), &prepared.session_id)? != prepared.verdict
+    {
+        return Ok(false);
+    }
+    let index = state.store.index().map_err(ApiError::internal)?;
+    let binding = super::super::managed_session_owner_at(&state.store, index, &prepared.session_id)
+        .map_err(ApiError::internal)?.map(|(owner, incarnation, _)| (owner, incarnation));
+    if binding != prepared.binding { return Ok(false); }
+    let mut mark = prepared.mark.lock().expect("prepared conversation mark poisoned");
+    let Some(since) = mark.as_mut() else { return Ok(false); };
+    if since.changed(state)? {
+        // A relevance check advances its watermarks. Never let that make an invalid
+        // page look current again on the next preparation pass.
+        *mark = None;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn source_verdict(
@@ -118,6 +131,15 @@ pub(super) fn initial(
     // Authentication belongs to the read, not to the preparation that happened earlier.
     require_scope(session, "read.projections")?;
     if let Some(prepared) = find_current(state, session, session_id)? {
+        // Preparation owns the backing snapshot even when ordinary pagination evicts it.
+        // Re-admit it before returning its cursor, under the same ordinary eviction bound.
+        if let Some(page) = &prepared.page {
+            let mut pages = client_page_cache().lock().expect("client page cache poisoned");
+            pages.retain(|entry| entry.expires_at_unix_ms > client_now_ms()
+                && !(entry.snapshot_id == page.snapshot_id && entry.collection == page.collection));
+            while pages.len() >= CLIENT_PAGE_CACHE_CAPACITY { pages.pop_front(); }
+            pages.push_back(page.clone());
+        }
         let mut value = (*prepared.value).clone();
         value["preparation"] = json!("ready");
         if let Some(cursor) = value["next_cursor"].as_str() {
@@ -204,29 +226,46 @@ fn build(
         || source_verdict(state, binding.as_ref(), session_id)? != verdict
     {
         return Err(ApiError {
-            status: StatusCode::CONFLICT,
+            status: StatusCode::SERVICE_UNAVAILABLE,
             code: "stale-fence".into(),
             message: "the native conversation changed while its initial page was read".into(),
             details: Box::default(),
         });
     }
-    let bytes = frame_bytes(&value);
+    let page_cursor = value.pointer("/initial_page/page/next_cursor").and_then(Value::as_str)
+        .map(decode_client_cursor).transpose()?;
+    let page = page_cursor.as_ref().and_then(|cursor| {
+        client_page_cache().lock().expect("client page cache poisoned").iter()
+            .find(|page| page.snapshot_id == cursor.snapshot.id
+                && page.collection == cursor.collection
+                && page.items_digest == cursor.items_digest
+                && page.expires_at_unix_ms == cursor.expires_at_unix_ms).cloned()
+    });
+    let value_bytes = frame_bytes(&value);
+    let bytes = value_bytes.saturating_add(page.as_ref().map_or(0, |page| page.items_bytes));
     let seen = stamp.as_ref().map(|stamp| (stamp.length, stamp.modified));
     // A bound path that failed during the actual native read is not a stable source verdict.
     let read_failed = matches!(verdict, SourceVerdict::Readable { .. })
         && value["initial_page"]["items"].as_array().is_some_and(|items| {
             items.iter().any(|entry| entry["body"]["code"] == "transcript-not-bound")
         });
-    let prepared = (cacheable && !read_failed && bytes <= CLIENT_MAX_RESPONSE_BYTES).then(|| Prepared {
+    let prepared = (cacheable && !read_failed && value_bytes <= CLIENT_MAX_RESPONSE_BYTES
+        && bytes <= MAX_PREPARED_BYTES && (page_cursor.is_none() || page.is_some())).then(|| Prepared {
         store: Arc::downgrade(&state.store),
         authority: session.authority_actor.clone(),
         session_id: session_id.to_owned(),
-        store_index: index,
-        local_position,
+        mark: Mutex::new(Some(ConversationMark {
+            owner: binding.as_ref().map(|(owner, _)| owner.clone()),
+            transcript: verdict.path().map(std::path::Path::to_path_buf),
+            transcript_seen: seen,
+            store_index: index,
+            local_position,
+        })),
         verdict,
         binding,
         stamp,
         value: value.clone(),
+        page,
         bytes,
         created: std::time::Instant::now(),
     });
@@ -244,13 +283,55 @@ pub(super) async fn prepare(
     session: &ClientSession,
     session_id: &str,
 ) -> Result<bool, ApiError> {
+    prepare_with_budget(state, session, session_id, None).await
+}
+
+type BackgroundBudget = tokio::sync::OwnedMutexGuard<tokio::time::Instant>;
+
+fn finish_background(budget: &mut BackgroundBudget, started: std::time::Instant) {
+    // One background read globally, at most 10% sustained read duty. Idle time is
+    // proportional to actual work, not just a concurrency bound on long transcripts.
+    **budget = tokio::time::Instant::now()
+        + started.elapsed().saturating_mul(9).max(Duration::from_millis(50));
+}
+
+async fn prepare_with_budget(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    budget: Option<BackgroundBudget>,
+) -> Result<bool, ApiError> {
     require_scope(session, "read.projections")?;
     let permit = slot().await?;
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        warm(&state, &session, &session_id)
+        let started = std::time::Instant::now();
+        let result = warm(&state, &session, &session_id);
+        // The blocking read keeps the budget even if its socket owner is cancelled.
+        if let Some(mut budget) = budget { finish_background(&mut budget, started); }
+        result
     }).await.map_err(ApiError::internal)?
+}
+
+async fn background(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    remote: Option<&str>,
+) -> Result<(), ApiError> {
+    static BUDGET: LazyLock<Arc<tokio::sync::Mutex<tokio::time::Instant>>> =
+        LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())));
+    let mut budget = BUDGET.clone().lock_owned().await;
+    tokio::time::sleep_until(*budget).await;
+    if remote.is_some() {
+        let started = std::time::Instant::now();
+        let result = prepare_conversation_value(state, session, session_id, remote).await;
+        finish_background(&mut budget, started);
+        result.map(|_| ())
+    } else {
+        prepare_with_budget(state, session, session_id, Some(budget)).await.map(|_| ())
+    }
 }
 
 /// Preparation belongs to a held agents window, never to hover or a guessed selection.
@@ -280,7 +361,7 @@ impl Owner {
                         Ok(remote) => remote,
                         Err(_) => continue,
                     };
-                    let _ = prepare_conversation_value(&state, &session, &session_id, remote.as_deref()).await;
+                    let _ = background(&state, &session, &session_id, remote.as_deref()).await;
                 }
             }
         });

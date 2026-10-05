@@ -805,9 +805,13 @@ offers the same bounded change read for clients that cannot open WebSockets.
 
 Held agents collection windows prepare their returned current sessions in the
 background; selection needs no separate client preparation request. Preparation
-is volatile, bounded, authorized on every read, and fenced by the claim/local
-watermarks and the exact native binding and file identity. A prepared page retains
-the full authoritative claim projection and any native-unavailable notice:
+is volatile, authorized on every read, and invalidated only by changes concerning
+that agent or its exact native binding and file identity. Background reads share
+one global budget with a 10% sustained read duty cycle; bursts are coalesced.
+Prepared pages own their pagination snapshots within the 64 MiB preparation bound
+and restore them to the ordinary page cache when served. Native snapshot races
+are retryable reads, not terminal subscription errors. A prepared page retains the
+full authoritative claim projection and any native-unavailable notice:
 `ready` does not mean native-complete or promise a daemon-cold latency.
 
 `GET /v1/client/conversations/{id}/prepare` (`conversation.prepare`, requiring

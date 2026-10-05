@@ -4925,11 +4925,10 @@ impl ConversationMark {
         }
         let local = local_latest_position(state)?;
         if local > self.local_position {
-            changed |= state
-                .store
+            let observations = state.store
                 .local_observations_after(self.local_position, 10_000)
-                .map_err(ApiError::internal)?
-                .iter()
+                .map_err(ApiError::internal)?;
+            changed |= observations.len() >= 10_000 || observations.iter()
                 .any(|claim| Some(claim.subject.as_str()) == self.owner.as_deref());
             self.local_position = local;
         }
@@ -11448,6 +11447,8 @@ subscription "watch/source" {
             ),
             ("remote-unavailable", StatusCode::SERVICE_UNAVAILABLE, true),
             ("page-cursor-expired", StatusCode::GONE, true),
+            // Transient read fences retry; action conflicts above still require a new fence.
+            ("stale-fence", StatusCode::SERVICE_UNAVAILABLE, true),
             ("validation-failed", StatusCode::UNPROCESSABLE_ENTITY, false),
         ] {
             let envelope = client_error_envelope(
@@ -12749,6 +12750,78 @@ mission "example/zero-run" state="ready" {
             .unwrap()
             .0;
         assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prepared_conversations_restore_history_and_ignore_unrelated_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "prepared-history");
+        let agent = "agent/prepared-history";
+        let incarnation = "prepared-history:i1";
+        let append = |subject: &str, kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(agent.into()),
+                fields: fields.as_object().unwrap().iter()
+                    .map(|(key, value)| (key.clone(), value.clone())).collect(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        append(agent, "runtime.observed", json!({
+            "status":"running", "runtime_id":"prepared-history", "incarnation_id":incarnation
+        }));
+        state.store.append_local_observations_for_test(&(0..201).map(|entry| ClaimInput {
+            subject: agent.into(), kind: "harness.timeline".into(), actor: Some(agent.into()),
+            fields: serde_json::from_value(json!({
+                "operation":"append", "entry_id":format!("timeline-entry/prepared-{entry}"),
+                "revision":1, "role":"assistant", "entry_type":"content", "final":false,
+                "body":{"text":format!("entry {entry}")}, "driver":"omp",
+                "incarnation_id":incarnation, "sequence":entry + 100
+            })).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).collect::<Vec<_>>());
+        let session_id = managed_session_id(agent, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let first = prepared_conversations::initial(&state, &session, &session_id).unwrap();
+        let cursor = first["initial_page"]["page"]["next_cursor"].as_str().unwrap();
+        let decoded = decode_client_cursor(cursor).unwrap();
+        // Fill the ordinary 32-entry cache, evicting the prepared page's history.
+        for entry in 0..CLIENT_PAGE_CACHE_CAPACITY {
+            client_page(&state, &new_client_snapshot(&state), &format!("other/{entry}"),
+                vec![json!({"id":"a"}), json!({"id":"b"})],
+                &ClientListQuery { limit: Some(1), ..Default::default() }).unwrap();
+        }
+        let restored = prepared_conversations::initial(&state, &session, &session_id).unwrap();
+        assert_eq!(restored["preparation"], "ready");
+        let history = client_page(&state, &decoded.snapshot, &decoded.collection, Vec::new(),
+            &ClientListQuery { cursor: Some(cursor.to_owned()), ..Default::default() }).unwrap();
+        assert_eq!(history.items.iter().map(|entry| (
+            entry["id"].as_str().unwrap(), entry["body"]["text"].as_str().unwrap()
+        )).collect::<Vec<_>>(), vec![("timeline-entry/prepared-0", "entry 0")]);
+        append("message/other", "message.sent", json!({
+            "from":"person/example", "to":"agent/someone-else", "content":"not here", "status":"sent"
+        }));
+        let unchanged = prepared_conversations::initial(&state, &session, &session_id).unwrap();
+        assert_eq!(unchanged["preparation"], "ready");
+        assert_eq!(unchanged["initial_page"], restored["initial_page"]);
+        append(agent, "harness.timeline", json!({
+            "operation":"replace", "entry_id":"timeline-entry/prepared-200", "revision":2,
+            "role":"assistant", "entry_type":"content", "final":true, "body":{"text":"revised"},
+            "driver":"omp", "incarnation_id":incarnation, "sequence":300
+        }));
+        let revised = prepared_conversations::initial(&state, &session, &session_id).unwrap();
+        assert_eq!(revised["preparation"], "miss");
+        let revised_entry = revised["initial_page"]["items"].as_array().unwrap().iter()
+            .find(|entry| entry["id"] == "timeline-entry/prepared-200").unwrap();
+        assert_eq!(revised_entry["revision"], 2);
+        assert_eq!(revised_entry["body"]["text"], "revised");
+        append("message/here", "message.sent", json!({
+            "from":"person/example", "to":agent, "session_id":session_id,
+            "content":"new message", "status":"sent"
+        }));
+        let sent = prepared_conversations::initial(&state, &session, &session_id).unwrap();
+        assert_eq!(sent["preparation"], "miss");
+        assert!(sent["initial_page"]["items"].as_array().unwrap().iter()
+            .any(|entry| entry["body"]["text"] == "new message"));
     }
 
     #[tokio::test]

@@ -99,11 +99,13 @@ const CLIENT_MAX_RESPONSE_BYTES: usize = 1_048_576;
 const CLIENT_PAGE_TTL_MS: u128 = 300_000;
 const CLIENT_PAGE_CACHE_CAPACITY: usize = 32;
 
+#[derive(Clone)]
 struct CachedClientPage {
     snapshot_id: String,
     collection: String,
     items_digest: String,
     items: Arc<Vec<Value>>,
+    items_bytes: usize,
     expires_at_unix_ms: u128,
 }
 
@@ -1275,7 +1277,7 @@ fn client_page_read(
         .limit
         .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
         .clamp(1, CLIENT_MAX_PAGE_ITEMS);
-    let (items, items_digest, offset, limit, expires_at_unix_ms) = if let Some(cursor) =
+    let (items, items_digest, items_bytes, offset, limit, expires_at_unix_ms) = if let Some(cursor) =
         &query.cursor
     {
         let cursor = decode_client_cursor(cursor)?;
@@ -1316,14 +1318,14 @@ fn client_page_read(
         (
             cached.items.clone(),
             cursor.items_digest,
+            cached.items_bytes,
             cursor.offset,
             cursor.limit,
             cursor.expires_at_unix_ms,
         )
     } else {
-        let items_digest = hex::encode(Sha256::digest(
-            serde_json::to_vec(&items).map_err(ApiError::internal)?,
-        ));
+        let serialized = serde_json::to_vec(&items).map_err(ApiError::internal)?;
+        let items_digest = hex::encode(Sha256::digest(&serialized));
         let cached = client_page_cache()
             .lock()
             .expect("client page cache poisoned")
@@ -1334,14 +1336,15 @@ fn client_page_read(
                     && entry.items_digest == items_digest
                     && entry.expires_at_unix_ms > client_now_ms()
             })
-            .map(|entry| (entry.items.clone(), entry.expires_at_unix_ms));
-        let (items, expires_at_unix_ms) = cached.unwrap_or_else(|| {
+            .map(|entry| (entry.items.clone(), entry.items_bytes, entry.expires_at_unix_ms));
+        let (items, items_bytes, expires_at_unix_ms) = cached.unwrap_or_else(|| {
             (
                 Arc::new(items),
+                serialized.len(),
                 client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
             )
         });
-        (items, items_digest, 0, requested_limit, expires_at_unix_ms)
+        (items, items_digest, items_bytes, 0, requested_limit, expires_at_unix_ms)
     };
     let end = offset.saturating_add(limit).min(items.len());
     let page_items = items.get(offset..end).unwrap_or_default().to_vec();
@@ -1365,6 +1368,7 @@ fn client_page_read(
                 collection: collection.into(),
                 items_digest: items_digest.clone(),
                 items: items.clone(),
+                items_bytes,
                 expires_at_unix_ms,
             });
         }

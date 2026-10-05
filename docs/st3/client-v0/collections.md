@@ -100,12 +100,15 @@ subscription only, for example while the owning host is unreachable. After a dro
 subscribe again on the new one.
 
 Held agents windows prepare their returned current sessions without hover,
-selection, or a client prefetch call. Preparation uses bounded daemon work and
-ends with that window or socket. Every hit checks authority, claim/local
-watermarks, native binding, and file identity. `ready` means the authoritative
-projection is prepared, including an unchanged native-unavailable notice; it
-does not mean native-complete. A miss reads the full current page. Neither label
-promises a latency for an unprepared daemon or replaces actual content.
+selection, or a client prefetch call. Background reads share one global 10%
+sustained read-duty budget and end with that window or socket. Unrelated fleet
+commits do not invalidate or rebuild a prepared conversation. Every hit checks
+authority, changes concerning its agent, native binding, and file identity.
+Prepared pages retain their pagination backing under the 64 MiB cache bound.
+Native snapshot races trigger resync and retry without ending the subscription.
+`ready` includes an unchanged native-unavailable notice; it does not mean
+native-complete. A miss reads the full current page. Neither label promises a
+latency for an unprepared daemon or replaces actual content.
 
 Conversation routing resolves the runtime identity at the requested snapshot
 without building the fleet's agent cards. Message reads apply the conversation's
