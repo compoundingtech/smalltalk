@@ -1617,19 +1617,21 @@ impl<R: RuntimeControl> Reconciler<R> {
             read("deadline/missions", &|| {
                 self.store.next_active_mission_deadline(&self.host)
             }),
-            // Skipping passes keep each wake's and capacity retry's due time, so these need
-            // no scan of every local agent's work and diagnostics after every pass. The next
-            // full pass bounds what a missing due time could delay.
+            // Every item records its clock dependencies, including times with no separate
+            // timer. Wake for the earliest one across all sections.
+            self.skip_unneeded
+                .then(|| self.incremental.next_due(""))
+                .flatten(),
             read("deadline/work-wakes", &|| {
                 if self.skip_unneeded {
-                    Ok(self.incremental.next_due("wake:"))
+                    Ok(None)
                 } else {
                     self.next_work_wake_deadline()
                 }
             }),
             read("deadline/provider-capacity-retries", &|| {
                 if self.skip_unneeded {
-                    Ok(self.incremental.next_due("capacity:"))
+                    Ok(None)
                 } else {
                     self.next_provider_capacity_retry_deadline()
                 }
@@ -2125,6 +2127,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let item = format!("member:{}", subject.subject);
             members.insert(item.clone());
+            let _clock = smallclaims::store::clock_snapshot();
             let needed = member_errors.contains_key(&subject.subject)
                 || self.needs_item(&item, !skip_members);
             if skip_members && !needed {
@@ -3621,6 +3624,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         skip: bool,
         work: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        let _clock = smallclaims::store::clock_snapshot();
         let needed = self.needs_item(item, !skip);
         if skip && !needed {
             return Ok(());
@@ -4061,6 +4065,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         live_workspaces: &BTreeSet<&str>,
         diagnostic_errors: &mut Vec<String>,
     ) {
+        let _clock = smallclaims::store::clock_snapshot();
         let needed = self.needs_item(item, !skip);
         if skip && !needed {
             return;
@@ -4566,6 +4571,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(format!("terminate:{subject}:{incarnation}")),
             })?;
+            // Even a failed terminate leaves a request that must reach its kill deadline.
+            // A short shutdown timeout comes before the usual first observation poll.
+            self.arm_restart(
+                &format!("stop:{subject}"),
+                deadline.min(now_ms().saturating_add(100)),
+            );
             if let Err(error) = self.runtime.stop(runtime_id, terminal, Some(incarnation)) {
                 self.store.append_claim(&ClaimInput {
                     subject: subject.into(),
@@ -4581,7 +4592,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })?;
                 return Err(error);
             }
-            self.arm_restart(&format!("stop:{subject}"), now_ms().saturating_add(100));
             return Ok(false);
         };
         let deadline = request
@@ -6197,6 +6207,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let full = !self.skip_unneeded || self.incremental.take_full_pass("mission-run", now_ms());
         for id in &ids {
             let subject = format!("mission-run/{id}");
+            let _clock = smallclaims::store::clock_snapshot();
             let needed = self.needs_item(&subject, full);
             if !full && !needed {
                 // Nothing it read changed and nothing is due. It stays active: keep its caches,
@@ -14749,6 +14760,7 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     mod differential;
+    mod incremental_deadlines;
     mod rollout_tests;
     mod ref_watch_tests;
     #[test]
@@ -14925,6 +14937,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         starts: Mutex<Vec<String>>,
         failed_starts: Mutex<std::collections::HashSet<String>>,
         failed_observes: Mutex<std::collections::HashSet<String>>,
+        observe_at: Mutex<Option<u128>>,
         failed_stops: Mutex<std::collections::HashSet<String>>,
         started_members: Mutex<Vec<MemberSpec>>,
         stops: Mutex<Vec<String>>,
@@ -14984,6 +14997,9 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             Ok(self.ptys.lock().unwrap().clone())
         }
         fn observe_exec(&self, runtime_id: &str) -> Result<Option<RuntimeObservation>> {
+            if let Some(at) = self.observe_at.lock().unwrap().take() {
+                smallclaims::store::set_thread_clock(Some(at));
+            }
             anyhow::ensure!(
                 !self.failed_observes.lock().unwrap().contains(runtime_id),
                 "fake observe failed"

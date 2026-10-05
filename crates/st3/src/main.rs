@@ -243,6 +243,8 @@ enum Command {
         #[command(subcommand)]
         command: RuleCommand,
     },
+    /// Run any CLI with credentials no seat can read, through the sekrets gateway.
+    Sekrets(st3::sekrets::cli::SekretsArgs),
     /// Discover native harness sessions and move one under durable st ownership.
     Import {
         #[command(subcommand)]
@@ -1699,6 +1701,10 @@ struct MissionShowArgs {
 struct MissionPublishArgs {
     /// KDL file to publish; use `-` to read standard input.
     file: PathBuf,
+    /// Print the resolved publication preview without applying or running exec gates.
+    /// Use `missions check` separately to run the gates.
+    #[arg(long, visible_alias = "preview")]
+    dry_run: bool,
     /// Preview against this exact store index.
     #[arg(long, visible_alias = "at")]
     at_index: Option<u64>,
@@ -4449,6 +4455,13 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Skill(args) = cli.command {
         return run_skill(args);
     }
+    // The gateway runs as the sekrets user, which has no st configuration.
+    if let Command::Sekrets(args) = cli.command {
+        let code = st3::sekrets::cli::run(args, cli.json).await?;
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
     if let Command::ReplicationWorker(args) = cli.command {
         let mut config = Config::load_unvalidated(args.config.as_deref())?;
         if let Some(value) = args.node {
@@ -4494,6 +4507,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Sets { command } => run_owned_sets(&endpoint, command, cli.json).await,
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
+        Command::Sekrets(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
         Command::Usage(args) => run_usage(&immediate, args, cli.json).await,
@@ -5249,6 +5263,16 @@ async fn run_up(args: UpArgs) -> Result<()> {
         None => st_runtime::resolve_executable("pty", &login_environment)?,
     };
     let recorder = install_recorder(&config, &login_environment);
+    if let Some(person) = &config.person {
+        let _ = st3::sekrets::daemon::PERSON.set(person.clone());
+    }
+    // Sekrets is opt-in: this records a gateway's calls once one listens on this host.
+    st3::sekrets::daemon::spawn_importer(
+        store.clone(),
+        config.node.clone(),
+        config.state_dir.clone(),
+        st3::sekrets::client::socket_path(),
+    );
     let state = AppState {
         store: store.clone(),
         notify: notify.clone(),
@@ -5956,11 +5980,17 @@ async fn publish_mission_file(
             },
         )
         .await?;
+    if args.dry_run {
+        print_value(&mission, json_output)?;
+    }
     anyhow::ensure!(
         mission.blockers.is_empty(),
         "{}",
         mission.blockers.join("; ")
     );
+    if args.dry_run {
+        return Ok(());
+    }
     warn_ignored_authority(&mission);
     if !args.no_gate_check {
         check_before_publish(client, &intent, &args.workspace).await?;
@@ -26046,6 +26076,7 @@ mission "review" state="ready" {
             client,
             MissionPublishArgs {
                 file,
+                dry_run: false,
                 at_index: None,
                 actor: "person/test".into(),
                 workspace: root.to_owned(),

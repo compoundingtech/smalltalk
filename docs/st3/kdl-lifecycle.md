@@ -21,6 +21,13 @@ can instead use `st launch` to create, review, and approve a conversationally pl
 authorized agent uses `st work publish-mission` from the exact claimed producing step for generated
 nested work. Every route keeps intent, authority, and provenance on a typed operation.
 
+`st missions publish FILE --as ACTOR --dry-run` (alias `--preview`) stops after the publication
+preview. It prints the normalized and resolved intent, exact mission revisions, changes, predicted
+actions, blockers, warnings, and subject tokens; `--json` returns the full preview object.
+Blockers are printed before the command exits with failure. It does not apply the intent, publish
+or start a mission, launch helpers, or run exec gates. Use `st missions check FILE` separately to
+run gate commands. `--at-index INDEX` fences the preview snapshot as it does for publication.
+
 ## Definitions do not start work
 
 This publication creates or updates one immutable mission revision. It does not start a run.

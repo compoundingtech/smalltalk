@@ -83,17 +83,22 @@ impl Daemon {
     }
 
     fn run_cli(&self, args: &[&str]) -> std::process::Output {
-        st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+        self.run_cli_format(args, true)
+    }
+
+    fn run_cli_format(&self, args: &[&str], json: bool) -> std::process::Output {
+        let mut command = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+        command
             .env_clear()
             .env("HOME", &self.root)
             .env("ST3_DAEMON_WAIT", "0")
             .current_dir(&self.root)
             .args(["--endpoint"])
-            .arg(self.root.join("daemon.sock"))
-            .arg("--json")
-            .args(args)
-            .output()
-            .unwrap()
+            .arg(self.root.join("daemon.sock"));
+        if json {
+            command.arg("--json");
+        }
+        command.args(args).output().unwrap()
     }
 
     fn run(&self) -> Value {
@@ -195,6 +200,128 @@ fn wait_for(label: &str, mut condition: impl FnMut() -> bool) {
     while !condition() {
         assert!(Instant::now() < deadline, "timed out waiting for {label}");
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn mission_publish_dry_run_prints_the_preview_without_gates_or_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(root.path());
+    let file = root.path().join("preview.kdl");
+    let source = r#"version 2
+agent "example/helper" {
+  workspace "."
+  command "touch helper-ran"
+  restart "never"
+  mission-authority { publish "example/*" }
+}
+mission "example/preview" state="ready" {
+  goal "Inspect publication without running commands."
+  step "work" {
+    agentless
+    gate "checked" {
+      exec "touch gate-ran; exit 2"
+      host "orchid"
+      workspace "."
+    }
+  }
+}
+"#;
+    std::fs::write(&file, source).unwrap();
+    let file = file.to_str().unwrap();
+    for flag in ["--dry-run", "--preview"] {
+        let args = ["missions", "publish", file, "--as", PUBLISHER, flag];
+        let preview = daemon.command(&args);
+        let resolved = preview["resolved_intent"]["kdl"].as_str().unwrap();
+        let intent = st3::graph::parse_intent(resolved, "orchid").unwrap();
+        assert!(resolved.contains("Inspect publication without running commands."));
+        assert!(preview["normalized"].is_object(), "{preview:#}");
+        let revision = preview["mission_revisions"]["mission/example/preview"]
+            .as_str()
+            .unwrap();
+        assert!(!revision.is_empty());
+        assert_eq!(intent.missions["example/preview"].revision, revision);
+        assert!(preview["changes"].as_array().unwrap().iter().any(|change| {
+            change["subject"] == "mission/example/preview" && change["new_revision"] == revision
+        }));
+        assert!(
+            preview["predicted_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| {
+                    action["subject"] == "mission/example/preview"
+                        && action["action"] == "publish-mission"
+                })
+        );
+        assert_eq!(preview["blockers"], serde_json::json!([]));
+        assert!(preview["warnings"].to_string().contains("free-mode"));
+        assert!(preview["subject_tokens"].is_object());
+
+        let human = daemon.run_cli_format(&args, false);
+        assert!(human.status.success(), "{human:?}");
+        let human = String::from_utf8_lossy(&human.stdout);
+        for expected in [
+            "RESOLVED INTENT",
+            "BLOCKERS",
+            "WARNINGS",
+            revision,
+            "Inspect publication without running commands.",
+        ] {
+            assert!(human.contains(expected), "{human}");
+        }
+        assert!(!root.path().join("gate-ran").exists());
+        assert!(!root.path().join("helper-ran").exists());
+        assert!(daemon.gate_results().is_empty());
+        let missions = daemon.command(&["missions", "ls", "--all"]);
+        assert!(
+            !missions.to_string().contains("example/preview"),
+            "{missions}"
+        );
+        let agents = daemon.command(&["agents", "ls", "--all"]);
+        assert!(!agents.to_string().contains("example/helper"), "{agents}");
+    }
+}
+
+#[test]
+fn mission_publish_dry_run_prints_blockers_before_refusing_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(root.path());
+    let file = root.path().join("blocked.kdl");
+    std::fs::write(
+        &file,
+        "version 2\nmission \"example/blocked\" state=\"ready\" {\n  goal \"Find an unresolved seat.\"\n  step \"work\" { assigned-to \"agent/example/nobody\" }\n}\n",
+    )
+    .unwrap();
+    for flag in ["--dry-run", "--preview"] {
+        let args = [
+            "missions",
+            "publish",
+            file.to_str().unwrap(),
+            "--as",
+            PUBLISHER,
+            flag,
+        ];
+        let refused = daemon.run_cli(&args);
+        assert!(!refused.status.success(), "{refused:?}");
+        let preview: Value = serde_json::from_slice(&refused.stdout).unwrap();
+        let blocker = preview["blockers"][0].as_str().unwrap();
+        assert!(blocker.contains("missing eligible agent `agent/example/nobody`"));
+        assert!(
+            preview["resolved_intent"]["kdl"]
+                .as_str()
+                .unwrap()
+                .contains("example/blocked")
+        );
+        assert!(String::from_utf8_lossy(&refused.stderr).contains(blocker));
+        let human = daemon.run_cli_format(&args, false);
+        assert!(!human.status.success());
+        assert!(String::from_utf8_lossy(&human.stdout).contains(blocker));
+        let missions = daemon.command(&["missions", "ls", "--all"]);
+        assert!(
+            !missions.to_string().contains("example/blocked"),
+            "{missions}"
+        );
     }
 }
 
