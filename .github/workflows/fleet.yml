@@ -40,7 +40,7 @@ jobs:
           QUEUE_REF: ${{ github.event.merge_group.head_ref }}
           GH_REPO_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
-          NEED: ${{ vars.CI1_MIN_IDLE || '4' }}
+          NEED: ${{ vars.CI1_MIN_IDLE || '1' }}
         run: |
           primary_label=
           namespace() {

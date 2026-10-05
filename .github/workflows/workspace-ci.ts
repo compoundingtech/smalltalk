@@ -44,8 +44,8 @@ export const linuxActionlintConfig = {
  */
 export const pickRunnerJobId = 'pick-runner'
 
-/** Preserve the primary shard's admission threshold; extra jobs use only observed free slots. */
-const ci1MinIdle = 4
+/** One free general runner admits a primary; reserved labels stay out of that pool. */
+const ci1MinIdle = 1
 
 export const pickRunnerJob = {
   name: pickRunnerJobId,

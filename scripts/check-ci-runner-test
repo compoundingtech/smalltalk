@@ -151,5 +151,5 @@ assert 'CI_TEST_PARTITION: "hash:1/2"' in blocks["linux-tests"]
 assert 'CI_TEST_PARTITION: "hash:2/2"' in blocks["linux-tests-shard-2"]
 for job in ("linux-tests", "linux-tests-shard-2"):
     assert 'CI_TEST_THREADS: "8"' in blocks[job], "bound each shard's test concurrency"
-assert "vars.CI1_MIN_IDLE || '4'" in picker, "leave CPU capacity for reserved lanes"
+assert "vars.CI1_MIN_IDLE || '1'" in picker, "use an idle general slot without requiring the entire pool"
 print("passed: bounded test shards, reserved primary lane, idle general slots, Namespace fallback, and required aggregation")

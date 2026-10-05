@@ -343,8 +343,8 @@ warm caches kept on the machine. GitHub has no overflow between runner labels, s
 starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
 through the API and picks the primary test partition's pool:
 
-- `ci1` when at least `CI1_MIN_IDLE` (default 4) general runners are online and idle. This leaves
-  CPU capacity for the priority and merge reservations;
+- `ci1` when at least `CI1_MIN_IDLE` (default 1) general runners are online and idle. Priority
+  and merge-only workers are excluded from this ordinary pool;
 - `ci1-priority` for trusted PRs labelled `ci-priority`, without an idle-count or token dependency.
   Pending urgent checks get the next free general runners; one slot stays reserved for priority
   and merge work after urgent checks finish;
@@ -361,7 +361,9 @@ The second shard and mail canaries read separate outputs, each choosing only `ci
 capacity. The picker counts online, idle general runners and subtracts one slot when the primary
 may also use that pool. It offers the remaining slots to the second shard, then the canaries;
 each falls back to the same Namespace priority and run affinity when no slot remains. The
-primary's `CI1_MIN_IDLE=4` threshold does not strand idle slots for these two extra jobs.
+primary's admission threshold does not strand idle slots for these two extra jobs. A previous
+threshold of four sent the primary to Namespace even when three general workers were free;
+the one-slot default lets both shards and canaries use those three workers.
 Neither extra output can select `ci1-priority` or `ci1-merge`. A missing status token, failed
 lookup, or malformed response leaves the extra jobs on Namespace, while reserved primary
 routing remains available without that token. Forks never reach any ci1 output.
