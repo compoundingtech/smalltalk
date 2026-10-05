@@ -1325,6 +1325,12 @@ pub(super) fn authenticate(
     request: &Request<Body>,
     transport: &'static str,
 ) -> Result<ClientSession, ApiError> {
+    if request.method() == axum::http::Method::GET
+        && request.uri().path().starts_with("/v1/client/private-notes/")
+        && request.extensions().get::<private_notes_login::Identity>() == Some(&private_notes_login::Identity::Agent) {
+        return Err(ApiError::bad(crate::model::St3Error::new("unsupported-capability",
+            "native private-notes self-read is unavailable without admitted reader-incarnation provenance")));
+    }
     let Some(value) = request.headers().get(AUTHORIZATION) else {
         if transport == "unix" {
             let person = request
@@ -1401,6 +1407,7 @@ pub(super) fn authenticate(
         .ok_or_else(|| ApiError::internal("a paired client has no concrete delegated person"))?;
     let notes_attested = paired.origin == state.store.origin()
         && state.private_notes.person.as_deref() == Some(authority_actor)
+        && request.extensions().get::<private_notes_login::Identity>().is_some_and(|peer| peer.allows_paired_notes())
         && paired.body.pointer("/fields/scopes").and_then(Value::as_array)
             .is_some_and(|scopes| scopes.iter().filter_map(Value::as_str).any(|scope| scope.starts_with("notes.")))
         && state.private_notes.pairing_attested(&state.state_dir, paired).map_err(ApiError::bad)?;
@@ -5482,6 +5489,7 @@ pub(super) async fn pairing_begin(
     Extension(session): Extension<ClientSession>,
     bound: Option<Extension<BoundAgent>>,
     principal: Option<Extension<VerifiedNotesPairingPrincipal>>,
+    notes_peer: Option<Extension<private_notes_login::Identity>>,
     Json(request): Json<PairingBegin>,
 ) -> Result<Json<Value>, ApiError> {
     if session.transport != "unix" {
@@ -5544,7 +5552,8 @@ pub(super) async fn pairing_begin(
     };
     let grants_notes = scopes.iter().any(|scope| scope.starts_with("notes."));
     if grants_notes
-        && (bound.is_some() || state.private_notes.person.as_deref() != Some(person_id.as_str())
+        && (bound.is_some() || !notes_peer.is_some_and(|Extension(peer)| peer.allows_paired_notes())
+            || state.private_notes.person.as_deref() != Some(person_id.as_str())
             || principal.is_none() && scopes.iter().filter(|scope| scope.starts_with("notes.")).any(|scope| !session.allows(scope))) {
         return Err(forbidden("notes delegation must be explicitly initiated by the owner node's configured person, not a native agent"));
     }
@@ -5610,6 +5619,7 @@ pub(super) async fn pairing_complete(
     Extension(_session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
     bound: Option<Extension<BoundAgent>>,
+    notes_peer: Option<Extension<private_notes_login::Identity>>,
     Json(request): Json<PairingComplete>,
 ) -> Result<Json<Value>, ApiError> {
     if request.api_version != CLIENT_API_VERSION || request.device_public_key.len() < 32 {
@@ -5683,8 +5693,8 @@ pub(super) async fn pairing_complete(
         Some(_) => return Err(validation("the pairing has invalid delegated scopes")),
     };
     let grants_notes = scopes.iter().any(|scope| scope.starts_with("notes."));
-    if grants_notes && bound.is_some() {
-        return Err(forbidden("native agents cannot complete notes authority delegation"));
+    if grants_notes && (bound.is_some() || !notes_peer.is_some_and(|Extension(peer)| peer.allows_paired_notes())) {
+        return Err(forbidden("native or unavailable local peers cannot complete notes authority delegation"));
     }
     if grants_notes
         && (state.private_notes.person.as_deref() != Some(person_id.as_str()) || begun.origin != state.store.origin()

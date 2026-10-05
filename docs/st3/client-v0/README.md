@@ -66,13 +66,26 @@ credential may delegate only its existing notes scopes. Linux admission
 revalidates the kernel socket-peer lifetime and current parent chain on each
 bootstrap. A root-owned system-bus login issuer must report a live PAM `sshd`
 session for the daemon OS-owner UID with the exact ancestor leader lifetime.
-Recognized native agents cannot begin or complete notes delegation.
-PID 1, detached processes, mutable person headers, user-service cgroups and
-native process environment are not positive authority. Missing kernel pidfd or
-system login support fails closed. Other platforms require an existing attested
-credential; no uncredentialed content access is available.
+Every direct local notes request carries independent native-peer classification
+on both the primary and paired listeners. Recognized agents and unavailable
+provenance cannot begin or complete delegation or use person notes grants.
+For bootstrap, each relevant OS-owner process up to the exact PAM leader must
+be inspectable; an unreadable or non-dumpable process fails closed, not as a
+verified non-agent. PID 1, detached processes, person selectors and user-service
+cgroups are not bootstrap authority. Missing kernel or system login support
+fails closed; no uncredentialed content access is available.
 
-Native agents never write or delegate notes authority. Optional native
+A direct privileged root peer, distinct from the daemon OS owner and fenced by
+its live kernel pidfd, is a trusted paired transport only. It never receives
+person-header or bootstrap authority. Notes still require the configured
+person's explicitly scoped, immutable owner-local paired credential and current
+expiry/revocation checks. The daemon does not prove whether a human or agent is
+behind that proxy. Likewise, this API is not credential isolation against
+arbitrary processes sharing the owner's OS credentials. Native provenance
+unavailable on a platform means local paired notes access fails closed there;
+cross-platform clients may use an admitted owning gateway.
+
+Recognized direct native peers never write or delegate notes authority. Optional native
 self-read is unavailable without admitted reader-incarnation provenance:
 the detail route returns `unsupported-capability` without content, revision,
 or digest. Ordinary native harness observation delivery has no private-notes
