@@ -81,13 +81,14 @@ pub struct OmpResidencyCheckpoint {
 /// 18.1 was measured at 18.1.2 on 2026-09-02.
 /// 18.3 was measured at 18.3.0 on 2026-09-24.
 /// 18.4 was measured at 18.4.2 on 2026-09-29.
+/// 18.6 was measured at 18.6.0 on 2026-10-04.
 ///
 /// Admission is per minor, per decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate ("hard version gate on the minor, 18.x initially")
 /// and OMP-R05 ("a later minor stays rejected"). Any patch inside an admitted minor launches
 /// without new evidence: omp releases near-daily, so gating patches blocked the fleet on changes
 /// the capture already covered — 18.0.10 shipped within hours of 18.0.9 being admitted. A new
 /// MINOR still costs the five OMP-R05 probes.
-const SUPPORTED_OMP_MINORS: [(u32, u32); 4] = [(18, 0), (18, 1), (18, 3), (18, 4)];
+const SUPPORTED_OMP_MINORS: [(u32, u32); 5] = [(18, 0), (18, 1), (18, 3), (18, 4), (18, 6)];
 
 /// The omp builds the harness-context producer's arithmetic was measured against (HC-R13, HC-T03).
 ///
@@ -567,7 +568,10 @@ mod tests {
     /// `.experiments/` capture that justifies it.
     #[test]
     fn admitted_minors_are_exactly_the_measured_set() {
-        assert_eq!(SUPPORTED_OMP_MINORS, [(18, 0), (18, 1), (18, 3), (18, 4)]);
+        assert_eq!(
+            SUPPORTED_OMP_MINORS,
+            [(18, 0), (18, 1), (18, 3), (18, 4), (18, 6)]
+        );
     }
 
     /// Every exact build that admitted a minor must still launch. Keeping the literals here makes
@@ -575,7 +579,7 @@ mod tests {
     /// admitted series.
     #[test]
     fn version_gate_admits_every_admission_capture() {
-        for version in ["18.0.3", "18.0.9", "18.1.2", "18.3.0", "18.4.2"] {
+        for version in ["18.0.3", "18.0.9", "18.1.2", "18.3.0", "18.4.2", "18.6.0"] {
             let fake = FakeExecutable::new(&format!(
                 "#!/bin/sh\nprintf 'omp v{version}\\n{version}\\n'\n"
             ));
@@ -614,6 +618,8 @@ mod tests {
             "18.1.2+meta",
             "18.3.0-rc1",
             "18.3.0+meta",
+            "18.6.0-rc1",
+            "18.6.0+meta",
         ] {
             let fake = FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
             assert!(
@@ -667,7 +673,7 @@ mod tests {
     /// which is how a minor gate would decay into "accept anything that starts with 18".
     #[test]
     fn version_gate_refuses_a_neighbouring_minor_that_shares_a_prefix() {
-        for version in ["18.10.0", "18.2.0"] {
+        for version in ["18.10.0", "18.2.0", "18.5.0", "18.7.0"] {
             let fake = FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
             let error = verify_supported_version(fake.path().to_str().unwrap())
                 .expect_err(version)
@@ -681,7 +687,7 @@ mod tests {
     /// allowlist; passes once the gate keys on MAJOR.MINOR.
     #[test]
     fn a_patch_inside_an_admitted_minor_is_accepted_without_new_evidence() {
-        for version in ["18.0.11", "18.1.99"] {
+        for version in ["18.0.11", "18.1.99", "18.6.99"] {
             let fake = FakeExecutable::new(&format!(
                 "#!/bin/sh\nprintf 'omp v{version}\\n{version}\\n'\n"
             ));
