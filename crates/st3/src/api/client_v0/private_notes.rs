@@ -67,7 +67,6 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::StatusCode;
-    use tower::ServiceExt as _;
 
     async fn request(app: Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
         let response = app.oneshot(Request::builder().method(method).uri(path)
