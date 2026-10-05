@@ -3039,7 +3039,8 @@ pub fn replication_bucket_start(sequence: u64) -> u64 {
 /// peer provably lacks, bounded per exchange, and the local identities of the ranges both
 /// sides hold with different digests, so the peer can compute the reverse difference. Whole
 /// ranges are listed in order while they fit `listing_limit`. The first differing range is
-/// always listed, so each exchange settles at least one range and later ones follow.
+/// always listed. If payloadless checkpoint differences prevent it from settling, the sync
+/// worker requests a full inventory rather than repeating this prefix indefinitely.
 pub fn compact_replication_difference(
     inventory: &CompactReplicationInventory,
     buckets: &[ReplicationInventoryBucket],
