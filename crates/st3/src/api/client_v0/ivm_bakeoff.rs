@@ -128,7 +128,8 @@ pub fn run(root: PathBuf, owner: String, native: PathBuf) -> Result<Value> {
     fields.insert("path".into(), json!(native));
     store.append_claim(&ClaimInput { subject: owner.clone(), kind: "harness.session-file".into(), actor: binding.actor,
         fields, evidence: vec![], expected_subject: None, idempotency_key: None })?;
-    let session = conversation_session_id(&state, &owner).map_err(|e| anyhow::anyhow!(e.message))?;
+    let mut session = conversation_session_id(&state, &owner).map_err(|e| anyhow::anyhow!(e.message))?;
+    let initial_session = session.clone();
     super::super::delivery_presence::assess("ivm-clock-initialization","omp");
     CLOCK.set((super::super::client_now_ms(),Instant::now())).map_err(|_|anyhow::anyhow!("one corpus run per process"))?;
     let before_rss = rss()?;
@@ -183,6 +184,8 @@ pub fn run(root: PathBuf, owner: String, native: PathBuf) -> Result<Value> {
     let mut replay_hashes = Vec::new();
     let mut channels = known.iter().map(|id| (id.clone(),watch::channel(0_u64))).collect::<BTreeMap<_,_>>();
     let mut targeted_wakes = 0;
+    let mut session_transitions = Vec::new();
+    let mut owner_view_hashes = Vec::new();
     for claim in &slice {
         let input = ClaimInput { subject:claim.subject.clone(),kind:claim.kind.clone(),actor:claim.actor.clone(),
             fields:serde_json::from_value(claim.body["fields"].clone())?,evidence:vec![],expected_subject:None,idempotency_key:None };
@@ -205,10 +208,22 @@ pub fn run(root: PathBuf, owner: String, native: PathBuf) -> Result<Value> {
             }
             let old=current.iter_mut().find(|v|v["id"]==item["id"]).context("unknown subject")?; *old=item.clone();
         }
-        if outputs.contains(&session) {
+        let owner_changed = outputs.contains(&session);
+        if owner_changed {
+            let next = conversation_session_id(&state,&owner).map_err(|e|anyhow::anyhow!(e.message))?;
+            if next != session {
+                // A new incarnation has a new session identity. Never keep an obsolete
+                // first-page snapshot looking current, or alias its cursor to the successor.
+                tx.execute("DELETE FROM subject_views WHERE subject=?1",[&session])?;
+                tx.execute("DELETE FROM dependency WHERE input=?1 AND output=?2",params![owner,session])?;
+                tx.execute("INSERT INTO dependency VALUES(?1,?2)",params![owner,next])?;
+                session_transitions.push(json!({"from":session,"to":next}));
+                session=next;
+            }
             for kind in ["timeline","conversation"] {
                 let value=oracle(&state,&session,kind,if kind=="timeline" {50} else {200})?;
-                tx.execute("UPDATE subject_views SET version=?3,body=?4 WHERE subject=?1 AND kind=?2",params![session,kind,store.index()?,serde_json::to_string(&value)?])?;
+                tx.execute("INSERT INTO subject_views VALUES(?1,?2,?3,?4) ON CONFLICT(subject,kind) DO UPDATE SET version=excluded.version,body=excluded.body",
+                    params![session,kind,store.index()?,serde_json::to_string(&value)?])?;
             }
         }
         tx.commit()?; maintenance.push(ms(start));
@@ -229,13 +244,29 @@ pub fn run(root: PathBuf, owner: String, native: PathBuf) -> Result<Value> {
         let materialized=read_view(&db,"agents",initial.len(),&session)?;
         assert_parity(&root,&format!("replay {}",accepted.id),&json!(all),&materialized)?;
         replay_hashes.push(digest(&materialized)?);
+        if owner_changed {
+            for kind in ["timeline","conversation"] {
+                let expected=oracle(&state,&session,kind,if kind=="timeline" {50} else {200})?;
+                let materialized=read_view(&db,kind,0,&session)?;
+                assert_parity(&root,kind,&expected,&materialized)?;
+                owner_view_hashes.push(json!({"session":session,"kind":kind,"sha256":digest(&materialized)?}));
+            }
+            for transition in &session_transitions {
+                if transition["from"].as_str()!=Some(session.as_str()) {
+                    let retained: u64=db.query_row("SELECT count(*) FROM subject_views WHERE subject=?1",
+                        [transition["from"].as_str().unwrap()],|r|r.get(0))?;
+                    ensure!(retained==0,"obsolete current session snapshot retained");
+                }
+            }
+        }
     }
     db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     let mut sorted=maintenance.clone();sorted.sort_by(f64::total_cmp);
     let mut admitted=admission.clone();admitted.sort_by(f64::total_cmp);
-    Ok(json!({"origin_main":"00156543f","startup_ms":startup,"agents":initial.len(),"session":session,"native_items":native_items,
+    Ok(json!({"origin_main":"00156543f","startup_ms":startup,"agents":initial.len(),"session":initial_session,"final_session":session,"native_items":native_items,
         "baseline":{"agents_uncached_cold_ms":baseline_cold,"agents_uncached_warm_ms":baseline_warm,"timeline_first_ms":timeline_cold,"timeline_warm_ms":timeline_warm,"conversation_first_ms":conversation_cold,"conversation_warm_ms":native_warm},
         "persist_ms":persist_ms,"reads":reads,"rss_before_kib":before_rss,"rss_after_kib":after_rss,"snapshot_bytes":std::fs::metadata(snapshot_path)?.len(),
         "replay":{"claims":slice.len(),"admission_ms":admission,"maintenance_ms":maintenance,"admission_p50_ms":admitted[admitted.len()/2],"maintenance_p50_ms":sorted[sorted.len()/2],"maintenance_p95_ms":sorted[(sorted.len()-1)*95/100],"affected_agent_rows":affected,"targeted_wakes":targeted_wakes,"global_wake_deliveries_for_same_subscribers":slice.len()*known.len(),"parity_sha256":replay_hashes,"source_claim_ids":slice.iter().map(|c|&c.id).collect::<Vec<_>>()},
+        "session_transitions":session_transitions,"owner_view_hashes":owner_view_hashes,
         "limits":"Cold means new SQLite reader, not cold ZFS ARC. Native first read follows Store::open and binding relocation. Page envelopes persisted only for selected session. Volatile clock/delivery overlays are frozen at measurement; production needs expiry invalidations. Maintenance transaction is separate from real admission; no claim of atomic production integration or replication correctness."}))
 }
