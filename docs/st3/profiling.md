@@ -82,6 +82,10 @@ The value is read once per process. Retention still defaults to 128, preserving 
 prepared-statement reuse from #1234. Profiling counts fresh connections as
 `read connection opened`.
 
+Each reader keeps up to 128 prepared statements. Mailbox changed-since, owner/binding,
+local watermark, and snapshot fence checks reuse those statements; caching removes repeated
+SQL preparation but does not change the graph-wide wake fan-out.
+
 `st doctor` reports open, idle and active reader counts, peak open readers, total connections
 opened since startup, the configured cache target, and summed current reader targets without
 requiring SQLite MEMSTATUS. These are targets, not measured allocations: SQLite schema,
