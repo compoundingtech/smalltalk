@@ -102,6 +102,14 @@ Their spend and limits use a stable label derived from the declared name; unboun
 provider's label. Queued observations capture the account at their source, so replay after a
 switch still charges the account that produced them.
 
+Limits include `identified`: true when the source names a provider identity or a declared account,
+false when it names neither. Older servers omit this additive metadata. Identity and quota
+freshness are separate: a missing identity does not make a reading stale. Once a driver has
+identified evidence, its identity-less historical group is hidden if none of its latest reporting
+seats is still declared active. Unknown evidence from active seats remains visible, as does unknown
+evidence for a driver with no identified readings. Identified accounts keep their readings even
+without seats; unknown readings are never assigned to an identified account.
+
 A relaunch or a partial five-hour report cannot erase the last weekly observation or give it a
 new timestamp. Weekly selection uses only reports that actually contain a weekly percentage;
 providers with only a five-hour window still show that window. The original observation survives

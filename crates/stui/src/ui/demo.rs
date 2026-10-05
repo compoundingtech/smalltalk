@@ -162,6 +162,7 @@ fn usage_limits() -> Vec<st3_client::UsageLimit> {
         st3_client::UsageLimit {
             account: s("anthropic"),
             account_ref: None,
+            identified: Some(true),
             driver: s("claude"),
             plan: Some(s("max")),
             five_hour_percent: Some(41.0),
@@ -176,6 +177,7 @@ fn usage_limits() -> Vec<st3_client::UsageLimit> {
         st3_client::UsageLimit {
             account: s("openai"),
             account_ref: None,
+            identified: Some(true),
             driver: s("codex"),
             plan: None,
             five_hour_percent: None,

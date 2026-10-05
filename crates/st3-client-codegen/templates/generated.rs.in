@@ -384,6 +384,10 @@ pub struct UsageLimit {
     /// The declared account the measuring seat ran on, when it was bound to one.
     #[serde(default)]
     pub account_ref: Option<String>,
+    /// Whether the source named a provider identity or declared account, independent of freshness.
+    /// Older servers omit this metadata.
+    #[serde(default)]
+    pub identified: Option<bool>,
     pub driver: String,
     #[serde(default)]
     pub plan: Option<String>,

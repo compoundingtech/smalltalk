@@ -607,6 +607,7 @@
       "properties": {
         "account": { "type": "string" },
         "account_ref": { "type": "string" },
+        "identified": { "type": "boolean", "description": "The source named a provider identity or declared account; independent of quota freshness. Absent on older servers." },
         "driver": { "type": "string" },
         "plan": { "type": "string" },
         "five_hour_percent": { "type": "number", "minimum": 0 },

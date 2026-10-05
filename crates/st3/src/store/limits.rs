@@ -7,6 +7,8 @@
 //! window, even after seats switch away, labelled with its original time and measuring seat.
 //! This also protects readers from older producers that re-stamp cached limits. Readings never
 //! cross accounts or providers: a harness that names no account reads as `PROVIDER/unknown`.
+//! Seatless identity-less history is hidden once that driver has identified evidence; it is
+//! never attributed to an identified account, and active seats keep their unknown evidence.
 
 use super::accounts::limit_binding_is_current;
 use super::*;
@@ -86,6 +88,10 @@ pub struct AccountLimit {
     /// to one. Bound seats derive the opaque label from this name; unbound seats use provider identity.
     #[serde(default)]
     pub account_ref: Option<String>,
+    /// Whether the source named a provider identity or a declared account. This says nothing
+    /// about the age or completeness of its quota evidence.
+    #[serde(default)]
+    pub identified: bool,
     pub driver: String,
     pub plan: Option<String>,
     pub five_hour_percent: Option<f64>,
@@ -122,18 +128,26 @@ pub struct LimitsOutcome {
 fn reading(origin: &str, body: &Value) -> Option<(AccountLimit, String)> {
     let fields = body.get("fields")?;
     let driver = fields["driver"].as_str()?.to_owned();
-    let account = fields["account"]
+    let identity = fields["account"]
         .as_str()
-        .filter(|account| !account.is_empty())
-        .map_or_else(|| format!("{driver}/unknown"), str::to_owned);
+        .filter(|account| !account.is_empty());
+    let account_ref = fields["account_ref"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    // Older bound producers can carry a generic label or none at all. Match the publishers'
+    // stable declared label so one declared account cannot split as its provider label changes.
+    let account = account_ref.as_ref().map_or_else(
+        || identity.map_or_else(|| format!("{driver}/unknown"), str::to_owned),
+        |name| st_drivers::account::account_label(&driver, &format!("declared:{name}")),
+    );
+    let identified = account_ref.is_some() || identity.is_some();
     let percent = |name: &str| fields[name].as_f64().filter(|value| value.is_finite());
     Some((
         AccountLimit {
             account: account.clone(),
-            account_ref: fields["account_ref"]
-                .as_str()
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned),
+            account_ref,
+            identified,
             driver,
             plan: fields["plan"].as_str().map(str::to_owned),
             five_hour_percent: percent("five_hour_percent"),
@@ -154,8 +168,8 @@ pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLi
         "SELECT subject, origin, body FROM claims WHERE kind='harness.limits'
          ORDER BY CANONICAL_ASC(claims)",
     ))?;
-    let mut newest = BTreeMap::<String, (String, Option<String>)>::new();
-    let mut readings = BTreeMap::<(String, Option<String>), Vec<AccountLimit>>::new();
+    let mut newest = BTreeMap::<String, (String, String, Option<String>)>::new();
+    let mut readings = BTreeMap::<(String, String, Option<String>), Vec<AccountLimit>>::new();
     for row in statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -167,7 +181,11 @@ pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLi
         let body: Value = serde_json::from_str(&body)?;
         if let Some((mut limit, _)) = reading(&origin, &body) {
             limit.measured_by = subject.clone();
-            let key = (limit.account.clone(), limit.account_ref.clone());
+            let key = (
+                limit.driver.clone(),
+                limit.account.clone(),
+                limit.account_ref.clone(),
+            );
             newest.insert(subject, key.clone());
             // Keep the last reading even after the account's last seat switches away. Otherwise
             // the exhausted account would immediately look unused to the next pool choice.
@@ -185,6 +203,20 @@ pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLi
             .seats
             .push(seat);
     }
+    let identified_drivers = accounts
+        .values()
+        .filter(|limit| limit.identified)
+        .map(|limit| limit.driver.clone())
+        .collect::<BTreeSet<_>>();
+    let mut active = connection.prepare_cached("SELECT subject FROM desired WHERE kind='agent'")?;
+    let active_seats = active
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    accounts.retain(|_, limit| {
+        limit.identified
+            || !identified_drivers.contains(&limit.driver)
+            || limit.seats.iter().any(|seat| active_seats.contains(seat))
+    });
     Ok(accounts.into_values().collect())
 }
 
@@ -915,11 +947,147 @@ agent "other" { workspace "/tmp"; harness "codex" { account-pool "person/ada"; }
     }
 
     #[test]
+    fn legacy_unknowns_are_hidden_only_with_identified_evidence_and_no_active_seat() {
+        let store = Store::open_memory("alder").unwrap();
+        let now = now_ms();
+        let seat = "agent/alder.worker";
+        read(&store, seat, None, 99.0, now - 3 * 24 * HOUR);
+        let unknown = store.account_limits().unwrap();
+        assert_eq!(unknown.len(), 1);
+        assert!(!unknown[0].identified);
+        // With no identified evidence this remains unknown, even without a declaration.
+        assert_eq!(unknown[0].account, "claude/unknown");
+        read(&store, seat, Some("claude/one"), 100.0, now);
+        read(&store, seat, Some("claude/two"), 20.0, now + 1);
+        read(&store, "agent/alder.other", Some("claude/three"), 30.0, now);
+        let limits = store.account_limits().unwrap();
+        assert_eq!(limits.len(), 3);
+        assert!(limits.iter().all(|limit| limit.identified));
+        let exhausted = limits
+            .iter()
+            .find(|limit| limit.account == "claude/one")
+            .unwrap();
+        assert!(exhausted.seats.is_empty());
+        assert_eq!(exhausted.weekly_percent, Some(100.0));
+
+        // Missing identity from a currently declared seat remains visible regardless of age.
+        let active = "agent/alder.unknown";
+        declare(&store, active, "alder");
+        read(&store, active, None, 90.0, now - 3 * 24 * HOUR);
+        let limits = store.account_limits().unwrap();
+        let unknown = limits.iter().find(|limit| !limit.identified).unwrap();
+        assert_eq!(unknown.seats, [active]);
+        let stop =
+            crate::graph::parse_internal_intent(&format!("version 2\nstop {active:?}\n"), "alder")
+                .unwrap();
+        store.apply_internal(&stop, "retire-unknown").unwrap();
+        // A retired seat's last reading still has a seat string, but cannot keep a phantom alive.
+        assert!(
+            store
+                .account_limits()
+                .unwrap()
+                .iter()
+                .all(|limit| limit.identified)
+        );
+    }
+
+    #[test]
+    fn identified_evidence_and_grouping_are_scoped_to_the_driver() {
+        let store = Store::open_memory("alder").unwrap();
+        let now = now_ms() as u64;
+        for (seat, driver, account, weekly) in [
+            ("agent/example/claude", "claude", "shared-label", 95.0),
+            ("agent/example/claude-old", "claude", "", 99.0),
+            ("agent/example/codex", "codex", "", 20.0),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: seat.into(),
+                    kind: "harness.limits".into(),
+                    actor: Some(seat.into()),
+                    fields: serde_json::from_value(json!({
+                        "driver": driver, "account": account, "account_ref": "",
+                        "weekly_percent": weekly, "measured_at_unix_ms": now,
+                    }))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let limits = store.account_limits().unwrap();
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[0].account, "shared-label");
+        assert!(limits[0].identified);
+        assert_eq!(limits[1].account, "codex/unknown");
+        assert!(!limits[1].identified);
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/example/codex".into(),
+                kind: "harness.limits".into(),
+                actor: Some("agent/example/codex".into()),
+                fields: serde_json::from_value(json!({
+                    "driver": "codex", "account": "shared-label", "weekly_percent": 10.0,
+                    "measured_at_unix_ms": now,
+                }))
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let limits = store.account_limits().unwrap();
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[0].weekly_percent, Some(95.0));
+        assert_eq!(limits[1].weekly_percent, Some(10.0));
+        assert!(limits.iter().all(|limit| limit.identified));
+    }
+
+    #[test]
+    fn bound_readings_with_different_provider_labels_do_not_split_or_merge_accounts() {
+        let store = Store::open_memory("alder").unwrap();
+        let now = now_ms();
+        read_account(&store, "agent/alder.first", "ada/one", "", 95.0, now);
+        read_account(
+            &store,
+            "agent/alder.second",
+            "ada/one",
+            "codex/generic",
+            20.0,
+            now + 1,
+        );
+        read_account(
+            &store,
+            "agent/alder.third",
+            "ada/two",
+            "codex/generic",
+            30.0,
+            now,
+        );
+        let limits = store.account_limits().unwrap();
+        assert_eq!(limits.len(), 2);
+        let first = limits
+            .iter()
+            .find(|limit| limit.account_ref.as_deref() == Some("ada/one"))
+            .unwrap();
+        assert!(first.identified);
+        assert_eq!(first.weekly_percent, Some(95.0));
+        assert_eq!(first.seats, ["agent/alder.first", "agent/alder.second"]);
+        assert_eq!(
+            first.account,
+            st_drivers::account::account_label("codex", "declared:ada/one")
+        );
+        assert_ne!(limits[0].account, limits[1].account);
+    }
+
+    #[test]
     fn an_exhausted_account_keeps_its_reading_after_its_last_seat_switches_away() {
         let store = Store::open_memory("alder").unwrap();
         declare_accounts(&store);
         let seat = "agent/alder.pooled";
         let now = now_ms();
+        read_account(&store, seat, "", "", 100.0, now - 3 * 24 * HOUR);
         read_account(&store, seat, "ada/one", "codex/aaaa", 97.0, now);
         read_account(&store, seat, "ada/two", "codex/bbbb", 20.0, now + 1);
 
@@ -928,6 +1096,7 @@ agent "other" { workspace "/tmp"; harness "codex" { account-pool "person/ada"; }
             .iter()
             .find(|limit| limit.account_ref.as_deref() == Some("ada/one"))
             .unwrap();
+        assert_eq!(limits.len(), 2);
         assert_eq!(exhausted.weekly_percent, Some(97.0));
         assert!(exhausted.seats.is_empty());
         let binding = store.seat_binding(seat).unwrap().unwrap();
@@ -948,8 +1117,10 @@ agent "other" { workspace "/tmp"; harness "codex" { account-pool "person/ada"; }
         read_account(&store, "agent/alder.other", "ada/two", "", 20.0, now + 1);
         let limits = store.account_limits().unwrap();
         assert_eq!(limits.len(), 2);
-        assert_eq!(limits[0].weekly_percent, Some(97.0));
-        assert_eq!(limits[1].weekly_percent, Some(20.0));
+        let first = limits.iter().find(|limit| limit.account_ref.as_deref() == Some("ada/one")).unwrap();
+        let second = limits.iter().find(|limit| limit.account_ref.as_deref() == Some("ada/two")).unwrap();
+        assert_eq!(first.weekly_percent, Some(97.0));
+        assert_eq!(second.weekly_percent, Some(20.0));
         let outcome = store.enforce_account_limits(&policy(), now + 2).unwrap();
         assert_eq!(
             outcome.switched,

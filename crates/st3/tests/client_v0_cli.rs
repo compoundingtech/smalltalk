@@ -241,6 +241,115 @@ async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_p
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_hides_legacy_unknowns_preserves_account_identity_and_stops_at_95_percent() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"worker\" { workspace \"/tmp\"; command \"true\"; }\nagent \"unknown\" { workspace \"/tmp\"; command \"true\"; }",
+        store.origin(),
+    ).unwrap();
+    store.apply_internal(&intent, "usage-identities").unwrap();
+    let worker = "agent/client-v0-cli.worker";
+    let unknown = "agent/client-v0-cli.unknown";
+    let now = st_drivers::message::now_ms();
+    let append = |seat: &str, driver: &str, account: Option<&str>, weekly: f64, at: u64| {
+        let mut fields = serde_json::json!({
+            "driver": driver, "incarnation_id": "example-inc", "weekly_percent": weekly,
+            "weekly_resets_at_unix_ms": now + 3_600_000, "measured_at_unix_ms": at,
+        });
+        if let Some(account) = account {
+            fields["account"] = serde_json::json!(account);
+        }
+        store
+            .append_claim(&ClaimInput {
+                subject: seat.into(),
+                kind: "harness.limits".into(),
+                actor: Some(seat.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    };
+    // Both drivers have old identity-less evidence. Neither observation can be attributed
+    // to any of the real accounts, and an exhausted off-seat account must stay visible.
+    let legacy_at = now - 3 * 86_400_000;
+    append(worker, "claude", None, 100.0, legacy_at);
+    append(worker, "claude", Some("claude/exhausted"), 100.0, now);
+    append(worker, "claude", Some("claude/current"), 95.0, now);
+    append("agent/example/old", "codex", None, 100.0, legacy_at);
+    append("agent/example/old", "codex", Some("codex/one"), 25.0, now);
+    append("agent/example/other", "codex", Some("codex/two"), 15.0, now);
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(state))
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let client = st3_client::Client::unix_as(&socket, "person/avery");
+    let cli = value(&run_cli(&socket, &["usage"]).await);
+    assert_eq!(cli["limits"].as_array().unwrap().len(), 4);
+    assert!(
+        cli["limits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|limit| limit["identified"] == true)
+    );
+    let report = client
+        .usage_period(Some(now - 1000), Some(now + 1000))
+        .await
+        .unwrap();
+    assert_eq!(report.value.limits.len(), 4);
+    let exhausted = report
+        .value
+        .limits
+        .iter()
+        .find(|limit| limit.account == "claude/exhausted")
+        .unwrap();
+    assert_eq!(exhausted.weekly_percent, Some(100.0));
+    assert!(exhausted.seats.is_empty());
+    // Identity-less quota from an active seat remains unknown, independently of freshness.
+    append(unknown, "claude", None, 20.0, legacy_at);
+    let report = client.usage_period(None, None).await.unwrap();
+    assert_eq!(report.value.limits.len(), 5);
+    let limit = report
+        .value
+        .limits
+        .iter()
+        .find(|limit| limit.identified == Some(false))
+        .unwrap();
+    assert_eq!(limit.account, "claude/unknown");
+    assert_eq!(limit.seats, [unknown]);
+    assert_eq!(limit.measured_at_unix_ms, legacy_at);
+    let cli = value(&run_cli(&socket, &["usage"]).await);
+    assert_eq!(cli["limits"].as_array().unwrap().len(), 5);
+    // The same shared selection drives the policy, including an exact 95% boundary.
+    let outcome = store
+        .enforce_account_limits(
+            &st3::store::LimitsPolicy {
+                stop_at_weekly_percent: 95,
+                keep: Default::default(),
+                notify: "agent/example/operations".into(),
+                fresh_ms: 3_600_000,
+            },
+            u128::from(now),
+        )
+        .unwrap();
+    assert_eq!(outcome.stopped, [worker]);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn weekly_usage_survives_a_member_restart_with_a_partial_harness_report() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("claims.sqlite3");

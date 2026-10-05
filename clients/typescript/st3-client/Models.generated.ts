@@ -1519,6 +1519,7 @@ export type UsageLimit = {
   five_hour_percent?: number;
   five_hour_resets_at_unix_ms?: number;
   host: string;
+  identified?: boolean;
   measured_at_unix_ms: number;
   measured_by: string;
   plan?: string;

@@ -205,3 +205,17 @@ test('resource pages decode only through ResourcesPage, never the generic Page',
     assert.equal(Rich.decodeUnknownSync(Rich.Page, 'strict')(page('missions')).collection, 'missions');
     assert.throws(() => Rich.decodeUnknownSync(Rich.Page)(page('resources')));
 });
+
+
+test('usage identity metadata is additive and independent of quota age', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const wire = { account: 'claude/unknown', driver: 'claude', measured_at_unix_ms: 1000, measured_by: 'agent/example/worker', host: 'alder', seats: [] };
+    const decode = Rich.decodeUnknownSync(Rich.UsageLimit, 'strict');
+    assert.equal(Object.hasOwn(decode(wire), 'identified'), false);
+    for (const identified of [false, true]) {
+        const decoded = decode({ ...wire, identified });
+        assert.equal(decoded.identified, identified);
+        assert.equal(Schema.encodeSync(Rich.UsageLimit)(decoded).identified, identified);
+    }
+    assert.throws(() => decode({ ...wire, identified: 'stale' }));
+});
