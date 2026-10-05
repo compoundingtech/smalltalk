@@ -8,6 +8,12 @@ mod resources;
 mod rollouts;
 mod seat_status;
 
+
+pub(crate) struct AgentRuntimeIdentity {
+    pub subject: String,
+    pub incarnation: Option<String>,
+    pub runtime: Option<String>,
+}
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
 use std::fs;
@@ -9709,6 +9715,43 @@ impl Store {
         };
         drop(connection);
         self.status_for_subject_names_at(subjects, store_index, include_history)
+    }
+
+    /// Session routing needs runtime identity, not declaration, harness or claim-history folds.
+    pub(crate) fn agent_runtime_identities_at(
+        &self,
+        snapshot_index: u64,
+    ) -> Result<Vec<AgentRuntimeIdentity>> {
+        let connection = self.readers.get();
+        let index = selected_index(current_index(&connection)?, Some(snapshot_index))
+            .map_err(anyhow::Error::new)?;
+        let subjects = connection
+            .prepare_cached(RANGE_SUBJECTS)?
+            .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        subjects.into_iter().map(|subject| {
+            let actual = latest_actual_at(&connection, &subject, Some(index))?;
+            let fields = actual.as_ref().map(|value| value.get("fields").unwrap_or(value));
+            let field = |name| fields
+                .and_then(|fields| fields.get(name))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            Ok(AgentRuntimeIdentity {
+                incarnation: field("incarnation_id"),
+                runtime: field("runtime_id"),
+                subject,
+            })
+        }).collect()
+    }
+
+    pub(crate) fn selected_actual_origin_at(
+        &self,
+        subject: &str,
+        snapshot_index: u64,
+    ) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        selected_actual_source_at(&connection, subject, Some(snapshot_index), None)
+            .map(|(_, origin, _)| origin)
     }
 
     /// Reduce only subjects that have emitted one claim kind at the selected snapshot.

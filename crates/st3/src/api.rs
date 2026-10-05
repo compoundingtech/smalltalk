@@ -2378,30 +2378,18 @@ fn managed_session_owner_at(
     snapshot_index: u64,
     session_id: &str,
 ) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
-    for subject in status.subjects {
-        if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
-            continue;
-        }
-        let fields = subject
-            .actual
-            .as_ref()
-            .map(|actual| actual.get("fields").unwrap_or(actual));
-        let incarnation = fields
-            .and_then(|fields| fields.get("incarnation_id"))
-            .and_then(Value::as_str)
-            .or(subject.projection.runtime_incarnation.as_deref());
-        let runtime = fields
-            .and_then(|fields| fields.get("runtime_id"))
-            .and_then(Value::as_str);
+    for subject in store.agent_runtime_identities_at(snapshot_index)? {
+        let incarnation = subject.incarnation.as_deref();
+        let runtime = subject.runtime.as_deref();
         let Some(identity) = incarnation.or(runtime) else {
             continue;
         };
         if managed_session_id(&subject.subject, identity) == session_id {
+            let origin = store.selected_actual_origin_at(&subject.subject, snapshot_index)?;
             return Ok(Some((
                 subject.subject,
                 incarnation.map(str::to_owned),
-                subject.actual_origin,
+                origin,
             )));
         }
     }
@@ -15580,6 +15568,49 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0]["revision"], incarnation);
         }
+    }
+
+    #[test]
+    fn managed_session_owner_preserves_runtime_fallback_and_snapshot_rollover() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let subject = "agent/session-owner";
+        let observe = |incarnation: Option<&str>| {
+            let mut fields = BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("legacy-runtime")),
+            ]);
+            if let Some(incarnation) = incarnation {
+                fields.insert("incarnation_id".into(), json!(incarnation));
+            }
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap();
+            state.store.index().unwrap()
+        };
+        let first = observe(None);
+        let legacy = managed_session_id(subject, "legacy-runtime");
+        assert_eq!(
+            managed_session_owner_at(&state.store, first, &legacy).unwrap(),
+            Some((subject.into(), None, Some(state.store.origin().into())))
+        );
+        let second = observe(Some("next-incarnation"));
+        assert_eq!(managed_session_owner_at(&state.store, second, &legacy).unwrap(), None);
+        assert_eq!(
+            managed_session_owner_at(&state.store, second, &managed_session_id(subject, "next-incarnation")).unwrap(),
+            Some((subject.into(), Some("next-incarnation".into()), Some(state.store.origin().into())))
+        );
+        assert_eq!(
+            managed_session_owner_at(&state.store, first, &legacy).unwrap(),
+            Some((subject.into(), None, Some(state.store.origin().into())))
+        );
+        assert_eq!(managed_session_owner_at(&state.store, second, "session/native").unwrap(), None);
     }
 
     #[tokio::test]
