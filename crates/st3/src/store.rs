@@ -13778,6 +13778,7 @@ impl Store {
             response_cached: u64,
             response_cost: f64,
             response_has_cost: bool,
+            response_unknown_cost: bool,
             response_currency: Option<String>,
         }
 
@@ -13930,9 +13931,20 @@ impl Store {
                     if let Some(cost) = fields.get("cost").and_then(Value::as_f64) {
                         group.response_cost += cost;
                         group.response_has_cost = true;
-                    }
-                    if let Some(currency) = fields.get("currency").and_then(Value::as_str) {
-                        group.response_currency = Some(currency.to_owned());
+                        if let Some(currency) = fields.get("currency").and_then(Value::as_str) {
+                            if group
+                                .response_currency
+                                .as_deref()
+                                .is_some_and(|current| current != currency)
+                            {
+                                group.response_unknown_cost = true;
+                            }
+                            group.response_currency = Some(currency.to_owned());
+                        } else {
+                            group.response_unknown_cost = true;
+                        }
+                    } else if total > 0 {
+                        group.response_unknown_cost = true;
                     }
                 }
                 _ => {}
@@ -13942,14 +13954,14 @@ impl Store {
             return Ok(None);
         }
         let mut summary = UsageSummary {
-            aggregation: "cumulative-per-incarnation-else-response-deltas".into(),
+            aggregation: "rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas".into(),
             context: context.map(|(_, value)| value),
             ..UsageSummary::default()
         };
         let mut cost = 0.0;
         let mut has_cost = false;
         let mut rollup_cost_microusd = 0_u128;
-        let mut unknown_rollup_cost = false;
+        let mut unknown_cost = false;
         for group in spend.into_values() {
             summary.incarnation_count += 1;
             if !group.rollups.is_empty() {
@@ -13963,9 +13975,16 @@ impl Store {
                     if let Some(value) = rollup.cost_microusd {
                         rollup_cost_microusd = rollup_cost_microusd.saturating_add(u128::from(value));
                         has_cost = true;
+                        if summary
+                            .currency
+                            .as_deref()
+                            .is_some_and(|currency| currency != "USD")
+                        {
+                            unknown_cost = true;
+                        }
                         summary.currency.get_or_insert_with(|| "USD".into());
-                    } else {
-                        unknown_rollup_cost = true;
+                    } else if rollup.total > 0 {
+                        unknown_cost = true;
                     }
                 }
             } else if let Some((total, input, output, cached, group_cost, currency)) =
@@ -13978,8 +13997,19 @@ impl Store {
                 if let Some(value) = group_cost {
                     cost += value;
                     has_cost = true;
+                    if currency.is_none()
+                        || summary
+                            .currency
+                            .as_ref()
+                            .zip(currency.as_ref())
+                            .is_some_and(|(current, candidate)| current != candidate)
+                    {
+                        unknown_cost = true;
+                    }
+                    summary.currency = summary.currency.or(currency);
+                } else if total > 0 {
+                    unknown_cost = true;
                 }
-                summary.currency = summary.currency.or(currency);
             } else {
                 summary.total_tokens = summary.total_tokens.saturating_add(group.response_total);
                 summary.input_tokens = summary.input_tokens.saturating_add(group.response_input);
@@ -13988,11 +14018,21 @@ impl Store {
                 if group.response_has_cost {
                     cost += group.response_cost;
                     has_cost = true;
+                    if group.response_currency.is_none()
+                        || summary
+                            .currency
+                            .as_ref()
+                            .zip(group.response_currency.as_ref())
+                            .is_some_and(|(current, candidate)| current != candidate)
+                    {
+                        unknown_cost = true;
+                    }
+                    summary.currency = summary.currency.or(group.response_currency);
                 }
-                summary.currency = summary.currency.or(group.response_currency);
+                unknown_cost |= group.response_unknown_cost;
             }
         }
-        if unknown_rollup_cost {
+        if unknown_cost {
             summary.currency = None;
         } else {
             summary.cost = has_cost.then_some(cost + rollup_cost_microusd as f64 / 1_000_000.0);
@@ -42166,7 +42206,7 @@ mission "nested-work" state="ready" {
         let rows = [
             json!({"semantics":"response","incarnation_id":"inc-one","total_tokens":10,"cost":99.0,"currency":"USD"}),
             json!({"semantics":"session_cumulative","incarnation_id":"inc-one","total_tokens":10,"cost":99.0,"currency":"USD"}),
-            json!({"semantics":"response_rollup","incarnation_id":"inc-one","model":"first","total_tokens":10,"cost_microusd":1_000_000,"reported_cost_microusd":1_000_000,"unpriced_tokens":0}),
+            json!({"semantics":"response_rollup","incarnation_id":"inc-one","model":"first","total_tokens":10,"unpriced_tokens":10}),
             json!({"semantics":"response_rollup","incarnation_id":"inc-one","model":"first","total_tokens":20,"cost_microusd":6_338_109,"reported_cost_microusd":6_338_109,"unpriced_tokens":0}),
             json!({"semantics":"response_rollup","incarnation_id":"inc-one","model":"second","total_tokens":30,"cost_microusd":500_000,"unpriced_tokens":0}),
             json!({"semantics":"response_rollup","incarnation_id":"inc-two","model":"first","total_tokens":40,"cost_microusd":0,"unpriced_tokens":0}),
@@ -42194,6 +42234,55 @@ mission "nested-work" state="ready" {
                 .extend(cost_fields.as_object().unwrap().clone());
             let known = json!({"semantics":"response_rollup","incarnation_id":"inc-one","model":"known","total_tokens":20,"cost_microusd":1_000_000,"unpriced_tokens":0});
             let rows = [known, fields].into_iter().enumerate().map(|(index, fields)| {
+                Ok((index as u64, json!({"fields":fields}).to_string(), "0".into()))
+            });
+            let summary = Store::usage_summary_from_rows(rows, None).unwrap().unwrap();
+            assert_eq!(summary.total_tokens, 30);
+            assert_eq!(summary.cost, None);
+            assert_eq!(summary.currency, None);
+        }
+    }
+
+    #[test]
+    fn agent_usage_rollup_and_legacy_cost_require_complete_matching_currency() {
+        for semantics in ["session_cumulative", "response"] {
+            for (legacy_cost, currency, expected) in [
+                (None, Some("USD"), None),
+                (Some(2.0), Some("USD"), Some(3.0)),
+                (Some(2.0), Some("EUR"), None),
+                (Some(2.0), None, None),
+            ] {
+                for legacy_incarnation in ["a-legacy", "z-legacy"] {
+                    let rows = [
+                        json!({"semantics":"response_rollup","incarnation_id":"m-rollup","total_tokens":20,"cost_microusd":1_000_000,"unpriced_tokens":0}),
+                        json!({"semantics":semantics,"incarnation_id":legacy_incarnation,"total_tokens":10,"cost":legacy_cost,"currency":currency}),
+                    ];
+                    let rows = rows.into_iter().enumerate().map(|(index, fields)| {
+                        Ok((index as u64, json!({"fields":fields}).to_string(), "0".into()))
+                    });
+                    let summary = Store::usage_summary_from_rows(rows, None).unwrap().unwrap();
+                    assert_eq!(summary.total_tokens, 30);
+                    assert_eq!(summary.cost, expected);
+                    assert_eq!(summary.currency.as_deref(), expected.map(|_| "USD"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agent_usage_legacy_response_cost_requires_every_delta_priced_in_one_currency() {
+        for second in [
+            json!({"total_tokens":10}),
+            json!({"total_tokens":10,"cost":2.0,"currency":"EUR"}),
+        ] {
+            let mut second = second;
+            second["semantics"] = json!("response");
+            second["incarnation_id"] = json!("legacy");
+            let rows = [
+                json!({"semantics":"response","incarnation_id":"legacy","total_tokens":20,"cost":1.0,"currency":"USD"}),
+                second,
+            ];
+            let rows = rows.into_iter().enumerate().map(|(index, fields)| {
                 Ok((index as u64, json!({"fields":fields}).to_string(), "0".into()))
             });
             let summary = Store::usage_summary_from_rows(rows, None).unwrap().unwrap();
