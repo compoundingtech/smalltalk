@@ -57,6 +57,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_observations` | Local | Local-retention observations and their local frontier/id; never replicated. |
 | `local_subscription_mission_deferrals` | Local | Local reconciler capacity backoff/retry scheduling. |
 | `local_usage_spend` | Local | Local provider usage and cost accumulation before publication. |
+| `local_usage_provenance` | Local | Cumulative pricing contributions for the same local usage publication slots. Published metadata travels in `harness.usage` claims; this accumulator is excluded from replicated projection digests. |
 | `local_usage_responses` | Local | Local usage-input deduplication, trimmed after 30 days. |
 | `local_limit_stops` | Local | Seats this node's limits policy stopped, once per account and weekly window. |
 | `local_latest_slots` | Local | Local latest-retention publication slots and pending local observation pointers. |

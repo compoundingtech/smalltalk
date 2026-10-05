@@ -50,7 +50,9 @@ pub async fn run(
 
 fn spool_watcher(directory: &Path, wake: Arc<Notify>) -> Result<notify::RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        if event.is_ok() {
+        // Scanning the spool opens its directory and reads receipts. Those access
+        // events must not schedule another scan of the same directory.
+        if event.is_ok_and(|event| !matches!(event.kind, notify::EventKind::Access(_))) {
             wake.notify_one();
         }
     })?;
@@ -204,6 +206,24 @@ mod tests {
             exit_code: Some(0),
             at: "2026-10-03T12:00:00Z".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn scanning_an_empty_spool_does_not_wake_an_idle_consumer() {
+        let spool = tempfile::tempdir().unwrap();
+        let wake = Arc::new(Notify::new());
+        let _watcher = spool_watcher(spool.path(), wake.clone()).unwrap();
+        assert_eq!(fs::read_dir(spool.path()).unwrap().count(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), wake.notified())
+                .await
+                .is_err(),
+            "the consumer's own scan queued another scan"
+        );
+        // Ignoring reads must not suppress the next atomic publication.
+        fs::write(spool.path().join("receipt.tmp"), b"partial").unwrap();
+        fs::rename(spool.path().join("receipt.tmp"), spool.path().join("receipt.json")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), wake.notified()).await.unwrap();
     }
 
     #[tokio::test]

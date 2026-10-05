@@ -501,6 +501,18 @@ export default function (pi: ExtensionAPI) {
       captureCost(event);
       sendContext(ctx);
       if (name === "message_end") sendTimeline(name, event);
+      if (name === "agent_end") {
+        const messages = (event as { messages?: Array<{ role?: string; stopReason?: string; errorMessage?: string }> }).messages;
+        if (!Array.isArray(messages)) return;
+        const message = [...messages].reverse().find((message) => message.role === "assistant");
+        if (!message || message.stopReason === "aborted") return;
+        // Only the producer's error field is credential evidence; content and tools are not.
+        if (message.stopReason === "error") {
+          sendFrame({ type: "turn", error: { driver: "pi", reason: (message.errorMessage ?? "assistant error").slice(0, 1024) } });
+        } else if (message.stopReason && ["stop", "length", "toolUse"].includes(message.stopReason)) {
+          sendFrame({ type: "turn" });
+        }
+      }
     });
   onContextEvent("message_end");
   onContextEvent("turn_end");

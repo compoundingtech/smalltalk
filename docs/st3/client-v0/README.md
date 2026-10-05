@@ -375,8 +375,8 @@ recomputing a contribution from aggregate token counts can differ slightly from 
 
 The external per-request ledger remains canonical (#1419). These additions keep the existing
 five-minute/stop publication cadence and latest/hourly/baseline retention bounds. They do not
-change checkpoint selection or carriers, so the checkpoint rules version is unchanged (the
-separate rules-version change discussed in #1322 remains independent). Typed imports and a
+change checkpoint selection or carriers, so they require no additional rules-version bump
+beyond version 10 introduced separately by #1322 for native credential evidence. Typed imports and a
 retention decision for native per-request records remain later work.
 
 The Rust method is `Client::usage_period(since_ms, until_ms)`;
