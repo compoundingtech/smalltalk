@@ -9479,7 +9479,7 @@ mod tests {
             }
         };
         let appeared = tokio::time::timeout(Duration::from_secs(4), focused).await.unwrap();
-        assert_eq!(appeared["upserts"][0]["subagents"][0]["subagent_id"], "leased-child");
+        assert_eq!(appeared["upserts"][0]["subagents"][0]["id"], "leased-child");
         let expired = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let frame = socket.next().await.unwrap().unwrap();
