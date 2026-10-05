@@ -10050,7 +10050,7 @@ fn render_replication_peers(
             if peer.projection_comparison_waiting {
                 let _ = writeln!(
                     output,
-                    "  same envelopes (measured {}); projection comparison waits for a newer build",
+                    "  same envelopes (measured {}); projection comparison waits for a settled exchange or a compatible build",
                     relative_time(sync.measured_at_unix_ms, now)
                 );
             } else if peer.graph_digest.as_deref() == Some(local_graph_digest) {
@@ -10247,8 +10247,8 @@ async fn run_replication(
                 "graph": {
                     "local": status.graph_digest,
                     "remote": remote.graph_digest,
-                    "equal": if remote.projection_digests.is_empty() { None } else { Some(remote.graph_digest.as_deref() == Some(status.graph_digest.as_str())) },
-                    "coverage": if remote.projection_digests.is_empty() { "legacy-only" } else { "all-shared-projections" },
+                    "equal": if remote.projection_digests.is_empty() || remote.projection_comparison_waiting { None } else { Some(remote.graph_digest.as_deref() == Some(status.graph_digest.as_str())) },
+                    "coverage": if remote.projection_digests.is_empty() { "legacy-only" } else if remote.projection_comparison_waiting { "pending" } else { "all-shared-projections" },
                 },
             });
             if json_output {
@@ -10272,6 +10272,8 @@ async fn run_replication(
                 "graph\t{}\t{}\t{}",
                 if remote.projection_digests.is_empty() {
                     "unverified (legacy peer)"
+                } else if remote.projection_comparison_waiting {
+                    "pending comparison"
                 } else if remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()) {
                     "equal"
                 } else {
@@ -21624,7 +21626,7 @@ mod tests {
         peer.sync = Some(Default::default());
         let rendered = render_replication_peers(&[peer], "local-graph", 0);
         assert!(rendered.contains("same envelopes"));
-        assert!(rendered.contains("projection comparison waits for a newer build"));
+        assert!(rendered.contains("projection comparison waits for a settled exchange or a compatible build"));
         assert!(!rendered.contains("graphs differ"));
         assert!(!rendered.contains("diverged"));
     }

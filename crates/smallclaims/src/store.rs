@@ -6248,6 +6248,7 @@ impl Store {
         };
         let waiting_claims = count("unknown")?;
         let registry_digest = self.runtime.schema_digest();
+        let projection_deferred = self.replication_projection_deferred();
         let now = now_ms();
         let sync = self.replication_peer_sync_held(
             configured_peers,
@@ -6353,6 +6354,7 @@ impl Store {
                 .map(|value| serde_json::from_str(&value))
                 .transpose()?
                 .unwrap_or_default();
+            let mut inventory_aligned = status.projection_digests.is_empty();
             if !status.projection_digests.is_empty() {
                 status.graph_digest = Some(projection_digest::root(&status.projection_digests));
                 let peer_inventory: Option<String> = connection
@@ -6362,8 +6364,10 @@ impl Store {
                         |row| row.get(0),
                     )
                     .optional()?;
-                if peer_inventory.as_deref() == Some(snapshot.inventory.digest.as_str())
-                    && !self.replication_projection_deferred()
+                inventory_aligned =
+                    peer_inventory.as_deref() == Some(snapshot.inventory.digest.as_str());
+                if inventory_aligned
+                    && !projection_deferred
                     && !unsealed_local
                     && status.schema_digest.as_deref() == Some(registry_digest.as_str())
                     && waiting_claims == 0
@@ -6375,6 +6379,10 @@ impl Store {
                 }
             }
             status.projection_comparison_waiting = waiting_claims != 0
+                || unsealed_local
+                || projection_deferred
+                || !inventory_aligned
+                || (!status.projection_digests.is_empty() && status.schema_digest.is_none())
                 || status
                     .schema_digest
                     .as_deref()
