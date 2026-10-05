@@ -1,7 +1,7 @@
 # Generated file - DO NOT EDIT
 # Source: perf.yml.genie.ts
 
-name: Performance paired mail backlog
+name: Performance mail backlog same-source profile
 
 on:
   workflow_dispatch:
@@ -114,7 +114,8 @@ jobs:
               report = out / f'"'"'paired-{name}.json'"'"'
               env = dict(os.environ, ST_LOAD_GATE='"'"'1'"'"', ST_LOAD_SECONDS='"'"'300'"'"', ST_LOAD_REPORT=str(report),
                          ST_LOAD_BASELINE=str(root / '"'"'perf-baseline'"'"'),
-                         ST_BENCH_DIR=str(root / '"'"'st-bench'"'"'), TMPDIR=str(root))
+                         ST_BENCH_DIR=str(root / '"'"'st-bench'"'"'), TMPDIR=str(root),
+                         ST3_PROFILE_DIR=str(out / f'"'"'profile-{name}'"'"'), ST3_PROFILE_SLOW_MS='"'"'5'"'"')
               env.pop('"'"'ST_AGENT'"'"', None)
               start = time.monotonic()
               with (out / f'"'"'paired-{name}.log'"'"').open('"'"'w'"'"') as log:
@@ -141,7 +142,7 @@ jobs:
               failures.append({'"'"'absolute_cpu_or_request_failure'"'"': True})
           result = {'"'"'main'"'"': main, '"'"'head'"'"': head, '"'"'direct_pair_failures'"'"': failures,
                     '"'"'runner_name'"'"': os.environ.get('"'"'RUNNER_NAME'"'"'), '"'"'measurement_order'"'"': ['"'"'main'"'"', '"'"'head'"'"'],
-                    '"'"'note'"'"': '"'"'Direct pair uses unchanged 20% ratio and 5/50 ms slack. Original saved-baseline test exits are retained; this diagnostic does not alter or waive the CI gates.'"'"'}
+                    '"'"'note'"'"': '"'"'Identical-source profiling control. Both source SHAs are equal; existing profiler is enabled for both. This diagnostic identifies latency costs and variability; it is not a substitute for unprofiled main/head gates.'"'"'}
           (out / '"'"'paired-comparison.json'"'"').write_text(json.dumps(result, indent=2) + '"'"'\n'"'"')
           print(json.dumps({'"'"'failures'"'"': failures}, indent=2), flush=True)
           sys.exit(bool(failures))
