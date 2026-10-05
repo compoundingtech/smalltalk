@@ -45,6 +45,9 @@ replacement are whole `snapshot` frames; replace the old window rather than merg
 Ordinary changes use the existing revisioned upsert/remove frames. Reconnect reads a fresh
 checkpointed snapshot, not replay.
 
+The focused GET participates in the daemon's scale-dependent cost probes with the
+existing paired agent fixture and unchanged read-growth budgets.
+
 The focused resource retains the established todo, usage and leased running-subagent
 contracts. Fleet agent rows still carry their full todo and running subagents unchanged.
 `todo: null` and `plan: null` mean no accepted observation, not an empty list. An accepted

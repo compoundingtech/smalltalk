@@ -584,6 +584,10 @@ const PROBES: &[Probe] = &[
     get("GET /v1/client/agents", "/v1/client/agents"),
     get("GET /v1/client/agents/{*id}", "/v1/client/agents/{agent}"),
     get(
+        "GET /v1/client/harness/{*id}",
+        "/v1/client/harness/{agent}",
+    ),
+    get(
         "GET /v1/client/agent-workspaces/{*id}",
         "/v1/client/agent-workspaces/{agent}",
     ),
