@@ -4,9 +4,10 @@
 //! these through `smallclaims::store::Runtime`.
 //!
 //! `doc/fleet/smalltalk/checkpoint-design` is the design. Each rule keeps, within a slot, the
-//! claims a reader's answer depends on. It drops a claim only when a later kept claim of the same
-//! slot replaces it for every fold that reads the kind (the claim's witness). The planner is a
-//! pure function of the claims before the cut, in canonical order, so every node that holds the
+//! claims a reader's answer depends on. Generic folds require a later kept claim of the same
+//! slot to replace every use (the claim's witness). Self-contained input audit snapshots also
+//! permit whole closed-session expiry outside their explicit read window. The planner is a
+//! pure function of the claims before the cut, in canonical order, so every node holding the
 //! same claims drops the same ones.
 
 use super::*;
@@ -22,8 +23,10 @@ use smallclaims::store::checkpoint_agreement::*;
 /// one initial definition when members independently create the same scheduled occurrence.
 /// Version 8 preserves quota source observations: a later claim can report an older or lower
 /// reading, so it no longer witnesses the reading the account fold selects. Version 9 preserves
-/// bounded observed status history and the beginning of the current state.
-pub const RULES_VERSION: u32 = 9;
+/// bounded observed status history and the beginning of the current state. Version 10 proves
+/// owner input audit snapshots and makes closed sessions older than thirty days eligible for
+/// guarded trimming, without promising physical erasure.
+pub const RULES_VERSION: u32 = 10;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -77,11 +80,12 @@ harness.limits keep=all-source-observations
 resource.observed actor=null observer=set slot=subject keep=newest
 render.applied slot=subject keep=newest min-age-before-cut=5d
 runtime.readiness-deadline-reached slot=subject keep=newest min-age-before-cut=5d
+terminal.input-session slot=subject keep=opening,highest-ordinal while-live-or-closed-within-30d-before-cut;expired-closed=eligible-all subject-proof=retained-latest-snapshot-and-opening-source-key
 sealed=every-admitted-claim-of-an-envelope-before-the-cut-but-repaired-originals
 proof=the-sealed-claims-and-the-blobs-they-reference
-guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope
-witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
-carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
+guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope,expired-input-session-whole-session
+witness=generic-every-field-set-again-by-a-later-kept-claim-of-the-slot;terminal.input-session=self-contained-cumulative-snapshot-and-explicit-retention
+carriers=every-rule-but-loop.state-and-terminal.input-session-keeps-the-newest-carrier-of-each-field";
 
 /// The digest of the rules this build applies.
 pub fn rules_digest() -> String {
@@ -101,6 +105,7 @@ pub(crate) enum Rule {
     Deferral,
     UsageSeries,
     UsageCumulative,
+    InputSession,
 }
 
 pub(crate) fn fields(claim: &ClaimRecord) -> Option<&serde_json::Map<String, Value>> {
@@ -131,6 +136,7 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
         slot
     };
     match claim.kind.as_str() {
+        "terminal.input-session" => Some((Rule::InputSession, slot(&[]))),
         // A legacy observation without an incarnation falls back to store index comparisons in
         // `current_harness_at`, so it stays.
         "harness.observed" => field_str(claim, "incarnation_id")
@@ -278,7 +284,9 @@ pub(crate) fn harness_keep(claims: &[&ClaimRecord]) -> BTreeSet<usize> {
         }
     }
     if let Some(last_state) = claims.last().and_then(|claim| state(claim)) {
-        let start = claims.iter().rposition(|claim| state(claim).as_deref() != Some(last_state.as_str()))
+        let start = claims
+            .iter()
+            .rposition(|claim| state(claim).as_deref() != Some(last_state.as_str()))
             .map_or(0, |position| position + 1);
         keep.insert(start);
     }
@@ -417,27 +425,49 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
     let mut status_seats: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for index in first.iter().copied() {
         let claim = &claims[index].claim;
-        if matches!(claim.kind.as_str(), "harness.observed" | "runtime.observed" | "harness.diagnostic") {
+        if matches!(
+            claim.kind.as_str(),
+            "harness.observed" | "runtime.observed" | "harness.diagnostic"
+        ) {
             status_seats.entry(&claim.subject).or_default().push(index);
         }
     }
     let mut status_keep = BTreeSet::new();
     for members in status_seats.values() {
-        let sources = members.iter().map(|index| &claims[*index].claim).collect::<Vec<_>>();
+        let sources = members
+            .iter()
+            .map(|index| &claims[*index].claim)
+            .collect::<Vec<_>>();
         let positions = seat_status::transition_positions(&sources);
-        for position in positions.into_iter().rev()
-            .filter(|position| seat_status::observation_time(sources[*position]) >= cut.saturating_sub(seat_status::WINDOW_MS))
-            .take(seat_status::MAX_TRANSITIONS) {
+        for position in positions
+            .into_iter()
+            .rev()
+            .filter(|position| {
+                seat_status::observation_time(sources[*position])
+                    >= cut.saturating_sub(seat_status::WINDOW_MS)
+            })
+            .take(seat_status::MAX_TRANSITIONS)
+        {
             status_keep.insert(members[position]);
             // A restored prompt exposes the most recent underlying harness state. Its source
             // can be hidden while the prompt is active, but still witnesses this transition.
             let source = sources[position];
-            if source.kind == "harness.diagnostic" && matches!(field_str(source, "code"), Some("provider-auth-restored" | "provider-update-restored"))
+            if source.kind == "harness.diagnostic"
+                && matches!(
+                    field_str(source, "code"),
+                    Some("provider-auth-restored" | "provider-update-restored")
+                )
                 && let Some(dependency) = sources[..position].iter().rposition(|claim| {
                     claim.kind == "harness.observed"
                         && field_str(claim, "incarnation_id") == field_str(source, "incarnation_id")
-                        && fields(claim).and_then(|fields| fields.get("status_transition")).and_then(Value::as_bool) != Some(false)
-                }) { status_keep.insert(members[dependency]); }
+                        && fields(claim)
+                            .and_then(|fields| fields.get("status_transition"))
+                            .and_then(Value::as_bool)
+                            != Some(false)
+                })
+            {
+                status_keep.insert(members[dependency]);
+            }
         }
     }
     let closed_requests = claims
@@ -448,6 +478,8 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
                 .map(|request| (sealed_claim.claim.subject.clone(), request.to_owned()))
         })
         .collect::<BTreeSet<_>>();
+    // Expiry may remove a whole session, never its closure while a protected opening remains.
+    let mut expired_sessions = Vec::new();
     for ((rule, slot), members) in &slots {
         let slot_claims = members
             .iter()
@@ -459,6 +491,38 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
             Rule::HarnessObserved => harness_keep(&slot_claims),
             Rule::UsageSeries => usage_series_keep(&slot_claims, cut),
             Rule::UsageCumulative => usage_cumulative_keep(&slot_claims),
+            Rule::InputSession => {
+                let latest = slot_claims.iter().enumerate().max_by_key(|(_, claim)| {
+                    fields(claim)
+                        .and_then(|fields| fields.get("ordinal"))
+                        .and_then(Value::as_u64)
+                });
+                let expired = latest.is_some_and(|(_, claim)| {
+                    matches!(field_str(claim, "event"), Some("closed" | "interrupted"))
+                        && fields(claim)
+                            .and_then(|fields| fields.get("observed_at_unix_ms"))
+                            .and_then(Value::as_u64)
+                            .is_some_and(|at| {
+                                u128::from(at)
+                                    < cut.saturating_sub(u128::from(input_sessions::RETENTION_MS))
+                            })
+                });
+                if expired {
+                    expired_sessions.push(members.clone());
+                    BTreeSet::new()
+                } else {
+                    let opening = slot_claims.iter().enumerate().min_by_key(|(_, claim)| {
+                        fields(claim)
+                            .and_then(|fields| fields.get("ordinal"))
+                            .and_then(Value::as_u64)
+                    });
+                    latest
+                        .into_iter()
+                        .chain(opening)
+                        .map(|(position, _)| position)
+                        .collect()
+                }
+            }
             Rule::LoopState => loop_keep(&slot_claims),
             Rule::Deferral => {
                 let request = slot.last().cloned().unwrap_or_default();
@@ -470,7 +534,7 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
             }
         };
         let mut keep = keep;
-        if *rule != Rule::LoopState {
+        if !matches!(rule, Rule::LoopState | Rule::InputSession) {
             keep.extend(field_carriers(&slot_claims));
         }
         for (position, index) in members.iter().enumerate() {
@@ -556,7 +620,12 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
     loop {
         let mut changed = false;
         // Newest first, so a claim kept back here can witness the ones before it.
-        for members in slots.values() {
+        for ((rule, _), members) in &slots {
+            // Audit snapshots carry complete identity and cumulative counts. Their explicit
+            // ordinal/retention rule replaces the generic later-field-carrier witness.
+            if *rule == Rule::InputSession {
+                continue;
+            }
             let mut later = BTreeSet::new();
             let mut later_claims = 0;
             for index in members.iter().rev() {
@@ -575,7 +644,11 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
                 }
             }
         }
-        for members in operations.values().chain(envelope_claims.values()) {
+        for members in operations
+            .values()
+            .chain(envelope_claims.values())
+            .chain(expired_sessions.iter())
+        {
             if members.iter().any(|index| dropped[*index])
                 && members.iter().any(|index| !dropped[*index])
             {
@@ -709,6 +782,41 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
 /// Every answer about `subject` that a checkpoint must leave unchanged, as of the cut.
 pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128) -> Result<Value> {
     let mut answers = serde_json::Map::new();
+    if subject.starts_with("input-session/") {
+        let latest = input_sessions::latest(connection, subject)?;
+        let record = latest
+            .as_ref()
+            .map(|claim| {
+                serde_json::from_value::<st3_schema::input_sessions::InputSessionRecord>(
+                    claim.body["fields"].clone(),
+                )
+            })
+            .transpose()?;
+        let retained_from = u64::try_from(cut)
+            .unwrap_or(u64::MAX)
+            .saturating_sub(input_sessions::RETENTION_MS);
+        let retained = record
+            .as_ref()
+            .is_some_and(|record| input_sessions::visible(record, retained_from));
+        let opening = if retained {
+            let id = connection
+                .query_row(
+                    "SELECT id FROM claims WHERE kind='terminal.input-session' AND subject=?1
+                 ORDER BY json_extract(body,'$.fields.ordinal') ASC LIMIT 1",
+                    [subject],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            id.map(|id| smallclaims::store::canonical::claim_key(connection, &id))
+                .transpose()?
+        } else {
+            None
+        };
+        return Ok(json!({
+            "input_session": if retained { record } else { None },
+            "opening_source": opening,
+        }));
+    }
     if subject.starts_with("glass/") {
         let person = st3_schema::glasses::owner(subject).map_err(anyhow::Error::new)?;
         answers.insert(
@@ -731,9 +839,10 @@ pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128)
     if subject.starts_with("agent/") {
         // Completeness metadata may change deliberately when old claims are tombstoned;
         // every transition still inside the published retention bound must stay identical.
-        answers.insert("status_history".into(), seat_status::history_at(
-            connection, subject, cut, i64::MAX as u64,
-        )?["items"].clone());
+        answers.insert(
+            "status_history".into(),
+            seat_status::history_at(connection, subject, cut, i64::MAX as u64)?["items"].clone(),
+        );
     }
     // Which claim a status shows, its origin, and whether its runtime observations conflict.
     answers.insert(

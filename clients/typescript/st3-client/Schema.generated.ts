@@ -931,11 +931,21 @@ export const CollectionName = /*#__PURE__*/ (() => Schema.Literals(["missions","
 export type CollectionName = typeof CollectionName.Type
 export type CollectionNameEncoded = typeof CollectionName.Encoded
 
+export const TerminalInputData = /*#__PURE__*/ (() => Schema.Union([
+  Schema.Struct({ "text": Schema.String.check(Schema.isMinLength(1)) }),
+  Schema.Struct({ "bytes_b64": Schema.String.check(Schema.isMinLength(1)) })
+], { mode: "oneOf" }).annotate({ identifier: "TerminalInputData" }))()
+export type TerminalInputData = typeof TerminalInputData.Type
+export type TerminalInputDataEncoded = typeof TerminalInputData.Encoded
+
 export const CollectionCommand = /*#__PURE__*/ (() => Schema.Union([
   Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": CollectionName, "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
   Schema.Struct({ "capability": Schema.String, "collection": Schema.Literal("terminal"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "incarnation": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "kind": Schema.Literal("subscribe"), "terminal": Id }),
   Schema.Struct({ "collection": Schema.Literal("conversation"), "conversation": Id, "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe") }),
-  Schema.Struct({ "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("unsubscribe") })
+  Schema.Struct({ "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("unsubscribe") }),
+  Schema.Struct({ "follow": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("input-open") }),
+  Schema.Struct({ "data": TerminalInputData, "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("input"), "seq": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) }),
+  Schema.Struct({ "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("input-close") })
 ], { mode: "oneOf" }).annotate({ identifier: "CollectionCommand" }))()
 export type CollectionCommand = typeof CollectionCommand.Type
 export type CollectionCommandEncoded = typeof CollectionCommand.Encoded
@@ -1612,6 +1622,10 @@ export const Snapshot = /*#__PURE__*/ (() => Schema.Struct({
 export type Snapshot = typeof Snapshot.Type
 export type SnapshotEncoded = typeof Snapshot.Encoded
 
+export const TerminalInputClosedReason = /*#__PURE__*/ (() => Schema.Literals(["incarnation-changed","revoked","detached","gap","rejected"]).annotate({ identifier: "TerminalInputClosedReason" }))()
+export type TerminalInputClosedReason = typeof TerminalInputClosedReason.Type
+export type TerminalInputClosedReasonEncoded = typeof TerminalInputClosedReason.Encoded
+
 export const TerminalFacts = /*#__PURE__*/ (() => Schema.Struct({
   "clients": optionalKey(Schema.Struct({ "attached": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), "read_only": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), "total": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) })),
   "columns": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))),
@@ -1832,7 +1846,10 @@ export const CollectionFrame = /*#__PURE__*/ (() => Schema.Union([
   Schema.Struct({ "collection": Schema.Literal("terminal"), "id": Schema.String, "kind": Schema.Literal("screen"), "snapshot": Snapshot, "value": TerminalScreen }),
   Schema.Struct({ "collection": Schema.Literal("conversation"), "has_more": optionalKey(Schema.Boolean), "id": Schema.String, "items": Schema.Array(TimelineEntry), "kind": Schema.Literal("conversation"), "replace": Schema.Boolean, "session_id": Id }),
   Schema.Struct({ "code": optionalKey(Schema.String), "collection": optionalKey(Schema.String), "id": Schema.String, "kind": Schema.Literal("resync"), "message": optionalKey(Schema.String), "retryable": optionalKey(Schema.Boolean) }),
-  Schema.Struct({ "code": optionalKey(Schema.String), "collection": optionalKey(Schema.String), "id": optionalKey(Schema.String), "kind": Schema.Literal("error"), "message": Schema.String, "retryable": optionalKey(Schema.Boolean) })
+  Schema.Struct({ "code": optionalKey(Schema.String), "collection": optionalKey(Schema.String), "id": optionalKey(Schema.String), "kind": Schema.Literal("error"), "message": Schema.String, "retryable": optionalKey(Schema.Boolean) }),
+  Schema.Struct({ "follow": Schema.String, "id": Schema.String, "kind": Schema.Literal("input-opened"), "next_seq": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) }),
+  Schema.Struct({ "id": Schema.String, "kind": Schema.Literal("input-ack"), "seq": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) }),
+  Schema.Struct({ "id": Schema.String, "kind": Schema.Literal("input-closed"), "message": Schema.String, "reason": TerminalInputClosedReason })
 ], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("kind")).annotate({ identifier: "CollectionFrame" }))()
 export type CollectionFrame = typeof CollectionFrame.Type
 export type CollectionFrameEncoded = typeof CollectionFrame.Encoded
@@ -2042,6 +2059,56 @@ export const SubjectDefinition = /*#__PURE__*/ (() => Schema.Struct({
 export type SubjectDefinition = typeof SubjectDefinition.Type
 export type SubjectDefinitionEncoded = typeof SubjectDefinition.Encoded
 
+export const InputSessionCloseReason = /*#__PURE__*/ (() => Schema.Literals(["client-close","socket-disconnected","replaced","gap","rejected","detached","incarnation-changed","revoked","audit-unavailable","owner-restarted"]).annotate({ identifier: "InputSessionCloseReason" }))()
+export type InputSessionCloseReason = typeof InputSessionCloseReason.Type
+export type InputSessionCloseReasonEncoded = typeof InputSessionCloseReason.Encoded
+
+export const InputSessionEvent = /*#__PURE__*/ (() => Schema.Literals(["opened","checkpoint","closed","interrupted"]).annotate({ identifier: "InputSessionEvent" }))()
+export type InputSessionEvent = typeof InputSessionEvent.Type
+export type InputSessionEventEncoded = typeof InputSessionEvent.Encoded
+
+export const TerminalInputAuditRecord = /*#__PURE__*/ (() => Schema.Struct({
+  "attachment": Schema.String.check(Schema.isPattern(new RegExp("^[a-z][a-z0-9-]*/[^\\s\\u0000-\\u001f\\u007f]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(512)),
+  "attachment_claim": Schema.String.check(Schema.isPattern(new RegExp("^[^\\s\\u0000-\\u001f\\u007f]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(512)),
+  "authority_actor": Schema.String.check(Schema.isPattern(new RegExp("^(?:person|agent)/[^\\s\\u0000-\\u001f\\u007f]+$", "u"))).check(Schema.isMaxLength(512)),
+  "device_actor": Schema.String.check(Schema.isPattern(new RegExp("^[^\\s\\u0000-\\u001f\\u007f]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(512)),
+  "device_id": Schema.OptionFromNullOr(Schema.String.check(Schema.isPattern(new RegExp("^[^\\s\\u0000-\\u001f\\u007f]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(512))),
+  "event": InputSessionEvent,
+  "incarnation": Schema.String.check(Schema.isPattern(new RegExp("^[^\\s\\u0000-\\u001f\\u007f]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(512)),
+  "observed_at_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(9007199254740991)),
+  "opened_at_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(9007199254740991)),
+  "ordinal": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(9007199254740991)),
+  "owner": Schema.String.check(Schema.isPattern(new RegExp("^[^/\\s\\u0000-\\u001f\\u007f]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(512)),
+  "owner_epoch": Schema.String.check(Schema.isPattern(new RegExp("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "u"))),
+  "pairing_claim": Schema.OptionFromNullOr(Schema.String.check(Schema.isPattern(new RegExp("^[^\\s\\u0000-\\u001f\\u007f]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(512))),
+  "person": Schema.OptionFromNullOr(Schema.String.check(Schema.isPattern(new RegExp("^person/[^\\s\\u0000-\\u001f\\u007f]+$", "u"))).check(Schema.isMaxLength(512))),
+  "reason": Schema.OptionFromNullOr(InputSessionCloseReason),
+  "session_id": Schema.String.check(Schema.isPattern(new RegExp("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "u"))),
+  "successful_batches": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(9007199254740991)),
+  "successful_send_bytes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(9007199254740991)),
+  "terminal": Schema.String.check(Schema.isPattern(new RegExp("^[a-z][a-z0-9-]*/[^\\s\\u0000-\\u001f\\u007f]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(512)),
+  "uncertain_handoff": Schema.Boolean,
+  "version": Schema.Literal(1)
+}).annotate({ identifier: "TerminalInputAuditRecord" }))()
+export type TerminalInputAuditRecord = typeof TerminalInputAuditRecord.Type
+export type TerminalInputAuditRecordEncoded = typeof TerminalInputAuditRecord.Encoded
+
+/** Latest metadata snapshot per session; no input content or replay. */
+export const TerminalInputAuditHistory = /*#__PURE__*/ (() => Schema.Struct({
+  "api_version": Schema.Literal("st3.client.v0"),
+  /** Explicit completeness for the retained read scope; absent history is not proof of fleet-wide zero input. */
+  "complete": Schema.Boolean.annotate({ description: "Explicit completeness for the retained read scope; absent history is not proof of fleet-wide zero input." }),
+  "items": Schema.Array(TerminalInputAuditRecord).check(Schema.isMaxLength(200)),
+  "kind": Schema.Literal("terminal-input-audit"),
+  "next_cursor": Schema.OptionFromNullOr(Schema.String),
+  "owner_coverage": Schema.Array(Schema.String),
+  /** Read eligibility cutoff in Unix milliseconds, not a hard-erasure guarantee. */
+  "retained_from": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(9007199254740991)).annotate({ description: "Read eligibility cutoff in Unix milliseconds, not a hard-erasure guarantee." }),
+  "terminal": Schema.String.check(Schema.isMinLength(1))
+}).annotate({ identifier: "TerminalInputAuditHistory", description: "Latest metadata snapshot per session; no input content or replay." }))()
+export type TerminalInputAuditHistory = typeof TerminalInputAuditHistory.Type
+export type TerminalInputAuditHistoryEncoded = typeof TerminalInputAuditHistory.Encoded
+
 export const TimelinePage = /*#__PURE__*/ (() => Schema.Struct({
   "items": Schema.Array(TimelineEntry),
   "kind": Schema.Literal("timeline-page"),
@@ -2102,7 +2169,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, TerminalInputAuditHistory, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded
@@ -2154,8 +2221,8 @@ export const PairingBegin = /*#__PURE__*/ (() => Schema.Struct({
   "device_name": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(120)),
   "full_control": optionalKey(Schema.Boolean),
   "person_id": Schema.String.check(Schema.isPattern(new RegExp("^person/[^/]+$", "u"))),
-  /** Narrows the default limited grant. Must not be combined with full_control. */
-  "scopes": optionalKey(Schema.Array(Schema.Literals(["read.projections","read.glasses","control.glasses","terminal.read","control.attention","control.launches"])).check(Schema.isMinLength(1)).check(Schema.isUnique())).annotate({ description: "Narrows the default limited grant. Must not be combined with full_control." })
+  /** Selects an explicit grant from limited scopes plus the opt-in fleet auditor scope. Must not be combined with full_control; terminal.audit.read is never granted by defaults or full_control. */
+  "scopes": optionalKey(Schema.Array(Schema.Literals(["read.projections","read.glasses","control.glasses","terminal.read","control.attention","control.launches","terminal.audit.read"])).check(Schema.isMinLength(1)).check(Schema.isUnique())).annotate({ description: "Selects an explicit grant from limited scopes plus the opt-in fleet auditor scope. Must not be combined with full_control; terminal.audit.read is never granted by defaults or full_control." })
 }).annotate({ identifier: "PairingBegin" }))()
 export type PairingBegin = typeof PairingBegin.Type
 export type PairingBeginEncoded = typeof PairingBegin.Encoded

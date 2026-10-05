@@ -11,6 +11,52 @@
     { "$ref": "#/$defs/PairingComplete" }
   ],
   "$defs": {
+    "InputSessionEvent": {"type": "string", "enum": ["opened", "checkpoint", "closed", "interrupted"]},
+    "InputSessionCloseReason": {"type": "string", "enum": ["client-close", "socket-disconnected", "replaced", "gap", "rejected", "detached", "incarnation-changed", "revoked", "audit-unavailable", "owner-restarted"]},
+    "TerminalInputAuditRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "ordinal", "event", "session_id", "owner", "owner_epoch", "terminal", "incarnation", "attachment", "attachment_claim", "device_id", "device_actor", "authority_actor", "person", "pairing_claim", "opened_at_unix_ms", "observed_at_unix_ms", "successful_send_bytes", "successful_batches", "uncertain_handoff", "reason"],
+      "properties": {
+        "version": {"const": 1, "maximum": 9007199254740991},
+        "ordinal": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "event": {"$ref": "#/$defs/InputSessionEvent"},
+        "session_id": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+        "owner": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^/\\s\\u0000-\\u001f\\u007f]+$"},
+        "owner_epoch": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+        "terminal": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[a-z][a-z0-9-]*/[^\\s\\u0000-\\u001f\\u007f]+$"},
+        "incarnation": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\s\\u0000-\\u001f\\u007f]+$"},
+        "attachment": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[a-z][a-z0-9-]*/[^\\s\\u0000-\\u001f\\u007f]+$"},
+        "attachment_claim": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\s\\u0000-\\u001f\\u007f]+$"},
+        "device_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 512, "pattern": "^[^\\s\\u0000-\\u001f\\u007f]+$"},
+        "device_actor": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\s\\u0000-\\u001f\\u007f]+$"},
+        "authority_actor": {"type": "string", "maxLength": 512, "pattern": "^(?:person|agent)/[^\\s\\u0000-\\u001f\\u007f]+$"},
+        "person": {"type": ["string", "null"], "maxLength": 512, "pattern": "^person/[^\\s\\u0000-\\u001f\\u007f]+$"},
+        "pairing_claim": {"type": ["string", "null"], "minLength": 1, "maxLength": 512, "pattern": "^[^\\s\\u0000-\\u001f\\u007f]+$"},
+        "opened_at_unix_ms": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "observed_at_unix_ms": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "successful_send_bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "successful_batches": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "uncertain_handoff": {"type": "boolean"},
+        "reason": {"oneOf": [{"$ref": "#/$defs/InputSessionCloseReason"}, {"type": "null"}]}
+      }
+    },
+    "TerminalInputAuditHistory": {
+      "description": "Latest metadata snapshot per session; no input content or replay.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "kind", "terminal", "items", "retained_from", "complete", "next_cursor", "owner_coverage"],
+      "properties": {
+        "api_version": {"const": "st3.client.v0"},
+        "kind": {"const": "terminal-input-audit"},
+        "terminal": {"type": "string", "minLength": 1},
+        "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/TerminalInputAuditRecord"}},
+        "retained_from": {"type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "Read eligibility cutoff in Unix milliseconds, not a hard-erasure guarantee."},
+        "complete": {"type": "boolean", "description": "Explicit completeness for the retained read scope; absent history is not proof of fleet-wide zero input."},
+        "next_cursor": {"type": ["string", "null"]},
+        "owner_coverage": {"type": "array", "items": {"type": "string"}}
+      }
+    },
     "ConversationSearchHit": {"type": "object", "additionalProperties": false, "required": ["conversation_id", "entry_id", "agent_id", "timestamp", "entry_type", "excerpt"], "properties": {"conversation_id": {"$ref": "#/$defs/Id"}, "entry_id": {"$ref": "#/$defs/Id"}, "agent_id": {"type": ["string", "null"]}, "timestamp": {"$ref": "#/$defs/Timestamp"}, "entry_type": {"type": "string"}, "excerpt": {"type": "string", "maxLength": 512}}},
     "ConversationSearch": {"type": "object", "additionalProperties": false, "required": ["kind", "items", "page", "indexed_at", "host_id", "incomplete_sources", "refreshing"], "properties": {"kind": {"const": "conversation-search"}, "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/ConversationSearchHit"}}, "page": {"$ref": "#/$defs/PageInfo"}, "indexed_at": {"$ref": "#/$defs/Timestamp"}, "host_id": {"$ref": "#/$defs/Id"}, "incomplete_sources": {"type": "array", "items": {"type": "string"}}, "refreshing": {"type": "boolean"}}},
 
@@ -116,6 +162,7 @@
             { "$ref": "#/$defs/TimelinePage" },
             { "$ref": "#/$defs/ConversationChanges" },
             { "$ref": "#/$defs/ConversationSearch" },
+            { "$ref": "#/$defs/TerminalInputAuditHistory" },
             { "$ref": "#/$defs/EventPage" },
             { "$ref": "#/$defs/ActionResult" },
             { "$ref": "#/$defs/PairingChallenge" },
@@ -1979,8 +2026,8 @@
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "description": "Narrows the default limited grant. Must not be combined with full_control.",
-          "items": { "type": "string", "enum": ["read.projections", "read.glasses", "control.glasses", "terminal.read", "control.attention", "control.launches"] }
+          "description": "Selects an explicit grant from limited scopes plus the opt-in fleet auditor scope. Must not be combined with full_control; terminal.audit.read is never granted by defaults or full_control.",
+          "items": { "type": "string", "enum": ["read.projections", "read.glasses", "control.glasses", "terminal.read", "control.attention", "control.launches", "terminal.audit.read"] }
         }
       }
     },
@@ -2187,6 +2234,13 @@
       }
     },
     "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses"] },
+    "TerminalInputData": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["text"], "properties": { "text": { "type": "string", "minLength": 1 } } },
+        { "type": "object", "additionalProperties": false, "required": ["bytes_b64"], "properties": { "bytes_b64": { "type": "string", "minLength": 1 } } }
+      ]
+    },
+    "TerminalInputClosedReason": { "enum": ["incarnation-changed", "revoked", "detached", "gap", "rejected"] },
     "CollectionCommand": {
       "oneOf": [
         {
@@ -2232,6 +2286,33 @@
           "additionalProperties": false,
           "required": ["kind", "id"],
           "properties": { "kind": { "const": "unsubscribe" }, "id": { "type": "string", "minLength": 1, "maxLength": 128 } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "follow"],
+          "properties": {
+            "kind": { "const": "input-open" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "follow": { "type": "string", "minLength": 1, "maxLength": 128 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "seq", "data"],
+          "properties": {
+            "kind": { "const": "input" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "seq": { "type": "integer", "minimum": 0 },
+            "data": { "$ref": "#/$defs/TerminalInputData" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": { "kind": { "const": "input-close" }, "id": { "type": "string", "minLength": 1, "maxLength": 128 } }
         }
       ]
     },
@@ -2316,6 +2397,38 @@
             "code": { "type": "string" },
             "message": { "type": "string" },
             "retryable": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "follow", "next_seq"],
+          "properties": {
+            "kind": { "const": "input-opened" },
+            "id": { "type": "string" },
+            "follow": { "type": "string" },
+            "next_seq": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "seq"],
+          "properties": {
+            "kind": { "const": "input-ack" },
+            "id": { "type": "string" },
+            "seq": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "reason", "message"],
+          "properties": {
+            "kind": { "const": "input-closed" },
+            "id": { "type": "string" },
+            "reason": { "$ref": "#/$defs/TerminalInputClosedReason" },
+            "message": { "type": "string" }
           }
         }
       ]

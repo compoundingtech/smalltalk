@@ -4,6 +4,62 @@ import Foundation
 public let st3ClientAPIVersion = "st3.client.v0"
 public let st3ClientTerminalSubprotocol = "st3.client.terminal.v0"
 
+public enum InputSessionEvent: String, Codable, Sendable {
+    case opened, checkpoint, closed, interrupted
+}
+public enum InputSessionCloseReason: String, Codable, Sendable {
+    case clientClose = "client-close", socketDisconnected = "socket-disconnected"
+    case replaced, gap, rejected, detached
+    case incarnationChanged = "incarnation-changed", revoked
+    case auditUnavailable = "audit-unavailable", ownerRestarted = "owner-restarted"
+}
+public struct TerminalInputAuditRecord: Codable, Sendable, Equatable {
+    public let version: UInt32
+    public let ordinal: UInt64
+    public let event: InputSessionEvent
+    public let sessionID: String
+    public let owner: String
+    public let ownerEpoch: String
+    public let terminal: String
+    public let incarnation: String
+    public let attachment: String
+    public let attachmentClaim: String
+    public let deviceID: String?
+    public let deviceActor: String
+    public let authorityActor: String
+    public let person: String?
+    public let pairingClaim: String?
+    public let openedAtUnixMS: UInt64
+    public let observedAtUnixMS: UInt64
+    public let successfulSendBytes: UInt64
+    public let successfulBatches: UInt64
+    public let uncertainHandoff: Bool
+    public let reason: InputSessionCloseReason?
+    enum CodingKeys: String, CodingKey {
+        case version, ordinal, event, sessionID = "session_id", owner, ownerEpoch = "owner_epoch"
+        case terminal, incarnation, attachment, attachmentClaim = "attachment_claim"
+        case deviceID = "device_id", deviceActor = "device_actor", person, pairingClaim = "pairing_claim"
+        case authorityActor = "authority_actor"
+        case openedAtUnixMS = "opened_at_unix_ms", observedAtUnixMS = "observed_at_unix_ms"
+        case successfulSendBytes = "successful_send_bytes", successfulBatches = "successful_batches"
+        case uncertainHandoff = "uncertain_handoff", reason
+    }
+}
+public struct TerminalInputAuditHistory: Codable, Sendable, Equatable {
+    public let apiVersion: String
+    public let kind: String
+    public let terminal: String
+    public let items: [TerminalInputAuditRecord]
+    public let retainedFrom: UInt64
+    public let complete: Bool
+    public let nextCursor: String?
+    public let ownerCoverage: [String]
+    enum CodingKeys: String, CodingKey {
+        case apiVersion = "api_version", kind, terminal, items, retainedFrom = "retained_from"
+        case complete, nextCursor = "next_cursor", ownerCoverage = "owner_coverage"
+    }
+}
+
 public struct Envelope<Value: Codable & Sendable>: Codable, Sendable {
     public let apiVersion: String
     public let requestID: String

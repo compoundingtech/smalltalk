@@ -1753,19 +1753,35 @@ fn status_history_checkpoint_drops_old_transitions_but_keeps_current_state_start
 fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
     let store = Store::open_memory("cedar").unwrap();
     let append = |kind: &str, fields: Value| {
-        store.append_claim(&ClaimInput {
-            subject:"agent/cedar".into(), kind:kind.into(), actor:Some("agent/cedar".into()),
-            fields:serde_json::from_value(fields).unwrap(), evidence:Vec::new(),
-            expected_subject:None, idempotency_key:None,
-        }).unwrap()
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/cedar".into(),
+                kind: kind.into(),
+                actor: Some("agent/cedar".into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap()
     };
-    append("runtime.observed", json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}));
+    append(
+        "runtime.observed",
+        json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}),
+    );
     for index in 0..220 {
-        append("harness.observed", json!({"state":if index%2==0 {"idle"} else {"working"}, "incarnation_id":"one"}));
+        append(
+            "harness.observed",
+            json!({"state":if index%2==0 {"idle"} else {"working"}, "incarnation_id":"one"}),
+        );
     }
     let cut = now_ms() + 1_000;
     let before = store.seat_status_history("agent/cedar", cut).unwrap();
-    let since = store.current_harness("agent/cedar").unwrap().unwrap().since_unix_ms;
+    let since = store
+        .current_harness("agent/cedar")
+        .unwrap()
+        .unwrap()
+        .since_unix_ms;
     let sealed = store.checkpoint_sealed_set(cut).unwrap();
     let plan = plan_drops(&sealed);
     assert!(!plan.claims.is_empty());
@@ -1773,11 +1789,21 @@ fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
     let copy = scratch.path().join("checkpoint.sqlite3");
     store.copy_store_to(&copy).unwrap();
     let proof = prove_on_copy(&copy, &sealed, &plan).unwrap();
-    assert!(proof.passed, "bounded transitions and current since must survive the proof: {:?}", proof.mismatches);
+    assert!(
+        proof.passed,
+        "bounded transitions and current since must survive the proof: {:?}",
+        proof.mismatches
+    );
     {
         let mut connection = store.connection.write();
         let transaction = connection.transaction().unwrap();
-        record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims).unwrap();
+        record_checkpoint_tombstones_tx(
+            &transaction,
+            &checkpoint_name(cut),
+            &plan.envelopes,
+            &plan.claims,
+        )
+        .unwrap();
         delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
         transaction.commit().unwrap();
     }
@@ -1785,5 +1811,66 @@ fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
     assert_eq!(after["items"], before["items"]);
     assert_eq!(after["retained_from"], before["retained_from"]);
     assert_eq!(after["complete"], false);
-    assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().since_unix_ms, since);
+    assert_eq!(
+        store
+            .current_harness("agent/cedar")
+            .unwrap()
+            .unwrap()
+            .since_unix_ms,
+        since
+    );
+}
+
+#[test]
+fn input_audit_expiry_is_session_atomic_and_respects_protected_claims() {
+    let mut sealed = Sealed::default();
+    let subject = "input-session/alder/00000000-0000-0000-0000-000000000001";
+    let snapshot = |ordinal, event, at| {
+        draft(
+            "terminal.input-session",
+            subject,
+            json!({"ordinal": ordinal, "event": event, "observed_at_unix_ms": at}),
+        )
+    };
+    let opening = sealed.add("alder", 1, snapshot(0, "opened", 1));
+    let checkpoint = sealed.add("alder", 2, snapshot(1, "checkpoint", 2));
+    let closure = sealed.add("alder", 3, snapshot(2, "closed", 3));
+    let mut sealed = sealed.build();
+    sealed.cut_unix_ms = 40 * DAY_MS;
+    assert_eq!(
+        dropped(&plan_drops(&sealed)),
+        ids([&opening, &checkpoint, &closure])
+    );
+    sealed
+        .claims
+        .iter_mut()
+        .find(|claim| claim.claim.id == opening)
+        .unwrap()
+        .protected = true;
+    assert!(
+        dropped(&plan_drops(&sealed)).is_empty(),
+        "a protected opening must not lose its closure"
+    );
+}
+
+#[test]
+fn input_audit_retains_live_opening_and_highest_ordinal_not_last_arrival_or_source_time() {
+    let mut sealed = Sealed::default();
+    let subject = "input-session/alder/00000000-0000-0000-0000-000000000002";
+    let snapshot = |ordinal| {
+        draft(
+            "terminal.input-session",
+            subject,
+            json!({"ordinal": ordinal, "event": if ordinal == 0 { "opened" } else { "checkpoint" },
+            "observed_at_unix_ms": ordinal + 1}),
+        )
+    };
+    let opening = sealed.add("alder", 1, snapshot(0));
+    let head = sealed.add("alder", 2, snapshot(2));
+    let older = sealed.add("alder", 3, snapshot(1));
+    let mut sealed = sealed.build();
+    sealed.cut_unix_ms = 40 * DAY_MS;
+    assert_eq!(dropped(&plan_drops(&sealed)), ids([&older]));
+    assert!(!dropped(&plan_drops(&sealed)).contains(&opening));
+    assert!(!dropped(&plan_drops(&sealed)).contains(&head));
 }

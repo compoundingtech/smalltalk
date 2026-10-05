@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `ce00ea80235297b9752e1ac13ebbe344e308446594d44259d32c58654ba684ee`
+Digest: `6e1264340776aacc3e56d1a6b08a1b5dc1906a9855189215280f26b7bac2fd3a`
 
 ## Subject families
 
@@ -24,6 +24,7 @@ Digest: `ce00ea80235297b9752e1ac13ebbe344e308446594d44259d32c58654ba684ee`
 | `github-post` | `github-post/OWNER/REPO/KIND/ID` | no | A GitHub comment or review an agent seat posted, by its GitHub ID. |
 | `glass` | `glass/person/NAME/UUID` | no | A private person workspace. |
 | `host` | `host/NAME` | no | A graph host. |
+| `input-session` | `input-session/OWNER/UUID` | no | A terminal owner's metadata-only ordered input session audit. |
 | `lane` | `lane/RUN/LOCAL_ID` | no | A mission-run lane: an ordered line of entries its run works through front first. |
 | `loop-run` | `loop-run/GENERATION/PATH` | no | One bounded loop execution. |
 | `message` | `message/ID` | yes | A Small Talk message. |
@@ -185,6 +186,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `subscription.mission-started` | `subscription` | `system-only` | `append` | `durable` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `subscription` |
 | `subscription.state` | `subscription` | `system-only` | `state-transition` | `durable` | `fields:array`, `observer:subject-reference`, `reason:string`, `state!:string`, `to:subject-reference` | `subscription` |
 | `subscription.watch-ended` | `subscription` | `system-only` | `append` | `durable` | `message:subject-reference(message)`, `reason!:string`, `since_unix_ms!:string` | `subscription` |
+| `terminal.input-session` | `input-session` | `system-only` | `append` | `durable` | `attachment!:subject-reference`, `attachment_claim!:string`, `authority_actor!:subject-reference(person|agent)`, `device_actor!:string`, `device_id:string`, `event!:string`, `incarnation!:string`, `observed_at_unix_ms!:integer`, `opened_at_unix_ms!:integer`, `ordinal!:integer`, `owner!:string`, `owner_epoch!:string`, `pairing_claim:string`, `person:subject-reference(person)`, `reason:string`, `session_id!:string`, `successful_batches!:integer`, `successful_send_bytes!:integer`, `terminal!:subject-reference`, `uncertain_handoff!:boolean`, `version!:integer` |  |
 | `terminal.input.requested` | `agent`, `pty` | `authorized-requester` | `append` | `durable` | `byte_count:integer`, `incarnation_id:string`, `intent:string`, `mode:string`, `runtime_id:string`, `sequence:integer`, `sha256:string` |  |
 | `terminal.input.result` | `agent`, `pty` | `system-only` | `append` | `durable` | `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string`, `sequence:integer` |  |
 | `transport.observed` | `host` | `system-only` | `append` | `durable` | `last_success_at:integer`, `protocol:string`, `reason:string`, `remote_heads:object`, `status!:string` |  |

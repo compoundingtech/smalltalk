@@ -509,6 +509,10 @@ async fn connected(
                             return Ended::Closed;
                         }
                     }
+                    // This feed follows projections; it never opens an input session.
+                    CollectionEvent::InputOpened { .. }
+                    | CollectionEvent::InputAck { .. }
+                    | CollectionEvent::InputClosed { .. } => {}
                 }
             }
             command = commands.recv() => match command {

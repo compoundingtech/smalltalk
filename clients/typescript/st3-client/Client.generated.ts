@@ -3,9 +3,10 @@ import { API_VERSION } from './Models.generated.ts';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
+    TerminalInputAuditHistory,
     SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
-    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
+    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TerminalInputData, TimelinePage,
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };
@@ -69,6 +70,11 @@ export type CollectionStream = {
     /** Follow the conversation of an agent or a session. */
     subscribeConversation(id: string, conversation: string): void;
     unsubscribe(id: string): void;
+    /** Open ordered input on a terminal this socket follows; requires `terminal.control`. */
+    openInput(id: string, follow: string): void;
+    /** Send batch `seq`, counting from `input-opened`'s `next_seq`. */
+    sendInput(id: string, seq: number, data: TerminalInputData): void;
+    closeInput(id: string): void;
     close(): void;
 };
 /** A window's rows in display order, as `applyWindow` keeps them. */
@@ -333,6 +339,9 @@ export class St3Client {
             subscribeTerminal: (id, terminal, incarnation, capability) => send({ kind: 'subscribe', id, collection: 'terminal', terminal, incarnation, capability }),
             subscribeConversation: (id, conversation) => send({ kind: 'subscribe', id, collection: 'conversation', conversation }),
             unsubscribe: id => send({ kind: 'unsubscribe', id }),
+            openInput: (id, follow) => send({ kind: 'input-open', id, follow }),
+            sendInput: (id, seq, data) => send({ kind: 'input', id, seq, data }),
+            closeInput: id => send({ kind: 'input-close', id }),
             close: () => { if (!ended) { stop(); socket.close(1000); } },
         };
     }
@@ -392,6 +401,7 @@ export class St3Client {
     async conversationChanges(id: string, options: { after?: string; wait_ms?: number } = {}): Promise<EnvelopeOf<ConversationChanges>> { return this.get(`/v1/client/conversations/${encodeURIComponent(routedId(id))}/changes` + query(options)); }
     async eventsList(options: EventOptions = {}): Promise<EnvelopeOf<EventPage>> { return this.get('/v1/client/events' + query(options), 'events'); }
     async terminalScreen(id: string): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`); }
+    async terminalInputAuditGet(terminal: string, options: PageOptions = {}): Promise<EnvelopeOf<TerminalInputAuditHistory>> { return this.get('/v1/client/terminal-input-audit' + query({ terminal, ...options })); }
     async glassesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/glasses' + query(options)); }
     async glassesGet(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(routedId(id))}`); }
     async agentCreate(input: Omit<ActionOf<'agent.create'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.create' } as ActionOf<'agent.create'>); }

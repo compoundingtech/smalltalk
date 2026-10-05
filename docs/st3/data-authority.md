@@ -7,6 +7,36 @@ shared canonical `binding_key` and an index; existing keys are backfilled once f
 
 The claim log and immutable blobs are the durable graph authority.
 
+Ordered terminal input audit is durable graph metadata, not a local observation or another
+authoritative database. The terminal owner records `terminal.input-session` snapshots on
+`input-session/OWNER/UUID`: immutable attribution and attachment identity, opening time,
+cumulative successful-send-return counters, and explicit closure or interruption. The owner
+origin must match the subject and record; attributed person/device identities are fields, not
+the claim author. Ordinals, counters, times and uncertainty are fenced under the graph writer
+transaction. Repeating the same retained ordinal returns its existing claim; different facts
+at that ordinal fail. Recovery interrupts only prior-process sessions authored by this node,
+retaining their last durable counters and original process epoch. It does not replay input or
+invent an exact crash close time.
+
+The scoped history reader returns the latest snapshot per session, at most 200 per page,
+ordered by immutable opening canonical source keys rather than replica arrival indexes.
+Live sessions remain readable regardless of age; closed/interrupted sessions are readable for
+thirty days after their final observation. `retained_from` reports that lower bound;
+`next_cursor` exposes pagination and `owner_coverage` names only owners represented by retained
+history in the requested scope. Page `complete` remains false: a local replica has no
+authenticated fleet audit completeness frontier, and even an empty fully paged response is
+not proof of zero activity. A closed snapshot without an uncertain handoff can nevertheless
+have complete successful-send-return totals; interrupted snapshots are lower bounds.
+
+Checkpoint rules version 10 preserves the opening source key and highest-ordinal snapshot
+for live/recent sessions and proves those reader answers. Older closed sessions become
+eligible for whole-session trimming through the existing protected-reference, evidence,
+newest-envelope and whole-envelope guards. A protected opening cannot lose its closure.
+Checkpoint tombstones prevent reuse of a fully retired session identity. Thirty days is a
+read window and trim eligibility rule, not physical erasure: blocked checkpoints, protected
+claims, trusted replicas and backups can retain metadata longer. There are no raw bytes,
+keystrokes, text or input digests in these records.
+
 A claim kind of `local` retention (`st3 schema show KIND`) is an observation that only the node
 that made it reads. The daemon records it in `local_observations` instead of the claim log. It gets
 no batch, no envelope and no digest, so it never replicates and trimming it never changes what a

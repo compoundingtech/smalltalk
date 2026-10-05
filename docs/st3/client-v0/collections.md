@@ -71,6 +71,60 @@ owner, I/O or viewer-idle failure returns `terminal-unavailable` with
 expired. Unsubscribing, or closing the socket, stops following; `terminal.detach` still ends the
 viewer record and revokes the lease. After a dropped socket, subscribe on the new socket.
 
+### Terminal input
+
+A device with `terminal.control` writes to a terminal it follows on the same
+socket by opening input on that follow:
+
+```json
+{"kind":"input-open","id":"keys","follow":"term"}
+{"kind":"input","id":"keys","seq":0,"data":{"text":"ls\r"}}
+{"kind":"input","id":"keys","seq":1,"data":{"bytes_b64":"Gw=="}}
+{"kind":"input-close","id":"keys"}
+```
+
+The input inherits the follow's viewer lease and fenced incarnation, so it
+needs no second capability. `input-opened` carries `id`, `follow`, and
+`next_seq`, the first sequence to send. Each batch holds exactly one of `text`
+(written as its UTF-8 bytes) or `bytes_b64`, 1 to 16384 bytes with no NUL byte,
+and is acknowledged with `input-ack` (`id`, `seq`) once written. A `seq` below
+`next_seq` is a repeat: it is acknowledged again and never written. Sequences
+apply in order: a `seq` above `next_seq` closes the input with `gap`.
+
+Before writing each new batch the server checks that the device is still paired, the
+viewer was not detached, and the terminal still runs the follow's incarnation.
+`input-closed` (`id`, `reason`, `message`) ends the input, and nothing more is
+written: `incarnation-changed` when the incarnation changed or the process
+ended, `revoked` when the pairing was revoked or expired, `detached` when the
+viewer was detached or its follow ended or was unsubscribed or replaced, `gap`,
+and `rejected` for a refused open or batch, including a device without
+`terminal.control`, a follow another host owns, or a follow that already has
+input. Batches for a closed input are dropped without a frame. The server never
+resends. Socket closure destroys every input session and its sequence state,
+even when the projected viewer lease remains reusable. After reconnect, follow
+the terminal on the new socket and explicitly open a new input; its sequence
+starts at zero. Never resend bytes whose earlier acknowledgement was lost.
+`input-close` ends an input without a frame. An input ID held again replaces
+the earlier input; callers must send fresh bytes, not replay an uncertain batch.
+
+The terminal owner commits a typed graph opening before `input-opened`; unavailable
+audit storage rejects the open. The graph records attribution, fenced target,
+lifecycle, and cumulative successful send-return totals, never input text, bytes,
+or their hashes. Repeats do not increase totals. Clean closure commits exact totals;
+a restarted owner labels unmatched older sessions interrupted with the last durable
+lower bound. Sparse checkpoints are rate-capped, not a guaranteed crash-loss window.
+Idle device revocation or expiry also closes input without requiring another batch.
+The [durable audit read](README.md#durable-terminal-input-session-audit) is a
+person-scoped or explicitly fleet-authorized projection, distinct from terminal output
+history and from socket-local authority.
+
+These commands and frames are defined by `CollectionCommand` and `CollectionFrame`
+in `client-v0.schema.json`. TypeScript exposes `openInput`, `sendInput`, and
+`closeInput`; Rust exposes `open_input`, `send_input`, and `close_input`, with
+typed `InputOpened`, `InputAck`, and `InputClosed` events. Swift's glasses-only
+stream does not expose terminal input. Input sessions are socket-local; their
+frames are never broadcast to another socket.
+
 ## Conversations
 
 A conversation is one more subscription too. Name an agent or a session:

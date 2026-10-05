@@ -50,7 +50,8 @@ clippy_and_codegen() {
     base_args=(--base-ref "$CLIPPY_BASE_SHA")
   fi
   python3 scripts/clippy_ratchet.py --logs "$logs" "${base_args[@]}" || return
-  cargo run --locked -p st3-client-codegen -- --check
+  cargo run --locked -p st3-client-codegen -- --check || return
+  cargo run --locked -p st3-schema --example schema_markdown -- --check docs/st3/schema.md
 }
 
 conversation_model() {
