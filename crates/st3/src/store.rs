@@ -6046,7 +6046,8 @@ impl Store {
                     }
                 }
             }
-            view.loops = loop_run_views_tx(&connection, &view)?;
+            // The tree renderer uses loop status and summary, never historical round results.
+            view.loops = loop_run_views_tx(&connection, &view, false)?;
             note_run_view_reads(&view);
             runs.push(view);
         }
@@ -29419,7 +29420,7 @@ fn mission_run_view_with_enrichment_tx(
                 step_timeout_extension_at(connection, &step.subject, step.attempt, now_ms())?;
         }
     }
-    view.loops = loop_run_views_tx(connection, &view)?;
+    view.loops = loop_run_views_tx(connection, &view, true)?;
     view.outcome = mission_run_outcome_tx(connection, &view)?;
     Ok(view)
 }
@@ -29548,6 +29549,7 @@ fn mission_run_header_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Miss
 fn loop_run_views_tx(
     connection: &Connection,
     run: &MissionRunView,
+    include_results: bool,
 ) -> rusqlite::Result<Vec<LoopRunView>> {
     let mission_id = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
     let body = connection
@@ -29588,63 +29590,67 @@ fn loop_run_views_tx(
             .or_else(|| step_view.map(|view| view.status.as_str()))
             .unwrap_or("pending")
             .to_owned();
-        let mut results_statement = connection.prepare(&canonical_sql(
-            "SELECT id, body, accepted_at_unix_ms FROM claims
+        let results = if include_results {
+            let mut results_statement = connection.prepare(&canonical_sql(
+                "SELECT id, body, accepted_at_unix_ms FROM claims
              WHERE subject=?1 AND kind='loop.round-result' ORDER BY CANONICAL_ASC(claims)",
-        ))?;
-        let results = results_statement
-            .query_map([&subject], |row| {
-                let body =
-                    serde_json::from_str::<Value>(&row.get::<_, String>(1)?).unwrap_or(Value::Null);
-                let fields = body.get("fields").unwrap_or(&body);
-                let metrics = fields
-                    .get("metrics")
-                    .and_then(Value::as_object)
-                    .map(|metrics| {
-                        metrics
-                            .iter()
-                            .filter_map(|(name, value)| {
-                                value.as_f64().map(|value| (name.clone(), value))
-                            })
-                            .collect()
+            ))?;
+            results_statement
+                .query_map([&subject], |row| {
+                    let body = serde_json::from_str::<Value>(&row.get::<_, String>(1)?)
+                        .unwrap_or(Value::Null);
+                    let fields = body.get("fields").unwrap_or(&body);
+                    let metrics = fields
+                        .get("metrics")
+                        .and_then(Value::as_object)
+                        .map(|metrics| {
+                            metrics
+                                .iter()
+                                .filter_map(|(name, value)| {
+                                    value.as_f64().map(|value| (name.clone(), value))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let recorded: String = row.get(2)?;
+                    Ok(LoopRoundView {
+                        claim: row.get(0)?,
+                        round: fields.get("round").and_then(Value::as_u64).unwrap_or(0) as u32,
+                        status: fields
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                        mission_run: fields
+                            .get("mission_run")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        metrics,
+                        feedback: fields
+                            .get("feedback")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        candidate: fields
+                            .get("candidate")
+                            .and_then(Value::as_u64)
+                            .map(|value| value as u32),
+                        item: fields.get("item").cloned(),
+                        reason: fields
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        token_usage: fields
+                            .get("token_usage")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        recorded_at_unix_ms: recorded.parse().unwrap_or(0),
                     })
-                    .unwrap_or_default();
-                let recorded: String = row.get(2)?;
-                Ok(LoopRoundView {
-                    claim: row.get(0)?,
-                    round: fields.get("round").and_then(Value::as_u64).unwrap_or(0) as u32,
-                    status: fields
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned(),
-                    mission_run: fields
-                        .get("mission_run")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    metrics,
-                    feedback: fields
-                        .get("feedback")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    candidate: fields
-                        .get("candidate")
-                        .and_then(Value::as_u64)
-                        .map(|value| value as u32),
-                    item: fields.get("item").cloned(),
-                    reason: fields
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    token_usage: fields
-                        .get("token_usage")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    recorded_at_unix_ms: recorded.parse().unwrap_or(0),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let (mode, max_parallel, candidate_count) = if let Some(candidates) = &spec.candidates {
             (
                 "best-of-n".to_owned(),
