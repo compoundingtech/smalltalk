@@ -302,9 +302,14 @@ def provider_pids(rows):
 async def agent(node):
     result = await node.cli("agents", "show", "agent/eval/fault-probe", "--json", check=False)
     try:
-        return json.loads(result).get("value", {})
+        return json.loads(result).get("value") or {}
     except ValueError:
         return {}
+
+
+async def current_channel(node):
+    card = await agent(node)
+    return card if (card.get("delivery") or {}).get("state") == "current" else None
 
 
 async def send(node, case):
@@ -543,10 +548,7 @@ agent "fault-probe" {{
         else:
             subject = await send(source, case)
         if case in RECOVERY_CASES and not link.enabled:
-            async def recovered_channel():
-                card = await agent(target)
-                return card if card.get("delivery", {}).get("state") == "current" else None
-            await until(recovered_channel, args.ready_seconds)
+            await until(lambda: current_channel(target), args.ready_seconds)
             # Recovery starts when the blocked link is actually restored, not during its outage.
             cleared = now_ms()
             link.enabled = True
@@ -562,10 +564,7 @@ agent "fault-probe" {{
         if case in RECOVERY_CASES:
             # A recent never-offered send survives recovery exactly once. Keep the full
             # observation tail and then send live mail to expose any duplicate native offer.
-            async def recovered_channel():
-                card = await agent(target)
-                return card if card.get("delivery", {}).get("state") == "current" else None
-            await until(recovered_channel, args.ready_seconds)
+            await until(lambda: current_channel(target), args.ready_seconds)
             link.enabled = True
             recovered_subject = subject
             recovery_cleared = cleared
