@@ -40603,6 +40603,12 @@ version 2
         assert_eq!(direct.status, progressed.status);
         assert_eq!(client.status, progressed.status);
         assert_eq!(client.claim_incarnation, progressed.claim_incarnation);
+        // A repeated operation key is a receipt for that old operation, not a fresh view.
+        let claim_receipt = store
+            .work_action(subject, "claim", &request("one", "claim-one"))
+            .unwrap();
+        assert_eq!(claim_receipt.status, "claimed");
+        assert_eq!(store.step_run(subject).unwrap().unwrap().status, "working");
         // Lease expiry changes the read projection before any repair commits.
         store
             .connection
