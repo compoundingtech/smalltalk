@@ -16989,7 +16989,11 @@ async fn drive_st2_native(
                 }
 
                 if driver == "opencode" {
-                    if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths).await {
+                    if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths, |gate| {
+                        if let Some(subscription) = &mailbox.subscription {
+                            subscription.report(native_delivery_control_report("opencode-server", gate));
+                        }
+                    }).await {
                         note_driver_tick_failure(subject, error, &mut last_control_warning);
                     }
                 }
@@ -17096,7 +17100,7 @@ async fn drive_st2_native(
                     )
                     .await;
                 } else if driver == "opencode" {
-                    delivery.report = Some(native_delivery_report("opencode-server", None));
+                    delivery.report = Some(native_delivery_control_report("opencode-server", &paths.delivery_gate).to_string());
                     supervise_native_delivery(
                         client,
                         subject,
@@ -19477,44 +19481,93 @@ async fn message_content(client: &Client, message: &MessageView) -> Result<Strin
     }
 }
 
+const DELIVERY_CONTROL_READ_DEADLINE: Duration = Duration::from_millis(250);
+const DELIVERY_CONTROL_RETRY_DELAY: Duration = Duration::from_millis(100);
+const DELIVERY_CONTROL_LEASE: Duration = Duration::from_secs(3);
+
+#[cfg(test)]
 async fn refresh_graph_delivery_gate(
     client: &Client,
     subject: &str,
     gate: &st_drivers::session_control::DeliveryGate,
 ) -> Result<()> {
+    refresh_graph_delivery_gate_with_report(client, subject, gate, |_| {}).await
+}
+
+async fn refresh_graph_delivery_gate_with_report(
+    client: &Client,
+    subject: &str,
+    gate: &st_drivers::session_control::DeliveryGate,
+    mut report: impl FnMut(&st_drivers::session_control::DeliveryGate),
+) -> Result<()> {
     let path = format!("/v1/delivery/hold?subject={}", urlencoding::encode(subject));
-    let read = client.get::<st3::delivery_hold::HoldView>(&path);
-    let result: Result<_> = async {
-        let view = tokio::time::timeout(Duration::from_millis(250), read)
+    for attempt in 0..2 {
+        let result: Result<st3::delivery_hold::HoldView> = async {
+            let view = tokio::time::timeout(
+                DELIVERY_CONTROL_READ_DEADLINE,
+                client.get::<st3::delivery_hold::HoldView>(&path),
+            )
             .await
             .context("delivery hold read timed out")??;
-        anyhow::ensure!(
-            view.subject == subject,
-            "delivery control names a different seat"
-        );
-        Ok(view.active)
+            anyhow::ensure!(
+                view.subject == subject,
+                "delivery control names a different seat"
+            );
+            Ok(view)
+        }
+        .await;
+        match result {
+            Ok(view) => {
+                gate.update(view.active, DELIVERY_CONTROL_LEASE);
+                report(gate);
+                return Ok(());
+            }
+            Err(error) => {
+                // Close before retrying, even if the previous permit has time left. A late
+                // response from the cancelled attempt can never authorize native input.
+                gate.unavailable();
+                if attempt == 1 {
+                    // Publish only the final result so a recovered retry does not flap health.
+                    report(gate);
+                    return Err(error).context(
+                        "new native handoffs held until graph delivery control is available",
+                    );
+                }
+                // Exactly one retry: both 250 ms reads and this delay fit inside the lease.
+                tokio::time::sleep(DELIVERY_CONTROL_RETRY_DELAY).await;
+            }
+        }
     }
-    .await;
-    gate.update(
-        result.as_ref().copied().unwrap_or(true),
-        Duration::from_secs(3),
-    );
-    result
-        .map(|_| ())
-        .context("new native handoffs held until graph delivery control is available")
+    unreachable!("two attempts either read control or return the last error")
+}
+
+fn native_delivery_control_report(
+    transport: &str,
+    gate: &st_drivers::session_control::DeliveryGate,
+) -> Value {
+    use st_drivers::session_control::DeliveryBlockReason;
+    let mut report: Value = serde_json::from_str(&native_delivery_report(transport, None))
+        .expect("native delivery reports are JSON");
+    // A deliberate graph hold is normal control, independent of mailbox readiness.
+    let unavailable = gate.blocked_reason()
+        .filter(|reason| *reason == DeliveryBlockReason::ControlUnavailable);
+    report["ready"] = json!(unavailable.is_none());
+    report["reason"] = json!(unavailable.map(|reason| reason.description()));
+    report
 }
 
 async fn refresh_native_delivery_control(
     client: &Client,
     subject: &str,
     paths: &mut NativePaths,
+    mut report: impl FnMut(&st_drivers::session_control::DeliveryGate),
 ) -> Result<()> {
     let adoption: Result<()> = async {
         if let Some(request) = &paths.pending_hold_adoption {
             // The previous hold can expire during an outage. Never import it with a new deadline.
             if current_unix_ms()? < u128::from(request.until_unix_ms) {
                 tokio::time::timeout(
-                    Duration::from_millis(250),
+                    DELIVERY_CONTROL_READ_DEADLINE,
                     client.post::<_, ClaimRecord>("/v1/delivery/hold", request),
                 )
                 .await
@@ -19526,11 +19579,12 @@ async fn refresh_native_delivery_control(
     }
     .await;
     if let Err(error) = adoption {
-        paths.delivery_gate.update(true, Duration::ZERO);
+        paths.delivery_gate.unavailable();
+        report(&paths.delivery_gate);
         return Err(error
             .context("native delivery held while the predecessor's hold awaits graph adoption"));
     }
-    refresh_graph_delivery_gate(client, subject, &paths.delivery_gate).await
+    refresh_graph_delivery_gate_with_report(client, subject, &paths.delivery_gate, report).await
 }
 
 /// The only transitional status read: one fresh DND on an adopted predecessor, with no writes.
@@ -19841,7 +19895,11 @@ async fn drive_codex_native(
                     }
                 }
 
-                if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths).await {
+                if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths, |gate| {
+                        if let Some(subscription) = &mailbox.subscription {
+                            subscription.report(native_delivery_control_report("app-server", gate));
+                        }
+                    }).await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 // Delivery runs first and on its own: a failing observation publish must never
@@ -19852,7 +19910,7 @@ async fn drive_codex_native(
                         note_driver_tick_failure(subject, error, &mut last_control_warning);
                     }
                 } else {
-                delivery.report = Some(native_delivery_report("app-server", None));
+                delivery.report = Some(native_delivery_control_report("app-server", &paths.delivery_gate).to_string());
                 supervise_native_delivery(
                     client,
                     subject,
@@ -20749,8 +20807,11 @@ impl NativeMailbox {
         } else {
             "opencode-server"
         };
-        let report: Value =
-            serde_json::from_str(&native_delivery_report(transport, None)).unwrap_or_default();
+        let report = if matches!(driver, "codex" | "opencode") {
+            native_delivery_control_report(transport, &st_drivers::session_control::DeliveryGate::default())
+        } else {
+            serde_json::from_str(&native_delivery_report(transport, None)).expect("native report is JSON")
+        };
         let subscription = push_mailbox_enabled()
             .then(|| st3::mailbox::Subscription::start(client.clone(), fence.clone(), report));
         Ok(Self {
@@ -26322,6 +26383,84 @@ mission "review" state="ready" {
         assert!(archive.join(filename).is_file());
     }
 
+    #[test]
+    fn graph_delivery_deliberate_hold_keeps_mailbox_ready() {
+        let gate = st_drivers::session_control::DeliveryGate::default();
+        gate.update(true, DELIVERY_CONTROL_LEASE);
+        assert!(gate.held(), "a deliberate hold must still block native input");
+        for transport in ["app-server", "opencode-server"] {
+            let report = native_delivery_control_report(transport, &gate);
+            assert_eq!(report["ready"], true, "a deliberate hold is healthy control");
+            assert!(report["reason"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_delivery_control_retries_once_and_keeps_late_reads_closed() {
+        use axum::{Json, Router, routing::get};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use st_drivers::session_control::{DeliveryBlockReason, DeliveryGate};
+
+        for delayed_reads in [1, usize::MAX] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("control.sock");
+            let reads = Arc::new(AtomicUsize::new(0));
+            let count = reads.clone();
+            let gate = DeliveryGate::default();
+            gate.update(false, DELIVERY_CONTROL_LEASE);
+            let handler_gate = gate.clone();
+            let retry_held = Arc::new(AtomicBool::new(false));
+            let handler_retry_held = retry_held.clone();
+            let app = Router::new().route("/v1/delivery/hold", get(move || {
+                let count = count.clone();
+                let gate = handler_gate.clone();
+                let retry_held = handler_retry_held.clone();
+                async move {
+                    let attempt = count.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 1 {
+                        retry_held.store(gate.held(), Ordering::SeqCst);
+                    }
+                    if attempt < delayed_reads {
+                        tokio::time::sleep(Duration::from_millis(350)).await;
+                    }
+                    Json(json!({"api_version":"st3.v1", "value": {
+                        "subject":"agent/eval/gated", "active":false,
+                        "until_unix_ms":null, "reason":null, "actor":null, "claim":null,
+                    }}))
+                }
+            }));
+            let server_socket = socket.clone();
+            let server = tokio::spawn(async move { serve_unix(&server_socket, app).await.unwrap() });
+            for _ in 0..100 {
+                if socket.exists() { break; }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            assert!(socket.exists());
+            let client = Client::unix(&socket);
+            let mut reported = Vec::new();
+            let started = Instant::now();
+            let result = refresh_graph_delivery_gate_with_report(
+                &client, "agent/eval/gated", &gate,
+                |gate| reported.push(gate.blocked_reason()),
+            ).await;
+            assert!(started.elapsed() < DELIVERY_CONTROL_LEASE);
+            assert_eq!(reads.load(Ordering::SeqCst), 2, "exactly one retry");
+            assert!(retry_held.load(Ordering::SeqCst), "native input must be closed during the retry");
+            if delayed_reads == 1 {
+                result.unwrap();
+                assert_eq!(reported, [None], "a recovered retry must not flap health");
+                assert!(!gate.held());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(reported, [Some(DeliveryBlockReason::ControlUnavailable)]);
+                assert!(gate.held());
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                assert!(gate.held(), "cancelled reads must never grant a permit later");
+            }
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn graph_delivery_gate_closes_on_hold_outage_and_mismatched_subject() {
         use axum::{Json, Router, routing::get};
@@ -26404,7 +26543,7 @@ mission "review" state="ready" {
             pending_hold_adoption: Some(request),
         };
         assert!(
-            refresh_native_delivery_control(&client, "agent/eval/gated", &mut paths)
+            refresh_native_delivery_control(&client, "agent/eval/gated", &mut paths, |_| {})
                 .await
                 .is_err()
         );
@@ -26414,7 +26553,7 @@ mission "review" state="ready" {
             deadline
         );
         paths.pending_hold_adoption.as_mut().unwrap().until_unix_ms = 0;
-        refresh_native_delivery_control(&client, "agent/eval/gated", &mut paths)
+        refresh_native_delivery_control(&client, "agent/eval/gated", &mut paths, |_| {})
             .await
             .unwrap();
         assert!(paths.pending_hold_adoption.is_none());
