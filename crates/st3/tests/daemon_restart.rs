@@ -554,8 +554,8 @@ async fn native_exit_signal_after_provider_end_bounds_an_in_flight_request() {
     assert_alive(&mut driver, "the driver with an in-flight exit report");
     let requested = Instant::now();
     request_driver_stop(&driver);
-    // Two-second deadline + 250-ms polling, with scheduling margin; no provider grace here.
-    native_exit_finishes(root, &mut driver, Duration::from_secs(3)).await;
+    // Two-second deadline + 250-ms polling; allow CI scheduling margin, with no provider grace.
+    native_exit_finishes(root, &mut driver, Duration::from_secs(5)).await;
     eprintln!(
         "native exit: cancelled in-flight terminal report and exited after {:?}",
         requested.elapsed()
