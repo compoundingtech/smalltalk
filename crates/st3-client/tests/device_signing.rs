@@ -131,6 +131,928 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[tokio::test]
+async fn shared_completion_persists_both_key_types_and_preserves_a_working_device_on_failure() {
+    use st3_client::device::{KeyAlgorithm, Profile, SigningKey, complete};
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    // Admit the signer through a pinned fleet anchor, just as an authenticated joining peer
+    // learns it. A bare transport copy is insufficient evidence of signature acceptance.
+    let anchor = Arc::new(smallclaims::fleet::MemberKey::generate().unwrap().0);
+    state.store.pin_fleet_anchor(anchor.public()).unwrap();
+    state.store.set_member_key(Some(anchor.clone())).unwrap();
+    state.store.append_claim(&st3::model::ClaimInput {
+        subject: "host/signing-node".into(), kind: "fleet.member-admitted".into(), actor: None,
+        fields: serde_json::from_value(json!({ "fleet_id": FLEET, "member_key": anchor.public(), "via": "anchor", "mode": "listening" })).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    wait_for_socket(&socket).await;
+    let local = Client::unix_as(&socket, PERSON);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let gateway = st3::api::fabric_router(state.clone());
+    let http_server = tokio::spawn(async move { axum::serve(listener, gateway).await });
+    let path = root.path().join("client/devices.json");
+    for algorithm in [KeyAlgorithm::Ed25519, KeyAlgorithm::P256] {
+        for import in [false, true] {
+            let key = if import {
+                let document = match algorithm {
+                    KeyAlgorithm::Ed25519 => {
+                        ring::signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                            .unwrap()
+                    }
+                    KeyAlgorithm::P256 => EcdsaKeyPair::generate_pkcs8(
+                        &ECDSA_P256_SHA256_FIXED_SIGNING,
+                        &SystemRandom::new(),
+                    )
+                    .unwrap(),
+                };
+                let key_path = root.path().join("import.der");
+                std::fs::write(&key_path, document.as_ref()).unwrap();
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                SigningKey::import(algorithm, &key_path).unwrap()
+            } else {
+                SigningKey::generate(algorithm).unwrap()
+            };
+            let public = key.public_key().unwrap();
+            let challenge = local
+                .pairing_begin(&PairingBegin {
+                    api_version: st3_client::API_VERSION.into(),
+                    device_name: "CLI device".into(),
+                    person_id: PERSON.into(),
+                    full_control: Some(true),
+                    scopes: None,
+                })
+                .await
+                .unwrap()
+                .value;
+            let previous = std::fs::read(&path).ok();
+            let wrong = complete(
+                &path,
+                &base,
+                &challenge.pairing_id,
+                "wrong-code",
+                key.clone(),
+            )
+            .await;
+            assert!(wrong.is_err());
+            assert_eq!(std::fs::read(&path).ok(), previous);
+            // A concurrent writer must fail before consuming this still-usable code.
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path.with_extension("lock"))
+                .unwrap();
+            lock.try_lock().unwrap();
+            assert!(
+                complete(
+                    &path,
+                    &base,
+                    &challenge.pairing_id,
+                    &challenge.code,
+                    key.clone()
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).ok(), previous);
+            drop(lock);
+            let device = complete(
+                &path,
+                &base,
+                &challenge.pairing_id,
+                &challenge.code,
+                key.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(device.session.person_id, PERSON);
+            assert_eq!(device.session.device_key_chain.len(), 2);
+            // This fixture has no background daemon sealing loop; seal before querying cached verdicts.
+            state.store.replication_snapshot().unwrap();
+            for grant in &device.session.device_key_chain {
+                assert_eq!(state.store.claim_verdict(grant).unwrap(), Verdict::Verified);
+            }
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            let saved = std::fs::read(&path).unwrap();
+            assert!(
+                complete(&path, &base, &challenge.pairing_id, &challenge.code, key)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                std::fs::read(&path).unwrap() == saved,
+                "Previous profile bytes changed"
+            );
+            let loaded = Profile::load(&path).unwrap().unwrap();
+            assert_eq!(
+                loaded.devices[0]
+                    .signing_key
+                    .as_ref()
+                    .unwrap()
+                    .public_key()
+                    .unwrap(),
+                public
+            );
+            let client = loaded.clients().unwrap().pop().unwrap();
+            let idem = format!("shared-completion-{algorithm:?}-{import}");
+            let snapshot = client.capabilities().await.unwrap().snapshot.id;
+            let result = client
+                .message_send(
+                    format!("action/{idem}"),
+                    &idem,
+                    Fence {
+                        snapshot_id: snapshot,
+                        ..Fence::default()
+                    },
+                    MessageSendParameters {
+                        to: "agent/alder".into(),
+                        content: "a/b \"quoted\"\nhello Ω".into(),
+                        title: Some("CLI proof".into()),
+                        in_reply_to: None,
+                        session_id: None,
+                        tags: vec!["zeta".into(), "alpha".into()],
+                        attachments: vec![],
+                        signature: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                result
+                    .value
+                    .affected_ids
+                    .iter()
+                    .any(|id| id == &message_subject(&idem))
+            );
+            let claim = state
+                .store
+                .latest_claim(&message_subject(&idem), Some("message.sent"))
+                .unwrap()
+                .unwrap();
+            state.store.replication_snapshot().unwrap();
+            assert_eq!(claim.actor.as_deref(), Some(PERSON));
+            assert_eq!(
+                state.store.claim_signature(&claim.id).unwrap().unwrap().key,
+                public
+            );
+            assert_eq!(
+                state.store.claim_verdict(&claim.id).unwrap(),
+                Verdict::Verified
+            );
+            let member = Store::open_memory("peer").unwrap();
+            member.bind_fleet(FLEET).unwrap();
+            member.pin_fleet_anchor(anchor.public()).unwrap();
+            let exchange = state
+                .store
+                .export_replication_exchange(FLEET, &member.replication_inventory().unwrap())
+                .unwrap();
+            member
+                .receive_replication_exchange("signing-node", FLEET, &exchange)
+                .unwrap();
+            member.validate_replication_backlog().unwrap();
+            member.project_replication_backlog().unwrap();
+            member.judge_claims(true).unwrap();
+            assert_eq!(member.claim_verdict(&claim.id).unwrap(), Verdict::Verified);
+        }
+    }
+    // A proxy that substitutes the key gets real, valid server-issued grants for its key.
+    // The client must reject those grants, as well as malformed responses after consumption,
+    // without losing its previous working device or exposing either credential/private key.
+    // An older member's refusal or missing advertisement must never receive the code.
+    for forbidden_capabilities in [false, true] {
+        let challenge = local
+            .pairing_begin(&PairingBegin {
+                api_version: st3_client::API_VERSION.into(),
+                device_name: "Preflight device".into(),
+                person_id: PERSON.into(),
+                full_control: Some(true),
+                scopes: None,
+            })
+            .await
+            .unwrap()
+            .value;
+        let saved = std::fs::read(&path).unwrap();
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = posts.clone();
+        let proxy = axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let count = count.clone();
+                async move {
+                    if request.uri().path().ends_with("/complete") {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return next.run(request).await;
+                    }
+                    if forbidden_capabilities {
+                        return axum::http::Response::builder()
+                            .status(403)
+                            .body(axum::body::Body::from("{}"))
+                            .unwrap();
+                    }
+                    let response = next.run(request).await;
+                    let (mut parts, body) = response.into_parts();
+                    let body = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    let mut response: Value = serde_json::from_slice(&body).unwrap();
+                    response["capabilities"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|capability| capability["id"] != "device-key-proofs");
+                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                    axum::http::Response::from_parts(
+                        parts,
+                        axum::body::Body::from(serde_json::to_vec(&response).unwrap()),
+                    )
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_base = format!("http://{}", listener.local_addr().unwrap());
+        let app = st3::api::fabric_router(state.clone()).layer(proxy);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
+        let error = complete(
+            &path,
+            &old_base,
+            &challenge.pairing_id,
+            &challenge.code,
+            key.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("code was not submitted"));
+        assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            std::fs::read(&path).unwrap() == saved,
+            "Previous profile bytes changed"
+        );
+        complete(&path, &base, &challenge.pairing_id, &challenge.code, key)
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    let saved = std::fs::read(&path).unwrap();
+    for mode in [
+        "swap-key",
+        "wrong-person",
+        "tampered-proof",
+        "secret-in-malformed-proof",
+    ] {
+        let challenge = local
+            .pairing_begin(&PairingBegin {
+                api_version: st3_client::API_VERSION.into(),
+                device_name: "Proxy regression".into(),
+                person_id: PERSON.into(),
+                full_control: Some(true),
+                scopes: None,
+            })
+            .await
+            .unwrap()
+            .value;
+        let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
+        let private = serde_json::to_value(&key).unwrap()["pkcs8"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let other_public = SigningKey::generate(KeyAlgorithm::P256)
+            .unwrap()
+            .public_key()
+            .unwrap();
+        let substitute = other_public.clone();
+        let observed = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let capture = observed.clone();
+        let proxy = axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let substitute = substitute.clone();
+                let capture = capture.clone();
+                async move {
+                    if !request.uri().path().ends_with("/complete") {
+                        return next.run(request).await;
+                    }
+                    let (mut parts, body) = request.into_parts();
+                    let body = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    let mut request: Value = serde_json::from_slice(&body).unwrap();
+                    if mode == "swap-key" {
+                        request["device_public_key"] = json!(substitute);
+                    }
+                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                    let response = next
+                        .run(axum::http::Request::from_parts(
+                            parts,
+                            axum::body::Body::from(serde_json::to_vec(&request).unwrap()),
+                        ))
+                        .await;
+                    let (mut parts, body) = response.into_parts();
+                    let body = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    let mut response: Value = serde_json::from_slice(&body).unwrap();
+                    if parts.status.is_success() {
+                        *capture.lock().unwrap() = Some(response["value"].clone());
+                        match mode {
+                            "wrong-person" => {
+                                response["value"]["person_id"] = json!("person/blair")
+                            }
+                            "tampered-proof" => {
+                                response["value"]["device_key_proofs"][0]["body"]["fields"]["key"] =
+                                    json!(substitute)
+                            }
+                            "secret-in-malformed-proof" => {
+                                response["value"]["device_key_proofs"][0]["signature"]["signed_at_unix_ms"] =
+                                    response["value"]["credential"].clone()
+                            }
+                            _ => {}
+                        }
+                    }
+                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                    axum::http::Response::from_parts(
+                        parts,
+                        axum::body::Body::from(serde_json::to_vec(&response).unwrap()),
+                    )
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_base = format!("http://{}", listener.local_addr().unwrap());
+        let app = st3::api::fabric_router(state.clone()).layer(proxy);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let error = complete(
+            &path,
+            &proxy_base,
+            &challenge.pairing_id,
+            &challenge.code,
+            key.clone(),
+        )
+        .await
+        .unwrap_err();
+        let error = format!("{error:#}");
+        let session = observed.lock().unwrap().take().unwrap();
+        assert!(error.contains(session["device_id"].as_str().unwrap()));
+        assert!(error.contains("st devices revoke"));
+        assert!(error.contains("server consumed the pairing code"));
+        assert!(!error.contains(session["credential"].as_str().unwrap()));
+        assert!(!error.contains(&private));
+        assert!(
+            std::fs::read(&path).unwrap() == saved,
+            "Previous profile bytes changed"
+        );
+        assert!(
+            Profile::load(&path).unwrap().unwrap().clients().unwrap()[0]
+                .capabilities()
+                .await
+                .is_ok()
+        );
+        assert!(
+            complete(&path, &base, &challenge.pairing_id, &challenge.code, key)
+                .await
+                .is_err()
+        );
+        if mode == "swap-key" {
+            let grant = state
+                .store
+                .claim_by_id(session["device_key_chain"][0].as_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(grant.body["fields"]["key"], other_public);
+            state.store.replication_snapshot().unwrap();
+            assert_eq!(
+                state.store.claim_verdict(&grant.id).unwrap(),
+                Verdict::Verified
+            );
+            assert!(error.contains("does not bind our public key"));
+        }
+        if mode == "tampered-proof" {
+            assert!(error.contains("content does not match its claim ID"));
+        }
+        server.abort();
+    }
+    // A local commit failure after remote success must retain the previous key and credential.
+    // The member's consumed code is a separate outcome, not a client-side rollback.
+    let saved = std::fs::read(&path).unwrap();
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Unwritable device".into(),
+            person_id: PERSON.into(),
+            full_control: Some(true),
+            scopes: None,
+        })
+        .await
+        .unwrap()
+        .value;
+    let directory = path.parent().unwrap().to_owned();
+    // Refuse a directory another user can write before consuming the still-usable code.
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let result = complete(
+        &path,
+        &base,
+        &challenge.pairing_id,
+        &challenge.code,
+        SigningKey::generate(KeyAlgorithm::P256).unwrap(),
+    )
+    .await;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("not be writable by others")
+    );
+    assert!(
+        std::fs::read(&path).unwrap() == saved,
+        "Previous profile bytes changed"
+    );
+    let write_failure =
+        axum::middleware::map_response(move |response: axum::response::Response| {
+            let directory = directory.clone();
+            async move {
+                if response.status().is_success() {
+                    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o500))
+                        .unwrap();
+                }
+                response
+            }
+        });
+    let app = st3::api::fabric_router(state.clone()).layer(write_failure);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let blocked_base = format!("http://{}", listener.local_addr().unwrap());
+    let blocked_server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let result = complete(
+        &path,
+        &blocked_base,
+        &challenge.pairing_id,
+        &challenge.code,
+        SigningKey::generate(KeyAlgorithm::P256).unwrap(),
+    )
+    .await;
+    std::fs::set_permissions(
+        path.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let failure = format!("{:#}", result.unwrap_err());
+    assert!(failure.contains("not writable"));
+    assert!(failure.contains("Possible orphaned device device/"));
+    assert!(failure.contains("st devices revoke"));
+    assert!(
+        std::fs::read(&path).unwrap() == saved,
+        "Previous profile bytes changed"
+    );
+    assert!(
+        Profile::load(&path).unwrap().unwrap().clients().unwrap()[0]
+            .capabilities()
+            .await
+            .is_ok()
+    );
+    assert!(
+        complete(
+            &path,
+            &base,
+            &challenge.pairing_id,
+            &challenge.code,
+            SigningKey::generate(KeyAlgorithm::P256).unwrap()
+        )
+        .await
+        .is_err()
+    );
+    blocked_server.abort();
+    let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
+    let public = key.public_key().unwrap();
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Hall display".into(),
+            person_id: PERSON.into(),
+            full_control: None,
+            scopes: Some(vec![
+                "read.projections".into(),
+                "read.glasses".into(),
+                "terminal.read".into(),
+            ]),
+        })
+        .await
+        .unwrap()
+        .value;
+    let device = complete(&path, &base, &challenge.pairing_id, &challenge.code, key)
+        .await
+        .unwrap();
+    assert!(device.signing_key.is_none());
+    assert!(device.session.device_key_chain.is_empty());
+    assert!(
+        Profile::load(&path).unwrap().unwrap().devices[0]
+            .signing_key
+            .is_none()
+    );
+    assert!(
+        state
+            .store
+            .claims_for(PERSON, Some(smallclaims::principal::KEY_GRANTED))
+            .unwrap()
+            .iter()
+            .all(|grant| grant.body["fields"]["key"] != public)
+    );
+    local_server.abort();
+    http_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anonymous_pairing_advertisement_is_static_and_never_notes_presence() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    wait_for_socket(&socket).await;
+    let local = Client::unix_as(&socket, PERSON);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let http = reqwest::Client::new();
+    let expected = json!({
+        "api_version": st3_client::API_VERSION,
+        "capabilities": [{"id": "device-key-proofs", "version": 1, "state": "granted"}],
+    });
+    for phase in 0..3 {
+        if phase > 0 {
+            state
+                .store
+                .append_claim(&st3::model::ClaimInput {
+                    subject: format!("message/advertisement-{phase}"),
+                    kind: "message.sent".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("content".into(), json!("changed")),
+                        ("to".into(), json!(PERSON)),
+                        ("from".into(), json!(PERSON)),
+                        ("status".into(), json!("sent")),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let before = state.store.index().unwrap();
+        let response = http
+            .get(format!("{base}/v1/client/capabilities"))
+            .header("x-st3-client", "anonymous-pairing-probe")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap(), expected);
+        assert_eq!(state.store.index().unwrap(), before);
+        let presence = serde_json::to_string(&local.clients_list().await.unwrap()).unwrap();
+        assert!(!presence.contains("anonymous-pairing-probe"));
+    }
+    assert!(
+        Client::fabric_pairing(&base)
+            .agents_list(None, None, false)
+            .await
+            .is_err()
+    );
+    server.abort();
+    local_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_attacker_key_is_revoked_and_code_remains_usable_for_a_fresh_key() {
+    use st3_client::device::{KeyAlgorithm, SigningKey, complete};
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let anchor = Arc::new(smallclaims::fleet::MemberKey::generate().unwrap().0);
+    state.store.pin_fleet_anchor(anchor.public()).unwrap();
+    state.store.set_member_key(Some(anchor.clone())).unwrap();
+    state.store.append_claim(&st3::model::ClaimInput {
+        subject: "host/signing-node".into(), kind: "fleet.member-admitted".into(), actor: None,
+        fields: serde_json::from_value(json!({ "fleet_id": FLEET, "member_key": anchor.public(), "via": "anchor", "mode": "listening" })).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    wait_for_socket(&socket).await;
+    let local = Client::unix_as(&socket, PERSON);
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Failed first attempt".into(),
+            person_id: PERSON.into(),
+            full_control: Some(true),
+            scopes: None,
+        })
+        .await
+        .unwrap()
+        .value;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    // Refuse only the final commit, after enrollment and both signed proofs exist.
+    state
+        .store
+        .connection
+        .write()
+        .execute_batch(
+            "CREATE TRIGGER refuse_pairing_commit BEFORE INSERT ON claims
+         WHEN NEW.kind='custom.client.pairing-completed'
+         BEGIN SELECT RAISE(ABORT, 'injected pairing commit refusal'); END;",
+        )
+        .unwrap();
+    let attacker = Device::new().public();
+    let refused = Client::fabric_pairing(&base)
+        .pairing_complete(
+            &challenge.pairing_id,
+            &PairingComplete {
+                api_version: st3_client::API_VERSION.into(),
+                code: challenge.code.clone(),
+                device_public_key: attacker.clone(),
+                key_storage: Some("software".into()),
+            },
+        )
+        .await;
+    assert!(refused.is_err());
+    let grants = state
+        .store
+        .claims_for_subject_kind_at(PERSON, "principal.key-granted", None, true, 100)
+        .unwrap()
+        .claims;
+    assert!(
+        grants
+            .iter()
+            .any(|claim| claim.body["fields"]["key"] == attacker)
+    );
+    let revoked = state
+        .store
+        .claims_for_subject_kind_at(PERSON, "principal.key-revoked", None, true, 100)
+        .unwrap()
+        .claims
+        .into_iter()
+        .filter(|claim| claim.body["fields"]["key"] == attacker)
+        .collect::<Vec<_>>();
+    assert_eq!(revoked.len(), 1);
+    state.store.judge_claims(true).unwrap();
+    assert_eq!(
+        state.store.claim_verdict(&revoked[0].id).unwrap(),
+        Verdict::Verified
+    );
+    assert!(
+        state
+            .store
+            .claim_signature(&revoked[0].id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        state
+            .store
+            .claims_for_kind_at("custom.client.pairing-completed", None, true, 10)
+            .unwrap()
+            .claims
+            .is_empty()
+    );
+    state
+        .store
+        .connection
+        .write()
+        .execute_batch("DROP TRIGGER refuse_pairing_commit")
+        .unwrap();
+    let reused_key = Client::fabric_pairing(&base)
+        .pairing_complete(
+            &challenge.pairing_id,
+            &PairingComplete {
+                api_version: st3_client::API_VERSION.into(),
+                code: challenge.code.clone(),
+                device_public_key: attacker.clone(),
+                key_storage: Some("software".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(reused_key.to_string().contains("key was revoked"));
+    assert!(
+        state
+            .store
+            .claims_for_kind_at("custom.client.pairing-completed", None, true, 10)
+            .unwrap()
+            .claims
+            .is_empty()
+    );
+    let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
+    let public = key.public_key().unwrap();
+    complete(
+        &root.path().join("client/devices.json"),
+        &base,
+        &challenge.pairing_id,
+        &challenge.code,
+        key,
+    )
+    .await
+    .unwrap();
+    let completed = state
+        .store
+        .claims_for_kind_at("custom.client.pairing-completed", None, true, 10)
+        .unwrap()
+        .claims;
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].body["fields"]["device_public_key"], public);
+    assert_ne!(public, attacker);
+    server.abort();
+    local_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_sealed_root_proof_does_not_consume_code_or_create_a_bearer() {
+    use st3_client::device::{KeyAlgorithm, SigningKey, complete};
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    wait_for_socket(&socket).await;
+    let local = Client::unix_as(&socket, PERSON);
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Historical proof".into(),
+            person_id: PERSON.into(),
+            full_control: Some(true),
+            scopes: None,
+        })
+        .await
+        .unwrap()
+        .value;
+    state.store.seal_local_batches().unwrap();
+    let grant = state
+        .store
+        .claims_for_subject_kind_at(PERSON, "principal.key-granted", None, true, 100)
+        .unwrap()
+        .claims
+        .into_iter()
+        .find(|claim| claim.body["fields"]["role"] == "root")
+        .unwrap();
+    // Fault injection in this disposable store models an immutable, unsigned sealed root.
+    state
+        .store
+        .connection
+        .write()
+        .execute(
+            "DELETE FROM claim_signatures WHERE claim_id=?1",
+            [&grant.id],
+        )
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
+    let profile = root.path().join("client/devices.json");
+    for _ in 0..2 {
+        let error = complete(
+            &profile,
+            &base,
+            &challenge.pairing_id,
+            &challenge.code,
+            key.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("pairing code was not consumed"));
+        assert!(!profile.exists());
+        assert!(
+            state
+                .store
+                .claims_for_kind_at("custom.client.pairing-completed", None, true, 10)
+                .unwrap()
+                .claims
+                .is_empty()
+        );
+        assert!(state.store.claim_signature(&grant.id).unwrap().is_none());
+        let prepared = state
+            .store
+            .claims_for_subject_kind_at(PERSON, "principal.key-granted", None, true, 100)
+            .unwrap()
+            .claims
+            .into_iter()
+            .filter(|claim| claim.body["fields"]["key"] == key.public_key().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(prepared.len(), 1); // idempotent retries retain the same prepared signing grant
+        assert_eq!(prepared[0].body["fields"]["key"], key.public_key().unwrap());
+        let revoked = state
+            .store
+            .claims_for_subject_kind_at(PERSON, "principal.key-revoked", None, true, 100)
+            .unwrap()
+            .claims
+            .into_iter()
+            .filter(|claim| claim.body["fields"]["key"] == key.public_key().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(revoked.len(), 1); // idempotent cleanup applies on every refusal
+    }
+    server.abort();
+    local_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simultaneous_completions_consume_once_and_enroll_only_the_winning_key() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    wait_for_socket(&socket).await;
+    let local = Client::unix_as(&socket, PERSON);
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Concurrent device".into(),
+            person_id: PERSON.into(),
+            full_control: Some(true),
+            scopes: None,
+        })
+        .await
+        .unwrap()
+        .value;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let first = Client::fabric_pairing(&base);
+    let second = Client::fabric_pairing(&base);
+    let request = |public| PairingComplete {
+        api_version: st3_client::API_VERSION.into(),
+        code: challenge.code.clone(),
+        device_public_key: public,
+        key_storage: Some("software".into()),
+    };
+    let first_request = request(Device::new().public());
+    let second_request = request(Device::new().public());
+    let (a, b) = tokio::join!(
+        first.pairing_complete(&challenge.pairing_id, &first_request),
+        second.pairing_complete(&challenge.pairing_id, &second_request),
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    let (winner, key, refused) = match (a, b) {
+        (Ok(a), Err(b)) => (a.value, first_request.device_public_key.clone(), b),
+        (Err(a), Ok(b)) => (b.value, second_request.device_public_key.clone(), a),
+        _ => unreachable!(),
+    };
+    assert!(refused.to_string().contains("already used"));
+    assert_eq!(
+        state
+            .store
+            .claims_for_kind_at("custom.client.pairing-completed", None, true, 10)
+            .unwrap()
+            .claims
+            .len(),
+        1
+    );
+    let grants = state
+        .store
+        .claims_for_subject_kind_at(PERSON, "principal.key-granted", None, true, 100)
+        .unwrap()
+        .claims
+        .into_iter()
+        .filter(|claim| {
+            claim.body["fields"]["key"] == first_request.device_public_key
+                || claim.body["fields"]["key"] == second_request.device_public_key
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].body["fields"]["key"], key);
+    st3_client::device::verify_device_key_proofs(
+        &winner.person_id,
+        &winner.device_key_chain,
+        &winner.device_key_proofs,
+        &key,
+    )
+    .unwrap();
+    server.abort();
+    local_server.abort();
+}
+
 fn state(root: &Path) -> AppState {
     let store = Store::open_memory("signing-node").unwrap();
     store.bind_fleet(FLEET).unwrap();

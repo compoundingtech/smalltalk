@@ -34,11 +34,96 @@ Every client's tests check against that file.
      role `device`.
    - The answer gains `device_key_chain`: the claim IDs of the device's grant and then of the
      person's root grant. The device keeps the chain with its key.
+   - It also returns optional `device_key_proofs` in chain order: each grant's ID, batch ID,
+     subject, kind, origin, actor, body, predecessors and existing claim signature. These public
+     receipts let a completing client check content hashes, signatures and issuer/role links,
+     including that the device grant binds the public key it submitted. They provide no new
+     authority. Without independently pinning a trusted node or person-root key, an active
+     attacker can return an entirely forged, self-consistent chain and defeat this check.
+     Use a trusted encrypted path; returned proofs alone do not authenticate the gateway.
    - A `device_public_key` that is not a signing key pairs the device as before. That device has
      no grant and cannot sign.
 4. Revoking the pairing (`pairing.revoke`) also writes `principal.key-revoked` for the key.
    Anything that key signs after the revocation is invalid on every member. What it signed
    before stays verified.
+
+## CLI and stui pairing
+
+On the trusted machine, begin a pairing as the person:
+
+```sh
+st devices pair cli-device --as person/avery --full-control
+```
+
+On the device, complete it using the member gateway's HTTP or HTTPS origin and the returned
+pairing ID. The command prompts privately for the single-use code, or reads it from stdin:
+
+```sh
+st devices complete https://member.example pairing/PAIRING_ID
+```
+
+HTTP is allowed by default for loopback, private addresses and tailnet addresses, including
+Tailscale's `100.64.0.0/10` range. Hostnames must resolve entirely to those addresses.
+**An HTTP address must already be an encrypted path**, such as Tailscale/WireGuard or an SSH
+tunnel: the pairing code and bearer credentials cross it. Both commands print this notice when
+using HTTP. Other HTTP addresses are refused by default. On an already encrypted path, use
+`--allow-public-http` with `st devices complete` or `stui pair` to override that restriction.
+The override is saved as `allow_public_http: true` on that device in the private profile;
+existing profiles can set that field explicitly. The override also permits ambient HTTP proxies;
+ensure that the proxy path is encrypted and trusted too. HTTPS requires no override.
+The same address restriction applies to every plain WebSocket stream connection and reconnect.
+
+The default generates a P-256 software key. Use `--algorithm ed25519` for Ed25519. To import
+an existing private key, add `--key-file /absolute/path/device.der` and select its algorithm;
+the file must contain DER PKCS#8, belong to your user, and have private permissions (0600).
+The import file is read without following symlinks and is never changed.
+
+The bearer credential, delegation chain and private key are stored together in one mode-0600
+profile, `$XDG_CONFIG_HOME/st3/stui-devices.json` (or `~/.config/st3/stui-devices.json`).
+`--profile /absolute/path/devices.json` selects another profile in a directory owned by you
+and not writable by other users. New profile directories are created with mode 0700; an existing
+mode-0755 config directory is accepted without changing its permissions.
+One atomic rename replaces both credential and key together; concurrent updates are refused.
+Wrong or reused codes, invalid keys and failures before that commit leave the existing profile
+unchanged. If response validation or saving fails after the member consumes the code, the error
+identifies the possible orphaned device and gives a revoke hint. On the trusted machine, inspect
+`st devices ls --as person/avery`, then revoke that device with
+`st devices revoke device/DEVICE_ID --as person/avery` before beginning another pairing.
+The new device may have a live bearer even though the client retained its previous profile.
+If a connection fails before an answer arrives, inspect the trusted device list because the
+client cannot know whether the member consumed the code.
+Neither ordinary output nor `--json` prints the bearer or private key.
+
+`stui pair https://member.example pairing/PAIRING_ID` uses the same key generation and
+persistence, and paired stui messages are signed using the saved key and chain. Existing legacy
+profiles remain readable. A pairing without `control.messages`, including `--read-only`,
+enrolls no signing key and persists no private signing material.
+
+Completion checks the private key with a local signing self-test before sending the existing
+pairing request. It does not add a server proof-of-possession requirement or send a message.
+Before sending the single-use code, it anonymously reads `GET /v1/client/capabilities` and
+requires `device-key-proofs` version 1. This unauthenticated response contains only `api_version`
+and that one capability. It is static: no machine version, snapshot, event cursor, limits, scopes,
+actions or client-presence update. Authenticated capability reads retain their full response.
+Older members are refused without submitting or consuming the code.
+The member prepares and checks both proofs before recording completion or creating the bearer.
+If a historical root has no usable signature or content hash, completion refuses without consuming
+its code; inspect signing history on the trusted member. Every refusal after enrollment calls
+`revoke_device_key` best-effort, recording `principal.key-revoked` for the prepared key and sealing
+that revocation. This withdraws signing authority without rewriting the original grant. Retry with
+a fresh signing key. A process crash or a storage failure can prevent cleanup and leave an unused
+signing grant; inspect principal grant and revocation history on the trusted member in that case.
+There is no completed device record for such a grant in `st devices ls`; pairing revocation only
+covers completed devices. Node/person-root fingerprint pinning remains a pending design decision;
+these proofs do not authenticate a gateway against an active attacker.
+Before committing a messaging profile it verifies the returned device and person-root grant
+proofs, their content hashes and signatures, the device-to-root-to-node issuer/role links, and
+the first grant's binding to its submitted public key. A member that does not return those
+proofs must be upgraded; the client refuses to save its response and reports the possible
+orphaned device. Existing profiles remain readable. Use the prompt for the pairing code;
+putting a literal code in an `echo` command or command argument can retain it in shell history.
+The shared signer's integration tests complete both key types, reload their profiles, send real
+signed messages, and check `Verified` verdicts on the accepting member and a receiving peer.
 
 ## Signing a message
 

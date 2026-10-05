@@ -107,8 +107,19 @@ printf 'Runner: **ci1** (%s, %s idle)\\n' "$label" "$idle" >> "$GITHUB_STEP_SUMM
 const pickedOr = (namespaceLabels: string) =>
   `\${{ fromJSON(needs.${pickRunnerJobId}.outputs.ci1 || ${namespaceLabels}) }}`
 
-/** `runs-on` for a stage job: ci1 when picked, else the Namespace shape label. */
-export const linuxStageRunsOn = pickedOr(`'${JSON.stringify(linuxStageRunner)}'`)
+// Required Workspace jobs precede optional benchmarks under Namespace contention.
+// Run affinity prevents another workflow with the same shape from taking their runner.
+const workspaceQueuePriority = "(github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10"
+const workspaceStageShape = `${linuxStageRunner[0]}-with-features`
+const workspaceStageLabels = (priority: string, runId: string) => [
+  `${workspaceStageShape};job.priority=${priority}`,
+  `namespace-features:github.run-id=${runId}`,
+] as const
+
+/** `runs-on` for a stage job: picked ci1, else prioritized Namespace with run affinity. */
+export const linuxStageRunsOn = pickedOr(
+  `format('${JSON.stringify(workspaceStageLabels('{0}', '{1}'))}', ${workspaceQueuePriority}, github.run_id)`,
+)
 
 /** `runs-on` for the other Linux jobs: ci1 when picked, else the Namespace profile with run affinity. */
 export const linuxRunsOn = pickedOr(
@@ -116,8 +127,11 @@ export const linuxRunsOn = pickedOr(
 )
 
 /** Supporting jobs use independent CPUs; only the primary test shard takes the picked lane. */
-export const supportingLinuxRunsOn = linuxRunner
-export const supportingStageRunsOn = linuxStageRunner
+export const supportingLinuxRunsOn = [
+  `${linuxRunner[0]};job.priority=\${{ ${workspaceQueuePriority} }}`,
+  linuxRunner[1],
+] as const
+export const supportingStageRunsOn = workspaceStageLabels(`\${{ ${workspaceQueuePriority} }}`, '${{ github.run_id }}')
 
 /** A job that needs `pick-runner` still runs when it was skipped (ci1 off). */
 export const afterPickRunner = { needs: [pickRunnerJobId], if: '${{ !cancelled() }}' } as const

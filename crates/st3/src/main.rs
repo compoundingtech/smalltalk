@@ -2330,6 +2330,24 @@ enum DevicesCommand {
         #[arg(long, conflicts_with = "full_control")]
         read_only: bool,
     },
+    /// Complete a single-use pairing on this device; read the code privately from stdin.
+    Complete {
+        /// The member gateway's HTTP or HTTPS origin.
+        member_url: String,
+        pairing_id: String,
+        /// Software key algorithm, also used when importing a key.
+        #[arg(long, value_parser = ["ed25519", "p256"], default_value = "p256")]
+        algorithm: String,
+        /// Import a private mode-0600 DER PKCS#8 file; otherwise generate a key.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Credential and private-key profile, shared with stui by default.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        /// Allow a public HTTP address only when it is already an encrypted path.
+        #[arg(long)]
+        allow_public_http: bool,
+    },
     /// Revoke one paired device.
     Revoke {
         #[arg(add = ArgValueCompleter::new(Complete(Entity::Device)))]
@@ -4479,6 +4497,31 @@ async fn run(cli: Cli) -> Result<()> {
     let own = std::env::var("ST_AGENT").ok();
     let mission_run = std::env::var("ST_MISSION_RUN").ok();
     guard_mutating_cli_actor(&cli.command, own.as_deref(), mission_run.as_deref())?;
+    // Completion is a remote device operation. It needs neither a local daemon nor its config.
+    if let Command::Devices(DevicesArgs {
+        command:
+            Some(DevicesCommand::Complete {
+                member_url,
+                pairing_id,
+                algorithm,
+                key_file,
+                profile,
+                allow_public_http,
+            }),
+        ..
+    }) = &cli.command
+    {
+        return run_devices_complete(
+            member_url,
+            pairing_id,
+            algorithm,
+            key_file.as_deref(),
+            profile.as_deref(),
+            *allow_public_http,
+            cli.json,
+        )
+        .await;
+    }
     if let Command::Up(args) = cli.command {
         return run_up(args).await;
     }
@@ -7751,6 +7794,7 @@ async fn run_devices(
     let person = configured_human(person.as_deref(), configured_person, "devices")?;
     let client = generated_client(&endpoint, Some(&person))?;
     match command.unwrap_or(DevicesCommand::Ls) {
+        DevicesCommand::Complete { .. } => unreachable!("handled before loading local config"),
         DevicesCommand::Ls => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
@@ -7824,6 +7868,61 @@ async fn run_devices(
             print_client_value(&response, json_output)
         }
     }
+}
+
+async fn run_devices_complete(
+    member_url: &str,
+    pairing_id: &str,
+    algorithm: &str,
+    key_file: Option<&Path>,
+    profile: Option<&Path>,
+    allow_public_http: bool,
+    json_output: bool,
+) -> Result<()> {
+    use st3_client::device::{KeyAlgorithm, SigningKey};
+    let algorithm = match algorithm {
+        "ed25519" => KeyAlgorithm::Ed25519,
+        "p256" => KeyAlgorithm::P256,
+        _ => anyhow::bail!("Choose ed25519 or p256"),
+    };
+    let key = match key_file {
+        Some(path) => SigningKey::import(algorithm, path)?,
+        None => SigningKey::generate(algorithm)?,
+    };
+    let path = profile
+        .map(Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(st3_client::device::profile_path)?;
+    let code = st3_client::device::read_pairing_code()?;
+    let device = st3_client::device::complete_with_http_policy(
+        &path, member_url, pairing_id, &code, key, allow_public_http,
+    )
+    .await?;
+    // Always choose explicit safe fields, including --json. PairedSession contains a bearer.
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "kind": "device-paired", "device_id": device.session.device_id,
+                "person_id": device.session.person_id, "scopes": device.session.scopes,
+                "expires_at": device.session.expires_at, "profile": path,
+                "signing_key": device.signing_key.as_ref().map(SigningKey::public_key).transpose()?,
+            }))?
+        );
+    } else {
+        println!(
+            "Paired {} as {}. Saved device credentials{} to {}.",
+            device.session.device_id,
+            device.session.person_id,
+            if device.signing_key.is_some() {
+                " and signing key"
+            } else {
+                ""
+            },
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 async fn run_clients(endpoint: &Endpoint, json_output: bool) -> Result<()> {
@@ -13637,12 +13736,39 @@ async fn run_attention(
                 completion::Matching::Fuzzy,
             )
             .await?;
+            // Public card IDs name a recipient and waiting episode, not just a work source.
+            // Resolve through the actor-scoped read projection; this must not read an update
+            // for the person or let a spent card open a later episode of the same source.
+            let alias = if normalized.starts_with("attention/") {
+                match generated_client(endpoint, Some(&actor))?
+                    .attention_get(&normalized)
+                    .await
+                {
+                    Ok(response) => match response.value {
+                        ClientResource::Attention(card)
+                            if card.header.id == normalized && card.person_id == actor =>
+                        {
+                            Some(card)
+                        }
+                        _ => None,
+                    },
+                    Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                None
+            };
             let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
             let item = client
                 .get::<Vec<AttentionItemView>>(&path)
                 .await?
                 .into_iter()
-                .find(|item| item.subject == normalized)
+                .find(|item| {
+                    alias.as_ref().map_or_else(
+                        || item.subject == normalized,
+                        |card| item.subject == card.source_id && item.episode == card.episode,
+                    )
+                })
                 .with_context(|| {
                     format!("attention item `{normalized}` is not currently actionable")
                 })?;

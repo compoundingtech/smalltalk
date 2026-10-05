@@ -8,9 +8,22 @@
     { "$ref": "#/$defs/ErrorEnvelope" },
     { "$ref": "#/$defs/ActionRequest" },
     { "$ref": "#/$defs/PairingBegin" },
-    { "$ref": "#/$defs/PairingComplete" }
+    { "$ref": "#/$defs/PairingComplete" },
+    { "$ref": "#/$defs/PairingAdvertisement" }
   ],
   "$defs": {
+    "PairingAdvertisement": {
+      "description": "Static unauthenticated pairing preflight; no envelope, presence update or graph information.",
+      "type": "object", "additionalProperties": false,
+      "required": ["api_version", "capabilities"],
+      "properties": {
+        "api_version": {"const": "st3.client.v0"},
+        "capabilities": {"type": "array", "minItems": 1, "maxItems": 1, "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "version", "state"],
+          "properties": {"id": {"const": "device-key-proofs"}, "version": {"const": 1}, "state": {"const": "granted"}}
+        }}
+      }
+    },
     "CustomReplyParameters": {"type": "object", "additionalProperties": false, "required": ["target_id", "registration", "revision", "episode", "fields"], "properties": {"target_id": {"$ref": "#/$defs/Id"}, "registration": {"type": "string"}, "revision": {"type": "string"}, "episode": {"type": "string"}, "fields": {"type": "object"}}},
     "ConversationSearchHit": {"type": "object", "additionalProperties": false, "required": ["conversation_id", "entry_id", "agent_id", "timestamp", "entry_type", "excerpt"], "properties": {"conversation_id": {"$ref": "#/$defs/Id"}, "entry_id": {"$ref": "#/$defs/Id"}, "agent_id": {"type": ["string", "null"]}, "timestamp": {"$ref": "#/$defs/Timestamp"}, "entry_type": {"type": "string"}, "excerpt": {"type": "string", "maxLength": 512}}},
     "ConversationSearch": {"type": "object", "additionalProperties": false, "required": ["kind", "items", "page", "indexed_at", "host_id", "incomplete_sources", "refreshing"], "properties": {"kind": {"const": "conversation-search"}, "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/ConversationSearchHit"}}, "page": {"$ref": "#/$defs/PageInfo"}, "indexed_at": {"$ref": "#/$defs/Timestamp"}, "host_id": {"$ref": "#/$defs/Id"}, "incomplete_sources": {"type": "array", "items": {"type": "string"}}, "refreshing": {"type": "boolean"}}},
@@ -2140,7 +2153,8 @@
         "credential": { "x-st-codec": "redacted", "type": "string", "minLength": 32 },
         "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "expires_at": { "$ref": "#/$defs/Timestamp" },
-        "device_key_chain": { "type": "array", "items": { "type": "string" } }
+        "device_key_chain": { "type": "array", "items": { "type": "string" } },
+        "device_key_proofs": { "type": "array", "items": { "type": "object" }, "maxItems": 2 }
       }
     },
     "DeviceSignature": {
