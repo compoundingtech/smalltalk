@@ -1,6 +1,5 @@
 use super::*;
 use crate::private_notes::{NotesFence, NotesWrite};
-use st3_schema::private_notes::PrivateNotesUri;
 
 
 #[derive(Deserialize)]
@@ -22,52 +21,6 @@ pub(super) fn entitled(state: &AppState, session: &ClientSession, scope: &str) -
     state.private_notes.person.as_deref() == Some(session.authority_actor.as_str()) && session.allows(scope)
 }
 
-fn native_source(state: &AppState, bound: &BoundAgent) -> Result<(String, String), ApiError> {
-    let desired = state.store.desired_subjects_named(std::slice::from_ref(&bound.0)).map_err(ApiError::internal)?;
-    let [desired] = desired.as_slice() else { return Err(forbidden("the native notes producer has no admitted seat declaration")); };
-    if desired.kind != "agent" || desired.owner_run.is_some() {
-        return Err(forbidden("the native notes producer must be a declared catalog seat"));
-    }
-    let field = |name: &str| desired.desired.get("children").and_then(Value::as_array)
-        .and_then(|children| children.iter().find(|child| child["name"].as_str() == Some(name)))
-        .and_then(|child| child["arguments"].as_array()).and_then(|arguments| arguments.first()).and_then(Value::as_str);
-    let identity = field("identity").or_else(|| desired.desired["arguments"].as_array().and_then(|args| args.first()).and_then(Value::as_str))
-        .ok_or_else(|| forbidden("the admitted native seat has no catalog identity"))?;
-    let host = desired.member.as_ref().map(|member| member.host.as_str()).or_else(|| field("host")).unwrap_or(&state.node);
-    if host != state.node { return Err(forbidden("the native notes producer belongs to another owner node")); }
-    let uri = PrivateNotesUri::for_subject(host, identity).map_err(|error| validation(error.message))?;
-    let runtime = state.store.latest_claim(&bound.0, Some("runtime.observed")).map_err(ApiError::internal)?
-        .filter(|runtime| runtime.body["fields"]["status"] == "running")
-        .ok_or_else(|| stale("the native notes source is not running"))?;
-    let incarnation = runtime.body["fields"]["incarnation_id"].as_str()
-        .ok_or_else(|| stale("the native notes source has no current incarnation"))?;
-    Ok((uri.to_string(), incarnation.into()))
-}
-
-pub(in crate::api) async fn bind_native(
-    state: &AppState,
-    agent: &str,
-    source_incarnation: &str,
-) -> Result<(), ApiError> {
-    if state.private_notes.catalogs.is_empty() { return Ok(()); }
-    let desired = state.store.desired_subjects_named(&[agent.to_owned()]).map_err(ApiError::internal)?;
-    // Runtime-only and run-owned agents have no catalog-owned notes source.
-    if desired.is_empty() || desired.iter().any(|subject| subject.kind != "agent" || subject.owner_run.is_some()) {
-        return Ok(());
-    }
-    let (uri, incarnation) = native_source(state, &BoundAgent(agent.into()))?;
-    if source_incarnation != incarnation { return Err(stale("the native notes source incarnation is stale")); }
-    let producer = state.clone();
-    let agent = agent.to_owned();
-    super::super::blocking_action(move || {
-        match producer.private_notes.bind_source(&producer.node, &producer.state_dir, &uri, &agent, &incarnation) {
-            Ok(_) => Ok(()),
-            // Seats without a declared notes binding have no notes supply to publish.
-            Err(error) if error.code == "not-found" => Ok(()),
-            Err(error) => Err(error),
-        }
-    }).await
-}
 
 pub(in crate::api) async fn detail(
     State(state): State<AppState>,
@@ -76,19 +29,15 @@ pub(in crate::api) async fn detail(
     bound: Option<Extension<BoundAgent>>,
     AxumPath(uri): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let native = if let Some(bound) = &bound {
-        let (own_uri, incarnation) = native_source(&state, &bound.0)?;
-        if uri != own_uri { return Err(forbidden("a native agent may read only its canonical self notes URI")); }
-        Some((bound.0.0.clone(), incarnation))
-    } else {
-        principal(&state, &session, None, "notes.read")?;
-        None
-    };
+    if bound.is_some() {
+        return Err(ApiError::bad(crate::model::St3Error::new(
+            "unsupported-capability",
+            "native private-notes self-read is unavailable without admitted reader-incarnation provenance",
+        )));
+    }
+    principal(&state, &session, None, "notes.read")?;
     let reader = state.clone();
     let notes = super::super::blocking_action(move || {
-        if let Some((agent, incarnation)) = native {
-            reader.private_notes.check_source(&reader.node, &reader.state_dir, &uri, &agent, &incarnation)?;
-        }
         reader.private_notes.read(&reader.node, &uri)
     }).await?;
     let mut actions = Vec::new();
@@ -130,17 +79,18 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
-    async fn bearer(app: Router, path: &str, credential: &str) -> (StatusCode, Value) {
-        let response = app.oneshot(Request::builder().uri(path)
+    async fn bearer(app: Router, method: &str, path: &str, body: Value, credential: &str) -> (StatusCode, Value) {
+        let response = app.oneshot(Request::builder().method(method).uri(path)
             .header(AUTHORIZATION, format!("Bearer {credential}"))
-            .body(Body::empty()).unwrap()).await.unwrap();
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())).unwrap()).await.unwrap();
         let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
     #[tokio::test]
-    async fn notes_routes_require_transport_proof_and_never_allow_native_principal_impersonation() {
+    async fn notes_routes_require_attested_pairing_and_refuse_native_and_forged_authority() {
         let root = tempfile::tempdir().unwrap();
         let catalog = root.path().join("catalog");
         let subject = catalog.join("agents/node/worker");
@@ -153,49 +103,72 @@ mod tests {
         });
         let app = crate::api::router(state.clone());
         let path = "/v1/client/private-notes/dev.schickling.agent-private-notes%3A%2F%2Fnode%2Fworker";
-        let (status, denied) = request(app.clone(), "GET", &path, Value::Null).await;
+        let issuer = app.clone().layer(Extension(VerifiedNotesPairingPrincipal));
+        for local in [app.clone(), issuer.clone()] {
+            let (status, denied) = request(local, "GET", path, Value::Null).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        }
+        let forged = crate::model::ClaimInput {
+            subject: "custom/client/forged-notes-pair".into(),
+            kind: "custom.client.pairing-completed".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("credential_hash".into(), json!(credential_digest("forged-notes-credential"))),
+                ("session_actor".into(), json!("client/forged-notes")),
+                ("person_id".into(), json!("person/operator")),
+                ("scopes".into(), json!(["notes.read", "notes.write"])),
+                ("expires_at_unix_ms".into(), json!(u64::MAX)),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        };
+        state.store.append_claim(&forged).unwrap();
+        let (status, denied) = bearer(app.clone(), "GET", path, Value::Null, "forged-notes-credential").await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
-        let principal = app.clone().layer(Extension(VerifiedNotesPrincipal));
-        let (status, notes) = request(principal.clone(), "GET", &path, Value::Null).await;
-        assert_eq!(status, StatusCode::OK, "{notes}");
-        let value = &notes["value"];
-        assert_eq!(value["data"]["markdown"], "");
-        let action = json!({
-            "api_version":"st3.client.v0", "id":"action/notes-first", "type":"private-notes.write",
-            "idempotency_key":"notes-first-key-0001", "fence":value["actions"][0]["fence"],
-            "parameters":{"uri":uri,"markdown":"owner private bytes\n"},
-        });
-        let native = principal.clone().layer(Extension(BoundAgent("agent/foreign".into())));
-        let (status, denied) = request(native.clone(), "GET", &path, Value::Null).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
-        let (status, denied) = request(native.clone(), "POST", "/v1/client/actions", action.clone()).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
-        let (status, denied) = request(app.clone(), "POST", "/v1/client/actions", action.clone()).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
-        let pairing = json!({"api_version":"st3.client.v0", "person_id":"person/operator", "device_name":"notes reader", "scopes":["notes.read"]});
-        let (status, denied) = request(app, "POST", "/v1/client/pairings", pairing.clone()).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
-        let (status, denied) = request(native, "POST", "/v1/client/pairings", pairing.clone()).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
-        let (status, offered) = request(principal.clone(), "POST", "/v1/client/pairings", pairing).await;
+        for kind in ["custom.client.pairing-begun", "custom.client.pairing-completed", "custom.client.pairing-revoked"] {
+            let mut public = forged.clone();
+            public.kind = kind.into();
+            let (status, denied) = request(app.clone(), "POST", "/v1/claims", serde_json::to_value(&public).unwrap()).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
+            assert_eq!(denied["code"], "claim-write-forbidden");
+        }
+        let pairing = json!({"api_version":"st3.client.v0", "person_id":"person/operator", "device_name":"notes editor", "scopes":["notes.read", "notes.write"]});
+        let native_issuer = issuer.clone().layer(Extension(BoundAgent("agent/foreign".into())));
+        for denied_issuer in [app.clone(), native_issuer.clone()] {
+            let (status, denied) = request(denied_issuer, "POST", "/v1/client/pairings", pairing.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        }
+        let (status, offered) = request(issuer.clone(), "POST", "/v1/client/pairings", pairing).await;
         assert_eq!(status, StatusCode::OK, "{offered}");
-        let (status, written) = request(principal.clone(), "POST", "/v1/client/actions", action.clone()).await;
-        assert_eq!(status, StatusCode::OK, "{written}");
         let pairing_id = offered["value"]["pairing_id"].as_str().unwrap().strip_prefix("pairing/").unwrap();
         let complete_path = format!("/v1/client/pairings/{pairing_id}/complete");
-        let (status, completed) = request(principal.clone(), "POST", &complete_path, json!({
+        let (status, completed) = request(app.clone(), "POST", &complete_path, json!({
             "api_version":"st3.client.v0", "code":offered["value"]["code"],
             "device_public_key":"legacy-notes-device-public-key-fixture",
         })).await;
         assert_eq!(status, StatusCode::OK, "{completed}");
         let credential = completed["value"]["credential"].as_str().unwrap();
-        let (status, paired_notes) = bearer(principal.clone(), path, credential).await;
+        let (status, notes) = bearer(app.clone(), "GET", path, Value::Null, credential).await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(notes["value"]["data"]["markdown"], "");
+        let action = json!({
+            "api_version":"st3.client.v0", "id":"action/notes-first", "type":"private-notes.write",
+            "idempotency_key":"notes-first-key-0001", "fence":notes["value"]["actions"][0]["fence"],
+            "parameters":{"uri":uri,"markdown":"owner private bytes\n"},
+        });
+        let native = app.clone().layer(Extension(BoundAgent("agent/foreign".into())));
+        let (status, denied) = bearer(native.clone(), "GET", path, Value::Null, credential).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
+        assert_eq!(denied["code"], "unsupported-capability");
+        let (status, denied) = bearer(native, "POST", "/v1/client/actions", action.clone(), credential).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, written) = bearer(app.clone(), "POST", "/v1/client/actions", action.clone(), credential).await;
+        assert_eq!(status, StatusCode::OK, "{written}");
+        let (status, paired_notes) = bearer(app.clone(), "GET", path, Value::Null, credential).await;
         assert_eq!(status, StatusCode::OK, "{paired_notes}");
         assert_eq!(paired_notes["value"]["data"]["markdown"], "owner private bytes\n");
-        assert_eq!(paired_notes["value"]["actions"], json!([]));
+        assert_eq!(written["value"]["private_notes"], paired_notes["value"]["data"]["fence"]);
         let replica = state.store.export_replication(0).unwrap();
-        let exported = serde_json::to_string(&replica).unwrap();
-        assert!(!exported.contains("owner private bytes"));
+        assert!(!serde_json::to_string(&replica).unwrap().contains("owner private bytes"));
         let peer_root = tempfile::tempdir().unwrap();
         let mut peer = crate::api::tests::state(peer_root.path());
         peer.node = "peer".into();
@@ -204,16 +177,13 @@ mod tests {
             person: Some("person/operator".into()), catalogs: vec![],
         });
         peer.store.import_replication("node", &replica).unwrap();
-        let peer_app = crate::api::router(peer);
-        let (status, denied) = bearer(peer_app.clone(), path, credential).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
-        let (status, denied) = bearer(peer_app, "/v1/client/capabilities", credential).await;
+        let (status, denied) = bearer(crate::api::router(peer), "GET", path, Value::Null, credential).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
         let mut stale = action;
         stale["id"] = "action/notes-concurrent".into();
         stale["idempotency_key"] = "notes-concurrent-key-0001".into();
         stale["parameters"]["markdown"] = "stale overwrite\n".into();
-        let (status, refused) = request(principal, "POST", "/v1/client/actions", stale).await;
+        let (status, refused) = bearer(app, "POST", "/v1/client/actions", stale, credential).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
         assert_eq!(std::fs::read_to_string(subject.join("resources/private-notes.md")).unwrap(), "owner private bytes\n");
     }

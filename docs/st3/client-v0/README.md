@@ -52,19 +52,27 @@ fleet claims, collections, or replication.
 
 Only the daemon's configured `person` has principal notes entitlement.
 `notes.read` and `notes.write` are explicit requested pairing scopes; neither the
-implicit limited nor full-control pairing defaults includes them. The local
-person header is an identity selector, not authority: uncredentialed notes
-access and notes-scope delegation require positively inspected local OS-owner
-process ancestry. This admission currently supports Linux only; other platforms
-fail closed for uncredentialed notes access. Configured-person paired credentials
-with explicit notes scopes remain valid through the authenticated client surface.
-The pairing grant and sealed challenge must originate on that owner node;
-replicated pairings do not acquire another node's notes authority, even for the same person.
-Native agents never write or delegate notes authority. The existing authenticated
-native harness producer binds only its declared self notes source to the current
-runtime incarnation. Optional admission skips a busy private writer and retries
-on a later native event; it does not wait on the private mutation lock before
-acknowledging unrelated observation delivery.
+implicit limited nor full-control pairing defaults includes them. A local person
+header is only an identity selector and never grants private notes access.
+Notes credentials require an immutable, owner-local attestation of the exact
+challenge and completed pairing claim. Public claim writes cannot create,
+complete, or revoke pairings. Legacy unmarked and replicated pairing claims do
+not acquire notes authority, even for the same person. Expiry and revocation
+remain checked on every authenticated request.
+
+Bootstrap delegation requires a positively admitted authenticated local login,
+the configured person, and an unbound client; another already-attested notes
+credential may delegate only its existing notes scopes. The login admission is
+Linux-only and fails closed when its protected SSH login executable cannot be
+inspected. PID 1, detached processes, mutable person headers and native process
+environment are not positive authority. Other platforms require an existing
+attested credential; no uncredentialed content access is available.
+
+Native agents never write or delegate notes authority. Optional native
+self-read is unavailable without admitted reader-incarnation provenance:
+the detail route returns `unsupported-capability` without content, revision,
+or digest. Ordinary native harness observation delivery has no private-notes
+source admission or mutation-lock dependency.
 
 `private-notes.write` requires `notes.write`, the returned action fence, a stable
 idempotency key, the canonical URI, and complete Markdown. Supported writers must

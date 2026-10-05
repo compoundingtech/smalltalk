@@ -134,29 +134,26 @@ impl Authority {
         }
         Ok(Notes { uri: uri.to_string(), markdown, fence })
     }
-    pub fn bind_source(&self, node: &str, state_dir: &Path, uri: &str, agent: &str, incarnation: &str) -> Result<Option<String>, St3Error> {
-        // Admission is optional: a busy writer must never park the harness outbox ACK.
-        let Some(_lock) = fs::local_try_lock(&state_dir.join("private-notes.lock")).map_err(io)? else {
-            return Ok(None);
-        };
-        let uri = PrivateNotesUri::parse(uri).map_err(|error| refusal("validation-failed", &error.message))?;
-        let resolved = self.resolve(node, &uri)?;
-        ledger(state_dir)?.execute("INSERT INTO notes_sources(uri, agent, incarnation, generation) VALUES(?1,?2,?3,?4)
-            ON CONFLICT(uri) DO UPDATE SET agent=excluded.agent, incarnation=excluded.incarnation, generation=excluded.generation
-            WHERE notes_sources.agent<>excluded.agent OR notes_sources.incarnation<>excluded.incarnation OR notes_sources.generation<>excluded.generation",
-            params![uri.as_str(), agent, incarnation, resolved.generation]).map_err(database_error)?;
-        Ok(Some(resolved.generation))
+
+    pub(crate) fn attest_pairing(&self, state_dir: &Path, claim: &crate::model::ClaimRecord) -> Result<(), St3Error> {
+        let _lock = fs::local_lock(&state_dir.join("private-notes.lock")).map_err(io)?;
+        let stamp = pairing_stamp(claim)?;
+        let connection = ledger(state_dir)?;
+        connection.execute("INSERT INTO notes_pairings(claim_id, stamp) VALUES(?1,?2)
+            ON CONFLICT(claim_id) DO NOTHING", params![claim.id, stamp]).map_err(database_error)?;
+        let stored: String = connection.query_row("SELECT stamp FROM notes_pairings WHERE claim_id=?1",
+            [&claim.id], |row| row.get(0)).map_err(database_error)?;
+        if stored != stamp { return Err(refusal("forbidden", "notes pairing authority changed after local attestation")); }
+        Ok(())
     }
 
-    pub fn check_source(&self, node: &str, state_dir: &Path, uri: &str, agent: &str, incarnation: &str) -> Result<(), St3Error> {
-        let uri = PrivateNotesUri::parse(uri).map_err(|error| refusal("validation-failed", &error.message))?;
-        let resolved = self.resolve(node, &uri)?;
-        let admitted = ledger(state_dir)?.query_row("SELECT generation FROM notes_sources WHERE uri=?1 AND agent=?2 AND incarnation=?3",
-            params![uri.as_str(), agent, incarnation], |row| row.get::<_, String>(0)).optional().map_err(database_error)?;
-        if admitted.as_deref() != Some(resolved.generation.as_str()) {
-            return Err(refusal("stale-fence", "the native notes source binding is absent or stale"));
+    pub(crate) fn pairing_attested(&self, state_dir: &Path, claim: &crate::model::ClaimRecord) -> Result<bool, St3Error> {
+        let admitted = ledger(state_dir)?.query_row("SELECT stamp FROM notes_pairings WHERE claim_id=?1",
+            [&claim.id], |row| row.get::<_, String>(0)).optional().map_err(database_error)?;
+        match admitted {
+            Some(admitted) => Ok(admitted == pairing_stamp(claim)?),
+            None => Ok(false),
         }
-        Ok(())
     }
 
 
@@ -229,6 +226,13 @@ impl Authority {
     }
 }
 
+fn pairing_stamp(claim: &crate::model::ClaimRecord) -> Result<String, St3Error> {
+    // Seal the immutable origin and full authority fields, not a mutable projection.
+    let body = serde_json::to_vec(&(&claim.id, &claim.origin, &claim.kind, &claim.subject, &claim.body))
+        .map_err(|_| refusal("internal", "notes pairing authority could not be encoded"))?;
+    Ok(digest(&body))
+}
+
 fn ledger(state_dir: &Path) -> Result<Connection, St3Error> {
     let path = state_dir.join("private-notes.sqlite");
     let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
@@ -238,6 +242,45 @@ fn ledger(state_dir: &Path) -> Result<Connection, St3Error> {
     let connection = Connection::open(path).map_err(database_error)?;
     connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
         CREATE TABLE IF NOT EXISTS notes_operations(operation TEXT PRIMARY KEY, uri TEXT NOT NULL, request_digest TEXT NOT NULL, generation TEXT NOT NULL, old_revision TEXT NOT NULL, new_revision TEXT NOT NULL, result TEXT);
-        CREATE TABLE IF NOT EXISTS notes_sources(uri TEXT PRIMARY KEY, agent TEXT NOT NULL, incarnation TEXT NOT NULL, generation TEXT NOT NULL);").map_err(database_error)?;
+        CREATE TABLE IF NOT EXISTS notes_pairings(claim_id TEXT PRIMARY KEY, stamp TEXT NOT NULL);").map_err(database_error)?;
     Ok(connection)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairing_attestation_is_local_immutable_and_cannot_reseal_changed_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let authority = Authority::default();
+        let store = crate::store::Store::open_memory("owner").unwrap();
+        let claim = store.append_claim(&crate::model::ClaimInput {
+            subject: "custom/client/pairing-notes".into(),
+            kind: "custom.client.pairing-completed".into(),
+            actor: Some("person/operator".into()),
+            fields: std::collections::BTreeMap::from([
+                ("person_id".into(), serde_json::json!("person/operator")),
+                ("credential_hash".into(), serde_json::json!("credential-hash")),
+                ("scopes".into(), serde_json::json!(["notes.read"])),
+                ("expires_at_unix_ms".into(), serde_json::json!(u64::MAX)),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert!(!authority.pairing_attested(root.path(), &claim).unwrap());
+        authority.attest_pairing(root.path(), &claim).unwrap();
+        assert!(authority.pairing_attested(root.path(), &claim).unwrap());
+        assert!(!authority.pairing_attested(other.path(), &claim).unwrap());
+        for field in ["person_id", "credential_hash", "scopes", "expires_at_unix_ms"] {
+            let mut changed = claim.clone();
+            changed.body["fields"][field] = serde_json::json!("substituted-authority");
+            assert!(!authority.pairing_attested(root.path(), &changed).unwrap());
+            assert_eq!(authority.attest_pairing(root.path(), &changed).unwrap_err().code, "forbidden");
+            assert!(authority.pairing_attested(root.path(), &claim).unwrap());
+        }
+        let mut foreign = claim;
+        foreign.origin = "foreign".into();
+        assert!(!authority.pairing_attested(root.path(), &foreign).unwrap());
+    }
 }
