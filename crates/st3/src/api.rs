@@ -157,6 +157,10 @@ struct ClientListQuery {
     owner_run: Option<String>,
     status: Option<String>,
     #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
     native_only: bool,
 }
 
@@ -171,6 +175,10 @@ struct ClientPageCursor {
     actor: Option<String>,
     owner_run: Option<String>,
     status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
     #[serde(default)]
     native_only: bool,
     items_digest: String,
@@ -1287,6 +1295,8 @@ fn client_page_read(
             || cursor.person != query.person
             || cursor.actor != query.actor
             || cursor.owner_run != query.owner_run
+            || cursor.owner != query.owner
+            || cursor.state != query.state
             || cursor.status != query.status
             || cursor.native_only != query.native_only
             || query
@@ -1383,6 +1393,8 @@ fn client_page_read(
             actor: query.actor.clone(),
             owner_run: query.owner_run.clone(),
             status: query.status.clone(),
+            owner: query.owner.clone(),
+            state: query.state.clone(),
             native_only: query.native_only,
             items_digest,
             before_index: None,
@@ -1419,6 +1431,8 @@ fn client_page_filters(query: &ClientListQuery) -> BTreeMap<String, String> {
         ("actor", query.actor.as_ref()),
         ("owner_run", query.owner_run.as_ref()),
         ("status", query.status.as_ref()),
+        ("owner", query.owner.as_ref()),
+        ("state", query.state.as_ref()),
     ] {
         if let Some(value) = value {
             filters.insert(name.into(), value.clone());
@@ -3635,6 +3649,8 @@ async fn client_work_history(
             || cursor.person != query.person
             || cursor.actor != query.actor
             || cursor.owner_run != query.owner_run
+            || cursor.owner != query.owner
+            || cursor.state != query.state
             || cursor.status != query.status
             || cursor.native_only != query.native_only
             || cursor.items_digest != "sql-page"
@@ -3705,6 +3721,8 @@ async fn client_work_history(
                 actor: query.actor.clone(),
                 owner_run: query.owner_run.clone(),
                 status: query.status.clone(),
+                owner: query.owner.clone(),
+                state: query.state.clone(),
                 native_only: query.native_only,
                 items_digest: "sql-page".into(),
                 before_index: None,
@@ -4328,6 +4346,8 @@ async fn client_history(
             || cursor.person != query.person
             || cursor.actor != query.actor
             || cursor.owner_run != query.owner_run
+            || cursor.owner != query.owner
+            || cursor.state != query.state
             || cursor.status != query.status
             || cursor.native_only != query.native_only
             || query
@@ -4381,6 +4401,8 @@ async fn client_history(
                 actor: query.actor.clone(),
                 owner_run: query.owner_run.clone(),
                 status: query.status.clone(),
+                owner: query.owner.clone(),
+                state: query.state.clone(),
                 native_only: query.native_only,
                 items_digest: String::new(),
                 before_index: Some(next),
@@ -4398,6 +4420,8 @@ async fn client_history(
         ("actor", query.actor.as_ref()),
         ("owner_run", query.owner_run.as_ref()),
         ("status", query.status.as_ref()),
+        ("owner", query.owner.as_ref()),
+        ("state", query.state.as_ref()),
     ] {
         if let Some(value) = value {
             filters.insert(name.into(), value.clone());

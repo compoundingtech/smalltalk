@@ -3950,3 +3950,141 @@ async fn creation_commands_end_with_actions_and_json_remains_parseable() {
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn terminal_owner_lookup_finds_a_seat_beyond_the_default_page() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let socket = root.path().join("terminal-lookup.sock");
+    for index in 0..65 {
+        let subject = format!("agent/lookup/seat-{index:03}");
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject),
+                fields: BTreeMap::from([
+                    (
+                        "runtime_id".into(),
+                        serde_json::json!(format!("lookup-{index:03}")),
+                    ),
+                    (
+                        "incarnation_id".into(),
+                        serde_json::json!(format!("lookup-{index:03}:i1")),
+                    ),
+                    ("status".into(), serde_json::json!("running")),
+                    ("terminal".into(), serde_json::json!(true)),
+                    ("reachability".into(), serde_json::json!("local")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists());
+    let first = value(&run_cli(&socket, &["terminals", "ls"]).await);
+    let items = first["value"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 50);
+    assert_eq!(items[0]["owner_id"], "agent/lookup/seat-000");
+    assert_eq!(items[49]["owner_id"], "agent/lookup/seat-049");
+    assert_eq!(first["value"]["filters"], serde_json::json!({}));
+    assert_eq!(first["value"]["page"]["has_more"], true);
+    let cursor = first["value"]["page"]["next_cursor"].as_str().unwrap();
+    let second = value(&run_cli(&socket, &["terminals", "ls", "--cursor", cursor]).await);
+    assert_eq!(second["value"]["items"].as_array().unwrap().len(), 15);
+
+    let wanted = "agent/lookup/seat-064";
+    let exact = value(
+        &run_cli(
+            &socket,
+            &[
+                "terminals",
+                "ls",
+                "--owner",
+                wanted,
+                "--state",
+                "running",
+                "--limit",
+                "1",
+            ],
+        )
+        .await,
+    );
+    assert_eq!(exact["value"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(exact["value"]["items"][0]["owner_id"], wanted);
+    assert_eq!(exact["value"]["items"][0]["state"], "running");
+    assert_eq!(
+        exact["value"]["filters"],
+        serde_json::json!({"owner": wanted, "state": "running"})
+    );
+    assert_eq!(exact["value"]["page"]["has_more"], false);
+    for (owner, state) in [
+        ("agent/lookup/unknown", "running"),
+        (wanted, "stopped"),
+        ("agent/lookup/seat-06", "running"),
+    ] {
+        let empty = value(
+            &run_cli(
+                &socket,
+                &["terminals", "ls", "--owner", owner, "--state", state],
+            )
+            .await,
+        );
+        assert!(empty["value"]["items"].as_array().unwrap().is_empty());
+        assert_eq!(empty["value"]["page"]["has_more"], false);
+    }
+    let running = value(
+        &run_cli(
+            &socket,
+            &["terminals", "ls", "--state", "running", "--limit", "50"],
+        )
+        .await,
+    );
+    let filtered_cursor = running["value"]["page"]["next_cursor"].as_str().unwrap();
+    let continued = value(
+        &run_cli(
+            &socket,
+            &[
+                "terminals",
+                "ls",
+                "--state",
+                "running",
+                "--limit",
+                "50",
+                "--cursor",
+                filtered_cursor,
+            ],
+        )
+        .await,
+    );
+    assert_eq!(continued["value"]["items"].as_array().unwrap().len(), 15);
+    for filters in [
+        vec![],
+        vec!["--state", "stopped"],
+        vec!["--state", "running", "--owner", wanted],
+    ] {
+        let mut args = vec!["terminals", "ls", "--cursor", filtered_cursor];
+        args.extend(filters);
+        let refused = run_cli(&socket, &args).await;
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("page cursor"));
+    }
+    let human = run_cli_human(&socket, &["terminals", "ls", "--state", "running"]).await;
+    assert!(human.status.success());
+    let rendered = String::from_utf8(human.stdout).unwrap();
+    assert!(rendered.contains("st terminals ls --state 'running' --cursor"), "{rendered}");
+    server.abort();
+}

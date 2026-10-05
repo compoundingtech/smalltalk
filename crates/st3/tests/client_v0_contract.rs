@@ -4264,3 +4264,72 @@ mission "timing/run" state="ready" {
     let (status, denied) = client_json_auth(st3::api::fabric_router(state), path, credential).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
 }
+
+#[tokio::test]
+async fn terminal_filters_use_projected_state_and_preserve_history_selection() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    for (name, status, terminal, reachability) in [
+        ("live", "running", true, "local"),
+        ("stopped", "stopped", true, "local"),
+        ("no-terminal", "running", false, "local"),
+        ("unreachable", "running", true, "unreachable"),
+    ] {
+        let subject = format!("agent/lookup/{name}");
+        state
+            .store
+            .append_claim(&st3::model::ClaimInput {
+                subject: subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject),
+                fields: std::collections::BTreeMap::from([
+                    ("runtime_id".into(), serde_json::json!(name)),
+                    (
+                        "incarnation_id".into(),
+                        serde_json::json!(format!("{name}:i1")),
+                    ),
+                    ("status".into(), serde_json::json!(status)),
+                    ("terminal".into(), serde_json::json!(terminal)),
+                    ("reachability".into(), serde_json::json!(reachability)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let app = st3::api::router(state);
+    for query in [
+        "owner=agent%2Flookup%2Fstopped",
+        "owner=agent%2Flookup%2Fno-terminal&history=true",
+        "owner=agent%2Flookup%2Funreachable&state=running",
+    ] {
+        let (status, page) =
+            client_json(app.clone(), &format!("/v1/client/terminals?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert!(
+            page["value"]["items"].as_array().unwrap().is_empty(),
+            "{page}"
+        );
+    }
+    for (name, state) in [
+        ("stopped", "stopped"),
+        ("unreachable", "unreachable"),
+        ("live", "running"),
+    ] {
+        let (status, page) = client_json(
+            app.clone(),
+            &format!(
+                "/v1/client/terminals?owner=agent%2Flookup%2F{name}&state={state}&history=true"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(
+            page["value"]["items"].as_array().unwrap().len(),
+            1,
+            "{page}"
+        );
+        assert_eq!(page["value"]["items"][0]["state"], state);
+    }
+}

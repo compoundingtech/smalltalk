@@ -1246,3 +1246,28 @@ updates use the existing agents collection stream, including clock-driven stalen
 Same-state observations remain local except for a freshness publication at most once a minute.
 That publication preserves `since` and does not add a history transition. Freshness uses the
 source observation time, so replaying old evidence cannot make a stale seat current.
+
+## Exact terminal lookup
+
+`GET /v1/client/terminals?owner=agent%2Fexample%2Fworker&state=running` matches the
+exact `owner_id` and projected `state` before the page limit. Owner lookup reduces only
+that subject at the selected snapshot rather than scanning the fleet. Both query fields are
+optional and combine with AND; there is no prefix or short-name resolution. An unknown
+owner returns an empty page. State filtering uses the projected state, including
+`unreachable` when runtime authority is unavailable. `history=true` (CLI `--all`)
+retains its existing meaning; filters do not add stopped history by themselves.
+
+The CLI equivalent is `st terminals ls --owner agent/example/worker --state running --json`.
+Rust exposes `terminals_list_filtered`, Swift `terminalsListFiltered`, and TypeScript
+`terminalsListFiltered`. Existing list methods, ordering, default limit (50), maximum
+limit (200), and unfiltered paging are unchanged. Filtered pages echo `owner` and `state`
+in `value.filters`; cursors bind those values, so every continuation must repeat them.
+Changing or dropping a filter while continuing returns `page-cursor-expired`.
+
+This is an additive client read contract change: the operations manifest documents the
+optional query fields; resource schemas, API versions, capabilities and stored claims
+are unchanged. Old clients still list new servers normally. New filtered client methods
+refuse an older server that omits the requested filter acknowledgment, with an upgrade
+message, instead of returning an unfiltered page or scanning pages on the client.
+A running projection is replicated evidence, not a successful PTY handshake: callers
+must still use the existing incarnation-fenced attachment routes to attach.

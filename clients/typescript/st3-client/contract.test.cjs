@@ -317,3 +317,21 @@ test('canonical publication read encodes mission and schedule subjects and prese
         assert.equal(calls.at(-1), 'https://example.test/v1/client/publication-definition?subject=' + encodeURIComponent(subject));
     }
 });
+
+test('terminal exact filters encode subjects and refuse an old server ignoring filters', async () => {
+    const calls = [];
+    let filters = { owner: 'agent/lookup/seat-064', state: 'running' };
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async url => {
+        calls.push(url);
+        return response(envelope(url.endsWith('/capabilities') ? capabilities : {
+            kind: 'page', collection: 'terminals', filters, items: [], page: { limit: 1, has_more: false }
+        }));
+    } });
+    await client.terminalsListFiltered({ ...filters, limit: 1 });
+    assert.equal(calls.at(-1), 'https://example.test/v1/client/terminals?owner=agent%2Flookup%2Fseat-064&state=running&limit=1');
+    filters = {};
+    await assert.rejects(client.terminalsListFiltered({ owner: 'agent/lookup/seat-064' }), /upgrade the server/);
+    await assert.rejects(client.terminalsListFiltered({ state: 'running' }), /upgrade the server/);
+    await client.terminalsList();
+    assert.equal(calls.at(-1), 'https://example.test/v1/client/terminals');
+});

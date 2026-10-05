@@ -3940,3 +3940,55 @@ async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_convers
         "60s",
     ]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ST3_TERMINALS_COMPAT_BIN: an st3 build before terminal owner filters"]
+async fn terminal_owner_filters_are_safe_across_mixed_builds() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut old = Node::new(root.path(), "terminal-legacy");
+    old.binary = PathBuf::from(std::env::var("ST3_TERMINALS_COMPAT_BIN").unwrap());
+    old.start().await;
+    let current_client = st3_client::Client::unix(old.socket());
+    current_client
+        .terminals_list(None, Some(50), false)
+        .await
+        .unwrap();
+    let error = current_client
+        .terminals_list_filtered(
+            None,
+            Some(1),
+            false,
+            Some("agent/lookup/unknown"),
+            Some("running"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, st3_client::ClientError::Protocol(message) if message.contains("upgrade the server"))
+    );
+
+    let mut current = Node::new(root.path(), "terminal-current");
+    current.start().await;
+    let output = old
+        .command(&[
+            "--endpoint",
+            current.socket().to_str().unwrap(),
+            "--json",
+            "terminals",
+            "ls",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["value"]["collection"], "terminals");
+    assert_eq!(response["value"]["filters"], serde_json::json!({}));
+    assert_eq!(response["value"]["page"]["limit"], 50);
+}
