@@ -37,6 +37,7 @@ export type Agent = ResourceHeader & {
   driver?: string | null;
   fault?: string | null;
   handoff?: (AgentHandoff | null);
+  harness_error_state?: string | null;
   harness_state?: string | null;
   host_id?: (HostId | null);
   id?: AgentId;

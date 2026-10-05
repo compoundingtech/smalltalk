@@ -1967,11 +1967,13 @@ async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
     assert!(after.is_disjoint(&a.notes().await));
     assert!(after.is_disjoint(&b.notes().await));
     wait_until(
-        "rejoining node compares the common envelope inventory",
+        "rejoining node compares the common inventory and settled projections",
         90,
         || async {
             let diff = c.st_json(&["replication", "diff", "orchard"]);
-            diff["authority"]["equal"] == true && diff["status"] == "up"
+            diff["authority"]["equal"] == true
+                && diff["status"] == "up"
+                && diff["graph"]["equal"].is_boolean()
         },
     )
     .await;

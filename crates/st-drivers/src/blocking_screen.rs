@@ -15,17 +15,21 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
             .trim_start()
             .to_owned()
     };
+    let latest_reply = lines.iter().rposition(|line| line.starts_with('●'));
     let login = match driver {
-        "claude" => lines.iter().find(|line| {
+        "claude" => lines.iter().enumerate().find_map(|(index, line)| {
             let text = ui_line(line);
-            [
+            let standalone = latest_reply.is_none_or(|latest| index == latest);
+            let matched = [
                 "Login expired · Please run /login",
                 "Not logged in · Run /login",
             ]
             .iter()
             .any(|phrase| {
-                text.strip_prefix(phrase)
-                    .is_some_and(|tail| tail.is_empty() || tail.starts_with(" ·"))
+                standalone
+                    && text
+                        .strip_prefix(phrase)
+                        .is_some_and(|tail| tail.is_empty() || tail.starts_with(" ·"))
                     || ["? for shortcuts", "⏵⏵ bypass permissions on"]
                         .iter()
                         .any(|prefix| {
@@ -34,7 +38,8 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
                                     .strip_suffix(phrase)
                                     .is_some_and(|footer| footer.ends_with("  "))
                         })
-            })
+            }) || standalone && crate::claude_session::claude_login_reply(&text);
+            matched.then_some(line)
         }),
         "pi" | "omp" => lines.iter().enumerate().find_map(|(index, line)| {
             let text = ui_line(line);
@@ -157,6 +162,18 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plain_followup_tool_lines_are_not_login_diagnostics() {
+        for text in [
+            "Please run /login",
+            "Invalid API key",
+            "Login expired · Please run /login",
+        ] {
+            let screen = format!("● Bash(cat log)\n  ⎿ first output line\n    {text}");
+            assert_eq!(super::detect("claude", &screen), None);
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -138,7 +138,7 @@ pub(super) fn agent_state(
             "Still starting — the agent process cannot currently be reached.".into()
         }
         "waiting" => match harness {
-            Some("unauthenticated") => {
+            Some("unauthenticated" | "needs-login") => {
                 "Waiting for you — attach to sign in to the agent's provider.".into()
             }
             _ => "Waiting for you — attach to inspect what the agent needs.".into(),

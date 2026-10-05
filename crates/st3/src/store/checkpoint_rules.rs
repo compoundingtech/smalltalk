@@ -23,7 +23,8 @@ use smallclaims::store::checkpoint_agreement::*;
 /// Version 8 preserves quota source observations: a later claim can report an older or lower
 /// reading, so it no longer witnesses the reading the account fold selects. Version 9 preserves
 /// bounded observed status history and the beginning of the current state.
-pub const RULES_VERSION: u32 = 9;
+/// Version 10 retains native credential edges and their bounded status transitions.
+pub const RULES_VERSION: u32 = 10;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -38,7 +39,7 @@ pub(crate) const USAGE_WINDOW_MS: u128 = 7 * DAY_MS;
 const HOUR_MS: u128 = 60 * 60 * 1000;
 
 /// The optional fields `current_harness_at` folds newest first from a harness's observations.
-pub(crate) const HARNESS_OPTIONAL_FIELDS: [&str; 7] = [
+pub(crate) const HARNESS_OPTIONAL_FIELDS: [&str; 10] = [
     "driver",
     "transport",
     "reason",
@@ -46,6 +47,9 @@ pub(crate) const HARNESS_OPTIONAL_FIELDS: [&str; 7] = [
     "ask",
     "input_buffer",
     "exit",
+    "provider_auth",
+    "provider_auth_sequence",
+    "ownership_sequence",
 ];
 
 /// The claims that close a subscription's mission request, as `pending_subscription_mission_requests`
@@ -58,8 +62,8 @@ pub(crate) const REQUEST_CLOSERS: [&str; 3] = [
 
 /// A canonical description of every rule. The rules digest hashes it with `RULES_VERSION`.
 pub(crate) const RULES_DESCRIPTION: &str = "\
-harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field
-seat.status-history slot=subject keep=last-200-transition-and-runtime-reset-sources-within-7d-before-cut,current-state-run-start
+harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start
+seat.status-history slot=subject keep=last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,current-state-run-start
 harness.timeline slot=subject,incarnation_id keep=newest min-age-before-cut=5d
 loop.state slot=subject keep=first-and-last-of-each-run-of-status-and-round,first-with-items
 subscription.mission-deferred slot=subject,request keep=all-while-open,newest
@@ -275,6 +279,25 @@ pub(crate) fn harness_keep(claims: &[&ClaimRecord]) -> BTreeSet<usize> {
             .rposition(|claim| fields(claim).is_some_and(|fields| fields.contains_key(name)))
         {
             keep.insert(position);
+        }
+    }
+    // A credential refusal can outlive the history window while activity keeps changing.
+    // Preserve the beginning of the current auth run as well as its newest carrier.
+    let auth = |claim: &ClaimRecord| {
+        fields(claim)
+            .and_then(|fields| fields.get("provider_auth"))
+            .and_then(Value::as_bool)
+    };
+    if let Some(last_auth) = claims.iter().rev().find_map(|claim| auth(claim)) {
+        let after = claims
+            .iter()
+            .rposition(|claim| auth(claim).is_some_and(|value| value != last_auth))
+            .map_or(0, |position| position + 1);
+        if let Some(offset) = claims[after..]
+            .iter()
+            .position(|claim| auth(claim) == Some(last_auth))
+        {
+            keep.insert(after + offset);
         }
     }
     if let Some(last_state) = claims.last().and_then(|claim| state(claim)) {

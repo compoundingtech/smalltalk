@@ -1406,9 +1406,12 @@ fn observe_payload(
     if let Some(edge) = turn_failure_edge(event, &payload) {
         driver_diagnostic::publish_turn_failure(agent_dir, driver_diagnostic::Driver::Claude, edge);
     }
-    let Some(observation) = observe_hook_event(event, &payload) else {
+    let Some(mut observation) = observe_hook_event(event, &payload) else {
         return Ok(());
     };
+    if let Some(edge) = provider_auth_edge(event, &payload) {
+        observation.provider_auth = Some(edge == ProviderAuthEdge::Accepted);
+    }
     let mut writer = observe_writer(
         agent_dir,
         identity,
@@ -1418,6 +1421,9 @@ fn observe_payload(
         exported_session,
         exported_seq,
     );
+    if observation.provider_auth.is_some() {
+        writer.interrupt();
+    }
     if event == "SessionStart" {
         // The one event that names a session boundary: even if the new session's first state
         // matches a fresh predecessor record, continuity must not be claimed across the restart.
@@ -1844,11 +1850,20 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
             BlockedOn::None,
             InputBuffer::Unknown,
         )),
-        "Stop" => Some(Observation::new(
-            Activity::Idle,
-            BlockedOn::None,
-            InputBuffer::Unknown,
-        )),
+        "Stop" => Some({
+            let rejected = payload
+                .get("last_assistant_message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(claude_login_reply);
+            let observation =
+                Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown)
+                    .with_provider_auth(!rejected);
+            if rejected {
+                observation.with_reason("providerAuth")
+            } else {
+                observation
+            }
+        }),
         // `StopFailure` fires INSTEAD of `Stop` when an API error ended the turn (Claude Code's
         // own words, 2.1.259), at the same lifecycle point — so the categorical truth is the one
         // `Stop` writes and only the reason differs. Deliberately not `ended`: the TUI is still
@@ -1955,20 +1970,52 @@ fn turn_failure_edge(
             Some(CLAUDE_AUTH_REJECTED_ERROR) => None,
             other => Some(TurnFailureEdge::Failed(claude_turn_failure_class(other).0)),
         },
-        "Stop" => Some(TurnFailureEdge::Recovered),
+        "Stop" if provider_auth_edge(event, payload) == Some(ProviderAuthEdge::Accepted) => {
+            Some(TurnFailureEdge::Recovered)
+        }
         _ => None,
     }
+}
+
+/// A standalone native login diagnostic, not a quotation or tool transcript.
+pub fn claude_login_reply(text: &str) -> bool {
+    let text = text.trim();
+    text.len() <= 512
+        && (matches!(
+            text,
+            "Login expired · Please run /login"
+                | "Please run /login"
+                | "Not logged in · Run /login"
+                | "Invalid API key"
+        ) || text.starts_with("Invalid API key · ") && text.ends_with("/login"))
 }
 
 /// Read the credential edge out of one hook event, or `None` when the event proves nothing about
 /// it — which must leave a standing rejection alone rather than clearing it.
 fn provider_auth_edge(event: &str, payload: &serde_json::Value) -> Option<ProviderAuthEdge> {
+    if payload
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return None;
+    }
     match event {
         "StopFailure" => (stop_failure_error(payload) == Some(CLAUDE_AUTH_REJECTED_ERROR))
             .then_some(ProviderAuthEdge::Rejected),
         // A turn that reached its ordinary end is positive proof the credential was accepted.
         // `SessionStart` is not: a fresh session has made no provider call yet.
-        "Stop" => Some(ProviderAuthEdge::Accepted),
+        "Stop" => Some(
+            if payload
+                .get("last_assistant_message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(claude_login_reply)
+            {
+                ProviderAuthEdge::Rejected
+            } else {
+                ProviderAuthEdge::Accepted
+            },
+        ),
         _ => None,
     }
 }
@@ -2300,6 +2347,36 @@ mod tests {
         // Unmapped events say nothing rather than guessing.
         assert_eq!(observe_hook_event("Notification", &none), None);
         assert_eq!(observe_hook_event("SubagentStop", &none), None);
+    }
+
+    #[test]
+    fn successful_login_error_reply_is_a_rejection_not_recovery() {
+        for text in [
+            "Login expired · Please run /login",
+            "Please run /login",
+            "Invalid API key",
+        ] {
+            let payload = serde_json::json!({"last_assistant_message": text});
+            assert_eq!(
+                provider_auth_edge("Stop", &payload),
+                Some(ProviderAuthEdge::Rejected)
+            );
+            let observed = observe_hook_event("Stop", &payload).unwrap();
+            assert_eq!(observed.provider_auth, Some(false));
+            assert_eq!(observed.reason.as_deref(), Some("providerAuth"));
+        }
+        for text in [
+            "The tool printed: Please run /login",
+            "`Invalid API key`",
+            "You can run /login to switch accounts.",
+            "Login expired · Please run /login\nHere is the code.",
+        ] {
+            assert!(!claude_login_reply(text));
+            assert_eq!(
+                provider_auth_edge("Stop", &serde_json::json!({"last_assistant_message":text})),
+                Some(ProviderAuthEdge::Accepted)
+            );
+        }
     }
 
     /// The measured `StopFailure` payload shape (Claude Code 2.1.259: `hook_event_name`, the

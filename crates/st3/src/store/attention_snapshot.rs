@@ -944,6 +944,22 @@ impl Store {
                 continue;
             }
             let f = &claim.body["fields"];
+            // Upgrades retain historical operational episodes. A current login with a concrete
+            // person has one derived person item; the old agent fault must not ask again.
+            if f["condition"] == "provider-auth"
+                && let Some(harness) = self.current_harness(source)?
+            {
+                let update_menu = self.claim_by_id(&harness.claim)?.is_some_and(|claim| {
+                    claim.body["fields"]["code"] == "provider-update-prompt"
+                });
+                // The visible update modal takes priority without restoring authentication.
+                // Once it clears, an unresolved login exposes its fallback fault again.
+                if update_menu
+                    || (harness.state == "needs-login" && self.agent_person(source)?.is_some())
+                {
+                    continue;
+                }
+            }
             if matches!(
                 f["condition"].as_str(),
                 Some("readiness" | "provider-auth" | "provider-trust" | "provider-update")

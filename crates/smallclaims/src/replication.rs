@@ -442,7 +442,8 @@ pub struct ReplicationPeerStatus {
     /// Comparable shared tables that differ at the last inventory-aligned comparison.
     #[serde(default)]
     pub differing_tables: Vec<String>,
-    /// Different registries or locally waiting claims make projection comparisons premature.
+    /// Pending projection, unsealed claims, different registries, or an older advertised
+    /// inventory make the projection comparison premature.
     #[serde(default)]
     pub projection_comparison_waiting: bool,
     /// How far apart the two envelope sets were at the last exchange that measured them.
