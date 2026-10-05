@@ -1482,7 +1482,9 @@ fn client_sync_notice(state: &AppState) -> Option<ClientSyncNotice> {
                 .ok()
                 .flatten()
                 .map(client_timestamp),
-            estimated_catch_up_seconds: sync.estimated_catch_up_seconds,
+            estimated_catch_up_seconds: sync
+                .estimated_catch_up_seconds
+                .filter(|seconds| *seconds <= smallclaims::replication::MAX_SAFE_DURATION_SECONDS),
             diverged_since: sync
                 .diverged
                 .then_some(sync.graph_differs_since_unix_ms)
@@ -13746,6 +13748,120 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn resources_page_keeps_rows_when_sync_forecast_is_unrepresentable() {
+        use smallclaims::replication::MAX_SAFE_DURATION_SECONDS;
+        use smallclaims::store::PeerSyncProgress;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.configured_peers = vec!["birch".into()];
+        for row in 0..9 {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: format!("resource/example/{row}"),
+                    kind: "resource.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("kind".into(), json!("vcs.pull-request")),
+                        (
+                            "facts".into(),
+                            json!({"opened_by": "agent/example", "number": row}),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let now = client_now_ms();
+        let mut progress = PeerSyncProgress::default();
+        progress.observe(0, Some((10_000, 0)), now - 610_000);
+        progress.observe(1_000, Some((9_000, 0)), now - 600_000);
+        for window in 1..=60 {
+            progress.observe(0, Some((9_000, 0)), now - 600_000 + window * 10_000);
+        }
+        assert_eq!(progress.view(now).unwrap().estimated_catch_up_seconds, None);
+        state
+            .store
+            .replication_sync
+            .lock()
+            .unwrap()
+            .insert("birch".into(), progress);
+
+        // An actual HTTP request over an isolated daemon's Unix socket, with the production
+        // router and resource projection. No fleet state or peer listener is involved.
+        let socket = root.path().join("api.sock");
+        let server_socket = socket.clone();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_socket, router(server_state))
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .unix_socket(socket.clone())
+            .build()
+            .unwrap();
+        let url = "http://localhost/v1/client/resources?opened_by=agent/example&limit=50";
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "isolated API did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let response = client.get(url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let envelope: Value = response.json().await.unwrap();
+        let page = &envelope["value"];
+        assert_eq!(page["items"].as_array().unwrap().len(), 9);
+        assert_eq!(page["sync"]["state"], "catching-up");
+        assert_eq!(page["sync"]["peers"][0]["peer_only_envelopes"], 9_000);
+        assert_eq!(
+            page["sync"]["peers"][0]["estimated_catch_up_seconds"],
+            Value::Null
+        );
+
+        // Guard the API boundary too: a pre-existing measurement can contain an unsafe value.
+        for (forecast, expected) in [
+            (Some(90), json!(90)),
+            (
+                Some(MAX_SAFE_DURATION_SECONDS),
+                json!(MAX_SAFE_DURATION_SECONDS),
+            ),
+            (Some(MAX_SAFE_DURATION_SECONDS + 1), Value::Null),
+            (Some(u64::MAX), Value::Null),
+            (None, Value::Null),
+        ] {
+            state
+                .store
+                .replication_sync
+                .lock()
+                .unwrap()
+                .get_mut("birch")
+                .unwrap()
+                .measured
+                .as_mut()
+                .unwrap()
+                .estimated_catch_up_seconds = forecast;
+            let response = client.get(url).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let envelope: Value = response.json().await.unwrap();
+            assert_eq!(envelope["value"]["items"], page["items"]);
+            assert_eq!(envelope["value"]["sync"]["state"], "catching-up");
+            assert_eq!(
+                envelope["value"]["sync"]["peers"][0]["estimated_catch_up_seconds"],
+                expected
+            );
+        }
+        server.abort();
+        let _ = server.await;
+    }
 
     #[tokio::test]
     async fn a_seat_reads_its_own_desired_record_for_its_status_line() {
