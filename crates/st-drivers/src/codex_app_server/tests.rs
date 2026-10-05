@@ -7269,3 +7269,38 @@ fn adopted_codex_records_keep_their_schema_family() {
     atomic_json(&path, &runtime).unwrap();
     assert!(load_runtime(&path, "h.worker", "runtime").is_err());
 }
+
+#[test]
+fn native_codex_login_recovery_requires_a_successful_current_thread_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::Idle);
+    let rejected = serde_json::json!({"method":"turn/completed","params":{"threadId":"thread-main","turn":{"id":"turn-auth","status":"failed","error":{"codexErrorInfo":"unauthorized"}}}});
+    state.observe(&rejected).unwrap();
+    delivery.observe_provider_auth(&rejected, "thread-main");
+    assert_eq!(delivery.provider_auth_edge, Some(false));
+    assert_eq!(
+        state
+            .observed()
+            .harness_observation()
+            .unwrap()
+            .provider_auth,
+        Some(false)
+    );
+    let foreign = serde_json::json!({"method":"turn/completed","params":{"threadId":"thread-other","turn":{"id":"turn-ok","status":"completed"}}});
+    delivery.observe_provider_auth(&foreign, "thread-main");
+    assert_eq!(delivery.provider_auth_edge, Some(false));
+    let accepted = serde_json::json!({"method":"turn/completed","params":{"threadId":"thread-main","turn":{"id":"turn-ok","status":"completed"}}});
+    state.observe(&accepted).unwrap();
+    delivery.observe_provider_auth(&accepted, "thread-main");
+    assert_eq!(delivery.provider_auth_edge, Some(true));
+    assert_eq!(state.observed(), &CodexObservedState::Idle);
+    assert_eq!(
+        CodexObservedState::Idle
+            .harness_observation()
+            .unwrap()
+            .provider_auth,
+        None
+    );
+}

@@ -932,6 +932,8 @@ pub struct Agent {
     #[serde(default)]
     pub harness_state: Option<String>,
     #[serde(default)]
+    pub harness_error_state: Option<String>,
+    #[serde(default)]
     pub since: Option<String>,
     #[serde(default)]
     pub observation: Option<String>,

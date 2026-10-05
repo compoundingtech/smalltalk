@@ -2229,7 +2229,7 @@ fn client_agent_resources_selected(
                 (
                     Some("running" | "ready" | "working" | "idle"),
                     Some(_),
-                    Some("indeterminate" | "unknown" | "unauthenticated" | "blocked"),
+                    Some("indeterminate" | "unknown" | "unauthenticated" | "needs-login" | "blocked"),
                     _,
                 ) => "waiting",
                 (Some("running" | "ready" | "working" | "idle"), Some(_), _, _) => "starting",
@@ -2306,7 +2306,8 @@ fn client_agent_resources_selected(
                 "runtime_ids": runtime_ids,
                 "owner_run_id": subject.owner_run,
                 "driver": driver,
-                "harness_state": harness_state,
+                "harness_state": harness_state.as_deref().map(|state| if state == "needs-login" { "unauthenticated" } else { state }),
+                "harness_error_state": (harness_state.as_deref() == Some("needs-login")).then_some("needs-login"),
                 "since": subject.harness.as_ref().map(|harness| client_timestamp(harness.since_unix_ms)),
                 "_status_source": subject.harness,
                 "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
@@ -19561,7 +19562,8 @@ mission "wake" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = &state.store;
-        let source = "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
+        let source =
+            "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
         let intent = crate::graph::parse_test_intent(source, "node").unwrap();
         let planned = store
             .mission(
@@ -19623,6 +19625,42 @@ mission "wake" state="ready" {
                     .find(|card| card["id"] == "agent/node.cobalt")
                     .unwrap()
             );
+        }
+        // Native credentials can change while activity stays working. Both cached
+        // history modes must carry the refusal/recovery, preserving the legacy wire state.
+        for provider_auth in [false, true, false, true] {
+            append(
+                "agent/node.amber",
+                "harness.observed",
+                json!({
+                    "state":"working", "driver":"codex", "incarnation_id":"amber-1",
+                    "provider_auth":provider_auth,
+                }),
+            );
+            let at = store.index().unwrap();
+            for history in [false, true] {
+                let cards = checked_agent_cache(store, history, at);
+                let amber = cards
+                    .iter()
+                    .find(|card| card["id"] == "agent/node.amber")
+                    .unwrap();
+                assert_eq!(
+                    amber["harness_state"],
+                    if provider_auth {
+                        "working"
+                    } else {
+                        "unauthenticated"
+                    }
+                );
+                assert_eq!(
+                    amber["harness_error_state"],
+                    if provider_auth {
+                        Value::Null
+                    } else {
+                        json!("needs-login")
+                    }
+                );
+            }
         }
         // Evicted old snapshots rebuild independently of the newest cache.
         assert_eq!(checked_agent_cache(store, false, before), original);
@@ -20101,7 +20139,11 @@ mission "agent-auth" state="ready" {
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
         assert_eq!(resources[0]["harness_state"], "unauthenticated");
+        assert_eq!(resources[0]["harness_error_state"], "needs-login");
         assert_eq!(resources[0]["state"], "waiting");
+        assert_eq!(resources[0]["observation"], "current");
+        assert!(resources[0]["since"].is_string());
+        assert!(resources[0].get("_status_source").is_none());
     }
 
     #[tokio::test]
