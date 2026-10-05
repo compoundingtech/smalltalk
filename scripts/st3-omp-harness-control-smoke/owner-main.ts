@@ -5,7 +5,8 @@ const st=process.env.ST_SMOKE_BIN,daemon=process.env.ST_SMOKE_DAEMON,omp=process
 if(!st||!daemon||!omp)throw Error('ST_SMOKE_BIN, ST_SMOKE_DAEMON, OMP_NATIVE_BIN required');
 const root=await mkdtemp(resolve(tmpdir(),'owner-native-smoke-'));await mkdir(root+'/agent');await mkdir(root+'/sessions');
 const socket=root+'/daemon.sock';const env=Object.fromEntries(Object.entries(process.env).filter(([k])=>!k.startsWith('ST_')&&!k.startsWith('ST3_')&&!k.startsWith('AGENT_')));
-let delay=2000;const server=Bun.serve({port:0,hostname:'127.0.0.1',fetch:async req=>{await req.json();await Bun.sleep(delay);const chunk={id:'smoke',object:'chat.completion.chunk',created:1,model:'native-smoke',choices:[{index:0,delta:{role:'assistant',content:'complete'},finish_reason:null}]};const end={...chunk,choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:1,completion_tokens:1,total_tokens:2}};return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: ${JSON.stringify(end)}\n\ndata: [DONE]\n\n`,{headers:{'content-type':'text/event-stream'}});}});
+const providerRequests=[];
+let delay=2000;const server=Bun.serve({port:0,hostname:'127.0.0.1',fetch:async req=>{providerRequests.push(await req.json());await Bun.sleep(delay);const chunk={id:'smoke',object:'chat.completion.chunk',created:1,model:'native-smoke',choices:[{index:0,delta:{role:'assistant',content:'complete'},finish_reason:null}]};const end={...chunk,choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:1,completion_tokens:1,total_tokens:2}};return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: ${JSON.stringify(end)}\n\ndata: [DONE]\n\n`,{headers:{'content-type':'text/event-stream'}});}});
 const d=Bun.spawn([daemon,root],{env,stdin:'ignore',stdout:'pipe',stderr:'pipe'});const daemonError=new Response(d.stderr).text();
 let native;let log='';let driverErrors='';
 const deadline=setTimeout(()=>{native?.kill();d.kill();},45000);
@@ -21,6 +22,7 @@ try {
  const out=(async()=>{for await(const bytes of native.stdout){const text=new TextDecoder().decode(bytes);log+=text;process.stdout.write(text);}})();
  const err=(async()=>{driverErrors=await new Response(native.stderr).text();})();
  await poll(async()=>{const q=await read();return q.native?.input_supported&&q.native.idle?q:false;},'native initial idle binding');
+ const steering=(await read()).native.steer;if(steering.state!=='unsupported'||steering.reason!=='native-pre-dequeue-api-unavailable')throw Error('Steer capability is not honestly unsupported');
  const models=await request('/v1/client/harness-models/'+encodeURIComponent(subject)+'?limit=1');
  if(models.status!==200||models.value.choices[0]?.provider!=='control-smoke'||!models.value.cursor)throw Error('Bounded model catalog unavailable');
  const nextModels=await request('/v1/client/harness-models/'+encodeURIComponent(subject)+'?cursor='+encodeURIComponent(models.value.cursor)+'&limit=1');
@@ -30,6 +32,12 @@ try {
  const modelAction=await request('/v1/client/actions',modelBody);if(modelAction.status!==200||modelAction.value.status!=='accepted')throw Error('Model action not accepted '+JSON.stringify(modelAction));
  const modelReceipt=await poll(async()=>{const r=await receipt(modelAction.value.operation_id);return r.status==='applied'?r:false;},'durable model receipt');
  if(modelReceipt.result?.id!=='native-smoke'||modelReceipt.result?.effective_effort!=='high'||!modelReceipt.model_revision)throw Error('Model receipt lacks exact native proof');
+ const retainedQueue=await poll(async()=>{const q=await read();return q.native.models.selected?.effective_effort==='high'?q:false;},'observed high effort');
+ const retainedCap=await request('/v1/client/capabilities');const retainedBody=structuredClone(modelBody);
+ retainedBody.id='action/model-retained';retainedBody.idempotency_key='owner-smoke-model-retained';retainedBody.fence.snapshot_id=retainedCap.error.snapshot.id;retainedBody.parameters.binding=retainedQueue.native.binding;retainedBody.parameters.model_revision=retainedQueue.native.models.revision;retainedBody.parameters.model_id='native-initial';delete retainedBody.parameters.effort;
+ const retainedAction=await request('/v1/client/actions',retainedBody);if(retainedAction.status!==200)throw Error(JSON.stringify(retainedAction));
+ const retainedModel=await poll(async()=>{const r=await receipt(retainedAction.value.operation_id);return r.status==='applied'?r:false;},'omitted native effort');
+ if(retainedModel.result?.id!=='native-initial'||retainedModel.result?.effective_effort!=='high')throw Error('Omitted effort replaced native selection');
  const unauthorized=await action('unauthorized',{type:'enqueue',content:'deny',lane:'steer'},undefined,undefined,false);if(unauthorized.status!==403)throw Error('Unauthorized native write admitted');
  native.stdin.write(JSON.stringify({type:'prompt',id:'busy',message:'busy seed'})+'\n');native.stdin.flush();
  await poll(async()=>!(await read()).native.idle,'native busy');
@@ -37,19 +45,24 @@ try {
  if([a,b,c].some(r=>r.status!==200||r.value.status!=='accepted'))throw Error('Input not owner accepted');
  const aid=a.value.harness_control.entry_id,bid=b.value.harness_control.entry_id,cid=c.value.harness_control.entry_id;
  if(new Set([aid,bid,cid]).size!==3)throw Error('Identical input identity collision');
- for(const [key,mutation] of [['move',{type:'move',entry_id:cid,before_id:bid}],['replace',{type:'replace',entry_id:bid,content:'replacement text'}],['cancel-a',{type:'cancel',entry_id:aid}],['promote',{type:'promote',entry_id:bid}],['cancel-c',{type:'cancel',entry_id:cid}]]){const r=await action(key,mutation);if(r.status!==200||r.value.status!=='applied')throw Error(JSON.stringify(r));}
- const q=await read();const stale=await action('stale-turn',{type:'enqueue',content:'stale',lane:'steer'},{...q.native.binding,turn_id:'stale-turn'});if(stale.status<400)throw Error('Stale native turn admitted');
- const badRevision=await action('stale-revision',{type:'enqueue',content:'stale',lane:'steer'},undefined,0);if(badRevision.status<400)throw Error('Stale queue revision admitted');
+ for(const [key,mutation] of [['move',{type:'move',entry_id:cid,before_id:bid}],['replace',{type:'replace',entry_id:bid,content:'replacement text'}],['cancel-a',{type:'cancel',entry_id:aid}],['cancel-c',{type:'cancel',entry_id:cid}]]){const r=await action(key,mutation);if(r.status!==200||r.value.status!=='applied')throw Error(JSON.stringify(r));}
+ const beforeSteer=await read();const unsupportedSteer=await action('unsupported-steer',{type:'enqueue',content:'CONTROL_STEER_MUST_NOT_REACH_PROVIDER',lane:'steer'});const unsupportedPromote=await action('unsupported-promote',{type:'promote',entry_id:bid});
+ for(const result of [unsupportedSteer,unsupportedPromote])if(result.status<400||result.error.code!=='native-pre-dequeue-api-unavailable')throw Error('Unsupported steer admitted '+JSON.stringify(result));
+ if(JSON.stringify((await read()).queue)!==JSON.stringify(beforeSteer.queue))throw Error('Unsupported steer changed owner queue');
+ const q=await read();const stale=await action('stale-turn',{type:'enqueue',content:'stale',lane:'follow_up'},{...q.native.binding,turn_id:'stale-turn'});if(stale.status<400)throw Error('Stale native turn admitted');
+ const badRevision=await action('stale-revision',{type:'enqueue',content:'stale',lane:'follow_up'},undefined,0);if(badRevision.status<400)throw Error('Stale queue revision admitted');
  const applied=await poll(async()=>{const r=await receipt(b.value.operation_id);return r.status==='applied'?r:false;},'exact native admitted receipt');
  if(!['message_start','message_end'].includes(applied.result?.native_event)||applied.entry_id!==bid)throw Error('Native proof not exact');
+ if(!providerRequests.some(body=>JSON.stringify(body.messages).includes('replacement text')))throw Error('Owner replacement did not reach actual native provider');
+ if(providerRequests.some(body=>JSON.stringify(body.messages).includes('CONTROL_STEER_MUST_NOT_REACH_PROVIDER')))throw Error('Unsupported steering reached a provider');
  const durable=await receipt(b.value.operation_id);if(durable.status!=='applied'||durable.entry_id!==bid||durable.result?.native_event!==applied.result.native_event)throw Error('Queue receipt GET lost proof');
  const wrongSubject=await request('/v1/client/harness-control-receipts/'+encodeURIComponent(b.value.operation_id)+'?subject=agent%2Fmissing');if(wrongSubject.status!==404)throw Error('Receipt read crossed subject scope');
  const replay=await request('/v1/client/actions',b.body);if(replay.status!==200||replay.value.status!=='applied')throw Error('Response-loss replay not frozen');
  const conflict=structuredClone(b.body);conflict.parameters.mutation.content='different';if((await request('/v1/client/actions',conflict)).status<400)throw Error('Digest conflict admitted');
- await poll(async()=>(await read()).native.idle,'native idle');delay=10000;native.stdin.write(JSON.stringify({type:'prompt',id:'busy-loss',message:'busy for process loss'})+'\n');native.stdin.flush();await poll(async()=>!(await read()).native.idle,'native process-loss busy');
- const lost=await action('lost',{type:'enqueue',content:'must not resend',lane:'steer'});if(lost.status!==200)throw Error(JSON.stringify(lost));const lostId=lost.value.harness_control.entry_id;
+ await poll(async()=>(await read()).native.idle,'native idle before transport loss');
+ const lost=await action('lost',{type:'enqueue',content:'must not resend',lane:'follow_up'});if(lost.status!==200)throw Error(JSON.stringify(lost));const lostId=lost.value.harness_control.entry_id;
  await poll(async()=>(await read()).queue.entries.find(e=>e.id===lostId)?.status==='dispatched','owner dispatch reservation');native.kill('SIGKILL');await native.exited;await out;await err;
  const uncertain=await poll(async()=>{const r=await receipt(lost.value.operation_id);return r.status==='indeterminate'?r:false;},'native loss indeterminate');
  const frozen=await request('/v1/client/actions',lost.body);if(frozen.status!==200||frozen.value.status!=='indeterminate')throw Error('Lost response retry attempted resend');
- console.log('OWNER_CONTROL_SUCCESS '+JSON.stringify({owner_queue:'stable-id move/replace/cancel/promote',native_applied:applied,durable_queue:durable,durable_model:modelReceipt,uncertain,receipt_replay:'frozen',unauthorized:unauthorized.status,stale_turn:stale.status,stale_queue_revision:badRevision.status,approval:(await read()).native.approval}));console.log('OWNER_DRIVER_STDERR '+driverErrors);
+ console.log('OWNER_CONTROL_SUCCESS '+JSON.stringify({owner_queue:'stable-id move/replace/cancel, idle-only delivery',steer:steering,unsupported_steer:unsupportedSteer.error.code,unsupported_promote:unsupportedPromote.error.code,native_applied:applied,durable_queue:durable,durable_model:modelReceipt,retained_model:retainedModel,uncertain,receipt_replay:'frozen',unauthorized:unauthorized.status,stale_turn:stale.status,stale_queue_revision:badRevision.status,approval:(await read()).native.approval}));console.log('OWNER_DRIVER_STDERR '+driverErrors);
 } finally {clearTimeout(deadline);native?.kill();d.kill();await d.exited;console.log('OWNER_DAEMON_STDERR '+await daemonError);server.stop();await rm(root,{recursive:true,force:true});}

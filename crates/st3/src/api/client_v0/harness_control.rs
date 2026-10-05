@@ -48,7 +48,7 @@ pub(in crate::api) async fn queue(State(state): State<AppState>, Extension(sessi
         return Ok(Json(relay(&state, &session, &host, crate::peer::ClientReadOperation::HarnessQueue { subject, cursor: query.cursor, limit: query.limit }).await?));
     }
     let mut queue = state.store.harness_control_queue(&subject).map_err(ApiError::bad)?;
-    let native = state.store.harness_control_state(&subject).map_err(ApiError::bad)?.map(|native| ControlState { subject: native.subject, binding: native.binding, idle: native.idle, input_supported: native.input_supported, models: ModelsSummary { selected: native.models.selected, revision: native.models.revision, available: native.models.available, complete: native.models.complete, atomic_model_effort: native.models.atomic_model_effort, source: native.models.source, catalog_path: format!("/v1/client/harness-models/{}", urlencoding::encode(&subject)) }, approval: native.approval, reason: native.reason });
+    let native = state.store.harness_control_state(&subject).map_err(ApiError::bad)?.map(|native| ControlState { subject: native.subject, binding: native.binding, idle: native.idle, input_supported: native.input_supported, steer: native.steer, models: ModelsSummary { selected: native.models.selected, revision: native.models.revision, available: native.models.available, complete: native.models.complete, atomic_model_effort: native.models.atomic_model_effort, source: native.models.source, catalog_path: format!("/v1/client/harness-models/{}", urlencoding::encode(&subject)) }, approval: native.approval, reason: native.reason });
     let total = queue.entries.len();
     let offset = if let Some(cursor) = query.cursor {
         let cursor = decode_queue_cursor(&state, &cursor)?;

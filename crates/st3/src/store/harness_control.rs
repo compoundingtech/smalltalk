@@ -150,7 +150,9 @@ impl Store {
         if !(16..=256).contains(&request.idempotency_key.len()) {
             return Err(St3Error::new("invalid-idempotency-key", "idempotency key must contain 16 to 256 bytes"));
         }
-        let operation = format!("operation/harness-{}", hex::encode(Sha256::digest(format!("{}:{}", request.actor, request.idempotency_key))));
+        let operation = format!("operation/harness-{}", hex::encode(Sha256::digest(
+            serde_json::to_vec(&(&request.actor, &request.idempotency_key)).map_err(internal)?
+        )));
         // Fences may legitimately change on a retry; semantic input may not.
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&(request.subject.as_str(), request.actor.as_str(), &request.mutation)).map_err(internal)?));
         self.connection.batched(|tx| -> Result<Receipt, St3Error> {
@@ -169,6 +171,9 @@ impl Store {
             let status;
             match &request.mutation {
                 QueueMutation::Enqueue { content: text, lane } => {
+                    if *lane == Lane::Steer {
+                        return Err(St3Error::new("native-pre-dequeue-api-unavailable", "native steering is unsupported without a public consumption fence"));
+                    }
                     content(text)?;
                     if queue.entries.iter().filter(|entry| matches!(entry.status, Outcome::Accepted | Outcome::Dispatched)).count() >= MAX_PENDING {
                         return Err(St3Error::new("queue-full", "the owner queue contains 128 unsettled inputs"));
@@ -198,13 +203,8 @@ impl Store {
                     queue.entries[index].content.clone_from(text);
                     entry_id = id.clone(); status = Outcome::Applied;
                 }
-                QueueMutation::Promote { entry_id: id } => {
-                    let index = pending_entry(&queue, id)?;
-                    let mut entry = queue.entries.remove(index);
-                    entry.lane = Lane::Steer;
-                    entry.binding = request.binding.clone();
-                    queue.entries.insert(0, entry);
-                    entry_id = id.clone(); status = Outcome::Applied;
+                QueueMutation::Promote { .. } => {
+                    return Err(St3Error::new("native-pre-dequeue-api-unavailable", "native steering is unsupported without a public consumption fence"));
                 }
             }
             queue.revision = queue.revision.checked_add(1).ok_or_else(|| St3Error::new("queue-revision-exhausted", "queue revision exhausted"))?;
@@ -244,22 +244,14 @@ impl Store {
             if subject != fence.subject { return Err(St3Error::new("foreign-harness-control", "input belongs to another seat")); }
             let Some(state) = state_tx(tx, subject)? else { return Ok(None); };
             check_binding(tx, subject, &state.binding)?;
-            if !state.input_supported { return Ok(None); }
+            if !state.input_supported || !state.idle { return Ok(None); }
             let mut queue = queue_tx(tx, subject)?;
             // An unresolved input retains the native transition interlock and owns this lane.
             if queue.entries.iter().any(|entry| entry.status == Outcome::Dispatched) { return Ok(None); }
-            let Some(index) = queue.entries.iter().position(|entry| entry.status == Outcome::Accepted && (entry.lane == Lane::Steer || state.idle)) else { return Ok(None); };
+            let Some(index) = queue.entries.iter().position(|entry| entry.status == Outcome::Accepted && entry.lane == Lane::FollowUp) else { return Ok(None); };
             let entry = &mut queue.entries[index];
             if !same_session(&entry.binding, &state.binding) {
                 return Err(St3Error::new("stale-harness-control", "pending input was accepted for another native session"));
-            }
-            if entry.lane == Lane::Steer && entry.binding.turn_id != state.binding.turn_id {
-                entry.status = Outcome::Rejected;
-                entry.reason = Some("stale-native-turn".into());
-                queue.revision += 1;
-                save_receipt(tx, &receipt_for(&queue.entries[index], subject, queue.revision))?;
-                save_queue(tx, subject, &mut queue)?;
-                return Ok(None);
             }
             if !reserve_dispatch_tx(tx, subject, &entry.operation_id, "input", &state.binding)? { return Ok(None); }
             entry.binding = state.binding;
@@ -324,7 +316,7 @@ mod tests {
         store.connection.batched(|tx| tx.execute("INSERT INTO desired(subject,kind,revision,claim_id,body) VALUES(?1,'agent','revision','desired-1','{}')", [SUBJECT])).unwrap().unwrap();
         store.append_claim(&ClaimInput { subject: SUBJECT.into(), kind: "runtime.observed".into(), actor: Some(SUBJECT.into()), fields: BTreeMap::from([("status".into(), json!("running")), ("incarnation_id".into(), json!("incarnation-1")), ("runtime_id".into(), json!("native-runtime"))]), evidence: Vec::new(), expected_subject: None, idempotency_key: None }).unwrap();
         let fence = store.bind_mailbox(&crate::mailbox::Fence::new(SUBJECT, "incarnation-1", "delivery")).unwrap();
-        let state = NativeState { subject: SUBJECT.into(), binding: Binding { desired_revision: "desired-1".into(), incarnation_id: "incarnation-1".into(), session_id: "session-1".into(), turn_id: None }, idle: false, input_supported: true, models: Models { choices: Vec::new(), selected: None, atomic_model_effort: false, revision: "models-1".into(), available: false, complete: true, source: "native-extension-model-registry".into() }, approval: Approval { supported: false, reason: "native-live-approval-api-unavailable".into() }, reason: None };
+        let state = NativeState { subject: SUBJECT.into(), binding: Binding { desired_revision: "desired-1".into(), incarnation_id: "incarnation-1".into(), session_id: "session-1".into(), turn_id: None }, idle: false, input_supported: true, steer: Default::default(), models: Models { choices: Vec::new(), selected: None, atomic_model_effort: false, revision: "models-1".into(), available: false, complete: true, source: "native-extension-model-registry".into() }, approval: Approval { supported: false, reason: "native-live-approval-api-unavailable".into() }, reason: None };
         store.observe_harness_control(&state, &fence).unwrap();
         (state, fence)
     }
@@ -337,7 +329,7 @@ mod tests {
     #[test]
     fn identical_inputs_are_edited_by_identity_and_only_pending_inputs_can_change() {
         let store = Store::open_memory("queue-owner").unwrap();
-        let (state, fence) = baseline(&store);
+        let (mut state, fence) = baseline(&store);
         let a = enqueue(&store, &state, "a");
         let b = enqueue(&store, &state, "b");
         let c = enqueue(&store, &state, "c");
@@ -348,10 +340,11 @@ mod tests {
         store.mutate_harness_queue(&request(&store, &state, "replace", QueueMutation::Replace { entry_id: bid.clone(), content: "replacement".into() })).unwrap();
         store.mutate_harness_queue(&request(&store, &state, "cancel", QueueMutation::Cancel { entry_id: aid.clone() })).unwrap();
         assert!(store.take_harness_input(SUBJECT, &fence).unwrap().is_none(), "follow-up stays owner-held while native is busy");
-        store.mutate_harness_queue(&request(&store, &state, "promote", QueueMutation::Promote { entry_id: bid.clone() })).unwrap();
+        state.idle = true;
+        store.observe_harness_control(&state, &fence).unwrap();
         let dispatched = store.take_harness_input(SUBJECT, &fence).unwrap().unwrap();
-        assert_eq!((dispatched.entry_id.as_str(), dispatched.content.as_str(), dispatched.lane), (bid.as_str(), "replacement", Lane::Steer));
-        let error = store.mutate_harness_queue(&request(&store, &state, "late-cancel", QueueMutation::Cancel { entry_id: bid.clone() })).unwrap_err();
+        assert_eq!((dispatched.entry_id.as_str(), dispatched.content.as_str(), dispatched.lane), (cid.as_str(), "identical text", Lane::FollowUp));
+        let error = store.mutate_harness_queue(&request(&store, &state, "late-cancel", QueueMutation::Cancel { entry_id: cid.clone() })).unwrap_err();
         assert_eq!(error.code, "already-dispatched");
         let queue = store.harness_control_queue(SUBJECT).unwrap();
         assert_eq!(store.harness_control_receipt(&a.operation_id).unwrap().unwrap().status, Outcome::Cancelled);
@@ -384,20 +377,47 @@ mod tests {
         assert_eq!(store.settle_harness_input(&forged, &fence).unwrap_err().code, "already-settled");
     }
     #[test]
+    fn operation_identity_keeps_actor_and_idempotency_key_boundaries() {
+        let store = Store::open_memory("queue-owner").unwrap();
+        let (state, _) = baseline(&store);
+        let mut first = request(&store, &state, "identity", QueueMutation::Enqueue {
+            content: "first person".into(), lane: Lane::FollowUp,
+        });
+        first.actor = "person/ada:key".into();
+        first.idempotency_key = "0123456789abcdef".into();
+        let accepted_first = store.mutate_harness_queue(&first).unwrap();
+        let mut second = request(&store, &state, "identity", QueueMutation::Enqueue {
+            content: "second person".into(), lane: Lane::FollowUp,
+        });
+        second.actor = "person/ada".into();
+        second.idempotency_key = "key:0123456789abcdef".into();
+        let accepted_second = store.mutate_harness_queue(&second).unwrap();
+        assert_ne!(accepted_first.operation_id, accepted_second.operation_id);
+        assert_eq!(store.mutate_harness_queue(&first).unwrap(), accepted_first);
+        assert_eq!(store.mutate_harness_queue(&second).unwrap(), accepted_second);
+        let queue = store.harness_control_queue(SUBJECT).unwrap();
+        assert_eq!((queue.entries[0].actor.as_str(), queue.entries[0].content.as_str()), (first.actor.as_str(), "first person"));
+        assert_eq!((queue.entries[1].actor.as_str(), queue.entries[1].content.as_str()), (second.actor.as_str(), "second person"));
+    }
+
+    #[test]
     fn stale_dependencies_reject_and_session_replacement_never_inherits_uncertain_input() {
         let store = Store::open_memory("queue-owner").unwrap();
         let (mut state, fence) = baseline(&store);
         for field in ["desired", "incarnation", "session", "turn", "revision"] {
-            let mut stale = request(&store, &state, field, QueueMutation::Enqueue { content: "stale".into(), lane: Lane::Steer });
+            let mut stale = request(&store, &state, field, QueueMutation::Enqueue { content: "stale".into(), lane: Lane::FollowUp });
             match field { "desired" => stale.binding.desired_revision = "old".into(), "incarnation" => stale.binding.incarnation_id = "old".into(), "session" => stale.binding.session_id = "old".into(), "turn" => stale.binding.turn_id = Some("old".into()), _ => stale.queue_revision += 1 }
             let error = store.mutate_harness_queue(&stale).unwrap_err();
             assert!(matches!(error.code.as_str(), "stale-harness-control" | "stale-mailbox-session" | "stale-queue"), "{field}: {error}");
         }
-        let mut unauthorized = request(&store, &state, "actor", QueueMutation::Enqueue { content: "actor".into(), lane: Lane::Steer });
+        let mut unauthorized = request(&store, &state, "actor", QueueMutation::Enqueue { content: "actor".into(), lane: Lane::FollowUp });
         unauthorized.actor = "person/".into();
         assert_eq!(store.mutate_harness_queue(&unauthorized).unwrap_err().code, "forbidden");
         let pending = enqueue(&store, &state, "pending");
-        let active = store.mutate_harness_queue(&request(&store, &state, "active", QueueMutation::Enqueue { content: "active".into(), lane: Lane::Steer })).unwrap();
+        let active = enqueue(&store, &state, "active");
+        store.mutate_harness_queue(&request(&store, &state, "active-first", QueueMutation::Move { entry_id: active.entry_id.clone().unwrap(), before_id: pending.entry_id.clone() })).unwrap();
+        state.idle = true;
+        store.observe_harness_control(&state, &fence).unwrap();
         store.take_harness_input(SUBJECT, &fence).unwrap().unwrap();
         state.binding.session_id = "session-2".into();
         store.observe_harness_control(&state, &fence).unwrap();
@@ -406,20 +426,24 @@ mod tests {
         assert!(store.take_harness_input(SUBJECT, &fence).unwrap().is_none());
     }
     #[test]
-    fn steer_never_crosses_a_native_turn_but_follow_up_waits_for_the_next_idle_turn() {
+    fn unsupported_steer_does_not_change_owner_queue_and_follow_up_waits_for_idle() {
         let store = Store::open_memory("queue-owner").unwrap();
         let (mut state, fence) = baseline(&store);
         state.binding.turn_id = Some("turn-a".into());
         store.observe_harness_control(&state, &fence).unwrap();
         let follow_up = enqueue(&store, &state, "follow-up-turn");
-        let steer = store.mutate_harness_queue(&request(&store, &state, "steer-turn", QueueMutation::Enqueue { content: "turn-a only".into(), lane: Lane::Steer })).unwrap();
+        let before = store.harness_control_queue(SUBJECT).unwrap();
+        for mutation in [
+            QueueMutation::Enqueue { content: "unsupported".into(), lane: Lane::Steer },
+            QueueMutation::Promote { entry_id: follow_up.entry_id.clone().unwrap() },
+        ] {
+            let error = store.mutate_harness_queue(&request(&store, &state, "unsupported-steer", mutation)).unwrap_err();
+            assert_eq!(error.code, "native-pre-dequeue-api-unavailable");
+            assert_eq!(store.harness_control_queue(SUBJECT).unwrap(), before);
+        }
         state.binding.turn_id = Some("turn-b".into());
         store.observe_harness_control(&state, &fence).unwrap();
         assert!(store.take_harness_input(SUBJECT, &fence).unwrap().is_none());
-        let rejected = store.harness_control_receipt(&steer.operation_id).unwrap().unwrap();
-        assert_eq!(rejected.status, Outcome::Rejected);
-        assert_eq!(rejected.reason.as_deref(), Some("stale-native-turn"));
-        assert_eq!(rejected.binding.turn_id.as_deref(), Some("turn-a"));
         state.idle = true;
         store.observe_harness_control(&state, &fence).unwrap();
         let command = store.take_harness_input(SUBJECT, &fence).unwrap().unwrap();

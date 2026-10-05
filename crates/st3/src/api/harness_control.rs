@@ -26,7 +26,7 @@ pub(super) async fn observe(State(state): State<AppState>, peer: Option<Extensio
     let binding = blocking_action(move || {
         let observation = request.observation;
         let binding = Binding { desired_revision: store.harness_control_desired_revision(&request.fence)?, incarnation_id: request.fence.incarnation.clone(), session_id: observation.session_id, turn_id: observation.turn_id };
-        store.observe_harness_control(&NativeState { subject: request.fence.subject.clone(), binding: binding.clone(), idle: observation.idle, input_supported: observation.input_supported, models: observation.models, approval: observation.approval, reason: observation.reason }, &request.fence)?;
+        store.observe_harness_control(&NativeState { subject: request.fence.subject.clone(), binding: binding.clone(), idle: observation.idle, input_supported: observation.input_supported, steer: observation.steer, models: observation.models, approval: observation.approval, reason: observation.reason }, &request.fence)?;
         Ok(binding)
     }).await?;
     signal_local_change(&state);

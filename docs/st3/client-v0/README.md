@@ -91,6 +91,14 @@ the durable receipt advances only when the supported OMP extension observes the
 matching native event. Lost native settlement is indeterminate, not permission
 to resend. Queue mutations and `harness.model.set` require `control.runtimes` and
 a concrete person; client request bodies cannot choose an actor.
+Follow-up inputs remain in Smalltalk until the native extension positively reports
+idle. Pending inputs support list, move, replace, and cancel without native queue
+ownership or text-addressed identity. OMP 18.4.10 has no public pre-dequeue
+consumption fence, so the native summary explicitly reports
+`steer: { state: "unsupported", reason: "native-pre-dequeue-api-unavailable" }`.
+Enqueue with `lane: "steer"` and promote return that machine-readable error code
+without changing the owner queue. Clients must disable steering controls rather
+than silently substituting a follow-up or using private native core hooks.
 
 `GET /v1/client/harness-queue/{subject}` returns a bounded queue page and native
 control summary. `GET /v1/client/harness-models/{subject}` returns the observed
@@ -101,9 +109,12 @@ are encoded whole as one path segment, including `agent/`.
 
 `harness.model.set` selects an observed provider/model and optionally an effort.
 It fences both native binding and model revision; its receipt records the actual
-native selection and effective effort. The current extension does not promise
-atomic model-and-effort updates. Approval policy is an observed unsupported
-capability, not a remote setter.
+native selection and effective effort. Omitted effort retains the current effective
+value when the target supports it, rather than substituting a model default.
+Otherwise the native target's observed effective value is returned; configured
+selectors unavailable through the native API remain unknown. The current extension
+does not promise atomic model-and-effort updates. Approval policy is an observed
+unsupported capability, not a remote setter.
 
 `GET /v1/client/harness-control-receipts/{id}?subject=...` reads either ledger's
 durable operation receipt. Its untagged queue/model union retains the original

@@ -11,7 +11,7 @@ type NativeControlContext = ExtensionContext & {
 };
 
 export type ControlBinding = { desired_revision: string; incarnation_id: string; session_id: string; turn_id: string | null };
-type Input = { type: "input"; operation_id: string; entry_id: string; actor: string; content: string; lane: "steer" | "follow_up"; binding: ControlBinding };
+type Input = { type: "input"; operation_id: string; entry_id: string; actor: string; content: string; lane: "follow_up"; binding: ControlBinding };
 type SetModel = { type: "set_model"; operation_id: string; binding: ControlBinding; model_revision: string; provider: string; model_id: string; effort?: string };
 type Command = Input | SetModel;
 type Receipt = { type: "harness_control_receipt"; operation_id: string; binding: ControlBinding; status: "applied" | "rejected" | "indeterminate"; reason?: string; result?: Record<string, unknown> };
@@ -68,6 +68,7 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
   const snapshot = (force = false) => {
     if (!context) return;
     const frame = { type: "harness_control_state", session_id: context.sessionManager.getSessionId(), turn_id: turnId, idle: idle(), input_supported: !transitioning && !!current(), reason: transitioning ? "session-transition-state-unknown" : undefined,
+      steer: { state: "unsupported", reason: "native-pre-dequeue-api-unavailable" },
       models: modelDescriptor(),
       approval: { supported: false, reason: "native-live-approval-api-unavailable" } };
     const serialized = JSON.stringify(frame);
@@ -143,6 +144,9 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
       if (!model) { settle(command, "rejected", "model-unavailable"); return; }
       const requested = command.effort;
       if (requested !== undefined && !efforts(model).includes(requested)) { settle(command, "rejected", "effort-unsupported"); return; }
+      // setModel may substitute its own default. An omitted effort retains a supported live value.
+      const priorEffort = pi.getThinkingLevel();
+      const targetEffort = requested ?? (priorEffort !== undefined && efforts(model).includes(priorEffort) ? priorEffort : undefined);
       const accepted = await pi.setModel(model);
       const binding = current();
       if (!binding || !sameBinding(binding, command.binding) || transitioning) { settle(command, "indeterminate", "native-binding-replaced"); return; }
@@ -154,17 +158,17 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
         settle(command, "indeterminate", "native-selection-replaced", { provider: selected?.provider, id: selected?.id, effective_effort: pi.getThinkingLevel() ?? null });
         return;
       }
-      if (requested !== undefined) {
+      if (targetEffort !== undefined) {
         // The public setter's choices are narrower than model metadata. Reject unknown choices
         // before mutation; no cast converts a provider-only effort into an extension capability.
-        switch (requested) {
-          case "off": case "minimal": case "low": case "medium": case "high": case "xhigh": case "max": pi.setThinkingLevel(requested); break;
+        switch (targetEffort) {
+          case "off": case "minimal": case "low": case "medium": case "high": case "xhigh": case "max": pi.setThinkingLevel(targetEffort); break;
           default: settle(command, "indeterminate", "model-applied-effort-api-unavailable", { effective_effort: pi.getThinkingLevel() ?? null }); return;
         }
       }
       const observed = selectedModel();
       const effective = pi.getThinkingLevel() ?? null;
-      if (observed?.provider !== command.provider || observed.id !== command.model_id || (requested !== undefined && effective !== requested)) settle(command, "indeterminate", "native-effective-value-mismatch", { provider: observed?.provider, id: observed?.id, effective_effort: effective });
+      if (observed?.provider !== command.provider || observed.id !== command.model_id || (targetEffort !== undefined && effective !== targetEffort)) settle(command, "indeterminate", "native-effective-value-mismatch", { provider: observed?.provider, id: observed?.id, effective_effort: effective });
       else settle(command, "applied", undefined, { provider: observed.provider, id: observed.id, effective_effort: effective, atomic_model_effort: false });
     } catch { settle(command, "indeterminate", "native-model-operation-failed"); }
     finally { mutation = undefined; snapshot(); }
@@ -196,11 +200,13 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
     const live = current();
     if (!live || !sameBinding(binding, live)) { reject("stale-native-binding"); return true; }
     if (transitioning || mutation || pending.size) { reject(transitioning ? "session-transition-state-unknown" : "native-control-busy"); return true; }
-    if (wire.type === "input" && typeof wire.entry_id === "string" && typeof wire.actor === "string" && typeof wire.content === "string" && (wire.lane === "steer" || wire.lane === "follow_up")) {
+    if (wire.type === "input" && wire.lane === "steer") { reject("native-pre-dequeue-api-unavailable"); return true; }
+    if (wire.type === "input" && typeof wire.entry_id === "string" && typeof wire.actor === "string" && typeof wire.content === "string" && wire.lane === "follow_up") {
+      if (!idle()) { reject("native-not-idle"); return true; }
       const command: Input = { type: "input", operation_id: operationId, binding, entry_id: wire.entry_id, actor: wire.actor, content: wire.content, lane: wire.lane };
       pending.set(operationId, command);
       try {
-        pi.sendMessage({ customType: "st-control-input", content: command.content, display: true, details: { operation_id: operationId, actor: command.actor, entry_id: command.entry_id }, attribution: "user" }, { triggerTurn: true, deliverAs: command.lane === "follow_up" ? "followUp" : "steer" });
+        pi.sendMessage({ customType: "st-control-input", content: command.content, display: true, details: { operation_id: operationId, actor: command.actor, entry_id: command.entry_id }, attribution: "user" }, { triggerTurn: true, deliverAs: "followUp" });
       } catch { settle(command, "indeterminate", "native-input-invocation-failed"); }
     } else if (wire.type === "set_model" && typeof wire.provider === "string" && typeof wire.model_id === "string" && typeof wire.model_revision === "string" && (wire.effort === undefined || typeof wire.effort === "string")) {
       const command: SetModel = { type: "set_model", operation_id: operationId, binding, model_revision: wire.model_revision, provider: wire.provider, model_id: wire.model_id, ...(typeof wire.effort === "string" ? { effort: wire.effort } : {}) };

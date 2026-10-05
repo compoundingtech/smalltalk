@@ -15,6 +15,7 @@ pub use st3_schema::harness_control::{
     Outcome as HarnessOutcome, Queue as HarnessQueue, QueueEntry as HarnessQueueEntry,
     QueueMutation as HarnessQueueMutation, QueueParameters as HarnessQueueParameters,
     QueueView as HarnessQueueView, Receipt as HarnessControlReceipt, SelectedModel as HarnessSelectedModel,
+    SteerCapability as HarnessSteerCapability, SteerUnsupportedReason as HarnessSteerUnsupportedReason,
 };
 
 pub const API_VERSION: &str = "st3.client.v0";
@@ -67,6 +68,7 @@ pub enum ErrorCode {
     RateLimited,
     RuntimeNotLocal,
     RuntimeAuthorityIndeterminate,
+    NativePreDequeueApiUnavailable,
     RemoteUnavailable,
     TerminalUnavailable,
     TerminalEnded,

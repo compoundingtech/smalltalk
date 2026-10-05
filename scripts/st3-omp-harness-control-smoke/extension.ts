@@ -1,6 +1,6 @@
 import { createHarnessControl } from '../../crates/st3/hooks/omp-harness-control.ts';
 export default function(pi) {
-  pi.registerProvider('control-smoke', { baseUrl: process.env.SMOKE_BASE_URL, apiKey:'test-only', api:'openai-completions', models:['native-initial','native-smoke'].map(id=>({id,name:id,reasoning:true,thinking:{efforts:['low','high']},input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:32000,maxTokens:1000})) });
+  pi.registerProvider('control-smoke', { baseUrl: process.env.SMOKE_BASE_URL, apiKey:'test-only', api:'openai-completions', models:['native-initial','native-smoke'].map(id=>({id,name:id,reasoning:true,thinking:{efforts:['low','high'],defaultLevel:'low'},input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:32000,maxTokens:1000})) });
   let frames=[]; let losing=false;
   const modelRevision=()=>frames.filter(frame=>frame.type==='harness_control_state').at(-1)?.models.revision;
   let shutdownBinding;
@@ -14,6 +14,10 @@ export default function(pi) {
     const awaitReceipt=async(id)=>{for(let i=0;i<500;i++){const r=frames.find(f=>f.type==='harness_control_receipt'&&f.operation_id===id);if(r)return r;await pause();}throw Error('Missing receipt '+id);};
     const bind=()=>({desired_revision:'revision',incarnation_id:'incarnation',session_id:ctx.sessionManager.getSessionId(),turn_id:frames.filter(f=>f.type==='harness_control_state').at(-1)?.turn_id??null});
     control.handle({type:'harness_control_binding',binding:bind()},ctx);
+    const steer=frames.filter(frame=>frame.type==='harness_control_state').at(-1)?.steer;
+    if(steer?.state!=='unsupported'||steer.reason!=='native-pre-dequeue-api-unavailable')throw Error('Native steering falsely advertised');
+    control.handle({type:'harness_control',command:{type:'input',operation_id:'unsupported-steer',entry_id:'unsupported-steer',actor:'person',content:'never native input',lane:'steer',binding:bind()}},ctx);
+    if((await awaitReceipt('unsupported-steer')).reason!=='native-pre-dequeue-api-unavailable')throw Error('Unsupported steering did not fail explicitly');
     const acknowledgedFrameCount=frames.length;
     for(let i=0;i<30;i++){control.handle({type:'harness_control_binding',binding:bind()},ctx);control.observe();}
     if(frames.length!==acknowledgedFrameCount)throw Error('Unchanged native ACK/keepalive emitted duplicate state');
@@ -27,6 +31,9 @@ export default function(pi) {
     control.observe();
     control.handle({type:'harness_control',command:{type:'set_model',operation_id:'model',binding,model_revision:modelRevision(),provider:'control-smoke',model_id:'native-smoke',effort:'high'}},ctx);
     if((await awaitReceipt('model')).status!=='applied')throw Error('Model not applied');
+    control.handle({type:'harness_control',command:{type:'set_model',operation_id:'model-retained',binding:bind(),model_revision:modelRevision(),provider:'control-smoke',model_id:'native-initial'}},ctx);
+    const retained=await awaitReceipt('model-retained');
+    if(retained.status!=='applied'||retained.result?.effective_effort!=='high')throw Error('Omitted effort replaced the live high selector with a model default');
     control.handle({type:'harness_control',command:{type:'set_model',operation_id:'bad-effort',binding:bind(),model_revision:modelRevision(),provider:'control-smoke',model_id:'native-smoke',effort:'adaptive'}},ctx);
     if((await awaitReceipt('bad-effort')).status!=='rejected')throw Error('Unknown effort not rejected');
     control.handle({type:'harness_control',command:{type:'input',operation_id:'stale',entry_id:'stale',actor:'person',content:'same text',lane:'steer',binding:{...bind(),session_id:'other-session'}}},ctx);

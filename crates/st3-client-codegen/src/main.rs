@@ -202,7 +202,7 @@ fn rust_operation_methods(
                 .strip_prefix("/v1/client/")
                 .and_then(|path| path.strip_suffix("/{id}"))
                 .context("harness page route must end with /{id}")?;
-            writeln!(out, "    pub async fn {method}(&self, id: &str, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<{response}>, ClientError> {{ self.list_internal(&format!(\"{collection}/{{}}\", percent_encode_segment(id)), cursor, limit, false).await }}")?;
+            writeln!(out, "    pub async fn {method}(&self, id: &str, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<{response}>, ClientError> {{ self.list_internal_with_filters(&format!(\"{collection}/{{}}\", percent_encode_segment(id)), cursor, limit, false, &[]).await }}")?;
             continue;
         }
         if id == "harness-control-receipt.get" {

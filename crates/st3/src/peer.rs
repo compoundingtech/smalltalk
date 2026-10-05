@@ -2704,6 +2704,7 @@ mod tests {
         store.observe_harness_control(&NativeState {
             subject: "agent/queue-worker".into(), binding: binding.clone(), idle: false,
             input_supported: true,
+            steer: Default::default(),
             models: Models {
                 choices: Vec::new(), selected: None, atomic_model_effort: false,
                 revision: "models-one".into(), available: false, complete: true,

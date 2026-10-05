@@ -38,6 +38,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case attentionMigrated
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
+    case nativePreDequeueAPIUnavailable
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired
     case unknown(String)
@@ -55,6 +56,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "blob-too-large": .blobTooLarge; case "unsupported-media-type": .unsupportedMediaType; case "blob-content-mismatch": .blobContentMismatch
         case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
+        case "native-pre-dequeue-api-unavailable": .nativePreDequeueAPIUnavailable
         default: .unknown(raw)
         }
     }
@@ -70,6 +72,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .blobTooLarge: "blob-too-large"; case .unsupportedMediaType: "unsupported-media-type"; case .blobContentMismatch: "blob-content-mismatch"
         case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
+        case .nativePreDequeueAPIUnavailable: "native-pre-dequeue-api-unavailable"
         case .unknown(let value): value
         }
         var container = encoder.singleValueContainer(); try container.encode(raw)
@@ -226,7 +229,25 @@ public struct HarnessModelChoice: Codable, Sendable { public let provider, id: S
 public struct HarnessSelectedModel: Codable, Sendable { public let provider, id, configuredEffort: String; public let effectiveEffort: String?; enum CodingKeys: String, CodingKey { case provider, id, configuredEffort = "configured_effort", effectiveEffort = "effective_effort" } }
 public struct HarnessModelsSummary: Codable, Sendable { public let selected: HarnessSelectedModel?; public let revision: String; public let atomicModelEffort, available, complete: Bool; public let source, catalogPath: String; enum CodingKeys: String, CodingKey { case selected, revision, atomicModelEffort = "atomic_model_effort", available, complete, source, catalogPath = "catalog_path" } }
 public struct HarnessApproval: Codable, Sendable { public let supported: Bool; public let reason: String }
-public struct HarnessControlState: Codable, Sendable { public let subject: String; public let binding: HarnessBinding; public let idle, inputSupported: Bool; public let models: HarnessModelsSummary; public let approval: HarnessApproval; public let reason: String?; enum CodingKeys: String, CodingKey { case subject, binding, idle, inputSupported = "input_supported", models, approval, reason } }
+public enum HarnessSteerUnsupportedReason: String, Codable, Sendable { case nativePreDequeueAPIUnavailable = "native-pre-dequeue-api-unavailable" }
+public enum HarnessSteerCapability: Codable, Sendable {
+    case unsupported(reason: HarnessSteerUnsupportedReason)
+    private enum State: String, Codable { case unsupported }
+    private enum CodingKeys: String, CodingKey { case state, reason }
+    public init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        switch try box.decode(State.self, forKey: .state) {
+        case .unsupported: self = .unsupported(reason: try box.decode(HarnessSteerUnsupportedReason.self, forKey: .reason))
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var box = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .unsupported(let reason): try box.encode(State.unsupported, forKey: .state); try box.encode(reason, forKey: .reason)
+        }
+    }
+}
+public struct HarnessControlState: Codable, Sendable { public let subject: String; public let binding: HarnessBinding; public let idle, inputSupported: Bool; public let steer: HarnessSteerCapability; public let models: HarnessModelsSummary; public let approval: HarnessApproval; public let reason: String?; enum CodingKeys: String, CodingKey { case subject, binding, idle, inputSupported = "input_supported", steer, models, approval, reason } }
 public struct HarnessQueueView: Codable, Sendable { public let schema, subject: String; public let queue: HarnessQueue; public let native: HarnessControlState?; public let cursor: String?; public let total: UInt }
 public struct HarnessInputResult: Codable, Sendable {
     public let nativeEvent: String

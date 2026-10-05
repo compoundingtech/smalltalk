@@ -83,7 +83,7 @@
   ],
   "actions": {
     "custom.reply": {"capability": "control.attention", "parameters": "CustomReplyParameters"},
-    "harness.queue.mutate": { "capability": "control.runtimes", "parameters": "HarnessQueueParameters" },
+    "harness.queue.mutate": { "capability": "control.runtimes", "parameters": "HarnessQueueParameters", "description": "Owner-held follow_up input waits for native idle dispatch. Enqueue lane steer and promote are rejected with native-pre-dequeue-api-unavailable when native.steer.state is unsupported." },
     "harness.model.set": { "capability": "control.runtimes", "parameters": "HarnessModelParameters" },
     "review.approve": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.reject": { "capability": "control.attention", "parameters": "TargetParameters" },

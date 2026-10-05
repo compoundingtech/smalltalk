@@ -78,6 +78,23 @@ pub struct Receipt {
     pub binding: Binding,
 }
 
+/// Steering requires a public native consumption fence, absent in the supported runtime.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SteerCapability {
+    Unsupported { reason: SteerUnsupportedReason },
+}
+impl Default for SteerCapability {
+    fn default() -> Self {
+        Self::Unsupported { reason: SteerUnsupportedReason::NativePreDequeueApiUnavailable }
+    }
+}
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SteerUnsupportedReason {
+    NativePreDequeueApiUnavailable,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeState {
@@ -85,6 +102,7 @@ pub struct NativeState {
     pub binding: Binding,
     pub idle: bool,
     pub input_supported: bool,
+    pub steer: SteerCapability,
     pub models: Models,
     pub approval: Approval,
     pub reason: Option<String>,
@@ -152,6 +170,7 @@ pub struct NativeObservation {
     pub turn_id: Option<String>,
     pub idle: bool,
     pub input_supported: bool,
+    pub steer: SteerCapability,
     pub models: Models,
     pub approval: Approval,
     pub reason: Option<String>,
@@ -267,6 +286,7 @@ pub struct ControlState {
     pub binding: Binding,
     pub idle: bool,
     pub input_supported: bool,
+    pub steer: SteerCapability,
     pub models: ModelsSummary,
     pub approval: Approval,
     pub reason: Option<String>,

@@ -60,7 +60,7 @@ fn reconcile_runtime(connection: &Connection, subject: &str) -> Result<(), St3Er
 
 fn validate_parameters(connection: &Connection, parameters: &ModelParameters) -> Result<(), St3Error> {
     let state = check_binding(connection, &parameters.subject, &parameters.binding)?;
-    if state.reason.as_deref() == Some("transition-state-unknown") {
+    if state.reason.as_deref() == Some("session-transition-state-unknown") {
         return Err(St3Error::new("unsupported-harness-model", "the native transition state is unknown"));
     }
     if !state.models.available || !state.models.complete || state.models.revision.is_empty() {
@@ -240,6 +240,7 @@ mod tests {
         let fence = store.bind_mailbox(&crate::mailbox::Fence::new(SUBJECT, "incarnation-1", "delivery")).unwrap();
         let state = NativeState {
             subject: SUBJECT.into(), binding: Binding { desired_revision: "desired-1".into(), incarnation_id: "incarnation-1".into(), session_id: "session-1".into(), turn_id: Some("turn-1".into()) }, idle: true, input_supported: true,
+            steer: Default::default(),
             models: Models {
                 choices: vec![
                     ModelChoice { provider: "provider".into(), id: "reasoner".into(), reasoning: true, supported_efforts: vec!["medium".into(), "high".into()] },
@@ -340,13 +341,13 @@ mod tests {
         store.reserve_harness_model(&original).unwrap();
         let command = store.take_harness_model(&fence).unwrap().unwrap();
         store.settle_harness_model(&model_proof(&command, Outcome::Applied, Some(actual_model("reasoner", Some("high")))), &fence).unwrap();
-        state.reason = Some("transition-state-unknown".into());
+        state.reason = Some("session-transition-state-unknown".into());
         store.observe_harness_control(&state, &fence).unwrap();
         assert_eq!(store.reserve_harness_model(&request(&state, "unknown-transition")).unwrap_err().code, "unsupported-harness-model");
         state.reason = None;
         store.observe_harness_control(&state, &fence).unwrap();
         let pending = store.reserve_harness_model(&request(&state, "becomes-unknown")).unwrap();
-        state.reason = Some("transition-state-unknown".into());
+        state.reason = Some("session-transition-state-unknown".into());
         store.observe_harness_control(&state, &fence).unwrap();
         assert!(store.take_harness_model(&fence).unwrap().is_none());
         assert_eq!(store.harness_model_receipt(&pending.operation_id).unwrap().unwrap().status, Outcome::Rejected);
