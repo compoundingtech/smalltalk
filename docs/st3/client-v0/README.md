@@ -332,6 +332,34 @@ the server returns `validation-failed` rather than an incomplete AST or KDL docu
 
 ### Usage over a period
 
+The optional `agent_messages` field adds a **daily estimate**, also shown by `st usage` and
+stui. It counts distinct agent-to-agent message subjects, excluding people, daemon sends and
+explicit delivery-probe/test tags, probe/soak seats and the audit's named test-title prefixes.
+Receipts and duplicate send claims add no messages. Bodies are never classified. Counts are
+maintained in the writer transaction and backfilled once on upgrade. Full UTC days use daily
+recipient counters; the first and last partial days use an indexed send-time range.
+
+`AgentMessageEstimate.days` contains at most the latest 31 UTC calendar days intersecting the
+period, including zero-message days. Each row names `day_start_ms`, the clipped `since_ms` and
+`until_ms`, `messages`, `calibrated_messages`, `low_microusd`, `high_microusd`,
+`usage_cost_microusd`, `unpriced_tokens` and nullable `low_percent`/`high_percent`.
+Usage costs use the same cumulative snapshots and baseline/reset rules as period rows, in the
+same pass. A zero priced denominator makes the percentages unknown; unpriced coverage remains
+visible. The range can exceed 100% and is never capped. This is a planning allowance that
+includes useful work in message-associated turns, not measured overhead, waste or a confidence
+interval. Subscription invoices and token shares are different measures.
+
+The selected `doc/usage/agent-message-allowances` JSON document optionally supplies
+`{ "source": "dated audit reference", "method": "calibration method", "recipients":
+{ "agent/alder": { "low_microusd": 100000, "high_microusd": 200000 } } }`.
+Seat names stay in the fleet's graph, rather than the public source. The response pins the
+selected immutable document in `calibration`, and carries its `source` and `method`.
+Missing recipient allowances use the $0.22–$0.33 API-equivalent fleet allowance, exposed as
+`fallback_low_microusd`/`fallback_high_microusd`. A missing or invalid document uses the fleet
+fallback for every recipient and reports no calibration. Recalibration changes future reads
+of historical counts; the pinned document makes an exported report reproducible. Older daemons
+omit the entire estimate, which clients treat as unavailable.
+
 `GET /v1/client/usage?since_ms=…&until_ms=…` reads token spend over a period: the last 24 hours
 when both are omitted, ending now when `until_ms` is omitted. It requires `read.projections`. The
 value is `UsagePeriod { since_ms, until_ms, rows }`, with one `UsageRow` per agent, mission run,

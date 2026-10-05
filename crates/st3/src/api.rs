@@ -9995,15 +9995,17 @@ async fn get_usage(
         )));
     }
     let store = state.store.clone();
-    let (rows, limits) = blocking_store(move || {
+    let (rows, agent_messages, limits) = blocking_store(move || {
+        let (rows, agent_messages) = store.usage_period_report(since_ms, until_ms)?;
         Ok((
-            store.usage_period_rows(since_ms, until_ms)?,
+            rows,
+            agent_messages,
             store.account_limits()?,
         ))
     })
     .await?;
     Ok(Json(
-        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits}),
+        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages}),
     ))
 }
 

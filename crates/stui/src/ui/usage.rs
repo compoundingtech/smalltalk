@@ -352,6 +352,14 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
             ))));
         }
     }
+    if let Some(estimate) = &world.agent_messages {
+        items.push(Item::Header {
+            title: "agent messages · daily estimate · UTC".into(),
+            count: estimate.days.len(),
+            color: theme::OVERLAY1,
+        });
+        items.extend(estimate_lines(estimate).into_iter().map(Item::Note));
+    }
     let grouped = groups(rows.iter(), by);
     if !grouped.is_empty() {
         items.push(Item::Header {
@@ -384,7 +392,11 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
     let state = match &world.usage {
         Load::Loading => ListState::Loading("Loading usage…"),
         Load::Failed(why) => ListState::Failed(why.clone()),
-        Load::Ready(rows) if rows.is_empty() && world.usage_limits.is_empty() => {
+        Load::Ready(rows)
+            if rows.is_empty()
+                && world.usage_limits.is_empty()
+                && world.agent_messages.is_none() =>
+        {
             ListState::Empty("No spend recorded in this period.")
         }
         Load::Ready(_) => ListState::Ready,
@@ -403,6 +415,63 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
             Line::from(span("Costs are API-equivalent list prices.", theme::dim())),
         ],
     }
+}
+
+fn estimate_lines(estimate: &st3_client::AgentMessageEstimate) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for note in [
+        "Estimate includes useful work.".to_owned(),
+        "Count × recipient allowance.".to_owned(),
+        "Share of priced usage.".to_owned(),
+        format!(
+            "Fleet fallback ${:.2}–${:.2}/message",
+            estimate.fallback_low_microusd as f64 / 1_000_000.0,
+            estimate.fallback_high_microusd as f64 / 1_000_000.0
+        ),
+        estimate.source.clone(),
+    ] {
+        lines.push(Line::from(span(format!(" {note}"), theme::dim())));
+    }
+    for day in &estimate.days {
+        let date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(day.day_start_ms as i64)
+            .map_or_else(|| "?".into(), |at| at.format("%Y-%m-%d").to_string());
+        let partial = if day.until_ms.saturating_sub(day.since_ms) < 86_400_000 {
+            " partial"
+        } else {
+            ""
+        };
+        let share = match (day.low_percent, day.high_percent) {
+            (Some(low), Some(high)) => format!(
+                "{low:.1}–{high:.1}%{}",
+                if day.unpriced_tokens > 0 { "*" } else { "" }
+            ),
+            _ => "share unknown".into(),
+        };
+        lines.push(Line::from(span(
+            format!(" {date}{partial} · {} messages", day.messages,),
+            theme::text(),
+        )));
+        lines.push(Line::from(span(
+            format!(
+                "   ${:.2}–${:.2} · {share}",
+                day.low_microusd as f64 / 1_000_000.0,
+                day.high_microusd as f64 / 1_000_000.0
+            ),
+            theme::text(),
+        )));
+        lines.push(Line::from(span(
+            format!(
+                "   {}/{} with recipient calibration",
+                day.calibrated_messages, day.messages
+            ),
+            theme::dim(),
+        )));
+    }
+    lines.push(Line::from(span(
+        " * Unpriced tokens excluded. Latest 31 UTC days; edges clipped.",
+        theme::dim(),
+    )));
+    lines
 }
 
 /// Every account that spent in the period or reported its limits, the largest spender first,
@@ -516,6 +585,21 @@ pub fn detail(world: &World, id: Option<&str>, hours: u64, width: usize) -> Doc 
         None => "All spend".into(),
     };
     doc.line(Line::from(span(title, theme::bold())));
+    if id.is_none()
+        && let Some(estimate) = &world.agent_messages
+    {
+        let mut card = Doc::new();
+        for line in estimate_lines(estimate) {
+            card.line(line);
+        }
+        doc.card(
+            "agent messages · daily estimate · UTC",
+            theme::OVERLAY1,
+            false,
+            card,
+            width,
+        );
+    }
     if mine.is_empty() {
         doc.line(Line::from(span(
             format!("No spend recorded in {}.", period_name(hours)),
@@ -641,6 +725,60 @@ pub fn detail(world: &World, id: Option<&str>, hours: u64, width: usize) -> Doc 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daily_estimate_is_visible_in_the_list_and_whole_period_pane() {
+        let mut world = super::super::demo::world();
+        world.agent_messages = Some(
+            serde_json::from_value(serde_json::json!({
+                "source":"dated audit", "method":"count times allowance",
+                "fallback_low_microusd":220000, "fallback_high_microusd":330000,
+                "days":[{"day_start_ms":0,"since_ms":0,"until_ms":86400000,
+                    "messages":10,"calibrated_messages":8,"low_microusd":2200000,
+                    "high_microusd":3300000,"usage_cost_microusd":1000000,
+                    "unpriced_tokens":100,"low_percent":220.0,"high_percent":330.0}]
+            }))
+            .unwrap(),
+        );
+        let listing = list(&world, By::Agent, 24);
+        let notes = listing
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Note(line) => Some(line.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pane = detail(&world, None, 24, 120)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let narrow_pane = detail(&world, None, 24, 40)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for text in [&notes, &pane, &narrow_pane] {
+            assert!(text.contains("10 messages"));
+            assert!(text.contains("$2.20–$3.30"));
+            assert!(
+                text.contains("220.0–330.0%"),
+                "allowance shares are not capped"
+            );
+            assert!(text.contains("includes useful work"));
+            assert!(text.contains("8/10 with recipient calibration"));
+        }
+        assert!(
+            !detail(&world, Some("agent/example/atlas/builder"), 24, 120)
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("10 messages"))
+        );
+    }
 
     #[test]
     fn groups_rank_by_cost_and_name_what_st_does_not_know() {

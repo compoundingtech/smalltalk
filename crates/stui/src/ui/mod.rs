@@ -566,6 +566,7 @@ impl Ui {
     pub(crate) fn usage_period_next(&mut self) {
         self.usage_hours = usage::next_period(self.usage_hours);
         self.world.usage = Load::Loading;
+        self.world.agent_messages = None;
         self.flash(format!(
             "Usage over {}",
             usage::period_name(self.usage_hours)
@@ -4851,6 +4852,7 @@ impl Ui {
                 self.world.machines = full.machines.clone();
                 self.world.usage = full.usage.clone();
                 self.world.usage_limits = full.usage_limits.clone();
+                self.world.agent_messages = full.agent_messages.clone();
                 self.world.worktrees = full.worktrees.clone();
                 self.world.conversations = full.conversations;
                 if let Some(Load::Ready(entries)) = self

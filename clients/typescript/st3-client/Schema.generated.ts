@@ -721,6 +721,33 @@ export const AgentDeclaration = /*#__PURE__*/ (() => Schema.Struct({
 export type AgentDeclaration = typeof AgentDeclaration.Type
 export type AgentDeclarationEncoded = typeof AgentDeclaration.Encoded
 
+export const AgentMessageDay = /*#__PURE__*/ (() => Schema.Struct({
+  "calibrated_messages": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "day_start_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "high_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "high_percent": Schema.OptionFromOptionalNullOr(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
+  "low_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "low_percent": Schema.OptionFromOptionalNullOr(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
+  "messages": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "since_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "unpriced_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "until_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "usage_cost_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "AgentMessageDay" }))()
+export type AgentMessageDay = typeof AgentMessageDay.Type
+export type AgentMessageDayEncoded = typeof AgentMessageDay.Encoded
+
+export const AgentMessageEstimate = /*#__PURE__*/ (() => Schema.Struct({
+  "calibration": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "days": Schema.Array(AgentMessageDay),
+  "fallback_high_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "fallback_low_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "method": Schema.String,
+  "source": Schema.String
+}).annotate({ identifier: "AgentMessageEstimate" }))()
+export type AgentMessageEstimate = typeof AgentMessageEstimate.Type
+export type AgentMessageEstimateEncoded = typeof AgentMessageEstimate.Encoded
+
 export const AgentQueueMove = /*#__PURE__*/ (() => Schema.Struct({
   "actor_id": Schema.OptionFromNullOr(Id),
   "anchor_run_id": Schema.OptionFromNullOr(Id),
@@ -2120,6 +2147,7 @@ export type UsageRow = typeof UsageRow.Type
 export type UsageRowEncoded = typeof UsageRow.Encoded
 
 export const UsagePeriod = /*#__PURE__*/ (() => Schema.Struct({
+  "agent_messages": optionalKey(AgentMessageEstimate),
   "limits": optionalKey(Schema.Array(UsageLimit)),
   "rows": Schema.Array(UsageRow),
   "since_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),

@@ -598,7 +598,37 @@
         "since_ms": { "type": "integer", "minimum": 0 },
         "until_ms": { "type": "integer", "minimum": 0 },
         "rows": { "type": "array", "items": { "$ref": "#/$defs/UsageRow" } },
-        "limits": { "type": "array", "items": { "$ref": "#/$defs/UsageLimit" } }
+        "limits": { "type": "array", "items": { "$ref": "#/$defs/UsageLimit" } },
+        "agent_messages": { "$ref": "#/$defs/AgentMessageEstimate" }
+      }
+    },
+    "AgentMessageEstimate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "method", "fallback_low_microusd", "fallback_high_microusd", "days"],
+      "properties": {
+        "calibration": { "type": ["string", "null"] },
+        "source": { "type": "string" },
+        "method": { "type": "string" },
+        "fallback_low_microusd": { "type": "integer", "minimum": 0 },
+        "fallback_high_microusd": { "type": "integer", "minimum": 0 },
+        "days": { "type": "array", "items": { "$ref": "#/$defs/AgentMessageDay" } }
+      }
+    },
+    "AgentMessageDay": {
+      "type": "object", "additionalProperties": false,
+      "required": ["day_start_ms", "since_ms", "until_ms", "messages", "calibrated_messages", "low_microusd", "high_microusd", "usage_cost_microusd", "unpriced_tokens"],
+      "properties": {
+        "day_start_ms": { "type": "integer", "minimum": 0 },
+        "since_ms": { "type": "integer", "minimum": 0 },
+        "until_ms": { "type": "integer", "minimum": 0 },
+        "messages": { "type": "integer", "minimum": 0 },
+        "calibrated_messages": { "type": "integer", "minimum": 0 },
+        "low_microusd": { "type": "integer", "minimum": 0 },
+        "high_microusd": { "type": "integer", "minimum": 0 },
+        "usage_cost_microusd": { "type": "integer", "minimum": 0 },
+        "unpriced_tokens": { "type": "integer", "minimum": 0 },
+        "low_percent": { "type": ["number", "null"], "minimum": 0 },
+        "high_percent": { "type": ["number", "null"], "minimum": 0 }
       }
     },
     "ClientConnections": {

@@ -930,9 +930,11 @@ pub(super) async fn usage_period(
         )));
     }
     let store = state.store.clone();
-    let (mut rows, limits) = blocking_store(move || {
+    let (mut rows, agent_messages, limits) = blocking_store(move || {
+        let (rows, agent_messages) = store.usage_period_report(since_ms, until_ms)?;
         Ok((
-            store.usage_period_rows(since_ms, until_ms)?,
+            rows,
+            agent_messages,
             store.account_limits()?,
         ))
     })
@@ -954,7 +956,7 @@ pub(super) async fn usage_period(
         })
         .collect::<Vec<_>>();
     Ok(Json(
-        json!({ "since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits }),
+        json!({ "since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages }),
     ))
 }
 
