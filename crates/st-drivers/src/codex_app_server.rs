@@ -2204,14 +2204,7 @@ impl CodexControlState {
                 reason: CodexHoldReason::NotLoaded,
                 turn_id: None,
             },
-            "systemError"
-                if matches!(
-                    self.observed,
-                    CodexObservedState::TerminalError {
-                        reason: CodexTerminalError::SystemError
-                    }
-                ) =>
-            {
+            "systemError" if matches!(self.observed, CodexObservedState::TerminalError { .. }) => {
                 self.observed.clone()
             }
             "systemError" => CodexObservedState::Held {
@@ -2440,14 +2433,7 @@ fn observed_from_thread_snapshot(
                 reason: CodexHoldReason::NotLoaded,
                 turn_id: None,
             },
-            "systemError"
-                if matches!(
-                    previous,
-                    CodexObservedState::TerminalError {
-                        reason: CodexTerminalError::SystemError
-                    }
-                ) =>
-            {
+            "systemError" if matches!(previous, CodexObservedState::TerminalError { .. }) => {
                 previous.clone()
             }
             "systemError" => CodexObservedState::Held {
@@ -5091,16 +5077,30 @@ fn recover_transcript_turn_if_due(
             return Ok(());
         }
     };
-    if system_error {
-        if failed_completed_turn_from_codex_frames(&frames).is_none() {
-            return Ok(());
+    recover_transcript_turn_from_frames(state, delivery, &frames, control_state_path, events)
+}
+
+fn recover_transcript_turn_from_frames(
+    state: &mut CodexControlState,
+    delivery: &mut Option<CodexInboxDelivery>,
+    frames: &[Value],
+    control_state_path: &Path,
+    events: &Sender<ControlEvent>,
+) -> Result<()> {
+    if matches!(
+        state.observed,
+        CodexObservedState::Held {
+            reason: CodexHoldReason::SystemError,
+            ..
         }
+    ) {
+        let Some((_, reason)) = failed_completed_turn_from_codex_frames(frames) else {
+            return Ok(());
+        };
         // Some Codex app-server versions report the terminal thread status but
         // omit turn/completed. The saved task_complete with an error proves the
         // turn ended, so the next inbox delivery can safely start a new turn.
-        state.observed = CodexObservedState::TerminalError {
-            reason: CodexTerminalError::SystemError,
-        };
+        state.observed = CodexObservedState::TerminalError { reason };
         atomic_json(control_state_path, state)
             .context("persisting transcript-recovered Codex system error")?;
         if let Some(delivery) = delivery.as_mut() {
@@ -5110,7 +5110,7 @@ fn recover_transcript_turn_if_due(
         let _ = events.send(ControlEvent::Observed);
         return Ok(());
     }
-    let Some(turn_id) = active_turn_from_codex_frames(&frames) else {
+    let Some(turn_id) = active_turn_from_codex_frames(frames) else {
         return Ok(());
     };
     let before = state.observed.clone();
@@ -5292,12 +5292,21 @@ fn active_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
     active
 }
 
-fn failed_completed_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
+fn failed_completed_turn_from_codex_frames(
+    frames: &[Value],
+) -> Option<(String, CodexTerminalError)> {
     let mut active = None;
+    // Codex can flush an item after task_complete; that does not reopen the closed turn.
+    let mut closed_turn = None;
     let mut failed = None;
     for value in frames {
         let event = value.pointer("/payload/type").and_then(Value::as_str);
-        let turn_id = value.pointer("/payload/turn_id").and_then(Value::as_str);
+        let turn_id = value
+            .pointer("/payload/turn_id")
+            .or_else(|| {
+                value.pointer("/payload/internal_chat_message_metadata_passthrough/turn_id")
+            })
+            .and_then(Value::as_str);
         match (event, turn_id) {
             (Some("task_started"), Some(turn_id)) => {
                 active = Some(turn_id);
@@ -5305,13 +5314,66 @@ fn failed_completed_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
             }
             (Some("task_complete"), Some(turn_id)) if active == Some(turn_id) => {
                 active = None;
+                closed_turn = Some(turn_id);
                 failed = value
                     .pointer("/payload/error")
-                    .filter(|error| !error.is_null())
-                    .map(|_| turn_id.to_string());
+                    .filter(|error| error.is_object() || error.is_string())
+                    .map(|error| {
+                        // The native transcript uses snake_case; the control stream uses camelCase.
+                        let info = error
+                            .get("codex_error_info")
+                            .or_else(|| error.get("codexErrorInfo"))
+                            .map(|info| match info.as_str() {
+                                Some("usage_limit_exceeded") => json!("usageLimitExceeded"),
+                                _ => info.clone(),
+                            });
+                        let turn = json!({
+                            "status": "failed",
+                            "error": {
+                                "message": error.get("message"),
+                                "codexErrorInfo": info,
+                            }
+                        });
+                        let reason = match codex_turn_outcome(Some(&turn)) {
+                            CodexTurnOutcome::ProviderCapacity => {
+                                CodexTerminalError::ProviderCapacity
+                            }
+                            CodexTurnOutcome::ProviderAuthRejected => {
+                                CodexTerminalError::ProviderAuthRejected
+                            }
+                            _ => CodexTerminalError::SystemError,
+                        };
+                        (turn_id.to_string(), reason)
+                    });
+            }
+            (Some("task_complete"), turn_id) => {
+                closed_turn = turn_id;
+                failed = None;
             }
             (Some("turn_aborted"), Some(turn_id)) if active == Some(turn_id) => {
                 active = None;
+                closed_turn = Some(turn_id);
+                failed = None;
+            }
+            (Some("turn_aborted"), turn_id) => {
+                closed_turn = turn_id;
+                failed = None;
+            }
+            // A long turn can put task_started outside the bounded tail. Recent typed
+            // frames prove its identity just as they do for active-turn recovery. They
+            // also invalidate an older failure when a newer turn is now live.
+            (Some("item_completed"), Some(turn_id))
+                if active.is_none() && closed_turn != Some(turn_id) =>
+            {
+                active = Some(turn_id);
+                failed = None;
+            }
+            (_, Some(turn_id))
+                if active.is_none()
+                    && closed_turn != Some(turn_id)
+                    && value.get("type").and_then(Value::as_str) == Some("response_item") =>
+            {
+                active = Some(turn_id);
                 failed = None;
             }
             _ => {}
