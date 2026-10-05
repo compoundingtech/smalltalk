@@ -144,8 +144,8 @@ The native proof runs in the normal Linux Cargo test suite.
 
 The probe's private `events.jsonl` pairs every channel start and exit by channel ID
 and PID. Exit records include whether the native hello arrived, the inherited runtime
-incarnation and ownership sequence, and a separately timed observation of the agent's
-current owner. That observation is context, not proof of the channel's accepted binding.
+incarnation and ownership sequence, and separately timed observations of the agent's
+current owner at launch and exit. Those observations are context, not proof of the channel's accepted binding.
 Stderr is drained concurrently with native stdout. Only a 4 KiB tail is retained;
 diagnostics keep CLI error lines with credentials redacted and omit structured or native
 message payloads. An inherited pipe cannot hold up restart indefinitely. These records

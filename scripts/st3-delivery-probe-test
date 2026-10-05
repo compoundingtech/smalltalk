@@ -127,6 +127,9 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ended["ownership_sequence"], "7")
         self.assertEqual(ended["observed_owner"]["incarnation_id"], "fixture-incarnation")
         self.assertEqual(ended["observed_owner"]["owner_generation"], 7)
+        self.assertEqual(ended["observed_owner_at_exit"]["incarnation_id"], "fixture-incarnation")
+        self.assertGreaterEqual(ended["observed_owner_at_exit"]["observed_at_unix_ms"],
+                                ended["observed_owner"]["observed_at_unix_ms"])
         self.assertEqual(ended["stderr"]["bytes"], 500001 + len("st: current runtime incarnation did not appear\n"))
         self.assertTrue(ended["stderr"]["truncated"])
         self.assertFalse(ended["stderr"]["incomplete"])
@@ -196,6 +199,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(ended["stderr"]["incomplete"])
             self.assertEqual(ended["stderr"]["diagnostic"], "st: startup refused before hello")
             self.assertTrue(ended["observed_owner"]["unavailable"])
+            self.assertTrue(ended["observed_owner_at_exit"]["unavailable"])
             self.assertEqual(self.monitor.state["receipts"], {})
             self.assertEqual(self.monitor.api.posts, [])
         finally:

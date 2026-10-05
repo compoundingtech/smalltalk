@@ -336,7 +336,8 @@ class Probe:
                     await asyncio.gather(drain, return_exceptions=True)
                 self.event("channel-exited", pid=child.pid, exit=child.returncode,
                            hello_seen=hello_seen, stderr=captured.report(),
-                           observed_owner=await owner, **context)
+                           observed_owner=await owner,
+                           observed_owner_at_exit=await self.channel_owner(), **context)
             await asyncio.sleep(1)
 
     def finished(self, task):
