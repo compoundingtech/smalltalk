@@ -3497,6 +3497,13 @@ struct AttentionWithdrawArgs {
 
 #[derive(Subcommand)]
 enum WorkCommand {
+    /// Open a one-step run for this seat without authoring a mission; then use claim.
+    Start(WorkStartArgs),
+    /// Release claimed work to another seat or person with a note they acknowledge.
+    Handoff(WorkHandoffArgs),
+    /// Acknowledge the exact handoff note before claiming or completing its work.
+    Acknowledge(WorkAcknowledgeArgs),
+
     /// Ask a person through a runtime step owned by live work.
     ///
     /// Puts a structured request on the person's home.
@@ -3577,6 +3584,44 @@ enum WorkCommand {
         #[command(subcommand)]
         command: WorkRevisionCommand,
     },
+}
+
+#[derive(Args)]
+struct WorkStartArgs {
+    /// What this spontaneous task is for.
+    title: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    /// Reuse a key after a timeout to recover the same run.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+struct WorkHandoffArgs {
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    #[arg(long, env = "ST3_INCARNATION")]
+    incarnation: Option<String>,
+    #[arg(long)]
+    to: String,
+    #[arg(long)]
+    note: String,
+    #[arg(long)]
+    evidence: Vec<String>,
+    #[arg(long)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+struct WorkAcknowledgeArgs {
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    /// The message ID from the handoff note or work show.
+    #[arg(long)]
+    message: String,
 }
 
 #[derive(Args)]
@@ -3807,6 +3852,18 @@ enum MessageCommand {
     Reply(MessageReplyArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
+    /// Archive unread mail past an age threshold as each recipient.
+    Cleanup {
+        #[arg(long, conflicts_with = "actor", required_unless_present = "actor")]
+        all: bool,
+        #[arg(long = "as", conflicts_with = "all", required_unless_present = "all")]
+        actor: Option<String>,
+        #[arg(long, default_value = "1h")]
+        older_than: String,
+        /// Show the matching message IDs without archiving them.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Render the bounded conversation thread around one message.
     Thread(MessageReferenceArgs),
     /// List normalized harness sessions available for native conversation views.
@@ -4685,6 +4742,9 @@ fn guard_mutating_cli_actor(
             _ => None,
         },
         Command::Work { command } => match command {
+            WorkCommand::Start(args) => Some(args.actor.as_str()),
+            WorkCommand::Handoff(args) => Some(args.actor.as_str()),
+            WorkCommand::Acknowledge(args) => Some(args.actor.as_str()),
             WorkCommand::Claim(args) | WorkCommand::Renew(args) | WorkCommand::Progress(args)
             | WorkCommand::Complete(args) | WorkCommand::Fail(args) | WorkCommand::Release(args) => args.actor.as_deref(),
             WorkCommand::Wake(args) => args.actor.as_deref(),
@@ -13613,6 +13673,69 @@ async fn run_work(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        WorkCommand::Start(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let response: StepRunView = client
+                .post(
+                    "/v1/work/start",
+                    &st3::model::WorkStartRequest {
+                        actor: args.actor.clone(),
+                        title: args.title,
+                        idempotency_key: args
+                            .idempotency_key
+                            .unwrap_or_else(|| format!("work-start:{}", uuid::Uuid::now_v7())),
+                    },
+                )
+                .await?;
+            if json_output {
+                print_value(&response, true)
+            } else {
+                println!(
+                    "{}\t{}\nClaim: st work claim {} --as {}",
+                    response.status, response.subject, response.subject, args.actor
+                );
+                Ok(())
+            }
+        }
+        WorkCommand::Handoff(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let incarnation = match args.incarnation {
+                Some(value) => Some(value),
+                None => current_agent_incarnation(client, &args.actor).await?,
+            };
+            let response: StepRunView = client
+                .post(
+                    &format!("/v1/work/handoff/{}", urlencoding::encode(&args.subject)),
+                    &st3::model::WorkHandoffRequest {
+                        actor: args.actor,
+                        incarnation,
+                        to: args.to,
+                        note: args.note,
+                        evidence: args.evidence,
+                        idempotency_key: args
+                            .idempotency_key
+                            .unwrap_or_else(|| format!("work-handoff:{}", uuid::Uuid::now_v7())),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+        WorkCommand::Acknowledge(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let response: StepRunView = client
+                .post(
+                    &format!(
+                        "/v1/work/acknowledge/{}",
+                        urlencoding::encode(&args.subject)
+                    ),
+                    &st3::model::WorkAcknowledgeRequest {
+                        actor: args.actor,
+                        message: args.message,
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
         WorkCommand::Ask(args) => {
             reject_foreign_agent_actor(&args.actor)?;
             let request = args
@@ -14553,6 +14676,31 @@ async fn run_message(
                 return Ok(());
             };
             print_message_receipt(&receipt, json_output)
+        }
+        MessageCommand::Cleanup { all, actor, older_than, dry_run } => {
+            if let Some(actor) = actor.as_deref() {
+                reject_foreign_agent_actor(actor)?;
+            }
+            let older_than_ms = st3::graph::parse_duration(&older_than, true)?;
+            let result: Value = client
+                .post("/v1/messages/cleanup", &json!({
+                    "older_than_ms": older_than_ms, "to": actor, "all": all, "dry_run": dry_run,
+                }))
+                .await?;
+            sync_message_projection(client).await?;
+            if json_output {
+                print_value(&result, true)
+            } else {
+                println!("{} {} unread messages older than {}", if dry_run { "Would archive" } else { "Archived" }, result["count"], older_than);
+                if dry_run {
+                    for id in result["messages"].as_array().into_iter().flatten() {
+                        if let Some(id) = id.as_str() {
+                            println!("{id}");
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
         MessageCommand::Archive(args) => {
             let actor = args

@@ -3,7 +3,7 @@ import { API_VERSION } from './Models.generated.ts';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
-    SubjectDefinition, AgentWorkspace, UsagePeriod, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
+    SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated.ts';
@@ -337,6 +337,7 @@ export class St3Client {
     async setsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/sets/${encodeURIComponent(routedId(id))}`); }
     async documentGet(name: string): Promise<EnvelopeOf<DocumentContent>> { return this.get('/v1/client/documents/content' + query({ name })); }
     async subjectDefinition(subject: string, showEnvValues = false): Promise<EnvelopeOf<SubjectDefinition>> { return this.get('/v1/client/subject-definition' + query({ subject, show_env_values: showEnvValues })); }
+    async mailBacklogSummary(): Promise<EnvelopeOf<MailBacklog>> { return this.get('/v1/client/mail-backlog'); }
     async usagePeriod(options: { since_ms?: number; until_ms?: number } = {}): Promise<EnvelopeOf<UsagePeriod>> { return this.get('/v1/client/usage' + query(options)); }
     async clientsList(): Promise<EnvelopeOf<ClientConnections>> { return this.get('/v1/client/clients'); }
     async nowList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/now' + query(options)); }

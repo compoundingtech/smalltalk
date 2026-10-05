@@ -49,6 +49,15 @@ lookup, and receipt publication failures have separate diagnostics and retry wit
 at 30 seconds. Retained handoffs are inspected only to recover missing receipts from exact native
 proof. Boot and reconnect never authorize a fresh offer of delivered-but-unread mail.
 
+`st doctor` and stui count unread (`sent`, `staged`, or `delivered`) messages older than one hour, including
+retained mail for retired seats. Boot never clears that backlog. To deliberately archive it across
+all mailboxes, run `st conversations cleanup --all --older-than 1h`. Add `--dry-run` to list matching
+message IDs first, or replace `--all` with `--as AGENT` to clean one mailbox. Cleanup archives as each
+recipient, records manual archival through stable keys and linked claims, and can be repeated,
+including after an interrupted archival. Delivered mail without a read claim is included. Fresh
+messages and messages with a read or closed claim are left alone. An agent can still list and explicitly
+read held mail instead of archiving it.
+
 Epochs are allocated by the daemon, independently of wall-clock time. An initial bind has a stable
 request token; a lost acknowledgement retries that same epoch, and retired tokens cannot allocate
 another epoch after replacement. Reexec carries the returned epoch and token. Only an explicit

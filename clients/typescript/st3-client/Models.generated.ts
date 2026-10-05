@@ -504,7 +504,7 @@ export type Envelope = {
   api_version: "st3.client.v0";
   request_id: RequestId;
   snapshot: Snapshot;
-  value: (Capabilities | DocumentContent | SubjectDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod);
+  value: (Capabilities | DocumentContent | SubjectDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
 export type ErrorCode = ("attention-migrated" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
@@ -779,6 +779,12 @@ export type MachineTransport = {
   last_success_at?: (Timestamp | null);
   protocol: string;
   status: "local" | "up" | "down" | "unknown";
+};
+
+export type MailBacklog = {
+  cleanup_command: string;
+  count: number;
+  threshold_ms: number;
 };
 
 export type Message = ResourceHeader & {

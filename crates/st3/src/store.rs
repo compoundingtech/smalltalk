@@ -94,6 +94,7 @@ mod backup;
 mod checkpoint_rules;
 mod limits;
 mod person_work;
+mod adhoc_work;
 mod subagents;
 mod watches;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
@@ -111,6 +112,7 @@ mod convergence;
 mod document_index_tests;
 mod lanes;
 mod operations;
+mod unread_mail;
 mod runtime;
 #[cfg(test)]
 mod tombstones_tests;
@@ -6621,6 +6623,38 @@ impl Store {
         request: &WorkRequest,
         extend_ms: Option<u64>,
     ) -> Result<StepRunView, St3Error> {
+        self.work_action_with_handoff(subject, action, request, extend_ms, None)
+    }
+
+    pub fn handoff_work(
+        &self,
+        subject: &str,
+        input: &crate::model::WorkHandoffRequest,
+    ) -> Result<StepRunView, St3Error> {
+        self.work_action_with_handoff(
+            subject,
+            "release",
+            &WorkRequest {
+                actor: Some(input.actor.clone()),
+                incarnation: input.incarnation.clone(),
+                summary: Some(input.note.clone()),
+                reason: None,
+                evidence: input.evidence.clone(),
+                idempotency_key: input.idempotency_key.clone(),
+            },
+            None,
+            Some(input),
+        )
+    }
+
+    fn work_action_with_handoff(
+        &self,
+        subject: &str,
+        action: &str,
+        request: &WorkRequest,
+        extend_ms: Option<u64>,
+        handoff: Option<&crate::model::WorkHandoffRequest>,
+    ) -> Result<StepRunView, St3Error> {
         if action == "extend" {
             if !extend_ms.is_some_and(|by| (1..=MAX_STEP_EXTENSION_MS).contains(&by)) {
                 return Err(St3Error::new(
@@ -6674,6 +6708,9 @@ impl Store {
                     .optional()
                     .map_err(internal)?
                 {
+                    if let Some(input) = handoff {
+                        adhoc_work::validate_retry(transaction, &subject, input)?;
+                    }
                     return serde_json::from_str(&response).map_err(internal);
                 }
                 if action == "claim" && rollouts::intake_held(transaction, &actor, &subject)? {
@@ -6776,6 +6813,12 @@ impl Store {
                         format!("step run `{subject}` has an unresolved external blocker"),
                     ));
                 }
+                if let Some(input) = handoff {
+                    adhoc_work::validate_recipient(transaction, input, &current)?;
+                }
+                if action == "claim" && adhoc_work::pending_handoff(transaction, &current)? {
+                    return Err(St3Error::new("handoff-not-acknowledged", "read the handoff note and acknowledge its message before claiming this work"));
+                }
                 let eligible = current.assigned_to.as_deref() == Some(actor.as_str())
                     || current
                         .available_to
@@ -6826,6 +6869,9 @@ impl Store {
                             ),
                         ));
                     }
+                }
+                if action == "complete" && adhoc_work::is_adhoc(transaction, &current.run).map_err(internal)? && request.evidence.is_empty() {
+                    return Err(St3Error::new("work-needs-evidence", "close spontaneous work with --evidence"));
                 }
                 if matches!(
                     current.status.as_str(),
@@ -6974,6 +7020,9 @@ impl Store {
                 if let Some(extend_ms) = extend_ms {
                     body["fields"]["extend_ms"] = json!(extend_ms);
                 }
+                if let Some(input) = handoff {
+                    adhoc_work::transfer_tx(transaction, &self.origin, &current, input, &mut body)?;
+                }
                 let claim_kind = match action {
                     "claim" => "work.claimed",
                     "renew" => "work.renewed",
@@ -6994,10 +7043,10 @@ impl Store {
                 let last_replicated_expiry = if quiet_renewal {
                     transaction
                         .query_row(
-                            "SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
+                            &canonical_sql("SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
                              FROM claims WHERE subject=?1
                                AND kind IN ('work.claimed','work.renewed','work.progress')
-                             ORDER BY store_index DESC LIMIT 1",
+                             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                             [&subject],
                             |row| row.get::<_, Option<u64>>(0),
                         )
@@ -10744,6 +10793,23 @@ impl Store {
             messages.push(self.message_view_cached(&connection, &subject, index)?);
         }
         Ok(messages)
+    }
+
+    pub fn unread_mail_count_before(&self, before_unix_ms: u128) -> Result<u64> {
+        smallclaims::touched::note_read(|| "kind:message.sent".to_owned());
+        if PINNED_READER.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|(pool, _)| *pool == self.readers.key())
+        }) {
+            return unread_mail::count_in_snapshot(&self.readers.get(), before_unix_ms);
+        }
+        let mut connection = self.connection.write();
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let count = unread_mail::count_before(&transaction, before_unix_ms)?;
+        transaction.commit()?;
+        Ok(count)
     }
 
     pub fn messages(
@@ -24411,6 +24477,9 @@ fn project_mission_run_created(
             format!("claim `{}` has an invalid mission run subject", claim.id),
         )
     })?;
+    if fields.get("ad_hoc_title").is_some() {
+        return adhoc_work::project_start(transaction, claim);
+    }
     // Creation claims fold in canonical order. A second admission of the same occurrence must
     // not append steps from another child revision to the winning initial generation.
     if transaction
@@ -24760,6 +24829,16 @@ fn project_mission_run_update(
             .map_err(internal)?;
         if current_attempt != Some(claim_attempt) {
             return Ok(());
+        }
+        if claim.kind == "work.released"
+            && let Some(to) = fields.get("handoff_to").and_then(Value::as_str)
+        {
+            transaction
+                .execute(
+                    "UPDATE step_runs SET assignee=?2, available_to='[]' WHERE subject=?1",
+                    params![claim.subject, to],
+                )
+                .map_err(internal)?;
         }
         let lease_expiry = fields
             .get("claim_expires_at_unix_ms")
@@ -26550,6 +26629,7 @@ fn enrich_step_queue_at(
     enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)?;
+    adhoc_work::enrich_handoff(connection, view, snapshot_unix_ms)?;
     person_work::enrich_responses(connection, view)
 }
 
@@ -26587,6 +26667,9 @@ fn enrich_step_summaries_at(
         if fields.get("attempt").and_then(Value::as_u64) != Some(u64::from(view.attempt)) {
             continue;
         }
+        if fields.get("handoff_acknowledged").is_some() {
+            continue;
+        }
         let Some(summary) = fields
             .get("summary")
             .and_then(Value::as_str)
@@ -26612,6 +26695,7 @@ fn enrich_step_queue_for_reconcile_at(
 ) -> rusqlite::Result<()> {
     apply_effective_step_state(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)?;
+    adhoc_work::enrich_handoff(connection, view, snapshot_unix_ms)?;
     person_work::enrich_responses(connection, view)
 }
 
@@ -46570,21 +46654,22 @@ impl Store {
             for claim in &batch.claims {
                 ensure_claim_blobs(&transaction, claim)?;
                 let inserted = transaction
-                    .execute(
+                    .prepare_cached(
                         "INSERT OR IGNORE INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                        params![
-                            claim.id,
-                            claim.batch_id,
-                            claim.subject,
-                            claim.kind,
-                            claim.origin,
-                            claim.actor,
-                            canonical_json_text(&claim.body).map_err(internal)?,
-                            serde_json::to_string(&claim.predecessors).map_err(internal)?,
-                            claim.accepted_at_unix_ms.to_string(),
-                        ],
                     )
+                    .map_err(internal)?
+                    .execute(params![
+                        claim.id,
+                        claim.batch_id,
+                        claim.subject,
+                        claim.kind,
+                        claim.origin,
+                        claim.actor,
+                        canonical_json_text(&claim.body).map_err(internal)?,
+                        serde_json::to_string(&claim.predecessors).map_err(internal)?,
+                        claim.accepted_at_unix_ms.to_string(),
+                    ])
                     .map_err(internal)?;
                 if inserted != 0 {
                     let index = transaction.last_insert_rowid() as u64;

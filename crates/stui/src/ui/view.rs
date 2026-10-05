@@ -46,6 +46,8 @@ pub struct World {
     /// Peers this host's graph has diverged from: the same envelopes project a different graph
     /// here, so what stui shows can be wrong until the host is repaired.
     pub diverged: Vec<String>,
+    #[serde(skip)]
+    pub mail_backlog: Load<st3_client::MailBacklog>,
     pub attention: Load<Vec<Attention>>,
     pub agents: Load<Vec<Agent>>,
     pub missions: Load<Vec<Mission>>,
@@ -64,6 +66,28 @@ pub struct World {
     /// Each account's freshest limits reading, from the same read.
     #[serde(skip)]
     pub usage_limits: Vec<st3_client::UsageLimit>,
+    /// The clients connected to this member now and those seen in the last few minutes.
+    pub clients: Load<Vec<Connected>>,
+}
+
+/// A client connected to this member, as it describes itself.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Connected {
+    /// Its reported name and build, "stui 0.1.0+ab12cd3"; empty when it sent none.
+    pub client: String,
+    /// The person or agent it acts for, and the paired device when one is acting.
+    pub who: String,
+    pub device: Option<String>,
+    pub member: String,
+    /// `local`, `gateway` or `tailscale`.
+    pub via: String,
+    pub connected: bool,
+    /// "since 4m", or "seen 2m ago" once it has gone.
+    pub when: String,
+    /// What it follows: windows, conversations and terminals.
+    pub follows: Vec<String>,
+    /// Its reported build is older than the member's own.
+    pub older: bool,
 }
 
 // ------------------------------------------------------------------ attention

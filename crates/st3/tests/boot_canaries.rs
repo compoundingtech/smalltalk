@@ -165,3 +165,8 @@ harness!(codex, "codex");
 harness!(pi, "pi");
 harness!(omp, "omp");
 harness!(opencode, "opencode");
+
+#[test]
+fn codex_transcript_utf8_and_discovery_failures_preserve_delivery_and_private_warnings() {
+    canary("codex", "utf8");
+}

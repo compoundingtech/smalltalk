@@ -2114,6 +2114,93 @@ fn a_working_turn_reconciles_a_missed_steer_receipt_and_delivers_the_next_ping()
 }
 
 #[test]
+fn split_utf8_window_recovers_a_receipt_and_delivers_the_next_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let first =
+        message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "first €").unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config.clone());
+    let mut state = subscribed_state(CodexObservedState::Active {
+        turn_id: "turn-live".into(),
+    });
+    let snapshot = delivery.maybe_snapshot_request(&state).unwrap().unwrap();
+    delivery
+        .accept_snapshot_response(
+            &json!({"id": snapshot["id"], "result": {"thread": {
+                "id": "thread-main", "status": {"type": "active"}, "turns": []
+            }}}),
+            &mut state,
+        )
+        .unwrap();
+    let request = delivery.maybe_request(&state).unwrap().unwrap();
+    let client_id = request["params"]["clientUserMessageId"].as_str().unwrap();
+    delivery
+        .accept_response(
+            &json!({"id": request["id"], "result": {"turnId": "turn-live"}}),
+            state.observed(),
+        )
+        .unwrap();
+
+    let transcript = tmp.path().join("rollout.jsonl");
+    let mut file = File::create(&transcript).unwrap();
+    writeln!(file, "€").unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type": "event_msg", "payload": {
+            "type": "item_completed", "thread_id": "thread-main", "turn_id": "turn-live",
+            "item": {"type": "UserMessage", "client_id": client_id}
+        }})
+    )
+    .unwrap();
+    // The metadata snapshot ends one byte into the final euro sign; the file grows before
+    // the read. Its fixed window also starts one byte into the first euro sign.
+    let length = TRANSCRIPT_TURN_RECOVERY_BYTES + 1;
+    let padding = length - 1 - file.stream_position().unwrap();
+    file.write_all(&vec![b' '; padding as usize]).unwrap();
+    writeln!(file, "€").unwrap();
+    drop(file);
+    assert!(std::str::from_utf8(&fs::read(&transcript).unwrap()).is_ok());
+    let second =
+        message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "second €").unwrap();
+    let (frames, bytes_read) =
+        codex_transcript_window(File::open(&transcript).unwrap(), length).unwrap();
+    assert_eq!(bytes_read, TRANSCRIPT_TURN_RECOVERY_BYTES);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        active_turn_from_codex_frames(&frames).as_deref(),
+        Some("turn-live")
+    );
+    delivery
+        .accept_transcript_receipts(&frames, "thread-main")
+        .unwrap();
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+    let next = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("next message must reach the live turn");
+    assert_eq!(next["method"], "turn/steer");
+    assert_eq!(
+        next["params"]["clientUserMessageId"],
+        stable_client_user_message_id("h.worker", "thread-main", &second)
+    );
+}
+
+#[test]
+fn a_partial_utf8_append_does_not_discard_complete_transcript_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("rollout.jsonl");
+    fs::write(&path, b"{\"complete\":true}\n{\"text\":\"\xe2\x82").unwrap();
+    assert_eq!(
+        codex_transcript_tail(&path).unwrap(),
+        [json!({"complete": true})]
+    );
+}
+
+#[test]
 fn a_delivery_on_a_history_larger_than_the_control_limit_uses_bounded_reads() {
     let mut request_lengths = Vec::new();
     let mut transcript_bytes_read = Vec::new();
@@ -5657,6 +5744,22 @@ fn a_controlled_tui_starts_without_the_update_notice() {
             "thread-prior"
         ]
     );
+    for args in [
+        vec![],
+        vec!["--remote".into(), "unix:///server.sock".into()],
+        vec![
+            "--remote".into(),
+            "unix:///server.sock".into(),
+            "--model".into(),
+            "gpt-test".into(),
+        ],
+    ] {
+        let command = controlled_tui_command("codex", &args);
+        assert_eq!(
+            command.get_args().take(2).collect::<Vec<_>>(),
+            ["-c", "check_for_update_on_startup=false"]
+        );
+    }
 }
 
 #[test]

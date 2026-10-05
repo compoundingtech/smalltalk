@@ -2474,6 +2474,34 @@ pub struct WorkRequest {
     pub idempotency_key: String,
 }
 
+/// Open a minimal run assigned to the calling seat; existing work verbs handle it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkStartRequest {
+    pub actor: String,
+    pub title: String,
+    pub idempotency_key: String,
+}
+
+/// Release a live claim to one exact recipient, with a durable note.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkHandoffRequest {
+    pub actor: String,
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    pub to: String,
+    pub note: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    pub idempotency_key: String,
+}
+
+/// Acknowledge the exact note visible to this recipient.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkAcknowledgeRequest {
+    pub actor: String,
+    pub message: String,
+}
+
 /// `work extend`: add `by_ms` to the execution budget of the attempt the actor holds.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkExtendRequest {

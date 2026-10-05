@@ -554,6 +554,12 @@ impl Store {
             if ask.is_none() && input.episode.as_ref().is_some_and(|episode| episode != &format!("{}:{}:{}", view.generation, view.attempt, view.readiness_epoch)) {
                 return Err(St3Error::new("stale-fence", "this authored person step has moved to another episode"));
             }
+            if !cancel && super::adhoc_work::pending_handoff(tx, &view)? {
+                return Err(St3Error::new("handoff-not-acknowledged", "read and acknowledge the current handoff note before closing this step"));
+            }
+            if !cancel && super::adhoc_work::is_adhoc(tx, &view.run).map_err(internal)? && input.evidence.is_empty() {
+                return Err(St3Error::new("work-needs-evidence", "close spontaneous work with --evidence"));
+            }
             let (answer, summary) = resolved?;
             if summary.trim().is_empty() {
                 return Err(St3Error::new("invalid-person-response", "a response needs a summary"));
@@ -812,6 +818,29 @@ fn send_answer_tx(
     Ok(())
 }
 
+/// Shared projection for a one-step runtime run, used by asks and spontaneous work.
+pub(super) fn project_minimal_run(
+    tx: &Transaction<'_>,
+    claim: &ClaimRecord,
+    mission: &MissionSpec,
+    run: &str,
+    generation: &str,
+    root: &str,
+    reason: &str,
+) -> Result<(), St3Error> {
+    let at = claim.accepted_at_unix_ms.to_string();
+    tx.execute("INSERT OR IGNORE INTO mission_revisions(mission_id,revision,state,body,claim_id,created_index)
+                VALUES(?1,?2,'ready',?3,?4,?5)", params![mission.id, mission.revision, serde_json::to_string(&mission).map_err(internal)?, claim.id, claim.store_index]).map_err(internal)?;
+    tx.execute("INSERT OR IGNORE INTO mission_definitions(mission_id,revision,state,claim_id) VALUES(?1,?2,'ready',?3)", params![mission.id, mission.revision, claim.id]).map_err(internal)?;
+    tx.execute("INSERT OR IGNORE INTO mission_runs(id,mission_id,initial_revision,current_generation_id,root_revision,root_run_id,
+                workspace,requester,inputs,mode,status,phase,created_at_unix_ms,updated_at_unix_ms)
+                VALUES(?1,?2,?3,?4,?3,?5,'.',?6,'{}','run','running','normal',?7,?7)",
+                params![run, mission.id, mission.revision, generation, root, claim.actor, at]).map_err(internal)?;
+    tx.execute("INSERT OR IGNORE INTO run_generations(id,run_id,revision,status,actor,reason,created_at_unix_ms,updated_at_unix_ms)
+                VALUES(?1,?2,?3,'running',?4,?6,?5,?5)", params![generation, run, mission.revision, claim.actor, at, reason]).map_err(internal)?;
+    Ok(())
+}
+
 pub(super) fn project(tx: &Transaction<'_>, claim: &ClaimRecord) -> Result<bool, St3Error> {
     let fields = &claim.body["fields"];
     if claim.kind == "work.person-asked" {
@@ -829,16 +858,7 @@ pub(super) fn project(tx: &Transaction<'_>, claim: &ClaimRecord) -> Result<bool,
                 .as_str()
                 .unwrap_or(run)
                 .trim_start_matches("mission-run/");
-            let at = claim.accepted_at_unix_ms.to_string();
-            tx.execute("INSERT OR IGNORE INTO mission_revisions(mission_id,revision,state,body,claim_id,created_index)
-                VALUES(?1,?2,'ready',?3,?4,?5)", params![mission.id, mission.revision, serde_json::to_string(&mission).map_err(internal)?, claim.id, claim.store_index]).map_err(internal)?;
-            tx.execute("INSERT OR IGNORE INTO mission_definitions(mission_id,revision,state,claim_id) VALUES(?1,?2,'ready',?3)", params![mission.id, mission.revision, claim.id]).map_err(internal)?;
-            tx.execute("INSERT OR IGNORE INTO mission_runs(id,mission_id,initial_revision,current_generation_id,root_revision,root_run_id,
-                workspace,requester,inputs,mode,status,phase,created_at_unix_ms,updated_at_unix_ms)
-                VALUES(?1,?2,?3,?4,?3,?5,'.',?6,'{}','run','running','normal',?7,?7)",
-                params![run, mission.id, mission.revision, generation, root, claim.actor, at]).map_err(internal)?;
-            tx.execute("INSERT OR IGNORE INTO run_generations(id,run_id,revision,status,actor,reason,created_at_unix_ms,updated_at_unix_ms)
-                VALUES(?1,?2,?3,'running',?4,'person ask',?5,?5)", params![generation, run, mission.revision, claim.actor, at]).map_err(internal)?;
+            project_minimal_run(tx, claim, &mission, run, generation, root, "person ask")?;
         }
         tx.execute("INSERT OR IGNORE INTO step_runs(subject,run_id,generation_id,step_path,definition_hash,status,
             attempt,assignee,available_to,agentless,title,goals,created_at_unix_ms,updated_at_unix_ms,constraints)

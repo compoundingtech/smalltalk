@@ -66,6 +66,7 @@ pub fn world() -> World {
         person: s("person/robin"),
         host: s("lark"),
         link: Link::Live,
+        mail_backlog: Load::Ready(st3_client::MailBacklog { count: 0, threshold_ms: 3_600_000, cleanup_command: String::new() }),
         diverged: Vec::new(),
         attention: Load::Ready(attention()),
         agents: Load::Ready(agents()),
@@ -92,6 +93,41 @@ pub fn world() -> World {
         quiet_missions: 6,
         usage: Load::Ready(usage()),
         usage_limits: usage_limits(),
+        clients: Load::Ready(vec![
+            Connected {
+                client: s("stui 0.1.0+1ecae71"),
+                who: s("person/robin"),
+                device: None,
+                member: s("lark"),
+                via: s("local"),
+                connected: true,
+                when: s("since 2h"),
+                follows: vec![s("glass:main"), s("conversation:agent/lark/planner")],
+                older: false,
+            },
+            Connected {
+                client: s("smalltalk-ios 1.0 (42)"),
+                who: s("person/robin"),
+                device: Some(s("Robin's phone")),
+                member: s("lark"),
+                via: s("gateway"),
+                connected: true,
+                when: s("since 12m"),
+                follows: vec![s("now"), s("terminal:terminal/agent/lark/planner")],
+                older: false,
+            },
+            Connected {
+                client: s("stui 0.0.9+77d0a13"),
+                who: s("person/robin"),
+                device: None,
+                member: s("lark"),
+                via: s("tailscale"),
+                connected: false,
+                when: s("seen 3m ago"),
+                follows: Vec::new(),
+                older: true,
+            },
+        ]),
     }
 }
 
@@ -101,6 +137,7 @@ pub fn loading() -> World {
         person: s("person/robin"),
         host: s("lark"),
         link: Link::Connecting,
+        mail_backlog: Load::Loading,
         diverged: Vec::new(),
         attention: Load::Loading,
         agents: Load::Loading,
@@ -112,6 +149,7 @@ pub fn loading() -> World {
         quiet_missions: 0,
         usage: Load::Loading,
         usage_limits: Vec::new(),
+        clients: Load::Loading,
     }
 }
 
@@ -806,6 +844,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: Some(s(ATLAS_KDL)),
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/site/pricing-page"),
@@ -840,6 +879,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/release/weekly"),
@@ -882,6 +922,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/harbor/pull-request-review"),
@@ -916,6 +957,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/rekey"),
@@ -960,6 +1002,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/docs/handbook"),
@@ -986,6 +1029,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/atlas/nightly"),
@@ -1020,6 +1064,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
     ]
 }

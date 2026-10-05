@@ -568,6 +568,14 @@ impl Ui {
     }
 
     /// The period to read usage over while something on screen shows it, or `None`.
+    /// Whether the clients connected to this member show: the Fleet tab or a machine pane.
+    pub(crate) fn clients_wanted(&self) -> bool {
+        match &self.glasses {
+            Some(glasses) => glasses.shows_machine() || self.tab == 3,
+            None => self.tab == 3,
+        }
+    }
+
     pub(crate) fn usage_wanted(&self) -> Option<u64> {
         let shown = match &self.glasses {
             Some(glasses) => glasses.shows_usage(),
@@ -1172,6 +1180,20 @@ impl Ui {
 
     fn footer(&self, buf: &mut Buffer, area: Rect) {
         buf.set_style(area, Style::default().bg(theme::CRUST));
+        let backlog_notice = match &self.world.mail_backlog {
+            Load::Ready(backlog) if backlog.count > 0 => Some(format!(
+                "{} unread >1h · {}", backlog.count, backlog.cleanup_command
+            )),
+            Load::Failed(error) => Some(error.clone()),
+            _ => None,
+        };
+        if let Some(notice) = backlog_notice {
+            buf.set_stringn(
+                area.x + 1, area.y, notice, area.width.saturating_sub(2) as usize,
+                Style::default().fg(theme::YELLOW).bg(theme::CRUST),
+            );
+            return;
+        }
         if let Link::Offline(message) = &self.world.link {
             buf.set_stringn(
                 area.x + 1,

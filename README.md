@@ -17,6 +17,9 @@ harness, daemon, and machine restarts. One daemon runs on each machine; machines
 
 ### Shared UI models
 
+[Build your own client](docs/clients/build-your-own.md) maps the Rust and TypeScript pieces
+and includes a small [example TUI](examples/client-tui/) built and tested in CI.
+
 `crates/st3-ui-model` provides renderer-independent UI semantics without a ratatui dependency.
 Its broad name is intentional; initially it contains only stui's mission model (`Word`,
 `StepState`, `Mission`, `Step`) and mission derivation. stui consumes that same model.
@@ -27,6 +30,9 @@ rules, outcomes and rich step details retain stui's existing behavior.
 Adapted steps retain their stable step-run `id` and claimant-or-assignee `seat` (absent for
 agentless steps), so consumers can select duplicate paths across open runs and navigate to
 the actual execution seat without reconstructing identity from display labels.
+`Mission.step_metadata` retains each selected step's raw `blocked_reason` and `last_progress`,
+keyed by its step-run ID. These facts survive state changes independently of a step's waiting
+blocker or derived queue `note`, and are not normalized by display text policies.
 Shared widgets and other UI models are separate follow-up work, not part of this mission extraction.
 
 ## Install
@@ -213,6 +219,15 @@ Use `st help agents new` to open a command's full help.
 Lists show current state. Add `--all` for history. Every command has `--help`, and the global
 `--json` flag prints the stable client format that the apps read. Run `stui` for the same views
 in a terminal app.
+
+For spontaneous work, `st work start "Inspect the fixture" --as agent/example/worker` opens a
+one-step run and prints how to claim it. Use `work progress --summary` for checkpoints and
+`work complete --summary --evidence` to close it. `work handoff STEP --to agent/example/reviewer
+--note TEXT --as agent/example/worker` releases the sender's claim and delivers a note to the
+recipient. The recipient reads it, uses `work acknowledge STEP --message MESSAGE --as RECIPIENT`,
+then claims it. A person recipient sees the step on their home and closes with `work done`.
+`work show STEP` includes the note and acknowledgment. Start and handoff accept
+`--idempotency-key KEY` for retries after a timeout.
 
 ### Embedding native conversations
 

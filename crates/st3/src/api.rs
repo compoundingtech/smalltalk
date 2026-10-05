@@ -66,6 +66,7 @@ mod delivery_probes;
 mod github_watch;
 mod harness_events;
 mod mailbox;
+mod mail_backlog;
 mod owned_sets;
 mod terminal_view;
 
@@ -333,6 +334,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/documents/content", get(client_v0::document_get))
         .route("/v1/client/usage", get(client_v0::usage_period))
+        .route("/v1/client/mail-backlog", get(mail_backlog::get))
         .route("/v1/client/clients", get(client_v0::clients_list))
         .route(
             "/v1/client/subject-definition",
@@ -534,6 +536,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/page", get(list_messages_page))
+        .route("/v1/messages/cleanup", post(mail_backlog::cleanup))
         .route("/v1/mailbox", get(mailbox::subscribe))
         .route("/v1/harness-events", post(harness_events::publish))
         .route("/v1/mailbox/bind", post(mailbox::bind))
@@ -650,6 +653,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(cancel_revision_proposal),
         )
         .route("/v1/work/ask", post(ask_person))
+        .route("/v1/work/start", post(start_work))
+        .route("/v1/work/handoff/{*subject}", post(handoff_work))
+        .route("/v1/work/acknowledge/{*subject}", post(acknowledge_work))
         .route("/v1/github/watch", post(github_watch::watch))
         .route("/v1/github/unwatch", post(github_watch::unwatch))
         .route("/v1/github/watches", get(github_watch::watches))
@@ -6140,6 +6146,14 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             status: "warn".into(),
             message: error.to_string(),
         }),
+    }
+    match mail_backlog::report(&state.store, client_now_ms()) {
+        Ok(backlog) => checks.push(DoctorCheck {
+            name: "mail-backlog".into(),
+            status: if backlog.count == 0 { "pass" } else { "warn" }.into(),
+            message: format!("{} unread messages older than 1h; close them with `{}`", backlog.count, backlog.cleanup_command),
+        }),
+        Err(error) => checks.push(DoctorCheck { name: "mail-backlog".into(), status: "warn".into(), message: error.to_string() }),
     }
     match delivery_probes::check(
         &state.store,
@@ -12169,6 +12183,50 @@ fn normalized_agent_actor(actor: &str) -> Option<String> {
     }
 }
 
+async fn start_work(
+    State(state): State<AppState>,
+    Json(request): Json<crate::model::WorkStartRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let store = state.store.clone();
+    let result = blocking_action(move || store.start_work(&request)).await?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
+async fn handoff_work(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut input): Json<crate::model::WorkHandoffRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        Some(&input.actor),
+        &mut input.incarnation,
+    )?;
+    let request = WorkRequest {
+        actor: Some(input.actor.clone()),
+        incarnation: input.incarnation.clone(),
+        summary: Some(input.note.clone()),
+        reason: None,
+        evidence: input.evidence.clone(),
+        idempotency_key: input.idempotency_key.clone(),
+    };
+    work_action_response(state, "release".into(), subject, request, None, Some(input)).await
+}
+
+async fn acknowledge_work(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<crate::model::WorkAcknowledgeRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let store = state.store.clone();
+    let result = blocking_action(move || store.acknowledge_work(&subject, &request)).await?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
 async fn post_work_action(
     State(state): State<AppState>,
     AxumPath((action, subject)): AxumPath<(String, String)>,
@@ -12181,7 +12239,7 @@ async fn post_work_action(
         request.actor.as_deref(),
         &mut request.incarnation,
     )?;
-    work_action_response(state, action, subject, request, None).await
+    work_action_response(state, action, subject, request, None, None).await
 }
 
 /// Add time to the execution budget of the step attempt this seat holds.
@@ -12206,7 +12264,7 @@ async fn extend_work(
         evidence: Vec::new(),
         idempotency_key: request.idempotency_key,
     };
-    work_action_response(state, "extend".into(), subject, request, Some(extend_ms)).await
+    work_action_response(state, "extend".into(), subject, request, Some(extend_ms), None).await
 }
 
 async fn work_action_response(
@@ -12215,6 +12273,7 @@ async fn work_action_response(
     subject: String,
     request: WorkRequest,
     extend_ms: Option<u64>,
+    handoff: Option<crate::model::WorkHandoffRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
     let actor = request
         .actor
@@ -12240,6 +12299,9 @@ async fn work_action_response(
         .cached_idempotency_response::<StepRunView>(&request.idempotency_key)
         .map_err(ApiError::internal)?
     {
+        if let Some(input) = handoff.as_ref() {
+            state.store.handoff_retry(&subject, input).map_err(ApiError::bad)?;
+        }
         return Ok(Json(response));
     }
     let harness = state
@@ -12261,7 +12323,12 @@ async fn work_action_response(
     let quiet_renewal = action == "renew";
     let store = state.store.clone();
     let (mut response, desired) = blocking_action(move || {
-        let response = store.work_action_extending(&subject, &action, &request, extend_ms)?;
+        let response = if let Some(input) = handoff {
+            store.handoff_work(&subject, &input)?
+        } else {
+            store.work_action_extending(&subject, &action, &request, extend_ms)?
+        };
+
         let desired = store.desired_subjects().map_err(|error| {
             St3Error::new("store-read-failed", format!("read desired agents: {error}"))
         })?;
