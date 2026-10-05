@@ -1340,6 +1340,7 @@ fn parse_agent(
             restart_intensity: restart_intensity.clone(),
             shutdown_timeout_ms,
             driver: None,
+            terminal_size: None,
         });
     }
 
@@ -2508,6 +2509,7 @@ fn driver_member(
         restart_intensity,
         shutdown_timeout_ms,
         driver: Some(name),
+        terminal_size: None,
     })
 }
 
@@ -2598,6 +2600,7 @@ fn task_member(
         restart_intensity,
         shutdown_timeout_ms,
         driver: None,
+        terminal_size: None,
     })
 }
 

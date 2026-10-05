@@ -935,6 +935,18 @@ Read-only terminal scope permits screens but rejects input and resize. Screen pa
 negotiated byte limits: at most 200 lines and 4096 bytes of text per line, with explicit
 `redacted` and `truncated` markers.
 
+### Launch size
+
+A client that draws seats in a pane of fixed size publishes it as a claim on the person, so a seat
+st launches later starts at that size and the first attach needs no resize:
+`POST /v1/claims` with `{"subject":"person/NAME","kind":"terminal.launch-geometry",
+"actor":"person/NAME","fields":{"rows":ROWS,"columns":COLUMNS}}`. Only the person may write it,
+and `rows` and `columns` must each fit a positive u16. At every terminal launch the reconciler
+reads the newest such claim for its configured `person` and starts `pty run` with
+`--rows ROWS --cols COLUMNS`; without a configured person or a claim, pty picks its own size. The
+claim does not wake the reconciler, and a running seat keeps its size: resize it with
+`terminal.resize`.
+
 ### Raw PTY transport
 
 `POST /v1/client/terminals/{id}/raw-attachments` accepts

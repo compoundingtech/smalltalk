@@ -8380,15 +8380,11 @@ async fn dispatch_action(
             let target = terminal_subject(&parameter_string(p, "terminal_id")?);
             let rows = p
                 .get("rows")
-                .and_then(Value::as_u64)
-                .and_then(|value| u16::try_from(value).ok())
-                .filter(|value| *value != 0)
+                .and_then(st3_schema::terminal_dimension)
                 .ok_or_else(|| validation("terminal resize rows must fit a positive u16"))?;
             let columns = p
                 .get("columns")
-                .and_then(Value::as_u64)
-                .and_then(|value| u16::try_from(value).ok())
-                .filter(|value| *value != 0)
+                .and_then(st3_schema::terminal_dimension)
                 .ok_or_else(|| validation("terminal resize columns must fit a positive u16"))?;
             let live = live_session(state, &target, request.fence.runtime_incarnation.as_deref())?;
             if !live.terminal {

@@ -432,6 +432,16 @@ impl Registry {
         if kind == "harness.todo.observed" {
             validate_harness_todo(fields)?;
         }
+        if kind == "terminal.launch-geometry" {
+            for name in ["rows", "columns"] {
+                if fields.get(name).and_then(terminal_dimension).is_none() {
+                    return Err(error(
+                        "invalid-claim-field",
+                        format!("claim field `{name}` on `{kind}` must fit a positive u16"),
+                    ));
+                }
+            }
+        }
         if subject_spec.family == "glass" {
             glasses::owner(subject)?;
             if !matches!(kind, "glass.upserted" | "glass.deleted") {
@@ -539,6 +549,14 @@ impl Registry {
         }
         Ok(spec)
     }
+}
+
+/// A terminal's row or column count: a positive integer that fits a `u16`, as pty takes it.
+pub fn terminal_dimension(value: &Value) -> Option<u16> {
+    value
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| *value != 0)
 }
 
 fn enum_label(value: &impl Serialize) -> String {
@@ -1827,6 +1845,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             Cardinality::Append,
             Some("terminal-control"),
             true,
+            &[],
+        ),
+        (
+            "terminal.launch-geometry",
+            &["person"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            None,
+            false,
             &[],
         ),
         (
@@ -3212,6 +3239,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("runtime_id", string()),
             ("sequence", integer()),
         ],
+        // The pane size a person's client draws seats at. A seat that st launches after it
+        // starts at this size; a live seat keeps its own.
+        "terminal.launch-geometry" => &[
+            ("rows", required_integer()),
+            ("columns", required_integer()),
+        ],
         "message.sent" => &[
             ("from", reference()),
             ("to", reference()),
@@ -4048,6 +4081,7 @@ mod tests {
                 "subscription.watch-ended",
                 "terminal.input.requested",
                 "terminal.input.result",
+                "terminal.launch-geometry",
                 "transport.observed",
                 "work.claimed",
                 "work.extended",
@@ -4266,6 +4300,61 @@ mod tests {
                 .unwrap()
                 .cardinality,
             Cardinality::Append
+        );
+    }
+
+    #[test]
+    fn a_person_publishes_only_their_own_positive_launch_geometry() {
+        let geometry = |rows: Value, columns: Value| {
+            BTreeMap::from([("rows".into(), rows), ("columns".into(), columns)])
+        };
+        let publish = |subject: &str, fields: &BTreeMap<String, Value>, actor: &str| {
+            registry()
+                .validate_public_claim(subject, "terminal.launch-geometry", fields, Some(actor))
+                .map(|_| ())
+                .map_err(|error| error.code)
+        };
+        let valid = geometry(Value::from(48), Value::from(160));
+        assert_eq!(publish("person/avery", &valid, "person/avery"), Ok(()));
+        assert_eq!(
+            publish(
+                "person/avery",
+                &geometry(Value::from(1), Value::from(65_535)),
+                "person/avery"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            publish("person/avery", &valid, "person/blake"),
+            Err("claim-write-forbidden")
+        );
+        assert_eq!(
+            publish("person/avery", &valid, "agent/avery"),
+            Err("claim-write-forbidden")
+        );
+        assert_eq!(
+            publish("agent/avery", &valid, "agent/avery"),
+            Err("invalid-claim-subject")
+        );
+        for (rows, columns) in [
+            (Value::from(0), Value::from(80)),
+            (Value::from(24), Value::from(0)),
+            (Value::from(65_536), Value::from(80)),
+            (Value::from(24), Value::from(-80)),
+            (Value::from("24"), Value::from(80)),
+        ] {
+            assert_eq!(
+                publish("person/avery", &geometry(rows, columns), "person/avery"),
+                Err("invalid-claim-field")
+            );
+        }
+        assert_eq!(
+            publish(
+                "person/avery",
+                &BTreeMap::from([("rows".into(), Value::from(24))]),
+                "person/avery"
+            ),
+            Err("missing-claim-field")
         );
     }
 

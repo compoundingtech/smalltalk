@@ -133,6 +133,10 @@ pub struct MemberSpec {
     pub restart_intensity: RestartIntensity,
     pub shutdown_timeout_ms: u64,
     pub driver: Option<String>,
+    /// The size a terminal seat starts at: the configured person's `terminal.launch-geometry`,
+    /// read at each launch. Never declared, so never a launch change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_size: Option<st_runtime::TerminalSize>,
 }
 
 impl MemberSpec {

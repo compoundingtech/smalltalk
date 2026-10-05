@@ -5379,7 +5379,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         notify.clone(),
         event_notify.clone(),
         recorder.map(|installation| installation.directory),
-    )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()));
+    )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()).with_person(config.person.clone()));
     tokio::spawn(reconciler.supervise());
     // A start no longer rebuilds the operation projection; check it once the API serves.
     tokio::spawn({
