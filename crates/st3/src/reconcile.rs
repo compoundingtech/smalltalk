@@ -6916,6 +6916,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                             matches!(child.status.as_str(), "completed" | "failed" | "cancelled")
                         })
                 })
+                && ((step.spec.uses_mission.is_none() && step.spec.loop_spec.is_none())
+                    || !self.store.step_has_active_child_runs(&view.subject)?)
                 && !self.step_has_live_process(&view.subject)?
             {
                 changed |= self.store.set_step_state(

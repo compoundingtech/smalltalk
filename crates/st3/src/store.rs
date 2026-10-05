@@ -4530,6 +4530,26 @@ impl Store {
         Ok(view)
     }
 
+    pub(crate) fn step_has_active_child_runs(&self, step: &str) -> Result<bool> {
+        let step = normalize_step_run(step);
+        smallclaims::touched::note_read(|| format!("children-of-step:{step}"));
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT 'mission-run/' || id, status FROM mission_runs WHERE parent_step_run=?1",
+        )?;
+        let rows = statement.query_map([step], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (subject, status) = row?;
+            smallclaims::touched::note_read(|| subject);
+            if !matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn adopt_mission_revision(
         &self,
         run: &str,

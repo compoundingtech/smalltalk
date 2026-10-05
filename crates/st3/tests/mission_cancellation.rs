@@ -499,3 +499,105 @@ fn cancellation_ends_final_evidence_after_its_exec_exits() {
 fn cancellation_runs_fresh_final_work_and_frees_the_mission_slot() {
     processless_cancellation(false, false);
 }
+
+#[test]
+fn cancellation_waits_for_a_used_missions_live_final_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(root.path());
+    let file = root.path().join("child.kdl");
+    std::fs::write(
+        &file,
+        r#"version 2
+mission "orchid/child" state="ready" {
+  goal "Keep final cleanup live until it finishes."
+  step "work" { agentless }
+  finally {
+    step "cleanup" {
+      agentless
+      gate "cleanup finishes" {
+        exec "echo $$ > final.pid; while [ ! -e finish ]; do sleep 0.05; done"
+        host "orchid"
+        workspace "."
+        time-limit "1m"
+      }
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let published = daemon.command(&[
+        "missions",
+        "publish",
+        file.to_str().unwrap(),
+        "--as",
+        "person/operator",
+        "--no-gate-check",
+    ]);
+    let revision = published["published_missions"][0]["revision"]
+        .as_str()
+        .unwrap();
+    let file = root.path().join("parent.kdl");
+    std::fs::write(
+        &file,
+        format!(
+            r#"version 2
+mission "orchid/parent" state="ready" {{
+  goal "Let child final cleanup settle before ending its parent."
+  step "work" {{ agentless }}
+  finally {{ step "report" {{ agentless; uses-mission "orchid/child@{revision}" }} }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    daemon.command(&[
+        "missions",
+        "publish",
+        file.to_str().unwrap(),
+        "--as",
+        "person/operator",
+        "--no-gate-check",
+    ]);
+    daemon.command(&[
+        "missions",
+        "start",
+        "orchid/parent",
+        "--id",
+        "orchid/cancel",
+        "--workspace",
+        root.path().to_str().unwrap(),
+        "--as",
+        "person/operator",
+    ]);
+    wait_for("the child final cleanup", || {
+        root.path().join("final.pid").exists()
+    });
+    let pid = std::fs::read_to_string(root.path().join("final.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert!(live(pid));
+    daemon.command(&[
+        "missions",
+        "cancel",
+        "mission-run/orchid/cancel",
+        "--reason",
+        "normal work is no longer needed",
+        "--as",
+        "person/operator",
+    ]);
+    std::thread::sleep(Duration::from_millis(250));
+    let run = daemon.run();
+    assert_eq!(run["phase"], "final-cancelled", "{run}");
+    assert!(
+        live(pid),
+        "the parent stopped its child's final cleanup early"
+    );
+    std::fs::write(root.path().join("finish"), "").unwrap();
+    wait_for("parent cancellation after child cleanup", || {
+        daemon.run()["phase"] == "terminal"
+    });
+    assert_eq!(daemon.run()["status"], "cancelled");
+}
