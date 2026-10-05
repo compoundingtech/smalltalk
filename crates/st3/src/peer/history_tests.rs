@@ -1,4 +1,4 @@
-//! Real PTY history through the paired gateway and signed remote-owner read.
+// Real PTY history through the paired gateway and signed remote-owner read.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paired_history_pages_read_the_actual_remote_pty_owner() {
