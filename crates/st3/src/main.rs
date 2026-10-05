@@ -16829,21 +16829,21 @@ impl NativeObservations {
         } else {
             None
         };
-        let provider_incarnation = if enabled {
-            st_drivers::harness_state::read(
-                &st_drivers::harness_state::harness_state_path(dir),
-                None,
-            )
-            .and_then(|state| state.evidence_incarnation)
+        // The provider token is separate from the runtime incarnation. Only the spool's
+        // producer/runtime binding proves that a saved snapshot belongs to this launch.
+        // Re-exec may restore it; a replacement runtime waits for its own provider event.
+        let snapshot = if enabled {
+            st_drivers::harness_events::read_runtime_state(dir, runtime)?
         } else {
             None
         };
-        let evidence_deadline = if enabled {
-            st_drivers::harness_events::read_snapshot(dir, "harness-state")?
-                .and_then(|raw| serde_json::from_slice(&raw).ok())
-        } else {
-            None
-        };
+        let provider_incarnation = snapshot.as_deref().and_then(|raw| {
+            st_drivers::harness_state::read_raw_at(raw, None, st_drivers::message::now_ms())
+                .evidence_incarnation
+        });
+        let evidence_deadline = snapshot
+            .as_deref()
+            .and_then(|raw| serde_json::from_slice(raw).ok());
         Ok(Self {
             dir: dir.into(),
             runtime: runtime.into(),
@@ -26356,6 +26356,61 @@ mission "review" state="ready" {
         assert_eq!(store.local_observations_tail(100).unwrap().len(), 1);
         server.abort();
     }
+    #[tokio::test]
+    async fn initial_snapshot_requires_the_providers_runtime_binding() {
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-old").unwrap();
+        let seq =
+            st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-old")
+                .unwrap();
+        let observations = NativeObservations::start(root.path(), "runtime-old").unwrap();
+        assert_eq!(
+            observations.provider_incarnation.as_deref(),
+            Some("provider-old")
+        );
+        assert!(observations.evidence_deadline.is_some());
+        drop(observations);
+
+        // Enabling the successor changes the runtime metadata, not the snapshot's producer.
+        // Even a delayed write by the predecessor belongs to its original runtime.
+        st_drivers::harness_events::enable(root.path(), "runtime-new").unwrap();
+        st_drivers::harness_state::Writer::new(
+            root.path(),
+            "example/seat",
+            "claude",
+            Some("pty".into()),
+        )
+        .with_ownership("provider-old", seq)
+        .observe(st_drivers::harness_state::Observation::new(
+            st_drivers::harness_state::Activity::Active,
+            st_drivers::harness_state::BlockedOn::None,
+            st_drivers::harness_state::InputBuffer::Unknown,
+        ))
+        .unwrap();
+        let observations = NativeObservations::start(root.path(), "runtime-new").unwrap();
+        assert_eq!(observations.provider_incarnation, None);
+        assert_eq!(observations.evidence_deadline, None);
+        drop(observations);
+        assert!(
+            st_drivers::harness_events::read_snapshot(root.path(), "harness-state")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            st_drivers::harness_events::pending(root.path(), 100).unwrap()[0].runtime_incarnation,
+            "runtime-old"
+        );
+
+        st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-new")
+            .unwrap();
+        let observations = NativeObservations::start(root.path(), "runtime-new").unwrap();
+        assert_eq!(
+            observations.provider_incarnation.as_deref(),
+            Some("provider-new")
+        );
+        assert!(observations.evidence_deadline.is_some());
+    }
+
     #[tokio::test]
     async fn reading_the_outbox_does_not_wake_an_idle_driver() {
         let root = tempfile::tempdir().unwrap();
