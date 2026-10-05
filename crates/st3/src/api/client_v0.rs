@@ -9480,7 +9480,7 @@ mod tests {
         };
         let appeared = tokio::time::timeout(Duration::from_secs(4), focused).await.unwrap();
         assert_eq!(appeared["upserts"][0]["subagents"][0]["id"], "leased-child");
-        let expired = tokio::time::timeout(Duration::from_secs(8), async {
+        let expired = tokio::time::timeout(ATTENTION_CLOCK_INTERVAL + Duration::from_secs(8), async {
             loop {
                 let frame = socket.next().await.unwrap().unwrap();
                 let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
