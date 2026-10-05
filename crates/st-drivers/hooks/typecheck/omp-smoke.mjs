@@ -79,10 +79,12 @@ process.env.ST_OMP_CHANNEL_SESSION = "smoke-session";
 process.env.ST_OMP_CHANNEL_SEQ = "1";
 
 const mod = await import(process.argv[2] ?? "./smoke-out/omp-channel.mjs");
+const isStOmp = process.argv[2]?.includes("st-omp")
+  || process.argv[2]?.endsWith("/crates/st3/hooks/omp-channel.ts");
 assert.strictEqual(typeof mod.default, "function", "extension exports its entry point");
 
 const expectedState = state => ({ type: "state", state,
-  ...(process.argv[2]?.includes("st-omp") ? { backgroundJobs: null } : {}),
+  ...(isStOmp ? { backgroundJobs: null } : {}),
 });
 const handlers = new Map();
 // Every message the extension hands to omp, with the options it chose.
@@ -205,6 +207,13 @@ assert.deepStrictEqual(askStates, [
     reason: "Which deployment target?",
   },
 ]);
+if (isStOmp) {
+  await handlers.get("tool_execution_start")({ toolName: "ask", toolCallId: "ask-1" }, activeCtx);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(readFrames().filter((frame) => frame.type === "state").at(-1).activeAsk, "ask-1");
+  await handlers.get("tool_result")({ toolCallId: "unrelated" }, activeCtx);
+  assert.equal(readFrames().filter((frame) => frame.type === "state").at(-1).activeAsk, "ask-1");
+}
 await handlers.get("tool_result")({ toolName: "ask", toolCallId: "ask-1" }, activeCtx);
 await new Promise((resolve) => setTimeout(resolve, 50));
 askStates = readFrames().filter((frame) => frame.type === "state").slice(beforeAsk);
@@ -486,11 +495,15 @@ for (const modal of ["ask", "approval"]) {
     readyBeforeModalReconnect + 1, "the modal's replacement channel completes its hello");
   await pause(250);
   assert.notStrictEqual(Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1)), modalPid);
-  assert.deepStrictEqual(
-    readFrames().filter((frame) => frame.type === "state").slice(beforeModalReconnect),
-    [],
-    `${modal} reconnect must not fabricate idle while waiting for the operator`,
-  );
+  const reconnectStates = readFrames().filter((frame) => frame.type === "state").slice(beforeModalReconnect);
+  if (modal === "ask" && isStOmp) {
+    assert.deepStrictEqual(reconnectStates, [{
+      ...expectedState("active"), blockedOn: "human", ask: "question",
+    }], "cached tool_call is not live picker confirmation");
+  } else {
+    assert.deepStrictEqual(reconnectStates, [],
+      `${modal} reconnect must not fabricate idle while waiting for the operator`);
+  }
   if (modal === "ask") {
     await handlers.get("tool_result")({ toolCallId: "ask-reconnect" }, bareCtx);
   } else {
@@ -561,7 +574,7 @@ await handlers.get("agent_end")(successfulEnd, mainCtx);
 fs.rmSync(outboxPath, { force: true });
 
 // st3's dedicated todo observation is deliberately absent from the legacy st2 asset.
-if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo")) {
+if (isStOmp || process.argv.includes("--todo")) {
   const totals = (pending = 0, in_progress = 0, completed = 0, blocked = 0, abandoned = 0) =>
     ({ pending, in_progress, completed, blocked, abandoned });
   const todos = () => readFrames().filter((frame) => frame.type === "todo");
@@ -750,8 +763,164 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
   await handlers.get("session_shutdown")({}, todoCtx);
 }
 
+// Exercise the shipped st3 hook through native event callbacks and the UI promise it observes.
+// The recorder is the consumer boundary: no private state or test-only hook API is inspected.
+if (isStOmp) {
+  const states = () => readFrames().filter(frame => frame.type === "state");
+  const waitFor = async (predicate, message) => {
+    const deadline = Date.now() + 5000;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, message);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  };
+  let finishPicker;
+  let failPicker;
+  const pickerCtx = {
+    ...activeCtx,
+    ui: {
+      notify: () => {},
+      askDialog: () => new Promise((resolve, reject) => {
+        finishPicker = resolve;
+        failPicker = reject;
+      }),
+    },
+  };
+  const askEvent = toolCallId => ({
+    toolName: "ask", toolCallId,
+    input: { questions: [{ id: "target", question: "Which target?", options: [] }] },
+  });
+  const emitState = async (callback, event = {}, ctx = pickerCtx) => {
+    const before = states().length;
+    await handlers.get(callback)(event, ctx);
+    await waitFor(() => states().length > before, `${callback} must publish a state`);
+    return states().at(-1);
+  };
+  const assertCleared = (frame, message) => {
+    assert.strictEqual(Object.hasOwn(frame, "activeAsk"), false, message);
+    assert.strictEqual(Object.hasOwn(frame, "blockedOn"), false, message);
+  };
+  const reconnect = async () => {
+    const before = readFrames().length;
+    const pid = Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1));
+    process.kill(pid, "SIGKILL");
+    await waitFor(() => {
+      const fresh = readFrames().slice(before);
+      return fresh.some(frame => frame.type === "ready")
+        && fresh.some(frame => frame.type === "state");
+    }, "a replacement channel must publish readiness and current state");
+    return readFrames().slice(before).filter(frame => frame.type === "state");
+  };
+  await handlers.get("session_start")({}, pickerCtx);
+
+  for (const outcome of ["answer", "cancel", "timeout"]) {
+    const id = `picker-${outcome}`;
+    const announced = await emitState("tool_call", askEvent(id));
+    assert.strictEqual(Object.hasOwn(announced, "activeAsk"), false,
+      "announcing an ask does not authorize a native identity");
+    const picker = pickerCtx.ui.askDialog();
+    const beforeExecution = await emitState("agent_start");
+    assert.strictEqual(Object.hasOwn(beforeExecution, "activeAsk"), false,
+      "opening a native dialog alone does not authorize its identity");
+    const started = await emitState("tool_execution_start", askEvent(id));
+    assert.strictEqual(started.activeAsk, id);
+    assert.strictEqual(started.blockedOn, "human");
+    if (outcome === "answer") {
+      const fresh = await reconnect();
+      assert.ok(fresh.every(frame => frame.activeAsk === id),
+        "same-session reconnect preserves the still-live native picker");
+    }
+    const beforeFinish = states().length;
+    if (outcome === "timeout") {
+      const rejected = assert.rejects(picker, /native picker timeout/);
+      failPicker(new Error("native picker timeout"));
+      await rejected;
+    } else {
+      const result = outcome === "answer" ? { answers: { target: "production" } } : undefined;
+      finishPicker(result);
+      assert.strictEqual(await picker, result, "the hook preserves native picker results");
+    }
+    await waitFor(() => states().length > beforeFinish, `${outcome} must clear the live ask`);
+    assertCleared(states().at(-1), `${outcome} clears identity and human blocking`);
+    const fresh = await reconnect();
+    assert.ok(fresh.every(frame => !Object.hasOwn(frame, "activeAsk")),
+      `${outcome} must not resurrect an identity on reconnect`);
+  }
+
+  for (const terminal of ["tool_execution_end", "tool_result"]) {
+    const id = `picker-${terminal}`;
+    await emitState("tool_call", askEvent(id));
+    const picker = pickerCtx.ui.askDialog();
+    await emitState("tool_execution_start", askEvent(id));
+    await handlers.get(terminal)(askEvent("unrelated"), pickerCtx);
+    const unchanged = await emitState("agent_start");
+    assert.strictEqual(unchanged.activeAsk, id, "an unrelated terminal event cannot clear the ask");
+    const ended = await emitState(terminal, askEvent(id));
+    assertCleared(ended, `${terminal} clears the matching ask before its UI promise settles`);
+    finishPicker(undefined);
+    await picker;
+  }
+
+  // Native execution may be seen without a live UI promise. Cached frames cannot reauthorize it.
+  await emitState("tool_execution_start", askEvent("no-native-picker"));
+  assert.ok((await reconnect()).every(frame => !Object.hasOwn(frame, "activeAsk")),
+    "reconnect without a live picker must discard a cached identity");
+  await emitState("tool_result", askEvent("no-native-picker"));
+  const historicalCtx = {
+    ...pickerCtx,
+    sessionManager: {
+      ...fullCtx.sessionManager,
+      getEntries: () => [
+        { type: "message", message: { role: "assistant", content: [
+          { type: "toolCall", id: "historical-ask", name: "ask", arguments: askEvent("historical-ask").input },
+        ] } },
+        { type: "message", message: { role: "toolResult", toolCallId: "historical-ask", toolName: "ask",
+          content: [{ type: "text", text: "Answered" }] } },
+      ],
+    },
+  };
+  await handlers.get("session_start")({}, historicalCtx);
+  const historical = await emitState("agent_start", {}, historicalCtx);
+  assertCleared(historical, "answered transcript history is not a native picker");
+  assert.ok((await reconnect()).every(frame => !Object.hasOwn(frame, "activeAsk")),
+    "historical transcript cannot authorize an identity after reconnect");
+  const unansweredCtx = {
+    ...historicalCtx,
+    sessionManager: {
+      ...historicalCtx.sessionManager,
+      getEntries: () => historicalCtx.sessionManager.getEntries().slice(0, 1),
+    },
+  };
+  await handlers.get("session_start")({}, unansweredCtx);
+  assertCleared(await emitState("agent_start", {}, unansweredCtx),
+    "an unanswered historical tool call without a native picker is not live");
+  assert.ok((await reconnect()).every(frame => !Object.hasOwn(frame, "activeAsk")),
+    "unanswered transcript history cannot resurrect an identity on reconnect");
+
+  for (const id of ["", " ", "   ", "\t", "bad\nid", "bad\n", "bad\r", "bad\u0000id", "bad\u007fid", "café", "🦀", "a".repeat(257)]) {
+    const beforeInvalid = states().length;
+    await handlers.get("tool_execution_start")(askEvent(id), historicalCtx);
+    await emitState("agent_start", {}, historicalCtx);
+    assert.ok(states().slice(beforeInvalid).every(frame => !Object.hasOwn(frame, "activeAsk")),
+      `untrusted identity ${JSON.stringify(id)} must never reach consumers`);
+  }
+  for (const id of ["a".repeat(256), " !~ "]) {
+    const started = await emitState("tool_execution_start", askEvent(id), historicalCtx);
+    assert.strictEqual(started.activeAsk, id, "valid boundary identities are preserved exactly");
+    await emitState("tool_result", askEvent(id), historicalCtx);
+  }
+  await emitState("tool_call", askEvent("shutdown-picker"), historicalCtx);
+  const shutdownPicker = pickerCtx.ui.askDialog();
+  await emitState("tool_execution_start", askEvent("shutdown-picker"), historicalCtx);
+  const shutdown = await emitState("session_shutdown", {}, historicalCtx);
+  assert.strictEqual(shutdown.state, "ended", "shutdown publishes a new ended frame");
+  assertCleared(shutdown, "shutdown withdraws the active native ask before closing the channel");
+  finishPicker(undefined);
+  await shutdownPicker;
+}
+
 // An idle model turn does not prove that the native session owns no jobs.
-if (process.argv[2]?.includes("st-omp")) {
+if (isStOmp) {
   let jobs = [{ id: "bg-fixture" }];
   const jobCtx = { ...fullCtx, getAsyncJobSnapshot: () => ({ running: jobs }) };
   await handlers.get("session_start")({}, jobCtx);
@@ -768,17 +937,7 @@ if (process.argv[2]?.includes("st-omp")) {
   await handlers.get("session_shutdown")({}, unknownCtx);
 }
 
-// `session_shutdown` has no reason field upstream and always denotes process exit. Closing must
-// make a later observational frame a no-op.
-const beforeShutdown = readFrames().filter((frame) => frame.type === "state").length;
 await handlers.get("session_shutdown")({}, fullCtx);
-await handlers.get("agent_start")({}, fullCtx);
-await new Promise((resolve) => setTimeout(resolve, 50));
-assert.strictEqual(
-  readFrames().filter((frame) => frame.type === "state").length,
-  beforeShutdown,
-  "shutdown without a reason closes the channel",
-);
 
 // Give the recorder a moment to drain, then assert the wire the Rust decoder reads.
 await new Promise((resolve) => setTimeout(resolve, 500));

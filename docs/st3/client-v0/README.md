@@ -64,6 +64,15 @@ activity makes the canonical agent `state: "waiting"`; clients present that comb
 a person. It takes precedence over working or idle, not over a terminal runtime, an ended/failed or
 indeterminate harness, a reconcile fault, or an observation fenced out by the current incarnation.
 `ask` names the structured question, permission, or review, not text inferred from the terminal.
+`active_ask` optionally identifies the last reported native OMP `toolCallId`
+confirmed live in the current incarnation. It is a nullable string of at most
+256 printable ASCII bytes (not empty or whitespace-only), distinct from the kind
+in `ask` and the diagnostic `reason`. Older daemons omit it. A missing or null
+identifier must not be replaced with a historical transcript call: the projection
+reads only the latest current-incarnation observation, without sparse backfill.
+Answer, cancel, timeout, exit, and incarnation changes clear it; reconnect requires
+native confirmation before exposing it again. A channel outage retains the last
+reported identity until a fresh observation; concurrent asks collapse to one identity.
 
 The omp extension correlates an ask with its tool-call ID. Unrelated results leave it blocked; the
 matching answer emits a new unblocked activity frame. The pi-family channel retains all three axes

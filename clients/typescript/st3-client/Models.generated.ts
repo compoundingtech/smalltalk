@@ -28,6 +28,7 @@ export type ActionResult = {
 export type ActorRef = string;
 
 export type Agent = ResourceHeader & {
+  active_ask?: string | null;
   active_work_count?: number;
   ask?: string | null;
   blocked_on?: string | null;

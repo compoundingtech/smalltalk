@@ -20126,6 +20126,7 @@ fn update_prompt_fence(
         reason: text("reason"),
         blocked_on: Some("human".into()),
         ask: None,
+        active_ask: None,
         input_buffer: None,
         exit: None,
         claim,
@@ -20185,6 +20186,7 @@ fn claude_attachment_fence(
         reason: Some("claude-channel-unattached".into()),
         blocked_on: Some("channel".into()),
         ask: None,
+        active_ask: None,
         input_buffer: None,
         exit: None,
         claim,
@@ -20246,6 +20248,7 @@ fn current_harness_fold_at(
             reason: Some(reason),
             blocked_on: None,
             ask: None,
+            active_ask: None,
             input_buffer: None,
             exit: None,
             claim,
@@ -20285,6 +20288,7 @@ fn current_harness_fold_at(
                 reason: Some("providerAuth".into()),
                 blocked_on: Some("human".into()),
                 ask: None,
+                active_ask: None,
                 input_buffer: None,
                 exit: None,
                 claim,
@@ -20341,6 +20345,7 @@ fn current_harness_fold_at(
             reason: Some(reason.into()),
             blocked_on: Some("human".into()),
             ask: None,
+            active_ask: None,
             input_buffer: None,
             exit: None,
             claim,
@@ -20377,6 +20382,7 @@ fn current_harness_fold_at(
     let mut named = statement.query_map(params![subject, at_index, incarnation_id], row)?;
     let mut next_named = None;
     let mut current = None;
+    let mut active_ask = None;
     let mut optional = BTreeMap::<&'static str, Option<String>>::new();
     loop {
         if next_named.is_none() {
@@ -20413,6 +20419,13 @@ fn current_harness_fold_at(
             && let Some(state) = fields.get("state").and_then(Value::as_str)
         {
             current = Some((state.to_owned(), claim, observed_at_unix_ms, key));
+            // Ask identity is a complete live snapshot, never a sparse historical axis.
+            // Absence in an older producer clears it rather than inheriting a prior picker.
+            if state == "working" && fields["driver"] == "omp"
+                && fields["blocked_on"] == "human" && fields["ask"] == "question"
+            {
+                active_ask = fields["active_ask"].as_str().map(str::to_owned);
+            }
         }
         for name in [
             "driver",
@@ -20476,6 +20489,7 @@ fn current_harness_fold_at(
             reason: None,
             blocked_on: None,
             ask: None,
+            active_ask: None,
             input_buffer: None,
             exit: None,
             claim,
@@ -20494,6 +20508,7 @@ fn current_harness_fold_at(
             state = "needs-login".into();
         }
     }
+    let active_ask = if state == "working" { active_ask } else { None };
     Ok(Some(crate::model::CurrentHarnessView {
         state,
         driver: optional.remove("driver").flatten(),
@@ -20502,6 +20517,7 @@ fn current_harness_fold_at(
         reason: optional.remove("reason").flatten(),
         blocked_on: optional.remove("blocked_on").flatten(),
         ask: optional.remove("ask").flatten(),
+        active_ask,
         input_buffer: optional.remove("input_buffer").flatten(),
         exit: optional.remove("exit").flatten(),
         claim,
@@ -23165,6 +23181,84 @@ mod fleet_admission_tests {
                 .revision,
             run.revision
         );
+    }
+
+    #[test]
+    fn mixed_builds_project_no_ask_observations_around_an_unknown_live_ask() {
+        let anchor_key = key();
+        let older_key = key();
+        let current = node("current", Some(&anchor_key), Some(&anchor_key));
+        admit(&current, "current", &anchor_key, "anchor", None);
+        admit(&current, "older", &older_key, "invite", None);
+        let older = node("older", Some(&older_key), Some(&anchor_key));
+        let mut registry = st3_schema::registry().clone();
+        registry.claims.get_mut("harness.observed").unwrap().fields.remove("active_ask").unwrap();
+        older.set_claim_registry(registry);
+        sync(&current, &older);
+
+        let subject = "agent/example/worker";
+        append(&current, "runtime.observed", subject, json!({
+            "status": "running", "runtime_id": "agent.example.worker",
+            "incarnation_id": "worker-one",
+        }));
+        let idle = append(&current, "harness.observed", subject, json!({
+            "state": "idle", "driver": "omp", "incarnation_id": "worker-one",
+        }));
+        let admission = sync(&current, &older);
+        assert_eq!(admission.invalid, 0);
+        assert_eq!(admission.unknown, 0);
+        assert!(admitted(&older, &idle));
+        assert_eq!(older.current_harness(subject).unwrap().unwrap().state, "idle");
+
+        let live = append(&current, "harness.observed", subject, json!({
+            "state": "working", "driver": "omp", "incarnation_id": "worker-one",
+            "blocked_on": "human", "ask": "question", "active_ask": "native-ask",
+        }));
+        let admission = sync(&current, &older);
+        assert_eq!(admission.invalid, 0);
+        assert_eq!(admission.unknown, 1);
+        assert!(!admitted(&older, &live));
+        assert_eq!(older.current_harness(subject).unwrap().unwrap().state, "idle");
+        assert_eq!(
+            current.current_harness(subject).unwrap().unwrap().active_ask.as_deref(),
+            Some("native-ask")
+        );
+
+        for id in ["x".repeat(257), "ask\nid".into(), "ask\u{7f}".into(), "aské".into()] {
+            let error = current.append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(json!({
+                    "state": "working", "driver": "omp", "incarnation_id": "worker-one",
+                    "blocked_on": "human", "ask": "question", "active_ask": id,
+                })).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap_err();
+            assert_eq!(error.code, "invalid-claim-field");
+            assert_eq!(
+                current.current_harness(subject).unwrap().unwrap().active_ask.as_deref(),
+                Some("native-ask")
+            );
+        }
+
+        let ready = append(&current, "harness.observed", subject, json!({
+            "state": "ready", "driver": "omp", "incarnation_id": "worker-one",
+            "blocked_on": null, "ask": null,
+        }));
+        let admission = sync(&current, &older);
+        assert_eq!(admission.invalid, 0);
+        assert!(admitted(&older, &ready));
+        for reader in [&current, &older] {
+            let harness = reader.current_harness(subject).unwrap().unwrap();
+            assert_eq!(harness.state, "ready");
+            assert_eq!(harness.active_ask, None);
+        }
+        let status = older.replication_status(true, Some(FLEET), &[]).unwrap();
+        assert_eq!(status.unknown_records, 1);
+        assert_eq!(status.invalid_records, 0);
     }
 
     #[test]

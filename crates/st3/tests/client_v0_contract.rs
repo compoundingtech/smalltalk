@@ -314,6 +314,30 @@ fn resource_fields_and_generation_map_keys_enforce_family_references() {
     }
 }
 
+#[test]
+fn agent_contract_bounds_active_ask_identifiers_without_requiring_them() {
+    let resources = fixture("resources.json");
+    let mut agent = resources
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| value["kind"] == "agent")
+        .unwrap()
+        .clone();
+    let validator = consumer_validator("Agent");
+    agent.as_object_mut().unwrap().remove("active_ask");
+    assert_conforms(&validator, "absent active ask", &agent);
+    for id in [Value::Null, Value::String("x".repeat(256)), Value::String(" !~ ".into())] {
+        agent["active_ask"] = id;
+        assert_conforms(&validator, "valid active ask", &agent);
+    }
+    for id in ["".into(), " ".into(), "x".repeat(257), "ask\n".into(), "ask\r".into(),
+        "ask\u{7f}".into(), "aské".into()] {
+        agent["active_ask"] = Value::String(id);
+        assert!(!validator.is_valid(&agent), "invalid active ask accepted: {}", agent["active_ask"]);
+    }
+}
+
 #[tokio::test]
 async fn outbound_rust_collection_commands_conform_with_none_options() {
     use axum::extract::ws::WebSocketUpgrade;

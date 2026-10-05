@@ -18348,6 +18348,11 @@ async fn publish_harness_activity(
                 .unwrap_or(Value::Null),
         ),
     ]);
+    if driver == "omp"
+        && let Some(id) = &observed.active_ask
+    {
+        fields.insert("active_ask".into(), Value::String(id.clone()));
+    }
     if let Some(incarnation) = incarnation {
         fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
     }
@@ -19655,6 +19660,7 @@ impl PiChannelResume {
                         self.first_idle_seen = true;
                         "idle"
                     }
+                    "ended" => "ended",
                     _ => return false,
                 };
                 self.frame_sequence = self.frame_sequence.saturating_add(1);
@@ -19667,6 +19673,21 @@ impl PiChannelResume {
                     .map(str::to_owned);
                 self.pending.ask = if self.pending.blocked_on.is_some() {
                     frame.get("ask").and_then(Value::as_str).map(str::to_owned)
+                } else {
+                    None
+                };
+                self.pending.active_ask = if status == "working"
+                    && self.pending.ask.as_deref() == Some("question")
+                {
+                    frame
+                        .get("activeAsk")
+                        .and_then(Value::as_str)
+                        .filter(|id| {
+                            id.len() <= 256
+                                && !id.trim().is_empty()
+                                && id.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+                        })
+                        .map(str::to_owned)
                 } else {
                     None
                 };
@@ -19773,6 +19794,8 @@ struct PiFamilyReports {
     #[serde(default)]
     ask: Option<String>,
     #[serde(default)]
+    active_ask: Option<String>,
+    #[serde(default)]
     reason: Option<String>,
     acknowledgements: BTreeSet<String>,
     #[serde(default)]
@@ -19801,36 +19824,44 @@ impl PiFamilyReports {
                         subject: subject.into(),
                         kind: "harness.observed".into(),
                         actor: Some(subject.into()),
-                        fields: with_quiescence(BTreeMap::from([
-                            ("state".into(), Value::String(status)),
-                            ("driver".into(), Value::String(driver.into())),
-                            (
-                                "transport".into(),
-                                Value::String(format!("{driver}-channel")),
-                            ),
-                            ("incarnation_id".into(), Value::String(incarnation.into())),
-                            (
-                                "blocked_on".into(),
-                                self.blocked_on
-                                    .clone()
-                                    .map(Value::String)
-                                    .unwrap_or(Value::Null),
-                            ),
-                            (
-                                "ask".into(),
-                                self.ask.clone().map(Value::String).unwrap_or(Value::Null),
-                            ),
-                            (
-                                "reason".into(),
-                                self.reason
-                                    .clone()
-                                    .map(Value::String)
-                                    .unwrap_or(Value::Null),
-                            ),
-                            ("background_jobs".into(), self.background_jobs.map(Value::from).unwrap_or(Value::Null)),
-                            ("input_buffer".into(), Value::Null),
-                            ("exit".into(), Value::Null),
-                        ])),
+                        fields: {
+                            let mut fields = with_quiescence(BTreeMap::from([
+                                ("state".into(), Value::String(status)),
+                                ("driver".into(), Value::String(driver.into())),
+                                (
+                                    "transport".into(),
+                                    Value::String(format!("{driver}-channel")),
+                                ),
+                                ("incarnation_id".into(), Value::String(incarnation.into())),
+                                (
+                                    "blocked_on".into(),
+                                    self.blocked_on
+                                        .clone()
+                                        .map(Value::String)
+                                        .unwrap_or(Value::Null),
+                                ),
+                                (
+                                    "ask".into(),
+                                    self.ask.clone().map(Value::String).unwrap_or(Value::Null),
+                                ),
+                                (
+                                    "reason".into(),
+                                    self.reason
+                                        .clone()
+                                        .map(Value::String)
+                                        .unwrap_or(Value::Null),
+                                ),
+                                ("background_jobs".into(), self.background_jobs.map(Value::from).unwrap_or(Value::Null)),
+                                ("input_buffer".into(), Value::Null),
+                                ("exit".into(), Value::Null),
+                            ]));
+                            if driver == "omp"
+                                && let Some(id) = &self.active_ask
+                            {
+                                fields.insert("active_ask".into(), Value::String(id.clone()));
+                            }
+                            fields
+                        },
                         evidence: Vec::new(),
                         expected_subject: None,
                         idempotency_key: Some(format!(
@@ -23415,6 +23446,47 @@ mod tests {
             );
             assert!(!root.path().join("resources").exists());
             server.abort();
+        }
+    }
+
+    #[test]
+    fn active_ask_is_a_complete_current_frame_not_a_sparse_transcript_hint() {
+        let mut state = PiChannelResume::default();
+        assert!(state.accept_frame(
+            r#"{"type":"state","state":"active","blockedOn":"human","ask":"question","activeAsk":"native-ask"}"#,
+        ));
+        assert_eq!(state.pending.active_ask.as_deref(), Some("native-ask"));
+        assert!(state.accept_frame(
+            r#"{"type":"state","state":"active","blockedOn":"human","ask":"question"}"#,
+        ));
+        assert_eq!(state.pending.active_ask, None);
+        assert!(state.accept_frame(
+            r#"{"type":"state","state":"active","blockedOn":"human","ask":"question","activeAsk":"native-ask"}"#,
+        ));
+        assert!(state.accept_frame(r#"{"type":"state","state":"idle","activeAsk":"stale"}"#));
+        assert_eq!(state.pending.active_ask, None);
+    }
+
+    #[test]
+    fn active_ask_accepts_only_bounded_printable_native_ids() {
+        let mut state = PiChannelResume::default();
+        for id in ["x".repeat(256), " !~ ".into()] {
+            let frame = json!({
+                "type": "state", "state": "active", "blockedOn": "human",
+                "ask": "question", "activeAsk": id,
+            });
+            assert!(state.accept_frame(&frame.to_string()));
+            assert_eq!(state.pending.active_ask.as_deref(), frame["activeAsk"].as_str());
+        }
+        for id in ["x".repeat(257), String::new(), "   ".into(), "\t".into(),
+            "ask\nid".into(), "ask\u{7f}".into(), "aské".into()]
+        {
+            let frame = json!({
+                "type": "state", "state": "active", "blockedOn": "human",
+                "ask": "question", "activeAsk": id,
+            });
+            assert!(state.accept_frame(&frame.to_string()));
+            assert_eq!(state.pending.active_ask, None);
         }
     }
     #[test]

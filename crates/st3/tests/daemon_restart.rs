@@ -1219,6 +1219,69 @@ async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_active_ask_observations_clear_and_fence_the_previous_incarnation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    use sha2::Digest as _;
+    use st_drivers::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let seat = "agent/native-ask";
+    let incarnation = "native-ask-one";
+    let mut daemon = Daemon::new(root);
+    let source = "version 2\nagent \"native-ask\" { workspace \"/tmp\"; harness \"omp\" {} }\n";
+    let intent = st3::parse_intent(source, "restart-node").unwrap();
+    let plan = daemon.store.mission(&intent, st3::model::IntentInput {
+        kdl: source.into(),
+        source_name: None,
+    }).unwrap();
+    daemon.store.apply(&intent, &plan.subject_tokens, "native-ask-source").unwrap();
+    daemon.observe_running(seat, incarnation);
+    daemon.start_with_binding(true).await;
+    let channel = seat_command(root, &daemon.socket)
+        .env("ST_AGENT", seat)
+        .arg("--catalog").arg(root.join("catalog"))
+        .args(["driver", "omp-channel", "--identity", "native-ask"])
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    let dir = root.join("catalog/.st3-channel-outbox")
+        .join(hex::encode(sha2::Sha256::digest(seat.as_bytes())))
+        .join(hex::encode(sha2::Sha256::digest(incarnation.as_bytes())));
+    wait_until("the native ask drain binds its spool", Duration::from_secs(10), || {
+        st_drivers::harness_events::enabled(&dir)
+            && dir.join(st_drivers::harness_events::WAKE_PIPE).exists()
+    }).await;
+    let sequence = st_drivers::harness_state::claim(&dir, "native-ask", "omp", "native-producer").unwrap();
+    let mut writer = Writer::new(&dir, "native-ask", "omp", Some("native-ask".into()))
+        .with_ownership("native-producer", sequence);
+    let mut question = Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
+        .with_ask(Ask::Question);
+    question.active_ask = Some("native-tool-call".into());
+    writer.observe(question).unwrap();
+    wait_until("the native snapshot publishes its current ask", Duration::from_secs(10), || {
+        daemon.store.claims_for(seat, Some("harness.observed")).unwrap_or_default().iter()
+            .any(|claim| claim.body["fields"]["active_ask"] == "native-tool-call"
+                && claim.body["fields"]["incarnation_id"] == incarnation)
+    }).await;
+    writer.ended("exit 0").unwrap();
+    wait_until("native exit explicitly clears the ask", Duration::from_secs(10), || {
+        daemon.store.claims_for(seat, Some("harness.observed")).unwrap_or_default().iter()
+            .any(|claim| claim.body["fields"]["state"] == "ended"
+                && claim.body["fields"]["exit"] == "exit 0"
+                && claim.body["fields"]["incarnation_id"] == incarnation
+                && claim.body["fields"].get("active_ask").is_none())
+    }).await;
+    daemon.observe_running(seat, "native-ask-two");
+    let client = st3::client::Client::unix(&daemon.socket);
+    let status: st3::model::StatusResponse =
+        client.get(&format!("/v1/status?subject={seat}")).await.unwrap();
+    let current = status.subjects.into_iter().find(|status| status.subject == seat).unwrap();
+    assert!(current.harness.is_none(), "a successor must not inherit a predecessor's native ask");
+    assert!(stop(channel).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_omp_ask_clears_without_poisoning_the_next_incarnation() {
     if st3::test_support::supervise_test() {
         return;
@@ -1251,6 +1314,7 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
     writeln!(input, "{}", json!({
         "type": "state", "state": "active", "blockedOn": "human",
         "ask": "question", "reason": "Which deployment target?",
+        "activeAsk": "ask-1",
     })).unwrap();
     input.flush().unwrap();
     wait_until("the channel publishes the ask", Duration::from_secs(10), || {
@@ -1264,6 +1328,7 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
     assert_eq!(blocked.blocked_on.as_deref(), Some("human"));
     assert_eq!(blocked.ask.as_deref(), Some("question"));
     assert_eq!(blocked.reason.as_deref(), Some("Which deployment target?"));
+    assert_eq!(blocked.active_ask.as_deref(), Some("ask-1"));
 
     // These are the producer's frames after the matching ask result. The producer's smoke
     // scenario proves that an unrelated result emits only timeline data, never this state.
@@ -1283,6 +1348,12 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
     assert!(answered.blocked_on.is_none());
     assert!(answered.ask.is_none());
     assert!(answered.reason.is_none());
+    assert!(answered.active_ask.is_none());
+    assert!(daemon.store.claims_for(seat, Some("harness.observed")).unwrap().iter()
+        .any(|claim| claim.body["fields"]["incarnation_id"] == incarnation
+            && claim.body["fields"]["state"] == "working"
+            && claim.body["fields"]["ask"].is_null()
+            && claim.body["fields"].get("active_ask").is_none()));
     assert!(stop(channel).is_empty());
 
     // A delayed ask from the old channel must not block a resumed runtime's fresh idle proof.
@@ -1290,10 +1361,12 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
     daemon.append(seat, "harness.observed", json!({
         "state": "idle", "driver": "omp", "incarnation_id": "human-2",
         "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
+        "active_ask": null,
     }));
     daemon.append(seat, "harness.observed", json!({
         "state": "working", "driver": "omp", "incarnation_id": incarnation,
         "blocked_on": "human", "ask": "question", "reason": "An obsolete question",
+        "active_ask": "obsolete-ask",
     }));
     let status: st3::model::StatusResponse =
         client.get(&format!("/v1/status?subject={seat}")).await.unwrap();
@@ -1304,6 +1377,7 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
     assert!(resumed.blocked_on.is_none());
     assert!(resumed.ask.is_none());
     assert!(resumed.reason.is_none());
+    assert!(resumed.active_ask.is_none());
 }
 
 #[test]

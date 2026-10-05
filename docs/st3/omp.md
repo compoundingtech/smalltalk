@@ -46,6 +46,39 @@ It keeps sampling through slow final unwind rather than abandoning the idle edge
 timeout. New activity, session replacement, or channel replacement retires the old sampler;
 an outstanding human ask or approval keeps its blocking observation, including on reconnect.
 
+The optional `harness.observed.active_ask` is the last reported native `ask`
+execution-start `toolCallId` for the current incarnation. Publishers omit it when
+no live ask is confirmed. A pre-execution call or an unresolved transcript entry
+is not a live picker. Matching completion (answer, cancellation or timeout), exit
+and incarnation replacement clear it. `reason` remains diagnostic, not ask identity.
+On channel reconnect, cached frames do not prove a live ask. The shared native UI's
+still-unsettled `askDialog` promise must re-confirm the same ask and native session.
+Without that native confirmation the identifier is withheld. If the channel drops
+while a picker is answered, its last reported identity remains until reconnect
+publishes a fresh observation. Concurrent asks collapse to one identity.
+On native `session_shutdown`, the hook sends an `ended` state frame before closing
+the channel, clearing the reported ask as well as marking harness exit.
+
+The required `typescript-client` CI job exercises the shipped hook with the existing
+OMP lifecycle smoke harness, including native identity set/clear, picker reconnect,
+historical transcripts without a picker, identifier bounds, and shutdown:
+
+```sh
+node --experimental-strip-types crates/st-drivers/hooks/typecheck/omp-smoke.mjs "$PWD/crates/st3/hooks/omp-channel.ts"
+```
+
+The standalone real-OMP probe drives the native picker in a disposable PTY with an
+isolated offline HOME, preserving real answer, cancellation, timeout and interruption
+records. It covers live start/completion, channel reconnect, shutdown and a hard-crash
+restart whose transcript still has an unresolved ask but whose new incarnation has no picker:
+
+```sh
+OMP_BIN=/path/to/raw/omp python3 crates/st3/fixtures/omp-resume/native-active-ask-probe.py
+```
+
+Use the raw pinned OMP executable, not a fleet launcher. The probe needs no provider
+credential, daemon or production seat. It exits nonzero on any failed lifecycle assertion.
+
 ## Channel telemetry
 
 The managed channel forwards `timeline` and `context` frames to the shared pi-family

@@ -642,6 +642,7 @@ fn state_observation(frame: &Value) -> Option<harness_state::Observation> {
     let state = match frame.get("state").and_then(Value::as_str)? {
         "active" => harness_state::Activity::Active,
         "idle" => harness_state::Activity::Idle,
+        "ended" => harness_state::Activity::Ended,
         _ => return None,
     };
     let blocked_on = match frame.get("blockedOn").and_then(Value::as_str) {
@@ -655,6 +656,17 @@ fn state_observation(frame: &Value) -> Option<harness_state::Observation> {
         && let Some(ask) = frame.get("ask").and_then(Value::as_str)
     {
         observation = observation.with_ask(parse_ask(ask));
+    }
+    if state == harness_state::Activity::Active && observation.ask == harness_state::Ask::Question {
+        observation.active_ask = frame
+            .get("activeAsk")
+            .and_then(Value::as_str)
+            .filter(|id| {
+                id.len() <= 256
+                    && !id.trim().is_empty()
+                    && id.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+            })
+            .map(str::to_owned);
     }
     if let Some(reason) = frame.get("reason").and_then(Value::as_str) {
         observation = observation.with_reason(reason);
@@ -1280,6 +1292,47 @@ mod tests {
         let plain = state_observation(&json!({"type":"state","state":"idle"})).unwrap();
         assert_eq!(plain.blocked_on, harness_state::BlockedOn::None);
         assert_eq!(plain.ask, harness_state::Ask::None);
+    }
+
+    #[test]
+    fn active_ask_requires_a_live_question_and_absence_clears_it() {
+        let live = json!({
+            "type":"state","state":"active","blockedOn":"human",
+            "ask":"question","activeAsk":"native-ask"
+        });
+        assert_eq!(state_observation(&live).unwrap().active_ask.as_deref(), Some("native-ask"));
+        for frame in [
+            json!({"type":"state","state":"idle","activeAsk":"stale"}),
+            json!({"type":"state","state":"active","activeAsk":"stale"}),
+            json!({"type":"state","state":"active","blockedOn":"human","ask":"permission","activeAsk":"stale"}),
+            json!({"type":"state","state":"active","blockedOn":"human","ask":"question"}),
+            json!({"type":"state","state":"active","blockedOn":"human","ask":"question","activeAsk":null}),
+        ] {
+            assert_eq!(state_observation(&frame).unwrap().active_ask, None);
+        }
+    }
+
+    #[test]
+    fn active_ask_accepts_only_bounded_printable_native_ids() {
+        for id in ["x".repeat(256), " !~ ".into()] {
+            let frame = json!({
+                "type": "state", "state": "active", "blockedOn": "human",
+                "ask": "question", "activeAsk": id,
+            });
+            assert_eq!(
+                state_observation(&frame).unwrap().active_ask.as_deref(),
+                frame["activeAsk"].as_str()
+            );
+        }
+        for id in ["x".repeat(257), String::new(), "   ".into(), "\t".into(),
+            "ask\nid".into(), "ask\u{7f}".into(), "aské".into()]
+        {
+            let frame = json!({
+                "type": "state", "state": "active", "blockedOn": "human",
+                "ask": "question", "activeAsk": id,
+            });
+            assert_eq!(state_observation(&frame).unwrap().active_ask, None);
+        }
     }
 
     /// A pre-compaction edge creates a last-resort checkpoint only for whitespace-only state. The
