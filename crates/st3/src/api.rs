@@ -1451,7 +1451,9 @@ where
     let (snapshot, items) = blocking_store(move || {
         reader.store.clone().read_snapshot(|index| {
             let snapshot = client_snapshot_at(&reader, index);
-            let items = read(&reader, &snapshot)?;
+            let items = reader
+                .store
+                .with_owned_set_snapshot_reads(|| read(&reader, &snapshot))?;
             Ok((snapshot, items))
         })
     })
@@ -2121,6 +2123,15 @@ fn client_agent_resources_selected(
         .collect::<BTreeMap<_, _>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
+    // Cards without a harness need only their actual claim's acceptance time, not its body.
+    // Keep the existing per-claim fallback if the bulk metadata read cannot be completed.
+    let actual_claim_times = store.claim_acceptance_times(
+        &status
+            .subjects
+            .iter()
+            .filter_map(|subject| subject.actual_claim.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let queued_steps = work_queues
         .values()
         .flat_map(|queue| {
@@ -2283,11 +2294,15 @@ fn client_agent_resources_selected(
                 .map(|harness| client_timestamp(harness.observed_at_unix_ms))
                 .or_else(|| {
                     subject.actual_claim.as_deref().and_then(|claim| {
-                        store
-                            .claim_by_id(claim)
-                            .ok()
-                            .flatten()
-                            .map(|claim| client_timestamp(claim.accepted_at_unix_ms))
+                        match &actual_claim_times {
+                            Ok(times) => times.get(claim).copied(),
+                            Err(_) => store
+                                .claim_by_id(claim)
+                                .ok()
+                                .flatten()
+                                .map(|claim| claim.accepted_at_unix_ms),
+                        }
+                        .map(client_timestamp)
                     })
                 })
                 .unwrap_or_default();

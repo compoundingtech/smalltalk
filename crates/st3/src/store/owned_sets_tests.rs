@@ -66,6 +66,69 @@ fn share(from: &Store, to: &Store) {
 }
 
 #[test]
+fn receipt_reuse_keeps_historical_bounds_and_ends_with_the_read_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let amber = Store::open(&directory.path().join("amber.sqlite3"), "amber").unwrap();
+    let cobalt = Store::open_memory("cobalt").unwrap();
+    let subject = "agent/garden/orchard";
+    apply(&amber, &bundle("first", false), 10);
+    let first_index = amber.index().unwrap();
+    let first = amber.selected_desired_token(subject).unwrap().unwrap();
+    apply(&amber, &bundle("second", false), 11);
+    let second = amber.selected_desired_token(subject).unwrap().unwrap();
+    apply(&cobalt, &bundle("other-store", false), 20);
+
+    amber
+        .read_snapshot(|index| {
+            amber.with_owned_set_snapshot_reads(|| {
+                let connection = amber.readers.get();
+                // Current and historical receipt reads must never borrow each other's results.
+                for _ in 0..2 {
+                    assert_eq!(amber.owned_sets().unwrap()[0].receipt.source.sequence, 11);
+                    assert_eq!(
+                        owned_sets::desired_at(&connection, subject, first_index)?
+                            .unwrap()
+                            .claim_id,
+                        first
+                    );
+                    assert_eq!(
+                        owned_sets::desired_at(&connection, subject, index)?
+                            .unwrap()
+                            .claim_id,
+                        second
+                    );
+                    assert_eq!(cobalt.owned_sets().unwrap()[0].receipt.source.sequence, 20);
+                }
+                // A new publication on another thread cannot tear the pinned read.
+                std::thread::scope(|scope| {
+                    scope.spawn(|| apply(&amber, &bundle("third", false), 12));
+                });
+                assert_eq!(amber.owned_sets().unwrap()[0].receipt.source.sequence, 11);
+                // A failed nested scope restores the enclosing read's receipt scope.
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        amber.with_owned_set_snapshot_reads(|| panic!("interrupted read"));
+                    }))
+                    .is_err()
+                );
+                assert_eq!(amber.owned_sets().unwrap()[0].receipt.source.sequence, 11);
+                Ok(())
+            })
+        })
+        .unwrap();
+    // Reusing a pooled connection on the next request must see the new graph authority.
+    amber
+        .read_snapshot(|_| {
+            amber.with_owned_set_snapshot_reads(|| {
+                assert_eq!(amber.owned_sets().unwrap()[0].receipt.source.sequence, 12);
+                Ok(())
+            })
+        })
+        .unwrap();
+    assert_eq!(amber.owned_sets().unwrap()[0].receipt.source.sequence, 12);
+}
+
+#[test]
 fn one_shot_set_retirement_is_fenced_to_the_member_and_its_runtime_host() {
     let amber = Store::open_memory("amber").unwrap();
     let cobalt = Store::open_memory("cobalt").unwrap();
