@@ -13854,10 +13854,19 @@ impl Store {
     where
         I: IntoIterator<Item = rusqlite::Result<(u64, String, String)>>,
     {
+        struct RollupSpend {
+            total: u64,
+            input: u64,
+            output: u64,
+            writes: u64,
+            reads: u64,
+            cost_microusd: Option<u64>,
+        }
+
         #[derive(Default)]
         struct Spend {
             cumulative: Option<CumulativeUsage>,
-            rollups: BTreeMap<String, (u64, u64, u64, u64, u64)>,
+            rollups: BTreeMap<String, RollupSpend>,
             response_total: u64,
             response_input: u64,
             response_output: u64,
@@ -13955,28 +13964,38 @@ impl Store {
                         .join("\0");
                     group.rollups.insert(
                         key,
-                        (
-                            fields
+                        RollupSpend {
+                            total: fields
                                 .get("total_tokens")
                                 .and_then(Value::as_u64)
                                 .unwrap_or(0),
-                            fields
+                            input: fields
                                 .get("input_tokens")
                                 .and_then(Value::as_u64)
                                 .unwrap_or(0),
-                            fields
+                            output: fields
                                 .get("output_tokens")
                                 .and_then(Value::as_u64)
                                 .unwrap_or(0),
-                            fields
+                            writes: fields
                                 .get("cache_write_tokens")
                                 .and_then(Value::as_u64)
                                 .unwrap_or(0),
-                            fields
+                            reads: fields
                                 .get("cached_tokens")
                                 .and_then(Value::as_u64)
                                 .unwrap_or(0),
-                        ),
+                            cost_microusd: fields
+                                .get("cost_microusd")
+                                .and_then(Value::as_u64)
+                                .filter(|_| {
+                                    fields
+                                        .get("unpriced_tokens")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0)
+                                        == 0
+                                }),
+                        },
                     );
                 }
                 Some("response") => {
@@ -14024,15 +14043,25 @@ impl Store {
         };
         let mut cost = 0.0;
         let mut has_cost = false;
+        let mut rollup_cost_microusd = 0_u128;
+        let mut unknown_rollup_cost = false;
         for group in spend.into_values() {
             summary.incarnation_count += 1;
             if !group.rollups.is_empty() {
-                for (total, input, output, writes, reads) in group.rollups.into_values() {
-                    summary.total_tokens = summary.total_tokens.saturating_add(total);
-                    summary.input_tokens = summary.input_tokens.saturating_add(input);
-                    summary.output_tokens = summary.output_tokens.saturating_add(output);
-                    summary.cache_write_tokens = summary.cache_write_tokens.saturating_add(writes);
-                    summary.cached_tokens = summary.cached_tokens.saturating_add(reads);
+                for rollup in group.rollups.into_values() {
+                    summary.total_tokens = summary.total_tokens.saturating_add(rollup.total);
+                    summary.input_tokens = summary.input_tokens.saturating_add(rollup.input);
+                    summary.output_tokens = summary.output_tokens.saturating_add(rollup.output);
+                    summary.cache_write_tokens =
+                        summary.cache_write_tokens.saturating_add(rollup.writes);
+                    summary.cached_tokens = summary.cached_tokens.saturating_add(rollup.reads);
+                    if let Some(value) = rollup.cost_microusd {
+                        rollup_cost_microusd = rollup_cost_microusd.saturating_add(u128::from(value));
+                        has_cost = true;
+                        summary.currency.get_or_insert_with(|| "USD".into());
+                    } else {
+                        unknown_rollup_cost = true;
+                    }
                 }
             } else if let Some((total, input, output, cached, group_cost, currency)) =
                 group.cumulative
@@ -14058,7 +14087,11 @@ impl Store {
                 summary.currency = summary.currency.or(group.response_currency);
             }
         }
-        summary.cost = has_cost.then_some(cost);
+        if unknown_rollup_cost {
+            summary.currency = None;
+        } else {
+            summary.cost = has_cost.then_some(cost + rollup_cost_microusd as f64 / 1_000_000.0);
+        }
         Ok(Some(summary))
     }
 
@@ -42262,6 +42295,48 @@ mission "nested-work" state="ready" {
             reopened.append_claim_outcome(&unnumbered).unwrap_err().code,
             "missing-claim-field"
         );
+    }
+
+    #[test]
+    fn agent_usage_rollups_include_latest_slot_cost_without_double_counting() {
+        let rows = [
+            json!({"semantics":"response","incarnation_id":"inc-one","total_tokens":10,"cost":99.0,"currency":"USD"}),
+            json!({"semantics":"session_cumulative","incarnation_id":"inc-one","total_tokens":10,"cost":99.0,"currency":"USD"}),
+            json!({"semantics":"response_rollup","incarnation_id":"inc-one","model":"first","total_tokens":10,"cost_microusd":1_000_000,"reported_cost_microusd":1_000_000,"unpriced_tokens":0}),
+            json!({"semantics":"response_rollup","incarnation_id":"inc-one","model":"first","total_tokens":20,"cost_microusd":6_338_109,"reported_cost_microusd":6_338_109,"unpriced_tokens":0}),
+            json!({"semantics":"response_rollup","incarnation_id":"inc-one","model":"second","total_tokens":30,"cost_microusd":500_000,"unpriced_tokens":0}),
+            json!({"semantics":"response_rollup","incarnation_id":"inc-two","model":"first","total_tokens":40,"cost_microusd":0,"unpriced_tokens":0}),
+        ];
+        let rows = rows.into_iter().enumerate().map(|(index, fields)| {
+            Ok((index as u64, json!({"fields":fields}).to_string(), "0".into()))
+        });
+        let summary = Store::usage_summary_from_rows(rows, None).unwrap().unwrap();
+        assert_eq!(summary.total_tokens, 90);
+        assert_eq!(summary.cost, Some(6.838109));
+        assert_eq!(summary.currency.as_deref(), Some("USD"));
+    }
+
+    #[test]
+    fn agent_usage_rollup_missing_or_unpriced_cost_stays_unknown() {
+        for cost_fields in [
+            json!({}),
+            json!({"cost_microusd":0,"unpriced_tokens":10}),
+            json!({"cost_microusd":500_000,"unpriced_tokens":1}),
+        ] {
+            let mut fields = json!({"semantics":"response_rollup","incarnation_id":"inc-one","model":"unknown","total_tokens":10});
+            fields
+                .as_object_mut()
+                .unwrap()
+                .extend(cost_fields.as_object().unwrap().clone());
+            let known = json!({"semantics":"response_rollup","incarnation_id":"inc-one","model":"known","total_tokens":20,"cost_microusd":1_000_000,"unpriced_tokens":0});
+            let rows = [known, fields].into_iter().enumerate().map(|(index, fields)| {
+                Ok((index as u64, json!({"fields":fields}).to_string(), "0".into()))
+            });
+            let summary = Store::usage_summary_from_rows(rows, None).unwrap().unwrap();
+            assert_eq!(summary.total_tokens, 30);
+            assert_eq!(summary.cost, None);
+            assert_eq!(summary.currency, None);
+        }
     }
 
     #[test]

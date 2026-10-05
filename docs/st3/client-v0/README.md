@@ -399,6 +399,14 @@ fallback for every recipient and reports no calibration. Recalibration changes f
 of historical counts; the pinned document makes an exported report reproducible. Older daemons
 omit the entire estimate, which clients treat as unavailable.
 
+An agent's `usage` summary selects the newest response rollup in each incarnation/model/account/
+run/step/host slot. Selected rollups take precedence over legacy cumulative or response records
+for that incarnation, for both tokens and cost. Known `cost_microusd` values are summed once and
+exposed as USD in `usage.cost`; `reported_cost_microusd` is already included, not added again.
+A missing rollup cost or any unpriced tokens leaves the combined cost/currency unknown, rather
+than presenting a partial sum as a complete total. This summary is not period spend, native
+session lifetime accounting, or a child-agent total.
+
 `GET /v1/client/usage?since_ms=…&until_ms=…` reads token spend over a period: the last 24 hours
 when both are omitted, ending now when `until_ms` is omitted. It requires `read.projections`. The
 value is `UsagePeriod { since_ms, until_ms, rows }`, with one `UsageRow` per agent, mission run,
