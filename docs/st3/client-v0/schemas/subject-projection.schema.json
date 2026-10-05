@@ -5534,6 +5534,16 @@
           },
           "type": "array"
         },
+        "claim_expires_at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "claimant": {
           "oneOf": [
             {
@@ -5565,6 +5575,38 @@
             "null"
           ]
         },
+        "loop_max_rounds": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "loop_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loop_round": {
+          "description": "Current round of this step's loop, enriched on mission detail reads.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "next_wake_at": {
+          "description": "Observed not-before time: earliest work eligibility, not a promise of wake dispatch.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "path": {
           "type": "string"
         },
@@ -5579,6 +5621,23 @@
             "string",
             "null"
           ]
+        },
+        "wake": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/MissionWake"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wake_reason": {
+          "description": "The deferral's blocked reason, or the observed wake failure when no deferral reason exists.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -5587,6 +5646,53 @@
         "state",
         "attempt",
         "since"
+      ],
+      "type": "object"
+    },
+    "MissionWake": {
+      "additionalProperties": false,
+      "properties": {
+        "acknowledged_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "assignee": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "assignee_state": {
+          "type": "string"
+        },
+        "attempts": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failure": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "incarnation_id": {
+          "type": "string"
+        },
+        "last_attempt_at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "assignee",
+        "assignee_state",
+        "incarnation_id",
+        "attempts"
       ],
       "type": "object"
     },
@@ -123095,7 +123201,7 @@
           "const": "subject-schemas"
         },
         "native_registry_digest": {
-          "const": "a1e7ba1aa0ca2e77e5afb58d4f6d6c11d5507e994a56a1c71f14536fd8d42049"
+          "const": "208b4d86cc11a38342298091eda8d48dc8e2c32cb6d55c725fbabadbb7e178a1"
         },
         "projected_digest_convention": {
           "const": "canonical-effective-definitions-with-transitive-dependencies-excluding-discovery-v1"
@@ -256382,6 +256488,10 @@
         "host": {
           "type": "string"
         },
+        "identified": {
+          "description": "The source named a provider identity or declared account; independent of quota freshness. Absent on older servers.",
+          "type": "boolean"
+        },
         "measured_at_unix_ms": {
           "minimum": 0,
           "type": "integer"
@@ -256451,6 +256561,111 @@
       ],
       "type": "object"
     },
+    "UsagePricing": {
+      "additionalProperties": false,
+      "description": "Cumulative contribution on claims; period contribution on usage reads. Provider-reported costs have no disclosed price table or rates. Missing provenance on historical claims is unknown.",
+      "properties": {
+        "cache_write_1h_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_write_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cached_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cost_microusd": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cost_source": {
+          "enum": [
+            "provider_reported",
+            "computed",
+            "unpriced"
+          ],
+          "type": "string"
+        },
+        "input_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "price_table_id": {
+          "type": "string"
+        },
+        "price_table_version": {
+          "type": "string"
+        },
+        "rates_usd_per_million_tokens": {
+          "$ref": "#/$defs/UsagePricingRates"
+        },
+        "reported_cost_microusd": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unpriced_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cost_source",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_write_tokens",
+        "cache_write_1h_tokens",
+        "cached_tokens",
+        "cost_microusd",
+        "reported_cost_microusd",
+        "unpriced_tokens"
+      ],
+      "type": "object"
+    },
+    "UsagePricingRates": {
+      "additionalProperties": false,
+      "properties": {
+        "cache_read": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "cache_write_1h": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "cache_write_5m": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "input": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "output": {
+          "minimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "input",
+        "output",
+        "cache_read",
+        "cache_write_5m",
+        "cache_write_1h"
+      ],
+      "type": "object"
+    },
     "UsageRow": {
       "additionalProperties": false,
       "properties": {
@@ -256489,12 +256704,21 @@
         "model": {
           "type": "string"
         },
+        "native_session_id": {
+          "type": "string"
+        },
         "output_tokens": {
           "minimum": 0,
           "type": "integer"
         },
         "pricing": {
           "type": "string"
+        },
+        "pricing_provenance": {
+          "items": {
+            "$ref": "#/$defs/UsagePricing"
+          },
+          "type": "array"
         },
         "reported_cost_microusd": {
           "minimum": 0,
@@ -269688,7 +269912,7 @@
       "schema_id": "subject-schema/5f5a8619771ea6de686edbf79d8dbdf30a6d861d221d757c94b0ec83daa8aa2e/subscription"
     }
   ],
-  "native_registry_digest": "a1e7ba1aa0ca2e77e5afb58d4f6d6c11d5507e994a56a1c71f14536fd8d42049",
+  "native_registry_digest": "208b4d86cc11a38342298091eda8d48dc8e2c32cb6d55c725fbabadbb7e178a1",
   "projected_digest_convention": "canonical-effective-definitions-with-transitive-dependencies-excluding-discovery-v1",
   "projected_schema_sha256": "2491c89c86f42233da84b095fe946a25ba4b087a5c2d71221b9e3094db17c56a",
   "resources": {

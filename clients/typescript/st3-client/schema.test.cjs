@@ -362,3 +362,16 @@ test('usage pricing provenance round-trips while legacy rows remain readable', a
     assert.throws(() => decode({ ...wire, pricing_provenance: [{ ...wire.pricing_provenance[0], cost_source: 'invented' }] }));
     assert.throws(() => decode({ ...wire, pricing_provenance: [{ ...wire.pricing_provenance[0], rates_usd_per_million_tokens: { input: 2 } }] }));
 });
+
+test('usage identity metadata is additive and independent of quota age', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const wire = { account: 'claude/unknown', driver: 'claude', measured_at_unix_ms: 1000, measured_by: 'agent/example/worker', host: 'alder', seats: [] };
+    const decode = Rich.decodeUnknownSync(Rich.UsageLimit, 'strict');
+    assert.equal(Object.hasOwn(decode(wire), 'identified'), false);
+    for (const identified of [false, true]) {
+        const decoded = decode({ ...wire, identified });
+        assert.equal(decoded.identified, identified);
+        assert.equal(Schema.encodeSync(Rich.UsageLimit)(decoded).identified, identified);
+    }
+    assert.throws(() => decode({ ...wire, identified: 'stale' }));
+});

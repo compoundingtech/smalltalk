@@ -1269,10 +1269,7 @@ pub fn run(context: Context) -> Result<()> {
                     {
                         let _ = commands.send(Command::Reconnect);
                     }
-                    Event::Key(key) => ui.key(key),
-                    Event::Paste(text) => ui.paste(text),
-                    Event::Mouse(mouse) => ui.mouse(mouse),
-                    _ => {}
+                    input => ui.input_event(input),
                 }
                 if !event::poll(Duration::ZERO)? {
                     break;
