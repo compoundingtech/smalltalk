@@ -212,7 +212,11 @@ projections can then show early history as current, such as a person step that a
 not-yet-received envelope completes. The notice lists each peer that holds more envelopes than one
 replication exchange carries, with `peer_only_envelopes` (held by the peer, missing here),
 `local_only_envelopes`, `last_exchange_at`, and `estimated_catch_up_seconds` (null until a rate is
-measured). Clients show the notice above the page. The page omits it once the host has caught up.
+measured or no finite forecast fits the safe-integer duration bound of 9,007,199,254,740,991
+whole seconds, `2^53 - 1`). Unavailable forecasts are null or absent; they are never clamped.
+The producer and API projection share `MAX_SAFE_DURATION_SECONDS`. A stalled peer keeps its
+sync notice even when its forecast is unavailable. Clients show the notice above the page.
+The page omits it once the host has caught up.
 
 The notice's `state` is `diverged` instead while the host's graph has diverged from a peer's: both
 hold the same envelopes but project different graphs from them, so the page can be wrong, not just

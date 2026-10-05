@@ -1493,6 +1493,8 @@ pub struct ClientSyncPeer {
     pub peer_only_envelopes: u64,
     pub local_only_envelopes: u64,
     pub last_exchange_at: Option<String>,
+    /// Whole seconds up to `smallclaims::replication::MAX_SAFE_DURATION_SECONDS`;
+    /// null when no finite, representable forecast is available.
     pub estimated_catch_up_seconds: Option<u64>,
     /// Since when this host and the peer hold the same envelopes but project different graphs.
     #[serde(default, skip_serializing_if = "Option::is_none")]

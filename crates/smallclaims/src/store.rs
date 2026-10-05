@@ -714,8 +714,12 @@ impl PeerSyncProgress {
             Some(0)
         } else {
             sync.catch_up_rate_per_second
-                .filter(|rate| *rate > 0.0)
-                .map(|rate| (peer_only as f64 / rate).ceil() as u64)
+                .filter(|rate| rate.is_finite() && *rate > 0.0)
+                .map(|rate| (peer_only as f64 / rate).ceil())
+                .filter(|seconds| {
+                    seconds.is_finite() && *seconds <= MAX_SAFE_DURATION_SECONDS as f64
+                })
+                .map(|seconds| seconds as u64)
         };
         self.measured = Some(sync);
     }
@@ -3687,6 +3691,71 @@ pub fn replication_difference_counts_what_each_side_lacks() {
         ..ReplicationInventory::default()
     };
     assert_eq!(difference(&bare), None);
+}
+
+#[cfg(test)]
+#[test]
+pub fn sync_progress_stalled_smoothing_has_no_unsafe_forecast() {
+    let mut progress = PeerSyncProgress::default();
+    progress.observe(0, Some((10_000, 0)), 1_000);
+    progress.observe(1_000, Some((9_000, 0)), 11_000);
+    assert_eq!(
+        progress.view(11_000).unwrap().estimated_catch_up_seconds,
+        Some(90)
+    );
+
+    // Zero-progress windows halve the old rate without ever making it exactly zero.
+    for window in 1..=60 {
+        progress.observe(0, Some((9_000, 0)), 11_000 + window * 10_000);
+    }
+    let sync = progress.view(611_000).unwrap();
+    assert!(sync.catch_up_rate_per_second.unwrap() > 0.0);
+    assert!(
+        sync.catching_up,
+        "a missing forecast must not hide the backlog"
+    );
+    assert_eq!(sync.peer_only_envelopes, 9_000);
+    assert_eq!(sync.estimated_catch_up_seconds, None);
+
+    // Real progress makes a forecast available again.
+    progress.observe(1_000, Some((8_000, 0)), 621_000);
+    assert_eq!(
+        progress.view(621_000).unwrap().estimated_catch_up_seconds,
+        Some(160)
+    );
+}
+
+#[cfg(test)]
+#[test]
+pub fn sync_progress_forecasts_require_finite_safe_seconds() {
+    for (rate, peer_only, expected) in [
+        (
+            1.0,
+            MAX_SAFE_DURATION_SECONDS,
+            Some(MAX_SAFE_DURATION_SECONDS),
+        ),
+        (1.0, MAX_SAFE_DURATION_SECONDS + 1, None),
+        (f64::MIN_POSITIVE, 9_000, None),
+        (f64::INFINITY, 9_000, None),
+        (f64::NAN, 9_000, None),
+        (0.0, 9_000, None),
+        (-1.0, 9_000, None),
+        (0.0, 0, Some(0)),
+    ] {
+        let mut progress = PeerSyncProgress {
+            measured: Some(ReplicationPeerSync {
+                catch_up_rate_per_second: Some(rate),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        progress.observe(0, Some((peer_only, 0)), 1_000);
+        assert_eq!(
+            progress.view(1_000).unwrap().estimated_catch_up_seconds,
+            expected,
+            "rate={rate}, peer_only={peer_only}"
+        );
+    }
 }
 
 #[cfg(test)]
