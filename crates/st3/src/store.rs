@@ -29831,9 +29831,9 @@ mod tests {
             .append_claim(&ClaimInput {
                 subject: "message/garden-event".into(),
                 kind: "message.sent".into(),
-                actor: Some("person/garden".into()),
+                actor: Some("person/test".into()),
                 fields: BTreeMap::from([
-                    ("from".into(), json!("person/garden")),
+                    ("from".into(), json!("person/test")),
                     ("to".into(), json!("agent/garden")),
                     ("content".into(), json!("hello")),
                     ("status".into(), json!("sent")),
