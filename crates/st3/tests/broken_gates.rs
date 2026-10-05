@@ -232,12 +232,15 @@ mission "example/preview" state="ready" {
     for flag in ["--dry-run", "--preview"] {
         let args = ["missions", "publish", file, "--as", PUBLISHER, flag];
         let preview = daemon.command(&args);
-        assert_eq!(preview["resolved_intent"]["kdl"], source);
+        let resolved = preview["resolved_intent"]["kdl"].as_str().unwrap();
+        let intent = st3::graph::parse_intent(resolved, "orchid").unwrap();
+        assert!(resolved.contains("Inspect publication without running commands."));
         assert!(preview["normalized"].is_object(), "{preview:#}");
         let revision = preview["mission_revisions"]["mission/example/preview"]
             .as_str()
             .unwrap();
         assert!(!revision.is_empty());
+        assert_eq!(intent.missions["example/preview"].revision, revision);
         assert!(preview["changes"].as_array().unwrap().iter().any(|change| {
             change["subject"] == "mission/example/preview" && change["new_revision"] == revision
         }));
