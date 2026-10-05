@@ -278,14 +278,31 @@ class Probe:
                        "owner_run_id": os.environ.get("ST_MISSION_RUN"),
                        "provider_runtime": os.environ.get("ST_OMP_CHANNEL_RUNTIME_ID"),
                        "ownership_sequence": os.environ.get("ST_OMP_CHANNEL_SEQ")}
-            child = await asyncio.create_subprocess_exec(
-                self.st3, "--catalog", str(catalog), "driver", "omp-channel",
-                "--identity", self.actor[6:], stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "ST3_ENDPOINT": self.api.socket})
+            # Own the stderr read transport so a descendant's inherited descriptor
+            # can be closed after the drain deadline, rather than leaked across retries.
+            read_fd, write_fd = os.pipe()
+            pipe = os.fdopen(read_fd, "rb", buffering=0)
+            stderr_reader = asyncio.StreamReader()
+            stderr_transport = None
+            try:
+                stderr_transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+                    lambda: asyncio.StreamReaderProtocol(stderr_reader), pipe)
+                child = await asyncio.create_subprocess_exec(
+                    self.st3, "--catalog", str(catalog), "driver", "omp-channel",
+                    "--identity", self.actor[6:], stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE, stderr=write_fd,
+                    env={**os.environ, "ST3_ENDPOINT": self.api.socket})
+            except BaseException:
+                if stderr_transport:
+                    stderr_transport.close()
+                else:
+                    pipe.close()
+                raise
+            finally:
+                os.close(write_fd)
             self.child = child
             captured = ChannelStderr()
-            drain = asyncio.create_task(captured.drain(child.stderr))
+            drain = asyncio.create_task(captured.drain(stderr_reader))
             owner = asyncio.create_task(self.channel_owner())
             hello_seen = False
             self.event("channel-started", pid=child.pid, **context)
@@ -304,6 +321,7 @@ class Probe:
                         self.tasks.add(task)
                         task.add_done_callback(self.finished)
             finally:
+                child.stdin.close()
                 if child.returncode is None:
                     try:
                         child.terminate()
@@ -334,6 +352,7 @@ class Probe:
                 finally:
                     drain.cancel()
                     await asyncio.gather(drain, return_exceptions=True)
+                    stderr_transport.close()
                 self.event("channel-exited", pid=child.pid, exit=child.returncode,
                            hello_seen=hello_seen, stderr=captured.report(),
                            observed_owner=await owner,

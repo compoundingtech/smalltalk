@@ -187,6 +187,15 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.monitor.st3 = str(child)
         self.monitor.api.socket = "/private-fixture/socket"
         self.monitor.api.agent = None
+        loop = asyncio.get_running_loop()
+        connect = loop.connect_read_pipe
+        transports = []
+        async def track_transport(*args, **kwargs):
+            transport, protocol = await connect(*args, **kwargs)
+            transports.append(transport)
+            return transport, protocol
+        tracking = patch.object(loop, "connect_read_pipe", track_transport)
+        tracking.start()
         receiver = asyncio.create_task(self.monitor.receiver())
         try:
             async def exited():
@@ -200,11 +209,15 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ended["stderr"]["diagnostic"], "st: startup refused before hello")
             self.assertTrue(ended["observed_owner"]["unavailable"])
             self.assertTrue(ended["observed_owner_at_exit"]["unavailable"])
+            os.kill(int(descendant.read_text()), 0)  # The inherited writer is still alive.
+            self.assertTrue(transports)
+            self.assertTrue(all(transport.is_closing() for transport in transports))
             self.assertEqual(self.monitor.state["receipts"], {})
             self.assertEqual(self.monitor.api.posts, [])
         finally:
             receiver.cancel()
             await asyncio.gather(receiver, return_exceptions=True)
+            tracking.stop()
             if descendant.exists():
                 try:
                     os.kill(int(descendant.read_text()), signal.SIGKILL)
