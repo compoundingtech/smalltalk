@@ -10,6 +10,7 @@ let
     anyhow = "=1.0.104"
     [features]
     extra = []
+    test-support = []
     [[bin]]
     name = "cache-probe"
     path = "src/main.rs"
@@ -40,6 +41,7 @@ let
     pkgs.runCommand "source"
       {
         inherit manifest lockFile;
+        buildScript = pkgs.writeText "build.rs" (builtins.readFile ../crates/st3/build.rs);
         code = pkgs.writeText "main.rs" ''
           fn main() {
             println!("${message}:{}:{}:{}", itoa::Buffer::new().format(42),
@@ -52,6 +54,7 @@ let
         cp "$manifest" "$out/Cargo.toml"
         cp "$lockFile" "$out/Cargo.lock"
         cp "$code" "$out/src/main.rs"
+        cp "$buildScript" "$out/build.rs"
         echo 'fn main() {}' > "$out/src/unselected.rs"
         touch "$out/tests/smoke.rs"
       '';
@@ -114,6 +117,16 @@ let
   fromProduction = changed.overrideAttrs (_: {
     cargoArtifacts = production.cargoBuildArtifacts;
   });
+  productionChecks = first.overrideAttrs (_: {
+    cargoArtifacts = production.cargoBuildArtifacts;
+    buildPhase = ''
+      # Check phases add tools to PATH; production does not capture that PATH.
+      export PATH="${pkgs.hello}/bin:$PATH"
+      cargoBuildHook > compilation.log 2>&1
+      cat compilation.log
+      grep -F 'Fresh cache-probe v' compilation.log
+    '';
+  });
   verifyFresh =
     package:
     package.overrideAttrs (_: {
@@ -139,5 +152,6 @@ pkgs.runCommand "cargo-artifact-reuse" { } ''
   test "$(${verifyFresh codeOnly}/bin/cache-probe)" = 'changed:42:revision-one:false'
   test "$(${feature}/bin/cache-probe)" = 'changed:42:revision-two:true'
   test "$(${verifyFresh fromProduction}/bin/cache-probe)" = 'changed:42:revision-two:false'
+  test "$(${productionChecks}/bin/cache-probe)" = 'first:42:revision-one:false'
   touch "$out"
 ''
