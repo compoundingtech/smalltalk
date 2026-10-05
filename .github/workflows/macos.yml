@@ -107,12 +107,12 @@ jobs:
             wasm=$(printf '%s' "$provider" | tr '[:upper:]' '[:lower:]')
             printf 'ST2_%s_COMPONENT=%s/share/st2/providers/st2_%s_component.component.wasm\n' "$provider" "$components" "$wasm" >> "$GITHUB_ENV"
           done
-      - name: Install matching rendered hooks
-        shell: bash
-        run: nix develop -c cargo run --locked -p st2 -- hooks install
       - name: Build selected test targets first (no debug info)
         shell: bash
         run: nix develop -c bash scripts/ci-nextest run --no-run
+      - name: Install matching rendered hooks
+        shell: bash
+        run: nix develop -c bash scripts/ci-install-built-hooks
       - name: Run macOS workspace tests (25 minute limit)
         shell: bash
         run: nix develop -c bash scripts/ci-nextest run

@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Require a disjoint, complete union of the two real nextest selections."""
+import json
+import os
+from pathlib import Path
+import subprocess
+
+
+def selected(output):
+    decoder = json.JSONDecoder()
+    tests = set()
+    while output.strip():
+        document, end = decoder.raw_decode(output.lstrip())
+        output = output.lstrip()[end:]
+        for binary, suite in document["rust-suites"].items():
+            for name, test in suite["testcases"].items():
+                if not test["ignored"] and test["filter-match"]["status"] == "matches":
+                    key = (binary, name)
+                    if key in tests:
+                        raise ValueError(f"duplicate selected test: {key}")
+                    tests.add(key)
+    return tests
+
+
+def verify(full, first, second):
+    if not full or not first or not second:
+        raise ValueError("full inventory and both shards must be nonempty")
+    if first & second:
+        raise ValueError(f"shards overlap: {sorted(first & second)}")
+    if first | second != full:
+        raise ValueError(f"incomplete shards: missing={sorted(full - (first | second))}; extra={sorted((first | second) - full)}")
+
+
+def main():
+    inventories = []
+    for partition in ("", "hash:1/2", "hash:2/2"):
+        output = subprocess.check_output(
+            ["bash", "scripts/ci-nextest", "list", "--message-format", "json"],
+            env={**os.environ, "CI_TEST_PARTITION": partition}, text=True)
+        inventories.append(selected(output))
+    verify(*inventories)
+    proof = {"revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+             "full": sorted(inventories[0]), "hash:1/2": sorted(inventories[1]), "hash:2/2": sorted(inventories[2])}
+    logs = Path(os.environ["RUNNER_TEMP"]) / "ci-logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "test-partitions.json").write_text(json.dumps(proof, indent=2) + "\n")
+    message = f"Shard inventory verified: {len(inventories[0])} selected tests = {len(inventories[1])} + {len(inventories[2])}; no overlap or omissions."
+    print(message, flush=True)
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
+        stream.write(message + "\n")
+
+
+if __name__ == "__main__":
+    main()
