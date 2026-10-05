@@ -781,6 +781,14 @@ agent "probe/{node.name}" {{
         except Exception:
             print(f"failed native probe fixture retained: {directory}", file=sys.stderr)
             for node in nodes:
+                # cli(check=True) discards stdout on doctor failure. Retain a
+                # separately labelled follow-up snapshot without accepting that failure.
+                try:
+                    doctor = json.loads(await node.cli("doctor", "--json", check=False))
+                    failed = [check for check in doctor["checks"] if check["status"] == "fail"]
+                    print(f"{node.name} follow-up failed doctor checks: {json.dumps(failed)[-8000:]}", file=sys.stderr)
+                except Exception as error:
+                    print(f"{node.name} follow-up doctor unavailable: {type(error).__name__}", file=sys.stderr)
                 for name in ("probe/latest.json", "probe/events.jsonl", "probe-channel.stderr"):
                     path = node.root / name
                     if path.exists():
