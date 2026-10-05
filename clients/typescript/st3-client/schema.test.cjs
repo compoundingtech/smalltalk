@@ -227,3 +227,30 @@ test('usage pricing provenance round-trips while legacy rows remain readable', a
     assert.throws(() => decode({ ...wire, pricing_provenance: [{ ...wire.pricing_provenance[0], cost_source: 'invented' }] }));
     assert.throws(() => decode({ ...wire, pricing_provenance: [{ ...wire.pricing_provenance[0], rates_usd_per_million_tokens: { input: 2 } }] }));
 });
+
+test('mission step assignees preserve persons and agents without granting person runtime claims', async () => {
+    const [{ Option, Schema }, Rich] = await modules;
+    const at = '2024-02-29T00:00:00Z';
+    const step = { id: 'step-run/example', path: 'approval', state: 'waiting-person', attempt: 0, since: at };
+    const current = { id: step.id, title: 'Approve work', state: step.state, since: at };
+    const run = {
+        id: 'mission-run/example', requester: 'person/operator', status: 'running', phase: 'work',
+        progress: { done: 0, total: 1 }, current_steps: [current], must_act: 'you', state_since: at,
+        steps: [step],
+    };
+    for (const assignee of ['person/operator', 'agent/worker']) {
+        const wire = { ...run, steps: [{ ...step, assignee }], current_steps: [{ ...current, assignee }] };
+        const decoded = Rich.decodeUnknownSync(Rich.MissionRunSummary, 'strict')(wire);
+        assert.equal(Option.getOrThrow(decoded.steps)[0].assignee.value, assignee);
+        assert.equal(Option.getOrThrow(decoded.current_steps[0].assignee), assignee);
+        const encoded = Schema.encodeSync(Rich.MissionRunSummary)(decoded);
+        assert.equal(encoded.steps[0].assignee, assignee);
+        assert.equal(encoded.current_steps[0].assignee, assignee);
+    }
+    for (const assignee of ['daemon/dev3', 'step/other', 'person/', 'person/has space']) {
+        assert.throws(() => Rich.decodeUnknownSync(Rich.MissionRunSummary)({ ...run, steps: [{ ...step, assignee }] }));
+        assert.throws(() => Rich.decodeUnknownSync(Rich.MissionRunSummary)({ ...run, current_steps: [{ ...current, assignee }] }));
+    }
+    assert.throws(() => Rich.decodeUnknownSync(Rich.MissionRunSummary)({ ...run, steps: [{ ...step, claimant: 'person/operator' }] }));
+    assert.throws(() => Rich.decodeUnknownSync(Rich.MissionRunSummary)({ ...run, current_steps: [{ ...current, claimant: 'person/operator' }] }));
+});

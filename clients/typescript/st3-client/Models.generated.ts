@@ -243,6 +243,8 @@ export type AgentWorkspace = {
   workspace: string;
 };
 
+export type AssigneeRef = string;
+
 export type Attachment = {
   blob: string;
   media_type: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
@@ -889,7 +891,7 @@ export type MissionRunSummary = {
 
 } | null;
   current_steps: Array<{
-  assignee?: (AgentId | null);
+  assignee?: (AssigneeRef | null);
   claimant?: (AgentId | null);
   id: StepRunId;
   since: Timestamp;
@@ -917,7 +919,7 @@ export type MissionState = ("draft" | "ready" | "retired" | "running" | "standin
 
 export type MissionStep = {
   agentless?: boolean;
-  assignee?: (AgentId | null);
+  assignee?: (AssigneeRef | null);
   attempt: number;
   blocked_reason?: string | null;
   blockers?: Array<Id>;
