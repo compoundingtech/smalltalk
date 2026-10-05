@@ -41659,6 +41659,48 @@ mission "nested-work" state="ready" {
     }
 
     #[test]
+    fn usage_period_keeps_price_versions_separate_without_repricing_the_baseline() {
+        let local = Store::open_memory("host-one").unwrap();
+        let subject = "agent/example.price-change";
+        let contribution = |version: &str, tokens: u64, rate: u64| json!({
+            "price_table_id":"st.api-list", "price_table_version":version,
+            "cost_source":"computed",
+            "rates_usd_per_million_tokens":{"input":rate,"output":rate,"cache_read":rate,
+                "cache_write_5m":rate,"cache_write_1h":rate},
+            "total_tokens":tokens,"input_tokens":tokens,"output_tokens":0,
+            "cache_write_tokens":0,"cache_write_1h_tokens":0,"cached_tokens":0,
+            "cost_microusd":tokens*rate,"reported_cost_microusd":0,"unpriced_tokens":0,
+        });
+        let old = contribution("example-v1",10,1);
+        let new = contribution("example-v2",20,2);
+        for (at,total,cost,provenance) in [
+            (10,10,10,json!([old.clone()])), (20,30,50,json!([old,new])),
+        ] {
+            local.append_client_claim(&ClaimInput {
+                subject:subject.into(), kind:"harness.usage".into(), actor:Some(subject.into()),
+                fields:serde_json::from_value(json!({
+                    "semantics":"response_rollup","driver":"codex","incarnation_id":"inc-one",
+                    "model":"example-model","native_session_id":"native-example",
+                    "observed_at_unix_ms":at,"total_tokens":total,"input_tokens":total,
+                    "cost_microusd":cost,"pricing_provenance":provenance,
+                })).unwrap(), evidence:vec![],expected_subject:None,idempotency_key:None,
+            }).unwrap();
+        }
+        let rows = local.usage_period_rows(10,20).unwrap();
+        assert_eq!(rows[0]["total_tokens"],20);
+        assert_eq!(rows[0]["cost_microusd"],40);
+        let provenance = rows[0]["pricing_provenance"].as_array().unwrap();
+        assert_eq!(provenance.len(),1);
+        assert_eq!(provenance[0]["price_table_version"],"example-v2");
+        assert_eq!(provenance[0]["rates_usd_per_million_tokens"]["input"],2);
+        assert_eq!(provenance[0]["total_tokens"],20);
+        assert_eq!(provenance[0]["cost_microusd"],40);
+        let lifetime = local.usage_period_rows(0,20).unwrap();
+        assert_eq!(lifetime[0]["pricing_provenance"].as_array().unwrap().len(),2);
+        assert_eq!(lifetime[0]["cost_microusd"],50);
+    }
+
+    #[test]
     fn historical_usage_claims_leave_provenance_unknown() {
         let local = Store::open_memory("host-one").unwrap();
         let subject = "agent/example.legacy";
