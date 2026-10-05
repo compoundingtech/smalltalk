@@ -202,7 +202,8 @@ export type AgentCreateParameters = typeof AgentCreateParameters.Type
 export type AgentCreateParametersEncoded = typeof AgentCreateParameters.Encoded
 
 export const AgentResumeParameters = /*#__PURE__*/ (() => Schema.Struct({
-  "agent": Id
+  "agent": Id,
+  "host": optionalKey(Schema.String.check(Schema.isMinLength(1)))
 }).annotate({ identifier: "AgentResumeParameters" }))()
 export type AgentResumeParameters = typeof AgentResumeParameters.Type
 export type AgentResumeParametersEncoded = typeof AgentResumeParameters.Encoded
@@ -499,6 +500,7 @@ export const AgentSuspension = /*#__PURE__*/ (() => Schema.Struct({
   /** Stable reason the last suspend or resume failed, such as not-quiescent, native-session-mismatch or native-resume-unavailable. */
   "code": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Stable reason the last suspend or resume failed, such as not-quiescent, native-session-mismatch or native-resume-unavailable." }),
   "harness": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "host": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   /** The suspended incarnation, or the one a completed resume launched. */
   "incarnation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "The suspended incarnation, or the one a completed resume launched." }),
   /** The harness's own session the seat suspended on and resumes. */
@@ -506,8 +508,9 @@ export const AgentSuspension = /*#__PURE__*/ (() => Schema.Struct({
   /** The request claim; each phase change is a change of this agent. */
   "operation_id": Schema.String.annotate({ description: "The request claim; each phase change is a change of this agent." }),
   /** suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason. */
-  "phase": Schema.Literals(["quiescing","snapshotting","suspended","failed","restoring","verifying","resumed"]).annotate({ description: "suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason." }),
+  "phase": Schema.Literals(["quiescing","snapshotting","suspended","failed","fencing-source","transferring","restoring","verifying","resumed"]).annotate({ description: "suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason." }),
   "reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "source_host": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "suspended_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "updated_at": Timestamp
 }).annotate({ identifier: "AgentSuspension" }))()

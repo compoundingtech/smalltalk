@@ -909,8 +909,10 @@
       "required": ["action", "phase", "operation_id", "updated_at", "blocking"],
       "properties": {
         "action": { "enum": ["suspend", "resume"] },
-        "phase": { "enum": ["quiescing", "snapshotting", "suspended", "failed", "restoring", "verifying", "resumed"], "description": "suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason." },
+        "phase": { "enum": ["quiescing", "snapshotting", "suspended", "failed", "fencing-source", "transferring", "restoring", "verifying", "resumed"], "description": "suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason." },
         "operation_id": { "type": "string", "description": "The request claim; each phase change is a change of this agent." },
+        "source_host": { "type": ["string", "null"] },
+        "host": { "type": ["string", "null"] },
         "harness": { "type": ["string", "null"] },
         "native_session_id": { "type": ["string", "null"], "description": "The harness's own session the seat suspended on and resumes." },
         "incarnation_id": { "type": ["string", "null"], "description": "The suspended incarnation, or the one a completed resume launched." },
@@ -1623,7 +1625,7 @@
     "AgentStopParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}, "reason": {"type": "string"}}},
     "AgentStartParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}}},
     "AgentSuspendParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}, "reason": {"type": "string"}}},
-    "AgentResumeParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}}},
+    "AgentResumeParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}, "host": {"type": "string", "minLength": 1}}},
     "TerminalCreateParameters": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1}, "host": {"type": "string", "minLength": 1}, "cwd": {"type": "string", "minLength": 1}}},
     "PersonAskParameters": {
       "type": "object", "additionalProperties": false, "required": ["person_id", "title", "reason"],
