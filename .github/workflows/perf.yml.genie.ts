@@ -1,5 +1,10 @@
 import { defaultActionlintConfig, githubWorkflow, nixDevelopStep, plainFlakeSetupSteps } from '../../repos/effect-utils/genie/external.ts'
-import { buildEnv, linuxRunner, linuxStageRunner, readOnlyBinaryCaches } from './workspace-ci.ts'
+import { buildEnv, readOnlyBinaryCaches } from './workspace-ci.ts'
+
+const performanceRunner = [
+  'nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1',
+  'namespace-features:github.run-id=${{ github.run_id }}',
+]
 
 const snapshotAttempt = "!cancelled() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (steps.load.outcome == 'success' || steps.load.outcome == 'failure')"
 const snapshotPublished = "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
@@ -37,13 +42,13 @@ export default githubWorkflow({
   },
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
+    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...performanceRunner],
   },
   jobs: {
     'perf-load': {
       name: 'perf-load',
-      'runs-on': linuxStageRunner,
-      'timeout-minutes': 30,
+      'runs-on': performanceRunner,
+      'timeout-minutes': 90,
       defaults: { run: { shell: 'bash' } },
       env: {
         ...buildEnv,
@@ -81,7 +86,7 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
           // copied to RUNNER_TEMP before measuring: measurements still use the normal disk.
           run: 'if [ ! -s "$RUNNER_TEMP/st-bench/generated-1.sqlite3" ]; then sudo mount -o remount,size=10G /dev/shm; fi',
         },
-        { ...nixDevelopStep({ name: 'Run the release load test', flake: '.#perf', command: ['bash', 'scripts/ci-perf', 'load'] }), id: 'load' },
+        { ...nixDevelopStep({ name: 'Run the pinned current-main API comparison', flake: '.#perf', command: ['python3', 'scripts/ci-api-paired'] }), id: 'load' },
         {
           id: 'cache',
           name: 'Save build and Nix snapshots',
