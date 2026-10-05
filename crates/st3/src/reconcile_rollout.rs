@@ -590,9 +590,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                     )?;
                     return Ok(true);
                 }
-                // Native binding admission needs this exact replacement's graph authority,
-                // even while rollout verification holds the normal runtime observer.
-                self.record_member(subject, observation, false)?;
                 let binding = rollout::binding(&self.store, agent, replacement)?;
                 let refused = self
                     .store

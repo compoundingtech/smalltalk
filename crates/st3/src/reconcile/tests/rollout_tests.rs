@@ -332,6 +332,15 @@ fn rollout_drains_then_resumes_once_across_disk_reopens() {
             .is_err()
     );
     seat.step();
+    let verification_index = seat.store.index().unwrap();
+    for _ in 0..8 {
+        seat.step();
+    }
+    assert_eq!(
+        seat.store.index().unwrap(),
+        verification_index,
+        "unchanged verification must not append runtime observations while waiting for the native binding"
+    );
     seat.binding("replacement-1", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
