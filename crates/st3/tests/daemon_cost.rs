@@ -73,8 +73,6 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
     // Fleet and replication status count every replica record (9.7x).
     ("GET /v1/internal/fleet/status", 15.0),
     ("GET /v1/replication/status", 15.0),
-    // A replica record is found by scanning them all (9.8x).
-    ("GET /v1/replication/records/{*record}", 15.0),
     // Outcome history reads every finished step to page them (8.3x).
     ("GET /v1/outcome-history", 12.5),
     // The repair plan's work grows faster than the store (24.7x steps, 64.6x full-scan steps).
