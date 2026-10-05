@@ -331,7 +331,8 @@ pub enum CollectionEvent {
         session_id: String,
         replace: bool,
         items: Vec<TimelineEntry>,
-        has_more: bool,
+        /// Availability before the live window; absent on deltas means unchanged.
+        has_more: Option<bool>,
     },
     /// Subscribe again: the server could not bring this subscription up to date.
     /// `code` and `message` say why when a temporary failure caused it, such as a conversation
@@ -390,7 +391,7 @@ impl CollectionEvent {
                 session_id: field(&frame, "session_id")?,
                 replace: field(&frame, "replace")?,
                 items: field(&frame, "items")?,
-                has_more: field::<Option<bool>>(&frame, "has_more")?.unwrap_or(false),
+                has_more: field(&frame, "has_more")?,
                 id,
             }),
             Some("resync") => Ok(Self::Resync {

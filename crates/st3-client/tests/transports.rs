@@ -710,6 +710,7 @@ async fn an_agents_conversation_rides_the_collection_socket_with_its_small_talk(
             id,
             session_id,
             replace: true,
+            has_more: Some(false),
             ..
         } if id == "chat" => session_id,
         other => panic!("expected the conversation page, got {other:?}"),
@@ -739,6 +740,7 @@ async fn an_agents_conversation_rides_the_collection_socket_with_its_small_talk(
         CollectionEvent::Conversation {
             id,
             replace: false,
+            has_more: None,
             items,
             ..
         } if id == "chat" => items,
