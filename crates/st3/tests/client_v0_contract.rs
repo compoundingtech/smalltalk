@@ -1061,10 +1061,14 @@ async fn collection_socket_multiplexes_snapshot_then_changes_and_resubscribes() 
         .unwrap();
     assert_eq!(first["kind"], "snapshot");
     assert_eq!(second["kind"], "snapshot");
-    assert_eq!(first["id"], "missions");
-    assert_eq!(second["id"], "agents");
-    assert_conforms(&validator, "missions snapshot", &first);
-    assert_conforms(&validator, "agents snapshot", &second);
+    // Different windows complete independently; only each window's snapshot-before-changes
+    // ordering is part of the collection contract.
+    assert_eq!(
+        BTreeSet::from([first["id"].as_str().unwrap(), second["id"].as_str().unwrap()]),
+        BTreeSet::from(["missions", "agents"])
+    );
+    assert_conforms(&validator, "collection snapshot", &first);
+    assert_conforms(&validator, "collection snapshot", &second);
 
     let source =
         "version 2\nmission \"socket-test\" state=\"ready\" { goal \"Test collection changes\" }\n";
