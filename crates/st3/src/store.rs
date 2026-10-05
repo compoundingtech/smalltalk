@@ -20949,9 +20949,10 @@ fn pending_attention_requests_tx(
 
 fn sort_messages_canonically(connection: &Connection, messages: &mut [MessageView]) -> Result<()> {
     let mut keys = BTreeMap::new();
-    let mut statement = connection.prepare(&canonical_sql(
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| canonical_sql(
         "SELECT id FROM claims WHERE subject=?1 AND kind IN ('message.sent','intent.desired') ORDER BY CANONICAL_ASC(claims) LIMIT 1"
-    ))?;
+    ));
+    let mut statement = connection.prepare_cached(&QUERY)?;
     for message in messages.iter() {
         let id: String = statement.query_row([&message.subject], |row| row.get(0))?;
         keys.insert(
