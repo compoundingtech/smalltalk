@@ -1163,14 +1163,13 @@ pub fn latest_claim_id_tx(transaction: &Transaction<'_>, subject: &str) -> Resul
 /// remaining claim, and never moves backwards.
 pub fn current_index(connection: &Connection) -> Result<u64> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT MAX(
                  COALESCE((SELECT MAX(store_index) FROM claims), 0),
                  COALESCE((SELECT seq FROM sqlite_sequence WHERE name='claims'), 0)
              )",
-            [],
-            |row| row.get(0),
-        )
+        )?
+        .query_row([], |row| row.get(0))
         .map_err(Into::into)
 }
 
@@ -1718,11 +1717,8 @@ pub fn writer_high_water(connection: &Connection, writer: &str) -> Result<Option
 
 pub fn max_envelope_rowid(connection: &Connection) -> Result<i64> {
     connection
-        .query_row(
-            "SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes",
-            [],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes")?
+        .query_row([], |row| row.get(0))
         .map_err(Into::into)
 }
 
@@ -2898,6 +2894,16 @@ pub fn full_replication_inventory_rows(
 pub fn full_compact_replication_inventory(
     connection: &Connection,
 ) -> Result<(CompactReplicationInventory, i64)> {
+    let (mut inventory, max_rowid) = load_compact_replication_inventory(connection)?;
+    inventory.refresh_digest();
+    Ok((inventory, max_rowid))
+}
+
+// The snapshot builder hashes the loaded identities while building its digest prefixes.
+// Leave the digest unset here so that path does not hash the full log twice.
+fn load_compact_replication_inventory(
+    connection: &Connection,
+) -> Result<(CompactReplicationInventory, i64)> {
     let mut statement = connection.prepare(
         "SELECT rowid, writer, sequence, envelope_hash, 1 FROM replica_envelopes
          UNION ALL
@@ -2923,7 +2929,6 @@ pub fn full_compact_replication_inventory(
             inventory.mark_last_payloadless();
         }
     }
-    inventory.refresh_digest();
     Ok((inventory, max_rowid))
 }
 
@@ -4773,7 +4778,7 @@ impl Store {
                 row.get(0)
             })?;
         let full = |connection: &Connection| -> Result<_> {
-            let (inventory, max_rowid) = full_compact_replication_inventory(connection)?;
+            let (inventory, max_rowid) = load_compact_replication_inventory(connection)?;
             let buckets = inventory.buckets();
             Ok((inventory, max_rowid, buckets, Vec::new(), 0))
         };
@@ -6939,11 +6944,9 @@ pub fn create_graph_generation_triggers(
 }
 
 pub fn graph_generation(connection: &Connection) -> Result<i64> {
-    Ok(
-        connection.query_row("SELECT value FROM graph_generation WHERE id=1", [], |row| {
-            row.get(0)
-        })?,
-    )
+    Ok(connection
+        .prepare_cached("SELECT value FROM graph_generation WHERE id=1")?
+        .query_row([], |row| row.get(0))?)
 }
 
 pub fn digest_queries(connection: &Connection, queries: &[(&str, &str)]) -> Result<String> {
