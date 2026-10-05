@@ -1,0 +1,102 @@
+name: 1391 unchanged-base/head load comparison (temporary experiment)
+on:
+  push:
+    branches: [agent/loop-clock-perf-pair]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: perf-1391-controlled-pair
+  cancel-in-progress: false
+jobs:
+  compare:
+    runs-on: nscloud-ubuntu-24.04-amd64-8x16
+    timeout-minutes: 70
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      SCCACHE_IDLE_TIMEOUT: '0'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Preserve diagnostic helper outside exact-source checkouts
+        run: |
+          cp .github/experiments/perf-1391-pair.py "$RUNNER_TEMP/perf-1391-pair.py"
+          cp scripts/ci-perf-cache "$RUNNER_TEMP/ci-perf-cache"
+      - name: Name compatible snapshot recipes
+        env:
+          PERF_BUILD_SNAPSHOT: "perf-load-build-v1-${{ hashFiles('Cargo.lock', 'flake.lock', 'flake.nix', 'Cargo.toml', 'crates/st3/Cargo.toml', '.cargo/config.toml') }}"
+          PERF_STORES_SNAPSHOT: "perf-load-stores-v1-${{ hashFiles('crates/st3/tests/daemon_bench.rs', 'docs/st3/schema.md') }}"
+        run: printf "PERF_BUILD_SNAPSHOT=%s\nPERF_STORES_SNAPSHOT=%s\n" "$PERF_BUILD_SNAPSHOT" "$PERF_STORES_SNAPSHOT" >> "$GITHUB_ENV"
+      - name: Restore genuine main caches and freeze five main baselines
+        run: python3 scripts/ci-perf-cache restore
+      - uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+      - name: Isolate test state and preserve compiler caches
+        run: |
+          test_home="$RUNNER_TEMP/test-home"
+          mkdir -p "$test_home"/{.config,.cache,.local/state}
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\nSCCACHE_DIR=%s\nSCCACHE_CACHE_SIZE=1G\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" "$RUNNER_TEMP/perf-sccache" >> "$GITHUB_ENV"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$test_home" "$test_home" "$test_home" "$test_home" >> "$GITHUB_ENV"
+      - name: Freeze workload, baseline and hardware receipts
+        run: python3 "$RUNNER_TEMP/perf-1391-pair.py" init
+      - name: Measure 01-base with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-1391-pair.py" measure 01-base f61d4ddd7bf0ffad27b0c900aa700acd9dc25eaa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-1391-01-base
+          path: ${{ runner.temp }}/1391-pair/results/01-base/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Measure 02-head with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-1391-pair.py" measure 02-head 6b21a5be4e2f64162e999280b5fc855533f7e7e4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-1391-02-head
+          path: ${{ runner.temp }}/1391-pair/results/02-head/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Measure 03-head-repeat with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-1391-pair.py" measure 03-head-repeat 6b21a5be4e2f64162e999280b5fc855533f7e7e4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-1391-03-head-repeat
+          path: ${{ runner.temp }}/1391-pair/results/03-head-repeat/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Measure 04-base-repeat with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-1391-pair.py" measure 04-base-repeat f61d4ddd7bf0ffad27b0c900aa700acd9dc25eaa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-1391-04-base-repeat
+          path: ${{ runner.temp }}/1391-pair/results/04-base-repeat/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Preserve every report and original verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-1391-evidence
+          path: |
+            ${{ runner.temp }}/1391-pair/results/
+            ${{ runner.temp }}/1391-pair/baselines/
+            ${{ runner.temp }}/1391-pair/provenance.json
+          retention-days: 30
+          if-no-files-found: error
+      - name: Propagate original benchmark failures
+        run: python3 "$RUNNER_TEMP/perf-1391-pair.py" verdict
