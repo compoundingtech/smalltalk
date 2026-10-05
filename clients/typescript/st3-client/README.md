@@ -38,6 +38,8 @@ The synchronous and effectful decode helpers default to tolerant mode: unknown e
 
 Inline semantic keywords provide branded strings and subject references, UTC instants, durations, and redacted credentials. Integer codecs reject unsafe JavaScript integers on decode and encode. Duration codecs round to whole wire units on encode; second durations preserve exact safe-integer units without overflowing millisecond precision. Recursive Glass layouts remain validated through suspended schemas.
 
+Mission step and current-step assignees use `AssigneeRef`: an `agent/…` or `person/…` reference. A person-assigned ask remains valid mission work; its runtime claimant still uses `AgentId` and cannot be a person. Consumers must not discard a mission merely because its assignee is a person.
+
 After installing the client development dependencies, run the focused rich checks with:
 
 ```sh
