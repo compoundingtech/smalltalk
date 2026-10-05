@@ -23174,7 +23174,7 @@ mod tests {
             "\nrequest   Review release\n          7m ago · high priority\n"
         );
         item.priority = "normal".into();
-        item.requester_id = Some("agent/fleet/example/worker".into());
+        item.requester_id = Some("agent/example/worker".into());
         item.update = Some(st3_client::PersonUpdate {
             version: 1,
             entry_type: "update".into(),
@@ -23184,7 +23184,7 @@ mod tests {
         });
         assert_eq!(
             attention_heading(&item, now),
-            "\nupdate    Review release\n          from fleet/example/worker · 7m ago\n"
+            "\nupdate    Review release\n          from example/worker · 7m ago\n"
         );
         // An update's action line warns that opening it reads it.
         let mut page = fixture_product_page(&["attention"], false);
