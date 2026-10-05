@@ -20,7 +20,7 @@ pub struct SmalltalkRuntime {
     pub(crate) subject_cache: Mutex<SubjectCache>,
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
-    pub(crate) agent_resources_cache: Mutex<VecDeque<(u64, u64, bool, Arc<Vec<Value>>)>>,
+    pub(crate) agent_resources_cache: Mutex<VecDeque<(u64, bool, Arc<Vec<Value>>)>>,
 }
 
 impl SmalltalkRuntime {
@@ -42,6 +42,7 @@ impl Runtime for SmalltalkRuntime {
         connection.execute_batch(SCHEMA)?;
         migrate_local_usage_seen(connection)?;
         backfill_message_index(connection)?;
+        unread_mail::create_schema(connection)?;
         resources::create_schema(connection)?;
         glass_heads::create_schema(connection)
     }
@@ -211,7 +212,7 @@ impl Runtime for SmalltalkRuntime {
 
 /// The version of smalltalk's shared projection layout, beside the claim vocabulary. Nodes whose
 /// layouts differ keep exchanging claim authority but do not compare projection maps.
-const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.one-shot-seats.v1";
+const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.adhoc-handoff.v3";
 
 /// The replication `schema_digest`: the claim vocabulary digest and the shared projection layout.
 pub(crate) fn compatibility_digest(registry_digest: &str) -> String {

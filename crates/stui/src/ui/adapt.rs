@@ -22,6 +22,7 @@ pub struct Extras {
     pub bodies: BTreeMap<String, (String, Option<String>, String)>,
     pub live: bool,
     pub offline: Option<String>,
+    pub mail_backlog: Option<Result<st3_client::MailBacklog, String>>,
 }
 
 fn now() -> String {
@@ -141,6 +142,11 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         host,
         link,
         diverged,
+        mail_backlog: match &extras.mail_backlog {
+            Some(Ok(value)) => Load::Ready(value.clone()),
+            Some(Err(error)) => Load::Failed(error.clone()),
+            None => Load::Loading,
+        },
         attention: loaded(model.now.snapshot.is_some(), attention),
         agents: loaded(model.agents.snapshot.is_some(), agents(model)),
         missions: loaded(model.missions.snapshot.is_some(), missions),
@@ -172,6 +178,55 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
             Some(Ok(period)) => period.limits.clone(),
             _ => Vec::new(),
         },
+        clients: match &model.clients {
+            Some(Ok(list)) => Load::Ready(
+                list.items
+                    .iter()
+                    .map(|item| connected(item, model.member_build.as_deref()))
+                    .collect(),
+            ),
+            Some(Err(why)) => Load::Failed(why.clone()),
+            None => Load::Loading,
+        },
+    }
+}
+
+fn connected(item: &st3_client::ClientConnection, member_build: Option<&str>) -> Connected {
+    let client = item.client.clone().unwrap_or_default();
+    Connected {
+        older: member_build.is_some_and(|member| older_than_member(&client, member)),
+        client,
+        who: item.person.clone(),
+        device: item.device_name.clone().or_else(|| item.device_id.clone()),
+        member: item.member.clone(),
+        via: item.via.clone(),
+        connected: item.connected,
+        when: if item.connected {
+            format!("since {}", age(&item.since))
+        } else {
+            format!("seen {} ago", age(&item.last_seen))
+        },
+        follows: item.follows.clone(),
+    }
+}
+
+/// Whether a client's reported build is an older version than the member's own. Only st's own
+/// builds share the member's version line ("stui 0.1.0+ab12cd3", "st 0.1.0+ab12cd3"); any other
+/// client, and any build that does not parse, is never called older.
+fn older_than_member(client: &str, member: &str) -> bool {
+    fn version(build: &str) -> Option<Vec<u64>> {
+        let base = build.split(['+', '-', ' ']).next()?;
+        base.split('.').map(|part| part.parse().ok()).collect()
+    }
+    let Some((name, build)) = client.split_once(' ') else {
+        return false;
+    };
+    if !matches!(name, "stui" | "st") {
+        return false;
+    }
+    match (version(build), version(member)) {
+        (Some(client), Some(member)) => client < member,
+        _ => false,
     }
 }
 
@@ -498,6 +553,12 @@ fn agents(model: &Model) -> Vec<Agent> {
                     AgentState::Fault
                 }
                 ("failed", _) => AgentState::Fault,
+                // Signed out of its provider (Claude "Not logged in · Run /login"): a login on
+                // its host fixes it, not a restart (Nathan, 2026-10-04).
+                ("waiting", Some("unauthenticated" | "needs-login")) => AgentState::NeedsLogin,
+                ("waiting", _) if agent.reason.as_deref() == Some("providerAuth") => {
+                    AgentState::NeedsLogin
+                }
                 ("running", Some("working")) => AgentState::Working,
                 ("running", _) => AgentState::Idle,
                 ("waiting", Some("ready" | "working" | "idle"))
@@ -505,7 +566,7 @@ fn agents(model: &Model) -> Vec<Agent> {
                 {
                     AgentState::NeedsYou
                 }
-                ("waiting", Some("unauthenticated" | "blocked")) => AgentState::NeedsYou,
+                ("waiting", Some("blocked")) => AgentState::NeedsYou,
                 ("waiting" | "starting" | "desired", _) => AgentState::Starting,
                 ("stopped", _) => AgentState::Stopped,
                 _ => AgentState::Unknown,
@@ -550,6 +611,11 @@ fn agents(model: &Model) -> Vec<Agent> {
                     queued: agent.queued_work_count,
                     harness_state: agent.harness_state.clone(),
                     runtime: None,
+                    model: agent
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.context.as_ref())
+                        .and_then(|context| context.model.clone()),
                     fault: agent.fault.clone(),
                     under: agent.under.first().map(|relation| {
                         model
@@ -1459,6 +1525,42 @@ mod tests {
     }
 
     #[test]
+    fn a_signed_out_harness_needs_login_and_clears_once_signed_in() {
+        let mut model = Model::default();
+        let resource = |state: &str, harness: &str, reason: Option<&str>| {
+            serde_json::json!({
+                "id": "agent/example/seat", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-10-04T12:00:00Z", "name": "example/seat",
+                "state": state, "reachability": "local", "harness_state": harness,
+                "blocked_on": "human", "reason": reason, "driver": "claude",
+                "host_id": "host/harbor", "runtime_ids": ["runtime/seat"], "under": [],
+            })
+        };
+        // st's own word for it (st-drivers' needs-login) reads the same.
+        model.agents = window(vec![resource("waiting", "needs-login", None)]);
+        assert_eq!(agents(&model)[0].state, AgentState::NeedsLogin);
+        model.agents = window(vec![resource("waiting", "unauthenticated", Some("providerAuth"))]);
+        let agent = &agents(&model)[0];
+        assert_eq!(agent.state, AgentState::NeedsLogin);
+        let guidance = super::super::screens::login_guidance(agent);
+        assert!(guidance.contains("Claude login required on harbor"), "{guidance}");
+        assert!(guidance.contains("/login") && guidance.contains("without a restart"), "{guidance}");
+        let header = super::super::screens::agent_header(&super::super::demo::world(), agent, 100, "⠋")
+            .lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(header.contains("needs login") && header.contains("run /login"), "{header}");
+        // st's reason alone says so too.
+        model.agents = window(vec![resource("waiting", "idle", Some("providerAuth"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::NeedsLogin);
+        // Signed in again on the same run: it is simply idle, with nothing to restart.
+        model.agents = window(vec![resource("running", "idle", None)]);
+        assert_eq!(agents(&model)[0].state, AgentState::Idle);
+    }
+
+    #[test]
     fn an_agents_subagents_come_from_st_as_part_of_it() {
         let mut model = Model::default();
         model.agents = window(vec![serde_json::json!({
@@ -1561,5 +1663,103 @@ mod tests {
         );
         assert_eq!(agent.details.queue, ["fleet/harbor · Audit › report"]);
         assert_eq!(world.host, "harbor");
+    }
+
+    #[test]
+    fn the_agent_header_names_the_model_beside_the_harness() {
+        let world = crate::ui::demo::world();
+        let mut agent = world.agents.items()[0].clone();
+        assert_eq!(agent.details.model.as_deref(), Some("claude-sonnet-5-5"));
+        let line = |agent: &Agent| -> String {
+            let doc = crate::ui::screens::agent_header(&world, agent, 100, "⠋");
+            doc.lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let with = line(&agent);
+        assert!(
+            with.contains(&format!("{} · claude-sonnet-5-5 · ", agent.harness.name())),
+            "{with}"
+        );
+        agent.details.model = None;
+        let without = line(&agent);
+        assert!(!without.contains("sonnet"), "{without}");
+        assert!(
+            without.contains(&format!("{} · {} ", agent.harness.name(), agent.host)),
+            "{without}"
+        );
+    }
+
+    #[test]
+    fn only_an_older_st_build_is_called_older_than_its_member() {
+        assert!(older_than_member("stui 0.0.9+77d0a13", "0.1.0+1ecae71"));
+        assert!(older_than_member("st 0.1.0+local.ab12cd3", "0.2.0+1ecae71"));
+        assert!(!older_than_member("stui 0.1.0+77d0a13", "0.1.0+1ecae71"));
+        assert!(!older_than_member("stui 0.2.0+77d0a13", "0.1.0+1ecae71"));
+        // Another client's version line is its own, and an unnamed or odd build is never older.
+        assert!(!older_than_member(
+            "smalltalk-ios 0.0.1 (3)",
+            "0.1.0+1ecae71"
+        ));
+        assert!(!older_than_member("", "0.1.0+1ecae71"));
+        assert!(!older_than_member("stui dev", "0.1.0+1ecae71"));
+    }
+
+    #[test]
+    fn the_clients_card_says_who_is_connected_and_notes_an_older_build_quietly() {
+        let world = crate::ui::demo::world();
+        let doc = crate::ui::screens::clients_card(&world, 100);
+        let text: Vec<String> = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        let text = text.join("\n");
+        assert!(text.contains("CONNECTED CLIENTS"), "{text}");
+        assert!(text.contains("stui 0.1.0+1ecae71"), "{text}");
+        assert!(text.contains("person/robin · Robin's phone"), "{text}");
+        // The follows list may wrap, so its words are checked apart.
+        assert!(text.contains("follows now,"), "{text}");
+        assert!(
+            text.contains("terminal:terminal/agent/lark/planner"),
+            "{text}"
+        );
+        assert!(text.contains("seen 3m ago"), "{text}");
+        assert_eq!(text.matches("older than this member").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn the_clients_card_wraps_a_long_client_instead_of_clipping_it() {
+        let world = crate::ui::demo::world();
+        let doc = crate::ui::screens::clients_card(&world, 44);
+        let lines: Vec<String> = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        for line in &lines {
+            assert!(
+                crate::ui::text::width(line) <= 44,
+                "clipped at the card's edge: {line:?}"
+            );
+        }
+        let text = lines.join("\n");
+        assert!(text.contains("smalltalk-ios 1.0 (42)"), "{text}");
+        assert!(
+            text.contains("terminal:terminal/agent/lark/planner"),
+            "{text}"
+        );
     }
 }

@@ -17,3 +17,9 @@ jobs:
         run: python3 scripts/check-public-repo-test
       - name: Check repository content
         run: python3 scripts/check-public-repo
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_REASON: Runs standard-library source checks without downloads or compilation.
+        run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""

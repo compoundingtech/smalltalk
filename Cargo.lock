@@ -4495,6 +4495,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "st3-client-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "st3-client",
+ "st3-conversation-ui",
+ "st3-feed",
+ "tokio",
+]
+
+[[package]]
 name = "st3-conversation-ui"
 version = "0.1.0"
 dependencies = [

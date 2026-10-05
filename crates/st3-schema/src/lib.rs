@@ -101,6 +101,20 @@ pub enum Cardinality {
     StateTransition,
 }
 
+/// What changed at a sekrets gateway. A `put` names the value it set, never the value.
+pub const SEKRET_CHANGES: &[&str] = &[
+    "profile-created",
+    "profile-removed",
+    "policy-set",
+    "put",
+    "unset",
+    "grant-added",
+    "grant-removed",
+    "locked",
+    "unlocked",
+    "daemon-registered",
+];
+
 /// How a subagent ended: as its harness reported (`completed`, `failed`, `interrupted`), or as st
 /// closed it when its lease ran out (`expired`), its parent session ended (`session-ended`), its
 /// harness exited or restarted (`harness-exited`), or its seat was stopped or removed
@@ -787,6 +801,12 @@ fn build_registry() -> Registry {
             "schedule",
             "schedule/RUN/LOCAL_ID",
             "A mission-run schedule.",
+            false,
+        ),
+        (
+            "sekret",
+            "sekret/HOST or sekret/HOST/OWNER/NAME",
+            "A host's sekrets gateway, or one of its profiles: calls run with a credential the caller never reads.",
             false,
         ),
         (
@@ -1702,6 +1722,45 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             false,
             &[],
         ),
+        // A host's sekrets gateway logs each call, its exit, each refusal and each change to its
+        // profiles, grants, locks and keys; the host's daemon records each entry once. Never a
+        // credential and never a command's output.
+        (
+            "sekret.called",
+            &["sekret"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("sekrets"),
+            false,
+            &[],
+        ),
+        (
+            "sekret.exited",
+            &["sekret"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("sekrets"),
+            false,
+            &[],
+        ),
+        (
+            "sekret.refused",
+            &["sekret"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("sekrets"),
+            false,
+            &[],
+        ),
+        (
+            "sekret.changed",
+            &["sekret"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("sekrets"),
+            false,
+            &[],
+        ),
         (
             "harness.timeline",
             &["agent"],
@@ -2387,6 +2446,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("attempt", integer()),
         ],
         "mission-run.created" => &[
+            ("mission_spec", object()),
+            ("ad_hoc_title", string()),
             ("status", string()),
             ("mission", reference()),
             ("revision", string()),
@@ -2533,6 +2594,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("claim_expires_at_unix_ms", integer()),
             ("readiness_epoch", integer()),
             ("extend_ms", integer()),
+            ("handoff_key", string()),
+            ("handoff_request", object()),
+            ("handoff_to", reference()),
+            ("handoff_message", reference()),
+            ("handoff_acknowledged", reference()),
         ],
         "gate.requested" => &[
             ("status", string()),
@@ -2787,6 +2853,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         ],
         "runtime.action.requested" => &[
             ("action", string()),
+            ("host", string()),
+            ("source_host", string()),
             ("rollout", object()),
             ("operation", string()),
             ("runtime_id", string()),
@@ -2800,6 +2868,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         | "runtime.action.failed"
         | "runtime.action.deadline-reached" => &[
             ("action", string()),
+            ("source_host", string()),
             ("rollout", object()),
             ("operation", string()),
             ("runtime_id", string()),
@@ -2886,6 +2955,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("input_buffer", string()),
             ("exit", string()),
             ("observed_since_ms", integer()),
+            ("status_transition", boolean()),
             ("observed_at_ms", integer()),
             ("ownership_sequence", integer()),
             ("transition_sequence", integer()),
@@ -2989,6 +3059,47 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("step_run", reference_to(&["step-run"])),
             ("started_at_unix_ms", integer()),
             ("lease_expires_at_unix_ms", required_integer()),
+        ],
+        "sekret.called" => &[
+            ("seq", required_integer()),
+            ("caller", required_reference_to(&["agent", "person"])),
+            ("person", required_reference_to(&["person"])),
+            ("profile", required_string()),
+            ("argv", array()),
+            ("cwd", string()),
+            ("grant", string()),
+            ("login", boolean()),
+            ("tty", boolean()),
+            ("at_unix_ms", required_integer()),
+        ],
+        "sekret.exited" => &[
+            ("seq", required_integer()),
+            ("call", required_integer()),
+            ("caller", reference_to(&["agent", "person"])),
+            ("person", required_reference_to(&["person"])),
+            ("profile", string()),
+            ("exit_code", integer()),
+            ("signal", integer()),
+            ("error", string()),
+            ("at_unix_ms", required_integer()),
+        ],
+        "sekret.refused" => &[
+            ("seq", required_integer()),
+            ("caller", reference_to(&["agent", "person"])),
+            ("person", required_reference_to(&["person"])),
+            ("profile", string()),
+            ("argv", array()),
+            ("reason", required_string()),
+            ("at_unix_ms", required_integer()),
+        ],
+        "sekret.changed" => &[
+            ("seq", required_integer()),
+            ("change", required_enum(SEKRET_CHANGES)),
+            ("caller", reference_to(&["agent", "person"])),
+            ("person", required_reference_to(&["person"])),
+            ("profile", string()),
+            ("detail", object()),
+            ("at_unix_ms", required_integer()),
         ],
         "subagent.renewed" => &[
             ("subagent_id", required_string()),
@@ -3750,6 +3861,7 @@ mod tests {
                 "rule",
                 "run-generation",
                 "schedule",
+                "sekret",
                 "step-run",
                 "subscription",
             ]
@@ -3894,6 +4006,10 @@ mod tests {
                 "schedule.work-failed",
                 "schedule.work-requested",
                 "schedule.work-started",
+                "sekret.called",
+                "sekret.changed",
+                "sekret.exited",
+                "sekret.refused",
                 "step-run.carried",
                 "step-run.retried",
                 "step-run.state",

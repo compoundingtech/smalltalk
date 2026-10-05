@@ -21,6 +21,9 @@ HERE = Path(__file__).resolve().parent
 CASES = ("baseline", "daemon-restart", "binary-swap", "path-deploy", "link-seconds", "link-minutes",
          "receiver-down", "harness-restart", "channel-killed", "old-channel", "handoff-failed")
 
+RECOVERY_CASES = ("daemon-restart", "binary-swap", "path-deploy", "receiver-down",
+              "harness-restart", "channel-killed")
+
 
 def now_ms():
     return time.time_ns() // 1_000_000
@@ -299,9 +302,14 @@ def provider_pids(rows):
 async def agent(node):
     result = await node.cli("agents", "show", "agent/eval/fault-probe", "--json", check=False)
     try:
-        return json.loads(result).get("value", {})
+        return json.loads(result).get("value") or {}
     except ValueError:
         return {}
+
+
+async def current_channel(node):
+    card = await agent(node)
+    return card if (card.get("delivery") or {}).get("state") == "current" else None
 
 
 async def send(node, case):
@@ -339,6 +347,16 @@ def judge(proof):
         for field in ("failed_path_visible", "failed_doctor_visible", "failed_sender_visible"):
             if not proof.get(field):
                 failures.append(f"blocked handoff was not visible: {field}")
+    if proof["case"] in RECOVERY_CASES:
+        if proof["recovered_received_copies"] != 1 or proof["recovered_read_claims"] != 1:
+            failures.append("recent unoffered mail did not recover with exactly one native offer and read")
+        if not proof["recovered_receipt_matches_graph"]:
+            failures.append("recovered reader receipt and graph read time differ")
+        if proof["recovered_sender_status"] not in ("read", "closed") or proof["recovered_recipient_status"] not in ("read", "closed"):
+            failures.append("recovered mail did not converge to read in both mailboxes")
+        delay = proof["recovered_read_after_clear_ms"]
+        if delay is None or not 0 <= delay <= 10_000:
+            failures.append("recent unoffered recovery missed its 10000 ms deadline")
     delivery = proof["delivery_after"]
     expected_delivery = "legacy" if proof["case"] == "old-channel" else "current"
     if delivery.get("state") != expected_delivery:
@@ -434,6 +452,7 @@ agent "fault-probe" {{
         fault_started = now_ms()
         fault_monotonic = time.monotonic()
         subject = None
+        recovery_started = None
         phase = "fault-injection"
         if case == "daemon-restart":
             # Queue before shutting down, without racing a successful handoff.
@@ -443,11 +462,13 @@ agent "fault-probe" {{
             await target.down()
             link.enabled = True
             await asyncio.sleep(args.short_seconds)
+            recovery_started = now_ms()
             await target.start()
         elif case == "receiver-down":
             await target.down()
             subject = await send(source, case)
             await asyncio.sleep(args.short_seconds)
+            recovery_started = now_ms()
             await target.start()
         elif case in ("binary-swap", "old-channel"):
             link.drop()
@@ -462,6 +483,7 @@ agent "fault-probe" {{
                 # between one-second polls. The real extension owns channel recovery.
                 await asyncio.sleep(args.short_seconds)
             await target.start()
+            recovery_started = now_ms()
             link.enabled = True
         elif case == "path-deploy":
             link.drop()
@@ -474,6 +496,7 @@ agent "fault-probe" {{
             await target.down()
             target.binary = deployed
             await target.start()
+            recovery_started = now_ms()
             link.enabled = True
         elif case in ("link-seconds", "link-minutes"):
             link.drop()
@@ -506,12 +529,14 @@ agent "fault-probe" {{
             result["failed_sender_visible"] = (blocked_sender or {}).get("delivery", {}).get("state") == "waiting"
             (target.root / "ws/handoff-blocked").unlink()
         elif case == "channel-killed":
+            link.drop()
             channels = [row for row in before if " driver omp-channel " in row["argv"]]
             if len(channels) != 1:
                 raise RuntimeError(f"expected one channel, got {len(channels)}")
             os.kill(channels[0]["pid"], signal.SIGKILL)
             subject = await send(source, case)
         elif case == "harness-restart":
+            link.drop()
             if len(initial) != 1:
                 raise RuntimeError("expected exactly one provider")
             os.kill(initial[0], signal.SIGKILL)
@@ -522,14 +547,47 @@ agent "fault-probe" {{
             await until(restarted, args.ready_seconds)
         else:
             subject = await send(source, case)
+        if case in RECOVERY_CASES and not link.enabled:
+            await until(lambda: current_channel(target), args.ready_seconds)
+            # Recovery starts when the blocked link is actually restored, not during its outage.
+            cleared = now_ms()
+            link.enabled = True
+        else:
+            cleared = recovery_started if recovery_started is not None else now_ms()
         phase = "fault-observation"
-        cleared = now_ms()
         result.update(message=subject, fault_started_at_unix_ms=fault_started,
                       fault_cleared_at_unix_ms=cleared,
                       fault_duration_ms=round((time.monotonic() - fault_monotonic) * 1000))
         # Fixed tail: a first successful read does not end duplicate observation.
         # Also wait beyond delivery-presence's startup grace, including old channels.
         await asyncio.sleep(args.observe_seconds)
+        if case in RECOVERY_CASES:
+            # A recent never-offered send survives recovery exactly once. Keep the full
+            # observation tail and then send live mail to expose any duplicate native offer.
+            await until(lambda: current_channel(target), args.ready_seconds)
+            link.enabled = True
+            recovered_subject = subject
+            recovery_cleared = cleared
+            cleared = now_ms()
+            subject = await send(source, case + "-fresh")
+            result.update(recovered_message=recovered_subject, message=subject, fresh_sent_at_unix_ms=cleared)
+            await asyncio.sleep(args.observe_seconds)
+            recovered_rows = [row for row in receipts(target) if row.get("subject") == recovered_subject]
+            recovered_trace = await target.cli("trace", "show", recovered_subject, "--json", "--limit", "100")
+            recovered_claims = [json.loads(line) for line in recovered_trace.splitlines() if line]
+            recovered_source = await source.api("/v1/messages/read/" + recovered_subject)
+            recovered_target = await target.api("/v1/messages/read/" + recovered_subject)
+            recovery_reads = [row for row in recovered_rows if row["event"] == "read"]
+            recovery_read_at = min((row["accepted_at_unix_ms"] for row in recovery_reads), default=None)
+            graph_recovery_reads = [row for row in recovered_claims if row.get("kind") == "message.read"]
+            result.update(recovered_read_after_clear_ms=recovery_read_at - recovery_cleared
+                              if recovery_read_at is not None else None,
+                          recovered_receipt_matches_graph=len(graph_recovery_reads) == 1
+                              and graph_recovery_reads[0]["accepted_at_unix_ms"] == recovery_read_at,
+                          recovered_received_copies=sum(row["event"] == "received" for row in recovered_rows),
+                          recovered_read_claims=sum(row.get("kind") == "message.read" for row in recovered_claims),
+                          recovered_sender_status=(recovered_source or {}).get("status"),
+                          recovered_recipient_status=(recovered_target or {}).get("status"))
         after = target.seats()
         after_card = await agent(target)
         all_receipts = receipts(target)

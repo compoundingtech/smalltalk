@@ -18,25 +18,55 @@ the provider. Several st processes carry the seat's messages for the whole provi
 | pi, omp | keeps presence, the terminal record, and live PTY titles | `st driver pi-channel` or `omp-channel` subscribes to the mailbox; the managed extension preserves first-idle gating and reports native acceptance separately from turn-context consumption |
 
 New seats receive `ST3_MAILBOX_TRANSPORT=push`. Each delivery component connects to `/v1/mailbox`
-over the local daemon Unix socket. The stream first replays the durable graph mailbox and full seat
-record, then pushes changes. SQLite fences both subscriptions and receipts to the live runtime
+over the local daemon Unix socket. The stream sends the full seat record and pushes new mail.
+Every connection starts a new automatic-delivery boundary. Pre-connection mail older than one
+hour stays held in the graph mailbox. Recent mail with no staging or delivery claim is admitted
+once so an in-flight send survives a daemon restart. Previously staged or delivered-but-unread
+mail stays held regardless of age; a missing receipt never authorizes another offer. The one-hour
+window uses the original send time and the same threshold as the unread backlog. SQLite
+fences both subscriptions and receipts to the live runtime
 incarnation and replacement owner; reconnecting an older channel cannot retake ownership, including
 after a daemon restart. Socket loss creates no delivered or read receipt. Native ledgers retain
 uncertain handoffs, and successful handoffs retry lost receipt acknowledgements with stable IDs.
 No push component projects message bodies into `resources/inbox` or `resources/archive`.
 
-`delivered` records native transport acceptance, not model consumption. A replacement runtime
-reoffers delivered-but-unread messages with their original stable IDs, as well as sent and staged
-messages. The same live channel keeps its handoff deduplication, and provider ledgers reconcile
-uncertain handoffs across channel replacement. Read and closed messages are not reinjected.
-If a provider accepted mail without durable consumption evidence, recovery favors another offer
-over silently dropping it; recipients should record read evidence when they consume the message.
+`delivered` records native transport acceptance, not model consumption. A boot or channel reconnect
+never authorizes another offer of old mail. Older polling drivers also recover recent unoffered
+pre-boot mail and retain the current boot's staging attempt until its receipts finish;
+their local archive projection removes old native inbox files without closing the graph messages.
+An agent can explicitly inspect that retained mail with `st conversations ls --as "$ST_AGENT"`
+and read it with `st conversations read MESSAGE --as "$ST_AGENT"`. New mail on the live connection
+continues to arrive normally, with the channel's usual handoff deduplication and receipt handling.
+
+Claude distinguishes native queue acceptance (`queue-operation/enqueue`, which records
+`delivered`) from consumption (a user transcript entry, including `isMeta`, or an explicit
+`queue-operation/remove` with `reason: absorbed_mid_turn`, which records `read`). Receipt matching
+requires the complete immutable message envelope. Startup can precede transcript creation;
+the channel retries validation of the exact native session named by this wrapper's hook binding,
+with backoff capped at 30 seconds. It never chooses a transcript by recency. Existing native proof
+is reconciled before another notification is sent, including after a channel or seat restart.
+
+For already-staged Claude mail, durable native proof repairs the missing receipts. An uncertain
+handoff stays queued and retains its attempt ledger across restart; after 30 seconds without proof,
+`claude-handoff-unconfirmed` explains why another notification is held. Preparation, transcript
+lookup, and receipt publication failures have separate diagnostics and retry with backoff capped
+at 30 seconds. Retained handoffs are inspected only to recover missing receipts from exact native
+proof. Boot and reconnect never authorize a fresh offer of delivered-but-unread mail.
+
+`st doctor` and stui count unread (`sent`, `staged`, or `delivered`) messages older than one hour, including
+retained mail for retired seats. Boot never clears that backlog. To deliberately archive it across
+all mailboxes, run `st conversations cleanup --all --older-than 1h`. Add `--dry-run` to list matching
+message IDs first, or replace `--all` with `--as AGENT` to clean one mailbox. Cleanup archives as each
+recipient, records manual archival through stable keys and linked claims, and can be repeated,
+including after an interrupted archival. Delivered mail without a read claim is included. Fresh
+messages and messages with a read or closed claim are left alone. An agent can still list and explicitly
+read held mail instead of archiving it.
 
 Epochs are allocated by the daemon, independently of wall-clock time. An initial bind has a stable
 request token; a lost acknowledgement retries that same epoch, and retired tokens cannot allocate
 another epoch after replacement. Reexec carries the returned epoch and token. Only an explicit
 `stale-mailbox-session` ends a subscription as fenced. Store/read worker failures close its socket
-and the current owner reconnects and replays after one second without creating a receipt.
+and the current owner reconnects after one second without creating a receipt or replaying old mail.
 
 OMP todo observation does not own delivery's lifetime. If the local PTY incarnation is ahead of
 the graph, the channel retains the latest validated todo snapshot while delivery continues. Its

@@ -66,10 +66,10 @@ with tempfile.TemporaryDirectory() as tmp:
         stub.write_text(f'''#!{bash}
 printf '%s\\n' "$*" >> "$COMMAND_LOG"
 if [ "${{1:-}}" = test ] && [[ " $* " != *" --no-run "* ]]; then exit 90; fi
-if [ "${{1:-}}" = run ] || [ "${{1:-}}" = nextest ]; then exit 91; fi
+if [ "${{1:-}}" = run ] || {{ [ "${{1:-}}" = nextest ] && [ "${{2:-}}" != archive ]; }}; then exit 91; fi
 ''')
         stub.chmod(0o755)
-    for stage in ['tests', 'clippy', 'fleet-compat']:
+    for stage in ['tests', 'clippy', 'fleet-compat', 'isolation-vm']:
         log = scratch / (stage + '.log')
         subprocess.run([bash, str(ROOT / 'scripts/ci-cache-warm'), stage], cwd=ROOT, check=True,
                        env={**os.environ, 'PATH': f'{scratch}:{os.environ["PATH"]}',

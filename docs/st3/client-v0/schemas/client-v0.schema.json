@@ -109,6 +109,7 @@
             { "$ref": "#/$defs/Capabilities" },
             { "$ref": "#/$defs/DocumentContent" },
             { "$ref": "#/$defs/SubjectDefinition" },
+            { "$ref": "#/$defs/AgentWorkspace" },
             { "$ref": "#/$defs/Page" },
             { "$ref": "#/$defs/ResourcesPage" },
             { "$ref": "#/$defs/Resource" },
@@ -120,8 +121,10 @@
             { "$ref": "#/$defs/PairingChallenge" },
             { "$ref": "#/$defs/PairedSession" },
             { "$ref": "#/$defs/TerminalScreen" },
+            { "$ref": "#/$defs/StatusHistory" },
             { "$ref": "#/$defs/AgentQueue" },
-            { "$ref": "#/$defs/UsagePeriod" }
+            { "$ref": "#/$defs/UsagePeriod" },
+            { "$ref": "#/$defs/MailBacklog" }
           ]
         }
       }
@@ -552,6 +555,15 @@
         "context": { "$ref": "#/$defs/UsageContext" }
       }
     },
+    "MailBacklog": {
+      "type": "object", "additionalProperties": false,
+      "required": ["count", "threshold_ms", "cleanup_command"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "threshold_ms": { "type": "integer", "minimum": 1 },
+        "cleanup_command": { "type": "string" }
+      }
+    },
     "UsagePeriod": {
       "type": "object", "additionalProperties": false,
       "required": ["since_ms", "until_ms", "rows"],
@@ -762,6 +774,19 @@
         }
       ]
     },
+    "AgentWorkspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "agent_id", "host_id", "workspace", "desired_token", "declaration_token"],
+      "properties": {
+        "kind": { "const": "agent-workspace" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "host_id": { "$ref": "#/$defs/HostId" },
+        "workspace": { "type": "string", "description": "Declared workspace directory on host_id, not the API gateway's filesystem or the harness's internal state directory." },
+        "desired_token": { "type": "string", "description": "Selected desired claim, including a stop when the seat is retired." },
+        "declaration_token": { "type": "string", "description": "Agent declaration supplying the workspace; reached through unambiguous stop predecessors." }
+      }
+    },
     "Agent": {
       "allOf": [
         { "$ref": "#/$defs/ResourceHeader" },
@@ -777,7 +802,9 @@
             "runtime_ids": { "type": "array", "items": { "$ref": "#/$defs/RuntimeId" } },
             "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/MissionRunId" }, { "type": "null" }] },
             "driver": { "type": ["string", "null"] },
-            "harness_state": { "type": ["string", "null"] },
+            "harness_state": { "type": ["string", "null"], "description": "Observed harness state; stale idle is indeterminate. Desired state and declared work status remain separate." },
+            "since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "When this observed state began in this runtime incarnation. Same-state observations never reset it." },
+            "observation": { "enum": ["current", "stale", "missing"], "description": "Stale after 90 seconds without a new observation; missing when this runtime has no observation." },
             "blocked_on": { "type": ["string", "null"], "description": "Current incarnation's harness blocking axis; human means a person must answer before it continues." },
             "ask": { "type": ["string", "null"], "description": "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." },
             "reason": { "type": ["string", "null"], "description": "Diagnostic harness reason, not a machine-readable verdict." },
@@ -882,8 +909,10 @@
       "required": ["action", "phase", "operation_id", "updated_at", "blocking"],
       "properties": {
         "action": { "enum": ["suspend", "resume"] },
-        "phase": { "enum": ["quiescing", "snapshotting", "suspended", "failed", "restoring", "verifying", "resumed"], "description": "suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason." },
+        "phase": { "enum": ["quiescing", "snapshotting", "suspended", "failed", "fencing-source", "transferring", "restoring", "verifying", "resumed"], "description": "suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason." },
         "operation_id": { "type": "string", "description": "The request claim; each phase change is a change of this agent." },
+        "source_host": { "type": ["string", "null"] },
+        "host": { "type": ["string", "null"] },
         "harness": { "type": ["string", "null"] },
         "native_session_id": { "type": ["string", "null"], "description": "The harness's own session the seat suspended on and resumes." },
         "incarnation_id": { "type": ["string", "null"], "description": "The suspended incarnation, or the one a completed resume launched." },
@@ -928,6 +957,70 @@
         "tree": { "type": "object" },
         "kdl": { "type": "string" },
         "revisions": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "StatusHistory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "seat",
+        "items",
+        "retained_from",
+        "complete"
+      ],
+      "properties": {
+        "kind": {
+          "const": "status-history"
+        },
+        "seat": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "items": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/StatusTransition"
+          }
+        },
+        "retained_from": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "complete": {
+          "type": "boolean"
+        }
+      }
+    },
+    "StatusTransition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "seat",
+        "runtime_incarnation",
+        "state",
+        "observed_at",
+        "reset"
+      ],
+      "properties": {
+        "seat": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "runtime_incarnation": {
+          "type": "string"
+        },
+        "state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observed_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "reset": {
+          "type": "boolean",
+          "description": "An incarnation starts here. A runtime reset without a harness observation has a null state."
+        }
       }
     },
     "AgentQueue": {
@@ -1532,7 +1625,7 @@
     "AgentStopParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}, "reason": {"type": "string"}}},
     "AgentStartParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}}},
     "AgentSuspendParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}, "reason": {"type": "string"}}},
-    "AgentResumeParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}}},
+    "AgentResumeParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}, "host": {"type": "string", "minLength": 1}}},
     "TerminalCreateParameters": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1}, "host": {"type": "string", "minLength": 1}, "cwd": {"type": "string", "minLength": 1}}},
     "PersonAskParameters": {
       "type": "object", "additionalProperties": false, "required": ["person_id", "title", "reason"],

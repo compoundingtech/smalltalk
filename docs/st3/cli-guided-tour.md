@@ -66,6 +66,7 @@ st missions ls
 st missions show --help
 st missions show mission-run/64bcc9227e0166a571e09117d35c572e
 st missions publish --help
+st missions publish mission.kdl --as person/alex --dry-run
 st missions check --help
 st missions start --help
 st missions cancel --help
@@ -76,6 +77,10 @@ st missions retire --help
 `ls` and `show` are live reads. Publication, start, cancel, setting a finished run's outcome, and
 retirement are reviewed through help here and are mutation-tested only in the disposable fixture
 run.
+
+`publish --dry-run` (alias `--preview`) prints the resolved intent and publication diagnostics,
+including blockers, without publishing or running exec gates. Add `--json` for the complete
+preview object. `missions check FILE` runs gate commands separately when needed.
 
 ### 3. `work` — the truthful queue and worker lifecycle
 
@@ -93,6 +98,9 @@ st work show step-run/e3e841ba011236a21fe8bd3e50c21a1d/walkthrough-and-followup
 Then inspect every lifecycle and revision action:
 
 ```sh
+st work start --help
+st work handoff --help
+st work acknowledge --help
 st work claim --help
 st work renew --help
 st work progress --help
@@ -259,7 +267,10 @@ stayed held.
 
 `agents suspend` is a mutation. Suspend only a seat we agreed to stop. Check that a busy seat is
 refused with its reasons, that a quiet one shows `suspended` with its native session in `agents
-show`, and that `agents resume` reports the same session.
+show`, and that `agents resume` reports the same session. `agents resume --host HOST` carries a pi
+or omp snapshot to another fleet host under the same seat identity. The target needs the same
+absolute workspace path, unoccupied; non-Git workspaces refuse suspend. Follow `suspension.phase`
+and the typed refusal reason in `agents show`.
 
 `agents new --print-kdl` shows the seat declaration without applying it. Check that its workspace is
 a new directory below that host's home and that the harness defaults match the fleet's existing
