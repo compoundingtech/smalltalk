@@ -11,12 +11,13 @@ export type ActionCommon = {
   parameters: {
 
 };
-  type: "custom.reply" | "harness.queue.mutate" | "harness.model.set" | "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
+  type: "custom.reply" | "harness.answer_ask" | "harness.queue.mutate" | "harness.model.set" | "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
 };
 
 export type ActionResult = {
   action_id: Id;
   affected_ids: Array<Id>;
+  harness_ask?: HarnessAskReceipt;
   harness_control?: HarnessControlReceipt;
   harness_model?: HarnessModelReceipt;
   kind: "action-result";
@@ -557,7 +558,7 @@ export type Envelope = {
   value: (Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | HarnessQueueView | HarnessModelCatalogPage | HarnessControlOperationReceipt | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
-export type ErrorCode = ("attention-migrated" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "stale-harness-control" | "unsupported-harness-control" | "missing-queue-entry" | "already-dispatched" | "invalid-queue-content" | "invalid-idempotency-key" | "stale-queue" | "queue-full" | "invalid-queue-move" | "queue-revision-exhausted" | "stale-queue-cursor" | "queue-metadata-too-large" | "queue-entry-too-large" | "unsupported-harness-model" | "stale-harness-model" | "unavailable-harness-model" | "unsupported-harness-effort" | "harness-control-busy" | "native-pre-dequeue-api-unavailable" | "internal" | string);
+export type ErrorCode = ("attention-migrated" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "stale-harness-control" | "unsupported-harness-control" | "missing-queue-entry" | "already-dispatched" | "invalid-queue-content" | "invalid-idempotency-key" | "stale-queue" | "queue-full" | "invalid-queue-move" | "queue-revision-exhausted" | "stale-queue-cursor" | "queue-metadata-too-large" | "queue-entry-too-large" | "unsupported-harness-model" | "stale-harness-model" | "unavailable-harness-model" | "unsupported-harness-effort" | "harness-control-busy" | "native-pre-dequeue-api-unavailable" | "ask-no-longer-pending" | "invalid-harness-answers" | "unsupported-harness-ask" | "internal" | string);
 
 export type ErrorEnvelope = {
   api_version: "st3.client.v0";
@@ -637,6 +638,66 @@ export type HarnessApproval = {
   supported: false;
 };
 
+export type HarnessAskAnswer = {
+  custom_input?: string;
+  id: string;
+  selected_options: Array<string>;
+};
+
+export type HarnessAskIndeterminateReason = "terminal-input-conflict";
+
+export type HarnessAskOption = {
+  description?: string;
+  label: string;
+  preview?: string;
+};
+
+export type HarnessAskOutcome = ({
+  _tag: "Indeterminate";
+  reason: HarnessAskIndeterminateReason;
+});
+
+export type HarnessAskParameters = ({
+  _tag: "Selection";
+  answers: Array<HarnessAskSelectionAnswer>;
+  askRef: string;
+} | {
+  _tag: "Text";
+  askRef: string;
+  text: string;
+});
+
+export type HarnessAskQuestion = {
+  id: string;
+  multi?: boolean;
+  options: Array<HarnessAskOption>;
+  question: string;
+  recommended?: number;
+};
+
+export type HarnessAskReceipt = {
+  binding: HarnessBinding;
+  operation_id: string;
+  outcome?: HarnessAskOutcome;
+  reason: string | null;
+  result: (HarnessAskResult | null);
+  status: HarnessOutcome;
+  subject: string;
+  tool_call_id: string;
+};
+
+export type HarnessAskResult = {
+  answers: Array<HarnessAskAnswer>;
+  native_event: "tool_result";
+  tool_call_id: string;
+};
+
+export type HarnessAskSelectionAnswer = {
+  options: Array<string>;
+  questionId: string;
+  text?: string;
+};
+
 export type HarnessBinding = {
   desired_revision: string;
   incarnation_id: string;
@@ -644,7 +705,7 @@ export type HarnessBinding = {
   turn_id: string | null;
 };
 
-export type HarnessControlOperationReceipt = (HarnessControlReceipt | HarnessModelReceipt);
+export type HarnessControlOperationReceipt = (HarnessControlReceipt | HarnessModelReceipt | HarnessAskReceipt);
 
 export type HarnessControlReceipt = {
   binding: HarnessBinding;
@@ -659,10 +720,13 @@ export type HarnessControlReceipt = {
 
 export type HarnessControlState = {
   approval: HarnessApproval;
+  ask_reason: string | null;
+  ask_supported: boolean;
   binding: HarnessBinding;
   idle: boolean;
   input_supported: boolean;
   models: HarnessModelsSummary;
+  pending_ask: (HarnessPendingAsk | null);
   reason: string | null;
   steer: HarnessSteerCapability;
   subject: string;
@@ -730,9 +794,15 @@ export type HarnessModelsSummary = {
   source: string;
 };
 
-export type HarnessNativeResult = (HarnessInputResult | HarnessModelResult);
+export type HarnessNativeResult = (HarnessInputResult | HarnessModelResult | HarnessAskResult);
 
 export type HarnessOutcome = "accepted" | "dispatched" | "applied" | "rejected" | "indeterminate" | "cancelled";
+
+export type HarnessPendingAsk = {
+  ask_ref: string;
+  questions: Array<HarnessAskQuestion>;
+  tool_call_id: string;
+};
 
 export type HarnessPhase = {
   name: string;
@@ -1979,6 +2049,7 @@ export type ActionRequest =
   reason?: string;
 }; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'custom.reply'; parameters: CustomReplyParameters; fence: Fence }) |
+  (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'harness.answer_ask'; parameters: HarnessAskParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'harness.model.set'; parameters: HarnessModelParameters; fence: Fence & Required<Pick<Fence, 'runtime_incarnation' | 'runtime_desired_revision'>> }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'harness.queue.mutate'; parameters: HarnessQueueParameters; fence: Fence & Required<Pick<Fence, 'runtime_incarnation' | 'runtime_desired_revision'>> }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'lane.approve'; parameters: {

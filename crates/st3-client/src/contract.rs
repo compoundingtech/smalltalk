@@ -12,6 +12,7 @@ pub const ACTION_NAMES: &[&str] = &[
     "agent.suspend",
     "attention.resolve",
     "custom.reply",
+    "harness.answer_ask",
     "harness.model.set",
     "harness.queue.mutate",
     "lane.approve",

@@ -179,7 +179,7 @@ export const ActionCommon = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
   "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")),
   "parameters": Schema.Record(Schema.String, Schema.Unknown),
-  "type": Schema.Literals(["custom.reply","harness.queue.mutate","harness.model.set","attention.resolve","review.approve","review.reject","review.request-changes","message.send","message.read","message.close","launch.create","launch.revise","launch.preview","launch.approve","launch.cancel","mission.start","mission.revise","mission.approve-revision","mission.cancel-revision","mission.cancel","session.import","work.ask","work.done","work.cancel-ask","work.claim","work.renew","work.progress","work.complete","work.fail","work.release","work.retry","work.publish-mission","agent.create","agent.stop","agent.start","agent.suspend","agent.resume","terminal.create","terminal.end","agent.queue-move","lane.join","lane.leave","lane.move","lane.mark","lane.approve","runtime.stop","runtime.restart","runtime.reset","runtime.context-clear","runtime.signal","terminal.input","terminal.resize","terminal.attach","terminal.detach","pairing.revoke"])
+  "type": Schema.Literals(["custom.reply","harness.answer_ask","harness.queue.mutate","harness.model.set","attention.resolve","review.approve","review.reject","review.request-changes","message.send","message.read","message.close","launch.create","launch.revise","launch.preview","launch.approve","launch.cancel","mission.start","mission.revise","mission.approve-revision","mission.cancel-revision","mission.cancel","session.import","work.ask","work.done","work.cancel-ask","work.claim","work.renew","work.progress","work.complete","work.fail","work.release","work.retry","work.publish-mission","agent.create","agent.stop","agent.start","agent.suspend","agent.resume","terminal.create","terminal.end","agent.queue-move","lane.join","lane.leave","lane.move","lane.mark","lane.approve","runtime.stop","runtime.restart","runtime.reset","runtime.context-clear","runtime.signal","terminal.input","terminal.resize","terminal.attach","terminal.detach","pairing.revoke"])
 }).annotate({ identifier: "ActionCommon" }))()
 export type ActionCommon = typeof ActionCommon.Type
 export type ActionCommonEncoded = typeof ActionCommon.Encoded
@@ -258,6 +258,21 @@ export const DeviceSignature = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "DeviceSignature" }))()
 export type DeviceSignature = typeof DeviceSignature.Type
 export type DeviceSignatureEncoded = typeof DeviceSignature.Encoded
+
+export const HarnessAskSelectionAnswer = /*#__PURE__*/ (() => Schema.Struct({
+  "options": Schema.Array(Schema.String).check(Schema.isUnique()),
+  "questionId": Schema.String,
+  "text": optionalKey(Schema.String)
+}).annotate({ identifier: "HarnessAskSelectionAnswer" }))()
+export type HarnessAskSelectionAnswer = typeof HarnessAskSelectionAnswer.Type
+export type HarnessAskSelectionAnswerEncoded = typeof HarnessAskSelectionAnswer.Encoded
+
+export const HarnessAskParameters = /*#__PURE__*/ (() => Schema.Union([
+  Schema.Struct({ "_tag": Schema.Literal("Selection"), "answers": Schema.Array(HarnessAskSelectionAnswer).check(Schema.isMinLength(1)), "askRef": Schema.String }),
+  Schema.Struct({ "_tag": Schema.Literal("Text"), "askRef": Schema.String, "text": Schema.String })
+], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("_tag")).annotate({ identifier: "HarnessAskParameters" }))()
+export type HarnessAskParameters = typeof HarnessAskParameters.Type
+export type HarnessAskParametersEncoded = typeof HarnessAskParameters.Encoded
 
 export const HarnessBinding = /*#__PURE__*/ (() => Schema.Struct({
   "desired_revision": Schema.String,
@@ -390,6 +405,7 @@ export type TerminalCreateParametersEncoded = typeof TerminalCreateParameters.En
 
 export const ActionRequest = /*#__PURE__*/ (() => Schema.Union([
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": CustomReplyParameters, "type": Schema.Literal("custom.reply") }),
+  Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": HarnessAskParameters, "type": Schema.Literal("harness.answer_ask") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), /** The snapshot and exact mutable identities the user acted on; echoed byte-identically in actions. */
 "fence": Schema.Struct({ "attempt": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "mission_generation": optionalKey(RunGenerationId), "preview_token": optionalKey(Schema.String.check(Schema.isPattern(new RegExp("^lpv0:[0-9a-f]{64}$", "u"))).pipe(Schema.brand("st3/PreviewToken"))), "readiness_epoch": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "runtime_desired_revision": Schema.String, "runtime_incarnation": Schema.String, "snapshot_id": SnapshotId, "step_definition": optionalKey(Revision), "subject_revisions": Schema.Record(Schema.String, Revision).check(Schema.makeFilter((o: object) => Object.keys(o).every(Schema.is(Schema.String.check(Schema.isPattern(new RegExp("^[a-z][a-z0-9-]*/", "u"))))), { expected: "property names matching the schema" })), "terminal_sequence": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))) }).annotate({ description: "The snapshot and exact mutable identities the user acted on; echoed byte-identically in actions." }), "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": HarnessQueueParameters, "type": Schema.Literal("harness.queue.mutate") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), /** The snapshot and exact mutable identities the user acted on; echoed byte-identically in actions. */
@@ -453,6 +469,49 @@ export const ActionRequest = /*#__PURE__*/ (() => Schema.Union([
 export type ActionRequest = typeof ActionRequest.Type
 export type ActionRequestEncoded = typeof ActionRequest.Encoded
 
+export const HarnessAskIndeterminateReason = /*#__PURE__*/ (() => Schema.Literal("terminal-input-conflict").annotate({ identifier: "HarnessAskIndeterminateReason" }))()
+export type HarnessAskIndeterminateReason = typeof HarnessAskIndeterminateReason.Type
+export type HarnessAskIndeterminateReasonEncoded = typeof HarnessAskIndeterminateReason.Encoded
+
+export const HarnessAskOutcome = /*#__PURE__*/ (() => Schema.Union([
+  Schema.Struct({ "_tag": Schema.Literal("Indeterminate"), "reason": HarnessAskIndeterminateReason })
+], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("_tag")).annotate({ identifier: "HarnessAskOutcome" }))()
+export type HarnessAskOutcome = typeof HarnessAskOutcome.Type
+export type HarnessAskOutcomeEncoded = typeof HarnessAskOutcome.Encoded
+
+export const HarnessAskAnswer = /*#__PURE__*/ (() => Schema.Struct({
+  "custom_input": optionalKey(Schema.String),
+  "id": Schema.String,
+  "selected_options": Schema.Array(Schema.String).check(Schema.isUnique())
+}).annotate({ identifier: "HarnessAskAnswer" }))()
+export type HarnessAskAnswer = typeof HarnessAskAnswer.Type
+export type HarnessAskAnswerEncoded = typeof HarnessAskAnswer.Encoded
+
+export const HarnessAskResult = /*#__PURE__*/ (() => Schema.Struct({
+  "answers": Schema.Array(HarnessAskAnswer),
+  "native_event": Schema.Literal("tool_result"),
+  "tool_call_id": Schema.String
+}).annotate({ identifier: "HarnessAskResult" }))()
+export type HarnessAskResult = typeof HarnessAskResult.Type
+export type HarnessAskResultEncoded = typeof HarnessAskResult.Encoded
+
+export const HarnessOutcome = /*#__PURE__*/ (() => Schema.Literals(["accepted","dispatched","applied","rejected","indeterminate","cancelled"]).annotate({ identifier: "HarnessOutcome" }))()
+export type HarnessOutcome = typeof HarnessOutcome.Type
+export type HarnessOutcomeEncoded = typeof HarnessOutcome.Encoded
+
+export const HarnessAskReceipt = /*#__PURE__*/ (() => Schema.Struct({
+  "binding": HarnessBinding,
+  "operation_id": Schema.String,
+  "outcome": optionalKey(HarnessAskOutcome),
+  "reason": Schema.OptionFromNullOr(Schema.String),
+  "result": Schema.OptionFromNullOr(HarnessAskResult),
+  "status": HarnessOutcome,
+  "subject": Schema.String,
+  "tool_call_id": Schema.String
+}).annotate({ identifier: "HarnessAskReceipt" }))()
+export type HarnessAskReceipt = typeof HarnessAskReceipt.Type
+export type HarnessAskReceiptEncoded = typeof HarnessAskReceipt.Encoded
+
 export const HarnessInputResult = /*#__PURE__*/ (() => Schema.Struct({
   "native_event": Schema.Literals(["message_start","message_end"]),
   "turn_id": Schema.OptionFromNullOr(Schema.String)
@@ -471,14 +530,11 @@ export type HarnessModelResultEncoded = typeof HarnessModelResult.Encoded
 
 export const HarnessNativeResult = /*#__PURE__*/ (() => Schema.Union([
   HarnessInputResult,
-  HarnessModelResult
+  HarnessModelResult,
+  HarnessAskResult
 ], { mode: "oneOf" }).annotate({ identifier: "HarnessNativeResult" }))()
 export type HarnessNativeResult = typeof HarnessNativeResult.Type
 export type HarnessNativeResultEncoded = typeof HarnessNativeResult.Encoded
-
-export const HarnessOutcome = /*#__PURE__*/ (() => Schema.Literals(["accepted","dispatched","applied","rejected","indeterminate","cancelled"]).annotate({ identifier: "HarnessOutcome" }))()
-export type HarnessOutcome = typeof HarnessOutcome.Type
-export type HarnessOutcomeEncoded = typeof HarnessOutcome.Encoded
 
 export const HarnessControlReceipt = /*#__PURE__*/ (() => Schema.Struct({
   "binding": HarnessBinding,
@@ -529,6 +585,7 @@ export type TerminalAttachmentEncoded = typeof TerminalAttachment.Encoded
 export const ActionResult = /*#__PURE__*/ (() => Schema.Struct({
   "action_id": Id,
   "affected_ids": Schema.Array(Id).check(Schema.isUnique()),
+  "harness_ask": optionalKey(HarnessAskReceipt),
   "harness_control": optionalKey(HarnessControlReceipt),
   "harness_model": optionalKey(HarnessModelReceipt),
   "kind": Schema.Literal("action-result"),
@@ -2091,7 +2148,8 @@ export type EventPageEncoded = typeof EventPage.Encoded
 
 export const HarnessControlOperationReceipt = /*#__PURE__*/ (() => Schema.Union([
   HarnessControlReceipt,
-  HarnessModelReceipt
+  HarnessModelReceipt,
+  HarnessAskReceipt
 ], { mode: "oneOf" }).annotate({ identifier: "HarnessControlOperationReceipt" }))()
 export type HarnessControlOperationReceipt = typeof HarnessControlOperationReceipt.Type
 export type HarnessControlOperationReceiptEncoded = typeof HarnessControlOperationReceipt.Encoded
@@ -2151,6 +2209,34 @@ export const HarnessModelsSummary = /*#__PURE__*/ (() => Schema.Struct({
 export type HarnessModelsSummary = typeof HarnessModelsSummary.Type
 export type HarnessModelsSummaryEncoded = typeof HarnessModelsSummary.Encoded
 
+export const HarnessAskOption = /*#__PURE__*/ (() => Schema.Struct({
+  "description": optionalKey(Schema.String),
+  "label": Schema.String,
+  "preview": optionalKey(Schema.String)
+}).annotate({ identifier: "HarnessAskOption" }))()
+export type HarnessAskOption = typeof HarnessAskOption.Type
+export type HarnessAskOptionEncoded = typeof HarnessAskOption.Encoded
+
+export const HarnessAskQuestion = /*#__PURE__*/ (() => Schema.Struct({
+  "id": Schema.String,
+  "multi": optionalKey(Schema.Boolean),
+  "options": Schema.Array(HarnessAskOption),
+  "question": Schema.String,
+  "recommended": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
+}).annotate({ identifier: "HarnessAskQuestion" }))()
+export type HarnessAskQuestion = typeof HarnessAskQuestion.Type
+export type HarnessAskQuestionEncoded = typeof HarnessAskQuestion.Encoded
+
+export const HarnessPendingAsk = /*#__PURE__*/ (() => Schema.Struct({
+  /** Opaque server-issued reference; contains no client-authoritative native binding. */
+  "ask_ref": Schema.String.annotate({ description: "Opaque server-issued reference; contains no client-authoritative native binding." }),
+  "questions": Schema.Array(HarnessAskQuestion).check(Schema.isMinLength(1)),
+  /** Read-only transcript correlation; never sent in an answer action. */
+  "tool_call_id": Schema.String.annotate({ description: "Read-only transcript correlation; never sent in an answer action." })
+}).annotate({ identifier: "HarnessPendingAsk" }))()
+export type HarnessPendingAsk = typeof HarnessPendingAsk.Type
+export type HarnessPendingAskEncoded = typeof HarnessPendingAsk.Encoded
+
 export const HarnessSteerCapability = /*#__PURE__*/ (() => Schema.Struct({
   "reason": Schema.Literal("native-pre-dequeue-api-unavailable"),
   "state": Schema.Literal("unsupported")
@@ -2160,10 +2246,13 @@ export type HarnessSteerCapabilityEncoded = typeof HarnessSteerCapability.Encode
 
 export const HarnessControlState = /*#__PURE__*/ (() => Schema.Struct({
   "approval": HarnessApproval,
+  "ask_reason": Schema.OptionFromNullOr(Schema.String),
+  "ask_supported": Schema.Boolean,
   "binding": HarnessBinding,
   "idle": Schema.Boolean,
   "input_supported": Schema.Boolean,
   "models": HarnessModelsSummary,
+  "pending_ask": Schema.OptionFromNullOr(HarnessPendingAsk),
   "reason": Schema.OptionFromNullOr(Schema.String),
   "steer": HarnessSteerCapability,
   "subject": Schema.String
@@ -2447,7 +2536,7 @@ export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded
 
 /** Versioned safe error code; unknown codes fall back to `retryable`. */
-export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","stale-harness-control","unsupported-harness-control","missing-queue-entry","already-dispatched","invalid-queue-content","invalid-idempotency-key","stale-queue","queue-full","invalid-queue-move","queue-revision-exhausted","stale-queue-cursor","queue-metadata-too-large","queue-entry-too-large","unsupported-harness-model","stale-harness-model","unavailable-harness-model","unsupported-harness-effort","harness-control-busy","native-pre-dequeue-api-unavailable","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`." }))()
+export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","stale-harness-control","unsupported-harness-control","missing-queue-entry","already-dispatched","invalid-queue-content","invalid-idempotency-key","stale-queue","queue-full","invalid-queue-move","queue-revision-exhausted","stale-queue-cursor","queue-metadata-too-large","queue-entry-too-large","unsupported-harness-model","stale-harness-model","unavailable-harness-model","unsupported-harness-effort","harness-control-busy","native-pre-dequeue-api-unavailable","ask-no-longer-pending","invalid-harness-answers","unsupported-harness-ask","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`." }))()
 export type ErrorCode = typeof ErrorCode.Type
 export type ErrorCodeEncoded = typeof ErrorCode.Encoded
 

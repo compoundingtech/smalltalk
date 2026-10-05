@@ -1730,6 +1730,17 @@ impl Client {
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
+    pub async fn harness_answer_ask(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: HarnessAskParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::harness_answer_ask(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
     pub async fn harness_model_set(
         &self,
         id: impl Into<String>,
