@@ -19978,6 +19978,7 @@ struct NativeMailbox {
     messages: Vec<MessageView>,
     queued: BTreeMap<String, st_drivers::message::Message>,
     replayed: bool,
+    last_title_warning: Option<Instant>,
 }
 impl NativeMailbox {
     async fn start(
@@ -20015,6 +20016,7 @@ impl NativeMailbox {
             messages: Vec::new(),
             queued: BTreeMap::new(),
             replayed: false,
+            last_title_warning: None,
         })
     }
     async fn recv(&mut self) -> Option<st3::mailbox::Frame> {
@@ -20033,7 +20035,16 @@ impl NativeMailbox {
             }
             Some(st3::mailbox::Frame::Seat { seat }) => {
                 if let Err(error) = update_native_title(&seat, runtime_id) {
-                    eprintln!("st: could not update seat title: {error:#}");
+                    let now = Instant::now();
+                    if self.last_title_warning.is_none_or(|prior| {
+                        now.duration_since(prior) >= Duration::from_secs(10)
+                    }) {
+                        let _ = write_driver_log(
+                            &self.fence.subject,
+                            &format!("could not update seat title: {error:#}"),
+                        );
+                        self.last_title_warning = Some(now);
+                    }
                 }
                 Ok(())
             }
@@ -20210,8 +20221,13 @@ fn seat_label(seat: &st3::model::DesiredSubject) -> String {
 }
 fn update_native_title(seat: &st3::model::DesiredSubject, runtime_id: &str) -> Result<()> {
     let label = seat_label(seat);
+    // The launcher's registry name can differ from the provider's logical runtime ID.
+    let session = std::env::var("PTY_SESSION")
+        .ok()
+        .filter(|session| !session.is_empty())
+        .unwrap_or_else(|| runtime_id.to_owned());
     let result = std::process::Command::new("pty")
-        .args(["rename", runtime_id, &label])
+        .args(["rename", &session, &label])
         .output()?;
     anyhow::ensure!(
         result.status.success(),
@@ -21763,6 +21779,7 @@ mod tests {
                 messages: vec![view.clone()],
                 queued: BTreeMap::new(),
                 replayed: true,
+                last_title_warning: None,
             };
             view.subject = "message/pending".into();
             view.status = "staged".into();
