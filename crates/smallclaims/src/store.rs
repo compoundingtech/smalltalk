@@ -6333,6 +6333,15 @@ impl Store {
                 status.last_error = None;
             }
             status.sync = sync.get(peer).cloned();
+            // A comparison can finish after the peer row's receipt timestamp. Once that
+            // peer is last-seen after a failed exchange, its cached measurement is stale
+            // even if the comparison's own age has not reached the quiet interval yet.
+            if status.status == "last-seen"
+                && status.last_failure_at_unix_ms.is_some()
+                && let Some(sync) = status.sync.as_mut()
+            {
+                sync.stale = true;
+            }
             let encoded: Option<String> = connection
                 .query_row(
                     "SELECT value FROM meta WHERE key=?1",
