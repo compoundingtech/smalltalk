@@ -4599,22 +4599,44 @@ impl<R: RuntimeControl> Reconciler<R> {
         member: &MemberSpec,
         reason: &str,
     ) -> Result<()> {
+        self.perform_start_for_request(subject, member, reason, None)?;
+        Ok(())
+    }
+
+    /// A person can spend one explicit retry despite an automatic failed-start hold. The
+    /// ordinary launch path, native-session selection and provider admission remain shared.
+    fn perform_start_for_request(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        reason: &str,
+        request: Option<&crate::model::ClaimRecord>,
+    ) -> Result<bool> {
         self.store.owned_desired_guard(subject)?;
+        let explicit_person = request.is_some_and(|request| {
+            request
+                .actor
+                .as_deref()
+                .is_some_and(|actor| actor.starts_with("person/"))
+        });
         let placement_evidence = if subject.kind == "agent" {
             let Some(evidence) = self.placement_start_evidence(&subject.subject)? else {
-                return Ok(());
+                return Ok(false);
             };
             evidence
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
         // A member whose start keeps failing waits between attempts and then parks with one
         // attention request, instead of spawning again on every pass. A gate runner fails its gate.
-        if matches!(subject.kind.as_str(), "agent" | "exec" | "pty")
+        if !explicit_person
+            && matches!(subject.kind.as_str(), "agent" | "exec" | "pty")
             && member.driver.as_deref() != Some("codex")
             && self.defer_or_park_failed_start(subject)?
         {
-            return Ok(());
+            return Ok(false);
         }
-        if member.driver.as_deref() == Some("codex") {
+        if !explicit_person && member.driver.as_deref() == Some("codex") {
             let token = self.launch_token(&subject.subject)?;
             if self.codex_crash_loop_raised(&subject.subject, &token)? {
                 self.raise_codex_crash_loop(
@@ -4622,7 +4644,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     &token,
                     "the prior Codex crash loop remains stopped",
                 )?;
-                return Ok(());
+                return Ok(false);
             }
             let recent_failures = self
                 .store
@@ -4650,7 +4672,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     &token,
                     &format!("Codex failed to launch three times: {detail}"),
                 )?;
-                return Ok(());
+                return Ok(false);
             }
         }
         let workspace = Path::new(&member.workspace);
@@ -4818,6 +4840,27 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             Ok(())
         };
+        if let Some(request) = request {
+            // Persist before the side effect. An interrupted attempt is never launched twice,
+            // including when the owner daemon loses its in-memory state between passes.
+            guard()?;
+            let (_, appended) = self.store.append_claim_outcome(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "runtime.action.requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("action".into(), Value::String("start".into())),
+                    ("reason".into(), Value::String(reason.into())),
+                    ("desired_token".into(), Value::String(desired_token.clone())),
+                ]),
+                evidence: vec![request.id.clone()],
+                expected_subject: None,
+                idempotency_key: Some(format!("agent-restart-attempt:{}", request.id)),
+            })?;
+            if !appended {
+                return Ok(false);
+            }
+        }
         if let Err(error) = self.runtime.start_guarded(&launch_member, &guard) {
             let reason = error.to_string();
             let prior_failures = self.start_failures(&subject.subject, &desired_token)?;
@@ -4893,7 +4936,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             ]),
         )?;
         self.signal_changed();
-        Ok(())
+        Ok(true)
     }
 
     /// Point a seat whose harness block binds an account (or a pool) at that account's login
@@ -5409,7 +5452,17 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(false);
         }
         let completion = format!("agent-restart-completed:{}", request.id);
-        if self.store.operation_claim(&completion)?.is_some() {
+        if let Some(result) = self.store.operation_claim(&completion)? {
+            if result.kind == "runtime.action.failed" {
+                // Keep the completed failure in the existing agents fault projection until a
+                // newer request or declaration supersedes it; an automatic pass is no retry.
+                anyhow::bail!(
+                    "{}",
+                    result.body["fields"]["reason"]
+                        .as_str()
+                        .unwrap_or("the explicit restart failed and the seat is parked")
+                );
+            }
             return Ok(false);
         }
         let previous = request.body["fields"]["incarnation_id"]
@@ -5429,6 +5482,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 fields: BTreeMap::from([
                     ("action".into(), Value::String("restart".into())),
                     (
+                        "reason".into(),
+                        Value::String("the replacement incarnation was observed".into()),
+                    ),
+                    (
                         "incarnation_id".into(),
                         Value::String(observation.incarnation_id.clone().unwrap()),
                     ),
@@ -5443,7 +5500,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         if let Some(observation) = observation.filter(|item| item.status == "running") {
             // Rendering must succeed before we shut down a still-running seat.
             if let Some(error) = blocked {
-                anyhow::bail!("restart blocked: {error:#}");
+                return self.fail_requested_restart(
+                    subject,
+                    member,
+                    &request,
+                    &format!("restart blocked: {error:#}"),
+                );
             }
             self.record_member(subject, observation, true)?;
             self.reconcile_runtime_stop(
@@ -5462,30 +5524,104 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(true);
         }
         if let Some(error) = blocked {
-            anyhow::bail!("restart blocked: {error:#}");
+            return self.fail_requested_restart(
+                subject,
+                member,
+                &request,
+                &format!("restart blocked: {error:#}"),
+            );
         }
-        let before = self
+        if self
             .store
-            .latest_observation(&subject.subject, "runtime.action.succeeded")?
-            .map(|claim| claim.id);
-        self.perform_start(subject, member, "an explicit seat restart was requested")?;
-        let after = self
-            .store
-            .latest_observation(&subject.subject, "runtime.action.succeeded")?
-            .map(|claim| claim.id);
-        if after != before {
-            self.store.append_claim(&ClaimInput {
-                subject: subject.subject.clone(),
-                kind: "runtime.action.succeeded".into(),
-                actor: request.actor.clone(),
-                fields: BTreeMap::from([("action".into(), Value::String("restart".into()))]),
-                evidence: vec![request.id],
-                expected_subject: None,
-                idempotency_key: Some(completion),
-            })?;
-            self.signal_changed();
+            .operation_claim(&format!("agent-restart-attempt:{}", request.id))?
+            .is_some()
+        {
+            return self.fail_requested_restart(
+                subject,
+                member,
+                &request,
+                "the explicit launch attempt was interrupted before its result was recorded",
+            );
         }
+        match self.perform_start_for_request(
+            subject,
+            member,
+            "an explicit seat restart was requested",
+            Some(&request),
+        ) {
+            Ok(false) => return Ok(true), // Placement or an automatic hold still defers this start.
+            Err(error) => {
+                return self.fail_requested_restart(
+                    subject,
+                    member,
+                    &request,
+                    &format!("{error:#}"),
+                );
+            }
+            Ok(true) => {}
+        }
+        self.store.append_claim(&ClaimInput {
+            subject: subject.subject.clone(),
+            kind: "runtime.action.succeeded".into(),
+            actor: request.actor.clone(),
+            fields: BTreeMap::from([
+                ("action".into(), Value::String("restart".into())),
+                (
+                    "reason".into(),
+                    Value::String("the explicit restart launched a replacement".into()),
+                ),
+            ]),
+            evidence: vec![request.id],
+            expected_subject: None,
+            idempotency_key: Some(completion),
+        })?;
+        self.signal_changed();
         Ok(true)
+    }
+
+    fn fail_requested_restart(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        request: &crate::model::ClaimRecord,
+        detail: &str,
+    ) -> Result<bool> {
+        let reason = format!("the explicit restart failed and the seat is parked again: {detail}");
+        let token = self.launch_token(&subject.subject)?;
+        let park = if member.driver.as_deref() == Some("codex") {
+            "codex-crash-loop"
+        } else {
+            "runtime-crash-loop"
+        };
+        self.store.append_claim(&ClaimInput {
+            subject: subject.subject.clone(),
+            kind: "runtime.reconcile-decision".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("decision".into(), Value::String("raise".into())),
+                ("reachability".into(), Value::String("unreachable".into())),
+                ("key".into(), Value::String(format!("{park}:{token}"))),
+                ("reason".into(), Value::String(reason.clone())),
+            ]),
+            evidence: vec![request.id.clone()],
+            expected_subject: None,
+            idempotency_key: Some(format!("agent-restart-parked:{}", request.id)),
+        })?;
+        self.store.append_claim(&ClaimInput {
+            subject: subject.subject.clone(),
+            kind: "runtime.action.failed".into(),
+            actor: request.actor.clone(),
+            fields: BTreeMap::from([
+                ("action".into(), Value::String("restart".into())),
+                ("reason".into(), Value::String(reason.clone())),
+                ("desired_token".into(), Value::String(token)),
+            ]),
+            evidence: vec![request.id.clone()],
+            expected_subject: None,
+            idempotency_key: Some(format!("agent-restart-completed:{}", request.id)),
+        })?;
+        self.signal_changed();
+        anyhow::bail!("{reason}")
     }
 
     fn reconcile_restart(
