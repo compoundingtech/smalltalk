@@ -15999,6 +15999,101 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(body["status"], "verifying");
     }
 
+    #[tokio::test]
+    async fn historical_claim_receipt_does_not_replace_current_http_work_views() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let kdl = r#"version 2
+mission "receipt-fixture" state="ready" {
+  goal "Compare a receipt with current work."
+  step "build" { assigned-to "agent/builder" }
+}"#;
+        let intent = parse_intent(kdl, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "receipt-fixture")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "receipt-fixture".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "receipt-run".into(),
+            })
+            .unwrap();
+        let subject = &run.steps[0].subject;
+        state.store.set_step_state(subject, "ready", None).unwrap();
+        let mut old_receipt = state.store.step_run(subject).unwrap().unwrap();
+        old_receipt.status = "claimed".into();
+        old_receipt.claimant = Some("agent/builder".into());
+        old_receipt.claim_incarnation = Some("old-incarnation".into());
+        state
+            .store
+            .cache_idempotency_response("old-receipt", &old_receipt)
+            .unwrap();
+
+        let app = router(state);
+        let (status, receipt) = json_request(
+            app.clone(),
+            &format!("/v1/work/claim/{subject}"),
+            serde_json::to_value(WorkRequest {
+                actor: Some("agent/builder".into()),
+                incarnation: Some("old-incarnation".into()),
+                summary: None,
+                reason: None,
+                evidence: Vec::new(),
+                idempotency_key: "old-receipt".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["status"], "claimed");
+        assert_eq!(receipt["generation"], old_receipt.generation);
+        assert_eq!(receipt["claim_incarnation"], "old-incarnation");
+
+        let get_envelope = |app: Router, path: String| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        };
+        let direct = get_envelope(app.clone(), format!("/v1/work-items/{subject}")).await;
+        let client = get_envelope(app, format!("/v1/client/work/{subject}")).await;
+        assert_eq!(direct["store_index"], client["snapshot"]["store_index"]);
+        assert_eq!(direct["value"]["status"], "ready");
+        assert_eq!(client["value"]["state"], "ready");
+        assert_eq!(direct["value"]["generation"], client["value"]["generation_id"]);
+        assert_eq!(direct["value"]["readiness_epoch"], old_receipt.readiness_epoch);
+        assert_eq!(client["value"]["readiness_epoch"], old_receipt.readiness_epoch);
+        assert_eq!(direct["value"]["claimant"], Value::Null);
+        assert_eq!(client["value"]["claimant"], Value::Null);
+        assert_eq!(direct["value"]["claim_incarnation"], Value::Null);
+        assert_eq!(client["value"]["claim_incarnation"], Value::Null);
+    }
+
     async fn get_request(app: Router, path: &str) -> (StatusCode, Value) {
         let response = app
             .oneshot(
