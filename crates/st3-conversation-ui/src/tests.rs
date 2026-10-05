@@ -271,6 +271,45 @@ fn copying_wrapped_lines_gives_back_only_the_real_newlines() {
 }
 
 #[test]
+#[cfg(feature = "ratatui")]
+fn mail_to_the_person_leads_with_a_bullet_and_their_own_keeps_the_bar() {
+    // Nathan, 2026-10-05: mail to me and from me looked the same.
+    let mail = |from: &str, to: &str| Entry {
+        id: format!("message/{from}-{to}"),
+        at: "10:00".into(),
+        body: Body::Mail {
+            from: from.into(),
+            to: to.into(),
+            subject: String::new(),
+            body: "hello\nthere".into(),
+            delivered: false,
+            dictated: false,
+            images: Vec::new(),
+        },
+    };
+    let lines = |entry: Entry| {
+        let doc = Cache::default().render(&[entry], 60, &HashSet::new(), "", &theme());
+        doc.lines.iter().map(text::plain).collect::<Vec<_>>()
+    };
+    let to_you = lines(mail("agent", "you"));
+    assert!(to_you[0].starts_with("● agent → you"), "{to_you:?}");
+    assert!(to_you[1..].iter().all(|line| !line.starts_with('●')), "{to_you:?}");
+    assert!(to_you[1].starts_with("▎ "), "the body keeps the bar: {to_you:?}");
+    let from_you = lines(mail("you", "agent"));
+    assert!(from_you[0].starts_with("▎ you → agent"), "{from_you:?}");
+    // Copying from the bullet's row leaves the bullet out, as it does the bar.
+    let selection = Selection {
+        pane: "session/a".into(),
+        anchor: (0, 0),
+        head: (to_you.len() - 1, 200),
+    };
+    let doc = Cache::default().render(&[mail("agent", "you")], 60, &HashSet::new(), "", &theme());
+    let copied = selection.text(&doc.lines);
+    assert!(!copied.contains('●') && !copied.contains('▎'), "{copied}");
+    assert!(copied.contains("hello"), "{copied}");
+}
+
+#[test]
 fn pane_intents_keep_other_sessions_drafts_and_expansion_independent() {
     let mut state = State::default();
     state
