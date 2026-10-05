@@ -6237,6 +6237,14 @@ fn history_error(code: &str, message: &str, status: StatusCode) -> ApiError {
     ApiError { status, code: code.into(), message: message.into(), details: Box::default() }
 }
 
+fn history_projection_error(_: terminal_view::HistoryTooLarge) -> ApiError {
+    history_error(
+        "history-too-large",
+        "the styled history page exceeds the response limit; request fewer rows",
+        StatusCode::PAYLOAD_TOO_LARGE,
+    )
+}
+
 /// The physical PTY incarnation and daemon generation come from one owner-local snapshot,
 /// never solely from a possibly lagging runtime claim.
 fn terminal_history_generation(root: &std::path::Path, runtime_id: &str, incarnation: &str) -> Result<String, ApiError> {
@@ -6270,6 +6278,7 @@ async fn terminal_history_value(
     let root = state.pty_root.clone();
     let runtime_id = live.runtime_id;
     let expected_incarnation = incarnation.to_owned();
+    let terminal_id = client_detail_id("terminal", id);
     let response = tokio::task::spawn_blocking(move || {
         let expected_generation = terminal_history_generation(&root, &runtime_id, &expected_incarnation)?;
         let response = pty_client::history::read_in(
@@ -6280,15 +6289,26 @@ async fn terminal_history_value(
         }
         match response {
             HistoryResponse::Page { columns, retained_rows, rows, next_before } => {
-                let lines = terminal_view::history_lines(columns, &rows).map_err(terminal_view_error)?;
-                Ok(json!({
-                    "kind": "terminal-history",
-                    "columns": columns,
-                    "retained_rows": retained_rows,
-                    "lines": lines,
-                    "next_before": next_before,
-                    "retention": "owner-memory",
-                }))
+                let mut value = serde_json::Map::from_iter([
+                    ("kind".into(), "terminal-history".into()),
+                    ("columns".into(), columns.into()),
+                    ("retained_rows".into(), retained_rows.into()),
+                    ("next_before".into(), next_before.map(Value::String).unwrap_or(Value::Null)),
+                    ("retention".into(), "owner-memory".into()),
+                    ("terminal_id".into(), terminal_id.into()),
+                    ("runtime_incarnation".into(), expected_incarnation.into()),
+                ]);
+                // Keep the existing envelope/cursor/sync reserve, counting metadata and
+                // styled runs without allocating a second serialized response buffer.
+                let mut budget = terminal_view::HistoryByteBudget::new(
+                    CLIENT_MAX_RESPONSE_BYTES.saturating_sub(128_000),
+                );
+                budget.charge_json(&value).map_err(history_projection_error)?;
+                budget.take(r#","lines":"#.len()).map_err(history_projection_error)?;
+                let lines = terminal_view::history_lines(columns, &rows, &mut budget)
+                    .map_err(history_projection_error)?;
+                value.insert("lines".into(), Value::Array(lines));
+                Ok(Value::Object(value))
             }
             HistoryResponse::CursorGap => Err(history_error("history-cursor-gap", "the history cursor expired or its retained boundary was discarded; restart pagination", StatusCode::CONFLICT)),
             HistoryResponse::StaleGeneration => Err(stale("the physical terminal generation changed before the history read")),
@@ -6299,15 +6319,7 @@ async fn terminal_history_value(
         }
     }).await.map_err(ApiError::internal)??;
     terminal_live_session(state, &subject, Some(incarnation))?;
-    let mut value = response;
-    value["terminal_id"] = client_detail_id("terminal", id).into();
-    value["runtime_incarnation"] = incarnation.into();
-    if serde_json::to_vec(&value).map_err(ApiError::internal)?.len()
-        > CLIENT_MAX_RESPONSE_BYTES.saturating_sub(128_000)
-    {
-        return Err(history_error("history-too-large", "the styled history page exceeds the response limit; request fewer rows", StatusCode::PAYLOAD_TOO_LARGE));
-    }
-    Ok(value)
+    Ok(response)
 }
 
 pub(super) async fn terminal_history(

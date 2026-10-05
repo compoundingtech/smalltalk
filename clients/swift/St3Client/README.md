@@ -22,6 +22,8 @@ retained in the owner's main-buffer memory, excluding the live viewport. Rows wi
 oldest-first; pass `nextBefore` unchanged to read the preceding page. Retention is not archival:
 an expired or discarded boundary returns `history-cursor-gap`, and alternate-screen reads return
 `history-alternate-screen`. Restart pagination after a gap; do not reuse cursors across incarnations.
+A styled page is bounded while its rows and runs are constructed. `history-too-large` asks the
+caller to request fewer rows; neither text nor style runs are silently discarded to fit the page.
 
 The generated models and complete typed operation surfaces are refreshed from the normative schema
 and machine manifest with `cargo run -p st3-client-codegen`; `--check` renders every artifact in
