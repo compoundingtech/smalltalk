@@ -1003,12 +1003,14 @@ async fn replication_exchange(context: &Context, turn: usize, key: &str) -> Resu
     let peer = context.peer.clone();
     let key = key.to_owned();
     // The peer's side runs on the load runtime: on a real fleet it is another machine.
-    let (peer_inventory, exchange) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        peer.append_claim(&claim_input("harness.observed", &key, turn, ""))?;
-        let inventory =
-            serde_json::from_value(summary["exchange"]["inventory"].clone()).unwrap_or_default();
-        let exchange = peer.export_replication_exchange(FLEET, &inventory)?;
-        Ok((peer.export_replication_summary(FLEET)?.inventory, exchange))
+    let (peer_inventory, exchange) = tokio::task::spawn_blocking(move || {
+        st3::profile::task("load peer/replication-prepare", || -> anyhow::Result<_> {
+            peer.append_claim(&claim_input("harness.observed", &key, turn, ""))?;
+            let inventory =
+                serde_json::from_value(summary["exchange"]["inventory"].clone()).unwrap_or_default();
+            let exchange = peer.export_replication_exchange(FLEET, &inventory)?;
+            Ok((peer.export_replication_summary(FLEET)?.inventory, exchange))
+        })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1028,14 +1030,16 @@ async fn replication_exchange(context: &Context, turn: usize, key: &str) -> Resu
         .await
         .map_err(|error| error.to_string())?;
     let peer = context.peer.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let exchange = serde_json::from_value(answer["exchange"].clone())?;
-        peer.receive_replication_exchange(NODE, FLEET, &exchange)
-            .map_err(|error| anyhow::anyhow!(error.message))?;
-        peer.validate_replication_backlog()?;
-        peer.apply_replication_repairs()?;
-        peer.project_replication_backlog()?;
-        Ok(())
+    tokio::task::spawn_blocking(move || {
+        st3::profile::task("load peer/replication-receive", || -> anyhow::Result<()> {
+            let exchange = serde_json::from_value(answer["exchange"].clone())?;
+            peer.receive_replication_exchange(NODE, FLEET, &exchange)
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            peer.validate_replication_backlog()?;
+            peer.apply_replication_repairs()?;
+            peer.project_replication_backlog()?;
+            Ok(())
+        })
     })
     .await
     .map_err(|error| error.to_string())?
