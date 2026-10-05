@@ -1332,10 +1332,9 @@ pub(super) fn authenticate(
                 .get(LOCAL_PERSON_HEADER)
                 .and_then(|value| value.to_str().ok());
             let mut session = ClientSession::local(person)?;
-            if request.extensions().get::<VerifiedNotesPrincipal>().is_none() {
-                session.scopes.remove("notes.read");
-                session.scopes.remove("notes.write");
-            }
+            // Person headers never grant private notes, even on an unbound Unix connection.
+            session.scopes.remove("notes.read");
+            session.scopes.remove("notes.write");
             return Ok(session);
         }
         let pairing_completion = request.method() == axum::http::Method::POST
@@ -1400,6 +1399,11 @@ pub(super) fn authenticate(
         .and_then(Value::as_str)
         .filter(|actor| actor.starts_with("person/") && actor.matches('/').count() == 1)
         .ok_or_else(|| ApiError::internal("a paired client has no concrete delegated person"))?;
+    let notes_attested = paired.origin == state.store.origin()
+        && state.private_notes.person.as_deref() == Some(authority_actor)
+        && paired.body.pointer("/fields/scopes").and_then(Value::as_array)
+            .is_some_and(|scopes| scopes.iter().filter_map(Value::as_str).any(|scope| scope.starts_with("notes.")))
+        && state.private_notes.pairing_attested(&state.state_dir, paired).map_err(ApiError::bad)?;
     let scopes = paired
         .body
         .pointer("/fields/scopes")
@@ -1407,8 +1411,8 @@ pub(super) fn authenticate(
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        // A replicated pairing is not this node's private-notes entitlement.
-        .filter(|scope| !scope.starts_with("notes.") || paired.origin == state.store.origin())
+        // Only a locally sealed real pairing grants this node's notes scopes.
+        .filter(|scope| !scope.starts_with("notes.") || notes_attested)
         .map(str::to_owned)
         .collect();
     let session = ClientSession {
@@ -5477,6 +5481,7 @@ pub(super) async fn pairing_begin(
     State(state): State<AppState>,
     Extension(session): Extension<ClientSession>,
     bound: Option<Extension<BoundAgent>>,
+    principal: Option<Extension<VerifiedNotesPairingPrincipal>>,
     Json(request): Json<PairingBegin>,
 ) -> Result<Json<Value>, ApiError> {
     if session.transport != "unix" {
@@ -5537,14 +5542,13 @@ pub(super) async fn pairing_begin(
                 .collect()
         }
     };
-    if scopes.iter().any(|scope| scope.starts_with("notes."))
+    let grants_notes = scopes.iter().any(|scope| scope.starts_with("notes."));
+    if grants_notes
         && (bound.is_some() || state.private_notes.person.as_deref() != Some(person_id.as_str())
-            || scopes.iter().filter(|scope| scope.starts_with("notes.")).any(|scope| !session.allows(scope))) {
+            || principal.is_none() && scopes.iter().filter(|scope| scope.starts_with("notes.")).any(|scope| !session.allows(scope))) {
         return Err(forbidden("notes delegation must be explicitly initiated by the owner node's configured person, not a native agent"));
     }
-    state
-        .store
-        .append_claim(&ClaimInput {
+    let begun = state.store.append_claim(&ClaimInput {
             subject,
             kind: "custom.client.pairing-begun".into(),
             actor: Some(person_id.clone()),
@@ -5561,6 +5565,10 @@ pub(super) async fn pairing_begin(
             idempotency_key: None,
         })
         .map_err(ApiError::bad)?;
+    if grants_notes {
+        let writer = state.clone();
+        super::blocking_action(move || writer.private_notes.attest_pairing(&writer.state_dir, &begun)).await?;
+    }
     signal_changed(&state);
     Ok(Json(
         json!({ "kind": "pairing-challenge", "pairing_id": pairing_id, "code": code, "expires_at": client_timestamp(expires_at) }),
@@ -5673,8 +5681,10 @@ pub(super) async fn pairing_complete(
         None => LIMITED_PAIRING_SCOPES.to_vec(),
         Some(_) => return Err(validation("the pairing has invalid delegated scopes")),
     };
-    if scopes.iter().any(|scope| scope.starts_with("notes."))
-        && (state.private_notes.person.as_deref() != Some(person_id.as_str()) || begun.origin != state.store.origin()) {
+    let grants_notes = scopes.iter().any(|scope| scope.starts_with("notes."));
+    if grants_notes
+        && (state.private_notes.person.as_deref() != Some(person_id.as_str()) || begun.origin != state.store.origin()
+            || !state.private_notes.pairing_attested(&state.state_dir, &begun).map_err(ApiError::bad)?) {
         return Err(forbidden("the notes pairing no longer names this owner node's locally authorized configured person"));
     }
     let completed = state.store.append_claim(&ClaimInput {
@@ -5703,13 +5713,18 @@ pub(super) async fn pairing_complete(
         expected_subject: Some(Some(begun.id.clone())),
         idempotency_key: None,
     });
-    if let Err(error) = completed {
-        if error.code == "stale-subject" {
-            return Err(forbidden(
-                "the pairing code is invalid, expired, or already used",
-            ));
+    let completed = match completed {
+        Ok(completed) => completed,
+        Err(error) => {
+            if error.code == "stale-subject" {
+                return Err(forbidden("the pairing code is invalid, expired, or already used"));
+            }
+            return Err(ApiError::bad(error));
         }
-        return Err(ApiError::bad(error));
+    };
+    if grants_notes {
+        let writer = state.clone();
+        super::blocking_action(move || writer.private_notes.attest_pairing(&writer.state_dir, &completed)).await?;
     }
     // A device with a real key, paired to send messages, is enrolled: the person's root key
     // grants it as a device key. A device paired only to read gets no key that speaks for the

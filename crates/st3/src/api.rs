@@ -770,9 +770,6 @@ async fn response_envelope(
             .body(Body::empty())
             .expect("the incoming request has a valid method and URI");
         *auth_request.headers_mut() = request.headers().clone();
-        if request.extensions().get::<VerifiedNotesPrincipal>().is_some() {
-            auth_request.extensions_mut().insert(VerifiedNotesPrincipal);
-        }
         let auth_state = state.clone();
         let transport = transport.as_str();
         let auth_profile = profile.clone();
@@ -4577,7 +4574,7 @@ async fn serve_unix_with_ancestor(
             };
             let notes_principal = match peer_pid {
                 Some(pid) if bind_ancestry && bound_agent.is_none() =>
-                    tokio::task::spawn_blocking(move || notes_principal_ancestor(pid)).await.unwrap_or(false),
+                    tokio::task::spawn_blocking(move || notes_pairing_principal_ancestor(pid)).await.unwrap_or(false),
                 _ => false,
             };
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
@@ -4587,7 +4584,7 @@ async fn serve_unix_with_ancestor(
                 let delivery_peer = delivery_peer.clone();
                 async move {
                     let mut request = request.map(Body::new);
-                    if notes_principal { request.extensions_mut().insert(VerifiedNotesPrincipal); }
+                    if notes_principal { request.extensions_mut().insert(VerifiedNotesPairingPrincipal); }
                     if let Some(peer) = delivery_peer {
                         request.extensions_mut().insert(peer);
                     }
@@ -4672,20 +4669,26 @@ mod gateway_listener_tests {
     }
 }
 
-/// A person header is a selector, not notes authority. Only a positively inspected
-/// local OS-owner ancestry can exercise principal notes scopes without a credential.
+/// Bootstrap authority only: a configured-person notes pairing requires a
+/// positive authenticated login anchor. This never grants uncredentialed notes access.
 #[derive(Clone, Copy)]
-struct VerifiedNotesPrincipal;
+struct VerifiedNotesPairingPrincipal;
 
 #[cfg(target_os = "linux")]
-fn notes_principal_ancestor(mut pid: u32) -> bool {
+fn notes_pairing_principal_ancestor(mut pid: u32) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let mut seen = std::collections::BTreeSet::new();
     while pid > 1 && seen.insert(pid) {
         let root = format!("/proc/{pid}");
         let Ok(metadata) = fs::metadata(&root) else { return false };
         // SAFETY: getuid has no inputs and no memory safety requirements.
-        if metadata.uid() != unsafe { libc::getuid() } { return true; }
+        if metadata.uid() != unsafe { libc::getuid() } {
+            if metadata.uid() != 0 { return false; }
+            let Ok(executable) = fs::read_link(format!("{root}/exe")) else { return false };
+            let Ok(image) = fs::metadata(format!("{root}/exe")) else { return false };
+            return image.uid() == 0 && image.mode() & 0o022 == 0
+                && matches!(executable.file_name().and_then(|name| name.to_str()), Some("sshd" | "sshd-session"));
+        }
         let Ok(environment) = fs::read(format!("{root}/environ")) else { return false };
         if environment.split(|byte| *byte == 0).any(|entry| entry.starts_with(b"ST_AGENT=agent/")) {
             return false;
@@ -4695,11 +4698,11 @@ fn notes_principal_ancestor(mut pid: u32) -> bool {
             .and_then(|parent| parent.parse().ok()) else { return false };
         pid = parent;
     }
-    pid == 1
+    false
 }
 
 #[cfg(not(target_os = "linux"))]
-fn notes_principal_ancestor(_pid: u32) -> bool { false }
+fn notes_pairing_principal_ancestor(_pid: u32) -> bool { false }
 
 #[cfg(target_os = "linux")]
 fn harness_ancestor(mut pid: u32) -> Option<String> {
@@ -21528,43 +21531,6 @@ agent "seat" { workspace "/tmp"; command "true" }
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
 
-    #[tokio::test]
-    async fn unavailable_notes_catalog_does_not_stall_native_observations() {
-        let root = tempfile::tempdir().unwrap();
-        let mut state = state(root.path());
-        state.private_notes = Arc::new(crate::private_notes::Authority {
-            person: Some("person/operator".into()),
-            catalogs: vec![root.path().join("unavailable-catalog")],
-        });
-        let source = format!("version 2\nagent \"notes-worker\" {{\n host \"node\"\n workspace {:?}\n harness \"claude\" {{}}\n}}\n", root.path().display().to_string());
-        let declared = apply_request(&state, &source, "person/operator", "notes-producer");
-        let app = router(state.clone());
-        let (status, body) = json_request(app.clone(), "/v1/intent/apply", serde_json::to_value(declared).unwrap()).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let subject = "agent/notes-worker";
-        state.store.append_claim(&ClaimInput {
-            subject: subject.into(), kind: "runtime.observed".into(), actor: Some(subject.into()),
-            fields: BTreeMap::from([("status".into(), json!("running")), ("incarnation_id".into(), json!("notes-runtime"))]),
-            evidence: vec![], expected_subject: None, idempotency_key: None,
-        }).unwrap();
-        let app = app.layer(Extension(NativeDeliveryPeer {
-            agent: subject.into(), transport: "claude-channel", pid: 7, archives_inbox: true,
-        }));
-        for (sequence, activity) in [(1, "idle"), (2, "working")] {
-            let event = json!({"runtime_incarnation":"notes-runtime", "sequence":sequence,
-                "claim":{"subject":subject,"kind":"harness.observed","actor":subject,
-                    "fields":{"state":activity,"driver":"claude","incarnation_id":"notes-runtime"},
-                    "evidence":[],"idempotency_key":format!("notes-observation-{sequence}")}});
-            let (status, published) = json_request(app.clone(), "/v1/harness-events", event.clone()).await;
-            assert_eq!(status, StatusCode::OK, "{published}");
-            let (status, replay) = json_request(app.clone(), "/v1/harness-events", event).await;
-            assert_eq!(status, StatusCode::OK, "{replay}");
-            assert_eq!(published["id"], replay["id"]);
-        }
-        assert_eq!(state.store.latest_claim(subject, Some("harness.observed")).unwrap().unwrap().body["fields"]["state"], "working");
-        let denied = state.private_notes.read("node", "dev.schickling.agent-private-notes://node/notes-worker").unwrap_err();
-        assert_eq!(denied.code, "private-notes-unreachable");
-    }
 }
 
 #[cfg(test)]

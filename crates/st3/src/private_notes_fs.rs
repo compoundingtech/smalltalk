@@ -140,14 +140,6 @@ pub(crate) fn local_lock(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-pub(crate) fn local_try_lock(path: &Path) -> io::Result<Option<File>> {
-    let file = lock_file(path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => Err(error),
-    }
-}
 
 fn cstring(name: &[u8]) -> io::Result<CString> {
     if name.is_empty() || name.contains(&b'/') || name == b"." || name == b".." {
