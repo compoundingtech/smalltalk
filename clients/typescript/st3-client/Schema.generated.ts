@@ -2137,6 +2137,8 @@ export const UsageLimit = /*#__PURE__*/ (() => Schema.Struct({
   "five_hour_percent": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))),
   "five_hour_resets_at_unix_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "host": Schema.String,
+  /** The source named a provider identity or declared account; independent of quota freshness. Absent on older servers. */
+  "identified": optionalKey(Schema.Boolean).annotate({ description: "The source named a provider identity or declared account; independent of quota freshness. Absent on older servers." }),
   "measured_at_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "measured_by": Schema.String,
   "plan": optionalKey(Schema.String),

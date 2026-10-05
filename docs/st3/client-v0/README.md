@@ -394,7 +394,8 @@ cost: the harness's own figure when it reports one, else st's pricing table, nam
 could price, which a client shows as unknown cost, never as free). An identity st does not know,
 such as the mission run of a standing seat, is absent from the row. A period whose start is after
 its end is `validation-failed`. `limits` lists each account's selected limits reading: `account`
-(a label such as `claude/<digest>`, or `DRIVER/unknown`), `driver`, optional `plan`,
+(a label such as `claude/<digest>`, or `DRIVER/unknown`), `driver`, optional `account_ref`,
+`identified` (optional for older servers), and `plan`,
 `five_hour_percent`, `weekly_percent` and their `*_resets_at_unix_ms`, when and by which seat and
 host it was measured, and the seats whose newest reading names the account. A harness that does
 not report a value leaves it out. Selection uses quota observation time, independently of
@@ -405,6 +406,11 @@ outside the hour cannot override it. This same selection serves `st usage`, stui
 account pools and the limits policy. The policy tests freshness against the selected source
 time, so a recent low publication cannot freshen an old high observation. Claim kinds and
 client fields remain compatible with older clients.
+`identified` is true for a provider identity or declared account, false when both are missing;
+it does not describe quota freshness. Identity-less history with no active reporting seat is
+hidden once identified evidence exists for that driver. Active unknown evidence and every
+identified account, including exhausted accounts with no seats, remain visible. Bound readings
+use the same stable declared label as publishers, including older generic provider labels.
 Partial reports without a weekly percentage do not replace or refresh a prior weekly source.
 The durable reading survives member restarts. Consumers must check its original measurement time
 and reset window; missing or stale evidence is unknown, never zero. `st doctor` reports missing,
