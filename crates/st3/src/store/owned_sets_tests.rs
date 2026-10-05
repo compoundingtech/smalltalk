@@ -183,6 +183,46 @@ fn daemon_cannot_retire_an_unmarked_set_member_as_a_one_shot() {
 }
 
 #[test]
+fn repeated_unmanaged_effect_guards_do_not_reread_ownership() {
+    let store = Store::open_memory("amber").unwrap();
+    let declaration = parse_intent(
+        "version 2\nagent \"garden/unmanaged\" { command \"true\" }",
+        "amber",
+    )
+    .unwrap();
+    let desired = &declaration.subjects["agent/garden/unmanaged"];
+    direct(&store, &declaration, "unmanaged").unwrap();
+    let before = smallclaims::sqlite::STATEMENTS_RUN.with(|n| n.get());
+    for _ in 0..100 {
+        store.owned_desired_guard(desired).unwrap();
+    }
+    let statements = smallclaims::sqlite::STATEMENTS_RUN.with(|n| n.get()) - before;
+    assert!(statements <= 250, "100 guards ran {statements} statements");
+}
+
+#[test]
+fn owned_effect_guard_reuses_its_selected_set_but_refreshes_the_next_effect() {
+    let store = Store::open_memory("amber").unwrap();
+    let original = bundle("sleep 100", false);
+    apply(&store, &original, 10);
+    let desired = &original.subjects["agent/garden/orchard"];
+    let before = smallclaims::sqlite::STATEMENTS_RUN.with(|n| n.get());
+    store.owned_desired_guard(desired).unwrap();
+    let statements = smallclaims::sqlite::STATEMENTS_RUN.with(|n| n.get()) - before;
+    assert!(statements <= 5, "one guard ran {statements} statements");
+
+    let replacement = bundle("sleep 200", false);
+    apply(&store, &replacement, 20);
+    assert_eq!(
+        store.owned_desired_guard(desired).unwrap_err().code,
+        "stale-set-member"
+    );
+    store
+        .owned_desired_guard(&replacement.subjects["agent/garden/orchard"])
+        .unwrap();
+}
+
+#[test]
 fn a_staged_owned_set_member_check_seeks_tagged_claims() {
     let store = Store::open_memory("amber").unwrap();
     let unmanaged = parse_intent(
