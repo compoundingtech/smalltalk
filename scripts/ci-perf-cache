@@ -167,8 +167,19 @@ def restore():
     pinned = api(f'repos/{repo}/actions/runs/37281901496')
     if not trusted_snapshot(pinned):
         raise ValueError('the fixed control fixture must be a completed main workload')
+    # This experiment holds the original data fixed across current-main revisions.
+    # Additive optional harness fields changed the recipe name; identify the original
+    # immutable artifact explicitly rather than looking it up under the new name.
+    fixture = api(f'repos/{repo}/actions/artifacts/11333545011')
+    if (fixture['expired'] or fixture['workflow_run']['id'] != pinned['id']
+            or fixture['digest'] != 'sha256:e31918ae968d5f101a4ab317fabbb1909a516d13b0f85b2d3d7d4edd9c3b4489'
+            or not fixture['name'].startswith('perf-load-stores-v1-')):
+        raise ValueError('the fixed control fixture identity changed')
+    current_recipe = wanted['stores']
+    wanted['stores'] = fixture['name']
     with tempfile.TemporaryDirectory(dir=temp) as tmp:
-        snapshots(pinned, {wanted['stores']}, Path(tmp), 'fixed control main fixture')
+        snapshots(pinned, {fixture['name']}, Path(tmp), 'fixed original control fixture')
+    wanted['stores'] = current_recipe
     if 'stores' not in found:
         raise ValueError('the fixed control fixture is unavailable')
 
