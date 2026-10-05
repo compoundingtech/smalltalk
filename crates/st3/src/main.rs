@@ -5338,6 +5338,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
             },
         ));
     }
+    tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
@@ -20744,6 +20745,23 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
             Err(error) => eprintln!("st3: limits policy stopped: {error}"),
         }
         tokio::time::sleep(LIMITS_INTERVAL).await;
+    }
+}
+
+/// Old payloads convert after startup; each page joins the normal writer queue and commits
+/// its own cursor. A failed page retries, including after a daemon restart.
+async fn convert_envelope_payloads(store: Arc<Store>) {
+    loop {
+        let store = store.clone();
+        let result = tokio::task::spawn_blocking(move || store.convert_envelope_payloads()).await;
+        match result {
+            Ok(Ok(report)) if report.done => return,
+            Ok(Ok(_)) => tokio::time::sleep(Duration::from_millis(50)).await,
+            error => {
+                eprintln!("st3: binary envelope conversion failed: {error:?}");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
     }
 }
 

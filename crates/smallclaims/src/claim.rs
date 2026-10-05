@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod envelope_payload;
+pub use envelope_payload::EnvelopePayload;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClaimInput {
     pub subject: String,
@@ -53,8 +56,8 @@ pub struct ReplicaEnvelope {
     pub previous_hash: Option<String>,
     pub hash: String,
     pub accepted_at_unix_ms: u128,
-    /// Base64-encoded CBOR. Receipt does not decode this field.
-    pub payload: String,
+    /// Exact CBOR bytes, represented as base64 on the wire. Receipt does not interpret CBOR.
+    pub payload: EnvelopePayload,
     /// The writer's member key and its signature over this envelope, when the writer is a
     /// keyed fleet member. Older peers ignore and drop both fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]

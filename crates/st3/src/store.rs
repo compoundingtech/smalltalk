@@ -48,8 +48,6 @@ use crate::model::{
 use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 #[cfg(test)]
-use base64::Engine as _;
-#[cfg(test)]
 use smallclaims::claim::ReplicaEnvelopePayload;
 use smallclaims::error::internal;
 use smallclaims::hash::{
@@ -1221,7 +1219,7 @@ fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == 0 || version == 13 || version == 14 || version == 15 {
+    if version == 0 || version == 13 || version == 14 || version == 15 || version == 16 {
         return Ok(());
     }
     if version == 12 {
@@ -30486,11 +30484,9 @@ agent "test/empty" { command "true" }
         envelope: &ReplicaEnvelope,
         update: impl FnOnce(&mut ReplicaEnvelopePayload),
     ) -> ReplicaEnvelope {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(envelope.payload.as_bytes())
-            .expect("envelope base64");
+        let bytes = envelope.payload.bytes().expect("envelope base64");
         let mut payload: ReplicaEnvelopePayload =
-            ciborium::from_reader(bytes.as_slice()).expect("envelope CBOR");
+            ciborium::from_reader(bytes).expect("envelope CBOR");
         update(&mut payload);
         let mut bytes = Vec::new();
         ciborium::into_writer(&payload, &mut bytes).expect("updated envelope CBOR");
@@ -30502,7 +30498,7 @@ agent "test/empty" { command "true" }
                 envelope.accepted_at_unix_ms,
                 &bytes,
             ),
-            payload: base64::engine::general_purpose::STANDARD.encode(bytes),
+            payload: bytes.into(),
             ..envelope.clone()
         }
     }
@@ -36949,7 +36945,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     &bytes,
                 ),
                 accepted_at_unix_ms: batch.accepted_at_unix_ms,
-                payload: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                payload: bytes.into(),
                 member_key: None,
                 signature: None,
             }
@@ -37803,7 +37799,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            15
+            16
         );
         assert_eq!(
             connection
@@ -37877,7 +37873,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            15
+            16
         );
     }
 
@@ -37910,7 +37906,7 @@ version 2
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         assert_eq!(planner_column, 1);
     }
 

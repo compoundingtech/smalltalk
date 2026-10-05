@@ -755,7 +755,6 @@ mod tests {
 
     #[test]
     fn a_backup_preserves_multiple_wire_envelopes_for_the_same_batch() {
-        use base64::Engine as _;
         let root = tempfile::tempdir().unwrap();
         let source = Store::open_memory("alder").unwrap();
         diagnostic(&source, "note");
@@ -763,13 +762,8 @@ mod tests {
             .export_replication_exchange("test-fleet", &ReplicationInventory::default())
             .unwrap();
         let mut variant = exchange.envelopes[0].clone();
-        let mut payload: smallclaims::claim::ReplicaEnvelopePayload = ciborium::from_reader(
-            base64::engine::general_purpose::STANDARD
-                .decode(&variant.payload)
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap();
+        let mut payload: smallclaims::claim::ReplicaEnvelopePayload =
+            ciborium::from_reader(variant.payload.bytes().unwrap()).unwrap();
         let blob = b"another wire representation".to_vec();
         payload
             .blobs
@@ -783,7 +777,7 @@ mod tests {
             variant.accepted_at_unix_ms,
             &bytes,
         );
-        variant.payload = base64::engine::general_purpose::STANDARD.encode(bytes);
+        variant.payload = bytes.into();
         exchange.envelopes.push(variant);
         let receiver = Store::open_memory("birch").unwrap();
         receiver
