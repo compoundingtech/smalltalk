@@ -494,7 +494,12 @@ impl Store {
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(principals::PRINCIPAL_SCHEMA)?;
         runtime.create_schema(connection)?;
-        connection.execute_batch(SCHEMA_VERSION)?;
+        // Reassigning user_version dirties the database header even when it is unchanged.
+        // Upgrade once, then let ordinary reopens avoid that write and its durable commit.
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != 16 {
+            connection.execute_batch(SCHEMA_VERSION)?;
+        }
         document_index::initialize(connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(connection, runtime.legacy_digest_tables())?;
