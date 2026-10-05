@@ -62,6 +62,8 @@ pub mod render;
 pub mod resource;
 pub mod rollout;
 pub mod seat_queue;
+/// Runs any CLI with credentials no seat can read, through a gateway the sekrets user owns.
+pub mod sekrets;
 pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
@@ -69,6 +71,7 @@ pub mod store;
 pub mod subagents;
 /// Suspends a quiet seat and resumes its own native session.
 pub mod suspension;
+pub mod seat_snapshot;
 pub mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

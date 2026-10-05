@@ -618,6 +618,14 @@ Rust exposes `agent_stop`/`agent_start`; TypeScript and Swift expose `agentStop`
 All generated clients' `Fence` models also carry the desired revision required by
 `runtime.stop` and `runtime.restart`.
 
+`agent.suspend` takes `{agent, reason?}` and requires the running incarnation and selected desired
+revision in its fence. `agent.resume` takes `{agent, host?}` and requires the selected desired
+revision. An absent `host` preserves single-host behavior. A different host requests portable
+continuation under the same seat identity, with `suspension.phase` progressing through
+`fencing-source`, `transferring`, `restoring`, `verifying`, and `resumed`. A failure returns to
+`suspended` with a typed code and reason. `suspension.source_host` and `suspension.host` are optional
+additive fields. See [suspending a seat](../suspend.md) for workspace and harness restrictions.
+
 `agent.queue-move` takes `agent_id`, `mission_run_id`, `placement` (`top`, `bottom`, `before`, or
 `after`), `anchor_run_id` for `before` and `after`, and an optional `reason`. It records one
 `agent.queue.moved` claim with the session's person as actor. It never changes a step the seat

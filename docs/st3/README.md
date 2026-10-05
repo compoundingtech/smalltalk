@@ -42,6 +42,8 @@ Use these documents for implementation details:
   on the seat, with a lease, and ends them when their harness, session or seat goes away.
 - [Model accounts](accounts.md) explains how a person declares several Claude and Codex accounts, how a
   seat binds one or a pool, and how a pooled seat at its limit restarts on another account.
+- [Sekrets](sekrets.md) explains the opt-in gateway that runs any CLI with a credential no seat
+  can read: profiles, policies, grants, how it tells a seat from its person, and its sandbox.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
   recorded, the log format, and what the recorder cannot see.
 - [Profiling the daemon](profiling.md) explains how the daemon accounts for its own time: waits
