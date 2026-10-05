@@ -6,7 +6,7 @@ from pathlib import Path
 import socket
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 loader = importlib.machinery.SourceFileLoader("fault_runtime", str(Path(__file__).with_name("run")))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -33,6 +33,24 @@ class RuntimeTests(unittest.TestCase):
                         self.assertEqual(str(runtime), node.env["XDG_RUNTIME_DIR"])
                     else:
                         self.assertNotIn("XDG_RUNTIME_DIR", node.env)
+
+
+class ChannelReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_current_channel_waits_for_a_current_delivery_report(self):
+        for card in ({}, {"delivery": None}, {"delivery": {"state": "legacy"}},
+                     {"delivery": {"state": "current"}}):
+            with self.subTest(card=card), patch.object(runner, "agent", AsyncMock(return_value=card)):
+                result = await runner.current_channel(object())
+            if (card.get("delivery") or {}).get("state") == "current":
+                self.assertIs(result, card)
+            else:
+                self.assertIsNone(result)
+
+    async def test_absent_agent_value_is_not_ready(self):
+        node = AsyncMock()
+        node.cli.return_value = '{"value":null}'
+        self.assertEqual(await runner.agent(node), {})
+        self.assertIsNone(await runner.current_channel(node))
 
 
 if __name__ == "__main__":

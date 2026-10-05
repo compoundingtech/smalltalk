@@ -9,13 +9,20 @@ message.
 `HARNESS` is `claude`, `codex`, `pi`, `omp` or `opencode`. `SCENARIO` is `fresh`, `restart`,
 `daemon-restart`, `reexec`, `concurrent` or `suspend`; `run --help` says what each does. Each
 stand-in keeps its sessions the way its harness does, so `suspend` proves that a resumed seat comes
-back on the session it suspended on. The Rust wrapper
+back on the session it suspended on, holds hour-old mail, and consumes recent never-offered
+mail exactly once. The Rust wrapper
 `crates/st3/tests/boot_canaries.rs` runs every pair as its own test in the required Linux gate.
 
 The Codex-only `utf8` scenario starts and ends the bounded transcript window inside a euro sign,
 withholds live receipts so transcript recovery must release the next message, then forces a
 discovery I/O error. A live status update and receipt must still reach the same seat, and repeated
 warnings must stay rate-limited in its private `driver.log`, outside the PTY.
+
+Claude's `channel-missing` and `channel-uninitialized` scenarios restart with healthy hooks
+but no usable channel. They require `claude-channel-unattached` with a blocked seat within
+45 seconds, a visible hold for early mail, and recovery with exactly one native offer and one
+staged/delivered/read receipt. Two further restarts must deliver fresh startup mail once without
+replaying recovered mail. The fault controls live only in each isolated workspace.
 
 Every fresh scenario also checks that the native driver creates no `catalog.kdl`, `agent.kdl`,
 or polled `harness-state`, `harness-context`, and `harness-timeline` records, and that each seat

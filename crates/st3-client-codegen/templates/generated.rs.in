@@ -269,6 +269,8 @@ pub struct Operational {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Attention {
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub custom_form: Option<Value>,
     #[serde(default)]
     pub episode: String,
     #[serde(default)]
@@ -301,6 +303,9 @@ pub struct Attention {
     /// Information the person asked for; reading it clears the card.
     #[serde(default)]
     pub update: Option<PersonUpdate>,
+    /// The mission step waiting on this ask, on an ask a mission step made.
+    #[serde(default)]
+    pub blocked: Option<AttentionBlocked>,
     pub title: String,
     pub detail: String,
     pub priority: String,
@@ -312,6 +317,16 @@ pub struct Attention {
     pub target_states: Vec<AttentionTargetState>,
     #[serde(default)]
     pub actions: Vec<String>,
+}
+/// The mission step that asked and waits for the answer.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AttentionBlocked {
+    pub step_run_id: String,
+    /// That step's name within its mission.
+    pub step: String,
+    /// What that step is for.
+    pub goal: String,
+    pub attempt: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AttentionTargetState {
@@ -1956,6 +1971,8 @@ pub struct Fence {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum ActionType {
+    #[serde(rename="custom.reply")]
+    CustomReply,
     #[serde(rename = "attention.resolve")]
     AttentionResolve,
     #[serde(rename = "review.approve")]
@@ -2726,4 +2743,14 @@ pub struct AgentRepository {
     pub path: String,
     pub workspaces: Vec<String>,
     pub agent_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomReplyParameters {
+    pub target_id: String,
+    pub registration: String,
+    pub revision: String,
+    pub episode: String,
+    pub fields: BTreeMap<String,Value>,
 }

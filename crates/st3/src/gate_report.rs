@@ -64,7 +64,7 @@ pub fn command_line() -> String {
         .join(" ")
 }
 
-fn shell_quote(argument: &str) -> String {
+pub(crate) fn shell_quote(argument: &str) -> String {
     if !argument.is_empty()
         && argument
             .chars()

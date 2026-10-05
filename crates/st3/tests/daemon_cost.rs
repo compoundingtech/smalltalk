@@ -104,6 +104,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "requires an authenticated native driver; the load test models seat waits with event long-polls",
     ),
     (
+        "GET /v1/mailbox/attachment",
+        "requires an authenticated native driver; uses indexed mailbox fence validation and an in-memory channel report",
+    ),
+    (
         "GET /v1/client/conversations/{id}/stream",
         "a WebSocket stream",
     ),
@@ -395,6 +399,29 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    post(
+        "POST /v1/schema/registrations",
+        "/v1/schema/registrations",
+        |_, attempt| json!({"manifest": custom_manifest(attempt as u32 + 2), "actor": "person/bench-operator"}),
+    ),
+    get("GET /v1/schema/registrations", "/v1/schema/registrations"),
+    get(
+        "GET /v1/client/custom-subjects",
+        "/v1/client/custom-subjects?kind=garden.review&version=1&limit=2",
+    ),
+    get(
+        "GET /v1/client/custom-subjects/{*id}",
+        "/v1/client/custom-subjects/custom/garden/review/v1/cost-read-000",
+    ),
+    get(
+        "GET /v1/custom/basis",
+        "/v1/custom/basis?subject=custom/garden/review/v1/cost-read-000&kinds=custom.garden.review.v1.requested",
+    ),
+    post(
+        "POST /v1/custom/reply",
+        "/v1/custom/reply",
+        |fixture, attempt| fixture.custom_replies[attempt].clone(),
+    ),
     post(
         "POST /v1/agents/source-offline",
         "/v1/agents/source-offline",
@@ -998,6 +1025,7 @@ impl Cost {
 struct Fixture {
     subjects: Subjects,
     items: BTreeMap<&'static str, String>,
+    custom_replies: Vec<Value>,
     /// A message sent for the lifecycle writes.
     sent: String,
     /// Person asks the done probe answers, one per attempt.
@@ -1431,6 +1459,8 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         .expect("the owned-set detail probe must read a live fixture");
     assert_eq!(selected["receipt"]["source"]["sequence"], 1);
 
+    prepare_custom_fixture(&store, &mut fixture, scale);
+
     let mut costs = BTreeMap::new();
     for probe in PROBES {
         // Prepare immediately before the work writes so the extra person steps do not change
@@ -1556,6 +1586,63 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         costs.len()
     );
     Measured { claims, costs }
+}
+
+fn custom_manifest(version: u32) -> st3_schema::custom::Manifest {
+    let mut manifest: st3_schema::custom::Manifest =
+        serde_json::from_str(include_str!("../../../examples/st3/custom-review.json")).unwrap();
+    manifest.version = version;
+    manifest.subject_prefix = format!("custom/garden/review/v{version}/");
+    manifest
+}
+
+fn prepare_custom_fixture(store: &Store, fixture: &mut Fixture, scale: f64) {
+    use st3::store::custom::{RegistrationRequest, ReplyRequest};
+    let manifest = custom_manifest(1);
+    store
+        .register_custom_kind(&RegistrationRequest {
+            manifest: manifest.clone(),
+            actor: "person/bench-operator".into(),
+        })
+        .unwrap();
+    let count = (scale * 200.0).round().max(2.0) as usize;
+    for name in (0..count)
+        .map(|i| format!("cost-read-{i:03}"))
+        .chain((0..4).map(|i| format!("cost-reply-{i}")))
+    {
+        let subject = format!("{}{}", manifest.subject_prefix, name);
+        store
+            .append_claim(&st3::model::ClaimInput {
+                subject: subject.clone(),
+                kind: manifest.creation_kind.clone(),
+                actor: Some("person/bench-operator".into()),
+                fields: serde_json::from_value(json!({"title":"Retain the seed history?",
+                "detail":"Choose Keep or Discard.","recipient":"person/bench-operator"}))
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let view = store.custom_subject(&subject).unwrap().unwrap();
+        let reply = ReplyRequest {
+            subject,
+            registration: view["registration"].as_str().unwrap().into(),
+            revision: view["revision"].as_str().unwrap().into(),
+            episode: view["attention"]["episode"].as_str().unwrap().into(),
+            fields: serde_json::from_value(json!({"selection":"keep"})).unwrap(),
+            actor: "person/bench-operator".into(),
+            idempotency_key: format!("cost-seed-{name}"),
+        };
+        if name.starts_with("cost-reply-") {
+            fixture
+                .custom_replies
+                .push(serde_json::to_value(&reply).unwrap());
+        } else {
+            // Grow the source index without growing the native attention fixture.
+            store.reply_custom_subject(&reply).unwrap();
+        }
+    }
 }
 
 /// Ids from the store's own lists, a sent message, and a person ask per attempt.
@@ -1690,6 +1777,7 @@ async fn fixture(person: &Client, client: &Client, subjects: Subjects) -> Fixtur
         asks,
         handoffs: Vec::new(),
         acknowledgments: Vec::new(),
+        custom_replies: Vec::new(),
         peer_inventory: Value::Null,
         peer_exchange: Value::Null,
     }
@@ -1832,17 +1920,23 @@ fn write_claims(store: &Store, origin: &str, round: usize) {
 }
 
 fn sync(from: &Store, from_name: &str, to: &Store) {
-    let exchange = from
-        .export_replication_exchange(
-            FLEET,
-            &to.export_replication_summary(FLEET).unwrap().inventory,
-        )
-        .unwrap();
-    to.receive_replication_exchange(from_name, FLEET, &exchange)
-        .unwrap();
-    to.validate_replication_backlog().unwrap();
-    to.apply_replication_repairs().unwrap();
-    to.project_replication_backlog().unwrap();
+    // Fixture setup must drain every page before adding the measured deltas. A compact
+    // summary can require another listing round and leave an empty first response.
+    // Measured replication requests still use the production compact inventories.
+    for _ in 0..128 {
+        let exchange = from
+            .export_replication_exchange(FLEET, &to.replication_inventory().unwrap())
+            .unwrap();
+        if exchange.envelopes.is_empty() {
+            return;
+        }
+        to.receive_replication_exchange(from_name, FLEET, &exchange)
+            .unwrap();
+        to.validate_replication_backlog().unwrap();
+        to.apply_replication_repairs().unwrap();
+        to.project_replication_backlog().unwrap();
+    }
+    panic!("replication fixture did not drain within 128 pages");
 }
 
 /// A checkpoint trim of everything the checkpoint rules drop, counted per deleted row.

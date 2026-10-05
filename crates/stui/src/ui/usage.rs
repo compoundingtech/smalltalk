@@ -110,6 +110,18 @@ impl Total {
         self.unpriced += row.unpriced_tokens;
     }
 
+    /// What the tokens were: re-read from the cache, written to it, fresh input, or output, as
+    /// shares of the total.
+    pub fn mix(&self) -> String {
+        format!(
+            "{} cached · {} written to cache · {} fresh input · {} output",
+            share(self.cached, self.tokens),
+            share(self.cache_write, self.tokens),
+            share(self.input, self.tokens),
+            share(self.output, self.tokens),
+        )
+    }
+
     /// The cost, with a `+` when some tokens had no price: the true cost is higher, never
     /// lower.
     pub fn money(&self) -> String {
@@ -128,6 +140,22 @@ pub fn money(microusd: u64) -> String {
         format!("${dollars:.2}")
     } else {
         format!("${dollars:.0}")
+    }
+}
+
+/// `part` of `whole` as a percentage: whole numbers from 10% up, a decimal below, and `<0.1%`
+/// for a sliver, so a small bucket never reads as none.
+pub fn share(part: u64, whole: u64) -> String {
+    if whole == 0 || part == 0 {
+        return "0%".into();
+    }
+    let percent = part as f64 * 100.0 / whole as f64;
+    if percent >= 10.0 {
+        format!("{percent:.0}%")
+    } else if percent >= 0.1 {
+        format!("{percent:.1}%")
+    } else {
+        "<0.1%".into()
     }
 }
 
@@ -297,6 +325,10 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
                 ),
                 theme::dim(),
             ),
+        ])));
+        items.push(Item::Note(Line::from(vec![
+            span(" ", theme::dim()),
+            span(total.mix(), theme::dim()),
         ])));
         for (name, grouping) in [("agent", By::Agent), ("mission", By::Mission)] {
             if let Some((id, spent)) = groups(rows.iter(), grouping)
@@ -664,6 +696,40 @@ mod tests {
         assert_eq!(next_period(24), 168);
         assert_eq!(next_period(720), 24);
         assert_eq!(period_name(168), "the last 7 days");
+    }
+
+    #[test]
+    fn the_token_mix_shows_cached_written_input_and_output_shares() {
+        assert_eq!(share(0, 100), "0%");
+        assert_eq!(share(5, 0), "0%");
+        assert_eq!(share(98_260, 100_000), "98%");
+        assert_eq!(share(890, 100_000), "0.9%");
+        assert_eq!(share(40, 100_000), "<0.1%");
+        let total = Total {
+            tokens: 100_000,
+            cached: 98_260,
+            cache_write: 890,
+            input: 630,
+            output: 210,
+            ..Total::default()
+        };
+        assert_eq!(
+            total.mix(),
+            "98% cached · 0.9% written to cache · 0.6% fresh input · 0.2% output"
+        );
+        // The summary shows it under the total.
+        let world = super::super::demo::world();
+        let summary = list(&world, By::Agent, 24)
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Note(line) => Some(text::plain(line)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(summary.contains("cached ·"), "{summary}");
+        assert!(summary.contains("written to cache"), "{summary}");
     }
 
     #[test]

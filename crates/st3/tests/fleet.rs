@@ -523,6 +523,9 @@ async fn joined(root: &Path, sponsor: &Node, name: &str, extra: &[&str]) -> Node
 /// child finishes. Put the next real weekly tick close enough to exercise it in this daemon.
 #[tokio::test(flavor = "multi_thread")]
 async fn scheduled_occurrence_survives_parent_reapply_revision_and_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut node = Node::new(root.path(), "orchard");
     node.start().await;
@@ -673,16 +676,25 @@ mission "orchard/weekly" state="ready" {{
 /// A stopped origin's earlier running claims must not fence a seat placed on another host.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_seat_is_reachable_after_a_cross_host_move() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     cross_host_seat_move(SeatMove::Stopped).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn placement_handoff_moves_a_running_seat_between_real_daemons() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     cross_host_seat_move(SeatMove::Running).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn placement_handoff_source_offline_retires_the_returning_real_daemon_runtime() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     cross_host_seat_move(SeatMove::SourceOffline).await;
 }
 
@@ -836,6 +848,9 @@ fn authority_digest(node: &Node) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_populated_standalone_daemon_founds_a_fleet_with_verified_person_and_agent_claims() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut a = Node::new(root.path(), "studio");
     a.start().await;
@@ -922,6 +937,9 @@ async fn a_populated_standalone_daemon_founds_a_fleet_with_verified_person_and_a
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invite_and_join_sync_full_history() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let mut expected = BTreeSet::new();
@@ -1004,6 +1022,9 @@ async fn invite_and_join_sync_full_history() {
 /// must say it has no route rather than that it is temporarily unavailable.
 #[tokio::test(flavor = "multi_thread")]
 async fn members_read_each_others_owner_state_and_unreachable_owners_say_why() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -1069,6 +1090,9 @@ fn peer_sync(node: &Node, peer: &str) -> Value {
 /// Then they heal: they find the claims one lacks and admit their envelopes again.
 #[tokio::test(flavor = "multi_thread")]
 async fn members_with_the_same_envelopes_but_different_claims_report_divergence_and_heal() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut a = anchor(root.path(), "a").await;
     let mut b = joined(root.path(), &a, "b", &[]).await;
@@ -1248,6 +1272,9 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dial_out_member_is_caught_up_and_never_reported_down() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let mut laptop = joined(root.path(), &a, "laptop", &["--dial-out"]).await;
@@ -1298,6 +1325,9 @@ async fn a_dial_out_member_is_caught_up_and_never_reported_down() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_interrupted_join_resumes_with_the_same_code() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut a = Node::new(root.path(), "a");
     let marker = root.path().join("drop-one-join-answer");
@@ -1380,6 +1410,9 @@ async fn an_interrupted_join_resumes_with_the_same_code() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_revoked_and_used_codes_are_refused() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let refusal = |output: Output| {
@@ -1425,6 +1458,9 @@ async fn expired_revoked_and_used_codes_are_refused() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaked_code_is_visible_and_can_be_revoked() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let m = joined(root.path(), &a, "m", &[]).await;
@@ -1508,6 +1544,9 @@ async fn a_leaked_code_is_visible_and_can_be_revoked() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_secret_never_leaves_its_file() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -1589,6 +1628,9 @@ async fn the_secret_never_leaves_its_file() {
 /// everything its peer held, instead of returning at once with the old verdict.
 #[tokio::test(flavor = "multi_thread")]
 async fn fleet_wait_after_a_restart_waits_until_the_member_has_caught_up() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let mut b = joined(root.path(), &a, "b", &[]).await;
@@ -1625,6 +1667,9 @@ async fn fleet_wait_after_a_restart_waits_until_the_member_has_caught_up() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_member_is_refused() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -1739,6 +1784,9 @@ fn doctor_check(node: &Node, name: &str) -> Value {
 /// measurement stale with the envelopes written since it, and doctor warns.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frozen_member_is_not_reported_up() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -1811,6 +1859,9 @@ async fn a_frozen_member_is_not_reported_up() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn leave_drains_everything_before_it_leaves() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -1851,6 +1902,9 @@ async fn leave_drains_everything_before_it_leaves() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "orchard").await;
     let b = joined(root.path(), &a, "meadow", &[]).await;
@@ -1970,6 +2024,9 @@ async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leave_already_refused_as_left_finishes_when_run_again() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -2034,6 +2091,9 @@ async fn a_leave_already_refused_as_left_finishes_when_run_again() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn uninstall_leaves_nothing_behind() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let mut b = joined(root.path(), &a, "b", &[]).await;
@@ -2115,6 +2175,9 @@ async fn uninstall_leaves_nothing_behind() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flood_of_invalid_join_requests_does_not_block_a_valid_join() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let code = a.invite("b", &[]);
@@ -2162,6 +2225,9 @@ async fn down_observations(node: &Node, host: &str) -> usize {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_config_peer_fleet_migrates_to_membership() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let fleet_id = "8f14e45f-ceea-467a-9a2b-5c3d6e7f8091";
     let secret = root.path().join("fleet.secret");
@@ -2288,6 +2354,9 @@ async fn a_config_peer_fleet_migrates_to_membership() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaving_member_writes_nothing_after_it_begins_to_leave() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -2356,6 +2425,9 @@ async fn a_leaving_member_writes_nothing_after_it_begins_to_leave() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_switches_between_listening_and_dial_out() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let mut b = joined(root.path(), &a, "b", &[]).await;
@@ -2398,6 +2470,9 @@ async fn a_member_switches_between_listening_and_dial_out() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs ST3_COMPAT_BIN: the st3 of the pinned baseline release"]
 async fn an_old_build_config_peer_replicates_with_new_members() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let old = PathBuf::from(
         std::env::var("ST3_COMPAT_BIN").expect("ST3_COMPAT_BIN names the baseline st3"),
     );
@@ -2559,6 +2634,9 @@ fn backup_baseline_graph(old: &Node, directory: &Path) {
 
 #[test]
 fn fleet_workflows_have_no_path_filter() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
     let compat = fs::read_to_string(workflows.join("fleet.yml")).unwrap();
     // The Linux gate runs the fleet compatibility stage from this script.
@@ -2622,6 +2700,9 @@ esac
 /// Legacy helper ports must be unnecessary after membership advertises native Fabric routes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_legacy_helper_fleet_migrates_to_native_fabric_without_losing_history() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let fleet_id = "8f14e45f-ceea-467a-9a2b-5c3d6e7f8091";
     let secret = root.path().join("fleet.secret");
@@ -2793,6 +2874,9 @@ async fn a_legacy_helper_fleet_migrates_to_native_fabric_without_losing_history(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_fabric_transport_works_through_the_worker_alone() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let registry = root.path().join("fabric-registry");
     let no_tailscale = root.path().join("no-tailscale");
@@ -2930,6 +3014,9 @@ async fn the_fabric_transport_works_through_the_worker_alone() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_members_writes_relayed_by_an_uninformed_member_are_refused() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut a = anchor(root.path(), "a").await;
     let mut c = joined(root.path(), &a, "c", &[]).await;
@@ -3005,6 +3092,9 @@ async fn a_removed_members_writes_relayed_by_an_uninformed_member_are_refused() 
 /// but its network accepts no inbound connection. Two servers keep syncing while it sleeps.
 #[tokio::test(flavor = "multi_thread")]
 async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alerts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     let root = tempfile::tempdir().unwrap();
     let fleet_id = "8a7c55c0-e0d4-41cb-8e8c-6ab134611650";
@@ -3183,6 +3273,9 @@ async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alert
 /// leave the rest to the 30-second quiet window that follows the peer's last inbound exchange.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_backlog_of_several_pages_is_fetched_without_waiting_for_the_quiet_window() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     // Pages of 100 envelopes make a backlog of several pages cheap to write and to admit.
     const SETTINGS: [(&str, &str); 2] = [
         ("ST3_WORKER_INTERVAL_MS", "30000"),
@@ -3256,6 +3349,9 @@ async fn a_backlog_of_several_pages_is_fetched_without_waiting_for_the_quiet_win
 
 #[tokio::test(flavor = "multi_thread")]
 async fn action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut amber = anchor(root.path(), "fixture-amber").await;
     let mut cobalt = joined(root.path(), &amber, "fixture-cobalt", &[]).await;
@@ -3391,6 +3487,9 @@ async fn action_coverage_fleet_controls_and_checkpoint_administration_survive_re
 
 #[tokio::test(flavor = "multi_thread")]
 async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = format!("http://{}", http.local_addr().unwrap());
@@ -3510,6 +3609,9 @@ async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart
 /// and the target launches only after receiving the Git workspace and the same native transcript.
 #[tokio::test(flavor = "multi_thread")]
 async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_conversation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     struct SeatCleanup {
         pty: PathBuf,

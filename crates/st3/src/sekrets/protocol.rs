@@ -11,6 +11,17 @@ use serde::{Deserialize, Serialize};
 
 use super::policy::Policy;
 
+/// A closed peer is an error, not SIGPIPE; received descriptors close on exec. Linux sets both
+/// per call; elsewhere SIGPIPE stays the process's own concern and descriptors are marked after.
+#[cfg(target_os = "linux")]
+const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(not(target_os = "linux"))]
+const SEND_FLAGS: libc::c_int = 0;
+#[cfg(target_os = "linux")]
+const RECV_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+#[cfg(not(target_os = "linux"))]
+const RECV_FLAGS: libc::c_int = 0;
+
 /// The largest frame either side accepts.
 const MAX_FRAME: usize = 1 << 20;
 /// The most descriptors one frame carries.
@@ -265,7 +276,7 @@ fn sendmsg(socket: RawFd, bytes: &[u8], fds: &[RawFd]) -> io::Result<usize> {
         }
     }
     loop {
-        let sent = unsafe { libc::sendmsg(socket, &message, libc::MSG_NOSIGNAL) };
+        let sent = unsafe { libc::sendmsg(socket, &message, SEND_FLAGS) };
         if sent >= 0 {
             return Ok(sent as usize);
         }
@@ -290,7 +301,7 @@ fn recvmsg(socket: RawFd, buffer: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)
     message.msg_control = control.as_mut_ptr().cast();
     message.msg_controllen = control.len() as _;
     let read = loop {
-        let read = unsafe { libc::recvmsg(socket, &mut message, libc::MSG_CMSG_CLOEXEC) };
+        let read = unsafe { libc::recvmsg(socket, &mut message, RECV_FLAGS) };
         if read >= 0 {
             break read as usize;
         }
@@ -309,6 +320,9 @@ fn recvmsg(socket: RawFd, buffer: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)
                     / std::mem::size_of::<RawFd>();
                 for index in 0..count {
                     let fd = std::ptr::read_unaligned(data.cast::<RawFd>().add(index));
+                    if RECV_FLAGS == 0 {
+                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    }
                     fds.push(OwnedFd::from_raw_fd(fd));
                 }
             }

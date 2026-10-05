@@ -437,11 +437,9 @@ pub fn table_digest(table: &str, columns: &str, count: u64, accumulator: &[u8]) 
 }
 
 pub fn generation(connection: &Connection) -> Result<i64> {
-    Ok(connection.query_row(
-        "SELECT value FROM projection_digest_generation WHERE id=1",
-        [],
-        |row| row.get(0),
-    )?)
+    Ok(connection
+        .prepare_cached("SELECT value FROM projection_digest_generation WHERE id=1")?
+        .query_row([], |row| row.get(0))?)
 }
 
 pub fn tables(connection: &Connection) -> Result<BTreeMap<String, String>> {

@@ -19,8 +19,11 @@ the provider. Several st processes carry the seat's messages for the whole provi
 
 New seats receive `ST3_MAILBOX_TRANSPORT=push`. Each delivery component connects to `/v1/mailbox`
 over the local daemon Unix socket. The stream sends the full seat record and pushes new mail.
-Every connection starts a new automatic-delivery boundary: messages sent before that connection
-are held in the graph mailbox, including sent, staged, and delivered-but-unread mail. SQLite
+Every connection starts a new automatic-delivery boundary. Pre-connection mail older than one
+hour stays held in the graph mailbox. Recent mail with no staging or delivery claim is admitted
+once so an in-flight send survives a daemon restart. Previously staged or delivered-but-unread
+mail stays held regardless of age; a missing receipt never authorizes another offer. The one-hour
+window uses the original send time and the same threshold as the unread backlog. SQLite
 fences both subscriptions and receipts to the live runtime
 incarnation and replacement owner; reconnecting an older channel cannot retake ownership, including
 after a daemon restart. Socket loss creates no delivered or read receipt. Native ledgers retain
@@ -28,7 +31,8 @@ uncertain handoffs, and successful handoffs retry lost receipt acknowledgements 
 No push component projects message bodies into `resources/inbox` or `resources/archive`.
 
 `delivered` records native transport acceptance, not model consumption. A boot or channel reconnect
-never authorizes another offer of old mail. Older polling drivers also hold pre-boot messages;
+never authorizes another offer of old mail. Older polling drivers also recover recent unoffered
+pre-boot mail and retain the current boot's staging attempt until its receipts finish;
 their local archive projection removes old native inbox files without closing the graph messages.
 An agent can explicitly inspect that retained mail with `st conversations ls --as "$ST_AGENT"`
 and read it with `st conversations read MESSAGE --as "$ST_AGENT"`. New mail on the live connection
@@ -88,11 +92,21 @@ and seats that were already running on the legacy path continue to use ordinary 
 
 Seat updates carry `desired.display_name` and the member record, including the persona suffix.
 They update the PTY title and pi/omp session name on reconnect, `session_start`, and `session_switch`.
+Native driver title updates use the launcher's `PTY_SESSION` registry name; the provider's logical
+runtime ID can differ from that name. Failed title updates go to the private driver warning log,
+at most once every ten seconds, without writing into the harness terminal.
 OMP compares the declared label with its current session name before writing it, so replaying an
 unchanged Seat on reconnect does not append a title change or rewrite the saved title timestamp.
 Older OMP releases without `getSessionName` still apply the declared label without that comparison.
 Claude's status line reads the same graph authority on each render and chains the existing renderer.
 Native `/rename` is temporary: the next authority update restores the declared name.
+
+Live harness evidence is refreshed every twenty seconds, inside the client's ninety-second
+observation freshness horizon. The driver retries its durable observation outbox across daemon
+outages; mailbox subscriptions reconnect under the existing incarnation and fence. Once the daemon
+returns, quiet seats recover their current observation without a provider restart or a new turn.
+Heartbeats remain evidence-gated: missing, ended, superseded, or disconnected provider observations
+are never kept alive merely because an outer process still exists.
 
 A long-lived process keeps executing the file it started from. Linux names that image
 `PATH (deleted)` once the file is replaced. Before this change the processes above kept talking to

@@ -11,6 +11,7 @@
     { "$ref": "#/$defs/PairingComplete" }
   ],
   "$defs": {
+    "CustomReplyParameters": {"type": "object", "additionalProperties": false, "required": ["target_id", "registration", "revision", "episode", "fields"], "properties": {"target_id": {"$ref": "#/$defs/Id"}, "registration": {"type": "string"}, "revision": {"type": "string"}, "episode": {"type": "string"}, "fields": {"type": "object"}}},
     "ConversationSearchHit": {"type": "object", "additionalProperties": false, "required": ["conversation_id", "entry_id", "agent_id", "timestamp", "entry_type", "excerpt"], "properties": {"conversation_id": {"$ref": "#/$defs/Id"}, "entry_id": {"$ref": "#/$defs/Id"}, "agent_id": {"type": ["string", "null"]}, "timestamp": {"$ref": "#/$defs/Timestamp"}, "entry_type": {"type": "string"}, "excerpt": {"type": "string", "maxLength": 512}}},
     "ConversationSearch": {"type": "object", "additionalProperties": false, "required": ["kind", "items", "page", "indexed_at", "host_id", "incomplete_sources", "refreshing"], "properties": {"kind": {"const": "conversation-search"}, "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/ConversationSearchHit"}}, "page": {"$ref": "#/$defs/PageInfo"}, "indexed_at": {"$ref": "#/$defs/Timestamp"}, "host_id": {"$ref": "#/$defs/Id"}, "incomplete_sources": {"type": "array", "items": {"type": "string"}}, "refreshing": {"type": "boolean"}}},
 
@@ -201,7 +202,8 @@
           "required": ["kind", "attention_kind", "source_id", "person_id", "title", "detail", "priority", "state", "requested_at", "actions"],
           "properties": {
             "kind": { "const": "attention" },
-            "attention_kind": { "enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "person-step", "agent-request", "fault"] },
+            "attention_kind": {"anyOf": [{"enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "person-step", "agent-request", "fault"]}, {"type": "string", "pattern": "^custom\\.[a-zA-Z0-9_.-]+$"}]},
+          "custom_form": {"type": "object", "description": "Data-only registered reply form; absent on native attention."},
             "source_kind": {"type": "string"},
             "episode": {"type": "string"},
             "action_parameters": {"type": "object"},
@@ -222,6 +224,7 @@
             "mission_id": { "$ref": "#/$defs/Id" },
             "mission_run_id": { "$ref": "#/$defs/Id" },
             "step_run_id": { "$ref": "#/$defs/Id" },
+            "blocked": { "$ref": "#/$defs/AttentionBlocked", "description": "The mission step waiting on this ask, on an ask a mission step made; absent on a standalone ask." },
             "title": { "type": "string" },
             "detail": { "type": "string" },
             "priority": { "enum": ["critical", "high", "normal", "low"] },
@@ -229,10 +232,21 @@
             "requested_at": { "$ref": "#/$defs/Timestamp" },
             "targets": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "target_states": { "type": "array", "items": { "$ref": "#/$defs/AttentionTargetState" } },
-            "actions": { "type": "array", "items": { "type": "string", "enum": ["work.done", "review.approve", "review.reject", "review.request-changes", "launch.approve", "launch.cancel", "mission.approve-revision", "mission.cancel-revision", "message.read"] } }
+            "actions": { "type": "array", "items": { "type": "string", "enum": ["custom.reply", "work.done", "review.approve", "review.reject", "review.request-changes", "launch.approve", "launch.cancel", "mission.approve-revision", "mission.cancel-revision", "message.read"] } }
           }
         }
       ]
+    },
+    "AttentionBlocked": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step_run_id", "step", "goal", "attempt"],
+      "properties": {
+        "step_run_id": { "$ref": "#/$defs/Id", "description": "The step run that asked and waits for the answer." },
+        "step": { "type": "string", "description": "That step's name within its mission." },
+        "goal": { "type": "string", "description": "What that step is for." },
+        "attempt": { "type": "integer", "minimum": 0 }
+      }
     },
     "AttentionTargetState": {
       "type": "object",
@@ -1612,7 +1626,7 @@
         "api_version": { "const": "st3.client.v0" },
         "id": { "$ref": "#/$defs/Id" },
         "type": {
-          "enum": ["attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.ask", "work.done", "work.cancel-ask", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.create", "agent.stop", "agent.start", "agent.suspend", "agent.resume", "terminal.create", "terminal.end", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
+          "enum": ["custom.reply", "attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.ask", "work.done", "work.cancel-ask", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.create", "agent.stop", "agent.start", "agent.suspend", "agent.resume", "terminal.create", "terminal.end", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
         },
         "idempotency_key": { "x-st-brand": "IdempotencyKey", "type": "string", "minLength": 16, "maxLength": 256 },
         "fence": { "$ref": "#/$defs/Fence" },
@@ -1716,6 +1730,7 @@
     "ActionRequest": {
       "allOf": [{ "$ref": "#/$defs/ActionCommon" }],
       "oneOf": [
+        {"properties": {"type": {"const": "custom.reply"}, "parameters": {"$ref": "#/$defs/CustomReplyParameters"}}},
         {"properties": {"type": {"const": "agent.create"}, "parameters": {"$ref": "#/$defs/AgentCreateParameters"}}},
         {"properties": {"type": {"const": "agent.stop"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["runtime_desired_revision"]}]}, "parameters": {"$ref": "#/$defs/AgentStopParameters"}}},
         {"properties": {"type": {"const": "agent.start"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["runtime_desired_revision"]}]}, "parameters": {"$ref": "#/$defs/AgentStartParameters"}}},

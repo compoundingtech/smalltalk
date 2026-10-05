@@ -362,7 +362,12 @@ The inventory is compact. It carries one digest per writer range of 256 sequence
 
 Each inventory says how many envelopes its sender takes in one exchange, 4,096 for this build. A peer sends at most that many, and at most 512 to a peer whose inventory does not say, as older builds do not.
 
-Each missing envelope contains one base64-encoded CBOR payload. Receipt stores the outer envelope before it decodes the payload.
+Each missing envelope contains one base64-encoded CBOR payload on the JSON wire. Receipt stores
+its decoded bytes in SQLite before admission interprets the CBOR. Malformed base64 stays as
+exact TEXT evidence, so receipt does not discard an invalid envelope. Existing TEXT payloads
+remain readable while the daemon converts them to BLOBs in bounded, restartable writer-queue
+transactions. Export restores the same base64 wire representation; hashes and signatures still
+commit the same original bytes.
 
 An exchange body larger than 64 KiB travels deflate-compressed (`Content-Encoding: deflate`), which shrinks a page of envelopes to about a third. A requester asks for compressed answers with `Accept-Encoding: deflate`; a peer's answer carries the same header when it takes compressed requests, and the requester then compresses its push. Signatures cover the uncompressed JSON, and an inflated body may not exceed the 64 MB exchange limit. An older build neither asks nor says, so it exchanges plain JSON.
 
