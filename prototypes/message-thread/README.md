@@ -26,7 +26,7 @@ repair and unrepair, deletion predecessor, rollback, rebuild and reopen.
 In invented 1,000/10,000 distinct stale-subject cohorts, the two-member
 parent seek used 16/15 SQLite VM steps and an unrelated new desired child
 write used 156/156. In 1,000/10,000 assignments for one child, deleting the
-latest assignment used 167/158 VM steps and reinserting it used 572/572.
+latest assignment used 167/158 VM steps and reinserting it used 249/249.
 These numbers include the prototype's indexes, especially the existing
 `claims_batch_index`. They are source-model evidence only; real Store work,
 startup/backfill, bytes, durability and p99 remain unmeasured.
