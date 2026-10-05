@@ -4325,7 +4325,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            publish("person/avery", &valid, "person/blake"),
+            publish("person/avery", &valid, "person/intruder"),
             Err("claim-write-forbidden")
         );
         assert_eq!(
