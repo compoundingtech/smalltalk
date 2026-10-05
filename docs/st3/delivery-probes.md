@@ -142,6 +142,17 @@ Shorter test intervals make the outage proof bounded; production uses the
 stand-in, requiring Node.js; probe recipients remain dedicated Python consumers.
 The native proof runs in the normal Linux Cargo test suite.
 
+The probe's private `events.jsonl` pairs every channel start and exit by channel ID
+and PID. Exit records include whether the native hello arrived, the inherited runtime
+incarnation and ownership sequence, and a separately timed observation of the agent's
+current owner. That observation is context, not proof of the channel's accepted binding.
+Stderr is drained concurrently with native stdout. Only a 4 KiB tail is retained;
+diagnostics keep CLI error lines with credentials redacted and omit structured or native
+message payloads. An inherited pipe cannot hold up restart indefinitely. These records
+have mode 0600 and stay local; they never enter replicated probe reports. Native test
+failures print the private event tail so a startup refusal can be distinguished from a
+later recovery failure without manufacturing a consumed or read receipt.
+
 A member shown as last seen pauses its route: the probe queues no new sends, withdraws
 route attention, and retains any pending message. After a new replication exchange,
 it resumes that same message with a fresh measurement window. Doctor waits for absent

@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import sys
 import time
@@ -20,6 +21,71 @@ import uuid
 
 FORMAT = "st3.delivery-probes.v1"
 PREFIX = "doc/delivery-probes/"
+CHANNEL_STDERR_BYTES = 4096
+
+
+class ChannelStderr:
+    """Drain every byte, retaining only a bounded private tail and redacted CLI errors."""
+    def __init__(self):
+        self.tail = bytearray()
+        self.bytes = 0
+        self.incomplete = False
+        self.payload_at = None
+        self.scan_tail = b""
+        self.secrets = [value for key, value in os.environ.items() if value
+                        and re.search(r"TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL|AUTHORIZATION", key, re.I)]
+
+    async def drain(self, reader):
+        while True:
+            data = await reader.read(CHANNEL_STDERR_BYTES)
+            if not data:
+                return
+            if self.payload_at is None:
+                scan = self.scan_tail + data
+                payload = re.search(rb"<smalltalk-message|\{|\b(?:body|content|messages|prompt)\s*[:=]", scan, re.I)
+                if payload:
+                    self.payload_at = self.bytes - len(self.scan_tail) + payload.start()
+                self.scan_tail = scan[-64:]
+            self.bytes += len(data)
+            self.tail.extend(data)
+            del self.tail[:-CHANNEL_STDERR_BYTES]
+
+    def report(self):
+        tail = bytes(self.tail)
+        if self.payload_at is not None:
+            offset = self.payload_at - (self.bytes - len(tail))
+            tail = tail[:offset] + b"[payload omitted]" if offset >= 0 else b""
+        text = tail.decode("utf-8", errors="replace")
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+        lines = []
+        # Discard a clipped first line: its missing prefix could conceal payload context.
+        if self.bytes > CHANNEL_STDERR_BYTES:
+            text = text.partition("\n")[2]
+        for line in text.splitlines():
+            # The CLI's error line is useful; trailing request, environment and native
+            # envelope dumps are not. A truncated partial line cannot pass this prefix.
+            line = line.strip()
+            payload = re.search(r"<smalltalk-message|\{|\b(?:body|content|messages|prompt)\s*[:=]", line, re.I)
+            if not line.startswith(("st:", "error:", "Error:")):
+                if payload:
+                    break
+                continue
+            line = re.sub(r"[\x00-\x1f\x7f]", "", line)
+            payload = re.search(r"<smalltalk-message|\{|\b(?:body|content|messages|prompt)\s*[:=]", line, re.I)
+            if payload:
+                line = line[:payload.start()] + "[payload omitted]"
+            for value in self.secrets:
+                line = line.replace(value, "[redacted]")
+            line = re.sub(r"(?i)(\b(?:authorization|cookie)\s*[:=]\s*).*", r"\1[redacted]", line)
+            line = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [redacted]", line)
+            line = re.sub(r"(https?://)[^/\s@]+@", r"\1[redacted]@", line)
+            line = re.sub(r"(?i)(\b(?:api[_-]?key|token|secret|password|credential)\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+                          r"\1[redacted]", line)
+            lines.append(line)
+            if payload:
+                break
+        return {"bytes": self.bytes, "truncated": self.bytes > CHANNEL_STDERR_BYTES,
+                "incomplete": self.incomplete, "diagnostic": "\n".join(lines)[-CHANNEL_STDERR_BYTES:]}
 
 
 def now_ms():
@@ -123,7 +189,9 @@ class Probe:
         self.changed = True
 
     def event(self, event, **fields):
-        with (self.directory / "events.jsonl").open("a") as output:
+        descriptor = os.open(self.directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(descriptor, "a") as output:
+            os.fchmod(output.fileno(), 0o600)
             output.write(json.dumps({"at_unix_ms": now_ms(), "event": event, **fields}) + "\n")
 
     async def claims(self, subject):
@@ -182,17 +250,45 @@ class Probe:
                 child.stdin.write((json.dumps({"type": "failed", "meta": frame["meta"]}) + "\n").encode())
                 await child.stdin.drain()
 
+    async def channel_owner(self):
+        observed_at = now_ms()
+        try:
+            card = await asyncio.wait_for(self.api.get("/v1/client/agents/" + self.actor), 3)
+            if not isinstance(card, dict):
+                return {"observed_at_unix_ms": observed_at, "unavailable": True}
+            operational = card.get("operational") or {}
+            return {"observed_at_unix_ms": observed_at, "incarnation_id": card.get("incarnation_id"),
+                    "owner_run_id": card.get("owner_run_id"), "host_id": card.get("host_id"),
+                    "revision": card.get("revision"), "state": card.get("state"),
+                    "owner_generation": operational.get("owner_generation"),
+                    "runtime_incarnation": operational.get("runtime_incarnation")}
+        except Exception as error:
+            # The unavailable lookup must neither stop native delivery nor copy an API
+            # response (which can contain private data) into the diagnostic.
+            return {"observed_at_unix_ms": observed_at, "unavailable": True,
+                    "error_type": type(error).__name__}
+
     async def receiver(self):
         catalog = self.directory / "channel-catalog"
         catalog.mkdir(exist_ok=True)
         while True:
+            context = {"channel_id": str(uuid.uuid4()), "agent": self.actor, "host": self.source,
+                       "probe_pid": os.getpid(), "binary": self.st3, "endpoint": self.api.socket,
+                       "inherited_incarnation": os.environ.get("ST3_INCARNATION"),
+                       "owner_run_id": os.environ.get("ST_MISSION_RUN"),
+                       "provider_runtime": os.environ.get("ST_OMP_CHANNEL_RUNTIME_ID"),
+                       "ownership_sequence": os.environ.get("ST_OMP_CHANNEL_SEQ")}
             child = await asyncio.create_subprocess_exec(
                 self.st3, "--catalog", str(catalog), "driver", "omp-channel",
                 "--identity", self.actor[6:], stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "ST3_ENDPOINT": self.api.socket})
             self.child = child
-            self.event("channel-started", pid=child.pid)
+            captured = ChannelStderr()
+            drain = asyncio.create_task(captured.drain(child.stderr))
+            owner = asyncio.create_task(self.channel_owner())
+            hello_seen = False
+            self.event("channel-started", pid=child.pid, **context)
             try:
                 while True:
                     line = await child.stdout.readline()
@@ -200,6 +296,7 @@ class Probe:
                         break
                     frame = json.loads(line)
                     if frame.get("type") == "hello":
+                        hello_seen = True
                         child.stdin.write(b'{"type":"ready"}\n{"type":"state","state":"idle"}\n')
                         await child.stdin.drain()
                     elif frame.get("type") == "message":
@@ -208,9 +305,38 @@ class Probe:
                         task.add_done_callback(self.finished)
             finally:
                 if child.returncode is None:
-                    child.terminate()
-                await child.wait()
-                self.event("channel-exited", pid=child.pid, exit=child.returncode)
+                    try:
+                        child.terminate()
+                    except ProcessLookupError:
+                        pass
+                # Process.wait() also waits for inherited pipe EOF on some Python
+                # versions. The child watcher reaps the PID independently; inspect its
+                # return code so an unrelated descendant cannot hold up shutdown.
+                deadline = time.monotonic() + 3
+                while child.returncode is None and time.monotonic() < deadline:
+                    await asyncio.sleep(0.02)
+                if child.returncode is None:
+                    try:
+                        child.kill()
+                    except ProcessLookupError:
+                        pass
+                    deadline = time.monotonic() + 1
+                    while child.returncode is None and time.monotonic() < deadline:
+                        await asyncio.sleep(0.02)
+                # A descendant can inherit stderr after the channel exits. Its open pipe
+                # must not delay restart forever; cancellation leaves the captured tail.
+                try:
+                    await asyncio.wait_for(drain, 1)
+                except asyncio.TimeoutError:
+                    captured.incomplete = True
+                except Exception:
+                    captured.incomplete = True
+                finally:
+                    drain.cancel()
+                    await asyncio.gather(drain, return_exceptions=True)
+                self.event("channel-exited", pid=child.pid, exit=child.returncode,
+                           hello_seen=hello_seen, stderr=captured.report(),
+                           observed_owner=await owner, **context)
             await asyncio.sleep(1)
 
     def finished(self, task):
@@ -489,16 +615,14 @@ class Probe:
     async def run(self):
         tasks = [asyncio.create_task(self.receiver()), asyncio.create_task(self.monitor())]
         try:
-            await asyncio.gather(*tasks)
+            # wait does not automatically cancel children when this parent is cancelled.
+            # Cancel them once below, allowing receiver's bounded diagnostic cleanup.
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            for task in done:
+                task.result()
         finally:
             for task in tasks + list(self.tasks):
                 task.cancel()
-            if self.child and self.child.returncode is None:
-                try:
-                    self.child.terminate()
-                except ProcessLookupError:
-                    pass
-                await self.child.wait()
             await asyncio.gather(*(tasks + list(self.tasks)), return_exceptions=True)
 
 

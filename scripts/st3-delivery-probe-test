@@ -89,6 +89,151 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.monitor.lock.close()
         self.directory.cleanup()
 
+    async def test_channel_stderr_flood_keeps_native_stdout_and_exit_context(self):
+        child = Path(self.directory.name) / "channel"
+        child.write_text("#!" + sys.executable + "\n" +
+                         "import sys\n"
+                         "sys.stderr.write('noise' * 100000 + '\\n')\n"
+                         "sys.stderr.write('st: current runtime incarnation did not appear\\n')\n"
+                         "sys.stderr.flush()\n"
+                         "print('{\"type\":\"hello\"}', flush=True)\n"
+                         "sys.stdin.readline()\n"
+                         "sys.exit(2)\n")
+        child.chmod(0o700)
+        self.monitor.st3 = str(child)
+        self.monitor.api.socket = "/private-fixture/socket"
+        self.monitor.api.agent.update(incarnation_id="fixture-incarnation", owner_run_id="fixture-run",
+                                      host_id="amber", revision="fixture-revision",
+                                      operational={"owner_generation": 7, "runtime_incarnation": "fixture-incarnation"})
+        with patch.dict(os.environ, ST3_INCARNATION="inherited-fixture", ST_MISSION_RUN="inherited-run",
+                        ST_OMP_CHANNEL_RUNTIME_ID="fixture-provider", ST_OMP_CHANNEL_SEQ="7"):
+            receiver = asyncio.create_task(self.monitor.receiver())
+            try:
+                async def exited():
+                    path = Path(self.directory.name) / "events.jsonl"
+                    events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+                    return events if any(event["event"] == "channel-exited" for event in events) else None
+                events = await faults.until(exited, 5)
+            finally:
+                receiver.cancel()
+                await asyncio.gather(receiver, return_exceptions=True)
+        started, ended = events
+        self.assertEqual(started["channel_id"], ended["channel_id"])
+        self.assertEqual(started["pid"], ended["pid"])
+        self.assertEqual(ended["exit"], 2)
+        self.assertTrue(ended["hello_seen"])
+        self.assertEqual(ended["inherited_incarnation"], "inherited-fixture")
+        self.assertEqual(ended["provider_runtime"], "fixture-provider")
+        self.assertEqual(ended["ownership_sequence"], "7")
+        self.assertEqual(ended["observed_owner"]["incarnation_id"], "fixture-incarnation")
+        self.assertEqual(ended["observed_owner"]["owner_generation"], 7)
+        self.assertEqual(ended["stderr"]["bytes"], 500001 + len("st: current runtime incarnation did not appear\n"))
+        self.assertTrue(ended["stderr"]["truncated"])
+        self.assertFalse(ended["stderr"]["incomplete"])
+        self.assertEqual(ended["stderr"]["diagnostic"], "st: current runtime incarnation did not appear")
+        self.assertEqual((Path(self.directory.name) / "events.jsonl").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.monitor.state["receipts"], {})
+        self.assertEqual(self.monitor.api.posts, [])
+        self.assertNotIn("channel", json.dumps(self.monitor.report()))
+
+    async def test_channel_stderr_omits_credentials_and_multiline_native_payload(self):
+        with patch.dict(os.environ, PROBE_TEST_API_KEY="fixture-private-key"):
+            capture = probe.ChannelStderr()
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"st: failure fixture-private-key token=fixture-token Bearer fixture-bearer\n"
+                         b"st: failed https://fixture-user:fixture-password@example.invalid/\n"
+                         b"st: Authorization: fixture-auth\n"
+                         b"<smalltalk-message>\nst: private message body\n</smalltalk-message>\n")
+        reader.feed_eof()
+        await capture.drain(reader)
+        report = capture.report()
+        self.assertIn("st: failure", report["diagnostic"])
+        for private in ("fixture-private-key", "fixture-token", "fixture-bearer", "fixture-user",
+                        "fixture-password", "fixture-auth", "private message body"):
+            self.assertNotIn(private, json.dumps(report))
+        self.assertIn("[redacted]", report["diagnostic"])
+        self.assertLessEqual(len(capture.tail), probe.CHANNEL_STDERR_BYTES)
+        # The envelope boundary may fall outside the retained tail. Its body can
+        # resemble a CLI error, but must still never become a diagnostic.
+        capture = probe.ChannelStderr()
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"<smalltalk-message>\n" + b"private body\n" * 1000 + b"st: private trailing body\n")
+        reader.feed_eof()
+        await capture.drain(reader)
+        self.assertTrue(capture.report()["truncated"])
+        self.assertEqual(capture.report()["diagnostic"], "")
+
+    async def test_channel_owner_lookup_failure_keeps_context_without_response_body(self):
+        self.monitor.api.agent = None
+        context = await self.monitor.channel_owner()
+        self.assertTrue(context["unavailable"])
+        self.assertEqual(context["error_type"], "ApiError")
+        self.assertNotIn("recipient does not exist", json.dumps(context))
+
+    async def test_channel_exit_before_hello_does_not_wait_for_descendant_stderr(self):
+        child = Path(self.directory.name) / "channel"
+        descendant = Path(self.directory.name) / "descendant-pid"
+        child.write_text("#!" + sys.executable + "\n" +
+                         "import subprocess, sys\n"
+                         "descendant = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+                         "stdout=subprocess.DEVNULL)\n"
+                         f"open({str(descendant)!r}, 'w').write(str(descendant.pid))\n"
+                         "sys.stderr.write('st: startup refused before hello\\n')\n"
+                         "sys.exit(2)\n")
+        child.chmod(0o700)
+        self.monitor.st3 = str(child)
+        self.monitor.api.socket = "/private-fixture/socket"
+        self.monitor.api.agent = None
+        receiver = asyncio.create_task(self.monitor.receiver())
+        try:
+            async def exited():
+                path = Path(self.directory.name) / "events.jsonl"
+                events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+                return next((event for event in events if event["event"] == "channel-exited"), None)
+            ended = await faults.until(exited, 5)
+            self.assertEqual(ended["exit"], 2)
+            self.assertFalse(ended["hello_seen"])
+            self.assertTrue(ended["stderr"]["incomplete"])
+            self.assertEqual(ended["stderr"]["diagnostic"], "st: startup refused before hello")
+            self.assertTrue(ended["observed_owner"]["unavailable"])
+            self.assertEqual(self.monitor.state["receipts"], {})
+            self.assertEqual(self.monitor.api.posts, [])
+        finally:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+            if descendant.exists():
+                try:
+                    os.kill(int(descendant.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    async def test_probe_cancellation_records_channel_exit_and_reaps_child(self):
+        child = Path(self.directory.name) / "channel"
+        child.write_text("#!" + sys.executable + "\n" +
+                         "import sys, time\n"
+                         "print('{\"type\":\"hello\"}', flush=True)\n"
+                         "sys.stdin.readline()\n"
+                         "time.sleep(30)\n")
+        child.chmod(0o700)
+        self.monitor.st3 = str(child)
+        self.monitor.api.socket = "/private-fixture/socket"
+        async def waiting_monitor():
+            await asyncio.Future()
+        self.monitor.monitor = waiting_monitor
+        running = asyncio.create_task(self.monitor.run())
+        try:
+            async def started():
+                return self.monitor.child is not None
+            await faults.until(started, 5)
+        finally:
+            running.cancel()
+            await asyncio.wait_for(asyncio.gather(running, return_exceptions=True), 5)
+        self.assertIsNotNone(self.monitor.child.returncode)
+        events = [json.loads(line) for line in (Path(self.directory.name) / "events.jsonl").read_text().splitlines()]
+        self.assertEqual([event["event"] for event in events], ["channel-started", "channel-exited"])
+        self.assertEqual(events[0]["pid"], events[1]["pid"])
+        self.assertEqual(events[1]["exit"], self.monitor.child.returncode)
+
     async def test_timeout_replays_exact_send_and_alerts_even_if_send_is_unaccepted(self):
         self.monitor.api.fail_send = True
         await self.monitor.route(self.target)
