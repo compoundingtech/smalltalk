@@ -155,6 +155,7 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
         println!("skipped: a debug build is too slow to measure; run with cargo test --release");
         return;
     }
+    st3::profile::init_from_env();
     let scale = env_number("ST_LOAD_SCALE", 1.0_f64);
     let seconds = env_number("ST_LOAD_SECONDS", 120_u64);
     let keep = std::env::var_os("ST_BENCH_DIR")

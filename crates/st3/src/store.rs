@@ -2447,6 +2447,7 @@ impl Store {
         history: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        let _profile = crate::profile::span("agent_resources/cache_and_build");
         let mut cache = self
             .smalltalk
             .agent_resources_cache
@@ -2481,9 +2482,10 @@ impl Store {
                     });
                     items
                 }
-                None => build(None)?,
+                None => { crate::profile::note("agent_resources/full_rebuild"); build(None)? },
             }
         } else {
+            crate::profile::note("agent_resources/initial_build");
             build(None)?
         };
         cache.push_back((index, history, Arc::new(items.clone())));
@@ -9816,9 +9818,12 @@ impl Store {
                 .get(subject)
                 .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
             {
+                crate::profile::note("subject_status/cache_hit");
                 return Ok((entry.status.clone(), entry.action.clone()));
             }
         }
+        crate::profile::note(if newest { "subject_status/cache_miss_current" } else { "subject_status/cache_miss_historical" });
+        let _profile = crate::profile::span("subject_status/reduce");
         let (status, action) = subject_status_at(connection, subject, Some(store_index), None)?
             .expect("a reduction without an owner filter always has a status");
         if newest {
@@ -9917,6 +9922,7 @@ impl Store {
         store_index: u64,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        let _profile = crate::profile::span("status_for_subject_names");
         let subjects = if include_history {
             subjects
         } else {
