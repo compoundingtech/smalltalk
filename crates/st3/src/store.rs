@@ -17760,7 +17760,10 @@ fn publish_changed_harness_state_tx(
         &json!(fields),
     )?;
     if input.fields.get("state").and_then(Value::as_str) != Some("working") {
-        publish_pending_usage_tx(transaction, origin, &input.subject, now)?;
+        publish_pending_usage_tx(
+            transaction, origin, &input.subject,
+            fields.get("incarnation_id").and_then(Value::as_str).unwrap_or(""), now,
+        )?;
     }
     Ok(Some(claim))
 }
@@ -17792,11 +17795,14 @@ fn usage_native_session(
     }
     // The native claim may have been trimmed after this slot first published. Its own
     // published snapshot is still an exact-incarnation carrier, never a current-seat guess.
-    let previous: Option<Option<String>> = connection.query_row(
-        "SELECT json_extract(published_fields, '$.native_session_id') FROM local_latest_slots
+    let previous: Option<Option<String>> = connection
+        .query_row(
+            "SELECT json_extract(published_fields, '$.native_session_id') FROM local_latest_slots
          WHERE subject=?1 AND kind='harness.usage' AND slot=?2",
-        params![subject, usage_slot(fields)], |row| row.get(0),
-    ).optional()?;
+            params![subject, usage_slot(fields)],
+            |row| row.get(0),
+        )
+        .optional()?;
     Ok(previous.flatten().filter(|id| !id.trim().is_empty()))
 }
 
@@ -17974,6 +17980,7 @@ fn publish_pending_usage_tx(
     transaction: &Transaction<'_>,
     origin: &str,
     subject: &str,
+    incarnation: &str,
     now: u128,
 ) -> Result<Vec<ClaimRecord>, St3Error> {
     let pending = {
@@ -17998,7 +18005,7 @@ fn publish_pending_usage_tx(
             [subject],
         )
         .map_err(internal)?;
-    pending
+    let mut published = pending
         .into_iter()
         .map(|observation| {
             let fields =
@@ -18012,7 +18019,43 @@ fn publish_pending_usage_tx(
                 now,
             )
         })
-        .collect()
+        .collect::<Result<Vec<_>, St3Error>>()?;
+    // Even a single response can have published before its native binding arrived, leaving
+    // no pending token change. Capture that binding in the normal stop flush as well.
+    let unbound = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT published_fields FROM local_latest_slots
+             WHERE subject=?1 AND kind='harness.usage'
+               AND json_extract(published_fields, '$.semantics')='response_rollup'
+               AND json_extract(published_fields, '$.incarnation_id')=?2
+               AND json_extract(published_fields, '$.native_session_id') IS NULL",
+            )
+            .map_err(internal)?;
+        let rows = statement
+            .query_map(params![subject, incarnation], |row| row.get::<_, String>(0))
+            .map_err(internal)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?
+    };
+    for fields in unbound {
+        let mut fields: BTreeMap<String, Value> =
+            serde_json::from_str(&fields).map_err(internal)?;
+        if let Some(binding) =
+            usage_native_session(transaction, subject, &fields).map_err(internal)?
+        {
+            fields.insert("native_session_id".into(), json!(binding));
+            published.push(publish_usage_slot_tx(
+                transaction,
+                origin,
+                subject,
+                Some(subject),
+                &fields,
+                now,
+            )?);
+        }
+    }
+    Ok(published)
 }
 
 fn local_observation_id(origin: &str, id: i64) -> String {
@@ -41662,42 +41705,56 @@ mission "nested-work" state="ready" {
     fn usage_period_keeps_price_versions_separate_without_repricing_the_baseline() {
         let local = Store::open_memory("host-one").unwrap();
         let subject = "agent/example.price-change";
-        let contribution = |version: &str, tokens: u64, rate: u64| json!({
-            "price_table_id":"st.api-list", "price_table_version":version,
-            "cost_source":"computed",
-            "rates_usd_per_million_tokens":{"input":rate,"output":rate,"cache_read":rate,
-                "cache_write_5m":rate,"cache_write_1h":rate},
-            "total_tokens":tokens,"input_tokens":tokens,"output_tokens":0,
-            "cache_write_tokens":0,"cache_write_1h_tokens":0,"cached_tokens":0,
-            "cost_microusd":tokens*rate,"reported_cost_microusd":0,"unpriced_tokens":0,
-        });
-        let old = contribution("example-v1",10,1);
-        let new = contribution("example-v2",20,2);
-        for (at,total,cost,provenance) in [
-            (10,10,10,json!([old.clone()])), (20,30,50,json!([old,new])),
+        let contribution = |version: &str, tokens: u64, rate: u64| {
+            json!({
+                "price_table_id":"st.api-list", "price_table_version":version,
+                "cost_source":"computed",
+                "rates_usd_per_million_tokens":{"input":rate,"output":rate,"cache_read":rate,
+                    "cache_write_5m":rate,"cache_write_1h":rate},
+                "total_tokens":tokens,"input_tokens":tokens,"output_tokens":0,
+                "cache_write_tokens":0,"cache_write_1h_tokens":0,"cached_tokens":0,
+                "cost_microusd":tokens*rate,"reported_cost_microusd":0,"unpriced_tokens":0,
+            })
+        };
+        let old = contribution("example-v1", 10, 1);
+        let new = contribution("example-v2", 20, 2);
+        for (at, total, cost, provenance) in [
+            (10, 10, 10, json!([old.clone()])),
+            (20, 30, 50, json!([old, new])),
         ] {
-            local.append_client_claim(&ClaimInput {
-                subject:subject.into(), kind:"harness.usage".into(), actor:Some(subject.into()),
-                fields:serde_json::from_value(json!({
-                    "semantics":"response_rollup","driver":"codex","incarnation_id":"inc-one",
-                    "model":"example-model","native_session_id":"native-example",
-                    "observed_at_unix_ms":at,"total_tokens":total,"input_tokens":total,
-                    "cost_microusd":cost,"pricing_provenance":provenance,
-                })).unwrap(), evidence:vec![],expected_subject:None,idempotency_key:None,
-            }).unwrap();
+            local
+                .append_client_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.usage".into(),
+                    actor: Some(subject.into()),
+                    fields: serde_json::from_value(json!({
+                        "semantics":"response_rollup","driver":"codex","incarnation_id":"inc-one",
+                        "model":"example-model","native_session_id":"native-example",
+                        "observed_at_unix_ms":at,"total_tokens":total,"input_tokens":total,
+                        "cost_microusd":cost,"pricing_provenance":provenance,
+                    }))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
         }
-        let rows = local.usage_period_rows(10,20).unwrap();
-        assert_eq!(rows[0]["total_tokens"],20);
-        assert_eq!(rows[0]["cost_microusd"],40);
+        let rows = local.usage_period_rows(10, 20).unwrap();
+        assert_eq!(rows[0]["total_tokens"], 20);
+        assert_eq!(rows[0]["cost_microusd"], 40);
         let provenance = rows[0]["pricing_provenance"].as_array().unwrap();
-        assert_eq!(provenance.len(),1);
-        assert_eq!(provenance[0]["price_table_version"],"example-v2");
-        assert_eq!(provenance[0]["rates_usd_per_million_tokens"]["input"],2);
-        assert_eq!(provenance[0]["total_tokens"],20);
-        assert_eq!(provenance[0]["cost_microusd"],40);
-        let lifetime = local.usage_period_rows(0,20).unwrap();
-        assert_eq!(lifetime[0]["pricing_provenance"].as_array().unwrap().len(),2);
-        assert_eq!(lifetime[0]["cost_microusd"],50);
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(provenance[0]["price_table_version"], "example-v2");
+        assert_eq!(provenance[0]["rates_usd_per_million_tokens"]["input"], 2);
+        assert_eq!(provenance[0]["total_tokens"], 20);
+        assert_eq!(provenance[0]["cost_microusd"], 40);
+        let lifetime = local.usage_period_rows(0, 20).unwrap();
+        assert_eq!(
+            lifetime[0]["pricing_provenance"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(lifetime[0]["cost_microusd"], 50);
     }
 
     #[test]

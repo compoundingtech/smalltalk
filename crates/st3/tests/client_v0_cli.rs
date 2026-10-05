@@ -456,20 +456,26 @@ async fn usage_cli_and_client_keep_pricing_provenance_and_native_session_binding
         store.append_client_claim(&rollup).unwrap();
     };
     respond("first-response");
-    respond("second-response");
     assert_eq!(
         store
             .claims_for(subject, Some("harness.usage"))
             .unwrap()
             .len(),
-        1,
-        "second snapshot stays pending within five minutes"
+        1
     );
-    // A native binding learned after the last response enriches the normal stop flush.
+    // A single response already published has no pending token change. Its late native
+    // binding must still be captured at stop, without publishing at binding time.
     append(
         "harness.session-file",
         json!({"harness":"codex","session_id":"native-example",
         "incarnation_id":"inc-one"}),
+    );
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        1
     );
     append(
         "harness.observed",
@@ -481,6 +487,30 @@ async fn usage_cli_and_client_keep_pricing_provenance_and_native_session_binding
             .unwrap()
             .len(),
         2
+    );
+    append(
+        "harness.observed",
+        json!({"state":"working","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    respond("second-response");
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        2,
+        "second response stays pending within five minutes"
+    );
+    append(
+        "harness.observed",
+        json!({"state":"idle","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        3
     );
     let server_socket = socket.clone();
     let server = tokio::spawn(async move {
