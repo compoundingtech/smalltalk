@@ -2183,7 +2183,21 @@ async fn cli_send_reply_read_archive_search_and_attachments_survive_restart() {
         vec!["conversations", "search", "Copper"],
     ] {
         daemon.restart().await;
-        cli_value(daemon.cli(WORKER, &arguments).await);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let output = loop {
+            let output = daemon.cli(WORKER, &arguments).await;
+            if arguments[1] == "search"
+                && !output.status.success()
+                && String::from_utf8_lossy(&output.stderr)
+                    .contains("conversation search index is being built; retry shortly")
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            break output;
+        };
+        cli_value(output);
     }
     let reply_args = [
         "conversations",
