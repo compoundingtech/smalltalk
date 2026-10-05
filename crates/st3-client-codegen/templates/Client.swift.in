@@ -200,7 +200,11 @@ public actor St3Client {
 
     static func routedSessionID(_ value: String) -> String {
         let innerID = value.hasPrefix("session/") ? String(value.dropFirst("session/".count)) : value
+        return encodedPathSegment(innerID)
+    }
+
+    private static func encodedPathSegment(_ value: String) -> String {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~"))
-        return innerID.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
     }
 }

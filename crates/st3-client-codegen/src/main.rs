@@ -373,7 +373,7 @@ fn swift_operation_methods(
         } else if id == "terminal.history" {
             writeln!(
                 out,
-                "    public func terminalHistory(_ id: String, runtimeIncarnation: String, before: String? = nil, limit: Int = 100) async throws -> Envelope<TerminalHistory> {{ let routedID = id.hasPrefix(\"terminal/\") ? String(id.dropFirst(\"terminal/\".count)) : id; var query: [URLQueryItem] = [.init(name: \"runtime_incarnation\", value: runtimeIncarnation), .init(name: \"limit\", value: String(limit))]; if let before {{ query.append(.init(name: \"before\", value: before)) }}; return try await get(\"v1/client/terminals/\\(Self.routedSessionID(routedID))/history\", query: query) }}"
+                "    public func terminalHistory(_ id: String, runtimeIncarnation: String, before: String? = nil, limit: Int = 100) async throws -> Envelope<TerminalHistory> {{ let routedID = id.hasPrefix(\"terminal/\") ? String(id.dropFirst(\"terminal/\".count)) : id; var query: [URLQueryItem] = [.init(name: \"runtime_incarnation\", value: runtimeIncarnation), .init(name: \"limit\", value: String(limit))]; if let before {{ query.append(.init(name: \"before\", value: before)) }}; return try await get(\"v1/client/terminals/\\(Self.encodedPathSegment(routedID))/history\", query: query) }}"
             )?;
         } else if id == "conversation.search" {
             writeln!(
