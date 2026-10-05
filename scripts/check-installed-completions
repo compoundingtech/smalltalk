@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Usage: check-installed-completions ST3_PACKAGE
+#
+# Checks the completion stubs an installed st3 package ships (docs/st3/cli-completion/spec.md,
+# R11): each one resolves st through PATH and completes through it in its shell.
+# No daemon runs here, so subcommands complete and entity arguments offer nothing.
+set -euo pipefail
+
+package=${1:?usage: check-installed-completions ST3_PACKAGE}
+bash_stub=$package/share/bash-completion/completions/st.bash
+zsh_stub=$package/share/zsh/site-functions/_st
+fish_stub=$package/share/fish/vendor_completions.d/st.fish
+
+for stub in "$bash_stub" "$zsh_stub" "$fish_stub"; do
+  test -s "$stub"
+done
+
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+export HOME=$scratch XDG_CONFIG_HOME=$scratch/config XDG_STATE_HOME=$scratch/state
+export ST3_ENDPOINT=$scratch/absent.sock
+export PATH="$package/bin:$PATH"
+unset ST_AGENT COMPLETE
+
+fish_out=$(fish --no-config -c "source '$fish_stub'; complete -C 'st terminals att'")
+grep -q '^attach' <<<"$fish_out" || {
+  echo "fish did not complete 'attach': $fish_out" >&2
+  exit 1
+}
+
+bash_complete() {
+  # shellcheck disable=SC1090
+  bash --norc -c 'source "$1"; shift; COMP_WORDS=("$@"); COMP_CWORD=$(($# - 1));
+    COMP_TYPE=9; _clap_complete_st st "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD - 1]}";
+    printf "%s\n" "${COMPREPLY[@]}"' _ "$bash_stub" "$@"
+}
+grep -qx attach <<<"$(bash_complete st terminals att)"
+entities=$(bash_complete st terminals attach '')
+if grep -q '^agent/' <<<"$entities"; then
+  echo "bash offered entities without a daemon: $entities" >&2
+  exit 1
+fi
+
+zsh -f -c "autoload -Uz compinit; compinit -u -D; source '$zsh_stub'
+  [[ \${_comps[st]} == _clap_dynamic_completer_st ]]"

@@ -68,3 +68,18 @@ client request records provide that detail. Profiling remains off unless `ST3_PR
 Capability admission seeks the attachment's indexed hash and its subject-head fence in one
 SQLite snapshot instead of decoding a bounded page of the whole fleet graph. Single-use CAS,
 session, person, and mode binding, expiry, and owner/incarnation checks remain unchanged.
+
+## Read connections and SQLite allocation
+
+Reads take an idle connection or open another when all retained connections are busy. The
+pool retains up to 128 idle connections by default; `SMALLCLAIMS_MAX_IDLE_READ_CONNECTIONS`
+overrides that retention ceiling. It does not cap concurrent connections or make reads wait
+for an available slot. Nested reads and pinned snapshots keep their existing behavior.
+Each retained connection can cache up to 8 MiB of pages, so raising retention trades memory
+for avoiding repeated schema parsing and statement preparation. Profiling counts fresh
+connections as `read connection opened`.
+
+The bundled SQLite build uses `SQLITE_DEFAULT_MEMSTATUS=0` through the workspace Cargo
+configuration, including Cargo-based Nix builds. SQLite's process-wide allocation statistics
+are disabled by default, removing their shared allocator mutex; statement, process CPU and
+I/O accounting remain available.

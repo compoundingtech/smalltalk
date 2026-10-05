@@ -1,7 +1,8 @@
+import { auditCaches } from './cache-audit.ts'
 import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
 
 // Preserve the public-content guard on all PRs and main pushes.
-export default githubWorkflow({
+export default githubWorkflow(auditCaches({
   actionlint: defaultActionlintConfig,
   "name": "Public repository check",
   "on": {
@@ -30,4 +31,4 @@ export default githubWorkflow({
       ]
     }
   }
-})
+}, {"public-repo": "Runs standard-library source checks without downloads or compilation."}))

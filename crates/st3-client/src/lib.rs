@@ -947,6 +947,15 @@ impl Client {
         };
         self.get(&format!("/v1/client/{collection}/{id}")).await
     }
+    /// Read one seat, including its retained history when requested.
+    pub async fn agents_get_with_history(
+        &self,
+        id: &str,
+        history: bool,
+    ) -> Result<Envelope<Resource>, ClientError> {
+        let query = if history { "?history=true" } else { "" };
+        self.get(&format!("/v1/client/agents/{id}{query}")).await
+    }
     pub async fn launch_variants(
         &self,
         launch_id: &str,
@@ -1171,6 +1180,9 @@ impl Client {
         ))
         .await
     }
+    pub async fn mail_backlog_summary(&self) -> Result<Envelope<MailBacklog>, ClientError> {
+        self.get("/v1/client/mail-backlog").await
+    }
     pub async fn usage_period(
         &self,
         since_ms: Option<u64>,
@@ -1333,6 +1345,16 @@ impl Client {
     pub async fn agents_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("agents", id).await
     }
+    pub async fn agent_workspace_get(
+        &self,
+        id: &str,
+    ) -> Result<Envelope<AgentWorkspace>, ClientError> {
+        self.get(&format!(
+            "/v1/client/agent-workspaces/{}",
+            percent_encode(id)
+        ))
+        .await
+    }
     pub async fn agent_declaration_get(
         &self,
         id: &str,
@@ -1349,6 +1371,13 @@ impl Client {
             path
         };
         self.get(&path).await
+    }
+    pub async fn status_history_get(
+        &self,
+        id: &str,
+    ) -> Result<Envelope<StatusHistory>, ClientError> {
+        self.get(&format!("/v1/client/status-history/{}", percent_encode(id)))
+            .await
     }
     pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {
         self.agent_queue_internal(agent_id).await

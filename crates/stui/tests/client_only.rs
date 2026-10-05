@@ -212,6 +212,7 @@ async fn pair(root: &Path, local: &Client, url: &str) {
             device_name: "Demo laptop".into(),
             person_id: "person/avery".into(),
             full_control: Some(true),
+            scopes: None,
         })
         .await
         .unwrap()

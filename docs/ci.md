@@ -4,7 +4,7 @@
 
 Workspace CI runs on pull requests, merge groups and manual dispatch. The merge queue tests the
 exact commit that lands on `main`; its successful checks stay attached to that SHA, so a main push
-does not repeat the workspace gate. `Main upkeep` verifies those four checks, runs `perf-cost`
+does not repeat the workspace gate. `Main upkeep` verifies those five checks, runs `perf-cost`
 (which the queue skips), and fills missing main-scope caches on Namespace. `macOS CI` still runs
 on main pushes. Each non-PR run uses its own `github.run_id` in the concurrency group, so
 successive pushes do not cancel checks or cache saves. PR updates still cancel stale checks;
@@ -12,12 +12,12 @@ macOS checks on PRs require the `macos-ci` label.
 
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
 (`.github/workflows/macos.yml`) replace the fleet's former Linux `st/ci` and optional `st/ci-macos`
-execution. The required checks on `main` are `linux-gate`, `isolation-vm`, `genie-freshness` and
-`typescript-client`,
+execution. The required checks on `main` are `linux-gate`, `isolation-vm`, `genie-freshness`,
+`typescript-client` and `mail-redelivery-canaries`,
 and `main` lands through GitHub's merge queue (see [Merge queue](#merge-queue)).
 
 Every pull request, including a fork and a draft, gets the Linux gate, the isolation VM, the
-freshness check and the TypeScript client check. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
+freshness check, the TypeScript client check and the mail redelivery canaries. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
 the required checks for each queued entry.
 Checkout uses GitHub's default `pull_request` merge ref, not the contributor's unmerged
 head: it tests that head merged with the current base. Strict branch protection also requires
@@ -25,10 +25,11 @@ that the head itself contain the latest `main`. No `pull_request_target` job run
 and the gate has only `contents: read` permission. Forks do not receive publishing secrets.
 
 The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
-`linux-gate` is the single required check: it needs the three jobs and passes only when every one of
-them succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
-`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm`, `typescript-client` and the `linux-gate`
-aggregate use `namespace-profile-linux-x86-64`. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
+`linux-gate` is the single required check: it needs the three stage jobs and the named mail redelivery
+check, and passes only when every one succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
+`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm` and `typescript-client`
+use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggregate uses GitHub-hosted
+`ubuntu-latest`, so it cannot queue behind build or benchmark jobs. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
 
@@ -46,15 +47,15 @@ limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
 Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
 or restoring build archives. When both entries exist it stops after the probes. A miss is flagged
 as P0 and fills the missing entries with builds only: selected test executables, Clippy artifacts,
-or the fleet baseline and integration binary. Workspace tests and the isolation VM are not repeated on main. The TypeScript dependency cache is also kept on main without repeating its tests.
+the fleet baseline and integration binary, the Genie shell, or the isolation archive and VM driver. Workspace tests and the isolation VM are not repeated on main. The TypeScript dependency cache is also kept on main without repeating its tests.
 Merge-group and PR caches have their own ref scope; they cannot replace these main-scope saves,
 which all PRs and Namespace overflow runs can restore. Manual Workspace CI dispatch on main
 remains available for a full run. Release and deployment workflows keep their own push triggers.
 
 Each stage restores a job-keyed `actions/cache` entry (Namespace serves it from its accelerated
 backend) holding Cargo's registry and the workspace `target/` directory, keyed on `Cargo.lock` and
-`flake.lock`. A second keyed entry (`nix4-<job>-...`) holds a signed local Nix binary cache in
-`$RUNNER_TEMP/st-ci-cache`. Its key includes `flake.lock` and both compatibility baseline pins.
+`flake.lock`, workspace manifests and linker configuration. A second keyed entry (`nix5-<job>-...`) holds a signed local Nix binary cache in
+`$RUNNER_TEMP/st-ci-cache`. Its key includes `flake.lock`, the flake, Nix expressions and both compatibility baseline pins.
 `scripts/ci-nix-cache use` makes it a preferred substituter. After a successful stage, `save`
 copies reference-free downloads and sources fetched by the run, plus the closures of the fleet
 baseline, historical messaging channel and provider components. It leaves the installer-managed
@@ -197,8 +198,8 @@ The Claude no-st2 seat eval and all five harness boot canaries inspect fresh sea
 for `ST2_*` exports and st2 program/path references. They also inspect generated state, home
 and PTY paths, text records, SQLite schemas/semantic rows and logs for st2 labels. Fixtures use
 neutral identities and payloads, so authored text cannot hide an owned label. Base64 replication
-payloads/signatures are opaque; their stored semantic claims are checked separately. Historical
-binary-upgrade canaries retain predecessor records and are outside this fresh-generation rule.
+payloads and replication/claim signatures are opaque; stored semantic claims remain checked.
+Historical binary-upgrade canaries retain predecessor records and are outside this fresh-generation rule.
 The mutation suite injects every prohibited category and requires rejection; source/dependency
 mutations also exercise the guard's CLI exit status.
 
@@ -269,24 +270,37 @@ warm caches kept on the machine. GitHub has no overflow between runner labels, s
 starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
 through the API and picks one pool for the whole run:
 
-- `ci1` when at least `CI1_MIN_IDLE` (default 5, the jobs a run starts at once) runners with that
-  label are online and idle; merge-group runs ask for `ci1-merge`, which a runner reserved for the
-  merge queue also carries, so queued merges never wait behind pull request pushes;
+- `ci1` when at least `CI1_MIN_IDLE` (default 1) general runners are online and idle. Work starts
+  on available capacity; the remaining jobs can wait briefly for a runner;
+- `ci1-priority` for trusted PRs labelled `ci-priority`, without an idle-count or token dependency.
+  Pending urgent checks get the next free general runners; one slot stays reserved for priority
+  and merge work after urgent checks finish;
+- `ci1-priority` for a merge-group entry whose PR is labelled `ci-priority`, including after its
+  PR checks passed. A read-only PR-label lookup identifies the entry from its queue ref;
+- `ci1-merge` for other merge-group runs while ci1 is enabled. These jobs wait for their reserved
+  pool even when its runners are currently busy, and do not query the status API;
 - Namespace otherwise, exactly as above: when ci1 is busy or offline, when the runner list is
   unavailable, and always for a pull request from a fork. The repository is public and a self-hosted
   runner runs whatever a job asks, so fork code never reaches ci1 (and forks receive no secrets).
 
-Every other job's `runs-on` reads `pick-runner`'s output and falls back to its Namespace label when
-the output is empty. The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
-names its three stages instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
+Build and test jobs read `pick-runner`'s output and fall back to their Namespace label when
+the output is empty. The aggregate stays on GitHub-hosted capacity regardless of that choice.
+The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
+names its stages and the redelivery canary instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
+Priority selection follows the fork boundary, so a fork label cannot reach a self-hosted runner.
+The private host controller keeps the priority slot out of the ordinary pool and removes its merge
+label while urgent required checks are pending. It also lends the other general runners to
+priority work during that interval, so queued ordinary work cannot take the next free slot.
+A guard applies labels after every ephemeral registration, before the runner accepts work.
+It changes labels without interrupting running jobs; the dedicated merge runner stays available.
 Two runs that pick at the same moment can both choose ci1; the later run's jobs then wait for
 runners on ci1.
 
 The switch is the repository variable `CI1_RUNNERS`: unset (the default), `pick-runner` is skipped
-and every run goes to Namespace with no extra job. `on` turns the choice on, and unsetting it turns
+and build/test jobs go to Namespace. `on` turns the choice on, and unsetting it turns
 it off again without a pull request. `pick-runner` reads the runners with the
 `CI1_RUNNERS_READ_TOKEN` secret, a token that may only read the organization's self-hosted runners;
-without it every run goes to Namespace.
+without it non-queue runs go to Namespace. Merge-group runs need no organization status token; a failed PR-label lookup retains merge capacity.
 
 On ci1 each runner is ephemeral: it takes one job, runs it as its own user in a fresh work directory
 with its own `/tmp`, and nothing the job started outlives it. The runner names a Cargo home in
@@ -354,14 +368,32 @@ unchanged.
 
 Performance uses the small `.#perf` Nix shell and the opt-in `perf_load` test target (feature
 `perf-load`), which imports the same `daemon_load` and `daemon_bench` modules without compiling
-all integration fixtures. Successful main runs retain seven-day build snapshots containing
+all integration fixtures. Completed main and PR runs retain seven-day build snapshots containing
 Cargo outputs, registry/git sources, a local sccache, and a signed Nix binary cache including the
 small shell closure. The build recipe includes the lockfiles, shell, manifests and Cargo config.
-Generated-store snapshots have a separate exact generator/schema key. PRs prefer their own
-successful snapshots, then fall back to trusted main artifacts. A PR snapshot must match the head
+Generated-store snapshots have a separate exact generator/schema key. Publication requires a
+complete real workload report, proving compilation and store generation finished; a missed latency
+budget still retains these valid caches. Cancelled and incomplete runs do not publish. Failed
+reports never become main baselines. PRs prefer their own published snapshots, then fall back to
+trusted main artifacts. A PR snapshot must match the head
 repository and branch and a commit in the current PR; it cannot supply main's caches or anyone's
-baseline. A rerun verifies the previous successful attempt explicitly, since the current run is
-in progress. Cargo and sccache validate source changes, preserving each build's real source identity.
+baseline. A rerun checks the previous completed attempt explicitly, since the current run is
+in progress, but GitHub may no longer expose that attempt's artifacts. If they are unavailable,
+restore another published snapshot of the same PR or main's snapshots. Main snapshots are the durable
+fallback; retrying the only PR seed before main has published can still be cold.
+Prefer `gh run rerun RUN_ID --job JOB_ID` for retrying only Performance (use the API job ID).
+The measured targeted retry retained its preceding artifacts; the full workflow retry did not.
+Cargo and sccache validate source changes, preserving each build's real source identity.
+Build and store archives download and extract concurrently; the log records each one's timing.
+Snapshots also retain the input timestamps from before compilation. Restore those timestamps
+only for the exact saved Git SHA with a clean checkout, so a retry does not rebuild and relink
+unchanged sources merely because checkout refreshed their timestamps. Changed or dirty sources
+still take Cargo's normal validation path; the embedded source revision remains real.
+For a clean checkout Performance passes its actual full SHA as `AGENT_SPEC_REVISION`.
+The source-identity and shared CLI-version build scripts track that explicit value instead
+of unrelated Git index/ref timestamps. The CLI stamp still derives its real revision and
+commit time from Git.
+Dirty checkouts continue to derive their identity from Git.
 PR snapshots also remain for seven days, outside the shared dependency-cache pool.
 The compiler-cache server stays alive during cold store generation; publication does not require
 stopping it after the workload has finished writing compiler outputs.
@@ -383,6 +415,70 @@ Run either locally with `TMPDIR=/var/tmp`; `ST_BENCH_DIR` keeps the generated st
 cargo test -p st3 --test integration daemon_cost:: -- --nocapture --test-threads 1
 ST_LOAD_GATE=1 nix develop .#perf -c cargo test --release -p st3 --features perf-load --test perf_load daemon_load:: -- --nocapture
 ```
+
+### Cache coverage across workflows
+
+Every job declares its cache coverage. Jobs that select runners, collect checks, run
+standard-library guards or consume verified release artifacts have no build cache and say
+why. The other jobs report exact hits, lookup-only hits, fallback restores, misses and
+failed lookups separately. A missing exact key or failed restore emits a P0 warning in
+both the log and the job summary; a skipped archive on ci1 is identified as a persistent
+runner store, rather than called an archive hit.
+
+Cargo keys include the lockfiles, workspace manifests and linker configuration. Nix keys
+include the flake, Nix expressions and compatibility pins. Both cover macOS as well as
+Linux, with isolated Cargo and Nix-cache directories. Genie freshness and isolation have
+job-specific caches seeded on main; portable builds use the same pinned Rust cache action as native
+releases. Native releases keep the pinned Zig compiler under a stable version/platform key instead of
+per-run entries. Matching native snapshots also retain it, so fresh nodes do not fetch it
+again. These Cargo builds do not produce Zig object-cache directories; empty cache declarations
+would miss on every run and are omitted.
+
+Compiled outputs also have three-day artifact snapshots keyed by the actual full source SHA,
+job, platform, architecture, build flags and workflow contents. Native snapshots additionally
+fingerprint the installed Rust compiler and, on macOS, the Swift compiler and SDK. A fresh
+runner restores a compatible completed run's outputs and the original tracked-source
+nanosecond timestamps only for that exact clean SHA. Git metadata is never restamped.
+Cargo still rebuilds dirty or changed source and embeds the genuine source identity.
+The signed Nix cache retains locally built shell tools and their runtime closures, so
+a target hit does not rebuild the immutable PTY and collector before Cargo starts.
+Upstream-signed compilers and Node stay with their faster public binary caches.
+Persistent ci1 runners keep their source checkpoint beside the actual target directory.
+A first build of a new source warns that no snapshot exists and restores dependency caches;
+a repeat reuses its snapshot without consuming the shared dependency-cache quota.
+
+Native releases keep the pinned PTY checkout at a stable Cargo-home path and retain the
+macOS speech app only with a matching native snapshot. Portable releases keep the immutable
+workflow helpers before checking out the accepted source, so earlier accepted sources can
+use the cache policy without weakening source, binary or publishing verification.
+
+Main upkeep removes cache entries belonging to closed PRs and redundant old Zig snapshots.
+It retains open PR entries, current main recipes and one legacy Zig snapshot per platform
+while the new cache is seeded. This maintains the shared cache quota without removing
+active work. Native Nix verification probes real output paths before building and still
+proves its repeat with downloads and builds disabled. Performance retains its separate
+durable snapshots and successful-main-only baselines.
+
+The macOS workflow was manually disabled when this audit ran. Its cache configuration is
+maintained without changing that repository setting. Portable publishing permissions and
+accepted-source verification remain in place.
+
+## Required mail redelivery canaries
+
+Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires seventeen named,
+unignored regressions: boot/reconnect mailbox suppression and recent unoffered recovery for
+Claude, Codex, OpenCode, Pi, and OMP; each harness's native suspend/resume canary with hour-old
+mail held and recent unoffered mail consumed exactly once; legacy polling recovery through the
+current offer's receipt sequence; and delivered-but-unread retention across native channel
+restart. The mailbox cases seed hour-old sent mail and recent staged and delivered-but-unread
+mail, prove zero historical offers, preserve explicit mailbox access, and recover an in-flight
+send after a daemon restart with exactly one receipt pair. Every selected test runs with zero retries.
+
+The script fails if any required test is missing, ignored, or filtered out. The named
+`mail-redelivery-canaries` check reads that step's actual outcome; a skipped step cannot pass.
+`linux-gate` requires it, so this protection applies to pull requests and merge groups. It
+reuses the compiled Linux test runner instead of allocating another native-test runner.
+Apply the fifth live ruleset check after this workflow has passed on main.
 
 ## Generated files and existing workflows
 
@@ -407,7 +503,7 @@ repo-settings changes have merged.
 | Workflow | Change and reason |
 | --- | --- |
 | `fleet.yml` | The old fork-only fleet compatibility job is absorbed into `linux-gate`, which now covers every PR and main. This preserves fork coverage and adds same-repository coverage on Namespace. |
-| `nix.yml` | Remove the fork-only nextest/Clippy job because the new Linux gate includes those checks and provider fixtures. Retain the tag-only full Nix release/check graph and its cache action. |
+| `nix.yml` | Build the package and all native checks on tags, relevant trusted PRs, dispatch, and daily at 01:17 UTC. Use ci1's persistent Nix store and GC roots; verify a repeat with downloads and builds disabled. No Actions cache or FlakeHub dependency. Forks use the public Linux gate. |
 | `release-smalltalk.yml` | Preserve tag/dispatch/fork-PR triggers, target packaging, source verification and publishing permissions. Move Linux and ARM macOS runners to Namespace. Also run on every `main` push, keeping the archives as 7-day artifacts, so release breakage fails on `main` (not required for merging). |
 | `release-daily.yml` | New. Once a day, publish the archives of the newest successful `main` release run when `main` changed since the last release; see [binary releases](st3/binary-releases.md#daily-releases). |
 | `release-portable.yml` | Preserve dispatch inputs, accepted-source verification, packaging, publishing and fresh-download execution proof. Move Linux to Namespace. |
@@ -415,7 +511,7 @@ repo-settings changes have merged.
 
 The content guard still rejects real machine/home identities and private fleet configuration
 references. Release workflows remain separate from the required gate; neither package
-verification nor the tag-only Nix graph is made redundant by workspace nextest.
+verification nor the Nix package/check graph is made redundant by workspace nextest.
 
 ## Merge queue
 
@@ -433,7 +529,7 @@ queued check fails, the entry leaves the queue and the pull request page says wh
 queue it again. The merge train (`st lanes join smalltalk`) is retired.
 
 The ruleset (`.github/repo-settings.json`, generated from `repo-settings.json.genie.ts`, applied
-by an administrator and never by CI) requires the four checks from GitHub Actions with an empty
+by an administrator and never by CI) requires the five checks from GitHub Actions with an empty
 bypass list, keeps the pull-request, deletion and force-push protections, and configures the queue:
 merge method MERGE, up to five entries build at once (see [Measured concurrency](#measured-concurrency)),
 up to five merge together, and a check that
@@ -494,12 +590,22 @@ from its first step to job completion, with unfinished jobs counted through the 
 The observation is repository-scoped; the workspace can also have jobs from other repositories.
 
 To refresh the capacity measurement, dispatch Workspace CI on `main`. Its `namespace-capacity`
-job runs only for `workflow_dispatch`, publishes platform limits and current usage to the job
+job publishes platform limits and current usage for `workflow_dispatch` to the job
 summary and retains the `namespace-capacity` artifact. It reports no workspace or account identity.
 See Namespace's [resource limits](https://namespace.so/docs/architecture/compute/resource-limits)
 and [profile concurrency controls](https://namespace.so/docs/solutions/github-actions/runner-controls/concurrent-runners)
 for the scheduler's limits, and GitHub's [merge queue settings](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
 for the distinction between build concurrency and merge batch size.
+
+## Superseded merge groups
+
+The `namespace-capacity` job also watches `merge_group` events on a GitHub-hosted runner,
+independent of ci1 and Namespace availability. It polls the group's ref and required check statuses
+every 15 seconds. A missing ref or a changed SHA on two consecutive successful lookups force-cancels
+its own workflow, including queued Linux jobs and always-run summaries. Lookup failures retain work.
+Once all four required checks finish, the watcher exits normally; a ref removed by a successful
+merge therefore retains the completed workflow result used by main upkeep. It executes embedded
+workflow code without checking out queued PR code. Manual capacity reports still use Namespace.
 
 ## Namespace jobs that never start
 

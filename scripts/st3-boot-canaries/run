@@ -15,9 +15,11 @@ step it names. SCENARIO is one of
                     takes a message
     concurrent      five seats launch at once
     suspend         the booted seat finishes its step and is suspended: no process remains, a
-                    message waits, and resume brings back the same native session, which reads
-                    it. Then a resume whose transcript is gone fails with a typed reason and the
+                    message waits, and resume brings back the same native session, which holds
+                    that old mail and reads a fresh message. Then a resume whose transcript is gone fails with a typed reason and the
                     seat stays suspended.
+    utf8            Codex recovers a receipt from a split UTF-8 transcript and keeps delivering
+                    through discovery I/O failures, with private, rate-limited warnings.
 
 Every seat must, within the time bound, claim its step with its current incarnation and read an
 st message, and none may park in the crash-loop guard. The verdict is in EVIDENCE_DIR/result.json.
@@ -40,7 +42,7 @@ sys.dont_write_bytecode = True
 from st_boundary import fresh_seat_findings
 
 HARNESSES = ("claude", "codex", "pi", "omp", "opencode")
-SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend")
+SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend", "utf8")
 RUN_ID = "c1"
 MISSION = "canary/boot"
 LETTERS = "abcde"
@@ -91,10 +93,11 @@ class Node:
         # binary. A link, because a debug st3 is hundreds of megabytes and /tmp is a small tmpfs.
         self.binary = root / "bin/st3"
         self.binary.symlink_to(binary)
-        pty = shutil.which("pty")
-        if not pty:
-            raise SystemExit("pty must be on PATH")
-        (root / "bin/pty").symlink_to(pty)
+        for tool in ("pty", "git"):
+            executable = shutil.which(tool)
+            if not executable:
+                raise SystemExit(f"{tool} must be on PATH")
+            (root / "bin" / tool).symlink_to(executable)
         install_stub(root / "bin", harness)
         self.path = f"{root / 'bin'}:/usr/bin:/bin"
         self.endpoint = root / "run/st.sock"
@@ -120,6 +123,9 @@ client_gateway_socket = "{root / 'run/client.sock'}"
         self.daemon = None
 
     def start(self):
+        if not (self.root / "ws/.git").exists():
+            subprocess.run(["git", "init", "-q", str(self.root / "ws")], env=self.env, check=True)
+            subprocess.run(["git", "-C", str(self.root / "ws"), "-c", "user.name=Canary", "-c", "user.email=canary@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "Canary workspace"], env=self.env, check=True)
         self.daemon = subprocess.Popen([str(self.binary), "up", "--config", str(self.root / "config.toml")],
                                        env=self.env, cwd=self.root / "ws", stdin=subprocess.DEVNULL,
                                        stdout=self.log, stderr=self.log, start_new_session=True)
@@ -401,6 +407,45 @@ def forget_native_session(node, harness, session):
         path.unlink()
 
 
+def native_offer_count(node, reference):
+    """Count provider handoffs, independently of idempotent graph receipt claims."""
+    return sum((row.get("event") == "channel" and reference in row.get("content", ""))
+               or (row.get("event") == "turn" and reference in row.get("text", ""))
+               for row in receipts(node, "a"))
+
+
+def age_mail_fixture(node, subject):
+    """Backdate isolated mail while preserving the store's transactional row digest."""
+    import hashlib
+    import sqlite3
+
+    def projection_change(accumulator, table, columns, old, new, version):
+        # Matches smallclaims::store::projection_digest's version-one row accumulator.
+        if version != 1:
+            raise ValueError("unsupported fixture projection digest version")
+        total = int.from_bytes(accumulator, "big")
+        for row, sign in ((old, -1), (new, 1)):
+            if row is None:
+                continue
+            digest = hashlib.sha512(b"st3-projection-row-v1\0")
+            for value in (table, columns, row):
+                data = value.encode()
+                digest.update(len(data).to_bytes(8, "big"))
+                digest.update(data)
+            total += sign * int.from_bytes(digest.digest(), "big")
+        return (total % (1 << 512)).to_bytes(64, "big")
+
+    with sqlite3.connect(node.root / "state/claims.sqlite3", timeout=10) as connection:
+        connection.execute("PRAGMA recursive_triggers=ON")
+        connection.create_function("st_projection_change", 6, projection_change, deterministic=True)
+        changed = connection.execute(
+            "UPDATE claims SET accepted_at_unix_ms=? WHERE subject=? AND kind='message.sent'",
+            (str(time.time_ns() // 1_000_000 - 3_600_001), subject),
+        ).rowcount
+        if changed != 1:
+            fail("the hour-old fixture has no unique sent claim")
+
+
 def suspend_and_resume(node, seats, harness):
     subject = seat_subject("a")
     step = seats.step("a")
@@ -432,6 +477,8 @@ def suspend_and_resume(node, seats, harness):
     # Mail to a suspended seat waits, and its restart policy does not wake it.
     sent = node.json("conversations", "send", subject, "--from", "person/eval",
                      "--subject", "while suspended", "--body", "boot canary suspended")["subject"]
+    # Old means the same one-hour age as the backlog; only this isolated fixture is changed.
+    age_mail_fixture(node, sent)
     time.sleep(5)
     held = node.api("/v1/messages/read/" + sent) or {}
     if held.get("status") in ("read", "closed"):
@@ -439,6 +486,8 @@ def suspend_and_resume(node, seats, harness):
     if node.json("agents", "show", subject)["value"].get("state") != "suspended":
         fail("a suspended seat did not stay suspended")
 
+    recent = node.json("conversations", "send", subject, "--from", "person/eval",
+                       "--subject", "recent while suspended", "--body", "boot canary recent resume")["subject"]
     resumed = json.loads(node.cli("agents", "resume", subject, "--as", "person/eval",
                                   "--timeout", f"{seats.bound:.0f}s", "--json"))
     after = resumed.get("suspension") or {}
@@ -447,8 +496,25 @@ def suspend_and_resume(node, seats, harness):
     latest = native_sessions(node, "a")[-1]
     if latest != (native, True):
         fail(f"the resumed harness ran {latest}, not session {native} resumed")
-    until(lambda: (node.api("/v1/messages/read/" + sent) or {}).get("status") in ("read", "closed"),
-          seats.bound, "the resumed seat did not read the message that waited for it")
+    # Recent never-offered mail survives the boot, while hour-old mail stays listable.
+    until(lambda: (node.api("/v1/messages/read/" + recent) or {}).get("status") in ("read", "closed"),
+          seats.bound, "the resumed seat did not recover recent unoffered mail")
+    if native_offer_count(node, recent) != 1:
+        fail("recent unoffered mail was not consumed exactly once after resume")
+    # Resuming a native session is still a new seat boot. Its old mail remains listable,
+    # and a fresh message proves that the resumed provider's delivery path works.
+    until(lambda: (node.json("agents", "show", subject).get("value", {}).get("delivery") or {}).get("state") in ("current", "legacy"),
+          seats.bound, "the resumed seat's channel did not become ready")
+    fresh = node.json("conversations", "send", subject, "--from", "person/eval",
+                      "--subject", "after resume", "--body", "boot canary fresh resume")["subject"]
+    until(lambda: (node.api("/v1/messages/read/" + fresh) or {}).get("status") in ("read", "closed"),
+          seats.bound, "the resumed seat did not read fresh mail")
+    if (node.api("/v1/messages/read/" + sent) or {}).get("status") != held.get("status"):
+        fail("resuming a seat automatically advanced its old mail")
+    if native_offer_count(node, sent) != 0:
+        fail("resuming a seat offered old mail to the provider")
+    if native_offer_count(node, recent) != 1:
+        fail("recovered recent mail reached the provider again")
     wait_drained(list((node.root / "state/drivers").rglob("st-harness-events.sqlite")), seats.bound)
     check_boundary(node)
 
@@ -480,6 +546,62 @@ def continued_session(node, label):
         fail(f"{label}: the relaunched harness ran {latest}, not session {previous} continued")
 
 
+def codex_transcript_recovery(node, seats):
+    """Recover a bounded receipt, and survive failed discovery, in a private real daemon."""
+    if node.harness != "codex":
+        fail("the utf8 scenario needs Codex")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("canary_codex", HERE / "stub-codex.py")
+    stub = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(stub)
+    subject = seat_subject("a")
+    native = native_sessions(node, "a")[-1][0]
+    sessions = node.root / "home/.codex/sessions"
+    rollout = next(sessions.rglob(f"rollout-*-{native}.jsonl"))
+    stub.split_utf8_rollout(rollout, native)
+    (node.root / "ws/codex-transcript-mode").write_text("utf8")
+
+    def send(label):
+        return node.json("conversations", "send", subject, "--from", "person/eval",
+                         "--subject", label, "--body", "transcript regression €")["subject"]
+
+    first = send("split UTF-8 receipt")
+    until(lambda: any(row.get("event") == "transcript-steer" and first in row.get("text", "")
+                      for row in receipts(node, "a")), seats.bound, "the first steer never reached Codex")
+    second = send("while receipt recovery is needed")
+    for message in (first, second):
+        until(lambda: (node.api("/v1/messages/read/" + message) or {}).get("status") in ("read", "closed"),
+              seats.bound, "split UTF-8 stopped receipt recovery or the next delivery")
+
+    # Force a real discovery I/O error. A stale systemError asks auxiliary turn recovery to
+    # run; the subsequent live idle status and receipt must still be processed on this socket.
+    (node.root / "ws/codex-transcript-mode").write_text("failure")
+    saved = sessions.with_name("sessions-saved")
+    sessions.rename(saved)
+    sessions.write_text("not a directory")
+    try:
+        third = send("during transcript discovery failure")
+        until(lambda: (node.api("/v1/messages/read/" + third) or {}).get("status") in ("read", "closed"),
+              seats.bound, "a discovery failure stopped live delivery/receipts")
+        logs = list((node.root / "state/drivers").rglob("driver.log"))
+        until(lambda: any("bounded transcript" in path.read_text() for path in logs), seats.bound,
+              "the discovery warning never reached the private driver log")
+        time.sleep(3)
+        warnings = [json.loads(line) for path in logs for line in path.read_text().splitlines()
+                    if "bounded transcript" in line]
+        if len(warnings) > 2:
+            fail(f"transcript warnings were not rate-limited: {len(warnings)}")
+        terminal = node.pty("peek", "--plain", "--full", "c1.seat-a")
+        if "bounded transcript" in terminal.stdout + terminal.stderr:
+            fail("a driver warning reached the harness PTY")
+    finally:
+        sessions.unlink()
+        saved.rename(sessions)
+        (node.root / "ws/codex-transcript-mode").unlink()
+    if node.json("agents", "show", subject)["value"].get("incarnation_id") != seats.incarnations["a"]:
+        fail("transcript recovery replaced the seat instead of preserving delivery")
+
+
 def scenario(node, seats, name, scratch, replacement_binary=None):
     if name in ("fresh", "concurrent"):
         return
@@ -491,6 +613,9 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
                        for row in receipts(node, letter) if row.get("event") == "read")
     until(lambda: all(probe_reads()[ref] >= 1 for ref in previous_probes), seats.bound,
           "the providers did not record their boot probe reads")
+    if name == "utf8":
+        codex_transcript_recovery(node, seats)
+        return
     if name == "suspend":
         suspend_and_resume(node, seats, node.harness)
         return
@@ -589,7 +714,7 @@ def run(args, root, evidence):
         for letter in letters:
             terminal = node.pty("peek", "--plain", "--full", f"c1.seat-{letter}")
             (evidence / f"terminal-{letter}.txt").write_text(terminal.stdout + terminal.stderr)
-            if node.daemon.poll() is None:
+            if node.daemon is not None and node.daemon.poll() is None:
                 (evidence / f"trace-{letter}.jsonl").write_text(
                     node.cli("trace", "show", seat_subject(letter), "--json", "--limit", "500", check=False))
         for index, record in enumerate(sorted((root / "state").rglob("harness-state"))):
@@ -609,7 +734,8 @@ def run(args, root, evidence):
             except sqlite3.Error as error:
                 summaries.append({"error": str(error)})
         (evidence / "observation-outboxes.json").write_text(json.dumps(summaries, indent=2) + "\n")
-        for index, log in enumerate((root / "home/.local/state/st3").rglob("*.log")):
+        for index, log in enumerate([*(root / "home/.local/state/st3").rglob("*.log"),
+                                    *(root / "state/drivers").rglob("driver.log")]):
             (evidence / f"driver-{index}.log").write_text(log.read_text(errors="replace"))
         node.stop()
         for path in [root / "daemon.log", *sorted((root / "ws").glob("receipts-*.jsonl"))]:

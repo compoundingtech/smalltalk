@@ -96,6 +96,7 @@ pub fn words() -> Value {
     .collect::<Vec<_>>();
     let agent = [
         AgentState::NeedsYou,
+        AgentState::NeedsLogin,
         AgentState::Fault,
         AgentState::Working,
         AgentState::Idle,

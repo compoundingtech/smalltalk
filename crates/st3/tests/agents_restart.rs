@@ -19,9 +19,11 @@ struct Runtime {
     starts: Mutex<Vec<MemberSpec>>,
     stops: Mutex<Vec<String>>,
     refuse_start: Mutex<bool>,
+    snapshot_unavailable: Mutex<bool>,
 }
 impl RuntimeControl for Runtime {
     fn snapshot_ptys(&self) -> anyhow::Result<Vec<RuntimeObservation>> {
+        anyhow::ensure!(!*self.snapshot_unavailable.lock().unwrap(), "fixture snapshot unavailable");
         Ok(self
             .observations
             .lock()
@@ -510,6 +512,344 @@ fn restarted_daemon(fixture: &Fixture) -> Reconciler<Runtime> {
         "restart-test".into(),
         Arc::new(Notify::new()),
     )
+}
+
+/// Exercise the daemon's exit path, not a launcher's post-exit cleanup. The API socket,
+/// database, workspace and runtime all belong to this fixture.
+#[tokio::test]
+async fn one_shot_exit_retires_keeps_history_and_can_start_again() {
+    for (shape, status, exit_code) in [
+        (Shape::TopLevel, "exited", Some(0)),
+        (Shape::TopLevel, "exited", Some(17)),
+        (Shape::Mission, "exited", Some(0)),
+        (Shape::Step, "vanished", None),
+    ] {
+        let (fixture, subject) =
+            Fixture::launching(shape, r#"command "sleep 1000"; one-shot"#, "always").await;
+        let socket = fixture.root.path().join("st3.sock");
+        let original = fixture
+            .store
+            .desired_subject_with_writer(&subject)
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(original.member.as_ref().unwrap().one_shot);
+        let runtime_id = original.member.as_ref().unwrap().runtime_id.clone();
+        assert!(succeeded(&st(&socket, &["agents", "ls"]).await).contains(&subject));
+        {
+            let mut observations = fixture.runtime.observations.lock().unwrap();
+            let observation = observations.get_mut(&runtime_id).unwrap();
+            observation.status = status.into();
+            observation.exit_code = exit_code;
+        }
+        for _ in 0..3 {
+            fixture.reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 1);
+        let ended = fixture
+            .store
+            .declaration_ended_by_stop(&subject)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.writer.as_deref(), Some("daemon/runtime"));
+        assert_eq!(ended.declaration, original);
+        assert!(!succeeded(&st(&socket, &["agents", "ls"]).await).contains(&subject));
+        assert!(succeeded(&st(&socket, &["agents", "ls", "--all"]).await).contains(&subject));
+        succeeded(&st(&socket, &["agents", "show", &subject, "--all"]).await);
+        assert!(
+            fixture
+                .store
+                .claims_for(&subject, Some("runtime.observed"))
+                .unwrap()
+                .iter()
+                .any(|claim| claim.body["fields"]["status"] == status)
+        );
+
+        // A new daemon and an absent PTY cannot revive a finished seat or lose its history.
+        fixture
+            .runtime
+            .observations
+            .lock()
+            .unwrap()
+            .remove(&runtime_id);
+        let restarted = restarted_daemon(&fixture);
+        for _ in 0..3 {
+            restarted.reconcile_once().unwrap();
+        }
+        assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 1);
+        assert_eq!(
+            fixture
+                .store
+                .declaration_ended_by_stop(&subject)
+                .unwrap()
+                .unwrap()
+                .declaration,
+            original
+        );
+        succeeded(
+            &st(
+                &socket,
+                &["agents", "start", &subject, "--as", "person/avery"],
+            )
+            .await,
+        );
+        for _ in 0..3 {
+            restarted.reconcile_once().unwrap();
+        }
+        assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 2);
+        assert!(
+            fixture
+                .runtime
+                .starts
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .one_shot
+        );
+        assert!(succeeded(&st(&socket, &["agents", "ls"]).await).contains(&subject));
+    }
+}
+
+#[tokio::test]
+async fn one_shot_exit_found_after_daemon_restart_retires_without_a_pty_record() {
+    let (fixture, subject) = Fixture::launching(
+        Shape::TopLevel,
+        r#"command "sleep 1000"; one-shot"#,
+        "never",
+    )
+    .await;
+    fixture.runtime.observations.lock().unwrap().clear();
+    let restarted = restarted_daemon(&fixture);
+    for _ in 0..3 {
+        restarted.reconcile_once().unwrap();
+    }
+    assert!(
+        fixture
+            .store
+            .declaration_ended_by_stop(&subject)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn one_shot_exit_retires_an_owned_set_member_without_changing_its_source() {
+    let (fixture, subject) = Fixture::launching(
+        Shape::TopLevel,
+        r#"command "sleep 1000"; one-shot"#,
+        "always",
+    )
+    .await;
+    let original = fixture
+        .store
+        .desired_subject_with_writer(&subject)
+        .unwrap()
+        .unwrap()
+        .0;
+    let node = st3::graph::render_desired_node(&original.desired).unwrap();
+    let intent = st3::parse_intent(&format!("version 2\n{node}\n"), "restart-test").unwrap();
+    let mut options = st3::store::owned_sets::Options {
+        set: "garden".into(),
+        source: st3::store::owned_sets::Source {
+            repository: "acme/garden".into(),
+            r#ref: "refs/heads/main".into(),
+            sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            sequence: 1,
+        },
+        expected_set: "absent".into(),
+        rollout: None,
+        adopt: std::collections::BTreeSet::from([subject.clone()]),
+        allow_empty: false,
+        confirm_retire: None,
+        expected_subjects: Default::default(),
+    };
+    options.expected_subjects = fixture
+        .store
+        .owned_set_preview(&intent, &options)
+        .unwrap()
+        .expected_subjects;
+    fixture
+        .store
+        .apply_owned_set(&intent, &options, "adopt-one-shot", "person/avery")
+        .unwrap();
+    let declaration_token = fixture
+        .store
+        .selected_desired_token(&subject)
+        .unwrap()
+        .unwrap();
+    hang_up(&fixture);
+    for _ in 0..3 {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
+    assert!(
+        fixture
+            .store
+            .declaration_ended_by_stop(&subject)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        fixture.store.owned_sets().unwrap()[0]
+            .receipt
+            .source
+            .sequence,
+        1
+    );
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 1);
+    let socket = fixture.root.path().join("st3.sock");
+    assert!(!succeeded(&st(&socket, &["agents", "ls"]).await).contains(&subject));
+    assert!(succeeded(&st(&socket, &["agents", "ls", "--all"]).await).contains(&subject));
+    succeeded(&st(&socket, &["agents", "show", &subject, "--all"]).await);
+    let workspace: serde_json::Value = serde_json::from_str(&succeeded(
+        &st(&socket, &["agents", "workspace", &subject, "--json"]).await,
+    ))
+    .unwrap();
+    assert_eq!(workspace["value"]["agent_id"], subject);
+    assert_eq!(
+        workspace["value"]["workspace"],
+        original.member.as_ref().unwrap().workspace
+    );
+    assert_eq!(workspace["value"]["declaration_token"], declaration_token);
+}
+
+#[tokio::test]
+async fn one_shot_unknown_snapshot_keeps_the_seat_live_until_exit_is_known() {
+    let (fixture, subject) = Fixture::launching(
+        Shape::TopLevel,
+        r#"command "sleep 1000"; one-shot"#,
+        "never",
+    )
+    .await;
+    *fixture.runtime.snapshot_unavailable.lock().unwrap() = true;
+    let restarted = restarted_daemon(&fixture);
+    for _ in 0..3 {
+        let _ = restarted.reconcile_once();
+    }
+    assert!(
+        fixture
+            .store
+            .declaration_ended_by_stop(&subject)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 1);
+    *fixture.runtime.snapshot_unavailable.lock().unwrap() = false;
+    for _ in 0..3 {
+        restarted.reconcile_once().unwrap();
+    }
+    assert!(
+        fixture
+            .store
+            .declaration_ended_by_stop(&subject)
+            .unwrap()
+            .is_none()
+    );
+    fixture.runtime.observations.lock().unwrap().clear();
+    for _ in 0..3 {
+        restarted.reconcile_once().unwrap();
+    }
+    assert!(
+        fixture
+            .store
+            .declaration_ended_by_stop(&subject)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn seats_without_one_shot_keep_their_exit_and_restart_behaviour() {
+    for restart in ["never", "always", "on-failure"] {
+        for exit_code in [0, 17] {
+            let (fixture, subject) =
+                Fixture::launching(Shape::TopLevel, r#"command "sleep 1000""#, restart).await;
+            {
+                let mut observations = fixture.runtime.observations.lock().unwrap();
+                let observation = observations.values_mut().next().unwrap();
+                observation.status = "exited".into();
+                observation.exit_code = Some(exit_code);
+            }
+            for _ in 0..3 {
+                fixture.reconciler.reconcile_once().unwrap();
+            }
+            assert!(
+                fixture
+                    .store
+                    .declaration_ended_by_stop(&subject)
+                    .unwrap()
+                    .is_none()
+            );
+            let restarts = restart == "always" || restart == "on-failure" && exit_code != 0;
+            assert_eq!(
+                fixture.runtime.starts.lock().unwrap().len(),
+                1 + usize::from(restarts)
+            );
+            assert!(
+                succeeded(&st(&fixture.root.path().join("st3.sock"), &["agents", "ls"]).await)
+                    .contains(&subject)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_restart_of_one_shot_replaces_the_process_without_retiring_the_seat() {
+    let (fixture, subject) = Fixture::launching(
+        Shape::TopLevel,
+        r#"command "sleep 1000"; one-shot"#,
+        "never",
+    )
+    .await;
+    fixture.request(&subject, "one-shot-explicit-restart").await;
+    for _ in 0..4 {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 2);
+    assert!(
+        fixture
+            .store
+            .declaration_ended_by_stop(&subject)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn one_shot_start_after_retirement_continues_the_same_native_session() {
+    let (fixture, subject) = Fixture::launching(
+        Shape::TopLevel,
+        r#"harness "claude" { model "example-model"; }; one-shot"#,
+        "always",
+    )
+    .await;
+    bind_session(&fixture, &subject, "fixture:1", "session-one").await;
+    hang_up(&fixture);
+    for _ in 0..3 {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
+    assert!(
+        fixture
+            .store
+            .declaration_ended_by_stop(&subject)
+            .unwrap()
+            .is_some()
+    );
+    succeeded(
+        &st(
+            &fixture.root.path().join("st3.sock"),
+            &["agents", "start", &subject, "--as", "person/avery"],
+        )
+        .await,
+    );
+    for _ in 0..3 {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
+    let starts = fixture.runtime.starts.lock().unwrap();
+    assert_eq!(starts.len(), 2);
+    assert!(starts[1].one_shot);
+    assert_eq!(continued(&starts[1]), Some("session-one"));
 }
 
 async fn stopped_mission_seat_stays_stopped(shape: Shape) {

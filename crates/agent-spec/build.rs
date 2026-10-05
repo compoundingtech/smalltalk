@@ -21,9 +21,11 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
-    let revision = std::env::var("AGENT_SPEC_REVISION")
+    let supplied = std::env::var("AGENT_SPEC_REVISION")
         .ok()
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value| !value.trim().is_empty());
+    let derive_from_git = supplied.is_none();
+    let revision = supplied
         .inspect(|value| {
             assert!(
                 is_sha(value) || value.starts_with("nix-dirty."),
@@ -42,9 +44,13 @@ fn main() {
             }
         });
     println!("cargo:rustc-env=AGENT_SPEC_REVISION={revision}");
-    for path in ["HEAD", "refs", "index"] {
-        if let Some(path) = git(&["rev-parse", "--git-path", path]) {
-            println!("cargo:rerun-if-changed={path}");
+    // An explicitly supplied source identity is already tracked above. Git metadata
+    // is an input only when deriving that identity from this checkout.
+    if derive_from_git {
+        for path in ["HEAD", "refs", "index"] {
+            if let Some(path) = git(&["rev-parse", "--git-path", path]) {
+                println!("cargo:rerun-if-changed={path}");
+            }
         }
     }
 }

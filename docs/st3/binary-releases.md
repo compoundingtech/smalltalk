@@ -17,6 +17,11 @@ archives need neither Nix nor Rust installed. Harness CLIs and their logins rema
 
 ## Install or update
 
+If a populated v0.3.4 store may have unsigned delegation grants, follow the
+[founder signing audit](founder-signing-audit.md) before doctor or restart. Preserve raw state and
+keys first. A build containing prevention #1269 can sign preserved unsealed work; it retains
+signature warnings from already-sealed affected payloads.
+
 Choose a tag from the repository's Releases page, then download the archive for your machine
 and its `.sha256` file. For example, with GitHub CLI:
 
@@ -59,6 +64,19 @@ runtime uses the same cached Cargo target directory. Generated `target`, `.zig-c
 files and Python bytecode are ignored by Git, so restored caches and previous archives do not mark
 the baked source version dirty. The extracted, installed binary must still report the exact clean
 checkout version.
+
+The separate **Nix** workflow builds the default Linux package and every native flake check on
+tags, relevant trusted PRs, manual dispatch, and daily at 01:17 UTC. It uses ci1's persistent Nix
+store, retains the latest outputs per runner as GC roots, and repeats the build with downloads
+and both local and remote builders disabled to prove the results are cached. It needs neither
+GitHub's Actions cache nor FlakeHub. The `nix-release-proof` artifact records the exact source,
+targets, and output paths. The scheduled check starts four hours before the daily release schedule
+to catch package breakage early.
+
+The st3 Nix check uses nextest to give each test its own process, including CPU-budget and
+delivery-presence fixtures. Python, Node, and the Linux process utilities are declared test inputs;
+the historical messaging binary is pinned in the lockfile and supplied before the sandbox starts.
+The native runtime suite and documentation tests remain covered.
 
 ## Daily releases
 

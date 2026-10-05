@@ -1,7 +1,7 @@
 //! stui's mission semantics, independent of its collection model and terminal UI.
 
 use st3_client::MissionStep;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One word naming who has to move, shared by every mission surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -97,6 +97,14 @@ pub struct Step {
     pub blockers: Vec<String>,
 }
 
+/// Raw step facts, independent of state-specific blocker presentation and queue notes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct StepMetadata {
+    /// st retains the last reason even after a step moves on or ends.
+    pub blocked_reason: Option<String>,
+    pub last_progress: Option<String>,
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Mission {
     pub id: String,
@@ -106,6 +114,9 @@ pub struct Mission {
     pub host: String,
     pub goals: Vec<String>,
     pub steps: Vec<Step>,
+    /// Metadata for the same steps, keyed by stable step-run ID rather than display path.
+    /// Values are retained verbatim, regardless of state or display text policies.
+    pub step_metadata: BTreeMap<String, StepMetadata>,
     pub agents: Vec<String>,
     pub decision: Option<String>,
     pub worktree: Option<String>,
@@ -266,6 +277,18 @@ pub fn adapt<'a>(
         .clone()
         .map(|mission| {
             let work = mission_steps(mission);
+            let step_metadata = work
+                .iter()
+                .map(|step| {
+                    (
+                        step.id.clone(),
+                        StepMetadata {
+                            blocked_reason: step.blocked_reason.clone(),
+                            last_progress: step.last_progress.clone(),
+                        },
+                    )
+                })
+                .collect();
             let decision = attention
                 .clone()
                 .find(|item| {
@@ -431,6 +454,7 @@ pub fn adapt<'a>(
                 host: String::new(),
                 goals: vec![],
                 steps,
+                step_metadata,
                 agents: active_agents,
                 kdl: None,
                 outcome: run_outcome(mission, now, display),

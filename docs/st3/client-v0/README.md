@@ -260,6 +260,43 @@ string, not the operational resource union's discriminator. This list route does
 `resources` subscription to `st3.client.collections.v0`.
 
 
+### Seat workspace directories
+
+`GET /v1/client/agent-workspaces/{id}` reads the declared workspace for one exact seat. `{id}`
+accepts `agent/garden/interactive` or `garden/interactive`; encode the path parameter when using
+a raw HTTP client. It requires only `read.projections`, not declaration or terminal-control scope.
+Rust exposes `Client::agent_workspace_get(id)`; Swift and TypeScript expose `agentWorkspaceGet`.
+The CLI is `st agents workspace agent/garden/interactive [--json]`.
+
+The response is `Envelope<AgentWorkspace>`:
+
+```json
+{
+  "kind": "agent-workspace",
+  "agent_id": "agent/garden/interactive",
+  "host_id": "host/garden",
+  "workspace": "/work/garden",
+  "desired_token": "selected-desired-claim",
+  "declaration_token": "original-agent-claim"
+}
+```
+
+The example is the envelope's `value`; its `snapshot.store_index` fences all fields to one SQLite
+read snapshot. `workspace` is the declared workspace root on `host_id`, not the connected
+gateway's filesystem, a harness state directory, or its process's current subdirectory. The read
+does not probe or create the directory and includes no environment values.
+
+Running, mission-owned, suspended, stopped, and retired one-shot seats use the same read; no
+history flag is necessary. The server reads the selected declaration, following unambiguous stop
+predecessors when needed. `desired_token` identifies the current desired claim (possibly a stop),
+while `declaration_token` identifies the agent declaration supplying the path. A replacement
+declaration immediately changes the returned workspace. Unknown seats and observed seats without
+a managed declaration return `not-found`; conflicting declarations or a stop without an
+unambiguous predecessor return `validation-failed`. No directory is inferred from the seat ID.
+
+For the full attach, stop/start, and suspend/resume recipe, see
+[seat lifecycle](../../seat-lifecycle.md#find-a-workspace-and-return-to-an-interactive-seat).
+
 ### Applied subject definitions
 
 `GET /v1/client/subject-definition?subject=agent%2Fexample%2Fworker` reads exactly one agent's
@@ -316,6 +353,11 @@ outside the hour cannot override it. This same selection serves `st usage`, stui
 account pools and the limits policy. The policy tests freshness against the selected source
 time, so a recent low publication cannot freshen an old high observation. Claim kinds and
 client fields remain compatible with older clients.
+Partial reports without a weekly percentage do not replace or refresh a prior weekly source.
+The durable reading survives member restarts. Consumers must check its original measurement time
+and reset window; missing or stale evidence is unknown, never zero. `st doctor` reports missing,
+stale, future-dated or already-reset weekly evidence for active accounts as `account-limits`.
+See [account limits](../accounts.md#at-the-limit) for the policy and external backstop behavior.
 The Rust method is `Client::usage_period(since_ms, until_ms)`;
 Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
 
@@ -576,6 +618,14 @@ Rust exposes `agent_stop`/`agent_start`; TypeScript and Swift expose `agentStop`
 All generated clients' `Fence` models also carry the desired revision required by
 `runtime.stop` and `runtime.restart`.
 
+`agent.suspend` takes `{agent, reason?}` and requires the running incarnation and selected desired
+revision in its fence. `agent.resume` takes `{agent, host?}` and requires the selected desired
+revision. An absent `host` preserves single-host behavior. A different host requests portable
+continuation under the same seat identity, with `suspension.phase` progressing through
+`fencing-source`, `transferring`, `restoring`, `verifying`, and `resumed`. A failure returns to
+`suspended` with a typed code and reason. `suspension.source_host` and `suspension.host` are optional
+additive fields. See [suspending a seat](../suspend.md) for workspace and harness restrictions.
+
 `agent.queue-move` takes `agent_id`, `mission_run_id`, `placement` (`top`, `bottom`, `before`, or
 `after`), `anchor_run_id` for `before` and `after`, and an optional `reason`. It records one
 `agent.queue.moved` claim with the session's person as actor. It never changes a step the seat
@@ -638,8 +688,15 @@ credential bound to that key. The resulting session returns the exact delegated 
 device-session actor, and granted scopes.
 Pairing codes expire after five minutes and reveal no fleet secret. The remote device cannot
 request its own actor or scopes. By default the trusted local begin grants projection reads,
-terminal reads, attention control, and launch control. For an intentionally trusted device that
-needs Chat sends, mission/work actions, runtime control, and terminal input, the initiating person
+glasses reads and control, terminal reads, attention control, and launch control. The begin
+request may narrow that default with `scopes`, a non-empty subset of exactly those limited
+scopes (`read.projections`, `read.glasses`, `control.glasses`, `terminal.read`,
+`control.attention`, `control.launches`); any other scope, or `scopes` combined with
+`full_control`, is rejected with a validation error. `st devices --as person/alex pair
+--read-only "Wall display"` requests `read.projections`, `read.glasses`, and `terminal.read`, so
+the device can observe but every attention, launch, and other action returns `403`. For an
+intentionally trusted device that needs Chat sends, mission/work actions, runtime control, and
+terminal input, the initiating person
 must use `st devices --as person/alex pair --full-control "Alex iPhone"` on the trusted local
 socket. The selected concrete scopes are sealed into that pairing; existing limited devices are
 not silently upgraded and must be re-paired, then revoked when no longer needed. Revocation takes
@@ -1046,3 +1103,24 @@ Rust exposes `agent_create`, `terminal_create`, `terminal_end`; TypeScript and S
 Messages tagged `dictated` carry a delivery-only line explaining that voice transcription may
 contain mistakes. The stored text and body digest stay unchanged. Timeline message bodies carry
 the message's optional `tags` array so clients can mark dictation without inspecting its text.
+
+The agent resource exposes observed harness status as `harness_state`, `since` (RFC 3339),
+and `observation: current | stale | missing`. `since` is the start of that state in that
+runtime incarnation; repeated observations and changes to display details preserve it.
+`observation` becomes stale after 90 seconds without fresh evidence, and is missing when
+this runtime has no observation. Stale idle is exposed as indeterminate, never proven idle.
+Desired runtime state and agent-declared work progress remain separate from harness evidence.
+
+`GET /v1/client/status-history/{agent-id}` (`statusHistoryGet` in TypeScript) reads canonical
+ordered transitions for one seat. Each item has `seat`, `runtime_incarnation`, `state`,
+`observed_at`, and `reset`. A replacement runtime produces a reset immediately, even before
+its first harness observation (`state: null`); no new state vocabulary is introduced.
+The read retains at most 200 transitions/reset entries and only the last 7 days. It reports
+`retained_from` and `complete: false` when either bound trims history or checkpoint tombstones
+prevent proving completeness. Absence from incomplete history never proves continuity.
+The paired gateway uses the same endpoint and `read.projections` scope. Current status
+updates use the existing agents collection stream, including clock-driven staleness updates.
+
+Same-state observations remain local except for a freshness publication at most once a minute.
+That publication preserves `since` and does not add a history transition. Freshness uses the
+source observation time, so replaying old evidence cannot make a stale seat current.

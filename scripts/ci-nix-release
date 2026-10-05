@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Build every native Nix check and prove the persistent store supplies a repeat."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+def output(*args):
+    return subprocess.check_output(args, text=True).strip()
+
+
+def paths(results):
+    return sorted({path for result in results for path in result['outputs'].values()})
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ('build', 'verify-cache'):
+        raise SystemExit('usage: scripts/ci-nix-release build|verify-cache')
+    cache_home = os.environ.get('CI_LOCAL_CARGO_HOME')
+    if not cache_home or not Path(cache_home).is_dir():
+        raise SystemExit('ci-nix-release: a runner with a persistent CI_LOCAL_CARGO_HOME is required')
+    report = Path(os.environ['RUNNER_TEMP']) / 'nix-release-build.json'
+    source = output('git', 'rev-parse', 'HEAD')
+
+    if sys.argv[1] == 'build':
+        system = output('nix', 'eval', '--impure', '--raw', '--expr', 'builtins.currentSystem')
+        checks = json.loads(output('nix', 'eval', '--json', '--no-update-lock-file',
+                                   f'.#checks.{system}', '--apply', 'builtins.attrNames'))
+        if not checks:
+            raise SystemExit('ci-nix-release: the flake has no native checks')
+        targets = [f'.#packages.{system}.default', *[f'.#checks.{system}.{check}' for check in checks]]
+        # Probe the actual output paths before building. A post-build warm proof alone
+        # cannot reveal whether this run first downloaded or compiled a missing output.
+        derivations = json.loads(output('nix', 'derivation', 'show', '--no-update-lock-file', *targets))
+        derivations = derivations.get('derivations', derivations)
+        expected = {entry.get('path') for derivation in derivations.values()
+                    for entry in derivation['outputs'].values()}
+        unknown = None in expected
+        expected.discard(None)
+        store_dir = output('nix', 'eval', '--raw', '--expr', 'builtins.storeDir')
+        expected = {path if path.startswith('/') else str(Path(store_dir) / path) for path in expected}
+        probe = subprocess.run(['nix', 'path-info', '--offline', *sorted(expected)],
+                               capture_output=True, text=True) if expected else None
+        cached = set(probe.stdout.splitlines()) if probe else set()
+        missing = expected - cached
+        if missing or unknown:
+            coverage = f'P0: Nix store cache MISS before build: {len(missing)} missing outputs' + ('; unresolved outputs' if unknown else '')
+            print(f'::warning::{coverage}', flush=True)
+        else:
+            coverage = f'Nix store cache HIT before build: {len(expected)} outputs already present.'
+        if summary := os.environ.get('GITHUB_STEP_SUMMARY'):
+            with open(summary, 'a') as stream:
+                stream.write(('⚠️ **' + coverage + '**' if missing or unknown else coverage) + '\n\n')
+        # The runner's persistent cache directory retains GC roots after its checkout and
+        # temporary directory disappear. Each runner retains its latest successful outputs.
+        roots = Path(cache_home) / 'smalltalk-nix-release'
+        roots.mkdir(exist_ok=True)
+        results = json.loads(output('nix', 'build', '--no-update-lock-file', '--json',
+                                    '--print-build-logs', '--cores', '4', '--max-jobs', '1',
+                                    '--out-link', str(roots / 'result'), *targets))
+        report.write_text(json.dumps({'source': source, 'system': system,
+                                      'targets': targets, 'results': results}, indent=2) + '\n')
+        message = f'Built the {system} package and all {len(checks)} checks at {source}.'
+    else:
+        built = json.loads(report.read_text())
+        if built['source'] != source:
+            raise SystemExit('ci-nix-release: source changed since the build')
+        # No network substitution, local compilation, or remote builder may supply a miss.
+        results = json.loads(output('nix', 'build', '--no-update-lock-file', '--json',
+                                    '--offline', '--max-jobs', '0', '--option', 'builders', '',
+                                    '--option', 'substituters', '', '--no-link', *built['targets']))
+        if paths(results) != paths(built['results']):
+            raise SystemExit('ci-nix-release: cached results differ from the verified build')
+        message = f'Warm store proof passed: {len(paths(results))} outputs, with downloads and builds disabled.'
+    print(message, flush=True)
+    if summary := os.environ.get('GITHUB_STEP_SUMMARY'):
+        with open(summary, 'a') as stream:
+            stream.write(message + '\n\n')
+
+
+if __name__ == '__main__':
+    main()

@@ -126,6 +126,9 @@ pub struct MemberSpec {
     pub tags: BTreeMap<String, String>,
     pub display_name: Option<String>,
     pub lifecycle: MemberLifecycle,
+    /// Retire this seat when its process finishes, independently of its restart policy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub one_shot: bool,
     pub restart: RestartType,
     pub restart_intensity: RestartIntensity,
     pub shutdown_timeout_ms: u64,
@@ -1516,6 +1519,8 @@ pub struct CurrentHarnessView {
     pub exit: Option<String>,
     pub claim: String,
     pub observed_at_unix_ms: u128,
+    #[serde(default)]
+    pub since_unix_ms: u128,
 }
 
 impl CurrentHarnessView {
@@ -1541,6 +1546,7 @@ mod current_harness_view_tests {
             input_buffer: None,
             exit: None,
             claim: "claim/one".into(),
+            since_unix_ms: 1,
             observed_at_unix_ms: 1,
         }
     }
@@ -2468,6 +2474,34 @@ pub struct WorkRequest {
     pub idempotency_key: String,
 }
 
+/// Open a minimal run assigned to the calling seat; existing work verbs handle it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkStartRequest {
+    pub actor: String,
+    pub title: String,
+    pub idempotency_key: String,
+}
+
+/// Release a live claim to one exact recipient, with a durable note.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkHandoffRequest {
+    pub actor: String,
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    pub to: String,
+    pub note: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    pub idempotency_key: String,
+}
+
+/// Acknowledge the exact note visible to this recipient.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkAcknowledgeRequest {
+    pub actor: String,
+    pub message: String,
+}
+
 /// `work extend`: add `by_ms` to the execution budget of the attempt the actor holds.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkExtendRequest {
@@ -2685,6 +2719,7 @@ mod launch_change_tests {
         same.environment
             .insert("ST_RUN_GENERATION".into(), "next".into());
         same.restart = super::RestartType::Never;
+        same.one_shot = true;
         assert!(same.launch_changes(&launched).is_empty());
 
         assert_eq!(

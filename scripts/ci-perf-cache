@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 
 def api(path):
@@ -18,6 +20,12 @@ def trusted(run):
     return (run.get('head_branch') == 'main' and run.get('conclusion') == 'success'
             and run.get('event') in ('push', 'schedule', 'workflow_dispatch')
             and run.get('path') == '.github/workflows/perf.yml')
+
+
+def trusted_snapshot(run):
+    # A completed workload can miss a latency budget while its compiled outputs and
+    # generated source stores remain valid. Failed reports never become baselines.
+    return run.get('conclusion') in ('success', 'failure') and trusted(dict(run, conclusion='success'))
 
 
 def valid_report(report):
@@ -36,7 +44,7 @@ def valid_report(report):
 
 
 def own_pr(run, number, repository, branch, commits):
-    return (run.get('event') == 'pull_request' and run.get('conclusion') == 'success'
+    return (run.get('event') == 'pull_request' and run.get('conclusion') in ('success', 'failure')
             and run.get('path') == '.github/workflows/perf.yml'
             and (run.get('head_repository') or {}).get('full_name') == repository
             and run.get('head_branch') == branch and run.get('head_sha') in commits
@@ -47,6 +55,55 @@ def own_pr(run, number, repository, branch, commits):
 def download(repo, run, name, dest):
     subprocess.run(['gh', 'run', 'download', str(run['id']), '--repo', repo,
                     '--name', name, '--dir', str(dest)], check=True)
+
+
+def git(work, *args):
+    return subprocess.check_output(['git', '-C', str(work), *args], text=True,
+                                   env=dict(os.environ, GIT_OPTIONAL_LOCKS='0')).rstrip('\n')
+
+
+def source_paths(work):
+    paths = set()
+    for name in git(work, 'ls-files', '-z').split('\0'):
+        if name:
+            path = Path(name)
+            paths.add(path)
+            paths.update(path.parents)
+    return {path for path in paths if (work / path).exists() or (work / path).is_symlink()}
+
+
+def remember_sources():
+    work = Path(os.environ['GITHUB_WORKSPACE'])
+    checkpoint = Path(os.environ['RUNNER_TEMP']) / 'perf-source-state.json'
+    checkpoint.unlink(missing_ok=True)
+    if git(work, 'status', '--porcelain'):
+        print('Performance source timestamps: dirty checkout; Cargo validates it normally', flush=True)
+        return
+    checkpoint.write_text(json.dumps(dict(head=git(work, 'rev-parse', 'HEAD'),
+        mtimes={str(path): (work / path).lstat().st_mtime_ns for path in source_paths(work)})))
+
+
+def restore_sources(checkpoint=None):
+    work = Path(os.environ['GITHUB_WORKSPACE'])
+    checkpoint = checkpoint or Path(os.environ['RUNNER_TEMP']) / 'st-ci-cache/perf-source-state.json'
+    if not checkpoint.exists():
+        print('Performance source timestamps: no saved checkpoint', flush=True)
+        return
+    state = json.loads(checkpoint.read_text())
+    if not isinstance(state, dict):
+        raise ValueError('invalid source timestamp checkpoint')
+    if state.get('head') != git(work, 'rev-parse', 'HEAD') or git(work, 'status', '--porcelain'):
+        print('Performance source timestamps: source changed; Cargo validates the new checkout', flush=True)
+        return
+    allowed = source_paths(work)
+    mtimes = state.get('mtimes')
+    if (not isinstance(mtimes, dict) or set(mtimes) != {str(path) for path in allowed}
+            or any(type(stamp) is not int or stamp < 0 for stamp in mtimes.values())):
+        raise ValueError('invalid source timestamp checkpoint')
+    for name, stamp in mtimes.items():
+        path = work / name
+        os.utime(path, ns=(path.lstat().st_atime_ns, stamp), follow_symlinks=False)
+    print('Performance source timestamps: restored for the exact clean source SHA', flush=True)
 
 
 def unpack(archive, destination, names):
@@ -72,21 +129,34 @@ def restore():
     found = set()
     reports = 0
     def snapshots(run, names, dest, origin):
-        for kind, name in wanted.items():
-            if kind in found or name not in names:
-                continue
-            download(repo, run, name, dest / kind)
+        def fetch(kind, name):
+            start = time.monotonic()
+            directory = dest / kind
+            download(repo, run, name, directory)
+            downloaded = time.monotonic()
             roots = ('target', 'cargo-home', 'perf-sccache', 'st-ci-cache') if kind == 'build' else ('st-bench',)
-            unpack(dest / kind / f'{kind}.tar.zst', dest, roots)
+            extracted = directory / 'extracted'
+            extracted.mkdir()
+            unpack(directory / f'{kind}.tar.zst', extracted, roots)
             for root in roots:
-                source = dest / root
-                if not source.is_dir():
+                if not (extracted / root).is_dir():
                     raise ValueError(f'incomplete {kind} snapshot: missing {root}')
-                target = (work if root == 'target' else temp) / root
-                shutil.rmtree(target, ignore_errors=True)
-                shutil.move(source, target)
-            found.add(kind)
-            print(f"Performance {kind} cache HIT: {origin} run {run['id']}", flush=True)
+            return extracted, roots, downloaded - start, time.monotonic() - downloaded
+
+        # Download and extract the independent archives together. Keep installation and HIT
+        # reporting on this thread, after validating every required root of that snapshot.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pending = [(kind, pool.submit(fetch, kind, name)) for kind, name in wanted.items()
+                       if kind not in found and name in names]
+            for kind, future in pending:
+                extracted, roots, downloaded, unpacked = future.result()
+                for root in roots:
+                    target = (work if root == 'target' else temp) / root
+                    shutil.rmtree(target, ignore_errors=True)
+                    shutil.move(extracted / root, target)
+                found.add(kind)
+                print(f"Performance {kind} cache HIT: {origin} run {run['id']} "
+                      f"(download {downloaded:.1f}s, extract {unpacked:.1f}s)", flush=True)
 
     def artifact_names(run):
         artifacts = api(f"repos/{repo}/actions/runs/{run['id']}/artifacts?per_page=100")
@@ -94,6 +164,7 @@ def restore():
 
     # PR snapshots can be reused only by that same PR, never by main or another PR.
     # A rerun changes the current run's status: verify its previous successful attempt directly.
+    # GitHub may hide that attempt's artifacts; main remains the durable fallback.
     if os.environ['GITHUB_EVENT_NAME'] == 'pull_request':
         number = int(os.environ['PERF_PR_NUMBER'])
         branch = os.environ['GITHUB_HEAD_REF']
@@ -112,7 +183,7 @@ def restore():
             previous = api(f"repos/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{attempt - 1}")
             candidates.append(previous)
         from urllib.parse import quote
-        candidates += api(f'repos/{repo}/actions/workflows/perf.yml/runs?event=pull_request&branch={quote(branch, safe="")}&status=success&per_page=100')['workflow_runs']
+        candidates += api(f'repos/{repo}/actions/workflows/perf.yml/runs?event=pull_request&branch={quote(branch, safe="")}&status=completed&per_page=100')['workflow_runs']
         for run in candidates:
             if not own_pr(run, number, repository, branch, commits):
                 continue
@@ -121,15 +192,15 @@ def restore():
             if len(found) == 2:
                 break
     # Bound discovery; seven days of snapshots and thirty days of reports fit comfortably.
-    runs = api(f'repos/{repo}/actions/workflows/perf.yml/runs?branch=main&status=success&per_page=100')
+    runs = api(f'repos/{repo}/actions/workflows/perf.yml/runs?branch=main&status=completed&per_page=100')
     for run in runs['workflow_runs']:
-        if not trusted(run):
+        if not trusted_snapshot(run):
             continue
         names = artifact_names(run)
         with tempfile.TemporaryDirectory(dir=temp) as tmp:
             dest = Path(tmp)
             snapshots(run, names, dest, 'main')
-            if reports < 5 and 'perf-load-logs' in names:
+            if trusted(run) and reports < 5 and 'perf-load-logs' in names:
                 download(repo, run, 'perf-load-logs', dest / 'report')
                 files = list((dest / 'report').rglob('load.json'))
                 if len(files) != 1:
@@ -143,13 +214,16 @@ def restore():
             break
     for kind in wanted.keys() - found:
         print(f'::warning::P0: Performance {kind} cache MISS; seed this recipe on main', flush=True)
-    if reports == 0 and os.environ['GITHUB_EVENT_NAME'] == 'pull_request':
-        raise ValueError('P0: every PR requires a saved main baseline; run Performance on main first')
+    restore_sources()
     print(f'Performance baseline: {reports} real successful main reports', flush=True)
     with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
         summary.write(f'Performance caches: build **{"HIT" if "build" in found else "MISS (P0)"}**, '
                       f'stores **{"HIT" if "stores" in found else "MISS (P0)"}**; '
                       f'baseline: **{reports} successful main reports**.\n')
+        for kind in wanted.keys() - found:
+            summary.write(f'\n⚠️ **P0: Performance {kind} cache MISS**; seed this recipe on main.\n')
+    if reports == 0 and os.environ['GITHUB_EVENT_NAME'] == 'pull_request':
+        raise ValueError('P0: every PR requires a saved main baseline; run Performance on main first')
 
 
 def pack():
@@ -157,21 +231,43 @@ def pack():
     temp = Path(os.environ['RUNNER_TEMP'])
     output = temp / 'perf-snapshots'
     output.mkdir(exist_ok=True)
+    checkpoint = temp / 'perf-source-state.json'
+    saved = temp / 'st-ci-cache/perf-source-state.json'
+    saved.unlink(missing_ok=True)
+    if checkpoint.exists():
+        state = json.loads(checkpoint.read_text())
+        if state['head'] == git(work, 'rev-parse', 'HEAD') and not git(work, 'status', '--porcelain'):
+            shutil.copyfile(checkpoint, saved)
     # Registry source/config files contain no runner credentials; never archive all of CARGO_HOME.
-    subprocess.run(['tar', '-I', 'zstd -1 -T2', '-cf', str(output / 'build.tar.zst'),
+    subprocess.run(['tar', '--format=pax', '-I', 'zstd -1 -T2', '-cf', str(output / 'build.tar.zst'),
                     '-C', str(work), 'target', '-C', str(temp),
                     'cargo-home/registry', 'cargo-home/git', 'perf-sccache', 'st-ci-cache'], check=True)
-    subprocess.run(['tar', '-I', 'zstd -1 -T2', '-cf', str(output / 'stores.tar.zst'),
+    subprocess.run(['tar', '--format=pax', '-I', 'zstd -1 -T2', '-cf', str(output / 'stores.tar.zst'),
                     '-C', str(temp), 'st-bench'], check=True)
+
+
+def check_report():
+    report = Path(os.environ['RUNNER_TEMP']) / 'perf/load.json'
+    try:
+        complete = valid_report(json.loads(report.read_text()))
+    except (OSError, ValueError):
+        complete = False
+    if not complete:
+        print('Performance snapshots skipped: no complete workload report', flush=True)
+        return 1
+    with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+        output.write('publish=true\n')
+    return 0
 
 
 def main():
     try:
-        {'restore': restore, 'pack': pack}[sys.argv[1]]()
+        result = {'restore': restore, 'pack': pack, 'remember-sources': remember_sources,
+                  'check-report': check_report}[sys.argv[1]]()
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
         print(f'::error::P0: Performance cache/baseline operation failed: {error}', file=sys.stderr)
         return 1
-    return 0
+    return result or 0
 
 
 if __name__ == '__main__':

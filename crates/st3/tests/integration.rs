@@ -4,6 +4,7 @@
 //! `mod NAME;` line here or an explicit test target for every new file.
 
 mod action_coverage;
+mod adhoc_work;
 mod agents_restart;
 mod backup;
 mod boot_canaries;
@@ -15,6 +16,7 @@ mod client_v0_cli;
 mod client_v0_contract;
 mod codex_bootstrap;
 mod command_recorder;
+mod completion_shells;
 mod convergence;
 mod daemon_bench;
 mod daemon_cost;

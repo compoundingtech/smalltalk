@@ -38,6 +38,9 @@ pub mod mission;
 pub mod model;
 /// A driver relaunches its harness on the native session a suspended seat resumes.
 pub mod native_resume;
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+pub mod omp_ask_resume;
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 pub mod otlp;
 pub mod peer;
 pub mod placement;
@@ -59,6 +62,8 @@ pub mod render;
 pub mod resource;
 pub mod rollout;
 pub mod seat_queue;
+/// Runs any CLI with credentials no seat can read, through a gateway the sekrets user owns.
+pub mod sekrets;
 pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
@@ -66,6 +71,7 @@ pub mod store;
 pub mod subagents;
 /// Suspends a quiet seat and resumes its own native session.
 pub mod suspension;
+pub mod seat_snapshot;
 pub mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

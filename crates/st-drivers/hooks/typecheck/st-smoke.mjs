@@ -4,6 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+import { mock } from "node:test";
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 const driver = process.argv[2];
 const asset = process.argv[3];
 assert.ok(["pi", "omp"].includes(driver));
@@ -30,12 +33,14 @@ for (const [key, value] of Object.entries({BIN:recorder,CATALOG:"/test/catalog",
 }
 const events = new Map();
 let title = "Stale saved title";
+const titleChanges = [];
 let nativeSession = "native-1";
 let synchronousContext = false;
 const handoffs = [];
 const api = {
   on:(event,callback)=>events.set(event,callback),
-  setSessionName:(label)=>{title=label;},
+  getSessionName:()=>title,
+  setSessionName:(label)=>{titleChanges.push(label);title=label;},
   sendMessage:()=>{},
   sendUserMessage:async(content)=>{
     handoffs.push(content);
@@ -52,8 +57,20 @@ await events.get("session_start")({},ctx);
 await until(()=>title==="Quartz[gen]");
 assert.ok(events.has("session_switch"),"OMP /new uses session_switch");
 const meta={messageId:"message/quartz-1"};
+const titleChangesBeforeReplay = titleChanges.length;
+for (let i = 0; i < 2; i++) {
+  send({type:"seat",seat:{subject:"agent/eval.worker",desired:{display_name:"Quartz"}}});
+}
 send({type:"message",content:"QUARTZ SIGNAL",meta});
 await until(()=>read().some(frame=>frame.type==="delivered"&&frame.meta?.messageId===meta.messageId));
+if (driver === "omp") {
+  assert.equal(titleChanges.length,titleChangesBeforeReplay,"replaying the same Seat twice must not rewrite the session name");
+  delete api.getSessionName;
+  api.setSessionName("Native rename without getter");
+  send({type:"seat",seat:{subject:"agent/eval.worker",desired:{display_name:"Quartz"}}});
+  await until(()=>title==="Quartz[gen]");
+  api.getSessionName=()=>title;
+}
 assert.equal(read().filter(frame=>frame.type==="read").length,0,"native queue acceptance is not read evidence");
 await events.get("context")({messages:[{role:"user",content:"QUARTZ SIGNAL"}]},ctx);
 await until(()=>read().some(frame=>frame.type==="read"&&frame.meta?.messageId===meta.messageId));
@@ -111,6 +128,68 @@ if (driver === "omp") {
 assert.ok(!fs.existsSync(path.join(dir,"resources/inbox")));
 assert.ok(!fs.existsSync(path.join(dir,"resources/archive")));
 await events.get("session_shutdown")(driver==="pi"?{reason:"quit"}:{},ctx);
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+if (driver === "omp") {
+  const realTimeout = globalThis.setTimeout;
+  const untilBridge = async (predicate) => {
+    for (let i = 0; i < 200; i++) {
+      if (predicate()) return;
+      await new Promise((resolve) => realTimeout(resolve, 20));
+    }
+    throw new Error("interrupted ask smoke deadline");
+  };
+  for (const outcome of ["reopened", "timeout"]) {
+    fs.rmSync(frames, { force: true });
+    fs.rmSync(outgoing, { force: true });
+    delete globalThis.__stOmpChannel;
+    for (const [key, value] of Object.entries({ BIN: recorder, IDENTITY: "eval.worker", RUNTIME_ID: "eval.worker", SESSION: "wrapper", SEQ: "1" })) {
+      process.env[prefix + key] = value;
+    }
+    process.env.ST3_OMP_PENDING_ASK = "restored-ask";
+    const bridgeEvents = new Map();
+    const bridgeHandoffs = [];
+    let idle = true;
+    const bridgeCtx = { ...ctx, isIdle: () => idle };
+    mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      extension({
+        ...api,
+        on: (name, handler) => bridgeEvents.set(name, handler),
+        sendUserMessage: async (content) => { bridgeHandoffs.push(content); },
+      });
+      await bridgeEvents.get("session_start")({}, bridgeCtx);
+      await untilBridge(() => read().some((frame) => frame.type === "retry_pending_ask"));
+      assert.equal(read().filter((frame) => frame.type === "retry_pending_ask").length, 1);
+      assert.equal(read().filter((frame) => frame.type === "delivery_ready").length, 0);
+      send({ type: "message", content: `HELD ${outcome}`, meta: { messageId: `message/${outcome}` } });
+      await untilBridge(() => globalThis.__stOmpChannel.held?.length === 1);
+      assert.deepEqual(bridgeHandoffs, [], "mail is held while reopening is unresolved");
+      idle = false;
+      if (outcome === "reopened") {
+        await bridgeEvents.get("tool_execution_start")({ toolName: "ask", toolCallId: "unrelated" }, bridgeCtx);
+        assert.equal(globalThis.__stOmpChannel.restoringAsk.toolCallId, "restored-ask");
+        await bridgeEvents.get("tool_execution_start")({ toolName: "ask", toolCallId: "restored-ask" }, bridgeCtx);
+        await untilBridge(() => read().some((frame) => frame.type === "delivery_ready"));
+        assert.equal(read().filter((frame) => frame.type === "state").at(-1).blockedOn, "human");
+        assert.equal(globalThis.__stOmpChannel.pendingAskToolCallId, "restored-ask");
+        mock.timers.tick(10_001);
+      } else {
+        mock.timers.tick(120_000);
+        await untilBridge(() => read().some((frame) => frame.code === "pending_ask_resume_timeout"));
+        assert.equal(read().filter((frame) => frame.type === "state" && frame.state === "idle").length, 0);
+      }
+      await untilBridge(() => bridgeHandoffs.length === 1);
+      assert.deepEqual(bridgeHandoffs, [`HELD ${outcome}`], "both exits release mail without waiting for idle");
+      assert.equal(read().filter((frame) => frame.type === "delivery_ready").length, 1);
+      assert.equal(globalThis.__stOmpChannel.restoringAsk, undefined);
+      await bridgeEvents.get("session_shutdown")({}, bridgeCtx);
+    } finally {
+      mock.timers.reset();
+      globalThis.__stOmpChannel?.child?.stdin?.end();
+    }
+  }
+}
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 fs.rmSync(dir,{recursive:true,force:true});
 console.log(`${driver} st channel smoke: ok`);
 process.exit(0);

@@ -28,6 +28,10 @@ const SESSION = "ST_OMP_CHANNEL_SESSION";
 const SEQ = "ST_OMP_CHANNEL_SEQ";
 const EXPECTED_NATIVE_SESSION = "ST_OMP_CHANNEL_EXPECTED_NATIVE_SESSION";
 const RESUME_GENERATION = "ST_OMP_CHANNEL_RESUME_GENERATION";
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+const PENDING_ASK = "ST3_OMP_PENDING_ASK";
+const PENDING_ASK_TIMEOUT_MS = 120_000;
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 
 // omp starts the session even if st is slow to answer. Restored context is worth a short wait
 // and never worth a hung agent.
@@ -82,6 +86,15 @@ type Stash = {
   seq?: string;
   expectedNativeSession?: string;
   resumeGeneration?: string;
+  // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+  restoringAsk?: {
+    toolCallId: string;
+    ready: boolean;
+    firstIdle: boolean;
+    retried: boolean;
+    timer?: NodeJS.Timeout;
+  };
+  // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
   child?: childProcess.ChildProcess;
   reconnectTimer?: ReturnType<typeof setTimeout>;
   reconnectAttempt?: number;
@@ -339,6 +352,18 @@ const stash = (): Stash => {
       expectedNativeSession: process.env[EXPECTED_NATIVE_SESSION],
       resumeGeneration: process.env[RESUME_GENERATION],
     };
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    const pendingAsk = process.env[PENDING_ASK];
+    if (pendingAsk?.trim()) {
+      globals.__stOmpChannel.restoringAsk = {
+        toolCallId: pendingAsk,
+        ready: false,
+        firstIdle: false,
+        retried: false,
+      };
+    }
+    delete process.env[PENDING_ASK];
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     delete process.env[BIN];
     delete process.env[IDENTITY];
     delete process.env[RUNTIME_ID];
@@ -384,7 +409,12 @@ export default function (pi: ExtensionAPI) {
   };
   const applyLabel = async (ctx: ExtensionContext) => {
     if (!state.label) return;
-    try { await pi.setSessionName(state.label); }
+    // Seat replay after reconnect must not append another title change to the session.
+    try {
+      if (typeof pi.getSessionName !== "function" || pi.getSessionName() !== state.label) {
+        await pi.setSessionName(state.label);
+      }
+    }
     catch { ctx.ui?.notify?.("st: could not update the session name", "warning"); }
   };
   const { bin, identity, runtimeId, session, seq } = state;
@@ -469,6 +499,9 @@ export default function (pi: ExtensionAPI) {
       channelEnv[EXPECTED_NATIVE_SESSION] = expectedNativeSession;
     }
     if (resumeGeneration) channelEnv[RESUME_GENERATION] = resumeGeneration;
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    if (state.restoringAsk) channelEnv[PENDING_ASK] = state.restoringAsk.toolCallId;
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     const child = childProcess.spawn(
       bin,
       ["driver", "omp-channel", "--identity", identity],
@@ -481,6 +514,9 @@ export default function (pi: ExtensionAPI) {
     state.todoNextPollAt = undefined;
     state.todoSession = nativeSessionId;
     state.todoReady = false;
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    armPendingAskTimeout(ctx);
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 
     return new Promise<string>((resolve) => {
       let settled = false;
@@ -572,6 +608,12 @@ export default function (pi: ExtensionAPI) {
           send({ type: "ready", sessionId: nativeSessionId });
           state.todoReady = true;
           observeTodoBranch(ctx, true);
+          // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+          if (state.restoringAsk) {
+            state.restoringAsk.ready = true;
+            retryPendingAsk();
+          }
+          // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
           // Every fresh channel needs the provider's idle proof, including reconnects
           // during an idle session where no further turn boundary will arrive.
           watchSettle(ctx);
@@ -648,6 +690,13 @@ export default function (pi: ExtensionAPI) {
   const sendFrame = (frame: Record<string, unknown>) => {
     const child = state.child;
     if (!child || !child.stdin || child.stdin.destroyed) return;
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    if (frame.type === "state" && frame.state === "idle" && state.restoringAsk) {
+      state.restoringAsk.firstIdle = true;
+      retryPendingAsk();
+      return;
+    }
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     if (frame.type === "state") {
       lastStateFrame = frame;
       lastBackgroundJobs = backgroundJobs();
@@ -853,6 +902,9 @@ export default function (pi: ExtensionAPI) {
 
   /** Hand every held message to omp now, in arrival order. */
   const release = (): Promise<void> => {
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    if (state.restoringAsk) return Promise.resolve();
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     clearHoldTimer();
     const batch = heldMessages().splice(0);
     const deliver = async () => {
@@ -865,6 +917,9 @@ export default function (pi: ExtensionAPI) {
 
   /** Bound the wait behind a running tool call, never the wait for the model to finish streaming. */
   const armHoldCap = () => {
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    if (state.restoringAsk) return;
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     if (state.holdTimer !== undefined) return;
     if (heldMessages().length === 0 || toolCallsInFlight().size === 0) return;
     state.holdTimer = setTimeout(() => {
@@ -883,6 +938,50 @@ export default function (pi: ExtensionAPI) {
     }
     return release();
   };
+
+  // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+  // Retry is a terminal action, not a model prompt. Rust owns the raw F5 write.
+  const retryPendingAsk = () => {
+    const pending = state.restoringAsk;
+    if (!pending || !pending.ready || !pending.firstIdle || pending.retried) return;
+    const child = state.child;
+    if (!child?.stdin || child.stdin.destroyed) return;
+    pending.retried = true;
+    sendFrame({ type: "retry_pending_ask", toolCallId: pending.toolCallId });
+  };
+  const armPendingAskTimeout = (ctx: ExtensionContext) => {
+    const pending = state.restoringAsk;
+    if (!pending || pending.timer !== undefined) return;
+    pending.timer = setTimeout(() => {
+      if (state.restoringAsk !== pending) return;
+      state.restoringAsk = undefined;
+      sendFrame({ type: "delivery_ready" });
+      sendFrame({
+        type: "diagnostic",
+        code: "pending_ask_resume_timeout",
+        toolCallId: pending.toolCallId,
+        message: `Interrupted ask ${pending.toolCallId} did not reopen within ${PENDING_ASK_TIMEOUT_MS}ms; releasing held mail`,
+      });
+      if (idleProof(ctx)) {
+        sendFrame({ type: "state", state: "idle" });
+      }
+      void release();
+    }, PENDING_ASK_TIMEOUT_MS);
+    pending.timer.unref?.();
+  };
+  const observePendingAsk = (event: { toolName?: unknown; toolCallId?: unknown }) => {
+    const pending = state.restoringAsk;
+    if (!pending || event.toolName !== "ask" || event.toolCallId !== pending.toolCallId) return;
+    clearTimeout(pending.timer);
+    state.restoringAsk = undefined;
+    state.pendingAskToolCallId = pending.toolCallId;
+    toolCallsInFlight().add(pending.toolCallId);
+    cancelSettle();
+    sendFrame({ type: "state", state: "active", blockedOn: "human", ask: "question" });
+    sendFrame({ type: "delivery_ready" });
+    armHoldCap();
+  };
+  // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 
   /** A turn's calls are over when the turn ends, answered or not: a blocked call has no result. */
   const endTurnToolCalls = (event: unknown) => {
@@ -1101,6 +1200,9 @@ export default function (pi: ExtensionAPI) {
   onWidened("tool_call", async (rawEvent) => {
     // Pinned pi declarations do not know OMP's tool events; the handler validates fields below.
     const event = rawEvent as ToolCallFrame;
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    observePendingAsk(event);
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     sendTimeline("tool_call", rawEvent);
     if (typeof event.toolCallId === "string") {
       toolCallsInFlight().add(event.toolCallId);
@@ -1118,6 +1220,11 @@ export default function (pi: ExtensionAPI) {
       reason: question,
     });
   });
+  // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+  onWidened("tool_execution_start", async (rawEvent) => {
+    observePendingAsk(rawEvent as ToolCallFrame);
+  });
+  // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
   onWidened("tool_result", async (rawEvent, ctx) => {
     const event = rawEvent as ToolResultFrame;
     sendTimeline("tool_result", rawEvent);
@@ -1251,6 +1358,10 @@ export default function (pi: ExtensionAPI) {
   // the named predecessor.
   onWidened("session_shutdown", async () => {
     state.shuttingDown = true;
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    clearTimeout(state.restoringAsk?.timer);
+    state.restoringAsk = undefined;
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     if (state.reconnectTimer !== undefined) clearTimeout(state.reconnectTimer);
     state.reconnectTimer = undefined;
     cancelSettle();

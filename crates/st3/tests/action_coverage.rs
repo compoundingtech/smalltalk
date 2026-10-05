@@ -2165,6 +2165,142 @@ async fn cli_send_reply_read_archive_search_and_attachments_survive_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_aged_unread_cleanup_preserves_fresh_and_read_mail_across_restart() {
+    let mut daemon = Daemon::new().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let mut messages = BTreeMap::new();
+    for (name, recipient, phase, fresh) in [
+        ("old-sent", PERSON, "sent", false),
+        ("old-delivered", PERSON, "delivered", false),
+        ("old-read", PERSON, "read", false),
+        ("old-closed", PERSON, "closed", false),
+        ("old-other", "person/blair", "sent", false),
+        ("fresh-sent", PERSON, "sent", true),
+        ("fresh-delivered", PERSON, "delivered", true),
+    ] {
+        daemon
+            .store()
+            .set_write_clock_at(if fresh { now } else { now - 7_200_000 })
+            .unwrap();
+        let sent = cli_value(
+            daemon
+                .cli(
+                    PERSON,
+                    &[
+                        "conversations",
+                        "send",
+                        recipient,
+                        "--from",
+                        PERSON,
+                        "--body",
+                        name,
+                        "--idempotency-key",
+                        name,
+                    ],
+                )
+                .await,
+        );
+        let subject = sent["subject"].as_str().unwrap().to_owned();
+        if phase != "sent" {
+            let _: Value = daemon.transport().post(
+                &format!("/v1/messages/{}/claims", subject.trim_start_matches("message/")),
+                &json!({"lifecycle": "delivered", "actor": recipient, "idempotency_key": format!("{name}:delivered")}),
+            ).await.unwrap();
+        }
+        if matches!(phase, "read" | "closed") {
+            cli_value(
+                daemon
+                    .cli(
+                        recipient,
+                        &["conversations", "read", &subject, "--as", recipient],
+                    )
+                    .await,
+            );
+        }
+        if phase == "closed" {
+            cli_value(
+                daemon
+                    .cli(
+                        recipient,
+                        &["conversations", "archive", &subject, "--as", recipient],
+                    )
+                    .await,
+            );
+        }
+        messages.insert(name, subject);
+    }
+    daemon.store().set_write_clock_at(now).unwrap();
+    daemon.restart().await;
+    let all = ["conversations", "cleanup", "--all", "--older-than", "1h"];
+    let before = daemon.store().index().unwrap();
+    let preview = cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &[
+                    "conversations",
+                    "cleanup",
+                    "--all",
+                    "--older-than",
+                    "1h",
+                    "--dry-run",
+                ],
+            )
+            .await,
+    );
+    assert_eq!(preview["count"], 3);
+    assert_eq!(daemon.store().index().unwrap(), before);
+    let scoped = [
+        "conversations",
+        "cleanup",
+        "--as",
+        PERSON,
+        "--older-than",
+        "1h",
+    ];
+    assert_eq!(cli_value(daemon.cli(PERSON, &scoped).await)["count"], 2);
+    daemon.restart().await;
+    assert_eq!(cli_value(daemon.cli(PERSON, &scoped).await)["count"], 0);
+    for (name, expected) in [
+        ("old-sent", "closed"),
+        ("old-delivered", "closed"),
+        ("old-other", "sent"),
+        ("old-read", "read"),
+        ("old-closed", "closed"),
+        ("fresh-sent", "sent"),
+        ("fresh-delivered", "delivered"),
+    ] {
+        assert_eq!(
+            daemon
+                .store()
+                .message(&messages[name])
+                .unwrap()
+                .unwrap()
+                .status,
+            expected,
+            "{name}"
+        );
+    }
+    assert_eq!(cli_value(daemon.cli(PERSON, &all).await)["count"], 1);
+    daemon.restart().await;
+    let before = daemon.store().index().unwrap();
+    assert_eq!(cli_value(daemon.cli(PERSON, &all).await)["count"], 0);
+    assert_eq!(daemon.store().index().unwrap(), before);
+    assert_eq!(
+        daemon
+            .store()
+            .message(&messages["old-other"])
+            .unwrap()
+            .unwrap()
+            .status,
+        "closed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_revision_propose_inspect_approve_and_cancel_survive_restart() {
     for decision in ["approve", "cancel"] {
         let mut daemon = Daemon::new().await;
@@ -2480,7 +2616,8 @@ async fn cli_service_install_status_restart_reset_uninstall_use_isolated_manager
     let config_path = root.path().join("config/st3/config.toml");
     std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
     let manager = root.path().join("bin/systemctl");
-    std::fs::write(&manager, r#"#!/usr/bin/env python3
+    std::fs::write(&manager, r#"#!/bin/sh
+exec python3 - "$@" <<'PY'
 import os, pathlib, signal, subprocess, sys, time
 root = pathlib.Path(os.environ['ST3_COVERAGE_ROOT'])
 args = sys.argv[1:]
@@ -2507,6 +2644,7 @@ if 'show' in args:
 elif 'st3.service' in args:
     if 'stop' in args or 'restart' in args or ('disable' in args and '--now' in args): stop()
     if 'start' in args or 'restart' in args: start()
+PY
 "#).unwrap();
     std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(root.path().join("bin/pty"), "#!/bin/sh\nexit 0\n").unwrap();
@@ -2997,9 +3135,26 @@ async fn cli_local_skill_completions_holds_and_repairs_use_private_files() {
             .join("home/.agents/skills/st/SKILL.md")
             .is_file()
     );
-    let completed = daemon.cli(PERSON, &["completions", "bash"]).await;
-    assert!(completed.status.success());
-    assert!(String::from_utf8_lossy(&completed.stdout).contains("missions"));
+    let completed = daemon
+        .cli_command(PERSON, &["--", "st", ""])
+        .env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "1")
+        .env("_CLAP_COMPLETE_COMP_TYPE", "9")
+        .env("_CLAP_COMPLETE_SPACE", "false")
+        .env("_CLAP_IFS", "\n")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&completed.stdout)
+            .split_whitespace()
+            .any(|candidate| candidate == "missions")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

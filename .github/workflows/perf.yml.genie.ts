@@ -1,7 +1,8 @@
 import { defaultActionlintConfig, githubWorkflow, nixDevelopStep, plainFlakeSetupSteps } from '../../repos/effect-utils/genie/external.ts'
 import { buildEnv, linuxStageRunner, readOnlyBinaryCaches } from './workspace-ci.ts'
 
-const snapshotSuccess = "success() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main')"
+const snapshotAttempt = "!cancelled() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (steps.load.outcome == 'success' || steps.load.outcome == 'failure')"
+const snapshotPublished = "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
 const paths = [
   'crates/smallclaims/**',
   'crates/st3/src/**',
@@ -80,24 +81,26 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
           // copied to RUNNER_TEMP before measuring: measurements still use the normal disk.
           run: 'if [ ! -s "$RUNNER_TEMP/st-bench/generated-1.sqlite3" ]; then sudo mount -o remount,size=10G /dev/shm; fi',
         },
-        nixDevelopStep({ name: 'Run the release load test', flake: '.#perf', command: ['bash', 'scripts/ci-perf', 'load'] }),
+        { ...nixDevelopStep({ name: 'Run the release load test', flake: '.#perf', command: ['bash', 'scripts/ci-perf', 'load'] }), id: 'load' },
         {
+          id: 'cache',
           name: 'Save build and Nix snapshots',
-          if: snapshotSuccess,
-          run: `nix print-dev-env .#perf --profile "$RUNNER_TEMP/perf-shell" > /dev/null
+          if: snapshotAttempt,
+          run: `if ! python3 scripts/ci-perf-cache check-report; then exit 0; fi
+nix print-dev-env .#perf --profile "$RUNNER_TEMP/perf-shell" > /dev/null
 nix develop .#perf -c env TMPDIR="$RUNNER_TEMP" sccache --show-stats
 CI_PERF_SHELL_ROOT="$RUNNER_TEMP/perf-shell" bash scripts/ci-nix-cache save
 python3 scripts/ci-perf-cache pack`,
         },
         {
           name: 'Retain the build and Nix cache',
-          if: snapshotSuccess,
+          if: snapshotPublished,
           uses: 'actions/upload-artifact@v4',
           with: { name: '${{ env.PERF_BUILD_SNAPSHOT }}', path: '${{ runner.temp }}/perf-snapshots/build.tar.zst', 'compression-level': 0, 'retention-days': 7, 'if-no-files-found': 'error', overwrite: true },
         },
         {
           name: 'Retain the generated stores',
-          if: snapshotSuccess,
+          if: snapshotPublished,
           uses: 'actions/upload-artifact@v4',
           with: { name: '${{ env.PERF_STORES_SNAPSHOT }}', path: '${{ runner.temp }}/perf-snapshots/stores.tar.zst', 'compression-level': 0, 'retention-days': 7, 'if-no-files-found': 'error', overwrite: true },
         },

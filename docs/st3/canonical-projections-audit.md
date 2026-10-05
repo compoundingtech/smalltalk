@@ -53,6 +53,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_work_lease_renewals` | Local | Local lease extensions, re-applied after canonical replay. Durable replicated lease anchors remain shared. |
 | `local_mailbox_owners` | Local | This daemon's native socket subscription owner, live runtime incarnation and replacement epoch. Survives daemon restart; excluded from replicated projection digests. |
 | `local_mailbox_bindings` | Local | Stable binding request tokens mapped to daemon-allocated epochs. Lost acknowledgements retry the same binding; retired tokens cannot allocate a successor. Excluded from replicated projection digests. |
+| `unread_mail`, `unread_mail_prefixes`, `unread_mail_pending` | Local cache | Rebuildable unread-message timestamp and prefix-count indexes, plus a deduplicated queue of changed messages, over this node's retained sent/read/closed claims. They accelerate current age counts, are not replicated, and do not add shared identities to projection digests. |
 | `local_observations` | Local | Local-retention observations and their local frontier/id; never replicated. |
 | `local_subscription_mission_deferrals` | Local | Local reconciler capacity backoff/retry scheduling. |
 | `local_usage_spend` | Local | Local provider usage and cost accumulation before publication. |
@@ -77,6 +78,22 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `checkpoints` | Local | Local seal/verification/trim/adoption ledger and rowid high water; nodes legitimately occupy different protocol stages. Shared protocol facts are checkpoint.* claims. |
 
 The temporary tables write_clock, sealed_claims, sealed_envelopes, canonical_index, adopted_envelopes and adopted_claims are Local: clock simulation or checkpoint proof/adoption scratch state. SQLite sqlite_sequence is a local allocation counter. There are no persistent SQL views in the audited schema. Rust actual/subject/message/status/replication snapshot caches and exported mailbox files are Local disposable caches; their shared source selections are not exempt.
+
+## Current glass head projection
+
+`glass_heads` is a shared, rebuildable projection added after the baseline inventory above.
+It stores each private glass's canonical first-upsert key, greatest-upsert key and claim ID,
+plus permanent deletion state. Its complete logical row, including both key byte sequences,
+is covered by projection digests and shuffle/restart/checkpoint comparisons.
+`local_glass_head_pending` and `local_glass_head_dirty` are local disposable work queues.
+
+Normal append processing updates canonical minima/maxima without scanning durable history.
+Canonical metadata corrections replay only affected subjects. Current lists read at most 100
+indexed live heads in creation order; updates cannot reorder quota priority, and retained
+overflow becomes visible when a slot opens. Deleted IDs remain retired.
+Historical snapshot reads retain the claim fold, as do reads while projection work is pending.
+Latest eligibility and pinned-head retrieval share one SQL snapshot so a concurrent append
+cannot leak a later head into an earlier `through` snapshot. Durable glass claims are not pruned.
 
 ## Every store_index order
 

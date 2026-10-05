@@ -113,6 +113,31 @@ struct Demo {
 const UPDATE_READ_AFTER: Duration = Duration::from_secs(3);
 
 /// A request the live loop sends to st. The demo never produces these.
+/// What the agent actions menu does to a seat; each is st's own agent action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentControl {
+    /// A new process for the same seat: stop, then start on its declaration.
+    Restart,
+    /// Stop it and take it off the lists; start brings it back.
+    Retire,
+    Start,
+    /// Stop at a quiet moment, keeping its native session.
+    Suspend,
+    Resume,
+}
+
+impl AgentControl {
+    pub fn verb(self) -> &'static str {
+        match self {
+            AgentControl::Restart => "Restart",
+            AgentControl::Retire => "Retire",
+            AgentControl::Start => "Start",
+            AgentControl::Suspend => "Suspend",
+            AgentControl::Resume => "Resume",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// Read an image a message carries from st, keep it here, and show it.
@@ -172,6 +197,11 @@ pub enum Effect {
     /// Interrupt an agent's turn, as Esc does in its harness's own TUI.
     StopAgent {
         agent: String,
+    },
+    /// Restart, retire (stop), start, suspend or resume an agent's seat, from its actions menu.
+    AgentControl {
+        agent: String,
+        control: AgentControl,
     },
     /// Start a new agent; its first message is what the person asked of it.
     /// Start a plain shell for the person; it opens in a new tab.
@@ -256,6 +286,8 @@ pub struct Ui {
     cache: conversation::Cache,
     editing: bool,
     confirm: Option<char>,
+    /// What an agent's actions menu will do once y confirms it.
+    pending_control: Option<(String, AgentControl)>,
     flash: Option<(String, Instant)>,
     tick: u64,
     help: bool,
@@ -297,7 +329,7 @@ pub struct Ui {
     /// What the Usage tab groups by, and over how many hours.
     usage_by: usage::By,
     pub(crate) usage_hours: u64,
-    /// Simplified conversations here (Shift+O): this device's choice, kept in prefs.json.
+    /// Simplified conversations here (Ctrl+P; the default): this device's choice, kept in prefs.json.
     pub(crate) simple: bool,
     /// An attached terminal shown in place of the conversation.
     pub(crate) terminal: Option<TerminalView>,
@@ -379,6 +411,7 @@ impl Ui {
             cache: conversation::Cache::default(),
             editing: false,
             confirm: None,
+            pending_control: None,
             flash: None,
             tick: 0,
             help: false,
@@ -480,7 +513,9 @@ impl Ui {
     /// This device's remembered choices, read once when stui starts.
     pub(crate) fn load_prefs(&mut self) {
         if let Some(path) = prefs::path() {
-            self.simple = prefs::load(&path).simple == Some(true);
+            // Simplified is the default, as on the phone (Nathan, 2026-10-04); a device that
+            // chose the full view keeps it.
+            self.simple = simplified(&prefs::load(&path));
         }
     }
 
@@ -507,9 +542,9 @@ impl Ui {
             );
         }
         self.flash(if self.simple {
-            "Simplified conversations · Shift+O for the full view"
+            "Simplified: each tool call is one line, a run of them one line · ctrl+p for everything"
         } else {
-            "Full conversations · Shift+O to simplify"
+            "Full: every tool call with its output · ctrl+p to simplify"
         });
     }
 
@@ -533,6 +568,14 @@ impl Ui {
     }
 
     /// The period to read usage over while something on screen shows it, or `None`.
+    /// Whether the clients connected to this member show: the Fleet tab or a machine pane.
+    pub(crate) fn clients_wanted(&self) -> bool {
+        match &self.glasses {
+            Some(glasses) => glasses.shows_machine() || self.tab == 3,
+            None => self.tab == 3,
+        }
+    }
+
     pub(crate) fn usage_wanted(&self) -> Option<u64> {
         let shown = match &self.glasses {
             Some(glasses) => glasses.shows_usage(),
@@ -1137,6 +1180,20 @@ impl Ui {
 
     fn footer(&self, buf: &mut Buffer, area: Rect) {
         buf.set_style(area, Style::default().bg(theme::CRUST));
+        let backlog_notice = match &self.world.mail_backlog {
+            Load::Ready(backlog) if backlog.count > 0 => Some(format!(
+                "{} unread >1h · {}", backlog.count, backlog.cleanup_command
+            )),
+            Load::Failed(error) => Some(error.clone()),
+            _ => None,
+        };
+        if let Some(notice) = backlog_notice {
+            buf.set_stringn(
+                area.x + 1, area.y, notice, area.width.saturating_sub(2) as usize,
+                Style::default().fg(theme::YELLOW).bg(theme::CRUST),
+            );
+            return;
+        }
         if let Link::Offline(message) = &self.world.link {
             buf.set_stringn(
                 area.x + 1,
@@ -2228,9 +2285,16 @@ impl Ui {
     /// A floating card for one graph subject, with a way to go to it.
     fn draw_popover(&self, buf: &mut Buffer, area: Rect, subject: &str) {
         let width = 72.min(area.width.saturating_sub(4));
-        let inner = screens::peek(&self.world, subject, width as usize - 4, self.spinner());
+        let menu_for = subject.strip_prefix("actions:").and_then(|id| {
+            self.world.agents.items().iter().find(|agent| agent.id == id)
+        });
+        let inner = match menu_for {
+            Some(agent) => screens::agent_actions_doc(agent, width as usize - 4, self.spinner()),
+            None => screens::peek(&self.world, subject, width as usize - 4, self.spinner()),
+        };
         let mut doc = Doc::new();
         let title = match subject.split('/').next().unwrap_or("") {
+            _ if menu_for.is_some() => "actions",
             "agent" | "session" => "agent",
             "mission" => "mission",
             "attention" => "needs you",
@@ -2655,10 +2719,14 @@ impl Ui {
                 ("wheel pgup pgdn ↑↓", "scroll the pane under the pointer"),
                 ("end", "jump to the newest message and follow it"),
                 ("ctrl+f", "find in this conversation"),
+                (
+                    "ctrl+a",
+                    "the agent's actions: restart, suspend, retire, terminal…",
+                ),
                 ("ctrl+e", "expand or collapse tool output"),
                 (
                     "ctrl+p",
-                    "simplified view: tool calls fold to a line (this device)",
+                    "simplified (the default: a tool call is one line, a run of them one) or full (every call and its output); this device",
                 ),
                 (
                     "ctrl+d",
@@ -3070,6 +3138,12 @@ impl Ui {
         }
         if let Some(subject) = self.popover.clone() {
             self.popover = None;
+            if let Some(agent) = subject.strip_prefix("actions:") {
+                if let KeyCode::Char(letter) = key.code {
+                    self.agent_action(agent.to_owned(), letter);
+                }
+                return;
+            }
             match key.code {
                 KeyCode::Char('g') | KeyCode::Enter => self.open(&subject),
                 KeyCode::Char('t') if subject.starts_with("agent/") => {
@@ -4049,7 +4123,82 @@ impl Ui {
             .map(|agent| agent.name.clone())
     }
 
+    /// A key from an agent's actions menu. What changes the seat asks y first; Esc keeps it.
+    fn agent_action(&mut self, agent: String, key: char) {
+        let name = self
+            .world
+            .agents
+            .items()
+            .iter()
+            .find(|candidate| candidate.id == agent)
+            .map(|candidate| candidate.name.clone())
+            .unwrap_or_else(|| agent.trim_start_matches("agent/").to_owned());
+        let control = match key {
+            'r' => Some(AgentControl::Restart),
+            'p' => Some(AgentControl::Suspend),
+            'x' => Some(AgentControl::Retire),
+            's' => Some(AgentControl::Start),
+            'u' => Some(AgentControl::Resume),
+            _ => None,
+        };
+        match (key, control) {
+            (_, Some(control @ (AgentControl::Start | AgentControl::Resume))) => {
+                self.control_agent(agent, control, &name)
+            }
+            (_, Some(control)) => {
+                self.flash(format!(
+                    "{} {name}? y to {} · Esc keeps it",
+                    control.verb(),
+                    control.verb().to_lowercase()
+                ));
+                self.pending_control = Some((agent, control));
+                self.confirm = Some('A');
+            }
+            ('i', None) => {
+                if self.live {
+                    self.effects.push(Effect::StopAgent { agent });
+                    self.flash("Interrupting…");
+                } else {
+                    self.flash("Interrupted · demo: nothing was sent");
+                }
+            }
+            ('t', None) => {
+                self.open(&agent);
+                self.open_terminal();
+            }
+            ('d', None) => {
+                self.open(&agent);
+                self.toggle_details();
+            }
+            ('f', None) => {
+                self.open(&agent);
+                self.find_in(&agent, "");
+            }
+            ('c', None) => {
+                copy(&agent);
+                self.flash(format!("Copied {agent}"));
+            }
+            _ => {}
+        }
+    }
+
+    fn control_agent(&mut self, agent: String, control: AgentControl, name: &str) {
+        if self.live {
+            self.effects.push(Effect::AgentControl { agent, control });
+            self.flash(format!("{} {name}…", control.verb()));
+        } else {
+            self.flash(format!("{} {name} · demo: nothing was sent", control.verb()));
+        }
+    }
+
     fn act(&mut self, action: char) {
+        if action == 'A' {
+            if let Some((agent, control)) = self.pending_control.take() {
+                let name = agent.trim_start_matches("agent/").to_owned();
+                self.control_agent(agent, control, &name);
+            }
+            return;
+        }
         if action == 's' {
             // Stop the agent's turn: its harness gets Esc, as in its own TUI.
             let Some(agent) = self.selected_id().filter(|_| self.tab == 1) else {
@@ -4420,7 +4569,7 @@ impl Ui {
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
             Hit::NewAgent => self.open_new_agent(None),
-            Hit::Home if self.home_open() => self.close_home(),
+            Hit::Home if self.home_open() && !self.usage_open() => self.close_home(),
             Hit::Home => self.open_home(),
             // The terminal may be on another machine than stui (over SSH or fabric): the
             // clipboard is the person's, so the link lands where their browser is.
@@ -4454,6 +4603,17 @@ impl Ui {
                     glasses.sidebar.section = section;
                     glasses.sidebar.focused = true;
                 }
+            }
+            Hit::Actions(agent) => self.popover = Some(format!("actions:{agent}")),
+            Hit::Key(key)
+                if self
+                    .popover
+                    .as_deref()
+                    .is_some_and(|subject| subject.starts_with("actions:")) =>
+            {
+                let subject = self.popover.take().unwrap_or_default();
+                let agent = subject.trim_start_matches("actions:").to_owned();
+                self.agent_action(agent, key);
             }
             Hit::Key(key) if self.popover.is_some() => {
                 let subject = self.popover.take().unwrap_or_default();
@@ -4815,6 +4975,11 @@ fn scrollbar(buf: &mut Buffer, area: Rect, top: usize, total: usize) {
             .set_symbol(if on { "┃" } else { " " })
             .set_fg(theme::OVERLAY0);
     }
+}
+
+/// Whether conversations are simplified on this device: yes unless it chose the full view.
+fn simplified(prefs: &prefs::Prefs) -> bool {
+    prefs.simple != Some(false)
 }
 
 /// Copy through OSC 52, which kitty, iTerm2, WezTerm and tmux (with set-clipboard) accept.
@@ -5827,6 +5992,13 @@ mod tests {
                 .join("\n")
                 .contains("a reply arrives below")
         );
+    }
+
+    #[test]
+    fn conversations_are_simplified_unless_this_device_chose_the_full_view() {
+        assert!(simplified(&prefs::Prefs::default()));
+        assert!(simplified(&prefs::Prefs { simple: Some(true) }));
+        assert!(!simplified(&prefs::Prefs { simple: Some(false) }));
     }
 
     #[test]

@@ -6,6 +6,11 @@
       "name": "needs you"
     },
     {
+      "glyph": "⚿",
+      "id": "needs_login",
+      "name": "needs login"
+    },
+    {
       "glyph": "✕",
       "id": "fault",
       "name": "broken"

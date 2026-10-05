@@ -6,12 +6,13 @@ const path = require('node:path');
 const ts = require('typescript');
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'st3-ts-client-'));
-for (const name of ['Models.generated', 'Client.generated']) {
+for (const name of ['Models.generated', 'Client.generated', 'fetch-receiver.test']) {
     const source = fs.readFileSync(path.join(__dirname, `${name}.ts`), 'utf8');
-    const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+    const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, rewriteRelativeImportExtensions: true } }).outputText;
     fs.writeFileSync(path.join(temporary, `${name}.js`), output);
 }
 const { St3Client, ClientError, applyWindow } = require(path.join(temporary, 'Client.generated.js'));
+require(path.join(temporary, 'fetch-receiver.test.js'));
 fs.rmSync(temporary, { recursive: true, force: true });
 
 const snapshot = { id: 'snapshot/test', host_id: 'host/test', store_index: 1, projection_version: 'client-projection.v0', created_at: '2026-09-20T00:00:00Z' };
@@ -285,4 +286,19 @@ test('search encodes text, filters, and cursor and preserves result targets', as
     assert.equal(url.searchParams.get('cursor'), 'opaque+/=');
     assert.equal(search.value.items[0].entry_id, 'timeline-entry/note');
     assert.deepEqual(search.value.incomplete_sources, ['session/older: truncation']);
+});
+
+test('reads bounded seat status history through the paired gateway', async () => {
+    const calls = [];
+    const history = { kind: 'status-history', seat: 'agent/cedar', retained_from: '2026-10-04T12:00:00Z', complete: false,
+        items: [{ seat: 'agent/cedar', runtime_incarnation: 'two', state: null, observed_at: '2026-10-04T12:00:00Z', reset: true }] };
+    const client = new St3Client({ baseUrl: 'https://example.test', credential: () => 'proof', fetchImpl: async (url, init) => {
+        calls.push({ url, init });
+        return response(envelope(url.endsWith('/capabilities') ? capabilities : history));
+    } });
+    const result = await client.statusHistoryGet('agent/cedar');
+    assert.equal(calls[1].url, 'https://example.test/v1/client/status-history/agent%2Fcedar');
+    assert.equal(calls[1].init.headers.Authorization, 'Bearer proof');
+    assert.equal(result.value.complete, false);
+    assert.equal(result.value.items[0].reset, true);
 });

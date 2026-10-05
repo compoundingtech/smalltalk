@@ -1,3 +1,4 @@
+import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import {
   effectUtilsBinaryCaches,
   namespaceRunner,
@@ -16,11 +17,13 @@ export const linuxStageRunner = ['nscloud-ubuntu-24.04-amd64-8x16'] as const
 export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-arm64', runId: '${{ github.run_id }}' })
 
 /**
- * ci1, our own CI machine, takes a whole Workspace CI run when it has room for it; Namespace takes
- * every other run. GitHub has no overflow between runner labels, so the `pick-runner` job asks the
+ * ci1, our own CI machine, takes a Workspace CI run when any general runner is idle; Namespace takes
+ * runs when no general runner is available. The other jobs may wait briefly on ci1. GitHub has no
+ * overflow between runner labels, so the `pick-runner` job asks the
  * GitHub API how many ci1 runners are idle before the other jobs start, and their `runs-on` reads its
- * output. Merge-queue runs ask for `ci1-merge`, which a runner reserved for the queue also carries, so
- * queued merges never wait behind pull request pushes.
+ * output. Trusted PRs labelled `ci-priority` use the reserved `ci1-priority` lane.
+ * Merge-queue runs always use the reserved `ci1-merge` label and wait for that pool,
+ * instead of moving to a busy Namespace pool when a reserved runner is occupied.
  *
  * Off unless the repository variable `CI1_RUNNERS` is `on`: then `pick-runner` is skipped, its output
  * is empty and every job runs on Namespace exactly as before. A pull request from a fork never runs on
@@ -28,9 +31,8 @@ export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-a
  */
 export const pickRunnerJobId = 'pick-runner'
 
-/** Jobs a run starts at once (three stages, isolation-vm, genie-freshness).
- * typescript-client follows genie-freshness and reuses its slot. */
-const ci1JobsAtOnce = 5
+/** Start work on available ci1 capacity without requiring room for all five jobs at once. */
+const ci1MinIdle = 1
 
 export const pickRunnerJob = {
   name: pickRunnerJobId,
@@ -38,11 +40,11 @@ export const pickRunnerJob = {
   // GitHub-hosted, so the choice never waits for either pool it chooses between.
   'runs-on': 'ubuntu-latest',
   'timeout-minutes': 3,
-  permissions: {},
+  permissions: { 'pull-requests': 'read' },
   outputs: { ci1: '${{ steps.pick.outputs.ci1 }}' },
   steps: [
     {
-      name: 'Pick ci1 when it has room, else Namespace',
+      name: 'Use reserved ci1 for priority PRs and the queue; available ci1 for PRs',
       id: 'pick',
       env: {
         // A token that may only read the organization's self-hosted runners. Forks never receive it.
@@ -50,8 +52,11 @@ export const pickRunnerJob = {
         EVENT: '${{ github.event_name }}',
         REPOSITORY: '${{ github.repository }}',
         HEAD_REPOSITORY: '${{ github.event.pull_request.head.repo.full_name }}',
+        PR_LABELS: '${{ toJSON(github.event.pull_request.labels.*.name) }}',
+        QUEUE_REF: '${{ github.event.merge_group.head_ref }}',
+        GH_REPO_TOKEN: '${{ github.token }}',
         OWNER: '${{ github.repository_owner }}',
-        NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1JobsAtOnce}' }}`,
+        NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1MinIdle}' }}`,
       },
       run: `namespace() {
   echo "$1: Namespace"
@@ -61,8 +66,27 @@ export const pickRunnerJob = {
 if [ "$EVENT" = pull_request ] && [ "$HEAD_REPOSITORY" != "$REPOSITORY" ]; then
   namespace "a pull request from a fork never runs on ci1"
 fi
+if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_LABELS" >/dev/null 2>&1; then
+  printf 'ci1=["ci1-priority"]\\n' >> "$GITHUB_OUTPUT"
+  echo "priority PR: reserved ci1-priority capacity"
+  printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\\n' >> "$GITHUB_STEP_SUMMARY"
+  exit 0
+fi
+if [ "$EVENT" = merge_group ]; then
+  label=ci1-merge
+  # A queue entry for an urgent PR uses the priority pool too, including when its PR checks passed.
+  if [ -n "$GH_REPO_TOKEN" ] && [[ "$QUEUE_REF" =~ ^refs/heads/gh-readonly-queue/main/pr-([0-9]+)-[0-9a-f]{40}$ ]]; then
+    queue_pr=\${BASH_REMATCH[1]}
+    if labels=$(GH_TOKEN="$GH_REPO_TOKEN" timeout 20s gh api "repos/$REPOSITORY/pulls/$queue_pr" --jq '.labels | map(.name)' 2>/dev/null) && jq -e 'index("ci-priority") != null' <<< "$labels" >/dev/null 2>&1; then
+      label=ci1-priority
+    fi
+  fi
+  printf 'ci1=["%s"]\\n' "$label" >> "$GITHUB_OUTPUT"
+  echo "merge queue: reserved $label runners"
+  printf 'Runner: **ci1** (%s, reserved merge-queue capacity)\\n' "$label" >> "$GITHUB_STEP_SUMMARY"
+  exit 0
+fi
 label=ci1
-[ "$EVENT" = merge_group ] && label=ci1-merge
 [ -n "$GH_TOKEN" ] || namespace "no runner status token"
 [[ "$NEED" =~ ^[1-9][0-9]*$ ]] || namespace "invalid minimum idle runner count"
 if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>&1); then
@@ -103,11 +127,11 @@ export const buildEnv = { CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG
 export const cargoCacheStep = {
   name: 'Restore the Cargo target and registry',
   id: 'cargo-cache',
-  if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
+  if: "env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'",
   uses: 'actions/cache@v4',
   with: {
     path: '${{ github.workspace }}/target\n${{ runner.temp }}/cargo-home/registry\n${{ runner.temp }}/cargo-home/git',
-    key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}",
+    key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config.toml') }}",
     'restore-keys': 'cargo-${{ github.job }}-${{ runner.os }}-',
   },
 } as const
@@ -115,12 +139,12 @@ export const cargoCacheStep = {
 export const nixCacheStep = {
   name: 'Restore the local Nix cache',
   id: 'nix-cache',
-  if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
+  if: "env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'",
   uses: 'actions/cache@v4',
   with: {
     path: '${{ runner.temp }}/st-ci-cache',
-    key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
-    'restore-keys': 'nix4-${{ github.job }}-${{ runner.os }}-',
+    key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
+    'restore-keys': 'nix5-${{ github.job }}-${{ runner.os }}-\nnix4-${{ github.job }}-${{ runner.os }}-',
   },
 } as const
 
@@ -135,14 +159,17 @@ export const commonSetupSteps = [
   // the archives below there would only cost time.
   {
     name: 'Use the runner\'s own caches',
-    run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi',
+    run: `if [ -n "\${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
+printf 'CARGO_HOME=%s\\nCI_CACHE_DIR=%s\\n' "\${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"`,
   },
   // actions/cache is served by Namespace's accelerated cache backend and is keyed, not tied to a node.
   // Namespace cache volumes are per node and replicate in the background, so a job on another node
   // starts empty. /nix itself cannot be cached (see scripts/ci-nix-cache); RUNNER_TEMP/st-ci-cache holds a
   // local Nix binary cache instead. Linux only: the key names the job, so each stage keeps its own.
+  buildSnapshotRestore,
   cargoCacheStep,
   nixCacheStep,
+  buildSnapshotPrepare,
   ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
   {
     name: 'Isolate test home and XDG state',
@@ -155,7 +182,7 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
   },
   {
     name: 'Use the cached Nix outputs',
-    if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
+    if: "env.CI_LOCAL_CACHES != '1'",
     run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"',
   },
 ]
@@ -216,7 +243,7 @@ export const linuxStageJob = ({
   'runs-on': runsOn,
   'timeout-minutes': 120,
   defaults: { run: { shell: 'bash' } },
-  env: { ...buildEnv, ...env },
+  env: { ...buildEnv, ...env, CI_CACHE_DEV_SHELL: 'default' },
   steps: [
     ...setup,
     {
@@ -228,9 +255,10 @@ export const linuxStageJob = ({
     ...after,
     {
       name: 'Save Nix outputs to the local Nix cache',
-      if: 'success()',
+      if: "success() && env.CI_LOCAL_CACHES != '1'",
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
+    ...buildSnapshotSave,
     {
       name: 'Retain stage logs and timings',
       uses: 'actions/upload-artifact@v4',
@@ -250,6 +278,7 @@ export const linuxStageJob = ({
  */
 export const perfStoresCache = (stage: string) => ({
   name: 'Restore the generated stores',
+  if: "env.CI_BUILD_SNAPSHOT_STORES_HIT != '1'",
   uses: 'actions/cache@v4',
   with: {
     path: '${{ runner.temp }}/st-bench',

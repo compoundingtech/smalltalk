@@ -8,6 +8,15 @@ case "$action" in
   *) echo "unknown nextest action: $action" >&2; exit 2 ;;
 esac
 
+# ci1's zpty completion phase is temporarily gated; all other shell assertions remain active.
+if [[ "$action" == run && " $* " != *" --no-run "* && "${GITHUB_ACTIONS:-}" == true && -n "${CI_LOCAL_CARGO_HOME:-}" ]]; then
+  reason='ci1 zsh completion phase temporarily gated; Bash/Fish and Namespace zsh remain checked. https://github.com/compoundingtech/smalltalk/issues/1344'
+  printf '::warning::%s\n' "$reason"
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    printf '### Temporary test gate\n\n%s\n' "$reason" >> "$GITHUB_STEP_SUMMARY"
+  fi
+fi
+
 # Use the same selections for --no-run and execution, on Linux and macOS. Keep both groups
 # running after a test failure, as the ci profile does with fail-fast = false.
 status=0

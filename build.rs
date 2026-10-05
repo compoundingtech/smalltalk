@@ -16,8 +16,15 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=AGENT_SPEC_REVISION");
+    let mut explicit_clean_source = false;
     if let Some(rev) = git(&["rev-parse", "--short", "HEAD"]) {
         let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+        explicit_clean_source = !dirty
+            && std::env::var("AGENT_SPEC_REVISION")
+                .ok()
+                .zip(git(&["rev-parse", "HEAD"]))
+                .is_some_and(|(supplied, head)| supplied == head);
         let commit_ts = git(&["log", "-1", "--format=%ct"])
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
@@ -26,6 +33,14 @@ fn main() {
         let stamp =
             format!(r#"{{"type":"local","rev":"{rev}","commitTs":{commit_ts},"dirty":{dirty}}}"#);
         println!("cargo:rustc-env=ST_BUILD_STAMP_LOCAL={stamp}");
+    }
+    // Performance supplies the real full SHA for a clean checkout. Its value changes
+    // with source identity, while fresh index/ref timestamps do not affect this stamp.
+    // Keep deriving the stamp above from Git, including its real commit time.
+    if explicit_clean_source {
+        println!("cargo:rerun-if-changed=src");
+        println!("cargo:rerun-if-changed=Cargo.toml");
+        return;
     }
     // Rebuild the stamp when HEAD moves or the working tree changes (dirty flag).
     // This build script also stamps st-drivers from its crate directory. Git resolves the

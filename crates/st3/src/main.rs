@@ -50,7 +50,11 @@ use st3_client::{
 };
 use tokio::sync::{Notify, watch};
 
+use clap_complete::engine::ArgValueCompleter;
+use completion::{Complete, Entity, WorkFilter};
+
 mod cli_help;
+mod completion;
 mod presentation;
 
 use presentation::{
@@ -239,12 +243,15 @@ enum Command {
         #[command(subcommand)]
         command: RuleCommand,
     },
+    /// Run any CLI with credentials no seat can read, through the sekrets gateway.
+    Sekrets(st3::sekrets::cli::SekretsArgs),
     /// Discover native harness sessions and move one under durable st ownership.
     Import {
         #[command(subcommand)]
         command: ImportCommand,
     },
-    /// Generate one shell completion script.
+    /// Print one shell's completion stub. On each TAB the stub asks this st executable for
+    /// candidates, including live terminals, agents, missions, and other entities from the daemon.
     Completions(CompletionsArgs),
     /// Answer one built-in gate check, as built-in gates run it: exit 0 to pass, 1 for not yet,
     /// and 3 when the check cannot answer.
@@ -324,6 +331,7 @@ enum FleetInvitesCommand {
         invite: String,
         #[arg(long)]
         reason: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -400,6 +408,7 @@ struct FleetInviteArgs {
     /// Write the code to a new 0600 file instead of printing it.
     #[arg(long)]
     code_file: Option<PathBuf>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -959,6 +968,7 @@ struct FleetRemoveArgs {
     name: String,
     #[arg(long)]
     reason: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -980,6 +990,7 @@ struct FleetLeaveArgs {
     /// How long to wait for a member to hold everything this machine wrote.
     #[arg(long, default_value = "10m")]
     wait: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -1004,6 +1015,7 @@ struct UninstallArgs {
     /// Never touch service managers; the daemon and worker must already be stopped.
     #[arg(long)]
     no_service: bool,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -1660,10 +1672,12 @@ enum MissionViewCommand {
     /// Show one seat's current claim and its queued mission runs in order; same as `st agents queue AGENT`.
     Queued {
         /// Exact seat subject or its identity without the `agent/` prefix.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
         agent: String,
     },
     /// Show one subscription's automatic mission request queue.
     Requests {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Subscription)))]
         subscription: String,
         /// Include started, cancelled, and failed requests.
         #[arg(long)]
@@ -1677,6 +1691,7 @@ enum MissionViewCommand {
 
 #[derive(Args)]
 struct MissionShowArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionOrRun)))]
     mission_or_run: String,
     #[arg(long)]
     follow: bool,
@@ -1686,10 +1701,15 @@ struct MissionShowArgs {
 struct MissionPublishArgs {
     /// KDL file to publish; use `-` to read standard input.
     file: PathBuf,
+    /// Print the resolved publication preview without applying or running exec gates.
+    /// Use `missions check` separately to run the gates.
+    #[arg(long, visible_alias = "preview")]
+    dry_run: bool,
     /// Preview against this exact store index.
     #[arg(long, visible_alias = "at")]
     at_index: Option<u64>,
     /// Complete person or agent subject authoring the publication.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// The workspace a run would use, where publish first checks each exec gate.
@@ -1751,6 +1771,7 @@ enum GateCommand {
 
 #[derive(Args)]
 struct MissionRunStartArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Mission)))]
     mission: String,
     /// Start exactly this published revision, as printed by `missions publish`. A revision
     /// published on another host is awaited briefly while it replicates here.
@@ -1766,9 +1787,11 @@ struct MissionRunStartArgs {
     inputs: Vec<(String, String)>,
     /// Start no work until this mission run completes; fail if it fails or is cancelled.
     #[arg(long, value_name = "RUN")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     after: Option<String>,
     #[arg(long)]
     follow: bool,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// Print the exact mission-run KDL without publishing it.
@@ -1779,11 +1802,13 @@ struct MissionRunStartArgs {
 #[derive(Args)]
 struct MissionCancelArgs {
     /// Exact mission-run subject to cancel.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     mission_run: String,
     /// Why the run is no longer wanted.
     #[arg(long)]
     reason: String,
     /// Person or authorized agent carried over the trusted local Unix boundary.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
@@ -1791,6 +1816,7 @@ struct MissionCancelArgs {
 #[derive(Args)]
 struct MissionOutcomeArgs {
     /// Exact mission-run subject of a finished run.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: false })))]
     mission_run: String,
     /// The outcome the run should show.
     #[arg(value_parser = ["completed", "failed", "cancelled"])]
@@ -1799,6 +1825,7 @@ struct MissionOutcomeArgs {
     #[arg(long)]
     reason: String,
     /// A person, or an agent that requested the run or may revise its mission.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
@@ -1806,8 +1833,10 @@ struct MissionOutcomeArgs {
 #[derive(Args)]
 struct MissionRetireArgs {
     /// Mission to retire, such as `mission/fleet/demo/deploy`.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Mission)))]
     mission: String,
     /// A person, or an agent that may publish the mission.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
@@ -1821,6 +1850,7 @@ struct PlanningStartArgs {
     request: Option<PathBuf>,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     requester: String,
     #[arg(long, value_parser = ["codex", "claude", "pi", "omp", "opencode"])]
@@ -1836,11 +1866,13 @@ struct PlanningStartArgs {
 
 #[derive(Args)]
 struct PlanningSessionArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
 }
 
 #[derive(Args)]
 struct PlanningPreviewArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     #[arg(long)]
     variant: Option<String>,
@@ -1848,6 +1880,7 @@ struct PlanningPreviewArgs {
 
 #[derive(Args)]
 struct PlanningSubmitArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     #[arg(long, default_value = "default")]
     variant: String,
@@ -1855,12 +1888,14 @@ struct PlanningSubmitArgs {
     markdown: PathBuf,
     #[arg(long)]
     kdl: PathBuf,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: String,
 }
 
 #[derive(Args)]
 struct PlanningCompareArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     left: String,
     right: String,
@@ -1868,8 +1903,10 @@ struct PlanningCompareArgs {
 
 #[derive(Args)]
 struct PlanningProposeArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     variant: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
@@ -1878,8 +1915,10 @@ struct PlanningProposeArgs {
 
 #[derive(Args)]
 struct PlanningReviseArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     feedback: PathBuf,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     /// Print the feedback KDL without storing the feedback or publishing it.
@@ -1889,37 +1928,44 @@ struct PlanningReviseArgs {
 
 #[derive(Args)]
 struct PlanningApproveArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     preview_hash: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
 #[derive(Args)]
 struct LaunchApproveAndStartArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     preview_hash: String,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
 #[derive(Args)]
 struct LaunchRunArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
 #[derive(Args)]
 struct LaunchQuestionArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     question: String,
     #[arg(long = "type", value_parser = parse_launch_decision_type)]
@@ -1927,12 +1973,14 @@ struct LaunchQuestionArgs {
     /// Structured JSON option: {"id":"stable-id","label":"Label","description":"optional"}.
     #[arg(long = "option", value_parser = parse_launch_decision_option)]
     options: Vec<LaunchDecisionOption>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: String,
 }
 
 #[derive(Args)]
 struct LaunchAnswerArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     decision: String,
     /// Structured JSON response such as {"type":"multiple-choice","value":["a","b"]}.
@@ -1942,13 +1990,16 @@ struct LaunchAnswerArgs {
     explanation: Option<String>,
     #[arg(long, default_value_t = 1)]
     expected_revision: u32,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
 #[derive(Args)]
 struct PlanningCancelArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     #[arg(long)]
@@ -2014,31 +2065,38 @@ struct PtyNewArgs {
     /// Display name; defaults to a generated name.
     name: Option<String>,
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Host)))]
     host: Option<String>,
     /// Absolute directory on the selected host. Locally defaults to the caller's directory;
     /// remotely defaults to the daemon's directory.
     #[arg(long)]
     cwd: Option<PathBuf>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
 
 #[derive(Args)]
 struct PtySubjectArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
 }
 
 #[derive(Args)]
 struct PtyScreenArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     /// Use this concrete person instead of the person configured for trusted local commands.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
 
 #[derive(Args)]
 struct PtyStreamArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
     /// The stream capability from `terminals attach-info`; can be set through the environment.
@@ -2053,8 +2111,10 @@ struct PtyStreamArgs {
 
 #[derive(Args)]
 struct PtyClientInputArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     value: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
     #[arg(long, conflicts_with = "key")]
@@ -2069,18 +2129,21 @@ struct PtyClientDetachArgs {
     /// Runtime incarnation returned by `terminals attach-info`.
     #[arg(long)]
     incarnation: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
 
 #[derive(Args)]
 struct PtyAttachArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     /// Allow an attachment from inside another PTY session.
     #[arg(long)]
     force: bool,
     /// The person attaching to a terminal another fleet host owns; defaults to `person` in the st
     /// config. A terminal on this host needs no person.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
@@ -2105,6 +2168,7 @@ struct PtyServeFabricArgs {
 
 #[derive(Args)]
 struct PtySendArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     /// Text typed as one line and followed by Enter a moment later; with --raw the exact bytes,
     /// with --key a key name.
@@ -2119,6 +2183,7 @@ struct PtySendArgs {
 
 #[derive(Args)]
 struct PtySignalArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     #[arg(value_parser = ["interrupt", "hangup", "user-1", "user-2"])]
     signal: String,
@@ -2133,6 +2198,7 @@ struct InspectArgs {
 struct TraceArgs {
     subject: Option<String>,
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: false })))]
     owner_run: Option<String>,
     #[arg(long, default_value_t = 100)]
     limit: usize,
@@ -2146,6 +2212,7 @@ struct TraceArgs {
 struct WaitArgs {
     subject: String,
     /// Interrupt the wait for this exact agent's messages or newly ready work.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long = "for", default_value = "ready")]
@@ -2157,9 +2224,11 @@ struct WaitArgs {
 #[derive(Args)]
 struct NowArgs {
     /// Use this concrete person instead of the person configured for trusted local commands.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
     #[arg(long = "as", value_parser = parse_person_subject)]
     person: Option<String>,
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: false })))]
     owner_run: Option<String>,
     /// Include explicitly historical rows in addition to the actionable default.
     #[arg(long)]
@@ -2244,6 +2313,9 @@ struct ActivityArgs {
     all: bool,
 }
 
+/// Observation-only device grant requested by `st devices pair --read-only`.
+const READ_ONLY_PAIRING_SCOPES: &[&str] = &["read.projections", "read.glasses", "terminal.read"];
+
 #[derive(Subcommand)]
 enum DevicesCommand {
     /// List paired devices visible to the authenticated person.
@@ -2254,9 +2326,13 @@ enum DevicesCommand {
         /// Delegate every current client scope to this trusted device.
         #[arg(long)]
         full_control: bool,
+        /// Delegate only observation: projections, glasses frames, and terminal output.
+        #[arg(long, conflicts_with = "full_control")]
+        read_only: bool,
     },
     /// Revoke one paired device.
     Revoke {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Device)))]
         device: String,
         #[arg(long)]
         reason: Option<String>,
@@ -2266,6 +2342,7 @@ enum DevicesCommand {
 #[derive(Args)]
 struct DevicesArgs {
     /// Concrete human authority carried over the trusted local Unix boundary.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
     #[arg(long = "as", value_parser = parse_person_subject, global = true)]
     person: Option<String>,
     /// Include expired and revoked device history.
@@ -2431,6 +2508,7 @@ enum ReplicationCommand {
         replacement_claim: String,
         #[arg(long)]
         reason: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: String,
         #[arg(long)]
@@ -2461,6 +2539,7 @@ enum CheckpointCommand {
         #[arg(long)]
         reason: String,
         /// The person excusing it.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -2471,6 +2550,7 @@ enum CheckpointCommand {
         #[arg(long)]
         reason: String,
         /// The person resuming.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -2486,6 +2566,7 @@ enum BlobCommand {
         #[arg(long)]
         media_type: Option<String>,
         /// Who uploads; defaults to ST_AGENT, then the configured person.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -2500,6 +2581,7 @@ enum BlobCommand {
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Who reads; defaults to ST_AGENT, then the configured person.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -2510,6 +2592,7 @@ enum DocCommand {
     /// Store a regular file as one immutable named document version.
     Put {
         file: PathBuf,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         name: String,
     },
@@ -2545,6 +2628,7 @@ enum RuleCommand {
     },
     /// Set the lockdown rules, each in audit mode until you enforce it.
     Lockdown {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
         /// An agent that may still start agents, such as agent/example/planner. Repeatable.
@@ -2556,6 +2640,7 @@ enum RuleCommand {
         name: String,
         #[arg(value_parser = ["off", "audit", "enforce"])]
         mode: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -2574,10 +2659,15 @@ enum ImportCommand {
         limit: usize,
     },
     /// Show the exact native identity, workspace, process fence, and importability.
-    Show { session: String },
+    Show {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::NativeSession { importable_only: false })))]
+        session: String,
+    },
     /// Stop an exactly identified running harness and resume it in a durable st mission.
     Run {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::NativeSession { importable_only: true })))]
         session: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as", value_parser = parse_actor_subject)]
         person: String,
     },
@@ -2610,11 +2700,14 @@ enum AgentsCommand {
     Tree(AgentsArgs),
     /// Show one exact agent, including its owner and operational annotation.
     Show {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
         subject: String,
         /// Include a historical agent that is absent from the operational default.
         #[arg(long)]
         all: bool,
     },
+    /// Print one seat's declared workspace directory on its owning host, even when stopped.
+    Workspace { subject: String },
     /// Declare one new agent seat, start its harness, and wait until it is ready.
     ///
     /// The declaration is the one a person writes by hand, with the harness defaults of the
@@ -2661,6 +2754,7 @@ enum AgentsCommand {
 
 #[derive(Args)]
 struct AgentHoldArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     subject: String,
     /// Hold new native handoffs for this duration, such as 15m.
     #[arg(long = "for", conflicts_with = "release")]
@@ -2669,12 +2763,14 @@ struct AgentHoldArgs {
     release: bool,
     #[arg(long)]
     reason: Option<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
 
 #[derive(Args)]
 struct AgentRenameArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     subject: String,
     #[arg(
         required_unless_present = "clear",
@@ -2685,6 +2781,7 @@ struct AgentRenameArgs {
     /// Restore the subject-derived presentation label.
     #[arg(long)]
     clear: bool,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -2696,6 +2793,7 @@ struct AgentQueueArgs {
     command: Option<AgentQueueCommand>,
     /// Exact seat subject or its identity without the `agent/` prefix.
     #[arg(required = true)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     agent: Option<String>,
 }
 
@@ -2713,8 +2811,10 @@ enum AgentQueueCommand {
 ))]
 struct AgentQueueMoveArgs {
     /// Exact seat subject or its identity without the `agent/` prefix.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     agent: String,
     /// Queued mission run to move.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     run: String,
     /// Put the run first in the seat's queue.
     #[arg(long)]
@@ -2724,15 +2824,18 @@ struct AgentQueueMoveArgs {
     bottom: bool,
     /// Put the run directly before another queued run.
     #[arg(long, value_name = "RUN")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     before: Option<String>,
     /// Put the run directly after another queued run.
     #[arg(long, value_name = "RUN")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     after: Option<String>,
     /// Why the order changed; recorded with the move.
     #[arg(long)]
     reason: Option<String>,
     /// Person or agent making the move; defaults to `person` in the st config. Any agent may move
     /// any seat's queue, its own included.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_queue_move_actor)]
     actor: Option<String>,
 }
@@ -2747,6 +2850,7 @@ enum LaneCommand {
     /// Show one lane's entries in order and its recent changes.
     Show {
         /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Lane)))]
         lane: String,
     },
     /// Add an entry at the back of a lane. An entry already in the lane stays where it is.
@@ -2764,6 +2868,7 @@ enum LaneCommand {
 #[derive(Args)]
 struct LaneEntryArgs {
     /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Lane)))]
     lane: String,
     /// The entry subject, or the part after the lane's entry prefix, such as a pull request number.
     entry: String,
@@ -2772,6 +2877,7 @@ struct LaneEntryArgs {
     reason: Option<String>,
     /// Person or agent making the change. A harness acts as its own seat (`ST_AGENT`); otherwise
     /// this defaults to `person` in the st config.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_queue_move_actor)]
     actor: Option<String>,
 }
@@ -2811,6 +2917,7 @@ struct LaneMoveArgs {
 #[derive(Args)]
 struct LaneMarkArgs {
     /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Lane)))]
     lane: String,
     /// The entry subject, or the part after the lane's entry prefix.
     entry: String,
@@ -2824,6 +2931,7 @@ struct LaneMarkArgs {
     #[arg(long)]
     head: Option<String>,
     /// Person or agent recording the status. A harness acts as its own seat (`ST_AGENT`).
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_queue_move_actor)]
     actor: Option<String>,
 }
@@ -2980,6 +3088,7 @@ struct AgentApplyArgs {
     /// KDL file to publish; use `-` to read standard input.
     file: PathBuf,
     /// Complete person or agent subject authoring the publication.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
@@ -2995,6 +3104,7 @@ struct AgentStartArgs {
     #[arg(long, value_parser = ["claude", "codex", "pi", "omp", "opencode"])]
     harness: Option<String>,
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Host)))]
     host: Option<String>,
     /// Record permission to start this placement before unreachable source hosts acknowledge exit.
     #[arg(long, conflicts_with = "print_kdl")]
@@ -3011,6 +3121,7 @@ struct AgentStartArgs {
     /// Replace typed-harness extra arguments; refused for existing command/argv seats.
     #[arg(long = "arg")]
     arguments: Vec<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// Read the daemon's declaration and print the effective seat KDL without publishing it.
@@ -3028,6 +3139,7 @@ struct AgentNewArgs {
     name: String,
     /// Fleet host that runs the agent; defaults to this host.
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Host)))]
     host: Option<String>,
     #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "pi", "omp", "opencode"])]
     harness: String,
@@ -3066,6 +3178,7 @@ struct AgentNewArgs {
     #[arg(long, default_value = "10m")]
     timeout: String,
     /// Person or agent publishing the declaration; defaults to `person` in the st config.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: Option<String>,
 }
@@ -3073,7 +3186,9 @@ struct AgentNewArgs {
 #[derive(Args)]
 struct AgentStopArgs {
     /// Exact seat subject or its identity without the `agent/` prefix.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: true })))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// Print the exact stop KDL without publishing it.
@@ -3097,7 +3212,9 @@ struct AgentRolloutArgs {
 struct AgentSuspendArgs {
     /// Exact seat subject or its identity without the `agent/` prefix.
     #[arg(value_parser = parse_agent_start_identity)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: true })))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// Why the seat is suspended, recorded with the request.
@@ -3110,9 +3227,14 @@ struct AgentSuspendArgs {
 
 #[derive(Args)]
 struct AgentResumeArgs {
+    /// Resume the suspended conversation on this fleet host.
+    #[arg(long)]
+    host: Option<String>,
     /// Exact seat subject or its identity without the `agent/` prefix.
     #[arg(value_parser = parse_agent_start_identity)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// How long to wait for the seat to resume its native session.
@@ -3124,7 +3246,9 @@ struct AgentResumeArgs {
 struct AgentRestartArgs {
     /// Exact seat subject or its identity without the `agent/` prefix.
     #[arg(value_parser = parse_agent_start_identity)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// How long to wait for a new running incarnation.
@@ -3240,6 +3364,7 @@ struct ClaimArgs {
 
 #[derive(Args)]
 struct HarnessDiagnosticArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: String,
     #[arg(long)]
@@ -3274,6 +3399,7 @@ enum SchemaCommand {
 #[derive(Args)]
 struct SubscriptionRequestArgs {
     request: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     #[arg(long)]
@@ -3287,6 +3413,7 @@ enum AttentionCommand {
         /// Follow current collection changes.
         #[arg(long, conflicts_with_all = ["all", "cursor"])]
         watch: bool,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
         /// Include resolved and historical attention.
@@ -3300,7 +3427,9 @@ enum AttentionCommand {
     },
     /// Explain one attention item and show the exact available actions.
     Show {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
         subject: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
     },
@@ -3321,6 +3450,7 @@ enum AttentionCommand {
 #[derive(Args)]
 struct AttentionRequestArgs {
     #[arg(long = "for", value_parser = parse_person_subject)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
     reviewer: String,
     #[arg(long)]
     title: String,
@@ -3332,6 +3462,7 @@ struct AttentionRequestArgs {
     /// item on its own.
     #[arg(long = "target")]
     targets: Vec<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
@@ -3342,6 +3473,7 @@ struct AttentionRequestArgs {
     until: Option<String>,
     /// Resolve the item on its own once this step ends, instead of the step you have claimed.
     #[arg(long, value_name = "STEP_RUN")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     step: Option<String>,
     /// Only a person closes the item, because nothing st observes can say it is done.
     #[arg(long, conflicts_with_all = ["until", "step"])]
@@ -3350,26 +3482,37 @@ struct AttentionRequestArgs {
 
 #[derive(Args)]
 struct AttentionResolveArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
     subject: String,
     #[arg(long, value_parser = ["resolved", "dismissed"])]
     outcome: String,
     #[arg(long)]
     reason: Option<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
 #[derive(Args)]
 struct AttentionWithdrawArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
     subject: String,
     #[arg(long)]
     reason: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: String,
 }
 
 #[derive(Subcommand)]
 enum WorkCommand {
+    /// Open a one-step run for this seat without authoring a mission; then use claim.
+    Start(WorkStartArgs),
+    /// Release claimed work to another seat or person with a note they acknowledge.
+    Handoff(WorkHandoffArgs),
+    /// Acknowledge the exact handoff note before claiming or completing its work.
+    Acknowledge(WorkAcknowledgeArgs),
+
     /// Ask a person through a runtime step owned by live work.
     ///
     /// Puts a structured request on the person's home.
@@ -3385,6 +3528,7 @@ enum WorkCommand {
         /// Follow current collection changes.
         #[arg(long, conflicts_with_all = ["all", "cursor", "since", "until", "status"])]
         watch: bool,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
         #[arg(long)]
@@ -3405,22 +3549,31 @@ enum WorkCommand {
         status: Option<String>,
     },
     /// Explain one work item, its owner, readiness, lease, and evidence.
-    Show { subject: String },
+    Show {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
+        subject: String,
+    },
     /// Acquire one ready work item with the current harness incarnation.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Ready))))))]
     Claim(WorkActionArgs),
     /// Extend the live lease for work this incarnation still owns.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Renew(WorkActionArgs),
     /// Record a material progress update without changing ownership.
     ///
     /// Records progress in the graph at no cost to anyone; people read it in stui.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Progress(WorkActionArgs),
     /// Add time to the execution budget of claimed work that ran out of it.
     Extend(WorkExtendArgs),
     /// Finish claimed work and attach its durable evidence.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Complete(WorkActionArgs),
     /// Fail claimed work with an actionable reason and evidence.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Fail(WorkActionArgs),
     /// Give claimed work back so another eligible agent can take it.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Release(WorkActionArgs),
     /// Wake one ready assignee through its supported harness driver.
     Wake(WorkWakeArgs),
@@ -3443,8 +3596,47 @@ enum WorkCommand {
 }
 
 #[derive(Args)]
+struct WorkStartArgs {
+    /// What this spontaneous task is for.
+    title: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    /// Reuse a key after a timeout to recover the same run.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+struct WorkHandoffArgs {
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    #[arg(long, env = "ST3_INCARNATION")]
+    incarnation: Option<String>,
+    #[arg(long)]
+    to: String,
+    #[arg(long)]
+    note: String,
+    #[arg(long)]
+    evidence: Vec<String>,
+    #[arg(long)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+struct WorkAcknowledgeArgs {
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    /// The message ID from the handoff note or work show.
+    #[arg(long)]
+    message: String,
+}
+
+#[derive(Args)]
 struct WorkAskArgs {
     #[arg(long = "for")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
     person: String,
     #[arg(long)]
     title: String,
@@ -3456,9 +3648,11 @@ struct WorkAskArgs {
     #[arg(long, value_name = "FILE", long_help = STRUCTURED_REQUEST_HELP)]
     request: Option<PathBuf>,
     #[arg(long, conflicts_with = "new_run")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     step: Option<String>,
     #[arg(long, conflicts_with = "step")]
     new_run: Option<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", env = "ST_AGENT")]
     actor: String,
     #[arg(long, env = "ST3_INCARNATION")]
@@ -3470,6 +3664,7 @@ struct WorkAskArgs {
 #[derive(Args)]
 struct WorkUpdateArgs {
     #[arg(long = "for")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
     person: String,
     /// Where the person asked for this: their own mission run or step run, or their message to
     /// you. An update about anything else is refused.
@@ -3480,6 +3675,7 @@ struct WorkUpdateArgs {
     /// The information itself.
     #[arg(long)]
     body: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", env = "ST_AGENT")]
     actor: String,
     #[arg(long)]
@@ -3488,7 +3684,9 @@ struct WorkUpdateArgs {
 
 #[derive(Args)]
 struct WorkDoneArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: String,
     /// The response in words. A structured answer derives it when omitted.
@@ -3510,7 +3708,9 @@ struct WorkDoneArgs {
 
 #[derive(Args)]
 struct WorkWakeArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Ready))))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, default_value = "manual wake requested")]
@@ -3519,7 +3719,9 @@ struct WorkWakeArgs {
 
 #[derive(Args)]
 struct WorkRetryArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Failed))))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
@@ -3529,21 +3731,29 @@ struct WorkRetryArgs {
 #[derive(Subcommand)]
 enum WorkRevisionCommand {
     /// Show the current revision proposal for one mission run.
-    Show { run: String },
+    Show {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: false })))]
+        run: String,
+    },
     /// List every immutable generation created for one mission run.
-    Generations { run: String },
+    Generations {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: false })))]
+        run: String,
+    },
     /// Explain one exact generation and its work state.
     Generation { generation: String },
     /// Approve an exact proposal preview and permit its cutover.
     Approve {
         proposal: String,
         preview_hash: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
     /// Cancel a pending revision proposal without changing the live generation.
     Cancel {
         proposal: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
         #[arg(long)]
@@ -3553,7 +3763,9 @@ enum WorkRevisionCommand {
 
 #[derive(Args)]
 struct WorkExtendArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, env = "ST3_INCARNATION")]
@@ -3568,7 +3780,9 @@ struct WorkExtendArgs {
 
 #[derive(Args)]
 struct WorkActionArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, env = "ST3_INCARNATION")]
@@ -3583,8 +3797,10 @@ struct WorkActionArgs {
 
 #[derive(Args)]
 struct WorkReviseArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     run: String,
     file: PathBuf,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
@@ -3596,8 +3812,10 @@ struct WorkReviseArgs {
 
 #[derive(Args)]
 struct WorkPublishMissionArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))]
     subject: String,
     file: PathBuf,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, env = "ST3_INCARNATION")]
@@ -3609,9 +3827,11 @@ enum MessageCommand {
     /// Search readable messages and normalized agent transcripts, newest first.
     Search {
         text: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long)]
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
         agent: Option<String>,
         /// Include entries at or after this RFC3339 timestamp.
         #[arg(long)]
@@ -3641,10 +3861,23 @@ enum MessageCommand {
     Reply(MessageReplyArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
+    /// Archive unread mail past an age threshold as each recipient.
+    Cleanup {
+        #[arg(long, conflicts_with = "actor", required_unless_present = "actor")]
+        all: bool,
+        #[arg(long = "as", conflicts_with = "all", required_unless_present = "all")]
+        actor: Option<String>,
+        #[arg(long, default_value = "1h")]
+        older_than: String,
+        /// Show the matching message IDs without archiving them.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Render the bounded conversation thread around one message.
     Thread(MessageReferenceArgs),
     /// List normalized harness sessions available for native conversation views.
     Sessions {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long)]
@@ -3657,7 +3890,9 @@ enum MessageCommand {
     /// Show one conversation as stui shows it: messages, folded tools, Small Talk. `--raw`
     /// prints every normalized entry (ids, message boundaries, tool JSON); `--json` the page.
     Timeline {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Session)))]
         session: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long, default_value_t = 100)]
@@ -3674,7 +3909,9 @@ enum MessageCommand {
     },
     /// Follow the visible normalized conversation; JSON output is one entry per line.
     Follow {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Session)))]
         session: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long, default_value_t = 100)]
@@ -3686,16 +3923,19 @@ enum MessageCommand {
 
 #[derive(Args)]
 struct MessageSendArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     to: String,
     #[arg(short = 'm', long)]
     body: String,
     #[arg(long)]
     subject: Option<String>,
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     in_reply_to: Option<String>,
     #[arg(long, value_delimiter = ',')]
     tags: Vec<String>,
     #[arg(long = "from", alias = "as")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     from: String,
     /// Attach an image (PNG, JPEG, GIF or WebP, at most 10 MiB, up to 4). It is uploaded to this
     /// member and fetched by the machine that reads or delivers the message.
@@ -3714,8 +3954,10 @@ struct MessageSendArgs {
 #[derive(Args)]
 struct MessageListArgs {
     /// Mailbox identity; defaults to the non-empty ST_AGENT value.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     identity: Option<String>,
     /// The same mailbox identity, spelled like `conversations read --as`.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", conflicts_with = "identity")]
     actor: Option<String>,
     #[arg(long)]
@@ -3723,29 +3965,34 @@ struct MessageListArgs {
     #[arg(long)]
     count: bool,
     #[arg(long = "from")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     sender: Option<String>,
 }
 
 #[derive(Args)]
 struct MessageReadArgs {
     #[arg(num_args = 1..)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     references: Vec<String>,
     #[arg(long)]
     raw: bool,
     #[arg(long)]
     archive: bool,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
 
 #[derive(Args)]
 struct MessageReplyArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     reference: String,
     #[arg(short = 'm', long)]
     body: String,
     #[arg(long)]
     subject: Option<String>,
     #[arg(long = "from", alias = "as")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     from: String,
     /// Attach an image (PNG, JPEG, GIF or WebP, at most 10 MiB, up to 4).
     #[arg(long = "attach", value_name = "FILE")]
@@ -3762,13 +4009,16 @@ struct MessageReplyArgs {
 #[derive(Args)]
 struct MessageArchiveArgs {
     #[arg(num_args = 1..)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     references: Vec<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
 
 #[derive(Args)]
 struct MessageReferenceArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     reference: String,
     #[arg(long)]
     tree: bool,
@@ -3790,6 +4040,7 @@ struct ReviewArgs {
     target: String,
     #[arg(long)]
     reason: Option<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
@@ -3801,6 +4052,7 @@ struct FeedbackReviewArgs {
     target: String,
     #[arg(long)]
     reason: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
@@ -3867,6 +4119,9 @@ fn main() -> ExitCode {
     }
     // What `st clients` lists for this process: its name and build, as reported.
     st3_client::set_client_name(format!("st {}", st_drivers::version::machine_version()));
+    // A shell stub from `st completions` calls back with `COMPLETE=<shell>` on each TAB. Answer
+    // before any config, runtime, or daemon work; this exits when the variable is set.
+    clap_complete::env::CompleteEnv::with_factory(Cli::command).complete();
     // A seat process asks a replacement binary which resume formats it reads before executing it.
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(st_drivers::reexec::PROBE_SUBCOMMAND))
@@ -4203,6 +4458,13 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Skill(args) = cli.command {
         return run_skill(args);
     }
+    // The gateway runs as the sekrets user, which has no st configuration.
+    if let Command::Sekrets(args) = cli.command {
+        let code = st3::sekrets::cli::run(args, cli.json).await?;
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
     if let Command::ReplicationWorker(args) = cli.command {
         let mut config = Config::load_unvalidated(args.config.as_deref())?;
         if let Some(value) = args.node {
@@ -4248,6 +4510,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Sets { command } => run_owned_sets(&endpoint, command, cli.json).await,
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
+        Command::Sekrets(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
         Command::Usage(args) => run_usage(&immediate, args, cli.json).await,
@@ -4380,11 +4643,20 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Import { command } => run_import(&endpoint, command, cli.json).await,
         Command::Completions(args) => {
             let shell = match args.shell {
-                CompletionShell::Bash => clap_complete::Shell::Bash,
-                CompletionShell::Zsh => clap_complete::Shell::Zsh,
-                CompletionShell::Fish => clap_complete::Shell::Fish,
+                CompletionShell::Bash => "bash",
+                CompletionShell::Zsh => "zsh",
+                CompletionShell::Fish => "fish",
             };
-            clap_complete::generate(shell, &mut Cli::command(), "st", &mut std::io::stdout());
+            clap_complete::env::Shells::builtins()
+                .completer(shell)
+                .context("clap_complete lacks a built-in shell")?
+                .write_registration(
+                    "COMPLETE",
+                    "st",
+                    "st",
+                    "st",
+                    &mut std::io::stdout(),
+                )?;
             Ok(())
         }
         Command::Driver(args) => run_driver(&immediate, args, cli.catalog.as_deref()).await,
@@ -4487,6 +4759,9 @@ fn guard_mutating_cli_actor(
             _ => None,
         },
         Command::Work { command } => match command {
+            WorkCommand::Start(args) => Some(args.actor.as_str()),
+            WorkCommand::Handoff(args) => Some(args.actor.as_str()),
+            WorkCommand::Acknowledge(args) => Some(args.actor.as_str()),
             WorkCommand::Claim(args) | WorkCommand::Renew(args) | WorkCommand::Progress(args)
             | WorkCommand::Complete(args) | WorkCommand::Fail(args) | WorkCommand::Release(args) => args.actor.as_deref(),
             WorkCommand::Wake(args) => args.actor.as_deref(),
@@ -4991,6 +5266,16 @@ async fn run_up(args: UpArgs) -> Result<()> {
         None => st_runtime::resolve_executable("pty", &login_environment)?,
     };
     let recorder = install_recorder(&config, &login_environment);
+    if let Some(person) = &config.person {
+        let _ = st3::sekrets::daemon::PERSON.set(person.clone());
+    }
+    // Sekrets is opt-in: this records a gateway's calls once one listens on this host.
+    st3::sekrets::daemon::spawn_importer(
+        store.clone(),
+        config.node.clone(),
+        config.state_dir.clone(),
+        st3::sekrets::client::socket_path(),
+    );
     let state = AppState {
         store: store.clone(),
         notify: notify.clone(),
@@ -5017,7 +5302,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         notify.clone(),
         event_notify.clone(),
         recorder.map(|installation| installation.directory),
-    )?.with_schedule_peers(state.configured_peers.clone()));
+    )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()));
     tokio::spawn(reconciler.supervise());
     // A start no longer rebuilds the operation projection; check it once the API serves.
     tokio::spawn({
@@ -5698,11 +5983,17 @@ async fn publish_mission_file(
             },
         )
         .await?;
+    if args.dry_run {
+        print_value(&mission, json_output)?;
+    }
     anyhow::ensure!(
         mission.blockers.is_empty(),
         "{}",
         mission.blockers.join("; ")
     );
+    if args.dry_run {
+        return Ok(());
+    }
     warn_ignored_authority(&mission);
     if !args.no_gate_check {
         check_before_publish(client, &intent, &args.workspace).await?;
@@ -5897,7 +6188,16 @@ async fn cancel_mission_run(
     args: MissionCancelArgs,
     json_output: bool,
 ) -> Result<()> {
-    let subject = normalize_member_subject(&args.mission_run, "mission-run");
+    let subject = resolve_member_subject(
+        endpoint,
+        &args.mission_run,
+        "mission-run",
+        Entity::MissionRun {
+            unfinished_only: true,
+        },
+        completion::Matching::Exact,
+    )
+    .await?;
     let run: MissionRunView = client
         .get(&format!(
             "/v1/mission-runs/{}",
@@ -6523,15 +6823,40 @@ async fn run_pty(
             )
         }
         PtyCommand::Attach(args) => {
-            let subject = normalize_member_subject(&args.subject, "pty");
+            let budget = (!args.subject.contains('/'))
+                .then(|| tokio::time::Instant::now() + LOCAL_ATTACH_CONSULT);
+            let resolution = resolve_member_subject(
+                endpoint,
+                &args.subject,
+                "pty",
+                Entity::Terminal,
+                completion::Matching::Fuzzy,
+            );
+            let subject = if let Some(deadline) = budget {
+                tokio::time::timeout_at(deadline, resolution)
+                    .await
+                    .context("st terminals attach: short-name resolution did not answer within 1 s; name the full subject to attach without the daemon")??
+            } else {
+                resolution.await?
+            };
             let person = args.person.as_deref().or(configured_person);
-            attach_terminal(client, endpoint, pty_root, person, &subject, args.force).await
+            attach_terminal(
+                client, endpoint, pty_root, person, &subject, args.force, budget,
+            )
+            .await
         }
         PtyCommand::ExposeFabric(_) | PtyCommand::ServeFabric(_) => {
             unreachable!("handled before any daemon client")
         }
         PtyCommand::Peek(args) => {
-            let subject = normalize_member_subject(&args.subject, "pty");
+            let subject = resolve_member_subject(
+                endpoint,
+                &args.subject,
+                "pty",
+                Entity::Terminal,
+                completion::Matching::Fuzzy,
+            )
+            .await?;
             let screen: SessionScreen = client
                 .get(&format!(
                     "/v1/sessions/screen/{}",
@@ -6684,7 +7009,14 @@ async fn run_pty(
             print_client_value(&response, json_output)
         }
         PtyCommand::Send(args) => {
-            let subject = normalize_member_subject(&args.subject, "pty");
+            let subject = resolve_member_subject(
+                endpoint,
+                &args.subject,
+                "pty",
+                Entity::Terminal,
+                completion::Matching::Exact,
+            )
+            .await?;
             let incarnation = session_incarnation(client, &subject).await?;
             let mode = if args.raw {
                 SessionInputMode::Raw
@@ -6712,7 +7044,14 @@ async fn run_pty(
             print_value(&response, json_output)
         }
         PtyCommand::Signal(args) => {
-            let subject = normalize_member_subject(&args.subject, "pty");
+            let subject = resolve_member_subject(
+                endpoint,
+                &args.subject,
+                "pty",
+                Entity::Terminal,
+                completion::Matching::Exact,
+            )
+            .await?;
             let response: SessionControlResponse = client
                 .post(
                     &format!("/v1/sessions/{}/signal", urlencoding::encode(&subject)),
@@ -6774,6 +7113,7 @@ async fn attach_terminal(
     person: Option<&str>,
     subject: &str,
     force: bool,
+    budget: Option<tokio::time::Instant>,
 ) -> Result<()> {
     if !force
         && let Ok(outer) = std::env::var("PTY_SESSION")
@@ -6791,7 +7131,8 @@ async fn attach_terminal(
         .filter(|(_, sessions)| !sessions.is_empty());
     let daemon = format!("st daemon at {}", endpoint_label(endpoint));
     let mut consult = std::pin::pin!(consult_attach(client, subject));
-    let answer = match tokio::time::timeout(LOCAL_ATTACH_CONSULT, consult.as_mut()).await {
+    let deadline = budget.unwrap_or_else(|| tokio::time::Instant::now() + LOCAL_ATTACH_CONSULT);
+    let answer = match tokio::time::timeout_at(deadline, consult.as_mut()).await {
         Ok(answer) => answer,
         Err(_) => match (&local, pty_root) {
             (Some((root, sessions)), _) => {
@@ -6801,6 +7142,9 @@ async fn attach_terminal(
                 );
                 let code = attach_unconsulted(root, subject, sessions, &waited).await?;
                 return terminal_exit(code);
+            }
+            (None, _) if budget.is_some() => {
+                anyhow::bail!("st terminals attach: daemon did not answer within 1 s and no local PTY session matches `{subject}`");
             }
             (None, Some(root)) => {
                 eprintln!(
@@ -7396,6 +7740,7 @@ async fn run_devices(
         DevicesCommand::Pair {
             device_name,
             full_control,
+            read_only,
         } => {
             let response = client
                 .pairing_begin(&PairingBegin {
@@ -7403,6 +7748,12 @@ async fn run_devices(
                     device_name,
                     person_id: person.clone(),
                     full_control: full_control.then_some(true),
+                    scopes: read_only.then(|| {
+                        READ_ONLY_PAIRING_SCOPES
+                            .iter()
+                            .map(|scope| (*scope).to_owned())
+                            .collect()
+                    }),
                 })
                 .await?;
             print_client_value(&response, json_output)?;
@@ -10041,6 +10392,54 @@ async fn session_incarnation(client: &Client, subject: &str) -> Result<String> {
         .with_context(|| format!("subject `{subject}` has no live incarnation"))
 }
 
+/// Resolves against all subjects of the kind. Destructive verbs use exact matching only;
+/// navigation permits the fuzzy ladder. Unreachable lists retain the literal interpretation.
+async fn resolve_member_subject(
+    endpoint: &Endpoint,
+    subject: &str,
+    namespace: &str,
+    entity: Entity,
+    matching: completion::Matching,
+) -> Result<String> {
+    let literal = normalize_member_subject(subject, namespace);
+    if subject.contains('/') {
+        return Ok(literal);
+    }
+    let Endpoint::Unix(socket) = endpoint else {
+        return Ok(literal);
+    };
+    let discovered = completion::LocalTarget::discover(&[]);
+    let target = completion::LocalTarget {
+        socket: socket.clone(),
+        caller: discovered.as_ref().and_then(|target| target.caller.clone()),
+        person: discovered.and_then(|target| target.person),
+    };
+    let listed = tokio::time::timeout(
+        completion::RESOLVE_DEADLINE,
+        completion::resolution_candidates(&target, entity),
+    )
+    .await;
+    let Ok(Ok(candidates)) = listed else {
+        return Ok(literal);
+    };
+    match completion::resolve(subject, namespace, &candidates, matching) {
+        completion::Resolution::Subject(subject) => Ok(subject),
+        completion::Resolution::Unmatched => Ok(literal),
+        completion::Resolution::Ambiguous(matches) => {
+            let listing = matches
+                .iter()
+                .map(|candidate| format!("  {}  {}", candidate.subject, candidate.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+            eprintln!(
+                "st: `{subject}` matches {} subjects; name one exactly:\n{listing}",
+                matches.len()
+            );
+            Err(CommandExit(2).into())
+        }
+    }
+}
+
 fn normalize_member_subject(subject: &str, namespace: &str) -> String {
     // Product terminal IDs include the resource prefix; the private PTY routes and registry
     // tags name their underlying member. `terminals new` returns the public form.
@@ -10723,6 +11122,16 @@ async fn run_agents(
             }
             Ok(())
         }
+        AgentsCommand::Workspace { subject } => {
+            let response = generated_client(endpoint, None)?
+                .agent_workspace_get(&normalize_agent_subject(&subject))
+                .await?;
+            if json_output {
+                return print_value(&response, true);
+            }
+            println!("{}", response.value.workspace);
+            Ok(())
+        }
         AgentsCommand::Apply(args) => {
             let client = cli_client(endpoint);
             let (kdl, source_name) = read_intent(Some(&args.file))?;
@@ -10824,6 +11233,7 @@ async fn run_agents(
                 &subject,
                 &args.actor,
                 args.reason.as_deref(),
+                None,
                 &args.timeout,
             )
             .await?;
@@ -10851,6 +11261,7 @@ async fn run_agents(
                 &subject,
                 &args.actor,
                 None,
+                args.host.as_deref(),
                 &args.timeout,
             )
             .await?;
@@ -10998,7 +11409,14 @@ async fn run_agents(
             }
         }
         AgentsCommand::Stop(args) => {
-            let subject = normalize_member_subject(&args.subject, "agent");
+            let subject = resolve_member_subject(
+                endpoint,
+                &args.subject,
+                "agent",
+                Entity::Agent { running_only: true },
+                completion::Matching::Exact,
+            )
+            .await?;
             let kdl = publication_document(kdl_node("stop", [subject.as_str()]));
             if args.print_kdl {
                 print!("{kdl}");
@@ -11469,7 +11887,7 @@ async fn run_agent_new(
     }
     if args.attach {
         // The daemon has just answered for the new agent, so there is no registry fallback to name.
-        attach_terminal(&client, endpoint, None, person, &subject, false).await?;
+        attach_terminal(&client, endpoint, None, person, &subject, false, None).await?;
     }
     Ok(())
 }
@@ -11622,7 +12040,7 @@ async fn run_agent_inspection(
                 format!("agent/{subject}")
             };
             let response = generated_client(endpoint, None)?
-                .agents_get(&subject)
+                .agents_get_with_history(&subject, all)
                 .await
                 .with_context(|| {
                     if all {
@@ -11657,6 +12075,7 @@ async fn run_agent_inspection(
             return Ok(());
         }
         AgentsCommand::New(_)
+        | AgentsCommand::Workspace { .. }
         | AgentsCommand::Repos { .. }
         | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
@@ -13083,7 +13502,14 @@ async fn run_attention(
         }
         AttentionCommand::Show { subject, actor } => {
             let actor = configured_human(actor.as_deref(), configured_person, "attention")?;
-            let normalized = normalize_member_subject(&subject, "attention");
+            let normalized = resolve_member_subject(
+                endpoint,
+                &subject,
+                "attention",
+                Entity::Attention,
+                completion::Matching::Fuzzy,
+            )
+            .await?;
             let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
             let item = client
                 .get::<Vec<AttentionItemView>>(&path)
@@ -13282,6 +13708,69 @@ async fn run_work(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        WorkCommand::Start(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let response: StepRunView = client
+                .post(
+                    "/v1/work/start",
+                    &st3::model::WorkStartRequest {
+                        actor: args.actor.clone(),
+                        title: args.title,
+                        idempotency_key: args
+                            .idempotency_key
+                            .unwrap_or_else(|| format!("work-start:{}", uuid::Uuid::now_v7())),
+                    },
+                )
+                .await?;
+            if json_output {
+                print_value(&response, true)
+            } else {
+                println!(
+                    "{}\t{}\nClaim: st work claim {} --as {}",
+                    response.status, response.subject, response.subject, args.actor
+                );
+                Ok(())
+            }
+        }
+        WorkCommand::Handoff(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let incarnation = match args.incarnation {
+                Some(value) => Some(value),
+                None => current_agent_incarnation(client, &args.actor).await?,
+            };
+            let response: StepRunView = client
+                .post(
+                    &format!("/v1/work/handoff/{}", urlencoding::encode(&args.subject)),
+                    &st3::model::WorkHandoffRequest {
+                        actor: args.actor,
+                        incarnation,
+                        to: args.to,
+                        note: args.note,
+                        evidence: args.evidence,
+                        idempotency_key: args
+                            .idempotency_key
+                            .unwrap_or_else(|| format!("work-handoff:{}", uuid::Uuid::now_v7())),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+        WorkCommand::Acknowledge(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let response: StepRunView = client
+                .post(
+                    &format!(
+                        "/v1/work/acknowledge/{}",
+                        urlencoding::encode(&args.subject)
+                    ),
+                    &st3::model::WorkAcknowledgeRequest {
+                        actor: args.actor,
+                        message: args.message,
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
         WorkCommand::Ask(args) => {
             reject_foreign_agent_actor(&args.actor)?;
             let request = args
@@ -14222,6 +14711,31 @@ async fn run_message(
                 return Ok(());
             };
             print_message_receipt(&receipt, json_output)
+        }
+        MessageCommand::Cleanup { all, actor, older_than, dry_run } => {
+            if let Some(actor) = actor.as_deref() {
+                reject_foreign_agent_actor(actor)?;
+            }
+            let older_than_ms = st3::graph::parse_duration(&older_than, true)?;
+            let result: Value = client
+                .post("/v1/messages/cleanup", &json!({
+                    "older_than_ms": older_than_ms, "to": actor, "all": all, "dry_run": dry_run,
+                }))
+                .await?;
+            sync_message_projection(client).await?;
+            if json_output {
+                print_value(&result, true)
+            } else {
+                println!("{} {} unread messages older than {}", if dry_run { "Would archive" } else { "Archived" }, result["count"], older_than);
+                if dry_run {
+                    for id in result["messages"].as_array().into_iter().flatten() {
+                        if let Some(id) = id.as_str() {
+                            println!("{id}");
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
         MessageCommand::Archive(args) => {
             let actor = args
@@ -15240,6 +15754,9 @@ async fn run_st2_native_driver(
     };
     // A resumed seat relaunches its harness on the session it suspended on, or not at all. Any
     // other relaunch continues the seat's last session when the harness can, or starts anew.
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    let mut selected_session = None;
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     let argv = if let Some(session) = st3::native_resume::requested() {
         if driver == "claude" {
             let path = std::env::var_os(st3::rollout::RESUME_PATH_ENV).map(PathBuf::from);
@@ -15260,7 +15777,12 @@ async fn run_st2_native_driver(
             }
         }
         match select(argv, &session)? {
-            Ok(argv) => argv,
+            Ok(argv) => {
+                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                selected_session = Some(session);
+                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+                argv
+            }
             Err(refusal) => {
                 return Err(
                     refuse_native_resume(client, subject, &incarnation, driver, refusal).await,
@@ -15278,7 +15800,12 @@ async fn run_st2_native_driver(
             );
         }
         match select(argv.clone(), &session)? {
-            Ok(argv) => argv,
+            Ok(argv) => {
+                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                selected_session = Some(session);
+                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+                argv
+            }
             Err(refusal) => {
                 skip_native_continue(client, subject, &incarnation, driver, &session, refusal)
                     .await;
@@ -15288,6 +15815,32 @@ async fn run_st2_native_driver(
     } else {
         argv
     };
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    let mut provider_environment = Vec::new();
+    if driver == "omp" {
+        let sessions = paths.session_dir.join("provider-sessions");
+        if let Some(tool_call_id) =
+            st3::omp_ask_resume::pending_for_selected(&sessions, selected_session.as_deref())
+        {
+            // Fail open: bridge I/O or diagnostics must never prevent native continuation.
+            match st3::omp_ask_resume::heal(
+                &argv[0],
+                &sessions,
+                selected_session.as_deref().expect("pending ask has a selected session"),
+            )
+            .await
+            {
+                Ok(output) => {
+                    let _ = write_driver_log(subject, &output);
+                    provider_environment.push(("ST3_OMP_PENDING_ASK".into(), tool_call_id));
+                }
+                Err(error) => {
+                    let _ = write_driver_log(subject, &json!({"type":"omp_pending_ask_heal_failed","error":format!("{error:#}")}).to_string());
+                }
+            }
+        }
+    }
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     if driver == "opencode" {
         // The predecessor's bound session is not this launch's, and the driver reports this file.
         let _ = fs::remove_file(
@@ -15303,7 +15856,16 @@ async fn run_st2_native_driver(
         predecessor_harness_record: fs::read(&harness_state_path).ok(),
         ..NativeLoopState::default()
     };
-    let task = spawn_st2_provider(driver, &paths, ProviderStart::Launch(argv));
+    let task = spawn_st2_provider(
+        driver,
+        &paths,
+        ProviderStart::Launch(
+            argv,
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            provider_environment,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        ),
+    );
     drive_st2_native(
         client,
         subject,
@@ -15423,7 +15985,12 @@ impl NativePaths {
 }
 
 enum ProviderStart {
-    Launch(Vec<String>),
+    Launch(
+        Vec<String>,
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+        Vec<(String, String)>,
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+    ),
     Adopt(st_drivers::provider_session::DetachedSession),
 }
 
@@ -15439,7 +16006,12 @@ fn spawn_st2_provider(
         st_drivers::push_mailbox::register(&paths.agent_dir);
     }
     tokio::task::spawn_blocking(move || match start {
-        ProviderStart::Launch(argv) => match driver.as_str() {
+        ProviderStart::Launch(
+            argv,
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            environment,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        ) => match driver.as_str() {
             "claude" => st_drivers::claude_session::run_controlled_paths(
                 &paths.resolved(),
                 paths.identity,
@@ -15457,6 +16029,9 @@ fn spawn_st2_provider(
                 paths.identity,
                 paths.runtime_id,
                 argv,
+                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                &environment,
+                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
             ),
             "opencode" => st_drivers::opencode_session::run_with_paths(
                 &paths.resolved(),
@@ -17227,12 +17802,18 @@ fn accept_managed_channel_frame(
     state: &mut PiChannelResume,
     observer: &mut Option<st_drivers::pi_channel::EventObserver>,
     line: &str,
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    subject: &str,
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 ) -> Result<bool> {
     if let Ok(frame) = serde_json::from_str::<Value>(line) {
         let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("unknown");
         let handled = match frame_type {
             "state" | "session" | "ready" | "delivered" | "read" | "failed" | "todo" => true,
             "timeline" | "context" | "turn" => observer.is_some(),
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            "delivery_ready" | "retry_pending_ask" | "diagnostic" => true,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
             _ => false,
         };
         if !handled {
@@ -17250,6 +17831,9 @@ fn accept_managed_channel_frame(
             }
         }
     }
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    state.apply_ask_bridge_frame(subject, line);
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     let publish = state.accept_frame(line);
     if observer.is_some() {
         state.pending.state = None;
@@ -17539,7 +18123,12 @@ async fn run_pi_channel(
                     Some(st_drivers::reexec::StdinChunk::Bytes(bytes)) => {
                         state.lines.push(&bytes);
                         while let Some(line) = state.lines.next_line() {
-                            match accept_managed_channel_frame(&mut state, &mut observer, &line) {
+                            match accept_managed_channel_frame(
+                                &mut state, &mut observer, &line,
+                                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                                subject,
+                                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+                            ) {
                                 Ok(changed) => publish |= changed,
                                 Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
                             }
@@ -17548,7 +18137,12 @@ async fn run_pi_channel(
                     // The extension ends the pipe when its session ends.
                     Some(st_drivers::reexec::StdinChunk::Eof) | None => {
                         if let Some(line) = state.lines.finish()
-                            && accept_managed_channel_frame(&mut state, &mut observer, &line)?
+                            && accept_managed_channel_frame(
+                                &mut state, &mut observer, &line,
+                                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                                subject,
+                                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+                            )?
                         {
                             let _ = state
                                 .pending
@@ -17739,7 +18333,12 @@ async fn run_pi_channel(
                         }
                     }
                     while let Some(line) = state.lines.next_line() {
-                        publish |= accept_managed_channel_frame(&mut state, &mut observer, &line)?;
+                        publish |= accept_managed_channel_frame(
+                            &mut state, &mut observer, &line,
+                            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                            subject,
+                            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+                        )?;
                     }
                     if publish {
                         let _ = state
@@ -17843,6 +18442,10 @@ struct PiChannelResume {
     // harness's latest state, so each waits here and is sent again on the next tick.
     pending: PiFamilyReports,
     lines: st_drivers::reexec::LineBuffer,
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    #[serde(default)]
+    pending_ask_retry_sent: bool,
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 }
 
 impl PiChannelResume {
@@ -17856,6 +18459,40 @@ impl PiChannelResume {
         Ok(())
     }
 
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    fn take_pending_ask_retry(&mut self, frame: &Value, expected: Option<&str>) -> Option<String> {
+        let id = frame["toolCallId"].as_str()?;
+        if frame["type"] != "retry_pending_ask"
+            || self.pending_ask_retry_sent
+            || expected != Some(id)
+        {
+            return None;
+        }
+        self.pending_ask_retry_sent = true;
+        Some(id.to_owned())
+    }
+
+    fn apply_ask_bridge_frame(&mut self, subject: &str, line: &str) {
+        let Ok(frame) = serde_json::from_str::<Value>(line) else { return };
+        let expected = std::env::var("ST3_OMP_PENDING_ASK").ok();
+        if let Some(id) = self.take_pending_ask_retry(&frame, expected.as_deref()) {
+            let sent = (|| -> Result<()> {
+                let root = std::env::var_os("PTY_ROOT").context("pending ask retry has no PTY_ROOT")?;
+                let session = std::env::var("PTY_SESSION").context("pending ask retry has no PTY_SESSION")?;
+                st_runtime::PtyRuntime::new(root.into()).send_raw_if(&session, b"\x1b[15~", None)?;
+                Ok(())
+            })();
+            let record = match sent {
+                Ok(()) => json!({"type":"omp_pending_ask_retry","toolCallId":id}),
+                Err(error) => json!({"type":"omp_pending_ask_retry_failed","toolCallId":id,"error":format!("{error:#}")}),
+            };
+            let _ = write_driver_log(subject, &record.to_string());
+        }
+        if frame["type"] == "diagnostic" {
+            let _ = write_driver_log(subject, &frame.to_string());
+        }
+    }
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     /// Apply one frame from the extension. Returns whether it left a report to publish.
     fn accept_frame(&mut self, line: &str) -> bool {
         let Ok(frame) = serde_json::from_str::<Value>(line) else {
@@ -17874,6 +18511,13 @@ impl PiChannelResume {
                 }
                 true
             }
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            Some("delivery_ready") => {
+                // Delivery readiness is independent of the reopened picker's human-blocked state.
+                self.first_idle_seen = true;
+                false
+            }
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
             Some("state") => {
                 let Some(state) = frame.get("state").and_then(Value::as_str) else {
                     return false;
@@ -18333,7 +18977,12 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
         subject,
         argv,
         incarnation,
-        ProviderStart::Launch(Vec::new()),
+        ProviderStart::Launch(
+            Vec::new(),
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            Vec::new(),
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        ),
         NativeLoopState::default(),
     )
     .await
@@ -18358,7 +19007,12 @@ fn spawn_codex_provider(
     tokio::task::spawn_blocking(move || match start {
         // A resumed seat's launch environment names the thread it suspended on, and any other
         // relaunch the thread it continues.
-        ProviderStart::Launch(_) => {
+        ProviderStart::Launch(
+            _,
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            _,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        ) => {
             let thread = st3::native_resume::requested().or_else(|| codex_continued_thread(&argv));
             st_drivers::codex_app_server::run_controlled_paths(
                 &paths.driver_root,
@@ -18407,12 +19061,22 @@ async fn drive_codex_native(
     start: ProviderStart,
     mut loop_state: NativeLoopState,
 ) -> Result<()> {
-    let mut paths = if matches!(start, ProviderStart::Launch(_)) {
+    let mut paths = if matches!(start, ProviderStart::Launch(
+        _,
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+        _,
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+    )) {
         NativePaths::prepare(subject, "codex")?
     } else {
         NativePaths::resumed(subject, "codex", loop_state.paths.clone())?
     };
-    if matches!(start, ProviderStart::Launch(_)) {
+    if matches!(start, ProviderStart::Launch(
+        _,
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+        _,
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+    )) {
         st_drivers::harness_events::enable(&paths.agent_dir, &incarnation)?;
     }
     loop_state.paths = Some(paths.resolved());
@@ -18425,7 +19089,12 @@ async fn drive_codex_native(
     let root = paths.state_root();
     let state_dir = paths.session_dir.clone();
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
-    if matches!(start, ProviderStart::Launch(_)) {
+    if matches!(start, ProviderStart::Launch(
+        _,
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+        _,
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+    )) {
         // The path can still hold the predecessor's terminal record. It is the predecessor's, never
         // this incarnation's: only a byte change after this point is the new wrapper's claim.
         loop_state.predecessor_harness_record = fs::read(&harness_state_path).ok();
@@ -18446,7 +19115,12 @@ async fn drive_codex_native(
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
     // The thread this launch continues; a refusal of it ends the wrapper before it binds.
-    let continued = matches!(start, ProviderStart::Launch(_))
+    let continued = matches!(start, ProviderStart::Launch(
+        _,
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+        _,
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+    ))
         .then(|| codex_continued_thread(&argv))
         .flatten();
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
@@ -19036,6 +19710,7 @@ async fn request_suspension(
     subject: &str,
     actor: &str,
     reason: Option<&str>,
+    host: Option<&str>,
     timeout_text: &str,
 ) -> Result<st3_client::Agent> {
     let timeout = st3::graph::parse_duration(timeout_text, false)?;
@@ -19047,6 +19722,7 @@ async fn request_suspension(
                 "subject": subject,
                 "actor": actor,
                 "reason": reason,
+                "host": host,
                 "idempotency_key": uuid::Uuid::now_v7().to_string(),
             }),
         )
@@ -20045,12 +20721,18 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
         let policy = policy.clone();
         match tokio::task::spawn_blocking(move || {
             st3::profile::task("task enforce-account-limits", || {
-                pass.enforce_account_limits(&policy, now_ms())
+                let now = now_ms();
+                let check = pass.account_limits_check(now, policy.fresh_ms)?;
+                let outcome = pass.enforce_account_limits(&policy, now)?;
+                Ok::<_, anyhow::Error>((outcome, check))
             })
         })
         .await
         {
-            Ok(Ok(outcome)) => {
+            Ok(Ok((outcome, check))) => {
+                if check.status == "warn" {
+                    eprintln!("st3: limits policy: {}", check.message);
+                }
                 for seat in outcome.stopped {
                     eprintln!("st3: limits policy stopped {seat}");
                 }
@@ -20205,6 +20887,36 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    #[test]
+    fn omp_pending_ask_retry_is_bound_to_the_expected_call_and_sent_once_across_reexec() {
+        let mut state = PiChannelResume::default();
+        let frame = json!({"type":"retry_pending_ask","toolCallId":"X"});
+        assert!(state.take_pending_ask_retry(&frame, None).is_none());
+        assert!(state.take_pending_ask_retry(&frame, Some("Y")).is_none());
+        assert!(state.take_pending_ask_retry(&json!({"type":"state","toolCallId":"X"}), Some("X")).is_none());
+        assert_eq!(state.take_pending_ask_retry(&frame, Some("X")).as_deref(), Some("X"));
+        assert!(state.take_pending_ask_retry(&frame, Some("X")).is_none());
+        let mut restored: PiChannelResume =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(restored.take_pending_ask_retry(&frame, Some("X")).is_none());
+    }
+
+    #[test]
+    fn omp_delivery_readiness_does_not_clear_the_reopened_human_block() {
+        let mut state = PiChannelResume::default();
+        assert!(state.accept_frame(r#"{"type":"state","state":"active","blockedOn":"human","ask":"question"}"#));
+        assert!(!state.first_idle_seen);
+        assert!(!state.accept_frame(r#"{"type":"delivery_ready"}"#));
+        assert!(state.first_idle_seen);
+        assert_eq!(state.pending.blocked_on.as_deref(), Some("human"));
+        assert_eq!(state.pending.ask.as_deref(), Some("question"));
+        assert_eq!(state.pending.state.as_ref().map(|(status, _)| status.as_str()), Some("working"));
+        assert!(state.accept_frame(r#"{"type":"state","state":"idle"}"#));
+        assert!(state.pending.blocked_on.is_none());
+    }
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 
     #[test]
     fn clients_and_devices_say_who_is_connected_and_when_others_were_seen() {
@@ -20983,6 +21695,7 @@ mod tests {
                         &mut state,
                         &mut None,
                         &json!({"type": frame_type, "private_payload": "not logged"}).to_string(),
+                        "agent/test/seat",
                     )
                     .unwrap()
                 );
@@ -24145,6 +24858,44 @@ mod tests {
             panic!("expected a device pairing command")
         };
         assert!(full_control);
+
+        let observer = Cli::try_parse_from([
+            "st3",
+            "devices",
+            "--as",
+            "person/alex",
+            "pair",
+            "--read-only",
+            "iPad",
+        ])
+        .unwrap();
+        let Command::Devices(DevicesArgs {
+            command:
+                Some(DevicesCommand::Pair {
+                    full_control,
+                    read_only,
+                    ..
+                }),
+            ..
+        }) = observer.command
+        else {
+            panic!("expected a device pairing command")
+        };
+        assert!(read_only && !full_control);
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "devices",
+                "--as",
+                "person/alex",
+                "pair",
+                "--read-only",
+                "--full-control",
+                "iPad",
+            ])
+            .is_err(),
+            "read-only and full-control pairing must be mutually exclusive"
+        );
     }
 
     #[test]
@@ -25321,6 +26072,7 @@ mission "review" state="ready" {
             client,
             MissionPublishArgs {
                 file,
+                dry_run: false,
                 at_index: None,
                 actor: "person/test".into(),
                 workspace: root.to_owned(),

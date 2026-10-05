@@ -8,6 +8,7 @@ const SHARED_TABLES: &[(&str, &[&str])] = &[
     ("desired", &[]),
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
+    ("glass_heads", &[]),
     ("mission_revisions", &["created_index"]),
     ("mission_definitions", &[]),
     ("mission_runs", &[]),
@@ -46,6 +47,9 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_work_lease_renewals",
         "local_mailbox_owners",
         "local_mailbox_bindings",
+        "unread_mail",
+        "unread_mail_prefixes",
+        "unread_mail_pending",
         "local_observations",
         "local_blobs",
         "local_blob_uploads",
@@ -56,6 +60,8 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_seat_accounts",
         "local_latest_slots",
         "local_resource_projection_pending",
+        "local_glass_head_pending",
+        "local_glass_head_dirty",
         "graph_generation",
         "projection_digest_state",
         "projection_digest_generation",
@@ -126,7 +132,6 @@ fn shared_folds_never_order_by_local_arrival() {
     let allowed = [
         "AGENT_STATUS_INDEX_QUERY",
         "claims_page_query",
-        "agent_projection_index",
         "work_action",
         "work_action_extending",
         "events_after_bounded",
@@ -249,6 +254,7 @@ pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
                 .map(|name| {
                     if (*table == "blobs" && name == "bytes")
                         || (*table == "documents" && name == "binding_key")
+                        || (*table == "glass_heads" && matches!(name.as_str(), "created_key" | "head_key"))
                     {
                         format!("hex({name})")
                     } else {

@@ -14,7 +14,9 @@ HERE = Path(__file__).resolve().parent
 
 class BoundaryCheck(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="boundary-")
+        # The root's own name holds st2, as a random one does by chance. Only paths below the root
+        # are judged, so it must neither fail a check nor be mistaken for a mutation to clean up.
+        self.temporary = tempfile.TemporaryDirectory(prefix="boundary-st2-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         for name in ("st3", "stui", "st-drivers", "st2"):
@@ -96,7 +98,7 @@ class BoundaryCheck(unittest.TestCase):
                 self.assertTrue(list(fresh_seat_findings(self.root, self.processes)))
                 output.unlink()
                 # Remove the forbidden directory too, so the next mutation starts clean.
-                if "st2" in output.parent.name:
+                if output.parent != self.root and "st2" in output.parent.name:
                     output.parent.rmdir()
                 self.assertEqual(list(fresh_seat_findings(self.root, self.processes)), [])
 
@@ -130,6 +132,19 @@ class BoundaryCheck(unittest.TestCase):
         with sqlite3.connect(database) as connection:
             connection.execute("CREATE TABLE replica_envelopes(payload BLOB)")
             connection.execute("INSERT INTO replica_envelopes VALUES ('randomBase64st2Letters')")
+            connection.execute("CREATE TABLE claims(body TEXT)")
+            connection.execute("INSERT INTO claims VALUES (?)", ('{"schema":"st.harness-state.v1"}',))
+            connection.commit()
+            self.assertEqual(list(fresh_seat_findings(self.root, self.processes)), [])
+            connection.execute("UPDATE claims SET body=?", ('{"schema":"st2.harness-state.v1"}',))
+            connection.commit()
+            self.assertTrue(list(fresh_seat_findings(self.root, self.processes)))
+
+    def test_opaque_claim_signature_does_not_mask_semantic_claims(self):
+        database = self.root / "state/claims.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE claim_signatures(signature TEXT)")
+            connection.execute("INSERT INTO claim_signatures VALUES ('Abc+st2/Def')")
             connection.execute("CREATE TABLE claims(body TEXT)")
             connection.execute("INSERT INTO claims VALUES (?)", ('{"schema":"st.harness-state.v1"}',))
             connection.commit()

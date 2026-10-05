@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Test the release verifier against real, tiny Nix derivations and an uncached result."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import uuid
+
+repo = Path(__file__).resolve().parent.parent
+script = repo / 'scripts/ci-nix-release'
+
+
+def output(*args, cwd=None):
+    return subprocess.check_output(args, cwd=cwd, text=True).strip()
+
+
+system = output('nix', 'eval', '--impure', '--raw', '--expr', 'builtins.currentSystem')
+# Only the fixture's nixpkgs input is needed. Archiving the whole graph also downloads
+# unused historical inputs, even when their package outputs already exist in the store.
+nixpkgs = output('nix', 'eval', '--impure', '--raw', '--expr',
+                 f'(builtins.getFlake {json.dumps(str(repo))}).inputs.nixpkgs.outPath')
+with tempfile.TemporaryDirectory() as temporary:
+    root = Path(temporary)
+    fixture = root / 'example'
+    fixture.mkdir()
+    cache = root / 'persistent-cache'
+    cache.mkdir()
+    env = {**os.environ, 'CI_LOCAL_CARGO_HOME': str(cache), 'RUNNER_TEMP': str(root)}
+    env['GITHUB_STEP_SUMMARY'] = str(root / 'summary')
+    name = 'example-cache-proof-' + uuid.uuid4().hex
+    flake = fixture / 'flake.nix'
+    flake.write_text('''{
+      inputs.nixpkgs.url = "path:%s";
+      outputs = { nixpkgs, ... }: let
+        system = "%s";
+        pkgs = import nixpkgs { inherit system; };
+        package = pkgs.runCommand "%s" {} "echo example-one > $out";
+        check = pkgs.runCommand "%s-check" {} "echo example-check > $out";
+      in {
+        packages.${system}.default = package;
+        checks.${system} = { smoke = package; extra = check; };
+      };
+    }
+    ''' % (nixpkgs, system, name, name))
+    output('git', 'init', '-q', cwd=fixture)
+    output('git', 'add', '-N', 'flake.nix', cwd=fixture)
+    output('nix', 'flake', 'lock', '--offline', cwd=fixture)
+    output('git', 'add', '.', cwd=fixture)
+    output('git', '-c', 'user.name=Example', '-c', 'user.email=example@example.invalid',
+           '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null',
+           'commit', '-qm', 'Example cache fixture', cwd=fixture)
+    subprocess.run([str(script), 'build'], cwd=fixture, env=env, check=True)
+    assert '⚠️ **P0: Nix store cache MISS before build' in (root / 'summary').read_text()
+    report = json.loads((root / 'nix-release-build.json').read_text())
+    assert len(report['targets']) == 3, report
+    contents = {Path(path).read_text().strip() for result in report['results']
+                for path in result['outputs'].values()}
+    assert contents == {'example-one', 'example-check'}, contents
+    assert list((cache / 'smalltalk-nix-release').glob('result*'))
+    subprocess.run([str(script), 'verify-cache'], cwd=fixture, env=env, check=True)
+
+    (root / 'summary').write_text('')
+    subprocess.run([str(script), 'build'], cwd=fixture, env=env, check=True)
+    assert 'Nix store cache HIT before build' in (root / 'summary').read_text()
+    assert 'MISS' not in (root / 'summary').read_text()
+
+    # A changed, uncached derivation must fail verification without being built.
+    flake.write_text(flake.read_text().replace('echo example-one', 'echo example-two'))
+    uncached = output('nix', 'eval', '--raw', f'.#packages.{system}.default.outPath', cwd=fixture)
+    missing = subprocess.run([str(script), 'verify-cache'], cwd=fixture, env=env, capture_output=True)
+    assert missing.returncode != 0, missing
+    exists = subprocess.run(['nix', 'path-info', uncached], capture_output=True)
+    assert exists.returncode != 0, 'cache verification unexpectedly built an uncached output'
+
+    env.pop('CI_LOCAL_CARGO_HOME')
+    no_cache = subprocess.run([str(script), 'build'], cwd=fixture, env=env, capture_output=True)
+    assert no_cache.returncode != 0 and b'persistent' in no_cache.stderr, no_cache
+
+print('Nix persistent-store release verification tests passed')

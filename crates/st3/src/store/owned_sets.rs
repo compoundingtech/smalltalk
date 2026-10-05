@@ -1,5 +1,6 @@
 //! Owned membership is graph authority. These reads and projections have no inventory store.
 use super::*;
+use crate::model::MemberSpec;
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -15,6 +16,8 @@ pub struct Member {
     /// Derived from the authored seat and retained when its reference becomes a stop.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub manual_rollout: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub one_shot: bool,
     pub kind: String,
     pub claim: String,
     pub revision: String,
@@ -226,6 +229,7 @@ pub(super) fn effective_members(
         } else {
             Member {
                 manual_rollout: manual_member(connection, &member)?,
+                one_shot: false,
                 revision: desired_revision(&stop_declaration(&subject)?),
                 claim: view.claim.clone(),
                 kind: member.kind,
@@ -233,12 +237,27 @@ pub(super) fn effective_members(
         };
         members.insert(subject, (member, true, true));
     }
-    members.extend(
-        view.receipt
-            .members
-            .iter()
-            .map(|(s, m)| (s.clone(), (m.clone(), false, false))),
-    );
+    for (s, m) in &view.receipt.members {
+        let retirement = if m.one_shot {
+            one_shot_retirement(connection, &view.id, s, m, at)?
+        } else {
+            None
+        };
+        let entry = if let Some(claim) = retirement {
+            (
+                Member {
+                    claim,
+                    revision: desired_revision(&stop_declaration(s)?),
+                    ..m.clone()
+                },
+                true,
+                false,
+            )
+        } else {
+            (m.clone(), false, false)
+        };
+        members.insert(s.clone(), entry);
+    }
     members.extend(
         view.receipt
             .retired
@@ -246,6 +265,53 @@ pub(super) fn effective_members(
             .map(|(s, m)| (s.clone(), (m.clone(), true, false))),
     );
     Ok(members)
+}
+
+/// An authored one-shot seat permits its runtime owner to retire that exact member without
+/// changing the source bundle. A later publication with a new member claim re-arms the seat.
+fn one_shot_retirement(
+    connection: &Connection,
+    set: &str,
+    subject: &str,
+    member: &Member,
+    at: Option<u64>,
+) -> Result<Option<String>, St3Error> {
+    let Some(declaration) = claim(connection, &member.claim, at)? else {
+        return Ok(None);
+    };
+    let desired: DesiredSubject = serde_json::from_value(declaration.body).map_err(internal)?;
+    let Some(launch) = desired.member.filter(|m| m.one_shot) else {
+        return Ok(None);
+    };
+    connection.query_row(&canonical_sql(
+        "SELECT claims.id FROM claims WHERE claims.subject=?1 AND claims.kind='intent.desired'
+         AND claims.actor='daemon/runtime' AND claims.origin=?2 AND claims.store_index<=?3
+         AND json_extract(claims.body,'$.owned_set')=?4 AND json_extract(claims.body,'$.kind')='stop'
+         AND json_array_length(claims.predecessors)=1 AND json_extract(claims.predecessors,'$[0]')=?5
+         AND NOT EXISTS (SELECT 1 FROM replica_records WHERE replica_records.claim_id=claims.id AND replica_records.state='repaired')
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+        params![subject,launch.host,at.unwrap_or(u64::MAX).min(i64::MAX as u64),set,member.claim],
+        |row| row.get(0),
+    ).optional().map_err(internal)
+}
+
+pub(super) fn one_shot_retirement_owner(
+    connection: &Connection,
+    desired: &DesiredSubject,
+    origin: &str,
+) -> Result<Option<String>, St3Error> {
+    let Some(set) = owner(connection, &desired.subject, None)? else {
+        return Ok(None);
+    };
+    guard_member(connection, &desired.subject)?;
+    let current = current_desired_row(connection, &desired.subject).map_err(internal)?;
+    let permitted = current
+        .filter(|row| row.kind == "agent")
+        .and_then(|row| row.member)
+        .map(|body| serde_json::from_str::<MemberSpec>(&body).map_err(internal))
+        .transpose()?
+        .is_some_and(|member| member.one_shot && member.host == origin);
+    Ok(permitted.then_some(set))
 }
 
 fn reference(view: &View) -> String {
@@ -899,6 +965,7 @@ pub(super) fn commit_tx(
                     |row| {
                         Ok(Member {
                             manual_rollout: false,
+                            one_shot: false,
                             kind: "mission".into(),
                             claim: row.get(0)?,
                             revision: row.get(1)?,
@@ -911,6 +978,12 @@ pub(super) fn commit_tx(
                 .map_err(internal)?
                 .ok_or_else(|| St3Error::new("missing-set-member", s.clone()))?;
             Member {
+                one_shot: plan
+                    .intent
+                    .subjects
+                    .get(s)
+                    .and_then(|d| d.member.as_ref())
+                    .is_some_and(|m| m.one_shot),
                 manual_rollout: if change == "retiring" {
                     plan.retired.get(s).is_some_and(|m| m.manual_rollout)
                 } else {
