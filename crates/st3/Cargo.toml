@@ -103,3 +103,7 @@ required-features = ["perf-load"]
 [[test]]
 name = "api_accept"
 path = "tests/api_accept.rs"
+
+[[test]]
+name = "keyed_agent_card_prototype"
+path = "tests/keyed_agent_card_prototype.rs"
