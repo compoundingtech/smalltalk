@@ -9335,7 +9335,7 @@ mod tests {
                                 let (mut gate, started) = (gate.clone(), started.clone());
                                 async move {
                                     let permit = tokio::task::spawn_blocking(move || {
-                                        started.send(()).unwrap();
+                                        started.send(permit.semaphore().clone()).unwrap();
                                         let _ = tokio::runtime::Handle::current().block_on(gate.wait_for(|released| *released));
                                         permit
                                     }).await.unwrap();
@@ -9352,9 +9352,10 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
         let command = json!({"kind":"subscribe","id":"replace","collection":"work","limit":2}).to_string();
+        let mut slots = None;
         for _ in 0..COLLECTION_MAX_SUBSCRIPTIONS {
             socket.send(tokio_tungstenite::tungstenite::Message::Text(command.clone().into())).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap();
+            slots = Some(tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap());
         }
         socket.send(tokio_tungstenite::tungstenite::Message::Text(command.into())).await.unwrap();
         // A conversation outbox frame positively confirms command/frame dispatch is live
@@ -9364,11 +9365,13 @@ mod tests {
         )).await.unwrap();
         let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
         let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
-        let extra = starts.try_recv();
+        // Worker-owned permit signals prove capacity is exhausted independently
+        // of whether the queued read happened to be polled before the outbox frame.
+        let available = slots.unwrap().available_permits();
         release.send(true).unwrap();
         assert_eq!(frame["id"], "admission");
         assert_eq!(frame["kind"], "error");
-        assert!(extra.is_err(), "replacement exceeded the physical read bound");
+        assert_eq!(available, 0, "canceled awaiters released live physical read slots");
         tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap();
         let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
         let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
