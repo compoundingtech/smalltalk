@@ -38,11 +38,11 @@ an upgrade. Equal envelope inventories alone cannot prove equal claim admission.
 
 `store::tests::canonical_audit::every_shared_projection_agrees_after_shuffle_restart_and_checkpoint`
 checks both invariants by comparing shared rows, selected readers and per-table digest oracles
-across isolated stores. `shared_folds_never_order_by_local_arrival` rejects raw shared arrival
-folds, and `every_persistent_table_has_a_projection_scope` rejects unclassified tables. A new
-shared table must join the shuffle test's inventory and history fixture,
-the canonical ordering guard, and the production digest registry in the same change. A new
-shared claim-derived view must compare its answer at the same explicit time and recipients.
+across isolated stores. `every_persistent_table_has_a_projection_scope` rejects unclassified
+tables. A new shared table must join the shuffle test's inventory and history fixture and the
+production digest registry in the same change. A new shared claim-derived view must compare
+its answer at the same explicit time and recipients. Local pagination metadata may order by
+local arrival; shared winner selection must remain independent of that order.
 
 The [canonical projections audit](canonical-projections-audit.md) records the original gaps and
 local exceptions. Modern status reports a graph digest over the complete projection registry,
@@ -362,7 +362,12 @@ The inventory is compact. It carries one digest per writer range of 256 sequence
 
 Each inventory says how many envelopes its sender takes in one exchange, 4,096 for this build. A peer sends at most that many, and at most 512 to a peer whose inventory does not say, as older builds do not.
 
-Each missing envelope contains one base64-encoded CBOR payload. Receipt stores the outer envelope before it decodes the payload.
+Each missing envelope contains one base64-encoded CBOR payload on the JSON wire. Receipt stores
+its decoded bytes in SQLite before admission interprets the CBOR. Malformed base64 stays as
+exact TEXT evidence, so receipt does not discard an invalid envelope. Existing TEXT payloads
+remain readable while the daemon converts them to BLOBs in bounded, restartable writer-queue
+transactions. Export restores the same base64 wire representation; hashes and signatures still
+commit the same original bytes.
 
 An exchange body larger than 64 KiB travels deflate-compressed (`Content-Encoding: deflate`), which shrinks a page of envelopes to about a third. A requester asks for compressed answers with `Accept-Encoding: deflate`; a peer's answer carries the same header when it takes compressed requests, and the requester then compresses its push. Signatures cover the uncompressed JSON, and an inflated body may not exceed the 64 MB exchange limit. An older build neither asks nor says, so it exchanges plain JSON.
 

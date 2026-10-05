@@ -4433,15 +4433,94 @@ fn the_transcript_snapshot_recovers_and_clears_the_active_turn() {
 }
 
 #[test]
+fn a_long_failed_turn_recovers_from_recent_typed_transcript_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout-thread-main.jsonl");
+    let mut content = String::from(
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-long\"}}\n",
+    );
+    content.push_str(&" ".repeat(TRANSCRIPT_TURN_RECOVERY_BYTES as usize));
+    content.push('\n');
+    content.push_str(concat!(
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"turn_id\":\"turn-long\"}}\n",
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-long\",",
+        "\"error\":{\"message\":\"Selected model is at capacity. Please try a different model.\",",
+        "\"codex_error_info\":\"server_overloaded\"}}}\n",
+    ));
+    fs::write(&transcript, content).unwrap();
+    let frames = codex_transcript_tail(&transcript).unwrap();
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame.pointer("/payload/type") != Some(&json!("task_started")))
+    );
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&frames),
+        Some(("turn-long".into(), CodexTerminalError::ProviderCapacity)),
+        "recent typed evidence and its matching failed completion prove the turn ended"
+    );
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "retry").unwrap();
+    let mut delivery = Some(inbox_delivery(tmp.path(), config.clone()));
+    let mut state = subscribed_state(CodexObservedState::Held {
+        reason: CodexHoldReason::SystemError,
+        turn_id: None,
+    });
+    let (events, received) = mpsc::channel();
+    let control_path = tmp.path().join("control-state.json");
+    recover_transcript_turn_from_frames(&mut state, &mut delivery, &frames, &control_path, &events)
+        .unwrap();
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::TerminalError {
+            reason: CodexTerminalError::ProviderCapacity,
+        }
+    );
+    let saved: CodexControlState =
+        serde_json::from_slice(&fs::read(control_path).unwrap()).unwrap();
+    assert_eq!(saved.observed(), state.observed());
+    assert!(matches!(
+        received.try_recv().unwrap(),
+        ControlEvent::Observed
+    ));
+    let observed =
+        harness_state::read(&harness_state::harness_state_path(&config.agent_dir), None).unwrap();
+    assert_eq!(observed.state, harness_state::Activity::Idle);
+    assert_eq!(observed.reason.as_deref(), Some("providerCapacity"));
+    assert_eq!(
+        delivery
+            .as_mut()
+            .unwrap()
+            .maybe_request(&state)
+            .unwrap()
+            .unwrap()["method"],
+        "turn/start"
+    );
+}
+
+#[test]
 fn transcript_proves_only_the_latest_matching_failed_completion() {
     let started = |id| json!({"type":"event_msg","payload":{"type":"task_started","turn_id":id}});
     let completed = |id, error: Option<&str>| json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":id,"error":error}});
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[completed("one", Some("error"))]),
+        None,
+        "a completion without matching turn evidence is not enough"
+    );
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[
+            started("one"),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"one","error":false}}),
+        ]),
+        None,
+        "a malformed error cannot prove a terminal failure"
+    );
     assert_eq!(
         failed_completed_turn_from_codex_frames(&[
             started("old"),
             completed("old", Some("unauthorized")),
         ]),
-        Some("old".into())
+        Some(("old".into(), CodexTerminalError::SystemError))
     );
     assert_eq!(
         failed_completed_turn_from_codex_frames(&[
@@ -4465,6 +4544,120 @@ fn transcript_proves_only_the_latest_matching_failed_completion() {
         None,
         "a successful completion cannot prove a terminal system error"
     );
+    for newer in [
+        json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"new"}}),
+        json!({"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"new"}}}),
+        completed("new", None),
+        json!({"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"new"}}),
+    ] {
+        assert_eq!(
+            failed_completed_turn_from_codex_frames(&[
+                started("old"),
+                completed("old", Some("error")),
+                newer,
+            ]),
+            None,
+            "later evidence cannot resurrect an older failed turn"
+        );
+    }
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[
+            json!({"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"one"}}}),
+            completed("other", Some("error")),
+        ]),
+        None,
+        "recent typed evidence must still match the failed completion"
+    );
+    for late in [
+        json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"old"}}),
+        json!({"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"old"}}}),
+    ] {
+        assert_eq!(
+            failed_completed_turn_from_codex_frames(&[
+                started("old"),
+                completed("old", Some("error")),
+                late,
+            ]),
+            Some(("old".into(), CodexTerminalError::SystemError)),
+            "late frames from the completed turn cannot reopen it"
+        );
+    }
+}
+
+#[test]
+fn failed_turn_recovery_preserves_the_native_error_class() {
+    for (error, reason) in [
+        (
+            json!({"codex_error_info":"unauthorized"}),
+            CodexTerminalError::ProviderAuthRejected,
+        ),
+        (
+            json!({"codex_error_info":"usageLimitExceeded"}),
+            CodexTerminalError::ProviderCapacity,
+        ),
+        (
+            json!({"codex_error_info":"usage_limit_exceeded"}),
+            CodexTerminalError::ProviderCapacity,
+        ),
+        (
+            json!({"message":"Selected model is at capacity. Please try a different model.","codex_error_info":"server_overloaded"}),
+            CodexTerminalError::ProviderCapacity,
+        ),
+        (
+            json!({"message":"provider failed"}),
+            CodexTerminalError::SystemError,
+        ),
+    ] {
+        assert_eq!(
+            failed_completed_turn_from_codex_frames(&[
+                json!({"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"one"}}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"one","error":error}}),
+            ]),
+            Some(("one".into(), reason))
+        );
+    }
+}
+
+#[test]
+fn generic_system_error_status_preserves_a_proven_terminal_cause() {
+    for reason in [
+        CodexTerminalError::ProviderCapacity,
+        CodexTerminalError::ProviderAuthRejected,
+        CodexTerminalError::SystemError,
+    ] {
+        let expected = CodexObservedState::TerminalError { reason };
+        let mut state = subscribed_state(expected.clone());
+        assert!(
+            !state
+                .observe(&json!({
+                    "method":"thread/status/changed",
+                    "params":{"threadId":"thread-main","status":{"type":"systemError"}},
+                }))
+                .unwrap()
+        );
+        assert_eq!(state.observed(), &expected);
+        assert_eq!(
+            observed_from_thread_snapshot(
+                &json!({
+                    "result":{"thread":{"id":"thread-main","status":{"type":"systemError"}}},
+                }),
+                "thread-main",
+                &expected
+            )
+            .unwrap(),
+            expected
+        );
+        // A new live status is a recovery boundary, so the old failure does not stick.
+        assert!(
+            state
+                .observe(&json!({
+                    "method":"thread/status/changed",
+                    "params":{"threadId":"thread-main","status":{"type":"idle"}},
+                }))
+                .unwrap()
+        );
+        assert_eq!(state.observed(), &CodexObservedState::Idle);
+    }
 }
 
 #[test]

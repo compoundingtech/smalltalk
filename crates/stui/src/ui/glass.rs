@@ -1317,6 +1317,14 @@ impl Ui {
         else {
             return;
         };
+        // The group a tab left keeps showing one of its tabs: the one that was shown, which moved
+        // up a place if the tab came from before it, else the next one, else the last.
+        if let Some(group) = glass.layout.group_mut(from_group) {
+            if from_tab < group.current {
+                group.current -= 1;
+            }
+            group.current = group.current.min(group.tabs.len().saturating_sub(1));
+        }
         let emptied = sources == 1 && glass.layout.groups().len() > 1;
         if emptied {
             let layout = std::mem::take(&mut glass.layout);
@@ -1854,14 +1862,6 @@ impl Ui {
             format!("{glyph} {word}"),
             bar(theme::fg(color)),
         ));
-        if let Load::Ready(backlog) = &self.world.mail_backlog
-            && backlog.count > 0
-        {
-            spans.push(Span::styled(format!(" · {} unread >1h", backlog.count), bar(theme::fg(theme::YELLOW))));
-        }
-        if let Load::Failed(_) = &self.world.mail_backlog {
-            spans.push(Span::styled(" · mail backlog unavailable", bar(theme::fg(theme::YELLOW))));
-        }
         // Now opens over the glass from its count, "need you" (Nathan, 2026-10-04: one way in,
         // named as `st now` is).
         let need = self
@@ -3548,23 +3548,6 @@ mod tests {
     }
 
     #[test]
-    fn mail_backlog_remains_visible_in_both_layouts_and_clears_after_cleanup() {
-        let mut ui = glass();
-        let backlog = st3_client::MailBacklog {
-            count: 37, threshold_ms: 3_600_000,
-            cleanup_command: "st conversations cleanup --all --older-than 1h".into(),
-        };
-        ui.world.mail_backlog = Load::Ready(backlog.clone());
-        assert!(screen(&ui).contains("37 unread >1h"));
-        ui.glasses = None;
-        let shown = screen(&ui);
-        assert!(shown.contains("37 unread >1h"));
-        assert!(shown.contains(&backlog.cleanup_command));
-        ui.world.mail_backlog = Load::Ready(st3_client::MailBacklog { count: 0, ..backlog });
-        assert!(!screen(&ui).contains("unread >1h"));
-    }
-
-    #[test]
     fn the_palette_opens_subjects_in_tabs_and_home_opens_over_them() {
         let mut ui = glass();
         ctrl(&mut ui, 'k');
@@ -3634,6 +3617,82 @@ mod tests {
         assert_eq!(tabs(&ui).1, 1);
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
+    }
+
+    #[test]
+    fn a_group_a_tab_was_dragged_out_of_still_shows_one_of_its_tabs() {
+        // Nathan, 2026-10-04: after dragging a tab to a new place, the group with the other tabs
+        // showed none of them.
+        let shown = |ui: &Ui, group: usize| {
+            ui.glasses
+                .as_ref()
+                .unwrap()
+                .glass()
+                .shown(group)
+                .map(|tab| tab.pane.clone())
+        };
+        let three = |ui: &mut Ui| {
+            ui.open_in_glass(
+                Pane::Agent(Some("agent/example/atlas/builder".into())),
+                Open::Tab,
+            );
+            ui.open_in_glass(
+                Pane::Mission(Some("mission/fleet/release/weekly".into())),
+                Open::Tab,
+            );
+            ui.open_in_glass(Pane::Agent(Some("agent/example/cos".into())), Open::Tab);
+        };
+        let cos = "agent:agent/example/cos";
+
+        // The shown tab is the last one and it leaves into a new split: the one before it shows.
+        let mut ui = glass();
+        three(&mut ui);
+        assert_eq!(tabs(&ui).1, 2);
+        ui.drop_tab(
+            (0, 2),
+            Drop::Edge {
+                group: 0,
+                side: Side::Right,
+                first: false,
+            },
+        );
+        assert_eq!(tabs(&ui).2, vec![vec![ATLAS, WEEKLY], vec![cos]]);
+        assert_eq!(shown(&ui, 0).as_deref(), Some(WEEKLY));
+        assert_eq!(shown(&ui, 1).as_deref(), Some(cos));
+
+        // The shown tab leaves from the middle: the next one takes its place.
+        let mut ui = glass();
+        three(&mut ui);
+        ui.glasses
+            .as_mut()
+            .unwrap()
+            .glass_mut()
+            .layout
+            .group_mut(0)
+            .unwrap()
+            .current = 1;
+        ui.drop_tab(
+            (0, 1),
+            Drop::Edge {
+                group: 0,
+                side: Side::Below,
+                first: false,
+            },
+        );
+        assert_eq!(shown(&ui, 0).as_deref(), Some(cos));
+
+        // A tab before the shown one leaves: the shown tab stays shown.
+        let mut ui = glass();
+        three(&mut ui);
+        ui.drop_tab(
+            (0, 0),
+            Drop::Edge {
+                group: 0,
+                side: Side::Right,
+                first: false,
+            },
+        );
+        assert_eq!(shown(&ui, 0).as_deref(), Some(cos));
     }
 
     #[test]
@@ -4833,6 +4892,47 @@ mod tests {
             links.contains(&"https://example.com/notes".to_owned()),
             "{links:?}"
         );
+    }
+
+    #[test]
+    fn an_address_the_renderer_wrapped_is_one_link_on_every_row() {
+        // Nathan, 2026-10-05: clicking a wrapped link copied only the part on the clicked row.
+        let long = "https://github.com/example/widgets/blob/main/docs/a-very-long-file-name-for-wrapping-tests/and-then-some-more-path-segments.md";
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        if let Some(Load::Ready(entries)) = ui
+            .world
+            .conversations
+            .get_mut("agent/example/atlas/builder")
+        {
+            entries.push(Entry {
+                id: "wrapped".into(),
+                at: "17:41".into(),
+                body: Body::Assistant(format!("Start here: {long}\nThen it ends.")),
+            });
+        }
+        ui.follow_latest();
+        screen(&ui);
+        let frame = ui.frame.borrow();
+        let rows = frame
+            .hits
+            .iter()
+            .filter_map(|(rect, hit)| match hit {
+                Hit::Link(url) if url == long => Some(rect.y),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            rows.len() >= 2,
+            "the whole address is the link on each row it covers: {rows:?}"
+        );
+        let partial = frame.hits.iter().any(|(_, hit)| {
+            matches!(hit, Hit::Link(url) if url != long && url.starts_with("https://github.com/example/widgets/blob"))
+        });
+        assert!(!partial, "no link holds only part of the address");
     }
 
     #[test]

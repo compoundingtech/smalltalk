@@ -24,25 +24,50 @@ head: it tests that head merged with the current base. Strict branch protection 
 that the head itself contain the latest `main`. No `pull_request_target` job runs PR code,
 and the gate has only `contents: read` permission. Forks do not receive publishing secrets.
 
-The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
+The Linux gate runs two test partitions plus Clippy and fleet compatibility on separate runners.
 `linux-gate` is the single required check: it needs the three stage jobs and the named mail redelivery
 check, and passes only when every one succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
-`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm` and `typescript-client`
+`nscloud-ubuntu-24.04-amd64-8x16-with-features`; `genie-freshness`, `isolation-vm` and `typescript-client`
 use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggregate uses GitHub-hosted
 `ubuntu-latest`, so it cannot queue behind build or benchmark jobs. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
-limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
+limit of about five runners at once.
 
-- `linux-tests`: prepares the provider component fixtures, installs matching rendered st2 hooks,
-  builds the selected test executables with dev/test debug info and incremental compilation
-  disabled, then runs `bash scripts/ci-nextest run` on every CPU, selected
-  by the profile's default filter (see [gate scope](#gate-scope));
+Required Namespace jobs use run affinity and inline `job.priority=1` for merge groups and
+`ci-priority` PRs, or `job.priority=10` for ordinary PRs. Optional benchmarks keep their existing
+labels. Namespace schedules lower priority numbers first, ahead of unprioritized jobs, when
+capacity is exhausted; run affinity prevents another workflow from taking the runner started
+for a required job. This uses existing capacity and shapes. See Namespace's
+[job ordering and priority controls](https://namespace.so/docs/solutions/github-actions/runner-controls/job-ordering).
+
+`scripts/ci-linux STAGE` runs one stage:
+
+- `linux-tests` and `linux-tests-shard-2`: prepare the provider component fixtures, build the
+  selected test executables with dev/test debug info and incremental compilation disabled,
+  and install matching hooks directly from the built st2 executable. They run complementary
+  nextest hash partitions with eight test threads each. The profile's default filter still
+  selects the gate scope (see [gate scope](#gate-scope));
 - `linux-clippy`: `cargo clippy --workspace --all-targets --locked`, the standalone conversation
   model check, the [warning ratchet](#clippy-warning-ratchet), then
   `cargo run --locked -p st3-client-codegen -- --check`;
 - `linux-fleet-compat`: the fleet compatibility test against `.github/fleet-compat-baseline.json`'s
   pinned older st3. Building that baseline also runs the pinned pty's own unit tests, two of which
   are timing-sensitive, so the build is retried up to three times.
+
+The primary test job proves that the two actual nextest inventories are disjoint and their union
+equals the full selected suite before running the explicit zero-retry mail canaries. It also
+runs the standalone conversation model feature check. The second shard runs the remaining
+workspace and st2 tests on independent Namespace CPUs. `linux-gate` requires both shards;
+failure, cancellation or skipping either shard fails the gate. Each shard retains passing test
+durations in its logs, and the primary saves `ci-logs/test-partitions.json` with the tested SHA
+and all three inventories.
+
+Both shards keep their own checkouts and builds because many tests embed build-time source and
+executable paths. Namespace's second shard restores the same main-seeded Cargo and Nix cache
+keys as the primary. Moving portable archives between runners remains a follow-up after those
+tests support relocation. Building selected targets before installing hooks removes the earlier
+standalone `cargo run -p st2` build. Local and macOS runs use the complete selection unless
+`CI_TEST_PARTITION` is explicitly set to `hash:1/2` or `hash:2/2`.
 
 Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
 or restoring build archives. When both entries exist it stops after the probes. A miss is flagged
@@ -95,6 +120,26 @@ Boot, delivery-probe and messaging-fault fixtures put large executable copies in
 directory, keeping their Unix sockets in short temporary paths. This avoids exhausting a
 host's temporary-filesystem quota when debug binaries are copied by parallel cases.
 
+On Linux, tests that launch isolated daemons, drivers, PTYs or long-lived CLI children call
+`st3::test_support::supervise_test()` before creating their fixtures. It runs that exact test
+under `scripts/st3_test_process.py`, a detached subreaper watching pidfds for the Rust runner
+and its launcher. Success, failure, panic, timeout, SIGTERM and SIGKILL of the runner all
+end the owned process tree. Each test has its own process group; detached children are
+adopted and killed and reaped before the supervisor returns the test's status. Exited adopted
+PTYs are also reaped while the test runs, so stop/suspend checks see their PIDs disappear. Cleanup
+uses only the supervisor's descendants, including when evidence collection fails or a
+temporary binary directory has already been removed. The Python boot, no-st2, subagent,
+messaging-fault and delivery-probe entrypoints use the same supervisor when run directly.
+
+The isolated-process audit covers `boot_canaries`, `broken_gates`, `daemon_environment`,
+`first_sync`, `fleet`, `getting_started`, `mission_cancellation`, `daemon_restart`,
+`idle_budget`, `driver_incarnation`, `codex_bootstrap`, `no_st2_seat`, `subagents_seat`,
+`delivery_probe`, and `messaging_faults`. The process-spawning tests in `action_coverage`,
+`agents_restart`, `hook_telemetry`, `terminal_attach` and `command_recorder` use it too.
+The separate `api_accept` target also supervises its descriptor-exhaustion subprocess.
+The remaining daemon fixtures serve their APIs in process or use fake runtime observations;
+their tasks end with their test runtime. New process-spawning fixtures should use this helper.
+
 The workspace suite still covers the token-free two-node messaging fault matrix. Its historical
 channel build remains independently pinned in `.github/messaging-compat-baseline.json`. Its
 provider stand-in runs the omp channel hook's TypeScript with Node 24's built-in type stripping;
@@ -113,6 +158,13 @@ seconds, so a race between a provider and the daemon fails here every time inste
 launch loses it. These cases never retry: a pass on the second attempt is the race the canary
 exists to catch (`.config/nextest.toml`). A failed case keeps its daemon log, the seat's terminal,
 its claim trace and the stand-in's receipts under `target/boot-canaries/`, which the stage uploads.
+
+`boot_canaries::every_exit_reaps_the_daemon_even_when_the_rust_test_is_killed` starts the real
+boot-canary Node in disposable Rust test processes. It covers success, assertion failure,
+Rust panic, SIGTERM and SIGKILL of the Rust process, and SIGKILL of the Python fixture. It
+requires both the daemon and a double-forked child in a new session to disappear within
+five seconds, and separately injects an evidence-collection error to prove `node.stop()`
+still runs. Existing canary assertions, phase bounds and zero retries remain unchanged.
 
 The Codex stand-in's schema files are generated from the protocol gate's own fixture; when the
 required Codex methods change, `ST_REGENERATE_CODEX_STUB_SCHEMAS=1 cargo test -p st-drivers
@@ -268,10 +320,10 @@ fall back to hosted or fleet runners.
 ci1 is a dedicated machine of ours that runs GitHub self-hosted runners for this repository, with
 warm caches kept on the machine. GitHub has no overflow between runner labels, so `Workspace CI`
 starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
-through the API and picks one pool for the whole run:
+through the API and picks the primary test partition's pool:
 
-- `ci1` when at least `CI1_MIN_IDLE` (default 1) general runners are online and idle. Work starts
-  on available capacity; the remaining jobs can wait briefly for a runner;
+- `ci1` when at least `CI1_MIN_IDLE` (default 4) general runners are online and idle. This leaves
+  CPU capacity for the priority and merge reservations;
 - `ci1-priority` for trusted PRs labelled `ci-priority`, without an idle-count or token dependency.
   Pending urgent checks get the next free general runners; one slot stays reserved for priority
   and merge work after urgent checks finish;
@@ -283,10 +335,12 @@ through the API and picks one pool for the whole run:
   unavailable, and always for a pull request from a fork. The repository is public and a self-hosted
   runner runs whatever a job asks, so fork code never reaches ci1 (and forks receive no secrets).
 
-Build and test jobs read `pick-runner`'s output and fall back to their Namespace label when
-the output is empty. The aggregate stays on GitHub-hosted capacity regardless of that choice.
-The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
-names its stages and the redelivery canary instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
+Only `linux-tests` reads `pick-runner`'s output and falls back to Namespace when it is empty.
+The second shard, Clippy, compatibility, generated-file checks, TypeScript, isolation and cost
+jobs always use existing Namespace capacity, keeping their builds off ci1's test cores. The
+aggregate stays on GitHub-hosted capacity regardless of that choice. The required check names
+are unchanged; `linux-gate` names both test shards, its supporting stages and the redelivery
+canary instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
 Priority selection follows the fork boundary, so a fork label cannot reach a self-hosted runner.
 The private host controller keeps the priority slot out of the ordinary pool and removes its merge
 label while urgent required checks are pending. It also lends the other general runners to
@@ -297,7 +351,7 @@ Two runs that pick at the same moment can both choose ci1; the later run's jobs 
 runners on ci1.
 
 The switch is the repository variable `CI1_RUNNERS`: unset (the default), `pick-runner` is skipped
-and build/test jobs go to Namespace. `on` turns the choice on, and unsetting it turns
+and all workload jobs go to Namespace. `on` turns the choice on, and unsetting it turns
 it off again without a pull request. `pick-runner` reads the runners with the
 `CI1_RUNNERS_READ_TOKEN` secret, a token that may only read the organization's self-hosted runners;
 without it non-queue runs go to Namespace. Merge-group runs need no organization status token; a failed PR-label lookup retains merge capacity.
@@ -308,8 +362,16 @@ with its own `/tmp`, and nothing the job started outlives it. The runner names a
 cache, use that Cargo home, and Cargo keeps its intermediate build files in a per-runner build
 directory, while sccache shares compiled crates between all runners and the Nix store is the
 machine's own. The machine's configuration lives in the private network repository.
-Initial Cargo build and nextest concurrency on ci1 is four threads per runner, with a 14 GiB
-per-job memory limit; tune those limits from measured runs on the machine.
+Cargo builds use the host's four-job limit. Workspace test shards explicitly use eight test
+threads, with the host's 14 GiB per-job memory limit. The repository variable `CI1_MIN_IDLE`
+can override admission; keep it at four when preserving CPU capacity for reserved lanes.
+
+The local test stage sets `TMPDIR`, `TMP` and `TEMP` to the short `RUNNER_TEMP/t` path on
+the runner's memory filesystem. Otherwise `nix develop` chooses disk-backed `/tmp`, making
+every test-store commit wait for a disk sync. Stores survive fixture process restarts and are
+removed with the ephemeral job; fixture executables retain their target scratch directories.
+The stage logs the scratch filesystem. Namespace and the performance jobs retain their existing
+temporary storage, and the host's per-job memory limit also covers this test scratch.
 
 `CI_RUN_ID` keeps the messaging-fault evidence under `target/messaging-faults/`, which is
 uploaded with the stage logs.
@@ -465,12 +527,14 @@ accepted-source verification remain in place.
 
 ## Required mail redelivery canaries
 
-Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires eleven named,
-unignored regressions: boot/reconnect mailbox suppression for Claude, Codex, OpenCode, Pi,
-and OMP; each harness's native suspend/resume canary with old mail held and fresh mail read;
-and delivered-but-unread retention across native channel restart. The mailbox cases seed
-sent, staged, and delivered-but-unread mail and prove zero old offers, live delivery, and
-continued explicit mailbox access. Every selected test runs with zero retries.
+Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires seventeen named,
+unignored regressions: boot/reconnect mailbox suppression and recent unoffered recovery for
+Claude, Codex, OpenCode, Pi, and OMP; each harness's native suspend/resume canary with hour-old
+mail held and recent unoffered mail consumed exactly once; legacy polling recovery through the
+current offer's receipt sequence; and delivered-but-unread retention across native channel
+restart. The mailbox cases seed hour-old sent mail and recent staged and delivered-but-unread
+mail, prove zero historical offers, preserve explicit mailbox access, and recover an in-flight
+send after a daemon restart with exactly one receipt pair. Every selected test runs with zero retries.
 
 The script fails if any required test is missing, ignored, or filtered out. The named
 `mail-redelivery-canaries` check reads that step's actual outcome; a skipped step cannot pass.

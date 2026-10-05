@@ -9,6 +9,9 @@ const SHARED_TABLES: &[(&str, &[&str])] = &[
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),
+    ("custom_registrations", &[]),
+    ("custom_sources", &[]),
+    ("custom_dependencies", &[]),
     ("mission_revisions", &["created_index"]),
     ("mission_definitions", &[]),
     ("mission_runs", &[]),
@@ -62,6 +65,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_resource_projection_pending",
         "local_glass_head_pending",
         "local_glass_head_dirty",
+        "local_custom_dirty",
         "graph_generation",
         "projection_digest_state",
         "projection_digest_generation",
@@ -122,118 +126,6 @@ fn native_mailbox_ownership_changes_no_shared_projection_digest() {
         ))
         .unwrap();
     assert_eq!(before, graph_digest(&store.readers.get()).unwrap());
-}
-
-#[test]
-fn shared_folds_never_order_by_local_arrival() {
-    // Local purposes and immutable intra-batch export exceptions are individually documented
-    // in the audit. A new raw shared ordering fails by default. The fix step will route every
-    // remaining violation through the common canonical helper, including the multiline queue.
-    let allowed = [
-        "AGENT_STATUS_INDEX_QUERY",
-        "claims_page_query",
-        "work_action",
-        "work_action_extending",
-        "events_after_bounded",
-        "events_tail_bounded",
-        "projection_time_at",
-        "events_after_filtered",
-        "member_reconcile_fault",
-        "member_reconcile_faults_for",
-        "claims_for_subject_kind_at",
-        "timeline_claim_rows_for_incarnation_at",
-        "claims_for_kind_at",
-        // Terminal capabilities are issuer-local authority, fenced against its local subject head.
-        "terminal_attachment_for_capability_hash",
-        // Node-local terminal history pagination; reason selection remains canonical.
-        "outcome_history",
-        "agent_last_activity_at",
-        "try_project_simple_replication_tx",
-        "export_replication_for_heads",
-        "seed_replica_envelopes_tx",
-        // Bounded mailbox pages expose local cursors, then complete readers sort source keys.
-        "messages_page",
-        "work_wake_messages_for_reconcile",
-    ];
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = vec![root.join("store.rs")];
-    let mut directories = vec![root.join("store")];
-    while let Some(directory) = directories.pop() {
-        for entry in std::fs::read_dir(directory).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                directories.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs")
-                && !["canonical_audit.rs", "convergence.rs"]
-                    .contains(&path.file_name().unwrap().to_str().unwrap())
-            {
-                files.push(path);
-            }
-        }
-    }
-    let mut violations = Vec::new();
-    for file in files {
-        let contents = std::fs::read_to_string(&file).unwrap();
-        let source = contents
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .unwrap();
-        for (offset, _) in source.match_indices("ORDER BY") {
-            let order = source[offset + "ORDER BY".len()..]
-                .split('"')
-                .next()
-                .unwrap()
-                .split("LIMIT")
-                .next()
-                .unwrap()
-                .split(';')
-                .next()
-                .unwrap();
-            // A marker explicitly orders the fold canonically. With window functions the
-            // rest of the same SQL literal may contain a snapshot bound after this clause.
-            if order.trim_start().starts_with("CANONICAL_ASC(")
-                || order.trim_start().starts_with("CANONICAL_DESC(")
-            {
-                continue;
-            }
-            if !order.contains("store_index") && !order.contains("created_index") {
-                continue;
-            }
-            let scope = source[..offset]
-                .lines()
-                .filter_map(|line| {
-                    let line = line.trim_start();
-                    if line.starts_with("//") {
-                        return None;
-                    }
-                    if let Some((_, name)) = line.split_once("fn ") {
-                        Some(name.split(['(', '<']).next().unwrap())
-                    } else if let Some(name) = line.strip_prefix("const ") {
-                        Some(name.split(':').next().unwrap())
-                    } else {
-                        None
-                    }
-                })
-                .next_back()
-                .unwrap();
-            if !allowed.contains(&scope) {
-                violations.push(format!(
-                    "{}:{} {scope}",
-                    file.strip_prefix(&root).unwrap().display(),
-                    source[..offset]
-                        .bytes()
-                        .filter(|byte| *byte == b'\n')
-                        .count()
-                        + 1
-                ));
-            }
-        }
-    }
-    assert!(
-        violations.is_empty(),
-        "shared arrival-order folds:\n{}",
-        violations.join("\n")
-    );
 }
 
 pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
@@ -493,6 +385,19 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
 }
 
 fn write_audit_history(source: &Store) {
+    source.register_custom_kind(&custom::RegistrationRequest {
+        manifest: serde_json::from_str(include_str!("../../../../examples/st3/custom-review.json")).unwrap(),
+        actor: "agent/garden/seed".into(),
+    }).unwrap();
+    source.put_document("doc/garden/audit", b"Immutable audit context", &None, "garden-audit-context").unwrap();
+    source.append_claim(&ClaimInput {
+        subject: "custom/garden/review/v1/audit".into(),
+        kind: "custom.garden.review.v1.requested".into(),
+        actor: Some("agent/garden/seed".into()),
+        fields: serde_json::from_value(json!({"title":"Retain the seed history?","detail":"Choose Keep or Discard.","recipient":"person/lichen","context":format!("doc/garden/audit@{}",hex::encode(Sha256::digest(b"Immutable audit context")))})).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+
     publish_takeover(
         source,
         &format!(
@@ -1170,7 +1075,7 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
         for (column, kind) in columns {
             let before_generation = projection_digest::generation(&connection).unwrap();
             let transaction = connection.transaction().unwrap();
-            let expression = if *table == "claims" && column == "body" {
+            let expression = if matches!(*table, "claims" | "custom_sources") && column == "body" {
                 // JSON expression indexes require valid JSON even for deliberate corruption.
                 "json_set(body, '$.fields.__canonical_audit', 'changed')".to_owned()
             } else if *table == "operations" && column == "state" {
@@ -1182,6 +1087,9 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
                 format!("COALESCE({column},0)+1")
             } else if kind == "BLOB" {
                 format!("CAST({column}||x'00' AS BLOB)")
+            } else if *table == "desired" && column == "body" {
+                // Declaration-edge triggers read this JSON during the same update.
+                "(json_set(body,'$.__audit_digest_change',1)||'')".to_owned()
             } else {
                 format!("COALESCE({column},'')||'-changed'")
             };

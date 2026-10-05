@@ -1,3 +1,4 @@
+pub mod custom;
 mod glass_heads;
 mod glasses;
 pub mod owned_sets;
@@ -47,8 +48,6 @@ use crate::model::{
 };
 use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
-#[cfg(test)]
-use base64::Engine as _;
 #[cfg(test)]
 use smallclaims::claim::ReplicaEnvelopePayload;
 use smallclaims::error::internal;
@@ -275,6 +274,18 @@ ON claims(
 )
 WHERE json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
     THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NOT NULL;
+
+-- Attachment checks must not walk a quiet seat's accumulated hook and work history.
+-- Only phase transitions publish these diagnostics, so a current-runtime lookup stays small.
+CREATE INDEX IF NOT EXISTS claims_claude_attachment_index
+ON claims(
+    subject,
+    json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END),
+    store_index
+)
+WHERE kind='harness.diagnostic'
+    AND json_extract(body, '$.fields.code') IN ('claude-channel-unattached','claude-channel-attached');
 
 -- Mailbox admission needs the newest state for one incarnation, never optional display fields
 -- from its entire history. Include legacy reports without an incarnation in a separate seek.
@@ -1097,6 +1108,7 @@ pub(crate) struct MissionGateRunner {
     pub subject: String,
     pub host: String,
     pub owner_run: String,
+    pub owner_step: Option<String>,
     pub retired: bool,
 }
 
@@ -1248,7 +1260,7 @@ fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == 0 || version == 13 || version == 14 || version == 15 {
+    if version == 0 || version == 13 || version == 14 || version == 15 || version == 16 {
         return Ok(());
     }
     if version == 12 {
@@ -1644,9 +1656,11 @@ fn discovered_collection_items(
             if resource.as_ref() == Some(&facts) {
                 return None;
             }
+            // Creation receipts establish identity and attribution, not observer state.
+            let observed_prior = prior.filter(|prior| prior.get("state").is_some());
             let new_item =
-                prior.is_none() && !baseline && item.get("new") != Some(&Value::Bool(false));
-            let deliver = match (field, prior) {
+                observed_prior.is_none() && !baseline && item.get("new") != Some(&Value::Bool(false));
+            let deliver = match (field, observed_prior) {
                 ("pull_requests", Some(prior)) => pull_request_needs_review(Some(prior), &facts),
                 (_, Some(_)) => false,
                 ("pull_requests", None) => new_item && pull_request_needs_review(None, &facts),
@@ -4558,6 +4572,26 @@ impl Store {
         Ok(view)
     }
 
+    pub(crate) fn step_has_active_child_runs(&self, step: &str) -> Result<bool> {
+        let step = normalize_step_run(step);
+        smallclaims::touched::note_read(|| format!("children-of-step:{step}"));
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT 'mission-run/' || id, status FROM mission_runs WHERE parent_step_run=?1",
+        )?;
+        let rows = statement.query_map([step], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (subject, status) = row?;
+            smallclaims::touched::note_read(|| subject);
+            if !matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn adopt_mission_revision(
         &self,
         run: &str,
@@ -5867,6 +5901,59 @@ impl Store {
                 Ok(view)
             })
             .collect()
+    }
+
+    /// When a loop first executed: a worker's first claim, or the creation of a round
+    /// with no claimable steps. Presentation details and other loops' rounds do not
+    /// affect this clock, including when an earlier round is already terminal.
+    pub fn loop_first_execution_at(&self, root: &str, parent_step: &str) -> Result<Option<u128>> {
+        let root = root.strip_prefix("mission-run/").unwrap_or(root);
+        smallclaims::touched::note_read(|| format!("children-of-step:{parent_step}"));
+        let connection = self.readers.get();
+        let mut children = connection.prepare_cached(
+            "SELECT id, current_generation_id, created_at_unix_ms FROM mission_runs
+             WHERE root_run_id=?1 AND parent_step_run=?2",
+        )?;
+        let mut steps = connection.prepare_cached(
+            "SELECT subject, agentless FROM step_runs WHERE run_id=?1 AND generation_id=?2",
+        )?;
+        let mut claims = connection.prepare_cached(
+            "SELECT accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='work.claimed'",
+        )?;
+        let mut started: Option<u128> = None;
+        let children = children.query_map(params![root, parent_step], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for child in children {
+            let (id, generation, created) = child?;
+            smallclaims::touched::note_read(|| format!("mission-run/{id}"));
+            smallclaims::touched::note_read(|| format!("run-generation/{generation}"));
+            smallclaims::touched::note_read(|| format!("generations:mission-run/{id}"));
+            let steps = steps
+                .query_map(params![id, generation], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (subject, _) in &steps {
+                smallclaims::touched::note_read(|| subject.clone());
+            }
+            if steps.iter().all(|(_, agentless)| *agentless) {
+                let created = created.parse::<u128>()?;
+                started = Some(started.map_or(created, |at| at.min(created)));
+            } else {
+                for (subject, _) in steps {
+                    for accepted in claims.query_map([subject], |row| row.get::<_, String>(0))? {
+                        let accepted = accepted?.parse::<u128>()?;
+                        started = Some(started.map_or(accepted, |at| at.min(accepted)));
+                    }
+                }
+            }
+        }
+        Ok(started)
     }
 
     pub fn work(&self, actor: Option<&str>, include_terminal: bool) -> Result<Vec<StepRunView>> {
@@ -10644,6 +10731,7 @@ impl Store {
                         subject: subject.clone(),
                         host: host.clone(),
                         owner_run: owner_run.clone(),
+                        owner_step: owner.starts_with("step-run/").then(|| owner.clone()),
                         retired,
                     }));
                 }
@@ -11882,6 +11970,7 @@ impl Store {
         let mut items = self.mission_run_attention_items(person)?;
         items.extend(self.person_attention_items(person, as_of)?);
         items.extend(self.harness_login_attention_items(person)?);
+        items.extend(self.custom_attention_items(person)?);
         // A person who published a broken gate is the one to correct it.
         items.extend(
             self.broken_gate_items(person, as_of)?
@@ -12327,7 +12416,7 @@ impl Store {
                                 &canonical_sql(
                                     "SELECT accepted_at_unix_ms FROM claims
                                      WHERE subject=?1 AND kind='resource.observed'
-                                     ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                                     ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1",
                                 ),
                                 [&subject],
                                 |row| row.get::<_, String>(0),
@@ -13984,6 +14073,9 @@ impl Store {
     /// The page merges replicated timeline claims, which older builds wrote, with
     /// this node's local timeline observations; a local observation sorts after the
     /// claim it follows.
+    /// `next_cursor` means the query omitted existing rows, never physical retention.
+    /// It is not a lossless local-observation cursor: several local IDs may follow
+    /// the same store index.
     pub fn timeline_claims_for_incarnation_at(
         &self,
         subject: &str,
@@ -14035,6 +14127,108 @@ impl Store {
             claims: merged,
             next_cursor,
         })
+    }
+    /// Resolve retained appends in one incarnation scan, without loading their bodies.
+    /// Full store/local positions distinguish query omission from a missing append.
+    pub(crate) fn timeline_entry_append_positions_at(
+        &self,
+        subject: &str,
+        incarnation: &str,
+        entries: &BTreeSet<String>,
+        before_index: Option<u64>,
+    ) -> Result<BTreeMap<String, (u64, u64)>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "WITH operations AS (
+                SELECT json_extract(body, '$.fields.entry_id') AS entry_id,
+                    store_index, 0 AS local_id
+                FROM claims
+                WHERE subject=?1 AND kind='harness.timeline'
+                    AND json_extract(body, '$.fields.incarnation_id')=?2
+                    AND json_extract(body, '$.fields.operation')='append'
+                    AND json_extract(body, '$.fields.entry_id') IN (SELECT value FROM json_each(?3))
+                    AND (?4 IS NULL OR store_index<?4)
+                UNION ALL
+                SELECT json_extract(body, '$.fields.entry_id') AS entry_id,
+                    after_store_index AS store_index, id AS local_id
+                FROM local_observations
+                WHERE subject=?1 AND kind='harness.timeline'
+                    AND json_extract(body, '$.fields.incarnation_id')=?2
+                    AND json_extract(body, '$.fields.operation')='append'
+                    AND json_extract(body, '$.fields.entry_id') IN (SELECT value FROM json_each(?3))
+                    AND (?4 IS NULL OR after_store_index<?4)
+            )
+            SELECT entry_id, store_index, local_id FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY entry_id ORDER BY store_index, local_id
+                ) AS position FROM operations
+            ) WHERE position=1",
+        )?;
+        let rows = statement.query_map(
+            params![subject, incarnation, serde_json::to_string(entries)?, before_index],
+            |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))),
+        )?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// Resolve physical prefix coverage independently of the bounded timeline window.
+    /// Read only typed truncation bounds, never materialize the omitted transcript bodies.
+    pub(crate) fn timeline_retention_is_explicit_at(
+        &self,
+        subject: &str,
+        incarnation: &str,
+        before_index: Option<u64>,
+        required_through: u64,
+    ) -> Result<bool> {
+        if required_through == 0 {
+            return Ok(true);
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT body -> '$.fields.body.omitted_from_sequence',
+                    body -> '$.fields.body.omitted_to_sequence'
+             FROM claims
+             WHERE subject=?1 AND kind='harness.timeline'
+                 AND json_extract(body, '$.fields.incarnation_id')=?2
+                 AND json_extract(body, '$.fields.operation')='append'
+                 AND json_extract(body, '$.fields.entry_type')='truncation'
+                 AND (?3 IS NULL OR store_index<?3)
+             UNION ALL
+             SELECT body -> '$.fields.body.omitted_from_sequence',
+                    body -> '$.fields.body.omitted_to_sequence'
+             FROM local_observations
+             WHERE subject=?1 AND kind='harness.timeline'
+                 AND json_extract(body, '$.fields.incarnation_id')=?2
+                 AND json_extract(body, '$.fields.operation')='append'
+                 AND json_extract(body, '$.fields.entry_type')='truncation'
+                 AND (?3 IS NULL OR after_store_index<?3)",
+        )?;
+        let rows = statement.query_map(params![subject, incarnation, before_index], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut intervals = Vec::new();
+        for row in rows {
+            let (from, to) = row?;
+            // Raw JSON scalars preserve unsigned bounds and reject strings, floats and booleans.
+            if let Some((from, to)) = from.and_then(|value| value.parse::<u64>().ok())
+                .zip(to.and_then(|value| value.parse::<u64>().ok()))
+                .filter(|(from, to)| from <= to)
+            {
+                intervals.push((from, to));
+            }
+        }
+        intervals.sort_unstable();
+        let mut covered_through = 0_u64;
+        for (from, to) in intervals {
+            if from > covered_through.saturating_add(1) {
+                break;
+            }
+            covered_through = covered_through.max(to);
+            if covered_through >= required_through {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The newest local timeline observation for one incarnation at or before a snapshot.
@@ -16560,7 +16754,7 @@ fn resolve_mission_run_inputs(
                 } else {
                     transaction
                         .query_row(
-                            &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                            &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1"),
                             [subject],
                             |row| row.get(0),
                         )
@@ -17112,7 +17306,7 @@ fn normalize_resource_observation(
         // Issue and pull request attribution belongs to its publisher, not to the latest
         // observer or fixer. Keep each named field, including a mission-run-only opener, across
         // observations, so a partial snapshot such as a merge never erases it.
-        if carries_opener(&kind) {
+        if carries_opener(&kind) && input.fields.get("attribution_only") != Some(&Value::Bool(true)) {
             for name in ["opened_by", "opened_by_run"] {
                 if let Some(value) = previous.get(name) {
                     facts.insert(name.into(), value.clone());
@@ -17175,6 +17369,7 @@ fn resource_facts(fields: &BTreeMap<String, Value>) -> Result<BTreeMap<String, V
         "observer",
         "baseline",
         "changed_fields",
+        "attribution_only",
     ];
     Ok(fields
         .iter()
@@ -18595,6 +18790,7 @@ fn append_claim_tx(
         forced_batch,
     )?;
     insert_event(transaction, record.store_index, kind, subject, body)?;
+    custom::flush(transaction)?;
     if kind == "resource.observed" {
         resources::refresh(transaction, subject)?;
     }
@@ -19020,6 +19216,10 @@ fn latest_actual_at(
         let value: Value = serde_json::from_str(&body)?;
         let source = value.get("fields").unwrap_or(&value);
         if let Some(fields) = source.as_object() {
+            if kind == "resource.observed" {
+                resources::merge_observation(&mut merged, fields);
+                continue;
+            }
             if registry
                 .claim(&kind)
                 .is_some_and(|spec| spec.cardinality == st3_schema::Cardinality::StateTransition)
@@ -19385,6 +19585,53 @@ fn current_harness_at(
     Ok(view)
 }
 
+fn claude_attachment_query() -> String {
+    format!(
+        "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
+         FROM claims INDEXED BY claims_claude_attachment_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.diagnostic' AND claims.store_index<=?2
+           AND {INCARNATION_OF_CLAIM}=?3
+           AND json_extract(claims.body, '$.fields.code') IN ('claude-channel-unattached','claude-channel-attached')
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    )
+}
+
+/// Channel readiness is independent of hook activity. A current driver owns this fence;
+/// MCP initialization under its delivery binding, or runtime replacement, clears it.
+fn claude_attachment_fence(
+    connection: &Connection,
+    subject: &str,
+    incarnation: &str,
+    at_index: u64,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
+    let claim = connection.prepare_cached(&claude_attachment_query())?.query_row(params![subject, at_index, incarnation], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    }).optional()?;
+    let Some((claim, body, at)) = claim else {
+        return Ok(None);
+    };
+    let body: Value = serde_json::from_str(&body)?;
+    if body["fields"]["code"] == "claude-channel-attached" {
+        return Ok(None);
+    }
+    let starting = body["fields"]["status"] == "starting";
+    Ok(Some(crate::model::CurrentHarnessView {
+        state: if starting { "starting" } else { "blocked" }.into(),
+        driver: Some("claude".into()),
+        incarnation_id: incarnation.into(),
+        transport: Some("claude-channel".into()),
+        reason: Some("claude-channel-unattached".into()),
+        blocked_on: Some("channel".into()),
+        ask: None,
+        input_buffer: None,
+        exit: None,
+        claim,
+        since_unix_ms: at.parse()?,
+        observed_at_unix_ms: at.parse()?,
+    }))
+}
+
 fn current_harness_fold_at(
     connection: &Connection,
     subject: &str,
@@ -19504,6 +19751,10 @@ fn current_harness_fold_at(
             since_unix_ms: observed_at_unix_ms.parse::<u128>()?,
             observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
         }));
+    }
+
+    if let Some(harness) = claude_attachment_fence(connection, subject, incarnation_id, at_index)? {
+        return Ok(Some(harness));
     }
 
     // The observations of this runtime epoch, newest first in canonical order, so every node that
@@ -20494,7 +20745,7 @@ fn pull_request_state_tx(connection: &Connection, target: &str) -> Result<Option
             &canonical_sql(
                 "SELECT json_extract(body, '$.fields'), accepted_at_unix_ms FROM claims
              WHERE subject=?1 AND kind='resource.observed'
-             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+             ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1",
             ),
             [subject],
             |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
@@ -24524,6 +24775,7 @@ fn replay_graph_from_nothing_tx(transaction: &Transaction<'_>) -> Result<(), St3
     rebuild_planning_tx(transaction).map_err(internal)?;
     resources::rebuild(transaction).map_err(internal)?;
     glass_heads::rebuild(transaction).map_err(internal)?;
+    custom::rebuild(transaction).map_err(internal)?;
     Ok(())
 }
 
@@ -29593,7 +29845,7 @@ agent "test/empty" { command "true" }
             .query_row("PRAGMA cache_size", [], |row| row.get(0))
             .unwrap();
         assert_eq!(writer_cache_kib, -32768);
-        assert_eq!(reader_cache_kib, -8192);
+        assert_eq!(reader_cache_kib, -(smallclaims::sqlite::read_cache_kib() as i64));
     }
 
     #[test]
@@ -30755,11 +31007,9 @@ agent "test/empty" { command "true" }
         envelope: &ReplicaEnvelope,
         update: impl FnOnce(&mut ReplicaEnvelopePayload),
     ) -> ReplicaEnvelope {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(envelope.payload.as_bytes())
-            .expect("envelope base64");
+        let bytes = envelope.payload.bytes().expect("envelope base64");
         let mut payload: ReplicaEnvelopePayload =
-            ciborium::from_reader(bytes.as_slice()).expect("envelope CBOR");
+            ciborium::from_reader(bytes).expect("envelope CBOR");
         update(&mut payload);
         let mut bytes = Vec::new();
         ciborium::into_writer(&payload, &mut bytes).expect("updated envelope CBOR");
@@ -30771,7 +31021,7 @@ agent "test/empty" { command "true" }
                 envelope.accepted_at_unix_ms,
                 &bytes,
             ),
-            payload: base64::engine::general_purpose::STANDARD.encode(bytes),
+            payload: bytes.into(),
             ..envelope.clone()
         }
     }
@@ -30889,6 +31139,212 @@ agent "test/empty" { command "true" }
             .next()
             .expect("published mission")
             .clone()
+    }
+
+    #[test]
+    fn loop_execution_clock_uses_only_its_direct_children_and_current_steps() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "clock-parent" state="ready" {
+  goal "Keep two independent loops open."
+  concurrent-runs max=20
+  step "first" { agentless }
+  step "other" { agentless }
+}
+mission "clock-worker" state="ready" {
+  goal "Start the loop clock when work is claimed."
+  concurrent-runs max=20
+  step "work" { assigned-to "agent/worker" }
+  step "automatic" { agentless }
+}
+mission "clock-automatic" state="ready" {
+  goal "Start an automatic round at creation."
+  concurrent-runs max=20
+  step "automatic" { agentless }
+}
+"#,
+            "clock-missions",
+        );
+        let request = |mission: &str, key: &str| MissionRunRequest {
+            mission: mission.into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: None,
+            mode: None,
+            inputs: BTreeMap::new(),
+            idempotency_key: key.into(),
+        };
+        let parent = store
+            .create_mission_run(&request("clock-parent", "clock-parent"))
+            .unwrap();
+        let other_root = store
+            .create_mission_run(&request("clock-parent", "other-root"))
+            .unwrap();
+        let parent_step = &parent
+            .steps
+            .iter()
+            .find(|step| step.step == "first")
+            .unwrap()
+            .subject;
+        let sibling_step = &parent
+            .steps
+            .iter()
+            .find(|step| step.step == "other")
+            .unwrap()
+            .subject;
+        let child = store
+            .create_child_mission_run(
+                &request("clock-worker", "clock-child"),
+                &parent,
+                parent_step,
+                None,
+            )
+            .unwrap();
+        let sibling = store
+            .create_child_mission_run(
+                &request("clock-automatic", "clock-sibling"),
+                &parent,
+                sibling_step,
+                None,
+            )
+            .unwrap();
+        let foreign = store
+            .create_child_mission_run(
+                &request("clock-automatic", "foreign-child"),
+                &other_root,
+                parent_step,
+                None,
+            )
+            .unwrap();
+        for excluded in [&sibling, &foreign] {
+            store
+                .connection
+                .write()
+                .execute(
+                    "UPDATE mission_runs SET created_at_unix_ms='1' WHERE id=?1",
+                    [&excluded.id],
+                )
+                .unwrap();
+        }
+        // A worker round that has not been claimed does not start the clock at creation.
+        assert_eq!(
+            store
+                .loop_first_execution_at(&parent.subject, parent_step)
+                .unwrap(),
+            None
+        );
+        let work = child.steps.iter().find(|step| !step.agentless).unwrap();
+        let automatic = child.steps.iter().find(|step| step.agentless).unwrap();
+        for (index, (step, at)) in [(work, "100"), (work, "90"), (automatic, "80")]
+            .into_iter()
+            .enumerate()
+        {
+            let claim = store
+                .append_claim(&ClaimInput {
+                    subject: step.subject.clone(),
+                    kind: "work.claimed".into(),
+                    actor: Some("agent/worker".into()),
+                    fields: BTreeMap::from([("attempt".into(), Value::from(index + 1))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("clock-claim-{index}")),
+                })
+                .unwrap();
+            store
+                .connection
+                .write()
+                .execute(
+                    "UPDATE claims SET accepted_at_unix_ms=?2 WHERE id=?1",
+                    params![claim.id, at],
+                )
+                .unwrap();
+        }
+        STEPS_ENRICHED.with(|enriched| enriched.set(0));
+        let (clock, reads) = smallclaims::touched::record(|| {
+            store
+                .loop_first_execution_at(&parent.subject, parent_step)
+                .unwrap()
+        });
+        assert_eq!(clock, Some(80));
+        assert_eq!(
+            STEPS_ENRICHED.with(std::cell::Cell::get),
+            0,
+            "the clock must not read presentation history"
+        );
+        assert!(reads.contains(&format!("children-of-step:{parent_step}")));
+        assert!(reads.contains(&child.subject));
+        assert!(reads.contains(&child.generation));
+        let generation_change = Change {
+            subject: "run-generation/new-round-generation".into(),
+            kind: "run-generation.created".into(),
+            actor: None,
+            body: json!({"fields": {"run": child.subject}}).to_string(),
+        };
+        assert!(
+            crate::incremental::change_keys(&generation_change)
+                .iter()
+                .any(|key| reads.contains(key)),
+            "a successor generation must invalidate the clock"
+        );
+        assert!(reads.contains(&work.subject));
+        assert!(reads.contains(&automatic.subject));
+        assert!(!reads.contains(&sibling.subject));
+        assert!(!reads.contains(&foreign.subject));
+        // Earlier terminal rounds still determine the clock.
+        store
+            .set_mission_run_state(&child.id, "completed", "terminal", None)
+            .unwrap();
+        assert_eq!(
+            store
+                .loop_first_execution_at(&parent.id, parent_step)
+                .unwrap(),
+            Some(80)
+        );
+        // Claims on predecessor-generation steps cannot start the current round.
+        store
+            .connection
+            .write()
+            .execute(
+                "UPDATE step_runs SET generation_id=?2 WHERE run_id=?1",
+                params![child.id, generation_id_from_subject(&parent.generation)],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .loop_first_execution_at(&parent.id, parent_step)
+                .unwrap(),
+            Some(child.created_at_unix_ms)
+        );
+        // No steps, like entirely agentless steps, means the round starts at creation.
+        let empty = store
+            .create_child_mission_run(
+                &request("clock-automatic", "clock-empty"),
+                &parent,
+                parent_step,
+                None,
+            )
+            .unwrap();
+        store
+            .connection
+            .write()
+            .execute("DELETE FROM step_runs WHERE run_id=?1", [&empty.id])
+            .unwrap();
+        store
+            .connection
+            .write()
+            .execute(
+                "UPDATE mission_runs SET created_at_unix_ms='50' WHERE id=?1",
+                [&empty.id],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .loop_first_execution_at(&parent.id, parent_step)
+                .unwrap(),
+            Some(50)
+        );
     }
 
     #[test]
@@ -37218,7 +37674,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     &bytes,
                 ),
                 accepted_at_unix_ms: batch.accepted_at_unix_ms,
-                payload: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                payload: bytes.into(),
                 member_key: None,
                 signature: None,
             }
@@ -38072,7 +38528,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            15
+            16
         );
         assert_eq!(
             connection
@@ -38146,7 +38602,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            15
+            16
         );
     }
 
@@ -38179,7 +38635,7 @@ version 2
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         assert_eq!(planner_column, 1);
     }
 
@@ -38574,6 +39030,51 @@ version 2
             unindexed.is_empty(),
             "unindexed foreign keys: {unindexed:?}"
         );
+    }
+
+    #[test]
+    fn claude_attachment_lookup_cost_ignores_hook_runtime_and_predecessor_history() {
+        let store = Store::open_memory("node").unwrap();
+        let append = |kind: &str, incarnation: &str, code: &str, key: &str| {
+            let fields = match kind {
+                "harness.diagnostic" => json!({"incarnation_id":incarnation,
+                    "code":code,"status":"blocked","severity":"warning","reason":"cost fixture"}),
+                "harness.observed" => json!({"incarnation_id":incarnation,"state":"idle","driver":"claude"}),
+                "runtime.observed" => json!({"incarnation_id":incarnation,"status":"running",
+                    "runtime_id":"grove/cedar","reachability":"local"}),
+                _ => unreachable!(),
+            };
+            store.append_claim(&ClaimInput {
+                subject: "agent/grove/cedar".into(),
+                kind: kind.into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None,
+                idempotency_key: Some(key.into()),
+            }).unwrap();
+        };
+        append("harness.diagnostic", "current", "claude-channel-unattached", "attach");
+        let work = || {
+            let connection = store.connection.lock().unwrap();
+            let mut statement = connection.prepare(&claude_attachment_query()).unwrap();
+            let claim: String = statement.query_row(
+                params!["agent/grove/cedar", i64::MAX, "current"], |row| row.get(0),
+            ).unwrap();
+            (claim, statement.get_status(rusqlite::StatementStatus::VmStep))
+        };
+        let before = work();
+        for index in 0..128 {
+            for (kind, incarnation, code) in [
+                ("harness.observed", "current", ""),
+                ("runtime.observed", "current", ""),
+                ("harness.diagnostic", "current", "native-delivery-recovered"),
+                ("harness.diagnostic", "previous", "claude-channel-attached"),
+            ] {
+                append(kind, incarnation, code, &format!("history:{kind}:{incarnation}:{index}"));
+            }
+        }
+        let after = work();
+        assert_eq!(after.0, before.0);
+        assert!(after.1 <= before.1 + 20, "attachment lookup grew with unrelated history: {before:?} -> {after:?}");
     }
 
     #[test]
@@ -44660,6 +45161,121 @@ mission "review-guardrail" state="ready" {
     }
 
     #[test]
+    fn late_receipt_preserves_observation_and_next_head_push_delivers() {
+        let store = Store::open_memory("node").unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        let repository = "resource/github/acme/demo";
+        let subject = format!("{repository}/pull-request/9");
+        let observed = json!({
+            "number": 9, "state": "open", "title": "Ready", "draft": false,
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "checks": [{"name": "build", "conclusion": "success"}]
+        });
+        store.append_claim(&ClaimInput {
+            subject: subject.clone(), kind: "resource.observed".into(), actor: None,
+            fields: BTreeMap::from([
+                ("kind".into(), json!("vcs.pull-request")),
+                ("facts".into(), observed.clone()),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        std::fs::write(spool.path().join("1.json"), serde_json::to_vec(&crate::recorder::Receipt {
+            schema: "st3.recorder.receipt.v1".into(),
+            url: "https://github.com/acme/demo/pull/9".into(),
+            actor: "agent/node.builder".into(), mission_run: Some("created".into()),
+            exit_code: Some(0), at: "2026-10-03T12:00:00Z".into(),
+        }).unwrap()).unwrap();
+        assert_eq!(crate::recorder_receipts::ingest_once(&store, spool.path()).unwrap(), 1);
+        let recorded = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
+        let previous = json!({"pull_requests": [{
+            "number": 9, "state": "open", "draft": false
+        }]});
+        let current = json!({"pull_requests": [{
+            "number": 9, "new": false, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }]});
+        let items = discovered_collection_items(
+            repository, "pull_requests", Some(&previous), &current,
+            &mut |_| Some(recorded.clone()),
+        );
+        assert!(items[0].deliver, "a late receipt must not lose the next head's review");
+        for field in ["state", "title", "head_sha", "checks"] {
+            assert_eq!(recorded[field], observed[field], "{field}");
+        }
+        assert_eq!(recorded["opened_by"], "agent/node.builder");
+        let projected = store.resource_collection_page(None, None, Some(&subject), None, 10).unwrap();
+        assert_eq!(projected[0]["facts"], recorded);
+    }
+
+    #[test]
+    fn receipt_born_resources_receive_first_observer_issue_and_review_delivery() {
+        let store = Store::open_memory("node").unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        let repository = "resource/github/acme/demo";
+        for (field, path, segment) in [
+            ("issues", "issues", "issue"),
+            ("pull_requests", "pull", "pull-request"),
+        ] {
+            let receipt = crate::recorder::Receipt {
+                schema: "st3.recorder.receipt.v1".into(),
+                url: format!("https://github.com/acme/demo/{path}/8"),
+                actor: "agent/node.builder".into(),
+                mission_run: Some("created".into()),
+                exit_code: Some(0),
+                at: "2026-10-03T12:00:00Z".into(),
+            };
+            std::fs::write(
+                spool.path().join(format!("{field}.json")),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::recorder_receipts::ingest_once(&store, spool.path()).unwrap(),
+                1
+            );
+            let subject = format!("{repository}/{segment}/8");
+            let recorded = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
+            assert!(recorded.get("state").is_none());
+            let previous = json!({"repository_id": 1, field: []});
+            let current = json!({"repository_id": 1, field: [{
+                "number": 8, "state": "open", "draft": false,
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }]});
+            let items = discovered_collection_items(
+                repository, field, Some(&previous), &current,
+                &mut |_| Some(recorded.clone()),
+            );
+            assert_eq!(items.len(), 1);
+            assert!(items[0].deliver, "{field} must deliver its first observed state");
+            assert_eq!(items[0].facts["opened_by"], "agent/node.builder");
+            assert_eq!(items[0].facts["opened_by_run"], "mission-run/created");
+            let observed = items[0].facts.clone();
+            assert!(
+                discovered_collection_items(
+                    repository, field, Some(&current), &current,
+                    &mut |_| Some(observed.clone()),
+                )
+                .is_empty(),
+                "the same sighting must not deliver twice"
+            );
+            assert!(
+                !discovered_collection_items(
+                    repository, field, None, &current,
+                    &mut |_| Some(recorded.clone()),
+                )[0].deliver,
+                "a repository baseline must not deliver receipt-born items"
+            );
+            let mut old_item = current.clone();
+            old_item[field][0]["new"] = Value::Bool(false);
+            assert!(
+                !discovered_collection_items(
+                    repository, field, Some(&previous), &old_item,
+                    &mut |_| Some(recorded.clone()),
+                )[0].deliver,
+                "an explicitly historical item must not deliver"
+            );
+        }
+    }
+
+    #[test]
     fn repository_collections_create_one_typed_resource_for_each_new_item() {
         let previous = json!({"pull_requests": [], "issues": []});
         let current = json!({
@@ -47215,6 +47831,7 @@ impl Store {
         owned_sets::project_tx(&transaction)?;
         project_replicated_mission_runs(&transaction)?;
         rebuild_planning_tx(&transaction).map_err(internal)?;
+        custom::flush(&transaction).map_err(internal)?;
         let accepted_heads = replica_heads(&transaction).map_err(internal)?;
         let accepted_through = accepted_heads.get(&input.peer).copied().unwrap_or(0);
         let missing_sequences = missing_ranges
@@ -47404,7 +48021,22 @@ fn append_claim_with_fences(
                         "placement changed; read the current handoff before overriding its sources"));
                 }
             }
-            let mut stored_fields = normalize_resource_observation(transaction, input)?;
+            // Check under the writer lock: concurrent captures must not append a second opener
+            // or replace an existing observation with another attribution-only claim.
+            if input.kind == "resource.observed"
+                && input.fields.get("attribution_only") == Some(&Value::Bool(true))
+                && let Some(previous) = latest_actual(transaction, &input.subject).map_err(internal)?
+                && previous.get("facts").unwrap_or(&previous).as_object().is_some_and(|facts| {
+                    facts.contains_key("opened_by") || facts.contains_key("opened_by_run")
+                })
+                && let Some(existing) = latest_claim_of_kind_tx(transaction, &input.subject, "resource.observed")?
+            {
+                return Ok((existing, false));
+            }
+            let mut stored_fields = custom::prepare(transaction, input)?;
+            if let Some(fields) = normalize_resource_observation(transaction, input)? {
+                stored_fields = Some(fields);
+            }
             if let Some(fields) = glasses::prepare(transaction, input)? {
                 stored_fields = Some(fields);
             }
@@ -47654,6 +48286,9 @@ const PROJECTION_DIGEST_TABLES: &[(&str, &[&str])] = &[
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),
+    ("custom_registrations", &[]),
+    ("custom_sources", &[]),
+    ("custom_dependencies", &[]),
     ("mission_revisions", &["created_index"]),
     ("mission_definitions", &[]),
     ("mission_runs", &[]),

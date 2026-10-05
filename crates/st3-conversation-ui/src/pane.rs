@@ -129,10 +129,11 @@ impl Selection {
     }
 }
 
-/// The display columns a message's edge ("▎ ", after any indent) takes at a line's start.
+/// The display columns a message's edge ("▎ ", or "● " on the first row of mail to the person,
+/// after any indent) takes at a line's start.
 fn edge(line: &str) -> usize {
     let indent = line.len() - line.trim_start_matches(' ').len();
-    match line[indent..].strip_prefix('▎') {
+    match line[indent..].strip_prefix(['▎', '●']) {
         Some(rest) if rest.is_empty() || rest.starts_with(' ') => indent + 2,
         _ => 0,
     }

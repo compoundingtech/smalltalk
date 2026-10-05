@@ -9,8 +9,12 @@ import subprocess
 HARNESSES = ("claude", "codex", "opencode", "pi", "omp")
 REQUIRED = {
     *(f"api::mailbox::tests::{harness}_boot_and_reconnect_never_inject_old_mail" for harness in HARNESSES),
+    *(f"api::mailbox::tests::{harness}_restart_recovers_recent_unoffered_mail_once" for harness in HARNESSES),
     *(f"boot_canaries::{harness}::a_suspended_seat_resumes_its_own_native_session" for harness in HARNESSES),
     "daemon_restart::delivered_unread_mail_stays_in_the_mailbox_after_seat_restart",
+    "api::mailbox::tests::native_poll_recovers_unoffered_preboot_mail_until_its_current_offer_finishes",
+    "boot_canaries::claude_missing_channel_blocks_and_recovers_early_mail_without_replay",
+    "boot_canaries::claude_uninitialized_channel_blocks_until_native_attachment",
 }
 
 
