@@ -27,11 +27,20 @@ and the gate has only `contents: read` permission. Forks do not receive publishi
 The Linux gate runs two test partitions plus Clippy and fleet compatibility on separate runners.
 `linux-gate` is the single required check: it needs the three stage jobs and the named mail redelivery
 check, and passes only when every one succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
-`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm` and `typescript-client`
+`nscloud-ubuntu-24.04-amd64-8x16-with-features`; `genie-freshness`, `isolation-vm` and `typescript-client`
 use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggregate uses GitHub-hosted
 `ubuntu-latest`, so it cannot queue behind build or benchmark jobs. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
-limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
+limit of about five runners at once.
+
+Required Namespace jobs use run affinity and inline `job.priority=1` for merge groups and
+`ci-priority` PRs, or `job.priority=10` for ordinary PRs. Optional benchmarks keep their existing
+labels. Namespace schedules lower priority numbers first, ahead of unprioritized jobs, when
+capacity is exhausted; run affinity prevents another workflow from taking the runner started
+for a required job. This uses existing capacity and shapes. See Namespace's
+[job ordering and priority controls](https://namespace.so/docs/solutions/github-actions/runner-controls/job-ordering).
+
+`scripts/ci-linux STAGE` runs one stage:
 
 - `linux-tests` and `linux-tests-shard-2`: prepare the provider component fixtures, build the
   selected test executables with dev/test debug info and incremental compilation disabled,
