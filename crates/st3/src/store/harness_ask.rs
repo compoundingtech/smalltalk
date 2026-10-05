@@ -166,7 +166,7 @@ impl Store {
 mod tests {
     use super::*;
     use st3_schema::harness_control::{Approval, AskAnswer, AskOption, AskQuestion, AskResult, Binding, Models, NativeState, PendingAsk};
-    const SUBJECT: &str = "agent/ask-control";
+    const SUBJECT: &str = "agent/ask-owner.ask-control";
     fn baseline() -> (Store, NativeState, crate::mailbox::Fence) {
         let store = Store::open_memory("ask-owner").unwrap();
         let intent = crate::graph::parse_intent("version 2\nagent \"ask-control\" { workspace \".\"; harness \"omp\" { model \"control-smoke/native-smoke\"; } }", "ask-owner").unwrap();

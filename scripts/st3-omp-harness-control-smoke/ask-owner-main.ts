@@ -11,7 +11,8 @@ await mkdir(root + '/agent'); await mkdir(sessions, { recursive: true });
 // This isolated provider fixture needs no interactive account onboarding.
 await mkdir(root + '/profile');
 await Bun.write(root + '/profile/config.yml', 'startup:\n  setupWizard: false\n  showSplash: false\n');
-const socket = root + '/daemon.sock', subject = 'agent/control-smoke';
+const identity = 'queue-smoke.control-smoke';
+const socket = root + '/daemon.sock', subject = 'agent/' + identity;
 const clean = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('ST_') && !key.startsWith('ST3_') && !key.startsWith('AGENT_') && !key.startsWith('PTY_')));
 const providerRequests = [];
 const scenarios = [
@@ -52,8 +53,8 @@ const server = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: async req => {
 const nativeEnv = {
   ...clean, PI_CODING_AGENT_DIR: root + '/profile', SMOKE_ROOT: root, SMOKE_SOCKET: socket,
   SMOKE_BASE_URL: `http://127.0.0.1:${server.port}/v1`, ST3_ENDPOINT: socket, ST_DRIVER_ROOT: root,
-  ST_DRIVER_AGENT_DIR: root + '/agent', ST_DRIVER_SESSION_DIR: sessions, ST_DRIVER_IDENTITY: 'control-smoke',
-  ST_AGENT: subject, ST_OMP_CHANNEL_BIN: st, ST_OMP_CHANNEL_IDENTITY: 'control-smoke',
+  ST_DRIVER_AGENT_DIR: root + '/agent', ST_DRIVER_SESSION_DIR: sessions, ST_DRIVER_IDENTITY: identity,
+  ST_AGENT: subject, ST_OMP_CHANNEL_BIN: st, ST_OMP_CHANNEL_IDENTITY: identity,
   ST_OMP_CHANNEL_RUNTIME_ID: 'native-smoke', ST_OMP_CHANNEL_SESSION: 'ask-channel', ST_OMP_CHANNEL_SEQ: '1',
 };
 const ptyEnv = { ...clean, PTY_ROOT: root + '/pty' };
