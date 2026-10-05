@@ -37809,7 +37809,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            16
+            17
         );
         assert_eq!(
             connection
@@ -37883,7 +37883,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            16
+            17
         );
     }
 
