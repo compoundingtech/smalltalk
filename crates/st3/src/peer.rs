@@ -2686,8 +2686,8 @@ mod tests {
         let planned = store.mission(&intent, crate::model::IntentInput { kdl: String::new(), source_name: None }).unwrap();
         store.apply_as(&intent, &planned.subject_tokens, "queue-relay-declaration", Some("person/operator")).unwrap();
         store.append_claim(&ClaimInput {
-            subject: "agent/queue-worker".into(), kind: "runtime.observed".into(),
-            actor: Some("agent/queue-worker".into()),
+            subject: "agent/queue-owner.queue-worker".into(), kind: "runtime.observed".into(),
+            actor: Some("agent/queue-owner.queue-worker".into()),
             fields: BTreeMap::from([
                 ("runtime_id".into(), serde_json::json!("native-runtime")),
                 ("incarnation_id".into(), serde_json::json!("incarnation-one")),
@@ -2696,14 +2696,14 @@ mod tests {
             evidence: Vec::new(), expected_subject: None, idempotency_key: None,
         }).unwrap();
         let fence = store.bind_mailbox(&crate::mailbox::Fence::new(
-            "agent/queue-worker", "incarnation-one", "delivery",
+            "agent/queue-owner.queue-worker", "incarnation-one", "delivery",
         )).unwrap();
         let binding = Binding {
             desired_revision: store.harness_control_desired_revision(&fence).unwrap(),
             incarnation_id: "incarnation-one".into(), session_id: "native-one".into(), turn_id: None,
         };
         store.observe_harness_control(&NativeState {
-            subject: "agent/queue-worker".into(), binding: binding.clone(), idle: false,
+            subject: "agent/queue-owner.queue-worker".into(), binding: binding.clone(), idle: false,
             input_supported: true,
             steer: Default::default(),
             models: Models {
@@ -2752,24 +2752,24 @@ mod tests {
             authority_actor: "person/operator".into(), relay: None,
             request: ClientReadOperation::HarnessQueueMutation {
                 action_id: "action/large-enqueue".into(), idempotency_key: "queue-relay-large-enqueue".into(),
-                parameters: serde_json::json!({"subject":"agent/queue-worker","binding":binding,
+                parameters: serde_json::json!({"subject":"agent/queue-owner.queue-worker","binding":binding,
                     "queue_revision":0,"mutation":{"type":"enqueue","content":content,"lane":"follow_up"}}),
             },
         }).await.unwrap();
         assert_eq!(accepted["status"], "accepted");
         let entry_id = accepted["harness_control"]["entry_id"].as_str().unwrap();
-        assert_eq!(store.harness_control_queue("agent/queue-worker").unwrap().entries[0].content, content);
+        assert_eq!(store.harness_control_queue("agent/queue-owner.queue-worker").unwrap().entries[0].content, content);
         let escaped = "\u{1}".repeat(64 * 1024);
         let replaced = relay.read("host/queue-owner", &ClientReadRequest {
             authority_actor: "person/operator".into(), relay: None,
             request: ClientReadOperation::HarnessQueueMutation {
                 action_id: "action/escaped-replace".into(), idempotency_key: "queue-relay-escaped-replace".into(),
-                parameters: serde_json::json!({"subject":"agent/queue-worker","binding":binding,
+                parameters: serde_json::json!({"subject":"agent/queue-owner.queue-worker","binding":binding,
                     "queue_revision":1,"mutation":{"type":"replace","entry_id":entry_id,"content":escaped}}),
             },
         }).await.unwrap();
         assert_eq!(replaced["status"], "applied");
-        let queue = store.harness_control_queue("agent/queue-worker").unwrap();
+        let queue = store.harness_control_queue("agent/queue-owner.queue-worker").unwrap();
         assert_eq!(queue.entries[0].id, entry_id);
         assert_eq!(queue.entries[0].content, escaped);
         worker.abort();
