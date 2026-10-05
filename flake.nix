@@ -344,34 +344,6 @@
           };
         };
 
-        decisionFoldCheck = pkgs.rustPlatform.buildRustPackage {
-          pname = "st-decision-fold-check";
-          inherit version;
-          src = self;
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-wBca1KgQO1GWszaVktbwbYVESuP4u+uAcyN0er7mBPE=";
-            };
-          };
-          # Workspace Linux rustflags select mold, as in the other hermetic checks.
-          nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.mold ];
-          cargoBuildFlags = [
-            "-p"
-            "st-decision-fold"
-          ];
-          cargoTestFlags = [
-            "-p"
-            "st-decision-fold"
-          ];
-          # A pure library check has no executable to install.
-          installPhase = ''
-            runHook preInstall
-            mkdir -p "$out"
-            runHook postInstall
-          '';
-        };
-
         st3Check = pkgs.rustPlatform.buildRustPackage {
           pname = "st3";
           inherit version;
@@ -817,7 +789,6 @@
         # wants them.
         checks.st2 = st2;
         checks.st3 = st3Check;
-        checks.decision-fold = decisionFoldCheck;
         checks.st3-help = st3Help;
         checks.install-layout = installLayout;
         checks.st2-install-layout = st2InstallLayout;

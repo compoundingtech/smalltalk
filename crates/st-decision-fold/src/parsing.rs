@@ -234,8 +234,9 @@ pub fn parse_record(
             answers: frontmatter.required("answers")?.to_string(),
             answered_by: frontmatter.required("answered-by")?.to_string(),
             provenance: match frontmatter.get("provenance") {
-                None | Some("native") => AnswerProvenance::Native,
+                Some("native") => AnswerProvenance::Native,
                 Some("imported") => AnswerProvenance::Imported,
+                None | Some("unknown") => AnswerProvenance::Unknown,
                 Some(other) => return Err(format!("unknown answer provenance `{other}`")),
             },
             choice: match frontmatter.get("choice") {

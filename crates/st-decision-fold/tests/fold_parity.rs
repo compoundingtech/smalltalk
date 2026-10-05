@@ -90,7 +90,7 @@ fn promotion_record_is_the_authority_for_the_link() {
 #[test]
 fn captured_record_preserves_choice_key_provenance_and_body() {
     let mut store = store();
-    store.push(parse_record("capt01", 1001, "---\nrecord: answer\nanswers: root01\nanswered-by: johannes\nchoice: [yes, no]\ncapture-key: a0b1\n---\nHuman chose both.\n").unwrap());
+    store.push(parse_record("capt01", 1001, "---\nrecord: answer\nanswers: root01\nanswered-by: johannes\nprovenance: native\nchoice: [yes, no]\ncapture-key: a0b1\n---\nHuman chose both.\n").unwrap());
     let captured = current_answer(&store, "root01").unwrap();
     assert_eq!(captured.choice, ["yes", "no"]);
     assert_eq!(captured.answered_by, "johannes");

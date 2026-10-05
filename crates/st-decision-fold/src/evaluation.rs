@@ -187,12 +187,18 @@ impl<'a> Evaluator<'a> {
             );
             return Truth::Invalid;
         }
-        if self.answers.get(term.decision.as_str())
-            .is_some_and(|answer| answer.provenance == AnswerProvenance::Imported)
-        {
-            self.report(owner, DefectCode::ImportedAnswer,
-                format!("guard term `{term}` depends on an imported historical answer"));
-            return Truth::Invalid;
+        match self.answers.get(term.decision.as_str()).map(|answer| answer.provenance) {
+            Some(AnswerProvenance::Imported) => {
+                self.report(owner, DefectCode::ImportedAnswer,
+                    format!("guard term `{term}` depends on an imported historical answer"));
+                return Truth::Invalid;
+            }
+            Some(AnswerProvenance::Unknown) => {
+                self.report(owner, DefectCode::UnknownAnswerProvenance,
+                    format!("guard term `{term}` depends on an answer with unknown provenance"));
+                return Truth::Invalid;
+            }
+            Some(AnswerProvenance::Native) | None => {}
         }
         match self.resolutions.get(term.decision.as_str()).copied()
             .unwrap_or(Resolution::Undecidable)

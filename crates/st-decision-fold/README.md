@@ -36,10 +36,10 @@ membership.
 The PR6 custom-subject adapter must check authority, kind and same-tree references
 before accepting records, and must ignore records that fail those checks. Its
 contract requires squatter, wrong-actor, cross-tree-reference and wrong-kind-
-reference tests. The adapter/importer, not untrusted frontmatter, must assign
-`AnswerProvenance::Imported` to imported answers. The legacy parser defaults a
-missing provenance field to `Native` only for file-format compatibility; that is
-not an authentication decision.
+reference tests. The adapter/importer, not untrusted frontmatter, must assign and
+write provenance explicitly: `Imported` for imported answers and `Native` for
+authorized live answers. Missing provenance parses as `Unknown` and cannot settle
+a guard. Provenance is not an authentication decision.
 
 ## Divergences from dotfiles ae542137
 
@@ -63,13 +63,14 @@ not an authentication decision.
 - Answer choices not offered by the referenced request report `unknown-option`,
   including historical answers. An invalid current choice makes the owner and
   guard dependents undecidable; a valid later answer may supersede it.
-- `Answer` carries `AnswerProvenance::{Native, Imported}`. The parser accepts
-  `provenance: native|imported`, defaults omission to native and rejects unknown
-  values. Imported answers remain current/history and can make their own request
-  answered, but every guard term on an imported current answer is invalid with
-  `imported-answer` (even if its owner is moot). A native superseding answer can
-  settle the guard. Imported answers cannot manufacture revival through a false
-  guard during prefix replay.
+- `Answer` carries `AnswerProvenance::{Native, Imported, Unknown}`. The parser
+  accepts `provenance: native|imported|unknown`, defaults omission to unknown and
+  rejects other values. Imported and unknown answers remain current/history and
+  can make their own request answered, but every guard term on either is invalid
+  with `imported-answer` or `unknown-answer-provenance` (even if its owner is moot).
+  An explicitly native superseding answer can settle the guard. Neither imported
+  nor unknown answers can manufacture revival through a false guard during prefix
+  replay.
 - Request traversal and diagnostic lists use deterministic ID order. Valid
   outcomes and defects/revival are invariant under input record permutations;
   cycle/fork diagnostics are correspondingly deterministic.
@@ -78,12 +79,19 @@ The public API is explicitly exported: record/model types, parsing and validatio
 entrypoints, fold/history accessors and the three limit constants. Frontmatter,
 option-building and evaluator implementation helpers are not public API.
 
+Revival detection replays each answer prefix. For a valid chain of length L, it
+evaluates the whole store L times, rebuilding indexes, parsing option material
+and walking the dependency graph each time. Its work is therefore approximately
+L times one store evaluation, not linear in chain length alone. The total-record
+cap bounds L but is not a latency budget; consumers must budget replay cost when
+accepting large histories.
+
 ## Verification
 
 Run `cargo test -p st-decision-fold` and
 `cargo clippy -p st-decision-fold --all-targets -- -D warnings`.
 
-The 28 pure source unit tests remain, with the exhaustive 3,375-store property
+The 43 unit tests include all 28 pure source tests, with the exhaustive 3,375-store property
 extended to all request/answer permutations (59,250 comparisons of resolutions,
 defects and revival). The assumption ordering test still covers equal timestamps.
 Additional regressions cover ambiguous chains/IDs, overflow boundaries, provenance,
@@ -93,9 +101,9 @@ Eight integration tests adapt the fold/parser assertions from
 lifecycle/revival/reframe, assumption history, answer history, promotion links,
 captured answers/manual supersession, and byte-exact material.
 
-The independent hermetic `checks.<system>.decision-fold` gate runs this crate's
-tests. The required Linux tests lane builds it explicitly; coverage does not
-depend on the st2 workspace check.
+The required Linux tests lane runs workspace nextest with the CI profile, which
+includes this crate independently of st2. The st2 workspace check excludes this
+crate; a separate Nix check would duplicate the required nextest coverage.
 
 Filesystem storage, reserved-ID races/replay, seat discovery, CLI option/handle
 normalization, target resolution, and capture retry/conflict/concurrency contracts

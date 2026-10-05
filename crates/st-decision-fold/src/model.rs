@@ -73,6 +73,8 @@ pub enum DefectCode {
     LimitExceeded,
     /// Imported historical answers cannot settle a live guard.
     ImportedAnswer,
+    /// An answer whose provenance is missing cannot settle a live guard.
+    UnknownAnswerProvenance,
 }
 
 impl DefectCode {
@@ -94,6 +96,7 @@ impl DefectCode {
             Self::DuplicateId => "duplicate-id",
             Self::LimitExceeded => "limit-exceeded",
             Self::ImportedAnswer => "imported-answer",
+            Self::UnknownAnswerProvenance => "unknown-answer-provenance",
         }
     }
 }
@@ -183,6 +186,8 @@ pub struct Request {
 pub enum AnswerProvenance {
     Native,
     Imported,
+    /// Missing or explicitly unknown provenance never provides live guard evidence.
+    Unknown,
 }
 
 #[derive(Clone, Debug)]

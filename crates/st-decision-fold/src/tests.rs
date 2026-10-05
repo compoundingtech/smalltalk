@@ -939,11 +939,12 @@ fn imported_yes_no_and_free_text_answers_preserve_history_but_cannot_settle_guar
 }
 
 #[test]
-fn provenance_parser_defaults_legacy_accepts_known_values_and_rejects_unknown_values() {
+fn provenance_parser_defaults_unknown_accepts_known_values_and_rejects_invalid_values() {
     for (field, expected) in [
-        ("", AnswerProvenance::Native),
+        ("", AnswerProvenance::Unknown),
         ("provenance: native\n", AnswerProvenance::Native),
         ("provenance: imported\n", AnswerProvenance::Imported),
+        ("provenance: unknown\n", AnswerProvenance::Unknown),
     ] {
         let document = format!("---\nrecord: answer\nanswers: r0\nanswered-by: human\n{field}---\nOriginal body.\n");
         let Record::Answer(parsed) = parse_record("x0", 1, &document).expect("valid provenance") else {
@@ -952,7 +953,7 @@ fn provenance_parser_defaults_legacy_accepts_known_values_and_rejects_unknown_va
         assert_eq!(parsed.provenance, expected);
         assert_eq!(parsed.body, "Original body.\n");
     }
-    for value in ["unknown", "Native", "IMPORTED", ""] {
+    for value in ["invalid", "Native", "IMPORTED", ""] {
         let document = format!("---\nrecord: answer\nanswers: r0\nanswered-by: human\nprovenance: {value}\n---\n");
         assert!(parse_record("x0", 1, &document).is_err(), "reject provenance {value:?}");
     }
@@ -1000,5 +1001,32 @@ fn revival_and_supersession_history_are_invariant_under_all_record_permutations(
             assert_eq!(answer_history(&store, "r0").iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["x0", "x1"]);
             assert_eq!(current_answer(&store, "r0").expect("chain tip").id, "x1");
         }
+    }
+}
+
+#[test]
+fn missing_provenance_never_settles_a_guard_or_manufactures_revival() {
+    for choice in ["yes", "no", ""] {
+        let mut store = store_of(
+            vec![request("r0", 1, &[], &["yes", "no"]),
+                 request("r1", 2, &[("r0", "yes")], &["a"])],
+            vec![],
+        );
+        store.push(parse_record("legacy", 1, &format!(
+            "---\nrecord: answer\nanswers: r0\nanswered-by: human\nchoice: [{choice}]\n---\nLegacy answer.\n"
+        )).expect("legacy history parses without authority"));
+        let computed = fold(&store);
+        assert_eq!(computed.resolution("r0"), Resolution::State(State::Answered));
+        assert_eq!(computed.resolution("r1"), Resolution::Undecidable);
+        assert!(computed.defects.iter().any(|d|
+            d.code == DefectCode::UnknownAnswerProvenance && d.about.as_deref() == Some("r1")));
+        assert_eq!(current_answer(&store, "r0").expect("history retained").provenance,
+            AnswerProvenance::Unknown);
+        store.answers.push(answer("native", "r0", &["yes"], Some("legacy")));
+        let computed = fold(&store);
+        assert_eq!(computed.resolution("r1"), Resolution::State(State::Pending));
+        assert!(!computed.revived.contains("r1"), "unknown history is not evidence of earlier mootness");
+        assert_eq!(answer_history(&store, "r0").iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["legacy", "native"]);
     }
 }
