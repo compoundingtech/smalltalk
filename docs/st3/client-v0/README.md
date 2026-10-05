@@ -700,6 +700,9 @@ claim what the missing prefix contained. An update whose append is genuinely abs
 reports HTTP `timeline-history-incomplete` with `retryable: false`, `full_resync: false` and
 `retained_history_incomplete: true`; a query bound does not excuse it. Retrying a fresh snapshot
 cannot restore missing claims. Ordinary expired stream cursors remain retryable.
+Prefix coverage considers every retained typed truncation append for the same owner and
+incarnation at the snapshot, including intervals outside the 4,096-operation projection window.
+The coverage query reads interval bounds only; it does not materialize older transcript entries.
 
 ## Pairing and remote access
 

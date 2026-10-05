@@ -3479,43 +3479,6 @@ fn timeline_attribution(owner: &str, desired: &[crate::model::DesiredSubject]) -
     })
 }
 
-fn timeline_retention_is_explicit(claims: &[ClaimRecord], required_through: u64) -> bool {
-    if required_through == 0 {
-        return true;
-    }
-    let mut intervals = claims
-        .iter()
-        .filter_map(|claim| {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            (fields.get("operation").and_then(Value::as_str) == Some("append")
-                && fields.get("entry_type").and_then(Value::as_str) == Some("truncation"))
-            .then(|| {
-                fields
-                    .pointer("/body/omitted_from_sequence")
-                    .and_then(Value::as_u64)
-                    .zip(
-                        fields
-                            .pointer("/body/omitted_to_sequence")
-                            .and_then(Value::as_u64),
-                    )
-            })
-            .flatten()
-            .filter(|(from, to)| from <= to)
-        })
-        .collect::<Vec<_>>();
-    intervals.sort_unstable();
-    let mut covered_through = 0_u64;
-    for (from, to) in intervals {
-        if from > covered_through.saturating_add(1) {
-            break;
-        }
-        covered_through = covered_through.max(to);
-        if covered_through >= required_through {
-            return true;
-        }
-    }
-    false
-}
 
 fn normalized_timeline_usage_body(
     body: Value,
@@ -4150,8 +4113,13 @@ pub(super) fn timeline_value(
     let missing_prefix_through = oldest.as_ref().and_then(|claim| {
         claim.body.pointer("/fields/sequence").and_then(Value::as_u64)
     }).unwrap_or(1).saturating_sub(1);
-    let prefix_unavailable =
-        !timeline_retention_is_explicit(&timeline_claims, missing_prefix_through);
+    let prefix_unavailable = if let Some(incarnation) = incarnation {
+        !state.store.timeline_retention_is_explicit_at(
+            owner, incarnation, before, missing_prefix_through,
+        ).map_err(ApiError::internal)?
+    } else {
+        false
+    };
     let window_start = timeline_claims.first().map(crate::store::claim_log_order);
     let missing_appends = {
         let mut retained_entries = BTreeSet::new();
@@ -14016,6 +13984,28 @@ mission "example/zero-run" state="ready" {
         assert_eq!(refresh.code, "cursor-gap");
         assert_eq!(refresh.details["full_resync"], true);
         assert!(!unavailable(&read()));
+        // Coverage remains retained even after the materialization window no longer includes
+        // its truncation entries.
+        state.store.append_local_observations_for_test(
+            &(6..=4_101).map(|sequence| ClaimInput {
+                subject: subject.into(),
+                kind: "harness.timeline".into(),
+                actor: Some(subject.into()),
+                fields: serde_json::from_value(entry(
+                    sequence, "status", json!({"status":"running"}),
+                )).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            }).collect::<Vec<_>>(),
+        );
+        let bounded = read();
+        assert!(!unavailable(&bounded));
+        assert!(bounded["items"].as_array().unwrap().iter().any(|item| {
+            item["body"]["code"] == "timeline-query-limited"
+        }));
+        let followed = conversation_read_now(&state, &session, &id, None).unwrap();
+        assert!(!unavailable(&followed));
     }
 
     #[test]

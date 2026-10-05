@@ -14027,6 +14027,66 @@ impl Store {
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
+    /// Resolve physical prefix coverage independently of the bounded timeline window.
+    /// Read only typed truncation bounds, never materialize the omitted transcript bodies.
+    pub(crate) fn timeline_retention_is_explicit_at(
+        &self,
+        subject: &str,
+        incarnation: &str,
+        before_index: Option<u64>,
+        required_through: u64,
+    ) -> Result<bool> {
+        if required_through == 0 {
+            return Ok(true);
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT body -> '$.fields.body.omitted_from_sequence',
+                    body -> '$.fields.body.omitted_to_sequence'
+             FROM claims
+             WHERE subject=?1 AND kind='harness.timeline'
+                 AND json_extract(body, '$.fields.incarnation_id')=?2
+                 AND json_extract(body, '$.fields.operation')='append'
+                 AND json_extract(body, '$.fields.entry_type')='truncation'
+                 AND (?3 IS NULL OR store_index<?3)
+             UNION ALL
+             SELECT body -> '$.fields.body.omitted_from_sequence',
+                    body -> '$.fields.body.omitted_to_sequence'
+             FROM local_observations
+             WHERE subject=?1 AND kind='harness.timeline'
+                 AND json_extract(body, '$.fields.incarnation_id')=?2
+                 AND json_extract(body, '$.fields.operation')='append'
+                 AND json_extract(body, '$.fields.entry_type')='truncation'
+                 AND (?3 IS NULL OR after_store_index<?3)",
+        )?;
+        let rows = statement.query_map(params![subject, incarnation, before_index], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut intervals = Vec::new();
+        for row in rows {
+            let (from, to) = row?;
+            // Raw JSON scalars preserve unsigned bounds and reject strings, floats and booleans.
+            if let Some((from, to)) = from.and_then(|value| value.parse::<u64>().ok())
+                .zip(to.and_then(|value| value.parse::<u64>().ok()))
+                .filter(|(from, to)| from <= to)
+            {
+                intervals.push((from, to));
+            }
+        }
+        intervals.sort_unstable();
+        let mut covered_through = 0_u64;
+        for (from, to) in intervals {
+            if from > covered_through.saturating_add(1) {
+                break;
+            }
+            covered_through = covered_through.max(to);
+            if covered_through >= required_through {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The newest local timeline observation for one incarnation at or before a snapshot.
     pub fn latest_local_timeline_at(
         &self,
