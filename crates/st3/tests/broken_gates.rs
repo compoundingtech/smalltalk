@@ -220,11 +220,9 @@ mission "example/preview" state="ready" {
   step "work" {
     agentless
     gate "checked" {
-      exec {
-        host "orchid"
-        workspace "."
-        command "touch gate-ran; exit 2"
-      }
+      exec "touch gate-ran; exit 2"
+      host "orchid"
+      workspace "."
     }
   }
 }
