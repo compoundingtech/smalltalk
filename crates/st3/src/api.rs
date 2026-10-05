@@ -402,6 +402,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::conversation_changes),
         )
         .route(
+            "/v1/client/conversations/{id}/prepare",
+            get(client_v0::conversation_prepare),
+        )
+        .route(
             "/v1/client/conversations/{id}/stream",
             get(client_v0::conversation_stream),
         )

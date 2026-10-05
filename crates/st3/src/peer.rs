@@ -70,6 +70,9 @@ pub const CLIENT_READ_FORWARD_PATH: &str = "/v1/internal/client-read/forward";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ClientReadOperation {
+    PrepareConversation {
+        session_id: String,
+    },
     ConversationChanges {
         session_id: String,
         after: Option<String>,
@@ -1016,6 +1019,9 @@ async fn receive_client_read(
         }
         let client = st3_client::Client::unix_as(state.backend().socket(), &request.authority_actor);
         match request.request {
+            ClientReadOperation::PrepareConversation { session_id } => {
+                Ok(serde_json::to_value(client.conversation_prepare(&session_id).await?.value)?)
+            }
             ClientReadOperation::ConversationChanges {
                 session_id,
                 after,
@@ -3183,7 +3189,7 @@ mod tests {
             authority_actor: "person/test".into(),
             relay: None,
             request: ClientReadOperation::Timeline {
-                session_id: session.id,
+                session_id: session.id.clone(),
                 limit: 20,
                 cursor: None,
             },
@@ -3220,6 +3226,32 @@ mod tests {
                 .iter()
                 .any(|entry| entry["body"]["text"] == "Relay owner answer")
         );
+
+        for operation in [
+            ClientReadOperation::PrepareConversation { session_id: session.id.clone() },
+            ClientReadOperation::ConversationChanges { session_id: session.id.clone(), after: None, wait_ms: 0 },
+        ] {
+            let body = serde_json::to_vec(&ClientReadRequest {
+                authority_actor: "person/test".into(), relay: None, request: operation,
+            }).unwrap();
+            let mut request = Request::builder().method("POST").uri(CLIENT_READ_PATH)
+                .body(Body::from(body.clone())).unwrap();
+            *request.headers_mut() = auth.request_headers_for(CLIENT_READ_PATH, "source", &body).unwrap();
+            let response = peer_router(peer.clone(), smalltalk_routes()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), MAX_CLIENT_READ_BYTES).await.unwrap();
+            let value: ApiResponse<Value> = serde_json::from_slice(&bytes).unwrap();
+            if value.value["kind"] == "conversation-preparation" {
+                // Unmanaged discovery is intentionally not cached; readiness is not content.
+                assert_eq!(value.value["state"], "unavailable");
+                assert!(value.value.get("items").is_none());
+            } else {
+                assert_eq!(value.value["kind"], "conversation-changes");
+                assert!(value.value["initial_page"]["items"].as_array().unwrap().iter()
+                    .any(|entry| entry["body"]["text"] == "Relay owner answer"));
+                assert_eq!(value.value["preparation"], "miss");
+            }
+        }
 
         let mut rejected = Request::builder()
             .method("POST")

@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 pub(super) mod raw_terminal;
 pub(super) mod resources;
 pub(super) mod search;
+mod prepared_conversations;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -351,51 +352,38 @@ fn conversation_owner_host(
     Ok(remote)
 }
 
-/// A conversation's newest page, read here or relayed from its owner.
-async fn conversation_page(
+
+pub(super) async fn conversation_prepare(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let session_id = conversation_session_id(&state, &id)?;
+    let remote = conversation_owner_host(&state, &session, &session_id)?;
+    prepare_conversation_value(&state, &session, &session_id, remote.as_deref()).await.map(Json)
+}
+
+async fn prepare_conversation_value(
     state: &AppState,
     session: &ClientSession,
     session_id: &str,
     remote: Option<&str>,
 ) -> Result<Value, ApiError> {
-    const PAGE: usize = 200;
+    require_scope(session, "read.projections")?;
     if let Some(owner) = remote {
-        let relay = state
-            .client_relay
-            .as_ref()
-            .ok_or_else(|| remote_unavailable(owner))?;
-        return relay
-            .read(
-                owner,
-                &crate::peer::ClientReadRequest {
-                    authority_actor: session.authority_actor.clone(),
-                    relay: None,
-                    request: crate::peer::ClientReadOperation::Timeline {
-                        session_id: session_id.to_owned(),
-                        limit: PAGE,
-                        cursor: None,
-                    },
-                },
-            )
-            .await
-            .map_err(|error| remote_read_error(owner, error));
-    }
-    let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
-    tokio::task::spawn_blocking(move || {
-        timeline_value(
-            &state,
-            &new_client_snapshot(&state),
-            &session,
-            &session_id,
-            &ClientListQuery {
-                limit: Some(PAGE),
-                ..Default::default()
+        let _permit = prepared_conversations::slot().await?;
+        let relay = state.client_relay.as_ref().ok_or_else(|| remote_unavailable(owner))?;
+        return relay.read(owner, &crate::peer::ClientReadRequest {
+            authority_actor: session.authority_actor.clone(),
+            relay: None,
+            request: crate::peer::ClientReadOperation::PrepareConversation {
+                session_id: session_id.to_owned(),
             },
-        )
-        .map(|page| page.0)
-    })
-    .await
-    .map_err(ApiError::internal)?
+        }).await.map_err(|error| remote_read_error(owner, error));
+    }
+    let ready = prepared_conversations::prepare(state, session, session_id).await?;
+    Ok(json!({"kind":"conversation-preparation", "session_id":session_id, "state":if ready { "ready" } else { "unavailable" }}))
 }
 
 /// What changed in a conversation after `after`, waiting up to `wait_ms` for something to.
@@ -449,7 +437,7 @@ async fn follow_conversation(
     let remote = remote.as_deref();
     let failed = |error: &ApiError| conversation_stream_error(&id, error);
     loop {
-        // The cursor first, so nothing that lands while the page is read is lost.
+        // The initial page and its replay cursor are prepared by one owner-local read.
         let start = match conversation_changes_value(&state, &session, &session_id, remote, None, 0)
             .await
         {
@@ -465,20 +453,14 @@ async fn follow_conversation(
                 return;
             }
         };
-        let page = match conversation_page(&state, &session, &session_id, remote).await {
-            Ok(page) => page,
-            Err(error) => {
-                if client_error_retryable(error.status, Some(&error.code)) {
-                    // Say why, so a client showing its last copy can say that copy is stale.
-                    if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true, "code":error.code, "message":error.message}))).is_err() { return; }
-                    tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
-                    continue;
-                }
-                let _ = outbox.send((id.clone(), failed(&error)));
-                return;
-            }
+        let Some(page) = start.get("initial_page") else {
+            let _ = outbox.send((id.clone(), failed(&ApiError::internal(
+                "the conversation owner returned no initial page",
+            ))));
+            return;
         };
         let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":true, "items":page["items"], "has_more":page["page"]["has_more"]});
+        frame["preparation"] = start["preparation"].clone();
         // A page of long tool output can outgrow one frame: keep its newest entries.
         while frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
             let Some(items) = frame["items"]
@@ -599,6 +581,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
     let mut conversations = ConversationFollowers::default();
+    let preparation = prepared_conversations::Owner::new(state.clone(), session.clone());
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
     // The commits already weighed for a reread, whether one is due, and when the last ran.
@@ -623,6 +606,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 // Take every command already waiting, so subscriptions sent together are read
                 // together below.
                 let mut next = Some(incoming);
+                let mut preparation_changed = false;
                 while let Some(incoming) = next.take() {
                     'command: {
                         let Some(Ok(message)) = incoming else { return; };
@@ -634,6 +618,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             if !send_collection(&mut socket, json!({"kind":"error", "message":"invalid collection command"})).await { return; }
                             break 'command;
                         };
+                        preparation_changed |= request.collection == "agents"
+                            || subscriptions.get(&request.id).is_some_and(|held| held.request.collection == "agents");
                         if request.kind == "unsubscribe" {
                             if let Some(presence) = &presence { presence.unfollow(&request.id); }
                             subscriptions.remove(&request.id);
@@ -693,6 +679,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
                 }
+                if preparation_changed { preparation.update(&subscriptions); }
             }
             Some(result) = reads.next(), if !command_waiting && !reads.is_empty() => {
                 let Some((id, generation, result)): Option<(String, u64, _)> = result else { continue; };
@@ -700,12 +687,14 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 if subscription.generation != generation { continue; }
                 subscription.reading = None;
                 if std::mem::take(&mut subscription.dirty) { refresh.push(id.clone()); }
+                let agents_changed = subscription.request.collection == "agents";
                 match deliver_collection(&mut socket, subscription, result).await {
                     Refreshed::Current => {}
                     Refreshed::Retry => { reread_due = true; }
                     Refreshed::Dropped => { subscriptions.remove(&id); }
                     Refreshed::Closed => return,
                 }
+                if agents_changed { preparation.update(&subscriptions); }
             }
             result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
@@ -4531,7 +4520,7 @@ pub(super) fn conversation_session_id(state: &AppState, id: &str) -> Result<Stri
     if id.starts_with("agent/") {
         let status = state
             .store
-            .status_for_subject_prefix_at("agent/", None, true)
+            .status_history(Some(id), None, Some(state.store.index().map_err(ApiError::internal)?))
             .map_err(ApiError::internal)?;
         let subject = status
             .subjects
@@ -4813,9 +4802,11 @@ fn conversation_read_now(
             )])),
         });
     }
-    Ok(
-        json!({"kind":"conversation-changes", "session_id":session_id, "items":items, "next_cursor":conversation_cursor(state, session_id, snapshot.store_index, local_latest, native_latest)}),
-    )
+    let mut value = json!({"kind":"conversation-changes", "session_id":session_id, "items":items, "next_cursor":conversation_cursor(state, session_id, snapshot.store_index, local_latest, native_latest)});
+    if after.is_none() {
+        value["initial_page"] = page;
+    }
+    Ok(value)
 }
 
 /// What a conversation read last saw, so a wake-up can tell cheaply whether anything that
@@ -4968,6 +4959,15 @@ async fn conversation_changes_local(
     after: Option<&str>,
     wait_ms: u64,
 ) -> Result<Value, ApiError> {
+    require_scope(session, "read.projections")?;
+    if after.is_none() {
+        let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
+        return tokio::task::spawn_blocking(move || {
+            prepared_conversations::initial(&state, &session, &session_id)
+        })
+        .await
+        .map_err(ApiError::internal)?;
+    }
     let mut changed = state.event_notify.subscribe();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(30_000));
     let mut mark = ConversationMark::new(state, session_id)?;
@@ -9129,6 +9129,7 @@ pub(super) async fn action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("client_v0/prepared_conversation_tests.rs");
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
