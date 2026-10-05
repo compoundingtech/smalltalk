@@ -420,7 +420,9 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
 fn estimate_lines(estimate: &st3_client::AgentMessageEstimate) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for note in [
-        "Count × recipient allowance; includes useful work.".to_owned(),
+        "Estimate includes useful work.".to_owned(),
+        "Count × recipient allowance.".to_owned(),
+        "Share of priced usage.".to_owned(),
         format!(
             "Fleet fallback ${:.2}–${:.2}/message",
             estimate.fallback_low_microusd as f64 / 1_000_000.0,
@@ -440,15 +442,18 @@ fn estimate_lines(estimate: &st3_client::AgentMessageEstimate) -> Vec<Line<'stat
         };
         let share = match (day.low_percent, day.high_percent) {
             (Some(low), Some(high)) => format!(
-                "{low:.1}–{high:.1}% of priced usage{}",
+                "{low:.1}–{high:.1}%{}",
                 if day.unpriced_tokens > 0 { "*" } else { "" }
             ),
-            _ => "share unknown; no priced usage".into(),
+            _ => "share unknown".into(),
         };
         lines.push(Line::from(span(
+            format!(" {date}{partial} · {} messages", day.messages,),
+            theme::text(),
+        )));
+        lines.push(Line::from(span(
             format!(
-                " {date}{partial} · {} messages · ${:.2}–${:.2} · {share}",
-                day.messages,
+                "   ${:.2}–${:.2} · {share}",
                 day.low_microusd as f64 / 1_000_000.0,
                 day.high_microusd as f64 / 1_000_000.0
             ),
