@@ -9063,11 +9063,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn obsolete_collection_results_are_dropped_after_replace_or_unsubscribe() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() { let _ = sender.send(()); }
+            }
+        }
+        for replace in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state(root.path());
+            let (release, held) = tokio::sync::watch::channel(false);
+            let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+            let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+            let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
+            let app = axum::Router::new().route(
+                "/stream",
+                axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                    let (state, held, dropped, entered, completed) =
+                        (state.clone(), held.clone(), dropped.clone(), entered.clone(), completed.clone());
+                    async move {
+                        upgrade.on_upgrade(move |socket| {
+                            collection_stream_socket_with_reader(
+                                socket, state, ClientSession::local(None).unwrap(), None,
+                                move |state, session, request, permit| {
+                                    let (mut held, dropped, entered, completed) =
+                                        (held.clone(), dropped.clone(), entered.clone(), completed.clone());
+                                    async move {
+                                        let result = collection_items(&state, &session, &request, permit).await;
+                                        if request.id != "held" || request.collection != "work" { return result; }
+                                        let (sender, receiver) = tokio::sync::oneshot::channel();
+                                        tokio::spawn(async move { let _ = receiver.await; let _ = dropped.send(()); });
+                                        let _dropped = Dropped(Some(sender));
+                                        tokio::task::spawn_blocking(move || {
+                                            entered.send(()).unwrap();
+                                            let _ = tokio::runtime::Handle::current().block_on(held.wait_for(|released| *released));
+                                            completed.send(()).unwrap();
+                                            result
+                                        }).await.unwrap()
+                                    }
+                                },
+                            )
+                        })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"held","collection":"work","limit":2}).to_string().into(),
+            )).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), entries.recv()).await.unwrap().unwrap();
+            if !replace {
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"unsubscribe","id":"held"}).to_string().into(),
+                )).await.unwrap();
+            }
+            let visible = if replace { "held" } else { "visible" };
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":visible,"collection":"missions","limit":2}).to_string().into(),
+            )).await.unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["id"], visible);
+            assert_eq!(frame["collection"], "missions");
+            assert_eq!(frame["kind"], "snapshot");
+            // Confirm the obsolete awaiter is gone, then complete its uncancellable
+            // physical worker. A ready marker lets us inspect post-release wire delivery.
+            tokio::time::timeout(Duration::from_secs(5), drops.recv()).await.unwrap().unwrap();
+            release.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), completions.recv()).await.unwrap().unwrap();
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"barrier","collection":"work","limit":2}).to_string().into(),
+            )).await.unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["id"], "barrier", "obsolete result arrived after release: {frame}");
+            assert_eq!(frame["kind"], "snapshot");
+            socket.close(None).await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_during_collection_read_delivers_snapshot_then_followup_changes() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let writer = state.clone();
+        let release = Arc::new(Notify::new());
+        let held = release.clone();
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let (refreshed, mut refreshes) = tokio::sync::mpsc::unbounded_channel();
+        let first = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, held, entered, refreshed, first, probe) =
+                    (state.clone(), held.clone(), entered.clone(), refreshed.clone(), first.clone(), probe.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let (held, entered, refreshed, first, probe) =
+                                    (held.clone(), entered.clone(), refreshed.clone(), first.clone(), probe.clone());
+                                async move {
+                                    let result = collection_items(&state, &session, &request, permit).await;
+                                    if request.id == "held" && first.fetch_add(1, Ordering::SeqCst) == 0 {
+                                        entered.send(()).unwrap();
+                                        held.notified().await;
+                                    } else if request.id == "probe" && probe.fetch_add(1, Ordering::SeqCst) > 0 {
+                                        // A second work read can only come from the all-window
+                                        // commit refresh; the same pass marks held dirty.
+                                        refreshed.send(()).unwrap();
+                                    }
+                                    result
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"held","collection":"missions","limit":2}).to_string().into(),
+        )).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entries.recv()).await.unwrap().unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"probe","collection":"work","limit":2}).to_string().into(),
+        )).await.unwrap();
+        let frame = socket.next().await.unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "probe");
+        let source = "version 2\nmission \"during-read\" state=\"ready\" { goal \"Observed after the fence.\"; step \"check\" { agentless; goal \"Check.\" } }\n";
+        let intent = crate::graph::parse_intent(source, "during-read").unwrap();
+        let planned = writer.store.mission(&intent, IntentInput { kdl: source.into(), source_name: None }).unwrap();
+        writer.store.apply(&intent, &planned.subject_tokens, "during-read").unwrap();
+        signal_changed(&writer);
+        tokio::time::timeout(Duration::from_secs(5), refreshes.recv()).await.unwrap().unwrap();
+        release.notify_one();
+        let mut frames = Vec::new();
+        while frames.len() < 2 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            if frame["id"] == "held" { frames.push(frame); }
+        }
+        assert_eq!(frames[0]["kind"], "snapshot");
+        assert_eq!(frames[0]["items"], json!([]));
+        assert_eq!(frames[1]["kind"], "changes");
+        assert_eq!(frames[1]["upserts"][0]["id"], "mission/during-read");
+        assert_eq!(frames[1]["order"], json!(["mission/during-read"]));
+        assert_ne!(frames[0]["snapshot"], frames[1]["snapshot"]);
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn pending_collection_does_not_block_new_windows_or_conversation_frames() {
         use futures_util::{SinkExt as _, StreamExt as _};
         let root = tempfile::tempdir().unwrap();
         let mut state = test_state(root.path());
         state.native_session_home = Some(root.path().join("native"));
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/dispatch-chat".into(),
+            kind: "runtime.observed".into(),
+            actor: Some("agent/dispatch-chat".into()),
+            fields: BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("dispatch-runtime")),
+                ("incarnation_id".into(), json!("dispatch-runtime:i1")),
+                ("terminal".into(), json!(false)),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let (started, blocked) = (entered.clone(), release.clone());
@@ -9106,7 +9284,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), entered.notified()).await.unwrap();
         for command in [
             json!({"kind":"subscribe","id":"fast","collection":"work","limit":2}),
-            json!({"kind":"subscribe","id":"chat","collection":"conversation","conversation":"session/missing"}),
+            json!({"kind":"subscribe","id":"chat","collection":"conversation","conversation":"agent/dispatch-chat"}),
         ] {
             socket.send(tokio_tungstenite::tungstenite::Message::Text(command.to_string().into()))
                 .await.unwrap();
@@ -9119,8 +9297,10 @@ mod tests {
             received.insert(frame["id"].as_str().unwrap().to_owned(), frame);
         }
         assert_eq!(received["fast"]["kind"], "snapshot");
-        assert_eq!(received["chat"]["kind"], "error");
-        assert_eq!(received["chat"]["retryable"], false);
+        assert_eq!(received["chat"]["kind"], "conversation");
+        assert_eq!(received["chat"]["collection"], "conversation");
+        assert_eq!(received["chat"]["replace"], true);
+        assert_eq!(received["chat"]["session_id"], managed_session_id("agent/dispatch-chat", "dispatch-runtime:i1"));
         // A held ID can be replaced while its previous read is still blocked.
         socket.send(tokio_tungstenite::tungstenite::Message::Text(
             json!({"kind":"subscribe","id":"slow","collection":"agents","limit":2})
@@ -9177,9 +9357,17 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap();
         }
         socket.send(tokio_tungstenite::tungstenite::Message::Text(command.into())).await.unwrap();
-        let extra = tokio::time::timeout(Duration::from_millis(100), starts.recv()).await;
-        // Release before asserting so a failed assertion cannot strand blocking tasks.
+        // A conversation outbox frame positively confirms command/frame dispatch is live
+        // while all eight physical workers are held; no wall-clock negative wait.
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"admission","collection":"conversation","conversation":"session/missing"}).to_string().into(),
+        )).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        let extra = starts.try_recv();
         release.send(true).unwrap();
+        assert_eq!(frame["id"], "admission");
+        assert_eq!(frame["kind"], "error");
         assert!(extra.is_err(), "replacement exceeded the physical read bound");
         tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap();
         let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
