@@ -13102,13 +13102,22 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: None,
             }).unwrap()
         };
-        append(owner, "runtime.observed", BTreeMap::from([
+        // These graph claims have no producer timestamp field. Control only the
+        // private projection fixture's accepted clock, without forging their schema.
+        let graph_clock = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
+        smallclaims::store::configure_projection_writer(&graph_clock).unwrap();
+        let set_graph_time = |claim: ClaimRecord, at: &str| {
+            graph_clock.execute(
+                "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                rusqlite::params![stamp(at).to_string(), claim.id],
+            ).unwrap();
+        };
+        set_graph_time(append(owner, "runtime.observed", BTreeMap::from([
             ("status".into(), json!("running")),
             ("runtime_id".into(), json!("chronology-runtime")),
             ("incarnation_id".into(), json!(incarnation)),
             ("terminal".into(), json!(false)),
-            ("observed_at_unix_ms".into(), json!(stamp("2026-10-04T17:15:16Z"))),
-        ]));
+        ])), "2026-10-04T17:15:16Z");
         let native = |operation: &str, id: &str, sequence: u64, revision: u64,
                       at: &str, role: &str, kind: &str, body: Value| {
             append(owner, "harness.timeline", BTreeMap::from([
@@ -13136,14 +13145,13 @@ mission "example/zero-run" state="ready" {
             ("observed_at_unix_ms".into(), json!(stamp("2026-10-04T21:40:11Z"))),
         ]));
         let session_id = managed_session_id(owner, incarnation);
-        append("message/chronology", "message.sent", BTreeMap::from([
+        set_graph_time(append("message/chronology", "message.sent", BTreeMap::from([
             ("from".into(), json!("agent/peer")),
             ("to".into(), json!(owner)),
             ("session_id".into(), json!(session_id)),
             ("content".into(), json!("continue")),
             ("status".into(), json!("sent")),
-            ("observed_at_unix_ms".into(), json!(stamp("2026-10-04T21:40:12Z"))),
-        ]));
+        ])), "2026-10-04T21:40:12Z");
         let session = ClientSession::local(Some("person/example")).unwrap();
         let initial = conversation_read_now(&state, &session, &session_id, None).unwrap();
         let collision_sequence = (state.store.index().unwrap() + 1) * 4;
