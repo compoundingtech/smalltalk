@@ -567,6 +567,15 @@ fn agents(model: &Model) -> Vec<Agent> {
                     AgentState::NeedsYou
                 }
                 ("waiting", Some("blocked")) => AgentState::NeedsYou,
+                // st withdraws an idle claim it has not heard renewed lately: the harness reads
+                // "indeterminate" and the seat "waiting", though it is up and reachable. That is an
+                // idle seat nobody has spoken to, not one starting (Nathan, 2026-10-05).
+                ("waiting", Some("indeterminate"))
+                    if agent.observation.as_deref() == Some("stale")
+                        && matches!(agent.reachability.as_str(), "reachable" | "local") =>
+                {
+                    AgentState::Idle
+                }
                 ("waiting" | "starting" | "desired", _) => AgentState::Starting,
                 ("stopped", _) => AgentState::Stopped,
                 _ => AgentState::Unknown,
@@ -1521,6 +1530,32 @@ mod tests {
         model.agents = window(vec![resource("failed", "working", Some("human"))]);
         assert_eq!(agents(&model)[0].state, AgentState::Fault);
         model.agents = window(vec![resource("waiting", "indeterminate", Some("human"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+    }
+
+    #[test]
+    fn an_idle_seat_st_has_not_heard_from_lately_reads_idle_not_starting() {
+        let mut model = Model::default();
+        let resource = |state: &str, harness: &str, observation: Option<&str>| {
+            serde_json::json!({
+                "id": "agent/example/quiet", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-10-05T12:00:00Z", "name": "example/quiet",
+                "state": state, "reachability": "reachable", "harness_state": harness,
+                "observation": observation, "blocked_on": "none", "runtime_ids": [], "under": [],
+            })
+        };
+        // Its idle claim went stale: st says waiting/indeterminate; the seat is just idle.
+        model.agents = window(vec![resource("waiting", "indeterminate", Some("stale"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::Idle);
+        // Without that staleness, an indeterminate waiting seat is still starting.
+        model.agents = window(vec![resource("waiting", "indeterminate", Some("current"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+        model.agents = window(vec![resource("waiting", "indeterminate", None)]);
+        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+        // A stale observation on an unreachable seat is no news that it is idle.
+        let mut gone = resource("waiting", "indeterminate", Some("stale"));
+        gone["reachability"] = "unreachable".into();
+        model.agents = window(vec![gone]);
         assert_eq!(agents(&model)[0].state, AgentState::Starting);
     }
 

@@ -34,9 +34,13 @@ function label(slug: string): string {
 }
 
 /** An agent's readable name, as stui names it: the last path segment, and `Parent · OMP` for an omp seat. */
-export function agentName(agent: Pick<Agent, 'id' | 'name'>): string {
+export function agentName(agent: Pick<Agent, 'id' | 'name'> & { host_id?: string | null }): string {
   const parts = (agent.name || agent.id).split('/').filter(Boolean);
-  const slug = parts.at(-1) ?? agent.id;
+  // `st agents new NAME` names a seat HOST.NAME; the host shows beside it, so the label is NAME.
+  const host = agent.host_id?.replace(/^host\//, '').toLowerCase();
+  const dotted = parts.at(-1) ?? agent.id;
+  const dot = dotted.indexOf('.');
+  const slug = host && dot > 0 && dot < dotted.length - 1 && dotted.slice(0, dot).toLowerCase() === host ? dotted.slice(dot + 1) : dotted;
   if (slug.toLowerCase() === 'omp' && parts.length > 1) return `${label(parts.at(-2)!)} · OMP`;
   return label(slug);
 }
@@ -55,7 +59,7 @@ export function harnessName(driver: string | null | undefined): string {
   return '?';
 }
 
-type StateAgent = Pick<Agent, 'state' | 'harness_state' | 'fault' | 'delivery'> & { reason?: string | null };
+type StateAgent = Pick<Agent, 'state' | 'harness_state' | 'fault' | 'delivery'> & { reason?: string | null; observation?: string | null; reachability?: string | null };
 export function agentState(agent: StateAgent): AgentState {
   if (agent.fault) return 'fault';
   // A seat whose message path runs a replaced binary or stopped polling takes no messages,
@@ -65,7 +69,10 @@ export function agentState(agent: StateAgent): AgentState {
     case 'failed': return 'fault';
     case 'running': return agent.harness_state === 'working' ? 'working' : 'idle';
     // Signed out of its provider: a login on its host fixes it, without a restart (Nathan, 2026-10-04).
-    case 'waiting': return agent.harness_state === 'unauthenticated' || agent.harness_state === 'needs-login' || agent.reason === 'providerAuth' ? 'needs-login' : agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
+    // st withdraws an idle claim it has not heard renewed lately: the harness reads "indeterminate"
+    // and the seat "waiting", though it is up and reachable. That is an idle seat nobody has
+    // spoken to, not one starting (Nathan, 2026-10-05).
+    case 'waiting': return agent.harness_state === 'indeterminate' && agent.observation === 'stale' && (agent.reachability === 'reachable' || agent.reachability === 'local') ? 'idle' : agent.harness_state === 'unauthenticated' || agent.harness_state === 'needs-login' || agent.reason === 'providerAuth' ? 'needs-login' : agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
     case 'starting':
     case 'desired': return 'starting';
     case 'stopped': return 'stopped';

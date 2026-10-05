@@ -324,8 +324,11 @@ extern "C" fn on_signal(signal: libc::c_int) {
 impl SignalPipe {
     fn install(signals: &[libc::c_int]) -> Result<Self> {
         let mut fds = [0; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error().into());
+        }
+        for fd in fds {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         }
         // One pipe at a time: a run relays either a terminal or interrupts, never both.
         SIGNAL_WRITE.store(fds[1], std::sync::atomic::Ordering::SeqCst);
