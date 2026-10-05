@@ -458,6 +458,8 @@
           # generator formats the Rust client it checks with rustfmt.
           nativeCheckInputs = [
             pkgs.bashInteractive
+            # Boot-canary ownership fixtures poll the real daemon through curl.
+            pkgs.curl
             # The completion tests drive the stub in each supported shell.
             pkgs.fish
             pkgs.zsh
