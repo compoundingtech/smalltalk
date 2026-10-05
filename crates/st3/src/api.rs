@@ -14631,6 +14631,46 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
     }
 
     #[test]
+    fn doctor_names_failed_admission_even_if_opencode_reports_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"version 2
+agent "fixture" { workspace "/tmp"; harness "opencode" {} }
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let plan = state.store.mission(&intent, crate::model::IntentInput { kdl: source.into(), source_name: None }).unwrap();
+        state.store.apply(&intent, &plan.subject_tokens, "admission-doctor").unwrap();
+        let subject = "agent/node.fixture";
+        let append = |kind: &str, fields: BTreeMap<String, Value>| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields, evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        append("runtime.observed", BTreeMap::from([
+            ("status".into(), json!("running")), ("runtime_id".into(), json!("fixture")),
+            ("incarnation_id".into(), json!("first")),
+        ]));
+        append("harness.diagnostic", BTreeMap::from([
+            ("code".into(), json!("harness-admission-failed")), ("status".into(), json!("degraded")),
+            ("severity".into(), json!("warning")),
+            ("reason".into(), json!("opencode 99.42.7 admission failed at admissionIdleEdge")),
+            ("incarnation_id".into(), json!("first")),
+        ]));
+        append("harness.observed", BTreeMap::from([
+            ("state".into(), json!("ready")), ("driver".into(), json!("opencode")),
+            ("incarnation_id".into(), json!("first")),
+        ]));
+        let report = doctor_report(&state).unwrap().0;
+        let readiness = report.checks.iter().find(|check| check.name == "driver-readiness").unwrap();
+        assert_eq!(readiness.status, "warn");
+        assert!(readiness.message.contains("admissionIdleEdge"), "{readiness:?}");
+        let index = state.store.index().unwrap();
+        let resources = client_agent_resources(&state.store, false, "snapshot", index).unwrap();
+        assert_eq!(resources[0]["state"], "waiting");
+    }
+
+    #[test]
     fn doctor_unread_counts_exclude_historical_recipients_and_people() {
         let store = Store::open_memory("amber").unwrap();
         for (id, recipient) in [

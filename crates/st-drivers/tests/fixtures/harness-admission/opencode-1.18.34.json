@@ -1,0 +1,1384 @@
+{
+  "producerVersion": "1.18.34",
+  "probe": "installed OpenCode loopback server, local model, approved harmless printf",
+  "nonce": "ADMISSION_NATIVE_FIXTURE",
+  "session": "ses_fixture_0",
+  "modelConsumed": true,
+  "apiContract": true,
+  "events": [
+    {
+      "id": "evt_fixture_0",
+      "properties": {},
+      "type": "server.connected"
+    },
+    {
+      "id": "evt_fixture_1",
+      "properties": {
+        "info": {
+          "cost": 0,
+          "directory": "/tmp/admission-fixture/workspace",
+          "id": "ses_fixture_0",
+          "path": "tmp/admission-fixture/workspace",
+          "projectID": "global",
+          "slug": "sunny-squid",
+          "time": {
+            "created": 1790971076612,
+            "updated": 1790971076612
+          },
+          "title": "New session - 2026-10-02T19:57:56.612Z",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          },
+          "version": "1.18.34"
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "session.created"
+    },
+    {
+      "id": "evt_fixture_2",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "directory": "/tmp/admission-fixture/workspace",
+          "id": "ses_fixture_0",
+          "model": {
+            "id": "fixture",
+            "providerID": "admission",
+            "variant": "default"
+          },
+          "path": "tmp/admission-fixture/workspace",
+          "projectID": "global",
+          "slug": "sunny-squid",
+          "time": {
+            "created": 1790971076612,
+            "updated": 1790971076680
+          },
+          "title": "New session - 2026-10-02T19:57:56.612Z",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          },
+          "version": "1.18.34"
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "session.updated"
+    },
+    {
+      "id": "evt_fixture_3",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "id": "msg_fixture_0",
+          "model": {
+            "modelID": "fixture",
+            "providerID": "admission"
+          },
+          "role": "user",
+          "sessionID": "ses_fixture_0",
+          "time": {
+            "created": 1790971076680
+          }
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "id": "evt_fixture_4",
+      "properties": {
+        "part": {
+          "id": "prt_fixture_0",
+          "messageID": "msg_fixture_0",
+          "sessionID": "ses_fixture_0",
+          "text": "ADMISSION_NATIVE_FIXTURE",
+          "type": "text"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971077381
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_5",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "directory": "/tmp/admission-fixture/workspace",
+          "id": "ses_fixture_0",
+          "model": {
+            "id": "fixture",
+            "providerID": "admission",
+            "variant": "default"
+          },
+          "path": "tmp/admission-fixture/workspace",
+          "projectID": "global",
+          "slug": "sunny-squid",
+          "time": {
+            "created": 1790971076612,
+            "updated": 1790971077385
+          },
+          "title": "New session - 2026-10-02T19:57:56.612Z",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          },
+          "version": "1.18.34"
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "session.updated"
+    },
+    {
+      "id": "evt_fixture_6",
+      "properties": {
+        "sessionID": "ses_fixture_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "id": "evt_fixture_7",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "id": "msg_fixture_1",
+          "mode": "build",
+          "modelID": "fixture",
+          "parentID": "msg_fixture_0",
+          "path": {
+            "cwd": "/tmp/admission-fixture/workspace",
+            "root": "/"
+          },
+          "providerID": "admission",
+          "role": "assistant",
+          "sessionID": "ses_fixture_0",
+          "time": {
+            "created": 1790971077394
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          }
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "id": "evt_fixture_8",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "directory": "/tmp/admission-fixture/workspace",
+          "id": "ses_fixture_0",
+          "model": {
+            "id": "fixture",
+            "providerID": "admission",
+            "variant": "default"
+          },
+          "path": "tmp/admission-fixture/workspace",
+          "projectID": "global",
+          "slug": "sunny-squid",
+          "summary": {
+            "additions": 0,
+            "deletions": 0,
+            "files": 0
+          },
+          "time": {
+            "created": 1790971076612,
+            "updated": 1790971077436
+          },
+          "title": "New session - 2026-10-02T19:57:56.612Z",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          },
+          "version": "1.18.34"
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "session.updated"
+    },
+    {
+      "id": "evt_fixture_9",
+      "properties": {
+        "diff": [],
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "session.diff"
+    },
+    {
+      "id": "evt_fixture_10",
+      "properties": {
+        "id": "core/config-reference"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_11",
+      "properties": {
+        "id": "agent"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_12",
+      "properties": {
+        "id": "command"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_13",
+      "properties": {
+        "id": "skill"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_14",
+      "properties": {
+        "id": "models-dev"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_15",
+      "properties": {
+        "id": "config-agent"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_16",
+      "properties": {
+        "id": "config-command"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_17",
+      "properties": {
+        "id": "config-skill"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_18",
+      "properties": {
+        "id": "alibaba"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_19",
+      "properties": {
+        "id": "amazon-bedrock"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_20",
+      "properties": {
+        "id": "anthropic"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_21",
+      "properties": {
+        "id": "azure-cognitive-services"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_22",
+      "properties": {
+        "id": "azure"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_23",
+      "properties": {
+        "id": "cerebras"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_24",
+      "properties": {
+        "id": "cloudflare-ai-gateway"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_25",
+      "properties": {
+        "id": "cloudflare-workers-ai"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_26",
+      "properties": {
+        "id": "cohere"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_27",
+      "properties": {
+        "id": "deepinfra"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_28",
+      "properties": {
+        "id": "gateway"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_29",
+      "properties": {
+        "id": "github-copilot"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_30",
+      "properties": {
+        "id": "gitlab"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_31",
+      "properties": {
+        "id": "google"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_32",
+      "properties": {
+        "id": "google-vertex-anthropic"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_33",
+      "properties": {
+        "id": "google-vertex"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_34",
+      "properties": {
+        "id": "groq"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_35",
+      "properties": {
+        "id": "kilo"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_36",
+      "properties": {
+        "id": "llmgateway"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_37",
+      "properties": {
+        "id": "mistral"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_38",
+      "properties": {
+        "id": "nvidia"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_39",
+      "properties": {
+        "id": "opencode"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_40",
+      "properties": {
+        "id": "snowflake-cortex"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_41",
+      "properties": {
+        "id": "openai-compatible"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_42",
+      "properties": {
+        "id": "openai"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_43",
+      "properties": {
+        "id": "openrouter"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_44",
+      "properties": {
+        "id": "perplexity"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_45",
+      "properties": {
+        "id": "sap-ai-core"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_47",
+      "properties": {},
+      "type": "catalog.updated"
+    },
+    {
+      "id": "evt_fixture_46",
+      "properties": {
+        "id": "togetherai"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_48",
+      "properties": {
+        "id": "vercel"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_49",
+      "properties": {
+        "id": "venice"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_50",
+      "properties": {
+        "id": "xai"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_51",
+      "properties": {
+        "id": "zenmux"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_52",
+      "properties": {
+        "id": "dynamic-provider"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_53",
+      "properties": {
+        "id": "config-plugin"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_54",
+      "properties": {
+        "id": "config-provider"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_55",
+      "properties": {
+        "id": "variant"
+      },
+      "type": "plugin.added"
+    },
+    {
+      "id": "evt_fixture_56",
+      "properties": {},
+      "type": "reference.updated"
+    },
+    {
+      "id": "evt_fixture_57",
+      "properties": {
+        "sessionID": "ses_fixture_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "id": "evt_fixture_58",
+      "properties": {
+        "part": {
+          "id": "prt_fixture_1",
+          "messageID": "msg_fixture_1",
+          "sessionID": "ses_fixture_0",
+          "type": "step-start"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971077876
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_59",
+      "properties": {
+        "part": {
+          "callID": "admission_call",
+          "id": "prt_fixture_2",
+          "messageID": "msg_fixture_1",
+          "sessionID": "ses_fixture_0",
+          "state": {
+            "input": {},
+            "raw": "",
+            "status": "pending"
+          },
+          "tool": "bash",
+          "type": "tool"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971077879
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_60",
+      "properties": {
+        "part": {
+          "callID": "admission_call",
+          "id": "prt_fixture_2",
+          "messageID": "msg_fixture_1",
+          "sessionID": "ses_fixture_0",
+          "state": {
+            "input": {
+              "command": "printf ADMISSION_FIXTURE",
+              "description": "Harmless admission fixture"
+            },
+            "status": "running",
+            "time": {
+              "start": 1790971077892
+            }
+          },
+          "tool": "bash",
+          "type": "tool"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971077892
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_61",
+      "properties": {},
+      "type": "integration.updated"
+    },
+    {
+      "id": "evt_fixture_62",
+      "properties": {},
+      "type": "catalog.updated"
+    },
+    {
+      "id": "evt_fixture_63",
+      "properties": {
+        "always": [
+          "printf *"
+        ],
+        "id": "per_fixture_0",
+        "metadata": {
+          "command": "printf ADMISSION_FIXTURE"
+        },
+        "patterns": [
+          "printf ADMISSION_FIXTURE"
+        ],
+        "permission": "bash",
+        "sessionID": "ses_fixture_0",
+        "tool": {
+          "callID": "admission_call",
+          "messageID": "msg_fixture_1"
+        }
+      },
+      "type": "permission.asked"
+    },
+    {
+      "id": "evt_fixture_64",
+      "properties": {
+        "reply": "once",
+        "requestID": "per_fixture_0",
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "permission.replied"
+    },
+    {
+      "id": "evt_fixture_65",
+      "properties": {
+        "part": {
+          "callID": "admission_call",
+          "id": "prt_fixture_2",
+          "messageID": "msg_fixture_1",
+          "sessionID": "ses_fixture_0",
+          "state": {
+            "input": {
+              "command": "printf ADMISSION_FIXTURE",
+              "description": "Harmless admission fixture"
+            },
+            "metadata": {
+              "output": ""
+            },
+            "status": "running",
+            "time": {
+              "start": 1790971077892
+            }
+          },
+          "tool": "bash",
+          "type": "tool"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971078190
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_66",
+      "properties": {
+        "part": {
+          "callID": "admission_call",
+          "id": "prt_fixture_2",
+          "messageID": "msg_fixture_1",
+          "sessionID": "ses_fixture_0",
+          "state": {
+            "input": {
+              "command": "printf ADMISSION_FIXTURE",
+              "description": "Harmless admission fixture"
+            },
+            "metadata": {
+              "output": "ADMISSION_FIXTURE"
+            },
+            "status": "running",
+            "time": {
+              "start": 1790971077892
+            }
+          },
+          "tool": "bash",
+          "type": "tool"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971078205
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_67",
+      "properties": {
+        "part": {
+          "callID": "admission_call",
+          "id": "prt_fixture_2",
+          "messageID": "msg_fixture_1",
+          "sessionID": "ses_fixture_0",
+          "state": {
+            "input": {
+              "command": "printf ADMISSION_FIXTURE",
+              "description": "Harmless admission fixture"
+            },
+            "metadata": {
+              "exit": 0,
+              "output": "ADMISSION_FIXTURE",
+              "truncated": false
+            },
+            "output": "ADMISSION_FIXTURE",
+            "status": "completed",
+            "time": {
+              "end": 1790971078208,
+              "start": 1790971077892
+            },
+            "title": "printf ADMISSION_FIXTURE"
+          },
+          "tool": "bash",
+          "type": "tool"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971078208
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_68",
+      "properties": {
+        "part": {
+          "cost": 0,
+          "id": "prt_fixture_3",
+          "messageID": "msg_fixture_1",
+          "reason": "tool-calls",
+          "sessionID": "ses_fixture_0",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          },
+          "type": "step-finish"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971078211
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_69",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "tool-calls",
+          "id": "msg_fixture_1",
+          "mode": "build",
+          "modelID": "fixture",
+          "parentID": "msg_fixture_0",
+          "path": {
+            "cwd": "/tmp/admission-fixture/workspace",
+            "root": "/"
+          },
+          "providerID": "admission",
+          "role": "assistant",
+          "sessionID": "ses_fixture_0",
+          "time": {
+            "completed": 1790971078214,
+            "created": 1790971077394
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          }
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "id": "evt_fixture_70",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "tool-calls",
+          "id": "msg_fixture_1",
+          "mode": "build",
+          "modelID": "fixture",
+          "parentID": "msg_fixture_0",
+          "path": {
+            "cwd": "/tmp/admission-fixture/workspace",
+            "root": "/"
+          },
+          "providerID": "admission",
+          "role": "assistant",
+          "sessionID": "ses_fixture_0",
+          "time": {
+            "completed": 1790971078214,
+            "created": 1790971077394
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          }
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "id": "evt_fixture_71",
+      "properties": {
+        "sessionID": "ses_fixture_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "id": "evt_fixture_72",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "id": "msg_fixture_2",
+          "mode": "build",
+          "modelID": "fixture",
+          "parentID": "msg_fixture_0",
+          "path": {
+            "cwd": "/tmp/admission-fixture/workspace",
+            "root": "/"
+          },
+          "providerID": "admission",
+          "role": "assistant",
+          "sessionID": "ses_fixture_0",
+          "time": {
+            "created": 1790971078216
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          }
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "id": "evt_fixture_73",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "directory": "/tmp/admission-fixture/workspace",
+          "id": "ses_fixture_0",
+          "model": {
+            "id": "fixture",
+            "providerID": "admission",
+            "variant": "default"
+          },
+          "path": "tmp/admission-fixture/workspace",
+          "projectID": "global",
+          "slug": "sunny-squid",
+          "summary": {
+            "additions": 0,
+            "deletions": 0,
+            "files": 0
+          },
+          "time": {
+            "created": 1790971076612,
+            "updated": 1790971078226
+          },
+          "title": "New session - 2026-10-02T19:57:56.612Z",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          },
+          "version": "1.18.34"
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "session.updated"
+    },
+    {
+      "id": "evt_fixture_74",
+      "properties": {
+        "diff": [],
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "session.diff"
+    },
+    {
+      "id": "evt_fixture_75",
+      "properties": {
+        "sessionID": "ses_fixture_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "id": "evt_fixture_76",
+      "properties": {
+        "part": {
+          "id": "prt_fixture_4",
+          "messageID": "msg_fixture_2",
+          "sessionID": "ses_fixture_0",
+          "type": "step-start"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971078244
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_77",
+      "properties": {
+        "part": {
+          "id": "prt_fixture_5",
+          "messageID": "msg_fixture_2",
+          "sessionID": "ses_fixture_0",
+          "text": "",
+          "time": {
+            "start": 1790971078246
+          },
+          "type": "text"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971078246
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_78",
+      "properties": {
+        "delta": "CONSUMED:ADMISSION_NATIVE_FIXTURE",
+        "field": "text",
+        "messageID": "msg_fixture_2",
+        "partID": "prt_fixture_5",
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "message.part.delta"
+    },
+    {
+      "id": "evt_fixture_79",
+      "properties": {
+        "part": {
+          "id": "prt_fixture_5",
+          "messageID": "msg_fixture_2",
+          "sessionID": "ses_fixture_0",
+          "text": "CONSUMED:ADMISSION_NATIVE_FIXTURE",
+          "time": {
+            "end": 1790971078248,
+            "start": 1790971078246
+          },
+          "type": "text"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971078248
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_80",
+      "properties": {
+        "part": {
+          "cost": 0,
+          "id": "prt_fixture_6",
+          "messageID": "msg_fixture_2",
+          "reason": "stop",
+          "sessionID": "ses_fixture_0",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          },
+          "type": "step-finish"
+        },
+        "sessionID": "ses_fixture_0",
+        "time": 1790971078249
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "id": "evt_fixture_81",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "stop",
+          "id": "msg_fixture_2",
+          "mode": "build",
+          "modelID": "fixture",
+          "parentID": "msg_fixture_0",
+          "path": {
+            "cwd": "/tmp/admission-fixture/workspace",
+            "root": "/"
+          },
+          "providerID": "admission",
+          "role": "assistant",
+          "sessionID": "ses_fixture_0",
+          "time": {
+            "completed": 1790971078252,
+            "created": 1790971078216
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          }
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "id": "evt_fixture_82",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "stop",
+          "id": "msg_fixture_2",
+          "mode": "build",
+          "modelID": "fixture",
+          "parentID": "msg_fixture_0",
+          "path": {
+            "cwd": "/tmp/admission-fixture/workspace",
+            "root": "/"
+          },
+          "providerID": "admission",
+          "role": "assistant",
+          "sessionID": "ses_fixture_0",
+          "time": {
+            "completed": 1790971078252,
+            "created": 1790971078216
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          }
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "id": "evt_fixture_83",
+      "properties": {
+        "sessionID": "ses_fixture_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "id": "evt_fixture_84",
+      "properties": {
+        "sessionID": "ses_fixture_0",
+        "status": {
+          "type": "idle"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "id": "evt_fixture_85",
+      "properties": {
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "session.idle"
+    },
+    {
+      "id": "evt_fixture_86",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "directory": "/tmp/admission-fixture/workspace",
+          "id": "ses_fixture_0",
+          "model": {
+            "id": "fixture",
+            "providerID": "admission",
+            "variant": "default"
+          },
+          "path": "tmp/admission-fixture/workspace",
+          "projectID": "global",
+          "slug": "sunny-squid",
+          "summary": {
+            "additions": 0,
+            "deletions": 0,
+            "files": 0
+          },
+          "time": {
+            "created": 1790971076612,
+            "updated": 1790971078255
+          },
+          "title": "New session - 2026-10-02T19:57:56.612Z",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          },
+          "version": "1.18.34"
+        },
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "session.updated"
+    },
+    {
+      "id": "evt_fixture_87",
+      "properties": {
+        "diff": [],
+        "sessionID": "ses_fixture_0"
+      },
+      "type": "session.diff"
+    }
+  ],
+  "messages": [
+    {
+      "info": {
+        "agent": "build",
+        "id": "msg_fixture_0",
+        "model": {
+          "modelID": "fixture",
+          "providerID": "admission"
+        },
+        "role": "user",
+        "sessionID": "ses_fixture_0",
+        "time": {
+          "created": 1790971076680
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_fixture_0",
+          "messageID": "msg_fixture_0",
+          "sessionID": "ses_fixture_0",
+          "text": "ADMISSION_NATIVE_FIXTURE",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "info": {
+        "agent": "build",
+        "cost": 0,
+        "finish": "tool-calls",
+        "id": "msg_fixture_1",
+        "mode": "build",
+        "modelID": "fixture",
+        "parentID": "msg_fixture_0",
+        "path": {
+          "cwd": "/tmp/admission-fixture/workspace",
+          "root": "/"
+        },
+        "providerID": "admission",
+        "role": "assistant",
+        "sessionID": "ses_fixture_0",
+        "time": {
+          "completed": 1790971078214,
+          "created": 1790971077394
+        },
+        "tokens": {
+          "cache": {
+            "read": 0,
+            "write": 0
+          },
+          "input": 0,
+          "output": 0,
+          "reasoning": 0
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_fixture_1",
+          "messageID": "msg_fixture_1",
+          "sessionID": "ses_fixture_0",
+          "type": "step-start"
+        },
+        {
+          "callID": "admission_call",
+          "id": "prt_fixture_2",
+          "messageID": "msg_fixture_1",
+          "sessionID": "ses_fixture_0",
+          "state": {
+            "input": {
+              "command": "printf ADMISSION_FIXTURE",
+              "description": "Harmless admission fixture"
+            },
+            "metadata": {
+              "exit": 0,
+              "output": "ADMISSION_FIXTURE",
+              "truncated": false
+            },
+            "output": "ADMISSION_FIXTURE",
+            "status": "completed",
+            "time": {
+              "end": 1790971078208,
+              "start": 1790971077892
+            },
+            "title": "printf ADMISSION_FIXTURE"
+          },
+          "tool": "bash",
+          "type": "tool"
+        },
+        {
+          "cost": 0,
+          "id": "prt_fixture_3",
+          "messageID": "msg_fixture_1",
+          "reason": "tool-calls",
+          "sessionID": "ses_fixture_0",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          },
+          "type": "step-finish"
+        }
+      ]
+    },
+    {
+      "info": {
+        "agent": "build",
+        "cost": 0,
+        "finish": "stop",
+        "id": "msg_fixture_2",
+        "mode": "build",
+        "modelID": "fixture",
+        "parentID": "msg_fixture_0",
+        "path": {
+          "cwd": "/tmp/admission-fixture/workspace",
+          "root": "/"
+        },
+        "providerID": "admission",
+        "role": "assistant",
+        "sessionID": "ses_fixture_0",
+        "time": {
+          "completed": 1790971078252,
+          "created": 1790971078216
+        },
+        "tokens": {
+          "cache": {
+            "read": 0,
+            "write": 0
+          },
+          "input": 0,
+          "output": 0,
+          "reasoning": 0
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_fixture_4",
+          "messageID": "msg_fixture_2",
+          "sessionID": "ses_fixture_0",
+          "type": "step-start"
+        },
+        {
+          "id": "prt_fixture_5",
+          "messageID": "msg_fixture_2",
+          "sessionID": "ses_fixture_0",
+          "text": "CONSUMED:ADMISSION_NATIVE_FIXTURE",
+          "time": {
+            "end": 1790971078248,
+            "start": 1790971078246
+          },
+          "type": "text"
+        },
+        {
+          "cost": 0,
+          "id": "prt_fixture_6",
+          "messageID": "msg_fixture_2",
+          "reason": "stop",
+          "sessionID": "ses_fixture_0",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          },
+          "type": "step-finish"
+        }
+      ]
+    }
+  ]
+}

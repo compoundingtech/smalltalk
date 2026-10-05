@@ -170,6 +170,26 @@ class BoundaryCheck(unittest.TestCase):
     def test_missing_process_evidence_fails(self):
         self.assertIn("no fresh seat processes inspected", list(fresh_seat_findings(self.root, [])))
 
+    def test_opaque_claim_signature_keeps_signer_and_claim_labels_checked(self):
+        database = self.root / "state/claims.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE claim_signatures(signer TEXT, signature TEXT)")
+            connection.execute("INSERT INTO claim_signatures VALUES (?, ?)",
+                               ("agent/example/worker", "randomBase64st2Letters"))
+            connection.execute("CREATE TABLE claims(body TEXT)")
+            connection.execute("INSERT INTO claims VALUES (?)", ('{"label":"st-provider"}',))
+            connection.commit()
+            self.assertEqual(list(fresh_seat_findings(self.root, self.processes)), [])
+            connection.execute("UPDATE claim_signatures SET signer='agent/st2-worker'")
+            connection.commit()
+            self.assertTrue(any("claim_signatures/signer" in error for error in
+                                fresh_seat_findings(self.root, self.processes)))
+            connection.execute("UPDATE claim_signatures SET signer='agent/example/worker'")
+            connection.execute("UPDATE claims SET body=?", ('{"label":"st2-provider"}',))
+            connection.commit()
+            self.assertTrue(any("claims/body" in error for error in
+                                fresh_seat_findings(self.root, self.processes)))
+
 
 if __name__ == "__main__":
     unittest.main()
