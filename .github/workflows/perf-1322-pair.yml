@@ -1,0 +1,113 @@
+name: 1322 main/head load comparison (temporary experiment)
+on:
+  push:
+    branches: [agent/ci-perf-1322-pair]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: perf-1322-controlled-pair
+  cancel-in-progress: false
+jobs:
+  replay:
+    runs-on: nscloud-ubuntu-24.04-amd64-8x16
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      SCCACHE_IDLE_TIMEOUT: '0'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Preserve the experiment outside historical clean checkouts
+        run: |
+          cp .github/experiments/perf-1322-pair.py "$RUNNER_TEMP/perf-1322-pair.py"
+          cp scripts/ci-perf-cache "$RUNNER_TEMP/ci-perf-cache"
+      - name: Download verified warm snapshots and freeze five main baselines
+        run: python3 "$RUNNER_TEMP/perf-1322-pair.py" init
+      - uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+      - name: Isolate state and preserve genuine compiler caches
+        run: |
+          test_home="$RUNNER_TEMP/test-home"
+          mkdir -p "$test_home"/{.config,.cache,.local/state}
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\nSCCACHE_DIR=%s\nSCCACHE_CACHE_SIZE=1G\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" "$RUNNER_TEMP/perf-sccache" >> "$GITHUB_ENV"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$test_home" "$test_home" "$test_home" "$test_home" >> "$GITHUB_ENV"
+          sudo mount -o remount,size=10G /dev/shm
+      - name: Measure 01-main-matched (5f8413ae) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-1322-pair.py" measure 01-main-matched 5f8413ae
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-1322-01-main-matched
+          path: ${{ runner.temp }}/1322-pair/results/01-main-matched/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 02-head-matched (5b58f1d1) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-1322-pair.py" measure 02-head-matched 5b58f1d1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-1322-02-head-matched
+          path: ${{ runner.temp }}/1322-pair/results/02-head-matched/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 03-integration-parent (2e075af9) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-1322-pair.py" measure 03-integration-parent 2e075af9
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-1322-03-integration-parent
+          path: ${{ runner.temp }}/1322-pair/results/03-integration-parent/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 04-head-matched-repeat (5b58f1d1) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-1322-pair.py" measure 04-head-matched-repeat 5b58f1d1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-1322-04-head-matched-repeat
+          path: ${{ runner.temp }}/1322-pair/results/04-head-matched-repeat/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 05-main-matched-repeat (5f8413ae) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-1322-pair.py" measure 05-main-matched-repeat 5f8413ae
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-1322-05-main-matched-repeat
+          path: ${{ runner.temp }}/1322-pair/results/05-main-matched-repeat/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 06-head-native-store (5b58f1d1) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-1322-pair.py" measure 06-head-native-store 5b58f1d1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-1322-06-head-native-store
+          path: ${{ runner.temp }}/1322-pair/results/06-head-native-store/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve all evidence and original baseline hashes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-1322-evidence
+          path: |
+            ${{ runner.temp }}/1322-pair/results/
+            ${{ runner.temp }}/1322-pair/baselines/
+            ${{ runner.temp }}/1322-pair/provenance.json
+            ${{ runner.temp }}/1322-pair/hardware.json
+          retention-days: 30
+          if-no-files-found: error
+      - name: Propagate original benchmark verdicts
+        run: python3 "$RUNNER_TEMP/perf-1322-pair.py" verdict
