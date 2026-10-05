@@ -885,7 +885,28 @@
         "blocked_reason": { "type": ["string", "null"] },
         "blockers": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
         "goals": { "type": "array", "items": { "type": "string" } },
-        "constraints": { "type": "array", "items": { "type": "string" } }
+        "constraints": { "type": "array", "items": { "type": "string" } },
+        "loop_round": { "type": ["integer", "null"], "minimum": 0, "description": "Current round of this step's loop, enriched on mission detail reads." },
+        "loop_max_rounds": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_reason": { "type": ["string", "null"] },
+        "next_wake_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "Observed not-before time: earliest work eligibility, not a promise of wake dispatch." },
+        "wake_reason": { "type": ["string", "null"], "description": "The deferral's blocked reason, or the observed wake failure when no deferral reason exists." },
+        "wake": { "oneOf": [{ "$ref": "#/$defs/MissionWake" }, { "type": "null" }] },
+        "claim_expires_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+      }
+    },
+    "MissionWake": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assignee", "assignee_state", "incarnation_id", "attempts"],
+      "properties": {
+        "assignee": { "$ref": "#/$defs/AgentId" },
+        "assignee_state": { "type": "string" },
+        "incarnation_id": { "type": "string" },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "last_attempt_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "acknowledged_by": { "type": ["string", "null"] },
+        "failure": { "type": ["string", "null"] }
       }
     },
     "WorkLabel": {
