@@ -13,6 +13,17 @@ back on the session it suspended on, holds hour-old mail, and consumes recent ne
 mail exactly once. The Rust wrapper
 `crates/st3/tests/boot_canaries.rs` runs every pair as its own test in the required Linux gate.
 
+The OMP `when-idle` regression uses a separate runner:
+
+    ../st3-rollout-binding-canary/run BINARY EVIDENCE_DIR omp when-idle [--omp EXECUTABLE]
+
+It uses raw OMP from `--omp`, `OMP_BIN`, or `PATH`, and uses the extension-host fixture only
+when OMP is absent. The verdict identifies which provider ran. No model prompts are sent.
+An owned-set publication must reach rollout phase `running`, with a new incarnation bound to
+the original native UUID and the same transcript inode. With real OMP, an inspection extension
+also verifies the historical conversation loaded on both starts. The Rust test runs this in
+the Linux gate with the same zero-retry policy as the other boot canaries.
+
 The Codex-only `utf8` scenario starts and ends the bounded transcript window inside a euro sign,
 withholds live receipts so transcript recovery must release the next message, then forces a
 discovery I/O error. A live status update and receipt must still reach the same seat, and repeated

@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Isolated, model-free OMP push-channel when-idle regression (#1370).
+
+Uses OMP_BIN or omp on PATH. Only a runner without OMP uses the boot canary's
+extension-host fixture; result.json explicitly identifies that fallback.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import sqlite3
+import subprocess
+import sys
+import uuid
+
+HERE = Path(__file__).resolve().parent
+boot = runpy.run_path(str(HERE.parent / "st3-boot-canaries/run"))
+Node, until, Failure, trace = (boot[key] for key in ("Node", "until", "Failure", "trace"))
+SUBJECT = "agent/garden/cedar"
+
+
+def fields(node, kind):
+    return [row["body"].get("fields", row["body"]) for row in trace(node, SUBJECT)
+            if row.get("kind") == kind]
+
+
+def binding(node, incarnation, native):
+    return next((row for row in reversed(fields(node, "harness.session-file"))
+                 if row.get("incarnation_id") == incarnation
+                 and row.get("session_id") == native and row.get("harness") == "omp"), None)
+
+
+def start_observations(node):
+    # Start receipts are owner-local; the public trace contains only durable claims.
+    database = (node.root / "state/claims.sqlite3").as_uri() + "?mode=ro"
+    with sqlite3.connect(database, uri=True) as connection:
+        rows = connection.execute(
+            "SELECT body FROM claims WHERE subject=? AND kind='runtime.action.succeeded' "
+            "UNION ALL SELECT body FROM local_observations "
+            "WHERE subject=? AND kind='runtime.action.succeeded'", (SUBJECT, SUBJECT))
+        return [json.loads(body)["fields"] for (body,) in rows]
+
+
+def run(args, root, evidence):
+    node = Node(root, args.binary.resolve(), "omp")
+    provider = args.omp or shutil.which("omp")
+    mode = "real-omp" if provider else "fixture (OMP unavailable on runner)"
+    version = None
+    receipts = root / "ws/native-starts.jsonl"
+    try:
+        # The private PATH also serves the raw OMP launcher and extension interpreter.
+        for tool in ("node", "bun"):
+            executable = shutil.which(tool)
+            if executable:
+                (root / "bin" / tool).symlink_to(executable)
+        if provider:
+            executable = Path(provider).resolve(strict=True)
+            (root / "bin/omp").unlink()
+            (root / "bin/omp").symlink_to(executable)
+            version = subprocess.check_output([str(executable), "--version"], text=True).strip()
+        print(f"when-idle provider: {mode}; {version or 'boot fixture'}", flush=True)
+        config = root / "home/omp-config"
+        config.mkdir()
+        (config / "models.yml").write_text(json.dumps({"providers": {"fixture": {
+            "baseUrl": "http://127.0.0.1:9/v1", "apiKey": "offline-fixture",
+            "api": "openai-completions", "models": [{"id": "quartz", "name": "Quartz",
+            "contextWindow": 128000, "maxTokens": 1024, "input": ["text"], "reasoning": False}]}}}))
+        native = str(uuid.uuid4())
+        # Seed the actual owner-local managed inventory. Both launches must open this UUID.
+        driver = root / "state/drivers" / hashlib.sha256(SUBJECT.encode()).hexdigest()[:24]
+        catalog = driver / "sessions/omp/provider-sessions"
+        catalog.mkdir(parents=True)
+        transcript = catalog / f"2000-01-01T00-00-00-000Z_{native}.jsonl"
+        historical = [
+            {"type": "session", "version": 3, "id": native,
+             "timestamp": "2000-01-01T00:00:00.000Z", "cwd": str(root / "ws")},
+            {"type": "message", "id": "cedar-user", "parentId": None,
+             "timestamp": "2000-01-01T00:00:01.000Z", "message": {"role": "user",
+             "content": [{"type": "text", "text": "Historical cedar question"}], "timestamp": 946684801000}},
+            {"type": "message", "id": "cedar-answer", "parentId": "cedar-user",
+             "timestamp": "2000-01-01T00:00:02.000Z", "message": {"role": "assistant",
+             "content": [{"type": "text", "text": "Historical cedar answer"}],
+             "api": "openai-completions", "provider": "fixture", "model": "quartz",
+             "stopReason": "stop", "timestamp": 946684802000,
+             "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                       "totalTokens": 0, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}}}
+        ]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in historical))
+        probe = root / "inspect.ts"
+        probe.write_text('''import fs from "node:fs";
+export default function(api) {
+  api.on("session_start", async (_event, ctx) => {
+    fs.appendFileSync(process.cwd() + "/native-starts.jsonl", JSON.stringify({
+      incarnation: process.env.ST3_INCARNATION, session: ctx.sessionManager.getSessionId(),
+      branch: ctx.sessionManager.getBranch(), pid: process.pid
+    }) + "\\n");
+  });
+  api.on("agent_start", () => { throw new Error("model turn forbidden in rollout canary"); });
+}
+''')
+
+        def source(sequence):
+            argv = ["--no-extensions", "--no-tools", "--no-skills", "--no-rules", "--no-lsp", "--no-title"]
+            if provider:
+                argv += ["-e", str(probe)]
+            if sequence == 1:
+                argv += ["--resume", native]
+            # Removing the authored selector exercises mandatory rollout's own strict selection.
+            return f'''version 2
+agent "garden/cedar" {{
+ host "canary"
+ workspace {json.dumps(str(root / 'ws'))}
+ restart "never"
+ env {{ PI_CODING_AGENT_DIR {json.dumps(str(config))}; PI_OFFLINE "1"; }}
+ harness "omp" {{ model "fixture/quartz"; args {' '.join(map(json.dumps, argv))}; }}
+}}
+'''
+
+        def publish(sequence, expected):
+            path = root / f"seats-{sequence}.kdl"
+            path.write_text(source(sequence))
+            argv = ["apply", str(path), "--set", "garden", "--repository", "acme/garden",
+                    "--ref", "refs/heads/main", "--sha", f"{sequence:040x}",
+                    "--source-sequence", str(sequence), "--expect-set", expected, "--as", "person/eval"]
+            if sequence == 2:
+                argv += ["--rollout", "when-idle"]
+            return node.json(*argv)
+
+        def agent():
+            return node.json("agents", "show", SUBJECT)["value"]
+
+        node.start()
+        publish(1, "absent")
+        original = until(lambda: agent().get("incarnation_id"), args.bound, "no original incarnation")
+        until(lambda: binding(node, original, native), args.bound, "no original native UUID binding")
+        until(lambda: any(row.get("incarnation_id") == original and row.get("quiescent") is True
+                          for row in fields(node, "harness.observed")), args.bound, "original OMP not quiescent")
+        # OMP may migrate the authored seed on its first open; fence the live transcript.
+        inode = transcript.stat().st_ino
+        selected = node.json("sets", "show", "garden")["value"]["revision"]
+        publish(2, selected)
+
+        def verified():
+            view = agent()
+            operation = view.get("rollout") or {}
+            if operation.get("phase") in ("failed", "blocked", "held"):
+                raise Failure(f"rollout stopped: {json.dumps(operation)}")
+            return view if operation.get("phase") == "running" else None
+
+        replacement = until(verified, args.bound, "when-idle never reached running")
+        incarnation = replacement["incarnation_id"]
+        assert incarnation != original, "replacement reused predecessor incarnation"
+        assert binding(node, incarnation, native), "no current-incarnation original UUID binding"
+        operation = replacement["rollout"]
+        assert any(row.get("action") == "start" and row.get("incarnation_id") == incarnation
+                   and row.get("desired_token") == operation["desired_token"]
+                   for row in start_observations(node)), "missing captured launch receipt"
+        assert any(row.get("incarnation_id") == incarnation and row.get("status") == "running"
+                   for row in fields(node, "runtime.observed")), "replacement not observed running"
+        assert transcript.stat().st_ino == inode, "transcript was copied/replaced"
+        if provider:
+            starts = [json.loads(line) for line in receipts.read_text().splitlines()]
+            assert len(starts) == 2, starts
+            assert {start["incarnation"] for start in starts} == {original, incarnation}, starts
+            for start in starts:
+                assert start["session"] == native, start
+                branch = json.dumps(start["branch"])
+                assert "Historical cedar question" in branch and "Historical cedar answer" in branch, start
+        else:
+            path = root / "ws/receipts-agent-garden-cedar.jsonl"
+            starts = [json.loads(line) for line in path.read_text().splitlines()]
+            sessions = [row for row in starts if row.get("event") == "session"]
+            assert len(sessions) == 2 and all(row["sessionId"] == native for row in sessions), sessions
+            assert not any(row.get("event") == "turn" for row in starts), starts
+        messages = [json.loads(line) for line in transcript.read_text().splitlines()
+                    if json.loads(line).get("type") == "message"]
+        assert len(messages) == 2, "a model turn ran"
+        return {"verdict": "pass", "provider": mode, "version": version,
+                "phase": "running", "original_incarnation": original,
+                "replacement_incarnation": incarnation, "native_uuid": native, "model_turns": 0}
+    except Exception as error:
+        return {"verdict": "fail", "provider": mode, "version": version, "failure": str(error)}
+    finally:
+        if node.daemon and node.daemon.poll() is None:
+            (evidence / "trace.jsonl").write_text(node.cli("trace", "show", SUBJECT,
+                                                          "--json", "--limit", "500", check=False))
+            (evidence / "agent.json").write_text(node.cli("agents", "show", SUBJECT, "--json", check=False))
+            (evidence / "start-observations.json").write_text(json.dumps(start_observations(node), indent=2) + "\n")
+        node.stop()
+        shutil.copy2(root / "daemon.log", evidence / "daemon.log")
+        for index, path in enumerate((root / "state/drivers").rglob("driver.log")):
+            shutil.copy2(path, evidence / f"driver-{index}.log")
+        if receipts.exists():
+            shutil.copy2(receipts, evidence / "native-starts.jsonl")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("evidence", type=Path)
+    parser.add_argument("harness", choices=["omp"])
+    parser.add_argument("scenario", choices=["when-idle"])
+    parser.add_argument("--bound", type=float, default=180)
+    parser.add_argument("--scratch", type=Path)
+    parser.add_argument("--omp", default=os.environ.get("OMP_BIN"))
+    args = parser.parse_args()
+    args.evidence.mkdir(parents=True, exist_ok=True)
+    # Keep sockets short and out of the invoking fleet seat's ancestry.
+    root = boot["private_root"]()
+    try:
+        result = run(args, root, args.evidence.resolve())
+    finally:
+        shutil.rmtree(root)
+    (args.evidence / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result), flush=True)
+    return 0 if result["verdict"] == "pass" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
