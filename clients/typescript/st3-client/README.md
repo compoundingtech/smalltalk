@@ -6,6 +6,8 @@ The package exports TypeScript source with explicit `.ts` relative import specif
 consumers use `allowImportingTsExtensions` for no-emit checking, or
 `rewriteRelativeImportExtensions` when emitting JavaScript.
 
+Native subject source also supports `noUncheckedIndexedAccess`; reference parsing checks the family before using it, and the portable descriptor hash uses bounds-checked fixed-width word reads.
+
 The client uses standard `fetch`, so callers can supply a fetch implementation and a credential callback. Call `discover()` before rendering capability-dependent controls. List and event limits are checked against the server's advertised bounds. Submit fenced actions with the generated typed methods, then use `followOperation(operation_id)` for accepted actions. `terminalStream` opens the screen stream a `terminal.attach` capability allows and calls `onScreen` with each changed screen; it needs a WebSocket that accepts headers, such as React Native's, or a `socket` factory. `collectionStream` opens the one collections socket: `subscribe` holds a window of missions, attention, agents, or work, `subscribeTerminal` follows a terminal with its attach capability, and `subscribeConversation` follows an agent's or a session's conversation, each by a client-chosen ID; `onFrame` receives every frame. `applyWindow` folds `snapshot` and `changes` frames into a window's ordered rows. Commands sent before the socket opens wait for it.
 
 The default transport binds `globalThis.fetch` to `globalThis`, preserving the receiver required by browser implementations. Supplying `fetchImpl` overrides that default without rebinding the custom implementation.
@@ -48,6 +50,8 @@ npm run typecheck:schema --prefix clients/typescript/st3-client
 ## Native subject projections
 
 The dependency-free entry point exports native subject decoders and the raw `St3Client` methods `subjectGet`, `subjectsList`, `subjectClaims`, `subjectHistory`, and `subjectSchemas`. Collection streams expose `subscribeSubjects`; `applySubjectWindow` applies snapshot, change, and removal frames in the server-provided order.
+
+The collection callback receives `CollectionStreamFrame`, which includes operational, native-subject, conversation, and terminal frames. Operational-only consumers must exclude snapshot/change frames whose `collection` is `subjects` before treating rows as operational resources; native windows use `applySubjectWindow`. Conversation, terminal, resync, and error frames remain part of the same stream.
 
 Native decoding validates the locally compiled family/kind descriptors, canonical references, and concrete custom claim hashes. Unknown or mismatched descriptors yield an `UnsupportedSubjectSchema` containing only `id`, `ref`, `schema_id`, and unavailable metadata; unvalidated heads and field payloads are not exposed. Use `isUnsupportedSubjectSchema` to narrow these results before reading supported payloads. Malformed payloads under supported descriptors fail validation instead of being accepted as future schemas.
 

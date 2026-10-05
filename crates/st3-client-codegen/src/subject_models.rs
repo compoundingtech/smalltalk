@@ -7,8 +7,10 @@ use super::subjects::Contract;
 
 fn nullable(schema:&Value)->Option<Value> {
     for key in ["anyOf","oneOf"] {
-        if let Some(branches)=schema[key].as_array() {
-            if branches.len()==2 && branches[1]==json!({"type":"null"}) { return Some(branches[0].clone()); }
+        if let Some(branches)=schema[key].as_array()
+            && branches.len()==2 && branches[1]==json!({"type":"null"})
+        {
+            return Some(branches[0].clone());
         }
     }
     None

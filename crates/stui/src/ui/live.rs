@@ -286,6 +286,12 @@ pub fn run(context: Context) -> Result<()> {
         ui.flash("The old screens are gone: this is spaces, and ? shows its keys");
     }
 
+    // A stui killed from outside leaves its last picture on the screen; the next one says so.
+    let (_run, earlier) = super::lastrun::begin(&crate::version::short(crate::version::now()));
+    if let Some(note) = earlier {
+        // Long enough to read: the usual flash ends after four seconds.
+        ui.flash = Some((note, Instant::now() + Duration::from_secs(26)));
+    }
     let _guard = Guard::enter(ui.glasses.is_some())?;
     // The release smoke test's probe: the terminal is restored after a panic too.
     #[cfg(debug_assertions)]
@@ -311,6 +317,8 @@ pub fn run(context: Context) -> Result<()> {
     let mut terminal_runtimes: Option<Vec<String>> = None;
     // Attaching a dropped terminal again: whether a try is out, and how many failed.
     let mut reattaching = false;
+    // When a terminal was asked for, while it connects: the wait is shown, and a long one named.
+    let mut attach_started: Option<Instant> = None;
     let mut reattach_tries = 0_u32;
     // The cursor shape last set, so it changes only when the attached terminal asks.
     let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
@@ -339,6 +347,18 @@ pub fn run(context: Context) -> Result<()> {
             .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(4))
         {
             ui.flash = None;
+        }
+        // A terminal still connecting says how long it has waited, so a slow st does not look
+        // like a stuck screen (Nathan, 2026-10-05: attaching took a long time).
+        if let (Some(started), Some(view)) = (attach_started, ui.terminal.as_mut())
+            && view.native.is_none()
+            && view.ended.is_none()
+            && view
+                .stale
+                .as_deref()
+                .is_some_and(|stale| stale.starts_with("connecting"))
+        {
+            view.stale = Some(connecting_text(started.elapsed()));
         }
         while let Ok(update) = incoming.try_recv() {
             match update {
@@ -586,6 +606,14 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::AgentStarted(id) => ui.agent_started(id),
                 Fetched::TerminalStarted(id) => ui.terminal_started(id),
                 Fetched::Native { agent, direct } => {
+                    if let Some(waited) = attach_started.take().map(|at| at.elapsed())
+                        && waited >= Duration::from_secs(3)
+                    {
+                        ui.flash(format!(
+                            "Attached after {}s: st was slow to answer",
+                            waited.as_secs()
+                        ));
+                    }
                     let (rows, columns) = ui.terminal_size.get();
                     if let Some(view) = ui
                         .terminal
@@ -623,6 +651,7 @@ pub fn run(context: Context) -> Result<()> {
                     runtime_ids,
                     reason,
                 } => {
+                    attach_started = None;
                     if agent.starts_with("terminal/") {
                         // A shell has no other view to fall back to.
                         if let Some(view) = ui.terminal.as_mut().filter(|view| view.agent == agent)
@@ -923,6 +952,7 @@ pub fn run(context: Context) -> Result<()> {
                     });
                     attached = None;
                     terminal_runtimes = Some(runtime_ids.clone());
+                    attach_started = Some(Instant::now());
                     let _ = commands.send(Command::Unfollow);
                     {
                         let client = client.clone();
@@ -2097,6 +2127,18 @@ async fn send_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_terminal_that_is_slow_to_connect_says_how_long_and_who_is_slow() {
+        use super::connecting_text;
+        use std::time::Duration;
+        assert_eq!(connecting_text(Duration::from_millis(900)), "connecting");
+        assert_eq!(connecting_text(Duration::from_secs(3)), "connecting 3s");
+        assert_eq!(
+            connecting_text(Duration::from_secs(12)),
+            "connecting 12s, st is slow to answer"
+        );
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -2836,6 +2878,16 @@ struct Direct {
 /// Attach straight to the terminal st already named, the quick way (each runtime read is a full
 /// round trip to the daemon, a second or more on a busy one: Nathan, 2026-10-04, "attaching
 /// … feels kinda slow"); when that terminal is not there, find it through the agent's runtimes.
+/// What a terminal that is still connecting says: nothing special at first, then how long it has
+/// waited, then that st is the slow part.
+fn connecting_text(waited: Duration) -> String {
+    match waited.as_secs() {
+        0..2 => "connecting".into(),
+        2..8 => format!("connecting {}s", waited.as_secs()),
+        seconds => format!("connecting {seconds}s, st is slow to answer"),
+    }
+}
+
 async fn attach_known_then_direct(
     client: &Client,
     agent: &str,

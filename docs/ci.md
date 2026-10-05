@@ -33,11 +33,19 @@ use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggreg
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once.
 
-Required Namespace jobs use run affinity and inline `job.priority=1` for merge groups and
-`ci-priority` PRs, or `job.priority=10` for ordinary PRs. Optional benchmarks keep their existing
-labels. Namespace schedules lower priority numbers first, ahead of unprioritized jobs, when
-capacity is exhausted; run affinity prevents another workflow from taking the runner started
-for a required job. This uses existing capacity and shapes. See Namespace's
+All Linux Namespace jobs use run affinity and the same inline `job.priority=1`: required
+Workspace jobs, optional benchmarks, manual Performance controls, main upkeep and releases.
+Using one class prevents a continuous stream of required jobs from overtaking older performance
+requests. Run affinity ensures that a runner started for a request is assigned to that run,
+so GitHub cannot hand it to a newer run with the same shape. Local `ci1-priority` and `ci1-merge`
+reservations continue to select only the primary test shard.
+
+The queue still shares the existing Linux limit of 320 vCPUs / 640 GiB and must drain its older
+backlog. Queue time is measured separately from execution time; the shared class removes
+indefinite overtaking, rather than promising a fixed start time under arbitrary overload.
+An already queued job retains the labels from its immutable workflow revision. Recover old
+unprioritized controls with label-only revisions and new dispatches, preserving their source,
+fixtures and budgets; retain completed failures as evidence. See Namespace's
 [job ordering and priority controls](https://namespace.so/docs/solutions/github-actions/runner-controls/job-ordering).
 
 `scripts/ci-linux STAGE` runs one stage:
@@ -530,12 +538,14 @@ accepted-source verification remain in place.
 
 ## Required mail redelivery canaries
 
-Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires seventeen named,
+Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires twenty named,
 unignored regressions: boot/reconnect mailbox suppression and recent unoffered recovery for
 Claude, Codex, OpenCode, Pi, and OMP; each harness's native suspend/resume canary with hour-old
 mail held and recent unoffered mail consumed exactly once; legacy polling recovery through the
 current offer's receipt sequence; and delivered-but-unread retention across native channel
-restart. The mailbox cases seed hour-old sent mail and recent staged and delivered-but-unread
+restart. Claude's missing-channel cases also require automatic recovery, attachment during
+recheck without replacing the seat, and durable parking after three failed replacements.
+The mailbox cases seed hour-old sent mail and recent staged and delivered-but-unread
 mail, prove zero historical offers, preserve explicit mailbox access, and recover an in-flight
 send after a daemon restart with exactly one receipt pair. Every selected test runs with zero retries.
 

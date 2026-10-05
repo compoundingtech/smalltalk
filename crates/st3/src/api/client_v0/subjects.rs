@@ -117,6 +117,15 @@ struct Cursor {
     expires_at_unix_ms: u128,
 }
 
+struct CursorBoundary<'a> {
+    collection: &'a str,
+    family: &'a str,
+    subject: Option<&'a str>,
+    prefix: Option<&'a str>,
+    kind: Option<&'a str>,
+    limit: usize,
+}
+
 fn visibility_key(session: &ClientSession) -> Result<String, ApiError> {
     let value = (&session.actor, &session.authority_actor, &session.scopes);
     Ok(hex::encode(Sha256::digest(
@@ -607,400 +616,6 @@ fn canonical_desired(value: &Value, root: &str) -> Result<Value, ApiError> {
     node(value)
 }
 
-#[cfg(test)]
-mod disclosure_tests {
-    use super::*;
-
-    fn state(root: &Path) -> AppState {
-        AppState {
-            store: Arc::new(Store::open(&root.join("graph.db"), "subject-test").unwrap()),
-            notify: Arc::new(Notify::new()), event_notify: watch::channel(0_u64).0,
-            node: "subject-test".into(), state_dir: root.to_path_buf(),
-            pty_root: root.join("pty"), pty_binary: root.join("unused-pty"),
-            fleet_id: None, configured_peers: Vec::new(), client_relay: None,
-            native_session_home: None, planner_default: crate::model::PlannerSpec::default(),
-        }
-    }
-
-    fn append(state: &AppState, subject: &str, kind: &str, fields: Value) -> ClaimRecord {
-        state.store.append_claim(&ClaimInput {
-            subject: subject.into(), kind: kind.into(), actor: Some("person/ada".into()),
-            fields: fields.as_object().unwrap().iter()
-                .map(|(key, value)| (key.clone(), value.clone())).collect(),
-            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap()
-    }
-
-    fn source(record: ClaimRecord) -> NativeSourceRecord {
-        NativeSourceRecord { record, local_position: None }
-    }
-
-    #[test]
-    fn planning_answers_resolve_exact_preceding_decision_revision() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let requested = |decision: &str, revision: u64, requester: &str| append(
-            &state, "planning-session/example", "planning-session.question-requested",
-            json!({"decision_id":decision,"revision":revision,"requester":requester,
-                "decision_type":"boolean","question":"Proceed?"}),
-        );
-        let first = requested("decision", 1, "person/ada");
-        requested("decision", 2, "person/bob");
-        let answer = append(&state, "planning-session/example", "planning-session.question-answered",
-            json!({"decision_id":"decision","expected_revision":1,"requester":"person/bob"}));
-        let future_answer = append(&state, "planning-session/example", "planning-session.question-answered",
-            json!({"decision_id":"future","expected_revision":1,"requester":"person/ada"}));
-        requested("future", 1, "person/ada");
-        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session,
-                fence: state.store.native_source_fence()? };
-            assert!(reader.claim_visible(&first).unwrap());
-            assert!(reader.claim_visible(&answer).unwrap());
-            assert!(!reader.claim_visible(&future_answer).unwrap());
-            let bob = ClientSession::for_tests("person/bob/session/test", "person/bob", "unix");
-            let bob_reader = Reader { session: &bob, ..reader };
-            assert!(!bob_reader.claim_visible(&answer).unwrap());
-            Ok(())
-        }).unwrap();
-    }
-
-    #[test]
-    fn approvals_and_recoveries_keep_their_actual_private_audience() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let approved = append(&state, "revision-proposal/example", "revision-proposal.approved",
-            json!({"reviewer":"person/ada","all_approved":true}));
-        let failure = append(&state, "agent/example", "operational.failure",
-            json!({"episode":"one","reviewer":"person/bob","reason":"private failure"}));
-        let recovered = append(&state, "agent/example", "operational.recovered",
-            json!({"episode":"one","failure":failure.id,"reason":"private recovery"}));
-        let missing = append(&state, "agent/example", "operational.recovered",
-            json!({"episode":"missing","failure":"unknown"}));
-        let unaddressed = append(&state, "agent/example", "operational.failure",
-            json!({"episode":"unaddressed","reason":"not an audience grant"}));
-        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session,
-                fence: state.store.native_source_fence()? };
-            assert!(reader.claim_visible(&approved).unwrap());
-            assert!(!reader.claim_visible(&failure).unwrap());
-            assert!(!reader.claim_visible(&recovered).unwrap());
-            assert!(!reader.claim_visible(&missing).unwrap());
-            assert!(!reader.claim_visible(&unaddressed).unwrap());
-            let bob = ClientSession::for_tests("person/bob/session/test", "person/bob", "unix");
-            let bob_reader = Reader { session: &bob, ..reader };
-            assert!(bob_reader.claim_visible(&recovered).unwrap());
-            assert!(!bob_reader.claim_visible(&approved).unwrap());
-            Ok(())
-        }).unwrap();
-    }
-
-    #[test]
-    fn excluded_records_cannot_establish_message_or_attention_identity() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let message = append(&state, "message/excluded", "message.sent",
-            json!({"from":"person/ada","to":"agent/shared","status":"sent","content":"private"}));
-        let reply = append(&state, "message/reply", "message.sent",
-            json!({"from":"person/bob","to":"person/carol","status":"sent",
-                "content":"private","in_reply_to":message.subject}));
-        let attention = append(&state, "attention/excluded", "attention.requested",
-            json!({"reviewer":"person/ada","title":"private","reason":"private","severity":"warning"}));
-        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session,
-                fence: state.store.native_source_fence()? };
-            assert!(reader.identity_visible(&message.subject, "message").unwrap());
-            assert!(reader.identity_visible(&attention.subject, "attention").unwrap());
-            assert!(reader.identity_visible(&reply.subject, "message").unwrap());
-            Ok(())
-        }).unwrap();
-        let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
-        crate::store::projection_digest::register(&connection).unwrap();
-        for id in [&message.id, &attention.id] {
-            connection.execute("INSERT INTO projection_digest_repaired_claims(id) VALUES(?1)",
-                [id]).unwrap();
-        }
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session,
-                fence: state.store.native_source_fence()? };
-            assert!(!reader.identity_visible(&message.subject, "message").unwrap());
-            assert!(!reader.identity_visible(&attention.subject, "attention").unwrap());
-            assert!(!reader.identity_visible(&reply.subject, "message").unwrap());
-            Ok(())
-        }).unwrap();
-    }
-
-    #[test]
-    fn resource_facts_never_disclose_legacy_or_unregistered_bags() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let mut record = append(&state, "resource/example", "resource.observed",
-            json!({"kind":"filesystem.file","observed_at":1}));
-        record.body = json!({"fields":{"kind":"filesystem.file","observed_at":1,
-            "state":{"secret":"hidden"},"facts":{"status":null,"path":"/safe",
-                "private-id":{"secret":"hidden"}},"other-secret":"hidden"}});
-        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session,
-                fence: state.store.native_source_fence()? };
-            let projected = reader.project(source(record.clone()), "resource", true).unwrap();
-            assert_eq!(projected.fields.get("facts"), Some(&json!({"status":null,"path":"/safe"})));
-            assert!(!projected.fields.contains_key("state"));
-            assert!(!projected.omitted_fields.iter().any(|name| name == "private-id" || name == "other-secret"));
-            assert!(!projected.omitted_fields.iter().any(|name| name == "observed_at"));
-            record.body["fields"]["kind"] = json!("unreviewed.kind");
-            let unknown = reader.project(source(record.clone()), "resource", true).unwrap();
-            assert!(!unknown.fields.contains_key("facts"));
-            assert!(!unknown.fields.contains_key("state"));
-            Ok(())
-        }).unwrap();
-    }
-
-    #[test]
-    fn desired_projectors_follow_family_policy_and_sensitive_history_scope() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let agent = append(&state, "agent/example", "intent.desired", json!({"desired":{
-            "name":"agent","arguments":["example"],"properties":{},"children":[{
-                "name":"env","arguments":[],"properties":{},"children":[{
-                    "name":"TOKEN","arguments":["private"],"properties":{},"children":[]}]}]}}));
-        let account = append(&state, "account/ada/provider", "intent.desired", json!({"desired":{
-            "name":"account","arguments":["ada/provider"],"properties":{"token":"private"},
-            "children":[{"name":"provider","arguments":["claude"],"properties":{},"children":[]},
-                {"name":"credential","arguments":["private"],"properties":{},"children":[]}]}}));
-        let mut session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        session.scopes.remove("read.declarations");
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session,
-                fence: state.store.native_source_fence()? };
-            let current = reader.project(source(agent.clone()), "agent", false).unwrap();
-            assert_eq!(current.fields["desired"]["children"][0]["children"][0]["arguments"],
-                json!(["<redacted>"]));
-            let history = reader.project(source(agent.clone()), "agent", true).unwrap();
-            assert!(!history.fields.contains_key("desired"));
-            assert!(history.omitted_fields.iter().any(|name| name == "desired"));
-            let mut privileged = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-            privileged.scopes.insert("read.declarations".into());
-            let privileged_reader = Reader { session: &privileged, ..reader };
-            let projected = privileged_reader.project(source(account.clone()), "account", true).unwrap();
-            assert_eq!(projected.fields["desired"], json!({"name":"account",
-                "arguments":["ada/provider"],"properties":{},"children":[{
-                    "name":"provider","arguments":["claude"],"properties":{},"children":[]}]}));
-            let mut null = agent.clone();
-            null.body = json!({"fields":{"desired":null}});
-            assert_eq!(privileged_reader.project(source(null), "agent", true).unwrap()
-                .fields.get("desired"), Some(&Value::Null));
-            let mut absent = agent.clone();
-            absent.body = json!({"fields":{}});
-            let absent = privileged_reader.project(source(absent), "agent", true).unwrap();
-            assert!(!absent.fields.contains_key("desired"));
-            assert!(!absent.omitted_fields.iter().any(|name| name == "desired"));
-            Ok(())
-        }).unwrap();
-    }
-
-    #[test]
-    fn desired_ast_redaction_drops_extra_keys_and_rejects_nested_env_values() {
-        let mut desired = json!({"name":"agent","arguments":["example"],"properties":{},
-            "hidden":{"token":"private"},"children":[{"name":"env","arguments":[],
-                "properties":{},"children":[{"name":"TOKEN","arguments":["private"],
-                    "properties":{},"children":[],"hidden":"private"}]}]});
-        let mut safe = canonical_desired(&desired, "agent").unwrap();
-        crate::graph::redact_agent_env_values(&mut safe);
-        assert_eq!(safe["children"][0]["children"][0]["arguments"], json!(["<redacted>"]));
-        assert!(safe.get("hidden").is_none());
-        assert!(safe["children"][0]["children"][0].get("hidden").is_none());
-        desired["children"][0]["children"][0]["children"] =
-            json!([{"name":"nested","arguments":["private"],"properties":{},"children":[]}]);
-        assert!(canonical_desired(&desired, "agent").is_err());
-    }
-
-    #[test]
-    fn unsafe_float_integers_are_withheld_at_any_json_depth() {
-        assert!(!json_safe(&json!({"nested":[9_007_199_254_740_992.0]})));
-        assert!(!json_safe(&json!(-9_007_199_254_740_992.0)));
-        assert!(!json_safe(&json!(u64::MAX)));
-        assert!(json_safe(&json!({"nested":[9_007_199_254_740_991_u64, 0.5, null]})));
-    }
-
-    #[test]
-    fn durable_answer_audience_survives_reverse_request_arrival() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let answer = append(&state, "planning-session/reordered", "planning-session.question-answered",
-            json!({"decision_id":"decision","expected_revision":1,"requester":"person/bob"}));
-        let request = append(&state, "planning-session/reordered", "planning-session.question-requested",
-            json!({"decision_id":"decision","revision":1,"requester":"person/ada",
-                "decision_type":"boolean","question":"Proceed?"}));
-        // Model the immutable earlier canonical timestamp of a request received
-        // after its answer; arrival indexes intentionally remain reversed.
-        let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
-        crate::store::projection_digest::register(&connection).unwrap();
-        connection.execute("UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
-            rusqlite::params![answer.accepted_at_unix_ms.saturating_sub(1).to_string(), request.id]).unwrap();
-        let ada = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        let bob = ClientSession::for_tests("person/bob/session/test", "person/bob", "unix");
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &ada,
-                fence: state.store.native_source_fence()? };
-            assert!(reader.claim_visible(&answer).unwrap());
-            assert!(!Reader { session: &bob, ..reader }.claim_visible(&answer).unwrap());
-            Ok(())
-        }).unwrap();
-    }
-
-    #[test]
-    fn fenced_glass_continuations_recheck_current_deletion() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let first = "glass/person/ada/019a0000-0000-7000-8000-000000000001";
-        let second = "glass/person/ada/019a0000-0000-7000-8000-000000000002";
-        for reference in [first, second] {
-            append(&state, reference, "glass.upserted",
-                json!({"body":{"name":"Private","layout":{"tabs":[]}},"base_revision":null}));
-        }
-        let mut session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        session.scopes.insert("read.glasses".into());
-        let mut query = SubjectsQuery { family: "glass".into(), limit: Some(1), ..Default::default() };
-        let page = state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
-            Ok(reader.subjects_page(&query).unwrap())
-        }).unwrap();
-        assert_eq!(page["items"][0]["ref"], first);
-        query.cursor = Some(page["page"]["next_cursor"].as_str().unwrap().to_owned());
-        append(&state, second, "glass.deleted", json!({}));
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
-            let continuation = reader.subjects_page(&query).unwrap();
-            assert_eq!(continuation["items"], json!([]));
-            assert_eq!(continuation["page"]["has_more"], false);
-            Ok(())
-        }).unwrap();
-    }
-
-    #[test]
-    fn native_cursor_rejects_body_tampering_and_another_session() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
-            let cursor = reader.cursor(None, "subjects", "agent", None, None, None, 1).unwrap();
-            let encoded = encode_cursor(&cursor).unwrap();
-            let (_, signed) = encoded.split_once('/').unwrap();
-            let (body, signature) = signed.split_once('.').unwrap();
-            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body).unwrap();
-            let mut altered: Value = serde_json::from_slice(&bytes).unwrap();
-            altered["limit"] = json!(200);
-            let altered = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(serde_json::to_vec(&altered).unwrap());
-            assert!(decode_cursor(&format!("subject-page/{altered}.{signature}")).is_err());
-            let other = ClientSession::for_tests("person/bob/session/test", "person/bob", "unix");
-            assert!(Reader { session: &other, ..reader }.cursor(
-                Some(&encoded), "subjects", "agent", None, None, None, 1).is_err());
-            Ok(())
-        }).unwrap();
-    }
-    #[test]
-    fn private_family_scan_keeps_hidden_refs_out_of_cursors() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        for (reference, reviewer) in [
-            ("attention/A", "person/ada"), ("attention/B", "person/bob"), ("attention/C", "person/ada"),
-        ] {
-            append(&state, reference, "attention.requested",
-                json!({"reviewer":reviewer,"title":"Review","reason":"Review","severity":"warning"}));
-        }
-        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        let mut query = SubjectsQuery { family: "attention".into(), limit: Some(1), ..Default::default() };
-        let first = state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
-            Ok(reader.subjects_page(&query).unwrap())
-        }).unwrap();
-        assert_eq!(first["items"][0]["ref"], "attention/A");
-        query.cursor = Some(first["page"]["next_cursor"].as_str().unwrap().to_owned());
-        assert_eq!(decode_cursor(query.cursor.as_deref().unwrap()).unwrap().after_ref.as_deref(), Some("attention/A"));
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
-            let second = reader.subjects_page(&query).unwrap();
-            assert_eq!(second["items"][0]["ref"], "attention/C");
-            assert_eq!(second["page"]["has_more"], false);
-            Ok(())
-        }).unwrap();
-    }
-
-    #[test]
-    fn family_cursor_expires_when_an_unreturned_source_is_repaired() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let mut records = Vec::new();
-        for reference in ["attention/A", "attention/B", "attention/C"] {
-            records.push(append(&state, reference, "attention.requested",
-                json!({"reviewer":"person/ada","title":"Review","reason":"Review","severity":"warning"})));
-        }
-        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        let mut query = SubjectsQuery { family: "attention".into(), limit: Some(1), ..Default::default() };
-        let first = state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
-            Ok(reader.subjects_page(&query).unwrap())
-        }).unwrap();
-        query.cursor = Some(first["page"]["next_cursor"].as_str().unwrap().to_owned());
-        let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
-        crate::store::projection_digest::register(&connection).unwrap();
-        connection.execute("INSERT INTO projection_digest_repaired_claims(id) VALUES(?1)", [&records[2].id]).unwrap();
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
-            assert!(reader.subjects_page(&query).is_err());
-            Ok(())
-        }).unwrap();
-    }
-
-    #[test]
-    fn glass_scope_refusal_does_not_depend_on_private_identity_existence() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        let query = SubjectsQuery { family: "glass".into(), ..Default::default() };
-        let refused = || state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
-            Ok(reader.subjects_page(&query).is_err())
-        }).unwrap();
-        assert!(refused());
-        state.store.append_claim(&ClaimInput {
-            subject: "glass/person/bob/019a0000-0000-7000-8000-000000000001".into(),
-            kind: "glass.upserted".into(), actor: Some("person/bob".into()),
-            fields: serde_json::from_value(json!({"body":{"name":"Private","layout":{"tabs":[]}},"base_revision":null})).unwrap(),
-            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
-        assert!(refused());
-    }
-
-    #[test]
-    fn native_stop_retains_claim_metadata_without_a_declaration_bag() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        append(&state, "agent/stopped", "intent.desired",
-            json!({"kind":"stop","revision":"stop-revision","desired":{"stop":"agent/stopped"}}));
-        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
-        state.store.read_snapshot(|_| {
-            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
-            let projected = reader.subject("agent/stopped", "agent").unwrap().unwrap();
-            assert_eq!(projected.heads[0].fields["kind"], "stop");
-            assert_eq!(projected.heads[0].fields["revision"], "stop-revision");
-            assert!(!projected.heads[0].fields.contains_key("desired"));
-            let page = reader.history_page(&HistoryQuery {
-                subject: "agent/stopped".into(), kind: None, limit: None, cursor: None,
-            }, "subject-history").unwrap();
-            assert_eq!(page["coverage"]["local_retention"]["window_ms"], 7 * 86_400_000_u64);
-            assert!(page.get("sync").is_none());
-            Ok(())
-        }).unwrap();
-    }
-
-}
-
 fn json_safe(value: &Value) -> bool {
     match value {
         Value::Number(number) => number.as_i64().is_none_or(|value| value.unsigned_abs() <= 9_007_199_254_740_991)
@@ -1118,9 +733,9 @@ impl Reader<'_> {
     }
 
     fn cursor(
-        &self, encoded: Option<&str>, collection: &str, family: &str,
-        subject: Option<&str>, prefix: Option<&str>, kind: Option<&str>, limit: usize,
+        &self, encoded: Option<&str>, boundary: CursorBoundary<'_>,
     ) -> Result<Cursor, ApiError> {
+        let CursorBoundary { collection, family, subject, prefix, kind, limit } = boundary;
         let visibility = visibility_key(self.session)?;
         if let Some(encoded) = encoded {
             let cursor = decode_cursor(encoded)?;
@@ -1143,12 +758,11 @@ impl Reader<'_> {
             if cursor.retention_version.as_deref() != Some(current.as_str()) {
                 return Err(client_page_expired("the retained native sources changed; restart pagination"));
             }
-            if let (Some(subject), Some(position)) = (subject, cursor.before) {
-                if !self.state.store.native_source_record_exists(subject, position)
+            if let (Some(subject), Some(position)) = (subject, cursor.before)
+                && !self.state.store.native_source_record_exists(subject, position)
                     .map_err(ApiError::internal)?
-                {
-                    return Err(client_page_expired("the retained native history cursor is no longer available"));
-                }
+            {
+                return Err(client_page_expired("the retained native history cursor is no longer available"));
             }
             return Ok(cursor);
         }
@@ -1202,8 +816,10 @@ impl Reader<'_> {
             !prefix.starts_with(&format!("{}/", query.family)) || prefix.len() > 512
         }) { return Err(validation("ref_prefix must remain inside the selected native family")); }
         let limit = query.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS).clamp(1, CLIENT_MAX_PAGE_ITEMS);
-        let mut cursor = self.cursor(query.cursor.as_deref(), "subjects", &query.family,
-            None, query.ref_prefix.as_deref(), None, limit)?;
+        let mut cursor = self.cursor(query.cursor.as_deref(), CursorBoundary {
+            collection: "subjects", family: &query.family, subject: None,
+            prefix: query.ref_prefix.as_deref(), kind: None, limit,
+        })?;
         let reader = Reader { state: self.state, session: self.session, fence: NativeSourceFence {
             graph_index: cursor.graph_index, local_position: cursor.local_position,
         }};
@@ -1219,13 +835,12 @@ impl Reader<'_> {
             if references.is_empty() { break; }
             let full = references.len() == SOURCE_PAGE;
             for reference in references {
-                if let Some(person) = glass_owner.as_deref() {
-                    if st3_schema::glasses::owner(&reference)
+                if let Some(person) = glass_owner.as_deref()
+                    && st3_schema::glasses::owner(&reference)
                         .map_err(|error| validation(error.message))? != person
-                    {
-                        after = Some(reference);
-                        continue;
-                    }
+                {
+                    after = Some(reference);
+                    continue;
                 }
                 if !disclosure::family_ref_allowed(&query.family, &reference) {
                     after = Some(reference);
@@ -1258,14 +873,16 @@ impl Reader<'_> {
         if !self.identity_visible(&query.subject, &family)? {
             return Err(ApiError::not_found("the native subject is not available"));
         }
-        if let Some(kind) = &query.kind {
-            if disclosure::claim_schema_id(&family, kind).is_none() {
-                return Err(validation("the selected claim kind is not registered for this family"));
-            }
+        if let Some(kind) = &query.kind
+            && disclosure::claim_schema_id(&family, kind).is_none()
+        {
+            return Err(validation("the selected claim kind is not registered for this family"));
         }
         let limit = query.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS).clamp(1, CLIENT_MAX_PAGE_ITEMS);
-        let mut cursor = self.cursor(query.cursor.as_deref(), collection, &family,
-            Some(&query.subject), None, query.kind.as_deref(), limit)?;
+        let mut cursor = self.cursor(query.cursor.as_deref(), CursorBoundary {
+            collection, family: &family, subject: Some(&query.subject),
+            prefix: None, kind: query.kind.as_deref(), limit,
+        })?;
         let reader = Reader { state: self.state, session: self.session, fence: NativeSourceFence {
             graph_index: cursor.graph_index, local_position: cursor.local_position,
         }};
@@ -1402,4 +1019,403 @@ pub(super) async fn collection_window(
 
 pub(super) async fn validate_live_session(state: AppState, session: ClientSession) -> Result<(), ApiError> {
     read_native(state, session, |_| Ok(())).await.map(|_| ())
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::*;
+
+    fn state(root: &Path) -> AppState {
+        AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), "subject-test").unwrap()),
+            notify: Arc::new(Notify::new()), event_notify: watch::channel(0_u64).0,
+            node: "subject-test".into(), state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"), pty_binary: root.join("unused-pty"),
+            fleet_id: None, configured_peers: Vec::new(), client_relay: None,
+            native_session_home: None, planner_default: crate::model::PlannerSpec::default(),
+        }
+    }
+
+    fn append(state: &AppState, subject: &str, kind: &str, fields: Value) -> ClaimRecord {
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: kind.into(), actor: Some("person/ada".into()),
+            fields: fields.as_object().unwrap().iter()
+                .map(|(key, value)| (key.clone(), value.clone())).collect(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap()
+    }
+
+    fn source(record: ClaimRecord) -> NativeSourceRecord {
+        NativeSourceRecord { record, local_position: None }
+    }
+
+    #[test]
+    fn planning_answers_resolve_exact_preceding_decision_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let requested = |decision: &str, revision: u64, requester: &str| append(
+            &state, "planning-session/example", "planning-session.question-requested",
+            json!({"decision_id":decision,"revision":revision,"requester":requester,
+                "decision_type":"boolean","question":"Proceed?"}),
+        );
+        let first = requested("decision", 1, "person/ada");
+        requested("decision", 2, "person/alex");
+        let answer = append(&state, "planning-session/example", "planning-session.question-answered",
+            json!({"decision_id":"decision","expected_revision":1,"requester":"person/alex"}));
+        let future_answer = append(&state, "planning-session/example", "planning-session.question-answered",
+            json!({"decision_id":"future","expected_revision":1,"requester":"person/ada"}));
+        requested("future", 1, "person/ada");
+        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session,
+                fence: state.store.native_source_fence()? };
+            assert!(reader.claim_visible(&first).unwrap());
+            assert!(reader.claim_visible(&answer).unwrap());
+            assert!(!reader.claim_visible(&future_answer).unwrap());
+            let alex = ClientSession::for_tests("person/alex/session/test", "person/alex", "unix");
+            let alex_reader = Reader { session: &alex, ..reader };
+            assert!(!alex_reader.claim_visible(&answer).unwrap());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn approvals_and_recoveries_keep_their_actual_private_audience() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let approved = append(&state, "revision-proposal/example", "revision-proposal.approved",
+            json!({"reviewer":"person/ada","all_approved":true}));
+        let failure = append(&state, "agent/example", "operational.failure",
+            json!({"episode":"one","reviewer":"person/alex","reason":"private failure"}));
+        let recovered = append(&state, "agent/example", "operational.recovered",
+            json!({"episode":"one","failure":failure.id,"reason":"private recovery"}));
+        let missing = append(&state, "agent/example", "operational.recovered",
+            json!({"episode":"missing","failure":"unknown"}));
+        let unaddressed = append(&state, "agent/example", "operational.failure",
+            json!({"episode":"unaddressed","reason":"not an audience grant"}));
+        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session,
+                fence: state.store.native_source_fence()? };
+            assert!(reader.claim_visible(&approved).unwrap());
+            assert!(!reader.claim_visible(&failure).unwrap());
+            assert!(!reader.claim_visible(&recovered).unwrap());
+            assert!(!reader.claim_visible(&missing).unwrap());
+            assert!(!reader.claim_visible(&unaddressed).unwrap());
+            let alex = ClientSession::for_tests("person/alex/session/test", "person/alex", "unix");
+            let alex_reader = Reader { session: &alex, ..reader };
+            assert!(alex_reader.claim_visible(&recovered).unwrap());
+            assert!(!alex_reader.claim_visible(&approved).unwrap());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn excluded_records_cannot_establish_message_or_attention_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let message = append(&state, "message/excluded", "message.sent",
+            json!({"from":"person/ada","to":"agent/shared","status":"sent","content":"private"}));
+        let reply = append(&state, "message/reply", "message.sent",
+            json!({"from":"person/alex","to":"person/reviewer","status":"sent",
+                "content":"private","in_reply_to":message.subject}));
+        let attention = append(&state, "attention/excluded", "attention.requested",
+            json!({"reviewer":"person/ada","title":"private","reason":"private","severity":"warning"}));
+        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session,
+                fence: state.store.native_source_fence()? };
+            assert!(reader.identity_visible(&message.subject, "message").unwrap());
+            assert!(reader.identity_visible(&attention.subject, "attention").unwrap());
+            assert!(reader.identity_visible(&reply.subject, "message").unwrap());
+            Ok(())
+        }).unwrap();
+        let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
+        crate::store::projection_digest::register(&connection).unwrap();
+        for id in [&message.id, &attention.id] {
+            connection.execute("INSERT INTO projection_digest_repaired_claims(id) VALUES(?1)",
+                [id]).unwrap();
+        }
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session,
+                fence: state.store.native_source_fence()? };
+            assert!(!reader.identity_visible(&message.subject, "message").unwrap());
+            assert!(!reader.identity_visible(&attention.subject, "attention").unwrap());
+            assert!(!reader.identity_visible(&reply.subject, "message").unwrap());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn resource_facts_never_disclose_legacy_or_unregistered_bags() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let mut record = append(&state, "resource/example", "resource.observed",
+            json!({"kind":"filesystem.file","observed_at":1}));
+        record.body = json!({"fields":{"kind":"filesystem.file","observed_at":1,
+            "state":{"secret":"hidden"},"facts":{"status":null,"path":"/safe",
+                "private-id":{"secret":"hidden"}},"other-secret":"hidden"}});
+        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session,
+                fence: state.store.native_source_fence()? };
+            let projected = reader.project(source(record.clone()), "resource", true).unwrap();
+            assert_eq!(projected.fields.get("facts"), Some(&json!({"status":null,"path":"/safe"})));
+            assert!(!projected.fields.contains_key("state"));
+            assert!(!projected.omitted_fields.iter().any(|name| name == "private-id" || name == "other-secret"));
+            assert!(!projected.omitted_fields.iter().any(|name| name == "observed_at"));
+            record.body["fields"]["kind"] = json!("unreviewed.kind");
+            let unknown = reader.project(source(record.clone()), "resource", true).unwrap();
+            assert!(!unknown.fields.contains_key("facts"));
+            assert!(!unknown.fields.contains_key("state"));
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn desired_projectors_follow_family_policy_and_sensitive_history_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let agent = append(&state, "agent/example", "intent.desired", json!({"desired":{
+            "name":"agent","arguments":["example"],"properties":{},"children":[{
+                "name":"env","arguments":[],"properties":{},"children":[{
+                    "name":"TOKEN","arguments":["private"],"properties":{},"children":[]}]}]}}));
+        let account = append(&state, "account/ada/provider", "intent.desired", json!({"desired":{
+            "name":"account","arguments":["ada/provider"],"properties":{"token":"private"},
+            "children":[{"name":"provider","arguments":["claude"],"properties":{},"children":[]},
+                {"name":"credential","arguments":["private"],"properties":{},"children":[]}]}}));
+        let mut session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        session.scopes.remove("read.declarations");
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session,
+                fence: state.store.native_source_fence()? };
+            let current = reader.project(source(agent.clone()), "agent", false).unwrap();
+            assert_eq!(current.fields["desired"]["children"][0]["children"][0]["arguments"],
+                json!(["<redacted>"]));
+            let history = reader.project(source(agent.clone()), "agent", true).unwrap();
+            assert!(!history.fields.contains_key("desired"));
+            assert!(history.omitted_fields.iter().any(|name| name == "desired"));
+            let mut privileged = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+            privileged.scopes.insert("read.declarations".into());
+            let privileged_reader = Reader { session: &privileged, ..reader };
+            let projected = privileged_reader.project(source(account.clone()), "account", true).unwrap();
+            assert_eq!(projected.fields["desired"], json!({"name":"account",
+                "arguments":["ada/provider"],"properties":{},"children":[{
+                    "name":"provider","arguments":["claude"],"properties":{},"children":[]}]}));
+            let mut null = agent.clone();
+            null.body = json!({"fields":{"desired":null}});
+            assert_eq!(privileged_reader.project(source(null), "agent", true).unwrap()
+                .fields.get("desired"), Some(&Value::Null));
+            let mut absent = agent.clone();
+            absent.body = json!({"fields":{}});
+            let absent = privileged_reader.project(source(absent), "agent", true).unwrap();
+            assert!(!absent.fields.contains_key("desired"));
+            assert!(!absent.omitted_fields.iter().any(|name| name == "desired"));
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn desired_ast_redaction_drops_extra_keys_and_rejects_nested_env_values() {
+        let mut desired = json!({"name":"agent","arguments":["example"],"properties":{},
+            "hidden":{"token":"private"},"children":[{"name":"env","arguments":[],
+                "properties":{},"children":[{"name":"TOKEN","arguments":["private"],
+                    "properties":{},"children":[],"hidden":"private"}]}]});
+        let mut safe = canonical_desired(&desired, "agent").unwrap();
+        crate::graph::redact_agent_env_values(&mut safe);
+        assert_eq!(safe["children"][0]["children"][0]["arguments"], json!(["<redacted>"]));
+        assert!(safe.get("hidden").is_none());
+        assert!(safe["children"][0]["children"][0].get("hidden").is_none());
+        desired["children"][0]["children"][0]["children"] =
+            json!([{"name":"nested","arguments":["private"],"properties":{},"children":[]}]);
+        assert!(canonical_desired(&desired, "agent").is_err());
+    }
+
+    #[test]
+    fn unsafe_float_integers_are_withheld_at_any_json_depth() {
+        assert!(!json_safe(&json!({"nested":[9_007_199_254_740_992.0]})));
+        assert!(!json_safe(&json!(-9_007_199_254_740_992.0)));
+        assert!(!json_safe(&json!(u64::MAX)));
+        assert!(json_safe(&json!({"nested":[9_007_199_254_740_991_u64, 0.5, null]})));
+    }
+
+    #[test]
+    fn durable_answer_audience_survives_reverse_request_arrival() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let answer = append(&state, "planning-session/reordered", "planning-session.question-answered",
+            json!({"decision_id":"decision","expected_revision":1,"requester":"person/alex"}));
+        let request = append(&state, "planning-session/reordered", "planning-session.question-requested",
+            json!({"decision_id":"decision","revision":1,"requester":"person/ada",
+                "decision_type":"boolean","question":"Proceed?"}));
+        // Model the immutable earlier canonical timestamp of a request received
+        // after its answer; arrival indexes intentionally remain reversed.
+        let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
+        crate::store::projection_digest::register(&connection).unwrap();
+        connection.execute("UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+            rusqlite::params![answer.accepted_at_unix_ms.saturating_sub(1).to_string(), request.id]).unwrap();
+        let ada = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        let alex = ClientSession::for_tests("person/alex/session/test", "person/alex", "unix");
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &ada,
+                fence: state.store.native_source_fence()? };
+            assert!(reader.claim_visible(&answer).unwrap());
+            assert!(!Reader { session: &alex, ..reader }.claim_visible(&answer).unwrap());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn fenced_glass_continuations_recheck_current_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let first = "glass/person/ada/019a0000-0000-7000-8000-000000000001";
+        let second = "glass/person/ada/019a0000-0000-7000-8000-000000000002";
+        for reference in [first, second] {
+            append(&state, reference, "glass.upserted",
+                json!({"body":{"name":"Private","layout":{"tabs":[]}},"base_revision":null}));
+        }
+        let mut session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        session.scopes.insert("read.glasses".into());
+        let mut query = SubjectsQuery { family: "glass".into(), limit: Some(1), ..Default::default() };
+        let page = state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
+            Ok(reader.subjects_page(&query).unwrap())
+        }).unwrap();
+        assert_eq!(page["items"][0]["ref"], first);
+        query.cursor = Some(page["page"]["next_cursor"].as_str().unwrap().to_owned());
+        append(&state, second, "glass.deleted", json!({}));
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
+            let continuation = reader.subjects_page(&query).unwrap();
+            assert_eq!(continuation["items"], json!([]));
+            assert_eq!(continuation["page"]["has_more"], false);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn native_cursor_rejects_body_tampering_and_another_session() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
+            let cursor = reader.cursor(None, CursorBoundary {
+                collection: "subjects", family: "agent", subject: None,
+                prefix: None, kind: None, limit: 1,
+            }).unwrap();
+            let encoded = encode_cursor(&cursor).unwrap();
+            let (_, signed) = encoded.split_once('/').unwrap();
+            let (body, signature) = signed.split_once('.').unwrap();
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body).unwrap();
+            let mut altered: Value = serde_json::from_slice(&bytes).unwrap();
+            altered["limit"] = json!(200);
+            let altered = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&altered).unwrap());
+            assert!(decode_cursor(&format!("subject-page/{altered}.{signature}")).is_err());
+            let other = ClientSession::for_tests("person/alex/session/test", "person/alex", "unix");
+            assert!(Reader { session: &other, ..reader }.cursor(Some(&encoded), CursorBoundary {
+                collection: "subjects", family: "agent", subject: None,
+                prefix: None, kind: None, limit: 1,
+            }).is_err());
+            Ok(())
+        }).unwrap();
+    }
+    #[test]
+    fn private_family_scan_keeps_hidden_refs_out_of_cursors() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        for (reference, reviewer) in [
+            ("attention/A", "person/ada"), ("attention/B", "person/alex"), ("attention/C", "person/ada"),
+        ] {
+            append(&state, reference, "attention.requested",
+                json!({"reviewer":reviewer,"title":"Review","reason":"Review","severity":"warning"}));
+        }
+        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        let mut query = SubjectsQuery { family: "attention".into(), limit: Some(1), ..Default::default() };
+        let first = state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
+            Ok(reader.subjects_page(&query).unwrap())
+        }).unwrap();
+        assert_eq!(first["items"][0]["ref"], "attention/A");
+        query.cursor = Some(first["page"]["next_cursor"].as_str().unwrap().to_owned());
+        assert_eq!(decode_cursor(query.cursor.as_deref().unwrap()).unwrap().after_ref.as_deref(), Some("attention/A"));
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
+            let second = reader.subjects_page(&query).unwrap();
+            assert_eq!(second["items"][0]["ref"], "attention/C");
+            assert_eq!(second["page"]["has_more"], false);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn family_cursor_expires_when_an_unreturned_source_is_repaired() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let mut records = Vec::new();
+        for reference in ["attention/A", "attention/B", "attention/C"] {
+            records.push(append(&state, reference, "attention.requested",
+                json!({"reviewer":"person/ada","title":"Review","reason":"Review","severity":"warning"})));
+        }
+        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        let mut query = SubjectsQuery { family: "attention".into(), limit: Some(1), ..Default::default() };
+        let first = state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
+            Ok(reader.subjects_page(&query).unwrap())
+        }).unwrap();
+        query.cursor = Some(first["page"]["next_cursor"].as_str().unwrap().to_owned());
+        let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
+        crate::store::projection_digest::register(&connection).unwrap();
+        connection.execute("INSERT INTO projection_digest_repaired_claims(id) VALUES(?1)", [&records[2].id]).unwrap();
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
+            assert!(reader.subjects_page(&query).is_err());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn glass_scope_refusal_does_not_depend_on_private_identity_existence() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        let query = SubjectsQuery { family: "glass".into(), ..Default::default() };
+        let refused = || state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
+            Ok(reader.subjects_page(&query).is_err())
+        }).unwrap();
+        assert!(refused());
+        state.store.append_claim(&ClaimInput {
+            subject: "glass/person/alex/019a0000-0000-7000-8000-000000000001".into(),
+            kind: "glass.upserted".into(), actor: Some("person/alex".into()),
+            fields: serde_json::from_value(json!({"body":{"name":"Private","layout":{"tabs":[]}},"base_revision":null})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert!(refused());
+    }
+
+    #[test]
+    fn native_stop_retains_claim_metadata_without_a_declaration_bag() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        append(&state, "agent/stopped", "intent.desired",
+            json!({"kind":"stop","revision":"stop-revision","desired":{"stop":"agent/stopped"}}));
+        let session = ClientSession::for_tests("person/ada/session/test", "person/ada", "unix");
+        state.store.read_snapshot(|_| {
+            let reader = Reader { state: &state, session: &session, fence: state.store.native_source_fence()? };
+            let projected = reader.subject("agent/stopped", "agent").unwrap().unwrap();
+            assert_eq!(projected.heads[0].fields["kind"], "stop");
+            assert_eq!(projected.heads[0].fields["revision"], "stop-revision");
+            assert!(!projected.heads[0].fields.contains_key("desired"));
+            let page = reader.history_page(&HistoryQuery {
+                subject: "agent/stopped".into(), kind: None, limit: None, cursor: None,
+            }, "subject-history").unwrap();
+            assert_eq!(page["coverage"]["local_retention"]["window_ms"], 7 * 86_400_000_u64);
+            assert!(page.get("sync").is_none());
+            Ok(())
+        }).unwrap();
+    }
+
 }

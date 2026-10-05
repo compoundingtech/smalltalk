@@ -33,6 +33,7 @@ use crate::resource::{
 };
 use crate::store::Store;
 
+mod channel_recovery;
 mod placement;
 
 /// The actor of every attention request the reconciler raises.
@@ -2314,6 +2315,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 blocked,
                                 &suspension,
                             );
+                        }
+                        if self.reconcile_claude_channel_recovery(
+                            subject,
+                            member,
+                            observed.as_ref(),
+                            blocked.as_ref(),
+                            now_ms(),
+                        )? {
+                            return Ok(());
                         }
                         if self.reconcile_requested_restart(
                             subject,
@@ -5694,7 +5704,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             if attempted.is_some()
                 && member.driver.is_some()
-                && !self
+                && (!self
                     .store
                     .current_harness(&subject.subject)?
                     .is_some_and(|harness| {
@@ -5702,6 +5712,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                             == observation.incarnation_id.as_deref()
                             && harness.is_ready()
                     })
+                    || (request.body["fields"]["operation"] == "claude-channel-recovery"
+                        && !self.store.claude_channel_attached(
+                            &subject.subject,
+                            observation.incarnation_id.as_deref().unwrap(),
+                        )?))
             {
                 // Continue ordinary observation and prompt handling while the new wrapper boots.
                 // Launch acceptance alone cannot prove the native provider passed its gate.
@@ -15176,6 +15191,7 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    mod channel_recovery;
     mod differential;
     mod incremental_deadlines;
     mod rollout_tests;

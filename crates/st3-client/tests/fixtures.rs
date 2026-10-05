@@ -565,8 +565,8 @@ fn concrete_native_models_reject_wrong_descriptors_literals_and_refs() {
 #[test]
 fn native_known_claims_reject_wrong_types_and_invalid_reference_fields() {
     for invalid in [
-        serde_json::json!(42), serde_json::json!("person/has whitespace"),
-        serde_json::json!("unregistered/example"), serde_json::json!("person/has\u{0001}control"),
+        serde_json::json!(42), serde_json::json!("person/ada whitespace"),
+        serde_json::json!("unregistered/example"), serde_json::json!("person/ada\u{0001}control"),
         serde_json::json!(format!("person/{}", "a".repeat(512))),
         serde_json::json!(format!("person/{}", "é".repeat(256))),
         serde_json::json!("custom/team//example"), serde_json::json!("file/not-absolute"),

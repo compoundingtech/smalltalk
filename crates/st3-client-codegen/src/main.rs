@@ -685,6 +685,8 @@ fn validate_surfaces(
         "AgentMessageDay",
         "MailBacklog",
         "UsageRow",
+        "UsagePricing",
+        "UsagePricingRates",
         "ClientConnections",
         "ClientConnection",
         "UsageLimit",

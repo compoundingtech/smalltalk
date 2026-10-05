@@ -9695,6 +9695,35 @@ export const UsageLimit = /*#__PURE__*/ (() => Schema.Struct({
 export type UsageLimit = typeof UsageLimit.Type
 export type UsageLimitEncoded = typeof UsageLimit.Encoded
 
+export const UsagePricingRates = /*#__PURE__*/ (() => Schema.Struct({
+  "cache_read": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cache_write_1h": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cache_write_5m": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "input": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "output": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "UsagePricingRates" }))()
+export type UsagePricingRates = typeof UsagePricingRates.Type
+export type UsagePricingRatesEncoded = typeof UsagePricingRates.Encoded
+
+/** Cumulative contribution on claims; period contribution on usage reads. Provider-reported costs have no disclosed price table or rates. Missing provenance on historical claims is unknown. */
+export const UsagePricing = /*#__PURE__*/ (() => Schema.Struct({
+  "cache_write_1h_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cache_write_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cached_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cost_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cost_source": Schema.Literals(["provider_reported","computed","unpriced"]),
+  "input_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "output_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "price_table_id": optionalKey(Schema.String),
+  "price_table_version": optionalKey(Schema.String),
+  "rates_usd_per_million_tokens": optionalKey(UsagePricingRates),
+  "reported_cost_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "total_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "unpriced_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "UsagePricing", description: "Cumulative contribution on claims; period contribution on usage reads. Provider-reported costs have no disclosed price table or rates. Missing provenance on historical claims is unknown." }))()
+export type UsagePricing = typeof UsagePricing.Type
+export type UsagePricingEncoded = typeof UsagePricing.Encoded
+
 export const UsageRow = /*#__PURE__*/ (() => Schema.Struct({
   "account": optionalKey(Schema.String),
   "agent": Id,
@@ -9706,8 +9735,10 @@ export const UsageRow = /*#__PURE__*/ (() => Schema.Struct({
   "input_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "mission_run": optionalKey(Id),
   "model": optionalKey(Schema.String),
+  "native_session_id": optionalKey(Schema.String),
   "output_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "pricing": optionalKey(Schema.String),
+  "pricing_provenance": optionalKey(Schema.Array(UsagePricing)),
   "reported_cost_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "step": optionalKey(Id),
   "total_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),

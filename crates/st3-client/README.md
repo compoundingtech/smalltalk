@@ -66,5 +66,14 @@ write is stalled. A closed remote stream produces EOF on the connector.
 Reconnect by explicitly acquiring a **new** attachment and opening a new connector; capabilities
 cannot be replayed, and the client does not transparently reconnect or reuse one.
 
-Run `cargo run -p st3-client-codegen -- --check` from the repository root to verify the generated
-models and operation surfaces exactly match the normative schema and operation manifest.
+After registry changes, regenerate the public registry document from the repository root with
+`cargo run -p st3-schema --example schema_markdown -- docs/st3/schema.md`, then regenerate the
+client surfaces with `cargo run -p st3-client-codegen`. Run
+`cargo run -p st3-client-codegen -- --check` to verify the generated models and operation surfaces
+exactly match the normative schema and operation manifest.
+
+Offline JSON Schema validators must register
+`docs/st3/client-v0/schemas/subject-projection.schema.json` at
+`https://st3.local/schemas/subject-projection.schema.json`, including when validating a modified
+older client schema. Registering the native resource resolves its external references without
+enabling network retrieval or loosening the older schema's closed enums.

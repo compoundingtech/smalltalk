@@ -1,12 +1,13 @@
+import { linuxActionlintConfig, linuxRunner } from './workspace-ci.ts'
 import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import { auditCaches } from './cache-audit.ts'
-import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
+import { githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
 
 // Preserve release triggers, source verification and publishing permissions. Every commit on main
 // also builds and verifies both archives and keeps them as short-lived artifacts, so release
 // breakage fails on main instead of at tag time (the daily release publishes those artifacts).
 export default githubWorkflow(auditCaches({
-  actionlint: defaultActionlintConfig,
+  actionlint: linuxActionlintConfig,
   "name": "Smalltalk tag release",
   "on": {
     "push": {
@@ -52,7 +53,7 @@ export default githubWorkflow(auditCaches({
         "fail-fast": false,
         "matrix": {
           "runner": [
-            "namespace-profile-linux-x86-64",
+            linuxRunner[0],
             "namespace-profile-macos-arm64"
           ]
         }
@@ -83,7 +84,7 @@ export default githubWorkflow(auditCaches({
         "matrix": {
           "include": [
             {
-              "runner": "namespace-profile-linux-x86-64",
+              "runner": linuxRunner[0],
               "target": "x86_64-unknown-linux-gnu"
             },
             {
@@ -166,7 +167,7 @@ export default githubWorkflow(auditCaches({
         "build",
         "installer"
       ],
-      "runs-on": "namespace-profile-linux-x86-64",
+      "runs-on": linuxRunner,
       "steps": [
         {
           "uses": "actions/checkout@v4",
@@ -204,7 +205,7 @@ export default githubWorkflow(auditCaches({
       "name": "release-publish",
       "if": "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.event.deleted == false",
       "needs": "assemble",
-      "runs-on": "namespace-profile-linux-x86-64",
+      "runs-on": linuxRunner,
       "permissions": {
         "contents": "write"
       },

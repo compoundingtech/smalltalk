@@ -46,8 +46,10 @@ fn native_patterns()->&'static BTreeMap<String,regex::Regex> {
         fn collect(value:&Value,patterns:&mut BTreeMap<String,regex::Regex>) {
             match value {
                 Value::Object(fields)=>{
-                    if let Some(pattern)=fields.get("pattern").and_then(Value::as_str).filter(|_| !fields.contains_key("x-st-native-ref-families")) {
-                        if !patterns.contains_key(pattern) { patterns.insert(pattern.to_owned(),regex::Regex::new(pattern).expect("generated native pattern is valid")); }
+                    if let Some(pattern)=fields.get("pattern").and_then(Value::as_str).filter(|_| !fields.contains_key("x-st-native-ref-families"))
+                        && !patterns.contains_key(pattern)
+                    {
+                        patterns.insert(pattern.to_owned(),regex::Regex::new(pattern).expect("generated native pattern is valid"));
                     }
                     for child in fields.values() { collect(child,patterns); }
                 },
@@ -92,8 +94,10 @@ fn native_reference_valid(schema:&Value,value:&Value)->bool {
     true
 }
 fn native_valid(schema:&Value,value:&Value)->bool {
-    if let Some(bound)=schema.get("x-st-max-utf8-bytes").and_then(Value::as_u64) {
-        if !value.as_str().is_some_and(|text|text.len()<=bound as usize) { return false; }
+    if let Some(bound)=schema.get("x-st-max-utf8-bytes").and_then(Value::as_u64)
+        && !value.as_str().is_some_and(|text|text.len()<=bound as usize)
+    {
+        return false;
     }
     if schema.get("x-st-native-ref-families").is_some() { return native_reference_valid(schema,value); }
     if let Some(reference)=schema.get("$ref").and_then(Value::as_str) {
@@ -117,16 +121,21 @@ fn native_valid(schema:&Value,value:&Value)->bool {
         None=>true, _=>false,
     };
     if !valid { return false; }
-    if let Some(number)=value.as_f64() {
-        if schema.get("minimum").and_then(Value::as_f64).is_some_and(|bound|number<bound) || schema.get("maximum").and_then(Value::as_f64).is_some_and(|bound|number>bound) { return false; }
+    if let Some(number)=value.as_f64()
+        && (schema.get("minimum").and_then(Value::as_f64).is_some_and(|bound|number<bound)
+            || schema.get("maximum").and_then(Value::as_f64).is_some_and(|bound|number>bound))
+    {
+        return false;
     }
     let length=value.as_array().map(Vec::len).or_else(||value.as_str().map(|text|text.chars().count()));
     if let Some(length)=length {
         for key in ["minItems","minLength"] { if schema.get(key).and_then(Value::as_u64).is_some_and(|bound|length<bound as usize) { return false; } }
         for key in ["maxItems","maxLength"] { if schema.get(key).and_then(Value::as_u64).is_some_and(|bound|length>bound as usize) { return false; } }
     }
-    if let (Some(pattern),Some(text))=(schema.get("pattern").and_then(Value::as_str),value.as_str()) {
-        if !native_patterns().get(pattern).is_some_and(|pattern|pattern.is_match(text)) { return false; }
+    if let (Some(pattern),Some(text))=(schema.get("pattern").and_then(Value::as_str),value.as_str())
+        && !native_patterns().get(pattern).is_some_and(|pattern|pattern.is_match(text))
+    {
+        return false;
     }
     true
 }

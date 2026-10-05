@@ -211,6 +211,8 @@ fn usage() -> Vec<st3_client::UsageRow> {
         })),
         host: Some(s(host)),
         pricing: Some(s("list-2026-10-02")),
+        native_session_id: None,
+        pricing_provenance: None,
         total_tokens: tokens,
         input_tokens: tokens / 50,
         output_tokens: output,

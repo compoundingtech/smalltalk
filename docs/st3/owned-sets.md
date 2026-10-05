@@ -5,7 +5,7 @@ definitions and schedules. A successful publication retires previously live memb
 absent from that list. Membership lives in the ordinary graph, on `owned-set/NAME` subjects with
 immutable `owned-set.revised` claims. There is no inventory database alongside the graph.
 
-Ordinary purpose-specific publication remains an upsert: omission has no effect. Owned sets are
+Ordinary `st apply FILE...` publication remains an upsert: omission has no effect. Owned sets are
 an explicit choice, made with `st apply --set NAME`. A file disappearing from a checkout does
 nothing by itself. The publisher must submit a complete, valid bundle. An unreadable input,
 invalid declaration, stale fence or unconfirmed mass retirement rejects the entire transaction.
@@ -22,7 +22,15 @@ st apply --set garden seats.kdl missions.kdl schedules.kdl \
   --as person/operator --dry-run
 ```
 
-Remove `--dry-run` to publish. Initial creation requires `--expect-set absent`; subsequent
+Remove `--dry-run` to publish. A dry run prints blockers and exits with failure when any
+are present. Add `--check` to execute gates during the preview, with `--workspace DIR` and
+`--input NAME=VALUE` as needed; gate answers appear on stderr. Publication checks for broken
+exec gates by default; `--no-gate-check` skips them.
+
+All source flags are required together with `--set`. Without `--set`, publish plain files
+with `st apply seats.kdl missions.kdl schedules.kdl --as person/operator`.
+
+Initial creation requires `--expect-set absent`; subsequent
 publications require the exact selected revision printed by `st sets show garden`. The CLI
 previews first, then submits captured member heads with the apply. The daemon checks the set
 revision, source sequence and every captured member head within the publication transaction.

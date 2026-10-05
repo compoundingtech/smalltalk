@@ -34,6 +34,13 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
     { kind: 'subscribe', id: 'agents', collection: 'agents', limit: 200 },
   ]);
   assert.deepEqual(seen.connection, ['connecting']);
+  // Native subjects cannot initialize or replace an operational window, even with its ID.
+  const unavailable = { kind: 'unsupported-subject-schema', id: 'agent/example', ref: 'agent/example', schema_id: 'future-schema', payload_availability: 'unsupported-schema' };
+  sockets[0].frame({ kind: 'snapshot', id: 'missions', collection: 'subjects', snapshot: snapshot(1), items: [unavailable], order: [unavailable.id], has_more: false });
+  sockets[0].frame({ kind: 'changes', id: 'missions', collection: 'subjects', snapshot: snapshot(2), upserts: [unavailable], removes: [], order: [unavailable.id], has_more: false });
+  assert.deepEqual(seen.windows, {});
+  assert.deepEqual(seen.connection, ['connecting']);
+  assert.deepEqual(subscribed(sockets[0]), ['attention', 'missions', 'agents'], 'native frames do not resubscribe operational windows');
   sockets[0].frame({ kind: 'snapshot', id: 'missions', collection: 'missions', snapshot: snapshot(1), items: [mission('mission/b'), mission('mission/a')], order: ['mission/a', 'mission/b'], has_more: true });
   assert.deepEqual(seen.windows.missions, { ids: ['mission/a', 'mission/b'], hasMore: true, snapshot: 'snapshot/host/1' });
   assert.deepEqual(seen.connection, ['connecting', 'live']);

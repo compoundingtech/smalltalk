@@ -414,6 +414,152 @@ async fn agent_workspace_cli_and_client_read_the_same_declaration_even_after_ret
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_cli_and_client_keep_pricing_provenance_and_native_session_binding() {
+    use serde_json::json;
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let subject = "agent/example.usage";
+    let append = |kind: &str, fields: Value| {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap()
+    };
+    append(
+        "harness.observed",
+        json!({"state":"working","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    let respond = |entry: &str| {
+        let observation = append(
+            "harness.timeline",
+            json!({
+                "operation":"append","entry_id":entry,"revision":1,"role":"system",
+                "entry_type":"usage","final":true,"driver":"codex",
+                "incarnation_id":"inc-one","sequence":1,
+                "body":{"semantics":"response","model":"gpt-6.1-sol",
+                    "input_tokens":1000,"output_tokens":100,"total_tokens":1100}
+            }),
+        );
+        let rollup = store
+            .usage_rollup_for_timeline(&observation)
+            .unwrap()
+            .unwrap();
+        store.append_client_claim(&rollup).unwrap();
+    };
+    respond("first-response");
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        1
+    );
+    // A single response already published has no pending token change. Its late native
+    // binding must still be captured at stop, without publishing at binding time.
+    append(
+        "harness.session-file",
+        json!({"harness":"codex","session_id":"native-example",
+        "incarnation_id":"inc-one"}),
+    );
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        1
+    );
+    append(
+        "harness.observed",
+        json!({"state":"idle","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        2
+    );
+    append(
+        "harness.observed",
+        json!({"state":"working","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    respond("second-response");
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        2,
+        "second response stays pending within five minutes"
+    );
+    append(
+        "harness.observed",
+        json!({"state":"idle","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        3
+    );
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(state))
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let cli = value(&run_cli(&socket, &["usage"]).await);
+    let row = &cli["rows"][0];
+    assert_eq!(row["native_session_id"], "native-example");
+    assert_eq!(row["total_tokens"], 2200);
+    assert_eq!(
+        row["pricing_provenance"][0]["price_table_id"],
+        st3::pricing::PRICE_TABLE_ID
+    );
+    assert_eq!(
+        row["pricing_provenance"][0]["price_table_version"],
+        st3::pricing::price_table_version()
+    );
+    assert_eq!(row["pricing_provenance"][0]["cost_source"], "computed");
+    assert_eq!(
+        row["pricing_provenance"][0]["rates_usd_per_million_tokens"]["input"],
+        2.0
+    );
+    let client = st3_client::Client::unix_as(&socket, "person/avery");
+    let report = client.usage_period(None, None).await.unwrap();
+    let typed = &report.value.rows[0];
+    assert_eq!(typed.native_session_id.as_deref(), Some("native-example"));
+    let provenance = &typed.pricing_provenance.as_ref().unwrap()[0];
+    assert_eq!(provenance.total_tokens, 2200);
+    assert_eq!(provenance.cost_microusd, 6000);
+    assert_eq!(
+        provenance
+            .rates_usd_per_million_tokens
+            .as_ref()
+            .unwrap()
+            .output,
+        10.0
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_policy() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");

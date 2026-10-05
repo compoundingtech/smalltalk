@@ -161,7 +161,7 @@ agent "garden/worker" {
   }
 }
 EOF
-st agents apply worker.kdl --as person/ada
+st apply worker.kdl --as person/ada
 st agents show agent/garden/worker
 st terminals attach agent/garden/worker
 ```
@@ -188,7 +188,7 @@ mission "garden/first-note" state="ready" {
   }
 }
 EOF
-st missions publish first-mission.kdl --as person/ada
+st apply first-mission.kdl --as person/ada
 st missions start garden/first-note --id garden/first-note/one \
   --workspace "$PWD" --as person/ada
 stui

@@ -94,13 +94,12 @@ fn merge_objects(parts: &[Value]) -> Result<Value> {
                 "properties" => {
                     for (name, schema) in value.as_object().context("properties")? {
                         let mut schema = schema.clone();
-                        if let Some(known) = properties.get(name).and_then(open_enum) {
-                            if schema["not"]["enum"]
+                        if let Some(known) = properties.get(name).and_then(open_enum)
+                            && schema["not"]["enum"]
                                 .as_array()
                                 .is_some_and(|excluded| known.iter().all(|value| excluded.contains(value)))
-                            {
-                                schema["x-st-unknown-case"] = Value::Bool(true);
-                            }
+                        {
+                            schema["x-st-unknown-case"] = Value::Bool(true);
                         }
                         properties.insert(name.clone(), schema);
                     }

@@ -426,6 +426,27 @@ The durable reading survives member restarts. Consumers must check its original 
 and reset window; missing or stale evidence is unknown, never zero. `st doctor` reports missing,
 stale, future-dated or already-reset weekly evidence for active accounts as `account-limits`.
 See [account limits](../accounts.md#at-the-limit) for the policy and external backstop behavior.
+Rows also carry optional `native_session_id` (the provider's session UUID, fenced by incarnation)
+and `pricing_provenance`. The legacy `pricing` label remains readable. Each provenance entry
+names `cost_source` (`provider_reported`, `computed`, or `unpriced`), disjoint token buckets,
+`cost_microusd`, `reported_cost_microusd` and `unpriced_tokens`. Computed entries name
+`price_table_id` (`st.api-list`), `price_table_version` (date plus SHA-256 of the complete table),
+and `rates_usd_per_million_tokens` (`input`, `output`, `cache_read`, `cache_write_5m`,
+`cache_write_1h`), with long-context multipliers already applied. Provider-reported entries
+omit undisclosed table identity and rates; unpriced entries name the attempted table and omit
+rates. Entries on rollups are cumulative; period reads subtract the matching baseline entry.
+Different versions, sources and effective rates remain separate within the same rollup slot.
+Historical claims without these fields remain readable; absent provenance or session binding
+is unknown. After an upgrade, provenance covers only responses priced by the upgraded writer;
+its bucket sums can therefore be smaller than the row's totals. Per-response rounding means
+recomputing a contribution from aggregate token counts can differ slightly from the recorded cost.
+
+The external per-request ledger remains canonical (#1419). These additions keep the existing
+five-minute/stop publication cadence and latest/hourly/baseline retention bounds. They do not
+change checkpoint selection or carriers, so they require no additional rules-version bump
+beyond version 10 introduced separately by #1322 for native credential evidence. Typed imports and a
+retention decision for native per-request records remain later work.
+
 The Rust method is `Client::usage_period(since_ms, until_ms)`;
 Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
 

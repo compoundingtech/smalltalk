@@ -37,6 +37,15 @@ snapshot's store index, so rows always match their fence. Commits that land
 while a window is read neither tear it nor delay it; they arrive in the next
 `changes` frame.
 
+Windows complete independently: a slow collection read does not prevent new
+subscription commands or ready conversation and terminal frames from being
+handled. Each subscription still delivers its snapshot before its changes.
+Replacing or removing a subscription discards its pending collection result;
+changes observed during a read schedule another read of that window.
+Each socket permits at most eight physical collection reads, including store
+work still finishing after cancellation. Replacements wait for a read slot
+without blocking command admission or unrelated ready frames.
+
 An `error` frame reports a permanent refusal and ends that subscription. A
 `resync` frame with `retryable: true` reports a temporary read failure; the server
 keeps the subscription and retries after its reread interval, including when the
@@ -66,11 +75,13 @@ rejecting malformed known rows. Retained claim/history pages are separate HTTP r
 Every native reread applies current identity visibility, claim audience, and positive field
 disclosure before choosing heads or computing diffs. Glass upserts/deletions and local observation
 changes wake native windows even when the operational claim feed omits them. Deleted or newly
-hidden identities leave the window through `removes`; reconnect starts with an authoritative
-snapshot.
+hidden identities leave an already delivered window through `removes`; reconnect starts with an
+authoritative snapshot. An initial subscription to a missing or hidden ref instead ends with the
+same `not-found` error, without disclosing whether that identity exists.
 
 Paired native subscriptions retain their authenticated pairing/device/session binding. The server
-rechecks revocation and scopes before reads and enforces expiry even on an idle socket.
+rechecks revocation and scopes before reads and again before delivering their results, and enforces
+expiry even on an idle socket. Results from replaced or unsubscribed windows are discarded.
 Revoked or expired authority ends the subscription before any further native data is sent.
 
 ## Terminals

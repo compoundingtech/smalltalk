@@ -280,12 +280,12 @@ pub fn family_descriptor(family: &str) -> Option<Value> {
             Some(SpecialProjector::GlassBody) => Some("body"),
             _ => None,
         };
-        if let Some(name) = special_field {
-            if let Some(native) = spec.fields.get(name) {
-                let mut projected = native.clone();
-                projected.required = false;
-                fields.insert(name, projected);
-            }
+        if let Some(name) = special_field
+            && let Some(native) = spec.fields.get(name)
+        {
+            let mut projected = native.clone();
+            projected.required = false;
+            fields.insert(name, projected);
         }
         if special == Some(SpecialProjector::ResourceObservation) {
             // The nested object is constructed from native ResourceSpec fields;

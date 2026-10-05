@@ -134,7 +134,7 @@ impl Contract {
                     fields = json!({"anyOf":alternatives});
                 }
                 definitions.insert(field_name.clone(), fields);
-                let properties = json!({"id":{"type":"string"},"ref":crate::subject_reference_schema(&[family.clone()]),
+                let properties = json!({"id":{"type":"string"},"ref":crate::subject_reference_schema(std::slice::from_ref(family)),
                     "kind":if kind == "custom.*" { json!({"type":"string","pattern":"^custom\\.[a-zA-Z0-9_-]+(?:\\.[a-zA-Z0-9_-]+)+$"}) } else { json!({"const":kind}) },
                     "schema_id":claim_id,"retention":if kind == "custom.*" { json!({"const":"durable"}) } else { json!({"const":claim["retention"]}) },
                     "provenance":reference("SubjectProvenance"),"payload_availability":{"enum":["available","withheld","unavailable"]},
@@ -147,7 +147,7 @@ impl Contract {
             }
             let heads_name = format!("Native{}Claim",pascal(family));
             definitions.insert(heads_name.clone(),union(family_claims));
-            definitions.insert(family_name.clone(),object(json!({"kind":{"const":"subject"},"id":{"type":"string"},"ref":crate::subject_reference_schema(&[family.clone()]),
+            definitions.insert(family_name.clone(),object(json!({"kind":{"const":"subject"},"id":{"type":"string"},"ref":crate::subject_reference_schema(std::slice::from_ref(family)),
                 "family":{"const":family},"schema_id":{"const":schema_id},"heads":{"type":"array","maxItems":64,"items":reference(&heads_name)},"heads_complete":{"type":"boolean"},"local_fence":reference("SubjectLocalFence")}),&["kind","id","ref","family","schema_id","heads","heads_complete","local_fence"]));
             let descriptor_name = format!("Native{}Descriptor", pascal(family));
             definitions.insert(descriptor_name.clone(),object(json!({"family":{"const":family},"schema_id":{"const":schema_id},"descriptor":exact_json_object(&descriptor),"claim_schema_ids":exact_json_object(&Value::Object(claim_ids.clone()))}),&["family","schema_id","descriptor","claim_schema_ids"]));

@@ -49,8 +49,8 @@ final class NativeSubjectTests: XCTestCase {
     }
 
     func testKnownNativeDescriptorsRejectWrongTypesAndReferences() throws {
-        let invalidValues: [Any] = [42, "person/has whitespace", "unregistered/example",
-            "person/has\u{0001}control", "person/" + String(repeating: "a", count: 512),
+        let invalidValues: [Any] = [42, "person/ada whitespace", "unregistered/example",
+            "person/ada\u{0001}control", "person/" + String(repeating: "a", count: 512),
             "person/" + String(repeating: "é", count: 256), "custom/team//example", "file/not-absolute"]
         for invalid in invalidValues {
             var value = try claim()

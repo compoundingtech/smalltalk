@@ -61,6 +61,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_blob_uploads",
         "local_subscription_mission_deferrals",
         "local_usage_spend",
+        "local_usage_provenance",
         "local_usage_responses",
         "local_limit_stops",
         "local_seat_accounts",
