@@ -3346,6 +3346,10 @@ impl Ui {
         let Some(id) = self.attention_focus() else {
             return;
         };
+        self.read_update_id(id);
+    }
+
+    fn read_update_id(&mut self, id: String) {
         if !self.updates_read.insert(id.clone()) {
             return;
         }
@@ -3361,20 +3365,26 @@ impl Ui {
         }
     }
 
-    /// An update left open on Home for a moment has been read (docs: it clears when the person
-    /// opens it). Passing over it with the arrows does not count.
+    /// An update opened on Home is read once the person leaves it, after it was open for a
+    /// moment: marking it read closes it, and it must stay put while it is being read (Nathan,
+    /// 2026-10-05: updates vanished mid-read). Passing over it with the arrows does not count,
+    /// and `x` still reads it at once.
     pub(crate) fn read_open_update(&mut self) {
         let open = self
             .attention_focus()
             .filter(|_| !self.help && self.popover.is_none())
             .filter(|_| self.current_kind() == Some("update"));
+        if let Some((shown, since)) = &self.update_open
+            && open.as_ref() != Some(shown)
+            && since.elapsed() >= UPDATE_READ_AFTER
+        {
+            let shown = shown.clone();
+            self.update_open = None;
+            self.read_update_id(shown);
+        }
         match (open, &self.update_open) {
             (None, _) => self.update_open = None,
-            (Some(id), Some((shown, since))) if *shown == id => {
-                if since.elapsed() >= UPDATE_READ_AFTER {
-                    self.read_update();
-                }
-            }
+            (Some(id), Some((shown, _))) if *shown == id => {}
             (Some(id), _) => self.update_open = Some((id, Instant::now())),
         }
     }
@@ -5624,15 +5634,26 @@ mod tests {
             "{:?}",
             ui.effects
         );
-        // Left open a moment, it counts as read without a key.
+        // Left open a good while, it stays: it is read only once the person moves off it.
         ui.effects.clear();
         ui.updates_read.clear();
         ui.update_open = Some((
             "attention/update".into(),
-            Instant::now() - UPDATE_READ_AFTER,
+            Instant::now() - UPDATE_READ_AFTER * 10,
         ));
         ui.read_open_update();
-        assert_eq!(ui.effects.len(), 1);
+        assert!(ui.effects.is_empty(), "still being read: {:?}", ui.effects);
+        assert!(ui.updates_read.is_empty());
+        // Moving off it (here, to nothing) after it was open a moment reads it.
+        ui.select(0);
+        ui.read_open_update();
+        assert_eq!(ui.effects.len(), 1, "{:?}", ui.effects);
+        // Moving off one that was only passed over does not.
+        ui.effects.clear();
+        ui.updates_read.clear();
+        ui.update_open = Some(("attention/update".into(), Instant::now()));
+        ui.read_open_update();
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
     }
 
     #[test]
