@@ -116,11 +116,17 @@ async fn provider_incarnation(
 
 #[tokio::test]
 async fn fresh_driver_exports_its_incarnation_in_the_provider_environment() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     provider_incarnation(None, false, "agent/garden/worker", "worker:current").await;
 }
 
 #[tokio::test]
 async fn fresh_driver_replaces_an_inherited_incarnation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     provider_incarnation(
         Some("worker:predecessor"),
         false,
@@ -132,6 +138,9 @@ async fn fresh_driver_replaces_an_inherited_incarnation() {
 
 #[tokio::test]
 async fn reexecuted_driver_refreshes_its_environment_from_the_saved_runtime_fence() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     provider_incarnation(
         Some("worker:predecessor"),
         true,
@@ -143,5 +152,8 @@ async fn reexecuted_driver_refreshes_its_environment_from_the_saved_runtime_fenc
 
 #[tokio::test]
 async fn exec_gates_start_without_an_agent_runtime_fence() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     provider_incarnation(None, false, "gate-operation/catalog/check", "").await;
 }

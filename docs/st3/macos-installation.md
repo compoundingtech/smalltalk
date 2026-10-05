@@ -15,7 +15,7 @@ When the `--from` directory also holds `StListen.app` (stui's speech helper, bui
 `apps/macos/listen/build.sh DIR` with Xcode's Swift and the macOS 26 SDK), the installer
 nests it at `SmallTalk.app/Contents/Helpers/StListen.app`. It signs the helper before the app,
 and gives the app the microphone and speech usage strings. macOS asks for the microphone on
-behalf of the outermost app, so the prompt names Small Talk and the answer lasts across updates
+behalf of the outermost app, so the prompt names Smalltalk and the answer lasts across updates
 signed with the same identity. `scripts/install` and release archives build the helper when they
 can; without it, stui's voice mode says that it is missing.
 

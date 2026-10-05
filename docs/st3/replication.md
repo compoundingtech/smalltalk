@@ -38,11 +38,11 @@ an upgrade. Equal envelope inventories alone cannot prove equal claim admission.
 
 `store::tests::canonical_audit::every_shared_projection_agrees_after_shuffle_restart_and_checkpoint`
 checks both invariants by comparing shared rows, selected readers and per-table digest oracles
-across isolated stores. `shared_folds_never_order_by_local_arrival` rejects raw shared arrival
-folds, and `every_persistent_table_has_a_projection_scope` rejects unclassified tables. A new
-shared table must join the shuffle test's inventory and history fixture,
-the canonical ordering guard, and the production digest registry in the same change. A new
-shared claim-derived view must compare its answer at the same explicit time and recipients.
+across isolated stores. `every_persistent_table_has_a_projection_scope` rejects unclassified
+tables. A new shared table must join the shuffle test's inventory and history fixture and the
+production digest registry in the same change. A new shared claim-derived view must compare
+its answer at the same explicit time and recipients. Local pagination metadata may order by
+local arrival; shared winner selection must remain independent of that order.
 
 The [canonical projections audit](canonical-projections-audit.md) records the original gaps and
 local exceptions. Modern status reports a graph digest over the complete projection registry,
@@ -184,7 +184,7 @@ This changes no claim or resource vocabulary and requires no new replication pay
 ## Add any machine
 
 Install st on the new machine and configure the person who operates it, as described in the
-[README](../../README.md#run-the-daemon). On an existing listening member, invite the new name:
+[README](../getting-started.md#3-start-the-daemon). On an existing listening member, invite the new name:
 
 ```sh
 st fleet invite beacon
@@ -358,9 +358,35 @@ One exchange sends an inventory of envelope identities. An identity is `(writer,
 
 The inventory is a set, not a high-water cursor. Sparse delivery and two candidates at one writer sequence are valid.
 
-The inventory is compact. It carries one digest per writer range of 256 sequences, and it lists identities only for ranges whose digests differ. A peer sends a range the other side lacks entirely, and it sends identities within a differing range only after the other side has listed that range. One two-phase exchange therefore converges both directions without sending the whole authority log. A peer without range digests receives and sends the full identity list, as before.
+The inventory is compact. It carries one digest per writer range of 256 sequences, and it lists identities only for ranges whose digests differ. A peer sends a range the other side lacks entirely, and it sends identities within a differing range only after the other side has listed that complete range and verified its count and digest. An ordinary two-phase exchange makes progress in both directions without sending the whole authority log. A peer without range digests receives and sends the full identity list, as before.
 
 Each inventory says how many envelopes its sender takes in one exchange, 4,096 for this build. A peer sends at most that many, and at most 512 to a peer whose inventory does not say, as older builds do not.
+
+If a compact exchange finds different inventories but stores no new envelopes and adopts no
+checkpoint, its earliest differing ranges may contain only payloadless checkpoint tombstones.
+The worker runs at most one additional two-phase full-inventory round: it clears the summary's
+range digests, retaining the inventory digest, then sends the reverse difference proved by the
+peer's complete identity list. A bare digest never proves an empty inventory. There are at most
+four signed exchange requests in total. Existing checkpoint-manifest paging can make additional
+signed requests under its separate limits. Payload page limits, the 64 MiB exchange body cap,
+envelope admission and checkpoint certificate verification remain unchanged. The exceptional
+full comparison costs O(inventory), rather than the compact listing's bounded identity prefix.
+
+This negotiation already exists in older builds, including `8298c70`; an upgraded worker
+initiating an exchange can transfer live payloads both ways with those peers, without new wire
+fields. An older initiator still uses its old compact-prefix algorithm, so recovery requires an
+upgraded member that can dial the peer. A pair of unupgraded members retains the starvation bug.
+The fallback reports no progress once only tombstone differences remain, allowing the worker to
+rest rather than loop. Importing older or losing checkpoint lineages remains separate
+([#1433](https://github.com/compoundingtech/smalltalk/issues/1433),
+[#1052](https://github.com/compoundingtech/smalltalk/issues/1052)); live-envelope convergence
+does not assert equal tombstone inventories.
+
+`sync::worker::tests::checkpoint_tombstones_do_not_starve_later_live_ranges` proves later notes
+transfer in both directions behind differing tombstone ranges, and that a new write still
+transfers after a quiet tombstone-only comparison. The joined-daemon regression
+`fleet::rejoin_exchanges_live_claims_beyond_differing_checkpoint_tombstones` exercises the same
+path through real isolated daemons and workers.
 
 Each missing envelope contains one base64-encoded CBOR payload on the JSON wire. Receipt stores
 its decoded bytes in SQLite before admission interprets the CBOR. Malformed base64 stays as

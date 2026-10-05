@@ -438,7 +438,20 @@ fn channel_loop(
                 {
                     delivery_ready = true;
                 }
-                if let Some(observation) = state.or_else(|| turn.as_ref().and_then(turn_observation))
+                let mut observation = state.or_else(|| turn.as_ref().and_then(turn_observation));
+                if let Some(observation) = &mut observation {
+                    observation.provider_auth = turn
+                        .as_ref()
+                        .and_then(provider_auth_edge)
+                        .map(|edge| edge == ProviderAuthEdge::Accepted);
+                }
+                if observation
+                    .as_ref()
+                    .is_some_and(|o| o.provider_auth.is_some())
+                {
+                    writer.interrupt();
+                }
+                if let Some(observation) = observation
                     // A queued live frame must never overwrite the wrapper's terminal record:
                     // the channel and the wrapper are separate processes, so the flock alone
                     // serializes but does not order their writes.
@@ -701,8 +714,32 @@ fn turn_result(frame: &Value) -> Option<TurnResult<'_>> {
     };
     Some(TurnResult::ProviderError {
         reason: error.get("reason").and_then(Value::as_str),
-        classification: error.get("errorId").and_then(Value::as_u64),
+        classification: error.get("errorId").and_then(Value::as_u64).or_else(|| {
+            (error["driver"] == "pi"
+                && error
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(pi_login_reply))
+            .then_some(omp_error::CLASSIFIED | omp_error::AUTH_FAILED)
+        }),
     })
+}
+
+/// Pi 0.84.2's native missing-key error (auth-guidance.js). The OAuth failure text also
+/// says the network may be unavailable, so it is deliberately not credential evidence.
+pub fn pi_login_reply(text: &str) -> bool {
+    let line = text.lines().next().unwrap_or_default().trim();
+    let Some(provider) = line
+        .strip_prefix("No API key found for ")
+        .and_then(|s| s.strip_suffix('.'))
+    else {
+        return false;
+    };
+    !provider.is_empty()
+        && provider.len() <= 80
+        && provider
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' '))
 }
 
 /// Whether omp's classification of the error that ended a turn names a REJECTED CREDENTIAL.
@@ -734,7 +771,14 @@ fn turn_observation(result: &TurnResult<'_>) -> Option<harness_state::Observatio
         classification,
     } = result
     else {
-        return None;
+        return Some(
+            harness_state::Observation::new(
+                harness_state::Activity::Active,
+                harness_state::BlockedOn::None,
+                harness_state::InputBuffer::Unknown,
+            )
+            .with_provider_auth(true),
+        );
     };
     let observation = harness_state::Observation::new(
         harness_state::Activity::Active,
@@ -948,6 +992,28 @@ fn message_frame(msg: message::Message, identity: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_native_login_errors_exclude_ambiguous_network_errors_and_content() {
+        assert!(pi_login_reply(
+            "No API key found for anthropic.\n\nUse /login"
+        ));
+        for text in [
+            "Credentials may have expired or network is unavailable",
+            "tool: No API key found for anthropic.",
+            "Invalid API key",
+            "No API key found for .",
+        ] {
+            assert!(!pi_login_reply(text));
+        }
+        let rejected = serde_json::json!({"type":"turn","error":{"driver":"pi","reason":"No API key found for anthropic."}});
+        assert_eq!(
+            provider_auth_edge(&turn_result(&rejected).unwrap()),
+            Some(ProviderAuthEdge::Rejected)
+        );
+        let ambiguous = serde_json::json!({"type":"turn","error":{"driver":"pi","reason":"Credentials may have expired or network is unavailable"}});
+        assert_eq!(provider_auth_edge(&turn_result(&ambiguous).unwrap()), None);
+    }
 
     fn todo_frame() -> Value {
         serde_json::json!({
@@ -1848,8 +1914,8 @@ mod tests {
         let ordinary_frame = json!({"type": "turn"});
         let ordinary = turn_result(&ordinary_frame).expect("an ordinary end decodes");
         assert!(
-            turn_observation(&ordinary).is_none(),
-            "the sampled idle poll still owns the settle edge"
+            turn_observation(&ordinary).unwrap().state == harness_state::Activity::Active,
+            "the credential edge must not invent idle before the sampled settle"
         );
         assert_eq!(
             provider_auth_edge(&ordinary),

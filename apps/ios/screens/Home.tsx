@@ -7,7 +7,7 @@ import { ContextMenu } from '../menu';
 import { HOME_LEGEND, homeRows, homeSections, type HomeRow, cleanMessageText, ANSWERS, isRequest, report, spaced, yesNo } from '@smalltalk/st3-views';
 import type { RootParams } from '../navigation';
 import { agentName } from '../agentsView';
-import { attentionActionLabel, attentionKindLabel } from '../presentation';
+import { attentionActionLabel, attentionKindLabel, blockedLine } from '../presentation';
 import { missionTitle } from '../missionsView';
 import { useStore } from '../store';
 import { randomName } from '../launcher';
@@ -142,8 +142,8 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
           <T bold color={theme.person}>{from} is waiting on you.</T>
           <RequestAnswers item={item} from={from} onAnswered={() => navigation.goBack()} />
         </>}
-        <T dim>Answer it, or Nothing to do if there is nothing for you to do. Either way the step it waits on continues.</T>
-        {mission ? <Button label={`mission ${missionTitle(mission)}`} onPress={() => navigation.navigate('Mission', { id: mission.id })} /> : null}
+        {blockedLine(item) ? <T dim selectable>{blockedLine(item)}</T> : <T dim>Answer it, or Nothing to do if there is nothing for you to do. Either way the step it waits on continues.</T>}
+        {mission ? <Button label={`mission ${missionTitle(mission)}`} onPress={() => navigation.navigate('Mission', { id: mission.id })} /> : item.mission_id ? <T dim>mission {item.mission_id}</T> : null}
         {agentId ? <Button label={`chat with ${from}`} onPress={() => navigation.navigate('Conversation', { target: agentId, title: from })} /> : null}
         <T dim selectable>{item.id}</T>
       </ScrollView>

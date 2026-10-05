@@ -253,6 +253,11 @@ fn rollup(account: &str, at: u128, total: u64) -> Value {
         "model": "claude-example", "account": account, "owner_run": "mission-run/example",
         "owner_step": "step-run/example/build", "host": "alder",
         "total_tokens": total, "cost_microusd": total * 10, "observed_at_unix_ms": at as u64,
+        "native_session_id": "native-example",
+        "pricing_provenance": [{"price_table_id":"st.api-list","price_table_version":"example-version",
+            "cost_source":"computed","total_tokens":total,"cost_microusd":total*10,
+            "rates_usd_per_million_tokens":{"input":10.0,"output":10.0,"cache_read":10.0,
+                "cache_write_5m":10.0,"cache_write_1h":10.0}}],
     })
 }
 
@@ -365,6 +370,9 @@ fn a_usage_trim_keeps_lifetime_usage_and_the_proof_guards_it() {
             ))
             .unwrap();
     }
+    let period = store.usage_period_rows(0, u64::MAX).unwrap();
+    assert_eq!(period[0]["native_session_id"], "native-example");
+    assert_eq!(period[0]["pricing_provenance"][0]["total_tokens"], 300);
     let lifetime = store.usage_summary_at(AGENT, None, None).unwrap().unwrap();
     assert_eq!(lifetime.total_tokens, 300);
     let scratch = tempfile::tempdir().unwrap();
@@ -1786,4 +1794,149 @@ fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
     assert_eq!(after["retained_from"], before["retained_from"]);
     assert_eq!(after["complete"], false);
     assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().since_unix_ms, since);
+}
+
+#[test]
+fn native_auth_history_survives_checkpoint_trimming_and_runtime_reset() {
+    let store = Store::open_memory("cedar").unwrap();
+    let append = |kind: &str, fields: Value| {
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/cedar".into(),
+                kind: kind.into(),
+                actor: Some("agent/cedar".into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap()
+    };
+    append(
+        "runtime.observed",
+        json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}),
+    );
+    for index in 0..220 {
+        if index == 110 {
+            append(
+                "runtime.observed",
+                json!({"status":"running", "runtime_id":"native", "incarnation_id":"two"}),
+            );
+        }
+        append(
+            "harness.observed",
+            json!({"state":"idle", "provider_auth": index % 2 == 0,
+            "provider_auth_sequence": index + 1, "ownership_sequence": 1,
+            "incarnation_id": if index < 110 { "one" } else { "two" }}),
+        );
+    }
+    let cut = now_ms() + 1_000;
+    let before = store.seat_status_history("agent/cedar", cut).unwrap();
+    assert_eq!(before["items"].as_array().unwrap().len(), 200);
+    assert_eq!(before["complete"], false);
+    assert!(
+        before["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["reset"] == true && item["runtime_incarnation"] == "two")
+    );
+    assert_eq!(
+        before["items"].as_array().unwrap().last().unwrap()["state"],
+        "unauthenticated"
+    );
+    let since = store
+        .current_harness("agent/cedar")
+        .unwrap()
+        .unwrap()
+        .since_unix_ms;
+    let sealed = store.checkpoint_sealed_set(cut).unwrap();
+    let plan = plan_drops(&sealed);
+    assert!(!plan.claims.is_empty());
+    let scratch = tempfile::tempdir().unwrap();
+    let copy = scratch.path().join("checkpoint.sqlite3");
+    store.copy_store_to(&copy).unwrap();
+    let proof = prove_on_copy(&copy, &sealed, &plan).unwrap();
+    assert!(
+        proof.passed,
+        "bounded transitions and current since must survive the proof: {:?}",
+        proof.mismatches
+    );
+    {
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        record_checkpoint_tombstones_tx(
+            &transaction,
+            &checkpoint_name(cut),
+            &plan.envelopes,
+            &plan.claims,
+        )
+        .unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        transaction.commit().unwrap();
+    }
+    let after = store.seat_status_history("agent/cedar", cut).unwrap();
+    assert_eq!(after["items"], before["items"]);
+    assert_eq!(after["retained_from"], before["retained_from"]);
+    assert_eq!(after["complete"], false);
+    assert_eq!(
+        store
+            .current_harness("agent/cedar")
+            .unwrap()
+            .unwrap()
+            .since_unix_ms,
+        since
+    );
+}
+
+#[test]
+fn native_auth_checkpoint_keeps_current_episode_start_outside_history_window() {
+    let mut sealed = Sealed::default();
+    sealed.add(
+        "cedar",
+        T,
+        draft(
+            "harness.observed",
+            "agent/cedar",
+            json!({
+                "incarnation_id":"one", "state":"idle", "provider_auth":true
+            }),
+        ),
+    );
+    let start = sealed.add(
+        "cedar",
+        T + 1,
+        draft(
+            "harness.observed",
+            "agent/cedar",
+            json!({
+                "incarnation_id":"one", "state":"idle", "provider_auth":false
+            }),
+        ),
+    );
+    let repeat = sealed.add(
+        "cedar",
+        T + 2,
+        draft(
+            "harness.observed",
+            "agent/cedar",
+            json!({
+                "incarnation_id":"one", "state":"idle", "provider_auth":false
+            }),
+        ),
+    );
+    sealed.add(
+        "cedar",
+        CUT - 1,
+        draft(
+            "harness.observed",
+            "agent/cedar",
+            json!({
+                "incarnation_id":"one", "state":"idle", "provider_auth":false
+            }),
+        ),
+    );
+    let gone = dropped(&plan_drops(&sealed.build()));
+    assert!(!gone.contains(&start));
+    assert!(gone.contains(&repeat));
 }

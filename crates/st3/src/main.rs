@@ -98,8 +98,9 @@ const DEFAULT_DAEMON_WAIT_SECS: u64 = 30;
 
 #[derive(Subcommand)]
 enum Command {
-    /// Atomically publish a complete owned set of seats, missions and schedules.
-    Apply(OwnedSetApplyArgs),
+    /// Validate and publish KDL files containing seats, missions and schedules.
+    /// Use --dry-run to preview, or --set with source flags to publish a complete owned set.
+    Apply(ApplyArgs),
     /// Inspect owned sets and their source publication receipts.
     Sets {
         #[command(subcommand)]
@@ -1646,7 +1647,7 @@ enum MissionViewCommand {
     },
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
-    /// Publish exact authored mission KDL after preview, once its exec gates pass a check.
+    /// Legacy: use `st apply FILE`; publish authored KDL after checking exec gates.
     ///
     /// Goals, constraints and named documents encode every known rule and decision.
     /// `depends-on` orders steps; `missions start --after` orders runs without reports.
@@ -1702,7 +1703,7 @@ struct MissionPublishArgs {
     /// KDL file to publish; use `-` to read standard input.
     file: PathBuf,
     /// Print the resolved publication preview without applying or running exec gates.
-    /// Use `missions check` separately to run the gates.
+    /// Add --check to run the gates during the preview.
     #[arg(long, visible_alias = "preview")]
     dry_run: bool,
     /// Preview against this exact store index.
@@ -1718,6 +1719,12 @@ struct MissionPublishArgs {
     /// Publish without first running each exec gate once to refuse a broken one.
     #[arg(long)]
     no_gate_check: bool,
+    /// Run exec gates even during a dry run.
+    #[arg(long, visible_alias = "check-gates", conflicts_with = "no_gate_check")]
+    check: bool,
+    /// Mission input values for exec gate checks.
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
 }
 
 #[derive(Args)]
@@ -1773,7 +1780,7 @@ enum GateCommand {
 struct MissionRunStartArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Mission)))]
     mission: String,
-    /// Start exactly this published revision, as printed by `missions publish`. A revision
+    /// Start exactly this published revision, as printed by `st apply`. A revision
     /// published on another host is awaited briefly while it replicates here.
     #[arg(long)]
     revision: Option<String>,
@@ -2330,6 +2337,24 @@ enum DevicesCommand {
         #[arg(long, conflicts_with = "full_control")]
         read_only: bool,
     },
+    /// Complete a single-use pairing on this device; read the code privately from stdin.
+    Complete {
+        /// The member gateway's HTTP or HTTPS origin.
+        member_url: String,
+        pairing_id: String,
+        /// Software key algorithm, also used when importing a key.
+        #[arg(long, value_parser = ["ed25519", "p256"], default_value = "p256")]
+        algorithm: String,
+        /// Import a private mode-0600 DER PKCS#8 file; otherwise generate a key.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Credential and private-key profile, shared with stui by default.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        /// Allow a public HTTP address only when it is already an encrypted path.
+        #[arg(long)]
+        allow_public_http: bool,
+    },
     /// Revoke one paired device.
     Revoke {
         #[arg(add = ArgValueCompleter::new(Complete(Entity::Device)))]
@@ -2358,6 +2383,29 @@ struct DevicesArgs {
 
 #[derive(Subcommand)]
 enum SubjectCommand {
+    /// Reply to a custom source under its current revision and waiting episode.
+    Reply {
+        subject: String,
+        #[arg(long)]
+        registration: String,
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        episode: String,
+        #[arg(long)]
+        fields_file: PathBuf,
+        #[arg(long="as",value_parser=parse_actor_subject)]
+        actor: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Read the revision of complete raw custom inputs for a derived-state basis.
+    Basis {
+        subject: String,
+        #[arg(long = "kind", required = true)]
+        kinds: Vec<String>,
+    },
+
     /// Show one typed subject card.
     Show(SubjectShowArgs),
     /// Show bounded immutable history for one subject.
@@ -2720,7 +2768,7 @@ enum AgentsCommand {
         #[arg(long)]
         host: Option<String>,
     },
-    /// Preview and apply one KDL file containing durable agent seats.
+    /// Legacy: use `st apply FILE`; preview and apply authored KDL.
     Apply(AgentApplyArgs),
     /// Start a durable seat, patching only explicitly supplied declaration fields. A stopped
     /// mission seat starts again on its run's own declaration.
@@ -2937,38 +2985,57 @@ struct LaneMarkArgs {
 }
 
 #[derive(Args)]
-struct OwnedSetApplyArgs {
-    #[arg(long)]
-    set: String,
-    /// Complete list of input KDL files; '-' reads stdin once.
+struct ApplyArgs {
+    /// Input KDL files; '-' reads stdin once. All files are previewed and applied together.
     files: Vec<PathBuf>,
-    #[arg(long)]
-    repository: String,
-    #[arg(long = "ref")]
-    source_ref: String,
-    #[arg(long)]
-    sha: String,
-    #[arg(long)]
-    source_sequence: u64,
+    /// Publish complete owned membership; requires all source flags and --expect-set.
+    #[arg(long, requires_all = ["repository", "source_ref", "sha", "source_sequence", "expect_set"])]
+    set: Option<String>,
+    #[arg(long, requires = "set")]
+    repository: Option<String>,
+    #[arg(long = "ref", requires = "set")]
+    source_ref: Option<String>,
+    #[arg(long, requires = "set")]
+    sha: Option<String>,
+    #[arg(long, requires = "set")]
+    source_sequence: Option<u64>,
     /// 'absent' for initial creation, otherwise the previous selected set revision.
-    #[arg(long)]
-    expect_set: String,
-    #[arg(long)]
+    #[arg(long, requires = "set")]
+    expect_set: Option<String>,
+    /// Print the resolved preview without publishing or running exec gates (unless --check).
+    #[arg(long, visible_alias = "preview")]
     dry_run: bool,
+    /// Run exec gates even during a dry run, as `st missions check` does.
+    #[arg(long, visible_alias = "check-gates", conflicts_with = "no_gate_check")]
+    check: bool,
+    /// The workspace a run would use, for exec gate checks.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Mission input values for exec gate checks.
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
+    /// Publish without checking exec gates for broken commands.
+    #[arg(long)]
+    no_gate_check: bool,
+    /// Preview against this exact store index (plain files only).
+    #[arg(long, visible_alias = "at", conflicts_with = "set")]
+    at_index: Option<u64>,
     /// Drain changed and retiring seats, then resume their native conversation.
-    #[arg(long, value_parser = ["when-idle"])]
+    #[arg(long, value_parser = ["when-idle"], requires = "set")]
     rollout: Option<String>,
     #[arg(long, default_value = "30m", requires = "rollout")]
     rollout_deadline: String,
     /// Interrupt busy work at the deadline; identity and session fences still apply.
     #[arg(long, requires = "rollout")]
     force_after_deadline: bool,
-    #[arg(long = "adopt")]
+    #[arg(long = "adopt", requires = "set")]
     adopt: Vec<String>,
-    #[arg(long)]
+    #[arg(long, requires = "set")]
     allow_empty: bool,
-    #[arg(long)]
+    #[arg(long, requires = "set")]
     confirm_retire: Option<String>,
+    /// Complete person or agent subject authoring the publication.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", env = "ST_AGENT", value_parser = parse_publication_actor)]
     actor: String,
 }
@@ -2989,22 +3056,18 @@ enum OwnedSetsCommand {
     },
 }
 
-async fn run_owned_set_apply(
-    client: &Client,
-    args: OwnedSetApplyArgs,
-    json_output: bool,
-) -> Result<()> {
-    use st3::store::owned_sets::{Options, Preview, Request, Source};
+/// Bundle each versioned file into one intent so references may cross file boundaries.
+fn read_apply_files(files: &[PathBuf], allow_empty: bool) -> Result<IntentInput> {
     anyhow::ensure!(
-        !args.files.is_empty() || args.allow_empty,
-        "no input files: intentional empty membership needs --allow-empty"
+        !files.is_empty() || allow_empty,
+        "no input files: intentional empty owned membership needs --set and --allow-empty"
     );
     anyhow::ensure!(
-        args.files.iter().filter(|p| p.as_os_str() == "-").count() <= 1,
+        files.iter().filter(|p| p.as_os_str() == "-").count() <= 1,
         "stdin may appear only once"
     );
     let mut bundle = String::from("version 2\n");
-    for path in &args.files {
+    for path in files {
         let (text, _) = read_intent(Some(path))?;
         let mut doc: kdl::KdlDocument = text
             .parse()
@@ -3021,15 +3084,59 @@ async fn run_owned_set_apply(
         bundle.push_str(&doc.to_string());
         bundle.push('\n');
     }
-    let options = Options {
-        set: args.set,
-        source: Source {
-            repository: args.repository,
-            r#ref: args.source_ref,
-            sha: args.sha,
-            sequence: args.source_sequence,
+    Ok(IntentInput {
+        kdl: bundle,
+        source_name: Some(
+            files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    })
+}
+
+async fn run_apply(client: &Client, args: ApplyArgs, json_output: bool) -> Result<()> {
+    let intent = read_apply_files(&args.files, args.allow_empty)?;
+    if args.set.is_some() {
+        return run_owned_set_apply(client, intent, args, json_output).await;
+    }
+    publish_mission_intent(
+        client,
+        intent,
+        MissionPublishArgs {
+            file: PathBuf::new(),
+            dry_run: args.dry_run,
+            at_index: args.at_index,
+            actor: args.actor,
+            workspace: args.workspace,
+            no_gate_check: args.no_gate_check,
+            check: args.check,
+            inputs: args.inputs,
         },
-        expected_set: args.expect_set,
+        json_output,
+    )
+    .await
+}
+
+async fn run_owned_set_apply(
+    client: &Client,
+    intent: IntentInput,
+    args: ApplyArgs,
+    json_output: bool,
+) -> Result<()> {
+    use st3::store::owned_sets::{Options, Preview, Request, Source};
+    let options = Options {
+        set: args.set.context("owned publication needs --set")?,
+        source: Source {
+            repository: args.repository.context("--set needs --repository")?,
+            r#ref: args.source_ref.context("--set needs --ref")?,
+            sha: args.sha.context("--set needs --sha")?,
+            sequence: args
+                .source_sequence
+                .context("--set needs --source-sequence")?,
+        },
+        expected_set: args.expect_set.context("--set needs --expect-set")?,
         rollout: args
             .rollout
             .map(|_| {
@@ -3044,23 +3151,34 @@ async fn run_owned_set_apply(
         expected_subjects: Default::default(),
     };
     let mut request = Request {
-        intent: IntentInput {
-            kdl: bundle,
-            source_name: Some("owned set input files".into()),
-        },
+        intent,
         options,
         actor: args.actor,
         idempotency_key: uuid::Uuid::now_v7().to_string(),
     };
     let preview: Preview = client.post("/v1/sets/preview", &request).await?;
     if args.dry_run {
-        return print_value(&preview, json_output);
+        print_value(&preview, json_output)?;
     }
     anyhow::ensure!(
         preview.blockers.is_empty(),
         "owned set refused: {}",
         preview.blockers.join("; ")
     );
+    // Empty owned membership has no gates and is not a valid plain gate-check intent.
+    if !preview.empty && (args.check || (!args.dry_run && !args.no_gate_check)) {
+        check_before_publish(
+            client,
+            &request.intent,
+            &args.workspace,
+            &args.inputs,
+            args.check,
+        )
+        .await?;
+    }
+    if args.dry_run {
+        return Ok(());
+    }
     request.options.expected_subjects = preview.expected_subjects;
     let response: Value = client.post("/v1/sets/apply", &request).await?;
     print_value(&response, json_output)
@@ -3091,6 +3209,9 @@ struct AgentApplyArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
+    /// Print the resolved publication preview without applying or running exec gates.
+    #[arg(long, visible_alias = "preview")]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -3381,6 +3502,17 @@ struct HarnessDiagnosticArgs {
 
 #[derive(Subcommand)]
 enum SchemaCommand {
+    /// Register an immutable typed custom schema and bounded projection.
+    Register {
+        file: PathBuf,
+        #[arg(long = "as",value_parser=parse_actor_subject)]
+        actor: String,
+    },
+    /// List registered custom kinds and their pinned revisions.
+    Registrations,
+    /// Read an exact custom registration, KIND@HASH.
+    Registration { kind: String },
+
     /// List registered subject families.
     Subjects,
     /// List registered resource kinds.
@@ -4445,6 +4577,31 @@ async fn run(cli: Cli) -> Result<()> {
     let own = std::env::var("ST_AGENT").ok();
     let mission_run = std::env::var("ST_MISSION_RUN").ok();
     guard_mutating_cli_actor(&cli.command, own.as_deref(), mission_run.as_deref())?;
+    // Completion is a remote device operation. It needs neither a local daemon nor its config.
+    if let Command::Devices(DevicesArgs {
+        command:
+            Some(DevicesCommand::Complete {
+                member_url,
+                pairing_id,
+                algorithm,
+                key_file,
+                profile,
+                allow_public_http,
+            }),
+        ..
+    }) = &cli.command
+    {
+        return run_devices_complete(
+            member_url,
+            pairing_id,
+            algorithm,
+            key_file.as_deref(),
+            profile.as_deref(),
+            *allow_public_http,
+            cli.json,
+        )
+        .await;
+    }
     if let Command::Up(args) = cli.command {
         return run_up(args).await;
     }
@@ -4506,7 +4663,7 @@ async fn run(cli: Cli) -> Result<()> {
     // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
     let immediate = Client::new(endpoint.clone());
     match cli.command {
-        Command::Apply(args) => run_owned_set_apply(&client, args, cli.json).await,
+        Command::Apply(args) => run_apply(&client, args, cli.json).await,
         Command::Sets { command } => run_owned_sets(&endpoint, command, cli.json).await,
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
@@ -5343,6 +5500,12 @@ async fn run_up(args: UpArgs) -> Result<()> {
         store.clone(),
         config.observations.clone(),
     ));
+    tokio::spawn(st3::recorder_receipts::run(
+        store.clone(),
+        st3::recorder::receipt_path(&config.state_dir),
+        notify.clone(),
+        event_notify.clone(),
+    ));
     if config.checkpoint.enabled {
         tokio::spawn(run_checkpoints(
             store.clone(),
@@ -5943,7 +6106,10 @@ async fn run_mission_view(
             }
             Ok(())
         }
-        MissionViewCommand::Publish(args) => publish_mission_file(client, args, json_output).await,
+        MissionViewCommand::Publish(args) => {
+            eprintln!("st: missions publish is legacy; use st apply FILE with the same options");
+            publish_mission_file(client, args, json_output).await
+        }
         MissionViewCommand::Check(args) => check_mission_file(client, args, json_output).await,
         MissionViewCommand::Start(args) => start_mission_run(client, args, json_output).await,
         MissionViewCommand::Cancel(args) => {
@@ -5975,6 +6141,15 @@ async fn publish_mission_file(
 ) -> Result<()> {
     let (kdl, source_name) = read_intent(Some(&args.file))?;
     let intent = IntentInput { kdl, source_name };
+    publish_mission_intent(client, intent, args, json_output).await
+}
+
+async fn publish_mission_intent(
+    client: &Client,
+    intent: IntentInput,
+    args: MissionPublishArgs,
+    json_output: bool,
+) -> Result<()> {
     let mission: MissionResponse = client
         .post(
             "/v1/intent/mission",
@@ -5992,13 +6167,20 @@ async fn publish_mission_file(
         "{}",
         mission.blockers.join("; ")
     );
+    if args.check || (!args.dry_run && !args.no_gate_check) {
+        check_before_publish(
+            client,
+            &mission.resolved_intent,
+            &args.workspace,
+            &args.inputs,
+            args.check,
+        )
+        .await?;
+    }
     if args.dry_run {
         return Ok(());
     }
     warn_ignored_authority(&mission);
-    if !args.no_gate_check {
-        check_before_publish(client, &intent, &args.workspace).await?;
-    }
     let resolved = mission.resolved_intent;
     let response: ApplyResponse = client
         .post(
@@ -6026,9 +6208,11 @@ async fn check_before_publish(
     client: &Client,
     intent: &IntentInput,
     workspace: &Path,
+    inputs: &[(String, String)],
+    required: bool,
 ) -> Result<()> {
     let mut announced = false;
-    let checked = run_gate_check(client, intent, workspace, &[], |view, item| {
+    let checked = run_gate_check(client, intent, workspace, inputs, |view, item| {
         if !announced {
             eprintln!("{}", gate_check_heading(view));
             announced = true;
@@ -6037,6 +6221,10 @@ async fn check_before_publish(
     })
     .await?;
     let Some(view) = checked else {
+        anyhow::ensure!(
+            !required,
+            "this st daemon cannot check exec gates; update it"
+        );
         eprintln!("st: this st daemon cannot check exec gates; publishing without the check");
         return Ok(());
     };
@@ -7711,6 +7899,7 @@ async fn run_devices(
     let person = configured_human(person.as_deref(), configured_person, "devices")?;
     let client = generated_client(&endpoint, Some(&person))?;
     match command.unwrap_or(DevicesCommand::Ls) {
+        DevicesCommand::Complete { .. } => unreachable!("handled before loading local config"),
         DevicesCommand::Ls => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
@@ -7784,6 +7973,61 @@ async fn run_devices(
             print_client_value(&response, json_output)
         }
     }
+}
+
+async fn run_devices_complete(
+    member_url: &str,
+    pairing_id: &str,
+    algorithm: &str,
+    key_file: Option<&Path>,
+    profile: Option<&Path>,
+    allow_public_http: bool,
+    json_output: bool,
+) -> Result<()> {
+    use st3_client::device::{KeyAlgorithm, SigningKey};
+    let algorithm = match algorithm {
+        "ed25519" => KeyAlgorithm::Ed25519,
+        "p256" => KeyAlgorithm::P256,
+        _ => anyhow::bail!("Choose ed25519 or p256"),
+    };
+    let key = match key_file {
+        Some(path) => SigningKey::import(algorithm, path)?,
+        None => SigningKey::generate(algorithm)?,
+    };
+    let path = profile
+        .map(Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(st3_client::device::profile_path)?;
+    let code = st3_client::device::read_pairing_code()?;
+    let device = st3_client::device::complete_with_http_policy(
+        &path, member_url, pairing_id, &code, key, allow_public_http,
+    )
+    .await?;
+    // Always choose explicit safe fields, including --json. PairedSession contains a bearer.
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "kind": "device-paired", "device_id": device.session.device_id,
+                "person_id": device.session.person_id, "scopes": device.session.scopes,
+                "expires_at": device.session.expires_at, "profile": path,
+                "signing_key": device.signing_key.as_ref().map(SigningKey::public_key).transpose()?,
+            }))?
+        );
+    } else {
+        println!(
+            "Paired {} as {}. Saved device credentials{} to {}.",
+            device.session.device_id,
+            device.session.person_id,
+            if device.signing_key.is_some() {
+                " and signing key"
+            } else {
+                ""
+            },
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 async fn run_clients(endpoint: &Endpoint, json_output: bool) -> Result<()> {
@@ -8443,6 +8687,54 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
             total[6]
         );
     }
+    if let Some(estimate) = report.get("agent_messages") {
+        output.push_str("\nAGENT MESSAGES · daily estimate · UTC · API-equivalent\n");
+        let _ = writeln!(
+            output,
+            "Count × recipient allowance; includes useful work, not measured waste."
+        );
+        let _ = writeln!(
+            output,
+            "Fleet fallback ${:.2}–${:.2}/message · {}",
+            estimate["fallback_low_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+            estimate["fallback_high_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+            estimate["source"].as_str().unwrap_or("fleet fallback")
+        );
+        output.push_str("DATE  MESSAGES  ESTIMATE  SHARE OF PRICED USAGE  CALIBRATED\n");
+        for day in estimate["days"].as_array().into_iter().flatten() {
+            let date = day["day_start_ms"]
+                .as_u64()
+                .and_then(|at| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at as i64))
+                .map_or_else(|| "?".into(), |at| at.format("%Y-%m-%d").to_string());
+            let partial = day["until_ms"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_sub(day["since_ms"].as_u64().unwrap_or(0))
+                < 86_400_000;
+            let share = match (day["low_percent"].as_f64(), day["high_percent"].as_f64()) {
+                (Some(low), Some(high)) => format!(
+                    "{low:.1}–{high:.1}%{}",
+                    if day["unpriced_tokens"].as_u64().unwrap_or(0) > 0 {
+                        "*"
+                    } else {
+                        ""
+                    }
+                ),
+                _ => "unknown (no priced usage)".into(),
+            };
+            let _ = writeln!(
+                output,
+                "{date}{}  {}  ${:.2}–${:.2}  {share}  {}/{}",
+                if partial { " (partial)" } else { "" },
+                day["messages"],
+                day["low_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+                day["high_microusd"].as_u64().unwrap_or(0) as f64 / 1_000_000.0,
+                day["calibrated_messages"],
+                day["messages"]
+            );
+        }
+        output.push_str("* Unpriced tokens are excluded from the denominator. Latest 31 UTC days; edge days are clipped.\n");
+    }
     let limits = report["limits"]
         .as_array()
         .map(Vec::as_slice)
@@ -8923,7 +9215,54 @@ async fn follow_conversation(
 
 async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool) -> Result<()> {
     match command {
+        SubjectCommand::Reply {
+            subject,
+            registration,
+            revision,
+            episode,
+            fields_file,
+            actor,
+            idempotency_key,
+        } => {
+            reject_foreign_agent_actor(&actor)?;
+            let fields = serde_json::from_slice(&std::fs::read(fields_file)?)?;
+            let result: Value = client
+                .post(
+                    "/v1/custom/reply",
+                    &st3::store::custom::ReplyRequest {
+                        subject,
+                        registration,
+                        revision,
+                        episode,
+                        fields,
+                        actor,
+                        idempotency_key,
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+        SubjectCommand::Basis { subject, kinds } => {
+            let result: Value = client
+                .get(&format!(
+                    "/v1/custom/basis?subject={}&kinds={}",
+                    urlencoding::encode(&subject),
+                    urlencoding::encode(&kinds.join(","))
+                ))
+                .await?;
+            print_value(&result, json_output)
+        }
         SubjectCommand::Show(args) => {
+            if args.subject.starts_with("custom/") && !args.kdl
+                && let Ok(result) = client
+                    .get::<Value>(&format!(
+                        "/v1/client/custom-subjects/{}",
+                        urlencoding::encode(&args.subject)
+                    ))
+                    .await
+            {
+                return print_value(&result, json_output);
+            }
             if args.kdl {
                 anyhow::ensure!(
                     args.subject.starts_with("agent/"),
@@ -9864,7 +10203,7 @@ fn render_replication_peers(
             if peer.projection_comparison_waiting {
                 let _ = writeln!(
                     output,
-                    "  same envelopes (measured {}); projection comparison waits for a newer build",
+                    "  same envelopes (measured {}); projection comparison waits for a settled exchange or a compatible build",
                     relative_time(sync.measured_at_unix_ms, now)
                 );
             } else if peer.graph_digest.as_deref() == Some(local_graph_digest) {
@@ -10061,8 +10400,8 @@ async fn run_replication(
                 "graph": {
                     "local": status.graph_digest,
                     "remote": remote.graph_digest,
-                    "equal": if remote.projection_digests.is_empty() { None } else { Some(remote.graph_digest.as_deref() == Some(status.graph_digest.as_str())) },
-                    "coverage": if remote.projection_digests.is_empty() { "legacy-only" } else { "all-shared-projections" },
+                    "equal": if remote.projection_digests.is_empty() || remote.projection_comparison_waiting { None } else { Some(remote.graph_digest.as_deref() == Some(status.graph_digest.as_str())) },
+                    "coverage": if remote.projection_digests.is_empty() { "legacy-only" } else if remote.projection_comparison_waiting { "pending" } else { "all-shared-projections" },
                 },
             });
             if json_output {
@@ -10086,6 +10425,8 @@ async fn run_replication(
                 "graph\t{}\t{}\t{}",
                 if remote.projection_digests.is_empty() {
                     "unverified (legacy peer)"
+                } else if remote.projection_comparison_waiting {
+                    "pending comparison"
                 } else if remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()) {
                     "equal"
                 } else {
@@ -11134,16 +11475,36 @@ async fn run_agents(
             Ok(())
         }
         AgentsCommand::Apply(args) => {
+            eprintln!(
+                "st: agents apply is legacy; use st apply FILE --no-gate-check with the same options"
+            );
             let client = cli_client(endpoint);
-            let (kdl, source_name) = read_intent(Some(&args.file))?;
-            let response = publish_text(
+            if !args.dry_run {
+                let (kdl, source_name) = read_intent(Some(&args.file))?;
+                let response = publish_text(
+                    &client,
+                    kdl,
+                    source_name.unwrap_or_else(|| "standard input".into()),
+                    args.actor,
+                )
+                .await?;
+                return print_value(&response, json_output);
+            }
+            publish_mission_file(
                 &client,
-                kdl,
-                source_name.unwrap_or_else(|| "standard input".into()),
-                args.actor,
+                MissionPublishArgs {
+                    file: args.file,
+                    dry_run: true,
+                    at_index: None,
+                    actor: args.actor,
+                    workspace: PathBuf::from("."),
+                    no_gate_check: true,
+                    check: false,
+                    inputs: vec![],
+                },
+                json_output,
             )
-            .await?;
-            print_value(&response, json_output)
+            .await
         }
         AgentsCommand::Start(args) => {
             let client = cli_client(endpoint);
@@ -11541,7 +11902,7 @@ async fn agent_start_declaration(
         }
         anyhow::ensure!(
             desired.kind == "stop" && claim.predecessors.len() == 1,
-            "`{subject}` has no unambiguous prior agent declaration; use `st agents apply`"
+            "`{subject}` has no unambiguous prior agent declaration; use `st apply`"
         );
         claim = client
             .get(&format!("/v1/claims/by-id/{}", claim.predecessors[0]))
@@ -11784,7 +12145,7 @@ async fn run_agent_new(
                 && agent.state != "stopped"
             {
                 anyhow::bail!(
-                    "`{subject}` already exists and is {}; change it with `st agents apply`, or stop it with `st agents stop` first",
+                    "`{subject}` already exists and is {}; change it with `st apply`, or stop it with `st agents stop` first",
                     agent.state
                 );
             }
@@ -13382,8 +13743,47 @@ async fn run_harness_diagnostic(
 }
 
 async fn run_schema(client: &Client, command: SchemaCommand, json_output: bool) -> Result<()> {
+    match &command {
+        SchemaCommand::Register { file, actor } => {
+            reject_foreign_agent_actor(actor)?;
+            let manifest = serde_json::from_slice(&std::fs::read(file)?)?;
+            let value: Value = client
+                .post(
+                    "/v1/schema/registrations",
+                    &st3::store::custom::RegistrationRequest {
+                        manifest,
+                        actor: actor.clone(),
+                    },
+                )
+                .await?;
+            return print_value(&value, json_output);
+        }
+        SchemaCommand::Registrations => {
+            let value: Value = client.get("/v1/schema/registrations").await?;
+            return print_value(&value, json_output);
+        }
+        SchemaCommand::Registration { kind } => {
+            let (name, hash) = kind
+                .rsplit_once('@')
+                .context("registration needs KIND@HASH")?;
+            let value: Value = client.get("/v1/schema/registrations").await?;
+            let item = value["items"]
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|v| v["manifest"]["kind"] == name && v["registration"] == hash)
+                })
+                .context("registration is unavailable")?;
+            return print_value(item, json_output);
+        }
+        _ => {}
+    }
     let value: Value = client.get("/v1/schema").await?;
     let selected = match command {
+        SchemaCommand::Register { .. }
+        | SchemaCommand::Registrations
+        | SchemaCommand::Registration { .. } => unreachable!("handled above"),
         SchemaCommand::Export => value,
         SchemaCommand::Subjects => value
             .get("subjects")
@@ -13511,12 +13911,39 @@ async fn run_attention(
                 completion::Matching::Fuzzy,
             )
             .await?;
+            // Public card IDs name a recipient and waiting episode, not just a work source.
+            // Resolve through the actor-scoped read projection; this must not read an update
+            // for the person or let a spent card open a later episode of the same source.
+            let alias = if normalized.starts_with("attention/") {
+                match generated_client(endpoint, Some(&actor))?
+                    .attention_get(&normalized)
+                    .await
+                {
+                    Ok(response) => match response.value {
+                        ClientResource::Attention(card)
+                            if card.header.id == normalized && card.person_id == actor =>
+                        {
+                            Some(card)
+                        }
+                        _ => None,
+                    },
+                    Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                None
+            };
             let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
             let item = client
                 .get::<Vec<AttentionItemView>>(&path)
                 .await?
                 .into_iter()
-                .find(|item| item.subject == normalized)
+                .find(|item| {
+                    alias.as_ref().map_or_else(
+                        || item.subject == normalized,
+                        |card| item.subject == card.source_id && item.episode == card.episode,
+                    )
+                })
                 .with_context(|| {
                     format!("attention item `{normalized}` is not currently actionable")
                 })?;
@@ -15718,6 +16145,18 @@ async fn run_st2_native_driver(
         reject_noninteractive_claude_argv(&argv)?;
     }
     let paths = NativePaths::prepare(subject, driver)?;
+    #[cfg(unix)]
+    if matches!(driver, "pi" | "omp")
+        && let Err(skip) = st3::native_resume::pi_family_link_transcript(
+            &argv,
+            &paths.session_dir.join("provider-sessions"),
+        )
+    {
+        let _ = write_driver_log(
+            subject,
+            &json!({"type":"authored_resume_link_skipped","driver":driver,"code":skip.code,"reason":skip.reason}).to_string(),
+        );
+    }
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
     // A driver launched while the daemon restarts waits for it; exiting here would end the seat.
     retry_while_daemon_unreachable(subject, || {
@@ -16121,6 +16560,10 @@ struct NativeLoopState {
     delivery_episode: u64,
     #[serde(default)]
     mailbox_fence: Option<st3::mailbox::Fence>,
+    #[serde(default)]
+    claude_attachment_phase: String,
+    #[serde(default)]
+    claude_attachment_episode: u64,
 }
 
 /// What a native driver hands its next image across `execve`.
@@ -16312,6 +16755,14 @@ async fn drive_st2_native(
     } = paths.clone();
     let mut mailbox =
         NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
+    let attach_started = Instant::now();
+    if driver == "claude" && mailbox.subscription.is_some()
+        && let Err(error) = check_claude_attachment(
+            client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
+        ).await
+    {
+        let _ = write_driver_log(subject, &format!("Claude attachment check will retry: {error:#}"));
+    }
     let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
@@ -16410,6 +16861,13 @@ async fn drive_st2_native(
                 return outcome;
             }
             _ = interval.tick() => {
+                if driver == "claude" && mailbox.subscription.is_some()
+                    && let Err(error) = check_claude_attachment(
+                        client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
+                    ).await
+                {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
                 if let Err(error) = observations.expire_due() {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
@@ -16829,21 +17287,21 @@ impl NativeObservations {
         } else {
             None
         };
-        let provider_incarnation = if enabled {
-            st_drivers::harness_state::read(
-                &st_drivers::harness_state::harness_state_path(dir),
-                None,
-            )
-            .and_then(|state| state.evidence_incarnation)
+        // The provider token is separate from the runtime incarnation. Only the spool's
+        // producer/runtime binding proves that a saved snapshot belongs to this launch.
+        // Re-exec may restore it; a replacement runtime waits for its own provider event.
+        let snapshot = if enabled {
+            st_drivers::harness_events::read_runtime_state(dir, runtime)?
         } else {
             None
         };
-        let evidence_deadline = if enabled {
-            st_drivers::harness_events::read_snapshot(dir, "harness-state")?
-                .and_then(|raw| serde_json::from_slice(&raw).ok())
-        } else {
-            None
-        };
+        let provider_incarnation = snapshot.as_deref().and_then(|raw| {
+            st_drivers::harness_state::read_raw_at(raw, None, st_drivers::message::now_ms())
+                .evidence_incarnation
+        });
+        let evidence_deadline = snapshot
+            .as_deref()
+            .and_then(|raw| serde_json::from_slice(raw).ok());
         Ok(Self {
             dir: dir.into(),
             runtime: runtime.into(),
@@ -17168,6 +17626,17 @@ async fn publish_harness_activity(
     let status = harness_activity_state(observed.state);
     let mut fields = BTreeMap::from([
         ("state".into(), Value::String(status.into())),
+        (
+            "provider_auth".into(),
+            observed
+                .provider_auth
+                .map(Value::Bool)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "provider_auth_sequence".into(),
+            Value::from(observed.provider_auth_sequence),
+        ),
         ("driver".into(), Value::String(driver.into())),
         ("transport".into(), Value::String(transport.into())),
         (
@@ -19972,12 +20441,81 @@ fn push_mailbox_enabled() -> bool {
     std::env::var("ST3_MAILBOX_TRANSPORT").as_deref() == Ok("push")
 }
 
+async fn check_claude_attachment(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    mailbox: &NativeMailbox,
+    started: Instant,
+    state: &mut NativeLoopState,
+) -> Result<()> {
+    let fence = &mailbox.fence;
+    let path = format!(
+        "/v1/mailbox/attachment?subject={}&incarnation={}&component={}&epoch={}&token={}",
+        urlencoding::encode(&fence.subject),
+        urlencoding::encode(&fence.incarnation),
+        fence.component,
+        fence.epoch,
+        fence.token,
+    );
+    let checked: Result<st3::mailbox::Attachment> = match tokio::time::timeout(
+        Duration::from_secs(2), client.get(&path),
+    ).await {
+        Ok(checked) => checked,
+        Err(_) => Err(anyhow::anyhow!("the channel attachment check exceeded two seconds")),
+    };
+    let attached = checked.as_ref().is_ok_and(|attachment| attachment.attached);
+    let phase = if attached {
+        "attached"
+    } else if started.elapsed() >= Duration::from_secs(20)
+        || state.claude_attachment_phase == "blocked"
+    {
+        "blocked"
+    } else {
+        "starting"
+    };
+    let reason = match checked {
+        Ok(_) => "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. The driver rechecks attachment and st will restart the harness with bounded retries if the channel stays missing.".into(),
+        Err(error) => format!("claude-channel-unattached: attachment could not be verified; mail is held while the driver retries: {error:#}"),
+    };
+    let mut report: Value = serde_json::from_str(&native_delivery_report("claude-channel", None))?;
+    report["ready"] = json!(attached);
+    report["reason"] = json!(&reason);
+    if let Some(subscription) = &mailbox.subscription {
+        subscription.report(report);
+    }
+    if state.claude_attachment_phase == phase {
+        return Ok(());
+    }
+    let code = if attached {
+        "claude-channel-attached"
+    } else {
+        "claude-channel-unattached"
+    };
+    let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
+        subject: subject.into(), kind: "harness.diagnostic".into(), actor: Some(subject.into()),
+        fields: BTreeMap::from([
+            ("severity".into(), json!(if phase == "blocked" { "error" } else { "warning" })),
+            ("status".into(), json!(if attached { "recovered" } else { phase })),
+            ("code".into(), json!(code)),
+            ("reason".into(), json!(if attached { "The current Claude channel is initialized and subscribed; durable mail delivery resumes." } else { &reason })),
+            ("driver".into(), json!("claude")),
+            ("incarnation_id".into(), json!(incarnation)),
+        ]), evidence: Vec::new(), expected_subject: None,
+        idempotency_key: Some(format!("{code}:{subject}:{incarnation}:{}:{}:{phase}", fence.epoch, state.claude_attachment_episode)),
+    }).await?;
+    state.claude_attachment_phase = phase.into();
+    state.claude_attachment_episode += 1;
+    Ok(())
+}
+
 struct NativeMailbox {
     subscription: Option<st3::mailbox::Subscription>,
     fence: st3::mailbox::Fence,
     messages: Vec<MessageView>,
     queued: BTreeMap<String, st_drivers::message::Message>,
     replayed: bool,
+    last_title_warning: Option<Instant>,
 }
 impl NativeMailbox {
     async fn start(
@@ -20015,6 +20553,7 @@ impl NativeMailbox {
             messages: Vec::new(),
             queued: BTreeMap::new(),
             replayed: false,
+            last_title_warning: None,
         })
     }
     async fn recv(&mut self) -> Option<st3::mailbox::Frame> {
@@ -20033,7 +20572,16 @@ impl NativeMailbox {
             }
             Some(st3::mailbox::Frame::Seat { seat }) => {
                 if let Err(error) = update_native_title(&seat, runtime_id) {
-                    eprintln!("st: could not update seat title: {error:#}");
+                    let now = Instant::now();
+                    if self.last_title_warning.is_none_or(|prior| {
+                        now.duration_since(prior) >= Duration::from_secs(10)
+                    }) {
+                        let _ = write_driver_log(
+                            &self.fence.subject,
+                            &format!("could not update seat title: {error:#}"),
+                        );
+                        self.last_title_warning = Some(now);
+                    }
                 }
                 Ok(())
             }
@@ -20210,8 +20758,13 @@ fn seat_label(seat: &st3::model::DesiredSubject) -> String {
 }
 fn update_native_title(seat: &st3::model::DesiredSubject, runtime_id: &str) -> Result<()> {
     let label = seat_label(seat);
+    // The launcher's registry name can differ from the provider's logical runtime ID.
+    let session = std::env::var("PTY_SESSION")
+        .ok()
+        .filter(|session| !session.is_empty())
+        .unwrap_or_else(|| runtime_id.to_owned());
     let result = std::process::Command::new("pty")
-        .args(["rename", runtime_id, &label])
+        .args(["rename", &session, &label])
         .output()?;
     anyhow::ensure!(
         result.status.success(),
@@ -21257,7 +21810,7 @@ mod tests {
         peer.sync = Some(Default::default());
         let rendered = render_replication_peers(&[peer], "local-graph", 0);
         assert!(rendered.contains("same envelopes"));
-        assert!(rendered.contains("projection comparison waits for a newer build"));
+        assert!(rendered.contains("projection comparison waits for a settled exchange or a compatible build"));
         assert!(!rendered.contains("graphs differ"));
         assert!(!rendered.contains("diverged"));
     }
@@ -21338,6 +21891,44 @@ mod tests {
     }
 
     #[test]
+    fn cli_timeline_folds_claude_skill_and_raw_preserves_the_expansion() {
+        let items: Vec<ClientTimelineEntry> = serde_json::from_str(include_str!(
+            "../../../fixtures/clients/transcripts/claude-skill.json"
+        ))
+        .unwrap();
+        for density in [
+            st3_conversation_ui::Density::Full,
+            st3_conversation_ui::Density::Simple,
+        ] {
+            let pretty = conversation_text("session/example", &items, 100, false, density);
+            assert!(pretty.contains("Skill st"), "{pretty}");
+            assert!(!pretty.contains("## Messages"), "{pretty}");
+            assert!(pretty.contains("I have loaded the st skill."), "{pretty}");
+        }
+        let raw = timeline_entries_text("session/example", &items);
+        assert!(raw.contains("# st\n\nThis applies only"), "{raw}");
+        assert!(raw.contains("When\nit prints nothing"), "{raw}");
+        assert!(
+            raw.contains("`<smalltalk-message>`, followed by a bounded preview."),
+            "{raw}"
+        );
+        // Paging can start after Skill: the expansion remains one block, with intact rows.
+        let orphan = conversation_text(
+            "session/example",
+            &items[2..3],
+            100,
+            false,
+            st3_conversation_ui::Density::Full,
+        );
+        assert!(orphan.lines().any(|line| line.trim() == "## Messages"), "{orphan}");
+        assert!(
+            orphan.contains("<smalltalk-message>, followed by a bounded preview."),
+            "{orphan}"
+        );
+        assert!(!orphan.contains("Whenit"), "{orphan}");
+    }
+
+    #[test]
     fn usage_report_ranks_each_group_by_cost_and_marks_unpriced_tokens() {
         let report = json!({"rows": [
             {"agent":"agent/cheap","mission_run":"mission-run/one","step":"step-run/one/build","model":"model-a","account":"claude/aaaa","host":"host/a","cost_microusd":250000,"total_tokens":900,"input_tokens":200,"output_tokens":100,"cache_write_tokens":0,"cached_tokens":600,"unpriced_tokens":0},
@@ -21376,6 +21967,24 @@ mod tests {
         let by_step = render_usage_report(&report, 24, Some(UsageBy::Step));
         assert_eq!(by_step.matches("USAGE  ").count(), 1);
         assert!(by_step.contains("by step"));
+    }
+
+    #[test]
+    fn usage_report_labels_the_daily_proxy_and_unknown_share() {
+        let report = json!({"rows":[],"agent_messages":{
+            "source":"dated audit", "fallback_low_microusd":220000,"fallback_high_microusd":330000,
+            "days":[{"day_start_ms":0,"since_ms":1,"until_ms":86400000,
+                "messages":2,"calibrated_messages":1,"low_microusd":440000,"high_microusd":660000,
+                "usage_cost_microusd":0,"unpriced_tokens":100,"low_percent":null,"high_percent":null}]
+        }});
+        let rendered = render_usage_report(&report, 24, None);
+        assert!(rendered.contains("daily estimate"));
+        assert!(rendered.contains("includes useful work"));
+        assert!(
+            rendered
+                .contains("1970-01-01 (partial)  2  $0.44–$0.66  unknown (no priced usage)  1/2"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -21763,6 +22372,7 @@ mod tests {
                 messages: vec![view.clone()],
                 queued: BTreeMap::new(),
                 replayed: true,
+                last_title_warning: None,
             };
             view.subject = "message/pending".into();
             view.status = "staged".into();
@@ -21994,6 +22604,8 @@ mod tests {
                 predecessor_harness_record: Some(b"ignored".to_vec()),
                 published_timeline: BTreeSet::from(["one:1:1:upsert".to_owned()]),
                 delivery_episode: 2,
+                claude_attachment_phase: "blocked".into(),
+                claude_attachment_episode: 3,
             },
         };
         let back: DriverResume =
@@ -22002,6 +22614,8 @@ mod tests {
         assert_eq!(back.incarnation, resume.incarnation);
         assert!(back.loop_state.ready);
         assert_eq!(back.loop_state.delivery_episode, 2);
+        assert_eq!(back.loop_state.claude_attachment_phase, "blocked");
+        assert_eq!(back.loop_state.claude_attachment_episode, 3);
         assert_eq!(
             back.loop_state.published_timeline,
             resume.loop_state.published_timeline
@@ -23761,6 +24375,114 @@ mod tests {
         assert_eq!(
             creation.after.as_deref(),
             Some("mission-run/release/build/1")
+        );
+    }
+
+    #[test]
+    fn apply_accepts_plain_files_and_requires_owned_source_flags_together() {
+        let plain = [
+            "st",
+            "apply",
+            "seats.kdl",
+            "missions.kdl",
+            "schedules.kdl",
+            "--as",
+            "person/operator",
+            "--dry-run",
+            "--check",
+            "--workspace",
+            "/tmp",
+            "--input",
+            "release=1.4.0",
+        ];
+        let cli = Cli::try_parse_from(plain).unwrap();
+        let Command::Apply(args) = cli.command else {
+            panic!("expected apply")
+        };
+        assert!(args.set.is_none());
+        assert_eq!(args.files.len(), 3);
+        assert!(args.dry_run && args.check);
+        assert_eq!(args.inputs, vec![("release".into(), "1.4.0".into())]);
+        let owned = [
+            "st",
+            "apply",
+            "seats.kdl",
+            "--as",
+            "person/operator",
+            "--set",
+            "garden",
+            "--repository",
+            "acme/garden",
+            "--ref",
+            "refs/heads/main",
+            "--sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--source-sequence",
+            "1",
+            "--expect-set",
+            "absent",
+        ];
+        assert!(Cli::try_parse_from(owned).is_ok());
+        for flag in [
+            "--set",
+            "--repository",
+            "--ref",
+            "--sha",
+            "--source-sequence",
+            "--expect-set",
+        ] {
+            let mut incomplete = owned.to_vec();
+            let index = incomplete.iter().position(|arg| *arg == flag).unwrap();
+            incomplete.drain(index..index + 2);
+            assert!(
+                Cli::try_parse_from(incomplete).is_err(),
+                "{flag} is required for owned publication"
+            );
+        }
+        let mut conflicting = plain.to_vec();
+        conflicting.push("--no-gate-check");
+        assert!(Cli::try_parse_from(conflicting).is_err());
+        let mut owned_at_index = owned.to_vec();
+        owned_at_index.extend(["--at-index", "0"]);
+        assert!(Cli::try_parse_from(owned_at_index).is_err());
+        for option in ["--allow-empty", "--adopt", "--confirm-retire", "--rollout"] {
+            let mut unsupported = vec![
+                "st",
+                "apply",
+                "seats.kdl",
+                "--as",
+                "person/operator",
+                option,
+            ];
+            match option {
+                "--allow-empty" => {}
+                "--rollout" => unsupported.push("when-idle"),
+                _ => unsupported.push("agent/example/helper"),
+            }
+            assert!(
+                Cli::try_parse_from(unsupported).is_err(),
+                "{option} needs --set"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_rejects_duplicate_stdin_and_unversioned_files() {
+        assert!(
+            read_apply_files(&["-".into(), "-".into()], false)
+                .unwrap_err()
+                .to_string()
+                .contains("stdin may appear only once")
+        );
+        assert!(read_apply_files(&[], false).is_err());
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("invalid.kdl");
+        fs::write(&file, "agent \"example/helper\" { command \"true\"; }\n").unwrap();
+        assert!(
+            read_apply_files(&[file], false)
+                .unwrap_err()
+                .to_string()
+                .contains("must begin with version 2")
         );
     }
 
@@ -26095,6 +26817,8 @@ mission "review" state="ready" {
                 actor: "person/test".into(),
                 workspace: root.to_owned(),
                 no_gate_check: false,
+                check: false,
+                inputs: vec![],
             },
             true,
         )
@@ -26356,6 +27080,61 @@ mission "review" state="ready" {
         assert_eq!(store.local_observations_tail(100).unwrap().len(), 1);
         server.abort();
     }
+    #[tokio::test]
+    async fn initial_snapshot_requires_the_providers_runtime_binding() {
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-old").unwrap();
+        let seq =
+            st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-old")
+                .unwrap();
+        let observations = NativeObservations::start(root.path(), "runtime-old").unwrap();
+        assert_eq!(
+            observations.provider_incarnation.as_deref(),
+            Some("provider-old")
+        );
+        assert!(observations.evidence_deadline.is_some());
+        drop(observations);
+
+        // Enabling the successor changes the runtime metadata, not the snapshot's producer.
+        // Even a delayed write by the predecessor belongs to its original runtime.
+        st_drivers::harness_events::enable(root.path(), "runtime-new").unwrap();
+        st_drivers::harness_state::Writer::new(
+            root.path(),
+            "example/seat",
+            "claude",
+            Some("pty".into()),
+        )
+        .with_ownership("provider-old", seq)
+        .observe(st_drivers::harness_state::Observation::new(
+            st_drivers::harness_state::Activity::Active,
+            st_drivers::harness_state::BlockedOn::None,
+            st_drivers::harness_state::InputBuffer::Unknown,
+        ))
+        .unwrap();
+        let observations = NativeObservations::start(root.path(), "runtime-new").unwrap();
+        assert_eq!(observations.provider_incarnation, None);
+        assert_eq!(observations.evidence_deadline, None);
+        drop(observations);
+        assert!(
+            st_drivers::harness_events::read_snapshot(root.path(), "harness-state")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            st_drivers::harness_events::pending(root.path(), 100).unwrap()[0].runtime_incarnation,
+            "runtime-old"
+        );
+
+        st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-new")
+            .unwrap();
+        let observations = NativeObservations::start(root.path(), "runtime-new").unwrap();
+        assert_eq!(
+            observations.provider_incarnation.as_deref(),
+            Some("provider-new")
+        );
+        assert!(observations.evidence_deadline.is_some());
+    }
+
     #[tokio::test]
     async fn reading_the_outbox_does_not_wake_an_idle_driver() {
         let root = tempfile::tempdir().unwrap();

@@ -2,6 +2,26 @@
 //! The provider API stand-in consumes native handoffs without making model calls.
 #![cfg(target_os = "linux")]
 
+#[test]
+fn controller_death_cleanup() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = st3::test_support::command("python3")
+        .arg(repo.join("scripts/st3-messaging-faults-eval/test_cleanup.py"))
+        .env("ST3_MFE_TEST_BINARY", env!("CARGO_BIN_EXE_st3-fixture"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run isolated messaging cleanup regression");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn run_case(case: &str) {
     use std::path::PathBuf;
 
@@ -106,55 +126,88 @@ fn run_case(case: &str) {
 
 #[test]
 fn baseline() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("baseline");
 }
 
 #[test]
 fn daemon_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("daemon-restart");
 }
 
 #[test]
 fn binary_swap() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("binary-swap");
 }
 
 #[test]
 fn path_deploy() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("path-deploy");
 }
 
 #[test]
 fn link_seconds() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("link-seconds");
 }
 
 #[test]
 fn link_minutes() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("link-minutes");
 }
 
 #[test]
 fn receiver_down() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("receiver-down");
 }
 
 #[test]
 fn harness_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("harness-restart");
 }
 
 #[test]
 fn channel_killed() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("channel-killed");
 }
 
 #[test]
 fn old_channel() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("old-channel");
 }
 
 #[test]
 fn handoff_failed() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("handoff-failed");
 }

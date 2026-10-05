@@ -8,6 +8,9 @@
 #[cfg(target_os = "linux")]
 #[test]
 fn a_claude_seat_runs_with_no_st2_on_the_machine() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use std::path::PathBuf;
     use std::process::Command;
 

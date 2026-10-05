@@ -60,11 +60,17 @@ async fn until(mut predicate: impl FnMut() -> bool, description: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fresh_codex_driver_waits_for_reconciliation_before_binding_its_mailbox() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     bootstrap_waits_for_reconciliation("starting", None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replacement_driver_waits_while_the_previous_runtime_is_vanished() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     bootstrap_waits_for_reconciliation("vanished", Some("previous-incarnation")).await;
 }
 

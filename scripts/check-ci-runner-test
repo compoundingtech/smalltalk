@@ -88,3 +88,42 @@ check("priority merge group uses the urgent pool", [], "ci1-priority", EVENT="me
 check("ordinary merge group retains reserved merge capacity", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_RESPONSE='["area:ci"]')
 check("merge-label API failure retains reserved capacity", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_EXIT="1")
 check("malformed queue ref never requests a PR", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/unrelated", api=False)
+
+# Supporting jobs must never spend ordinary CI work on priority/merge capacity.
+import re
+blocks = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow.split("\njobs:\n", 1)[1]))
+for job in ("linux-tests-shard-2", "linux-clippy", "linux-fleet-compat", "genie-freshness", "typescript-client", "isolation-vm", "perf-cost", "mail-redelivery-canaries"):
+    assert "outputs.ci1" not in blocks[job], (job, "supporting job consumes reserved cores")
+    assert ";job.priority=1" in blocks[job], (job, "one class prevents perpetual benchmark starvation")
+    assert "github.run-id=" in blocks[job], (job, "prevent cross-run assignment")
+    if job in ("genie-freshness", "typescript-client", "isolation-vm"):
+        assert "namespace-profile-linux-x86-64;job.priority=1;github.run-id=" in blocks[job], (job, "profile controls must be inline")
+        assert "namespace-features:" not in blocks[job], (job, "separate feature labels are unsupported with profiles")
+    else:
+        assert "namespace-features:github.run-id=" in blocks[job], (job, "shape labels need a separate features label")
+assert "outputs.ci1" in blocks["linux-tests"], "primary shard must retain reserved routing"
+canaries = blocks['mail-redelivery-canaries']
+assert 'needs: [pick-runner]' in canaries and 'needs: [linux-tests]' not in canaries, "canaries must run beside both test shards"
+assert 'scripts/ci-linux mail-redelivery-canaries' in canaries, "the required check must execute the canaries itself"
+assert 'cargo-linux-tests-' in canaries and 'nix5-linux-tests-' in canaries, "reuse protected-main test dependency caches"
+assert 'CI_TEST_PARTITION' not in canaries, "every required canary must run"
+assert 'mail_redelivery' not in blocks['linux-tests'] and 'scripts/ci-mail-redelivery-canaries' not in blocks['linux-tests'], "canaries cannot serialize the primary shard"
+assert 'needs.mail-redelivery-canaries.result' in blocks['linux-gate'], "failures and skips must still fail the Linux gate"
+assert "job.priority=1" in blocks["linux-tests"] and "github.run-id={0}" in blocks["linux-tests"], "same class for Namespace fallback with an evaluated run id"
+for path in ("perf.yml", "main-upkeep.yml", "public-repo.yml", "release-daily.yml", "release-portable.yml", "release-smalltalk.yml"):
+    generated = (ROOT / ".github/workflows" / path).read_text()
+    assert ";job.priority=1" in generated, (path, "Linux optional work must share the class")
+    assert "github.run-id=" in generated, (path, "avoid nondeterministic runner pickup")
+    assert ";job.priority=10" not in generated, path
+for path in ("public-repo.yml", "release-daily.yml", "release-portable.yml", "release-smalltalk.yml", "macos.yml"):
+    generated = (ROOT / ".github/workflows" / path).read_text()
+    assert "namespace-features:" not in generated, (path, "profile workflows must use inline controls")
+release = (ROOT / ".github/workflows/release-smalltalk.yml").read_text()
+assert "${{ matrix.runner }};github.run-id=${{ github.run_id }}" in release, "both release profile matrix entries need evaluated inline affinity"
+assert "linux-tests-shard-2" in blocks["linux-gate"], "both shards must be required"
+assert 'CI_TEST_PARTITION: "hash:1/2"' in blocks["linux-tests"]
+assert 'CI_TEST_PARTITION: "hash:2/2"' in blocks["linux-tests-shard-2"]
+for job in ("linux-tests", "linux-tests-shard-2"):
+    assert 'CI_TEST_THREADS: "8"' in blocks[job], "bound each shard's test concurrency"
+assert "vars.CI1_MIN_IDLE || '4'" in picker, "leave CPU capacity for reserved lanes"
+print("passed: bounded test shards, reserved primary lane, independent support jobs, and required aggregation")

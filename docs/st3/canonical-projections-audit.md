@@ -54,9 +54,11 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_mailbox_owners` | Local | This daemon's native socket subscription owner, live runtime incarnation and replacement epoch. Survives daemon restart; excluded from replicated projection digests. |
 | `local_mailbox_bindings` | Local | Stable binding request tokens mapped to daemon-allocated epochs. Lost acknowledgements retry the same binding; retired tokens cannot allocate a successor. Excluded from replicated projection digests. |
 | `unread_mail`, `unread_mail_prefixes`, `unread_mail_pending` | Local cache | Rebuildable unread-message timestamp and prefix-count indexes, plus a deduplicated queue of changed messages, over this node's retained sent/read/closed claims. They accelerate current age counts, are not replicated, and do not add shared identities to projection digests. |
+| `agent_message_sends`, `agent_message_days`, `local_agent_message_pending` | Local cache | Rebuildable eligible-message timestamps and daily recipient counts, plus a deduplicated queue of changed messages, over this node's retained send claims. They accelerate the daily usage estimate, are not replicated, and do not add shared identities to projection digests. |
 | `local_observations` | Local | Local-retention observations and their local frontier/id; never replicated. |
 | `local_subscription_mission_deferrals` | Local | Local reconciler capacity backoff/retry scheduling. |
 | `local_usage_spend` | Local | Local provider usage and cost accumulation before publication. |
+| `local_usage_provenance` | Local | Cumulative pricing contributions for the same local usage publication slots. Published metadata travels in `harness.usage` claims; this accumulator is excluded from replicated projection digests. |
 | `local_usage_responses` | Local | Local usage-input deduplication, trimmed after 30 days. |
 | `local_limit_stops` | Local | Seats this node's limits policy stopped, once per account and weekly window. |
 | `local_latest_slots` | Local | Local latest-retention publication slots and pending local observation pointers. |
@@ -231,12 +233,14 @@ delivery disagrees on planning_sessions, planning_candidates and selected docume
 all three phases. The six-table graph_digest still matches in every comparison. Both checkpoint
 proofs pass, confirming that proof normalization alone does not expose the live-replica bug.
 
-Two companion checks are included under the same test module:
 `every_persistent_table_has_a_projection_scope` requires classification of each persistent
-table, and `shared_folds_never_order_by_local_arrival` rejects literal shared arrival folds by
-default with explicit documented local/immutable-position exceptions. The source guard is a
-first barrier; the fix must also centralize helper and in-memory key use so indirect pagination
-or nonliteral SQL cannot bypass the invariant. Run all three with `cargo test -p st3 --lib canonical_audit -- --nocapture`. The final baseline run compiled successfully: table classification passed; the source guard named 62 shared arrival-order clauses; shuffle/restart/checkpoint comparison failed with the divergences above (1 passed, 2 intentionally failed).
+table. The original source-text guard `shared_folds_never_order_by_local_arrival` was retired:
+literal SQL inspection cannot distinguish shared winner selection from legitimate local
+pagination metadata and requires an implementation-name allowlist. Behavioral shuffle,
+restart, checkpoint, reader and digest comparisons enforce the invariant without pinning SQL
+wording. Run the current checks with `cargo test -p st3 --lib canonical_audit -- --nocapture`.
+At the original audit baseline, table classification passed; the source guard named 62 shared
+arrival-order clauses; shuffle/restart/checkpoint comparison failed with the divergences above.
 
 The required sync invariants and these enforcing test names are stated in
 [replication](replication.md#sync-invariants), linked from the README and fleet join guide.
@@ -245,6 +249,6 @@ The fix step must extend this foundation with non-empty fixtures for currently e
 
 ## Required fix boundaries
 
-1. Shared canonical helper + exhaustive local exceptions + build guard against new unclassified/shared arrival folds. Retain deterministic ancestry/operation selection and local cursor semantics.
+1. Shared canonical helper + exhaustive local exceptions + behavioral coverage for shared winner selection independent of local arrival. Retain deterministic ancestry/operation selection and local cursor semantics.
 2. One incremental digest per logical shared table/source covering all shared columns, with insert/update/delete maintenance in the same transaction, stable serialization/PK order, full-rebuild validation and migration. Cheap cache invalidation alone is not incremental hashing. Physical indexes, receipt metadata, local clocks and live overlays stay outside. Extend replication status, heal diagnostics and doctor with named mismatches, and keep format/version compatibility explicit.
 3. Expand shuffle/restart/checkpoint CI coverage to every source and derived attention view. The audit commit intentionally contains the failing regression; it is not a green merge candidate. Only the completed fix PR with st/ci green on its own head may join the smalltalk merge train.

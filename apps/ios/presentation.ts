@@ -22,6 +22,7 @@ export function attentionHeadline({ count, loaded, error }: { count: number; loa
 }
 
 const actionLabels: Record<Attention['actions'][number], string> = {
+  'custom.reply': 'Reply with the declared fields',
   'work.done': 'Complete step',
   'review.approve': 'Approve review',
   'review.reject': 'Reject review',
@@ -129,6 +130,13 @@ export function deviceTitle(device: DeviceView, connectedActor: string | undefin
 }
 export function deviceDetail(device: DeviceView, now = Date.now()): string {
   return `${device.state} · paired ${ago(device.updated_at, now)} ago · expires ${device.expires_at.slice(0, 10)}`;
+}
+
+// The mission step waiting on an ask a mission step made, and what it is for.
+export function blockedLine(item: { blocked?: { step: string; goal: string } | null }): string | null {
+  if (!item.blocked) return null;
+  const goal = item.blocked.goal.trim();
+  return `waits ${item.blocked.step}${goal ? ` · ${goal}` : ''} — it continues once you answer`;
 }
 
 // A connected client as it describes itself: its reported name and build, never identity.

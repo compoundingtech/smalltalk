@@ -141,50 +141,58 @@ pub fn wrap(
     // How the line being built continues the one before it (see `continues`).
     let mut joining = None;
     start(&mut current, &mut used, first);
-    let base = used;
     let mut line_has_words = false;
     for run in runs {
         let style = with_bg(run.style, fill);
-        for (index, piece) in run.text.split(' ').enumerate() {
-            if index > 0 {
-                // A space: keep it unless it would start a line.
-                if line_has_words && used < width {
-                    push(&mut current, " ", style);
-                    used += 1;
-                }
-            }
-            if piece.is_empty() {
-                continue;
-            }
-            let piece_width = self::width(piece);
-            if used + piece_width > width && line_has_words {
-                trim_trailing_space(&mut current, &mut used);
+        for (line_index, logical_line) in run.text.split('\n').enumerate() {
+            if line_index > 0 {
+                // A source newline is a real row boundary, including blank paragraphs.
+                // Ratatui spans cannot carry it: Buffer::set_line drops control characters.
                 finish(&mut current, used, &mut lines, joining);
-                joining = Some(SPACE_WRAP);
+                joining = None;
                 start(&mut current, &mut used, rest);
+                line_has_words = false;
             }
-            if used + piece_width <= width {
-                push(&mut current, piece, style);
-                used += piece_width;
-            } else {
-                // A word longer than the line: break it by character.
-                for character in piece.chars() {
-                    let w = character.width().unwrap_or(0);
-                    if used + w > width {
-                        finish(&mut current, used, &mut lines, joining);
-                        joining = Some(WORD_WRAP);
-                        start(&mut current, &mut used, rest);
+            for (index, piece) in logical_line.split(' ').enumerate() {
+                if index > 0 {
+                    // A space: keep it unless it would start a line.
+                    if line_has_words && used < width {
+                        push(&mut current, " ", style);
+                        used += 1;
                     }
-                    push(&mut current, &character.to_string(), style);
-                    used += w;
                 }
+                if piece.is_empty() {
+                    continue;
+                }
+                let piece_width = self::width(piece);
+                if used + piece_width > width && line_has_words {
+                    trim_trailing_space(&mut current, &mut used);
+                    finish(&mut current, used, &mut lines, joining);
+                    joining = Some(SPACE_WRAP);
+                    start(&mut current, &mut used, rest);
+                }
+                if used + piece_width <= width {
+                    push(&mut current, piece, style);
+                    used += piece_width;
+                } else {
+                    // A word longer than the line: break it by character.
+                    for character in piece.chars() {
+                        let w = character.width().unwrap_or(0);
+                        if used + w > width {
+                            finish(&mut current, used, &mut lines, joining);
+                            joining = Some(WORD_WRAP);
+                            start(&mut current, &mut used, rest);
+                        }
+                        push(&mut current, &character.to_string(), style);
+                        used += w;
+                    }
+                }
+                line_has_words = true;
             }
-            line_has_words = true;
         }
     }
-    if line_has_words || used > base || lines.is_empty() {
-        finish(&mut current, used, &mut lines, joining);
-    }
+
+    finish(&mut current, used, &mut lines, joining);
     lines
 }
 

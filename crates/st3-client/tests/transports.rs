@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Empty;
+use http_body_util::{BodyExt as _, Empty};
 use hyper::client::conn::http1;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -861,6 +861,14 @@ fn assert_private_socket(socket: &Path) {
 }
 
 async fn unix_status(socket: &Path, path: &str, credential: Option<&str>) -> StatusCode {
+    unix_response(socket, path, credential).await.status()
+}
+
+async fn unix_response(
+    socket: &Path,
+    path: &str,
+    credential: Option<&str>,
+) -> hyper::Response<hyper::body::Incoming> {
     let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await.unwrap();
     tokio::spawn(async move {
@@ -877,7 +885,6 @@ async fn unix_status(socket: &Path, path: &str, credential: Option<&str>) -> Sta
         .send_request(request.body(Empty::<Bytes>::new()).unwrap())
         .await
         .unwrap()
-        .status()
 }
 
 async fn attach_terminal(client: &Client, suffix: &str) -> TerminalAttachment {
@@ -1531,13 +1538,23 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
         unix_status(&gateway_socket, "/v1/health", None).await,
         StatusCode::OK
     );
+    let advertised = unix_response(&gateway_socket, "/v1/client/capabilities", None).await;
+    assert_eq!(advertised.status(), StatusCode::OK);
+    let advertisement: Value = serde_json::from_slice(
+        &advertised.into_body().collect().await.unwrap().to_bytes(),
+    ).unwrap();
+    assert_eq!(advertisement, serde_json::json!({
+        "api_version": st3_client::API_VERSION,
+        "capabilities": [{"id":"device-key-proofs", "version":1, "state":"granted"}],
+    }));
     assert_eq!(
-        unix_status(&gateway_socket, "/v1/client/capabilities", None).await,
-        StatusCode::FORBIDDEN
+        unix_status(&gateway_socket, "/v1/client/agents", None).await,
+        StatusCode::FORBIDDEN,
+        "anonymous compatibility discovery must not grant graph access"
     );
     assert!(
         Client::unix(&gateway_socket).capabilities().await.is_err(),
-        "the paired-only Unix gateway must reject an ordinary local session"
+        "anonymous compatibility discovery is not a full privileged capability envelope"
     );
     let direct_gateway = Client::unix_gateway(&gateway_socket, &paired.value.credential);
     let direct_capabilities = direct_gateway.capabilities().await.unwrap();
@@ -1753,8 +1770,75 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     );
     assert_eq!(
         unix_status(&gateway_socket, "/v1/client/capabilities", None).await,
-        StatusCode::FORBIDDEN
+        StatusCode::OK
+    );
+    assert_eq!(
+        unix_status(&gateway_socket, "/v1/client/agents", None).await,
+        StatusCode::FORBIDDEN,
+        "restarting the paired gateway must preserve anonymous graph denial"
     );
     restarted_gateway.abort();
     restarted_local.abort();
+}
+
+#[tokio::test]
+async fn canonical_publication_definition_requires_declaration_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let server_socket = socket.clone();
+    let state = state(root.path(), "client-publication-definition");
+    let source = r#"version 2
+mission "example/readback" state="ready" {
+    goal "Read resolved defaults."
+    step "inspect" { agentless }
+}
+schedule "example/daily" {
+    host "client-publication-definition"
+    every "1h"
+    anchor "2026-01-01T00:00:00Z"
+    work { mission "example/readback"; workspace "/tmp"; }
+}
+"#;
+    let intent =
+        st3::graph::parse_owned_set_intent(source, "client-publication-definition").unwrap();
+    state
+        .store
+        .apply_internal(&intent, "readback-fixture")
+        .unwrap();
+    let app = st3::api::router(state.clone());
+    let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+    wait_for_socket(&socket).await;
+    let reader = Client::unix(&socket);
+    let publisher = Client::unix_as(&socket, "person/test");
+    for subject in ["mission/example/readback", "schedule/example/daily"] {
+        assert!(matches!(
+            reader.publication_definition(subject).await,
+            Err(ClientError::Api(ErrorCode::Forbidden, _, _))
+        ));
+        let response = publisher.publication_definition(subject).await.unwrap();
+        assert_eq!(response.value.subject, subject);
+        assert_eq!(response.snapshot.store_index, state.store.index().unwrap());
+        let expected = if subject.starts_with("mission/") {
+            serde_json::to_value(&intent.missions["example/readback"]).unwrap()
+        } else {
+            serde_json::to_value(&intent.subjects[subject]).unwrap()
+        };
+        assert_eq!(
+            serde_json::to_value(response.value.declaration).unwrap(),
+            expected
+        );
+    }
+    assert!(matches!(
+        publisher
+            .publication_definition("mission/example/absent")
+            .await,
+        Err(ClientError::Api(ErrorCode::NotFound, _, _))
+    ));
+    assert!(matches!(
+        publisher
+            .publication_definition("runtime/unsupported")
+            .await,
+        Err(ClientError::Api(ErrorCode::ValidationFailed, _, _))
+    ));
+    server.abort();
 }

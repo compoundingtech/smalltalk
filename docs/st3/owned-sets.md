@@ -5,7 +5,7 @@ definitions and schedules. A successful publication retires previously live memb
 absent from that list. Membership lives in the ordinary graph, on `owned-set/NAME` subjects with
 immutable `owned-set.revised` claims. There is no inventory database alongside the graph.
 
-Ordinary purpose-specific publication remains an upsert: omission has no effect. Owned sets are
+Ordinary `st apply FILE...` publication remains an upsert: omission has no effect. Owned sets are
 an explicit choice, made with `st apply --set NAME`. A file disappearing from a checkout does
 nothing by itself. The publisher must submit a complete, valid bundle. An unreadable input,
 invalid declaration, stale fence or unconfirmed mass retirement rejects the entire transaction.
@@ -22,7 +22,15 @@ st apply --set garden seats.kdl missions.kdl schedules.kdl \
   --as person/operator --dry-run
 ```
 
-Remove `--dry-run` to publish. Initial creation requires `--expect-set absent`; subsequent
+Remove `--dry-run` to publish. A dry run prints blockers and exits with failure when any
+are present. Add `--check` to execute gates during the preview, with `--workspace DIR` and
+`--input NAME=VALUE` as needed; gate answers appear on stderr. Publication checks for broken
+exec gates by default; `--no-gate-check` skips them.
+
+All source flags are required together with `--set`. Without `--set`, publish plain files
+with `st apply seats.kdl missions.kdl schedules.kdl --as person/operator`.
+
+Initial creation requires `--expect-set absent`; subsequent
 publications require the exact selected revision printed by `st sets show garden`. The CLI
 previews first, then submits captured member heads with the apply. The daemon checks the set
 revision, source sequence and every captured member head within the publication transaction.
@@ -35,6 +43,42 @@ Reintroducing a retired member through its set makes it live again.
 Mission runs, mission-owned seats, resources, observers and subscriptions cannot be set members.
 Publish those through their existing routes. A mission definition may contain its normal
 run-owned declarations; changing its definition preserves active runs and their pinned revisions.
+
+## Declaration diffs and readback
+
+`st apply --set NAME ... --dry-run` includes an additive `declaration_diffs` map keyed by
+subject for added, changed and retiring members. Each entry has `before`, `after` and `fields`.
+`before` is null when the subject has never been published; adoption includes its existing
+unmanaged definition. `after` includes the proposed retirement declaration when retiring.
+Unchanged members have no entry. `fields` lists the changed JSON pointers in sorted order;
+objects are compared by field and arrays as a whole. The empty pointer means the complete
+definition was added. The existing classifications, effects, fences, digests and exit codes
+are unchanged. The preview uses the existing person-or-agent actor validation.
+
+The values are canonical structured publication definitions: seats and schedules use the
+normalized `DesiredSubject` (including its canonical declaration AST and compiled seat member),
+and missions use the compiled `MissionSpec`. The mission compiler supplies concurrent run,
+revision cutover, completion, retry and duration defaults. These values come from the same
+compiler and selected graph definitions as publication; publishers need not reproduce defaults
+or render KDL themselves. Derived revision and step definition hashes remain visible.
+`st missions publish FILE --dry-run` and the intent preview reuse this same `declaration_diffs`
+format. These JSON values are inspection data, not an alternative JSON publication input.
+
+Read an applied definition with the client operation `publication.definition`:
+
+```text
+GET /v1/client/publication-definition?subject=mission%2Fgarden%2Fharvest
+GET /v1/client/publication-definition?subject=schedule%2Fgarden%2Fdaily
+```
+
+The response envelope contains the selected `subject`, `declaration`, `revision` and immutable
+claim `token`, with a snapshot from the same read transaction. Owned members follow the selected
+set references; active mission runs keep their pinned revisions. Rust `publication_definition`,
+Swift `publicationDefinition` and TypeScript `publicationDefinition` also accept agent subjects.
+The operation requires both `read.projections` and `read.declarations`, since canonical values
+can include environment values and embedded mission declarations. It returns 404 for a missing
+definition and rejects unsupported subject kinds or an oversized response without truncation.
+The existing redacted agent `subject.definition` operation remains available.
 
 ## Retirement
 

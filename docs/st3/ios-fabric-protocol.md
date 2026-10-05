@@ -20,7 +20,7 @@ select **iroh 1.0.2**. Pin `=1.0.2`, the fabric source revision, and the adapter
 own lockfile for the executable proof. A version banner alone is not an artifact
 checksum; record the built adapter and tested member binary hashes when testing.
 
-Small Talk references were inspected at commit
+Smalltalk references were inspected at commit
 `0c6b10d044f6a8a3b051639b55f53522cc9a9b11`. Relative links describe that checkout;
 recheck them when implementing against a newer main.
 

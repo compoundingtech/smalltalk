@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use anyhow::{Context as _, Result};
@@ -14,11 +14,30 @@ use rusqlite::{Connection, OpenFlags, Transaction};
 use crate::store::current_index;
 
 /// Read connections a store keeps between reads; more open while more reads run at once.
-/// Each caches up to 8 MiB of pages. Opening a connection also parses the database schema
+/// Each requests `read_cache_kib()` KiB of pages. Opening a connection also parses the database schema
 /// (`sqlite3Init`), which under the daemon's read pattern cost more CPU than the reads
 /// themselves (issue #946: 55% of daemon CPU was `ReadPool::get` reopening connections the
 /// pool had just closed), so the pool keeps every connection it opened, up to this many.
 pub const MAX_IDLE_READ_CONNECTIONS: usize = 128;
+
+/// A fixed page-cache target per reader, leaving retained schema and statement caches intact.
+/// SQLite's page-cache target excludes statements, schema, query results and allocator overhead.
+pub const READ_CACHE_KIB: usize = 2048;
+pub const WRITE_CACHE_KIB: usize = 32768;
+
+pub fn read_cache_kib() -> usize {
+    static CACHE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        configured_read_cache_kib(std::env::var("SMALLCLAIMS_READ_CACHE_KIB").ok().as_deref())
+    });
+    *CACHE
+}
+
+fn configured_read_cache_kib(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=i32::MAX as usize).contains(value))
+        .unwrap_or(READ_CACHE_KIB)
+}
 
 /// Idle retention ceiling, not a limit on concurrent reads or open connections.
 /// `MAX_IDLE_READ_CONNECTIONS`, or `SMALLCLAIMS_MAX_IDLE_READ_CONNECTIONS` when that parses.
@@ -388,27 +407,61 @@ impl Drop for WriterGuard<'_> {
 /// excess idle connections. Reads see the last committed state and, in WAL mode, never wait
 /// for the writer. The retention ceiling does not bound concurrent connections.
 pub struct ReadPool {
-    pub idle: Mutex<Vec<Connection>>,
+    pub idle: Mutex<Vec<ReadConnection>>,
     /// Wakes a read waiting for an idle connection, which happens only when the operating system
     /// refuses another one, for example past the open file limit.
     pub returned: Condvar,
     pub path: PathBuf,
     pub shared_memory: bool,
-    #[cfg(test)]
-    connections_opened: std::sync::atomic::AtomicUsize,
+    counts: Arc<ReaderCounts>,
+}
+
+#[derive(Default)]
+struct ReaderCounts {
+    open: AtomicUsize,
+    peak: AtomicUsize,
+    opened: AtomicU64,
+}
+
+/// Counts the actual connection lifetime, including a connection shared by a pinned snapshot.
+pub struct ReadConnection {
+    connection: Connection,
+    counts: Arc<ReaderCounts>,
+}
+
+impl Deref for ReadConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+impl Drop for ReadConnection {
+    fn drop(&mut self) {
+        self.counts.open.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ReaderUsage {
+    pub open: usize,
+    pub idle: usize,
+    pub peak: usize,
+    pub opened: u64,
 }
 
 pub struct ReadGuard<'a> {
     pub pool: &'a ReadPool,
-    pub connection: Option<Connection>,
+    pub connection: Option<ReadConnection>,
     /// The connection `Store::read_snapshot` pinned for this thread, shared by every read in it.
-    pub pinned: Option<Rc<Connection>>,
+    pub pinned: Option<Rc<ReadConnection>>,
 }
 
 thread_local! {
     /// While `Store::read_snapshot` runs on this thread: the pool it pinned a connection from,
     /// and that connection, held inside one read transaction.
-    pub static PINNED_READER: RefCell<Option<(usize, Rc<Connection>)>> = const { RefCell::new(None) };
+    pub static PINNED_READER: RefCell<Option<(usize, Rc<ReadConnection>)>> = const { RefCell::new(None) };
 }
 
 /// A write from inside `Store::read_snapshot` commits after the snapshot its thread reads, so
@@ -423,7 +476,7 @@ pub fn debug_assert_no_pinned_read() {
 /// Ends a pinned read on every exit path, panics included.
 pub struct PinnedRead<'a> {
     pub pool: &'a ReadPool,
-    pub connection: Option<Rc<Connection>>,
+    pub connection: Option<Rc<ReadConnection>>,
 }
 
 impl Drop for PinnedRead<'_> {
@@ -448,17 +501,39 @@ impl ReadPool {
             returned: Condvar::new(),
             path: path.to_path_buf(),
             shared_memory,
-            #[cfg(test)]
-            connections_opened: std::sync::atomic::AtomicUsize::new(1),
+            counts: Arc::new(ReaderCounts::default()),
         };
         // Open one now, so a store that cannot be read fails to open.
-        let connection = open_read_connection(&pool.path, pool.shared_memory)?;
+        let connection = pool.open_connection()?;
         pool.release(connection);
         Ok(pool)
     }
 
     pub fn key(&self) -> usize {
         std::ptr::from_ref(self) as usize
+    }
+
+    fn open_connection(&self) -> Result<ReadConnection> {
+        let connection = open_read_connection(&self.path, self.shared_memory)?;
+        let open = self.counts.open.fetch_add(1, Ordering::Relaxed) + 1;
+        self.counts.peak.fetch_max(open, Ordering::Relaxed);
+        self.counts.opened.fetch_add(1, Ordering::Relaxed);
+        Ok(ReadConnection {
+            connection,
+            counts: self.counts.clone(),
+        })
+    }
+
+    /// Operational estimates remain available with SQLite MEMSTATUS disabled. These counts
+    /// describe connections; page-cache targets are not measurements of process memory.
+    pub fn usage(&self) -> ReaderUsage {
+        let idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        ReaderUsage {
+            open: self.counts.open.load(Ordering::Relaxed),
+            idle: idle.len(),
+            peak: self.counts.peak.load(Ordering::Relaxed),
+            opened: self.counts.opened.load(Ordering::Relaxed),
+        }
     }
 
     pub fn get(&self) -> ReadGuard<'_> {
@@ -483,10 +558,8 @@ impl ReadPool {
             .pop();
         let connection = match idle {
             Some(connection) => connection,
-            None => match open_read_connection(&self.path, self.shared_memory) {
+            None => match self.open_connection() {
                 Ok(connection) => {
-                    #[cfg(test)]
-                    self.connections_opened.fetch_add(1, Ordering::Relaxed);
                     crate::profile::note("read connection opened");
                     connection
                 }
@@ -517,7 +590,7 @@ impl ReadPool {
 
     /// Keep `connection` for the next read, or close it when the pool already holds
     /// `max_idle_read_connections()` of them.
-    pub fn release(&self, connection: Connection) {
+    pub fn release(&self, connection: ReadConnection) {
         let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
         if idle.len() < max_idle_read_connections() {
             idle.push(connection);
@@ -533,6 +606,7 @@ impl Deref for ReadGuard<'_> {
         self.pinned
             .as_deref()
             .or(self.connection.as_ref())
+            .map(|connection| &**connection)
             .expect("a read guard always has a connection")
     }
 }
@@ -697,9 +771,9 @@ pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connecti
     connection.execute_batch(
         "PRAGMA busy_timeout = 5000;
          PRAGMA foreign_keys = ON;
-         PRAGMA cache_size = -8192;
          PRAGMA query_only = ON;",
     )?;
+    connection.pragma_update(None, "cache_size", -(read_cache_kib() as i64))?;
     Ok(connection)
 }
 
@@ -708,7 +782,6 @@ thread_local! {
     /// SQLite statements this thread ran, so a test can see how a read's work grows.
     pub static STATEMENTS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -721,7 +794,7 @@ mod tests {
         // A read-only open needs the file to exist.
         rusqlite::Connection::open(&path).unwrap();
         let pool = ReadPool::new(&path, false).unwrap();
-        let opened = || pool.connections_opened.load(Ordering::Relaxed);
+        let opened = || pool.usage().opened;
         let burst = |pool: &ReadPool| {
             let guards: Vec<_> = (0..40).map(|_| pool.get()).collect();
             drop(guards);
@@ -733,5 +806,70 @@ mod tests {
         assert_eq!(opened(), 40);
         burst(&pool);
         assert_eq!(opened(), 40, "the second wave must not open connections");
+        let usage = pool.usage();
+        assert_eq!((usage.open, usage.idle, usage.peak), (40, 40, 40));
+        for connection in pool.idle.lock().unwrap().iter() {
+            let cache: i64 = connection
+                .query_row("PRAGMA cache_size", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(cache, -(read_cache_kib() as i64));
+        }
+    }
+
+    #[test]
+    fn reader_cache_override_rejects_values_that_disable_the_cache_limit() {
+        for invalid in [
+            None,
+            Some(""),
+            Some("bad"),
+            Some("0"),
+            Some("-1024"),
+            Some("2147483648"),
+        ] {
+            assert_eq!(configured_read_cache_kib(invalid), READ_CACHE_KIB);
+        }
+        assert_eq!(configured_read_cache_kib(Some("1024")), 1024);
+        assert_eq!(configured_read_cache_kib(Some("8192")), 8192);
+    }
+
+    #[test]
+    fn counts_follow_a_reader_shared_by_a_snapshot_until_its_last_owner_drops() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        rusqlite::Connection::open(&path).unwrap();
+        let pool = ReadPool::new(&path, false).unwrap();
+        let mut guard = pool.get();
+        let connection = Rc::new(guard.connection.take().unwrap());
+        drop(guard);
+        let escaped = connection.clone();
+        drop(PinnedRead {
+            pool: &pool,
+            connection: Some(connection),
+        });
+        assert_eq!((pool.usage().open, pool.usage().idle), (1, 0));
+        drop(escaped);
+        assert_eq!((pool.usage().open, pool.usage().idle), (0, 0));
+        drop(pool.get());
+        assert_eq!((pool.usage().open, pool.usage().opened), (1, 2));
+    }
+
+    #[test]
+    fn burst_and_retained_counts_include_connections_closed_above_retention() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        rusqlite::Connection::open(&path).unwrap();
+        let pool = ReadPool::new(&path, false).unwrap();
+        let burst = MAX_IDLE_READ_CONNECTIONS + 8;
+        let guards: Vec<_> = (0..burst).map(|_| pool.get()).collect();
+        assert_eq!(
+            (pool.usage().open, pool.usage().idle, pool.usage().peak),
+            (burst, 0, burst)
+        );
+        drop(guards);
+        let retained = burst.min(max_idle_read_connections());
+        assert_eq!(
+            (pool.usage().open, pool.usage().idle, pool.usage().peak),
+            (retained, retained, burst)
+        );
     }
 }

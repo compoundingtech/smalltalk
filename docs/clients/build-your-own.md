@@ -1,4 +1,4 @@
-# Build your own Small Talk client
+# Build your own Smalltalk client
 
 Start with the typed client for transport and actions, then reuse the conversation model and
 feed. Your application owns layout, input, credentials and device storage. It does not need to
@@ -50,7 +50,7 @@ Open [main.rs](../../examples/client-tui/src/main.rs) for startup/input and
 
 These are repository source packages, not crates published on crates.io or npm. In a Rust app
 inside this checkout, use path dependencies like the [example manifest](../../examples/client-tui/Cargo.toml).
-When using them in another repository, pin one Small Talk revision and keep the sibling crates
+When using them in another repository, pin one Smalltalk revision and keep the sibling crates
 together; they use relative path dependencies. The model's default features have no ratatui
 dependency. Enable `features = ["ratatui"]` only when drawing with ratatui, whose version must
 match the workspace. The example uses ratatui 0.30 and crossterm 0.29.
@@ -82,7 +82,7 @@ Pass the feed a standard update sender and a Tokio command receiver. Drain updat
 UI loop. An agents `Window` replaces the ordered agent rows; keep selection by resource ID,
 not row index. `Connected` means the socket opened, not that rows loaded: wait for a live
 window before enabling actions. `Offline` preserves the last display while disabling sends.
-`Converse { targets: vec![agent_id] }` asks st to join that agent's transcript and Small Talk.
+`Converse { targets: vec![agent_id] }` asks st to join that agent's transcript and Smalltalk.
 Apply conversation frames through `Timeline`, then feed `adapt::conversation` into `Cache`.
 Do not append frames blindly: entries can be revised, streams can replace their window, and
 an agent can restart into another session. The feed can follow at most three conversations.

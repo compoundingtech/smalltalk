@@ -782,7 +782,7 @@ async fn seat_loop(
                         "subject": agent,
                         "kind": "harness.observed",
                         "actor": agent,
-                        "fields": {"state": if tick % 60 == 0 { "idle" } else { "working" },
+                        "fields": {"state": if tick.is_multiple_of(60) { "idle" } else { "working" },
                                    "incarnation_id": format!("seat-{seat}")},
                         "evidence": [],
                     }),
@@ -1360,21 +1360,21 @@ fn generate(store: &Store, prefix: &str, scale: f64) {
             idempotency_key: format!("bench-{prefix}-person-ask-{request}"),
             request: None,
         });
-        if let Ok(posted) = posted {
-            if request % 50 != 0 {
-                let _ = store.finish_person_step(
-                    &PersonStepResponse {
-                        subject: posted.subject,
-                        actor: "person/bench-operator".into(),
-                        summary: "The invented decision is made".into(),
-                        evidence: Vec::new(),
-                        episode: None,
-                        idempotency_key: format!("bench-{prefix}-person-done-{request}"),
-                        answer: None,
-                    },
-                    false,
-                );
-            }
+        if let Ok(posted) = posted
+            && !request.is_multiple_of(50)
+        {
+            let _ = store.finish_person_step(
+                &PersonStepResponse {
+                    subject: posted.subject,
+                    actor: "person/bench-operator".into(),
+                    summary: "The invented decision is made".into(),
+                    evidence: Vec::new(),
+                    episode: None,
+                    idempotency_key: format!("bench-{prefix}-person-done-{request}"),
+                    answer: None,
+                },
+                false,
+            );
         }
     }
     let registry = st3_schema::registry();
