@@ -6,6 +6,10 @@ import { githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
 export default githubWorkflow(auditCaches({
   actionlint: linuxActionlintConfig,
   "name": "Public repository check",
+  concurrency: {
+    group: "public-repo-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main') || github.run_id }}",
+    'cancel-in-progress': "${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
+  },
   "on": {
     "pull_request": null,
     "push": {

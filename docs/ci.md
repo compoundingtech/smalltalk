@@ -6,8 +6,11 @@ Workspace CI runs on pull requests, merge groups and manual dispatch. The merge 
 exact commit that lands on `main`; its successful checks stay attached to that SHA, so a main push
 does not repeat the workspace gate. `Main upkeep` verifies those five checks, runs `perf-cost`
 (which the queue skips), and fills missing main-scope caches on Namespace. macOS CI is currently
-disabled. Each non-PR run uses its own `github.run_id` in the concurrency group, so
-successive pushes do not cancel checks or cache saves. PR updates still cancel stale checks.
+disabled. PR updates cancel obsolete runs for that PR in Workspace CI, Performance and the
+public-content guard. Main upkeep, Performance and public checks keep only the latest main push;
+older pushes must not keep consuming runners after their source is superseded. Manual dispatch,
+scheduled Performance controls and merge-group runs retain independent `github.run_id` groups.
+The required queue checks and their runner reservations are unchanged.
 
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) replaces the fleet's
 former Linux `st/ci` execution. The retained macOS workflow (`.github/workflows/macos.yml`) is
@@ -692,6 +695,14 @@ for the scheduler's limits, and GitHub's [merge queue settings](https://docs.git
 for the distinction between build concurrency and merge batch size.
 
 ## Superseded merge groups
+
+Push concurrency in Main upkeep, Performance and the public guard is scoped to protected main.
+A new main push cancels obsolete automatic work; its upkeep still probes and fills the current
+main's exact cache entries. PR groups use the PR number, rather than its head SHA, so a new head
+replaces the old one. Manual pinned validations are never grouped with PR or push runs. Old
+immutable workflow revisions can remain queued: before cancelling a backlog entry, compare its
+event, source and PR state with current main or the PR's latest head, retain its original timing
+and cancellation, and leave manual controls and merge groups to their owners.
 
 The `namespace-capacity` job also watches `merge_group` events on a GitHub-hosted runner,
 independent of ci1 and Namespace availability. It polls the group's ref and required check statuses
