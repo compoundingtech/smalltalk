@@ -19163,6 +19163,57 @@ version 2
         );
     }
 
+    #[tokio::test]
+    async fn message_thread_counts_canonical_children_once_when_edges_have_two_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("claims.sqlite3");
+        let mut app_state = state(root.path());
+        app_state.store = Arc::new(Store::open(&database, "node").unwrap());
+        let app = router(app_state);
+        let send = |key: String, parent: Option<String>| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.clone(),
+                from: "agent/garden-writer".into(),
+                to: "agent/garden-reader".into(),
+                content: key,
+                title: None,
+                in_reply_to: parent,
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+        };
+        let (_, first) =
+            json_request(app.clone(), "/v1/messages", send("garden-root".into(), None)).await;
+        let first_id = first["subject"].as_str().unwrap().to_owned();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        for index in 0..101 {
+            let (_, child) = json_request(
+                app.clone(),
+                "/v1/messages",
+                send(format!("garden-child-{index}"), Some(first_id.clone())),
+            )
+            .await;
+            let child_id = child["subject"].as_str().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO message_reply_edges(source, subject, parent) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![format!("desired:{child_id}"), child_id, first_id],
+                )
+                .unwrap();
+        }
+        let (status, thread) = get_request(
+            app,
+            &format!(
+                "/v1/messages/thread/{}",
+                first_id.trim_start_matches("message/")
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{thread}");
+        assert_eq!(thread.as_array().unwrap().len(), 102);
+    }
+
 
     #[tokio::test]
     async fn message_lifecycle_requires_the_exact_recipient_actor() {

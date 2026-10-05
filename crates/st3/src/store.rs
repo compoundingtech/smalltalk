@@ -11363,7 +11363,7 @@ impl Store {
             let bare = parent.strip_prefix("message/").unwrap_or(&parent);
             let mut statement = connection
                 .prepare_cached(
-                    "SELECT edge.subject FROM message_reply_edges AS edge INDEXED BY message_reply_edges_parent
+                    "SELECT DISTINCT edge.subject FROM message_reply_edges AS edge INDEXED BY message_reply_edges_parent
                  WHERE edge.parent IN (?1, ?2)
                  ORDER BY edge.parent, edge.subject LIMIT 201",
                 )
