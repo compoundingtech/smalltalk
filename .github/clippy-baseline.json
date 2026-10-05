@@ -20,7 +20,7 @@
     },
     "st3": {
       "clippy::cloned_ref_to_slice_refs": 5,
-      "clippy::collapsible_if": 28,
+      "clippy::collapsible_if": 27,
       "clippy::collapsible_match": 1,
       "clippy::derivable_impls": 1,
       "clippy::double_ended_iterator_last": 1,
