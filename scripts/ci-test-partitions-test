@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Incomplete or overlapping test shards must fail rather than weaken the gate."""
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parent.parent
+loader = importlib.machinery.SourceFileLoader("partitions", str(root / "scripts/ci-test-partitions"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+
+def document(binary, matches, ignored=(), excluded=()):
+    return json.dumps({"rust-suites": {binary: {"testcases": {
+        **{name: {"ignored": False, "filter-match": {"status": "matches"}} for name in matches},
+        **{name: {"ignored": True, "filter-match": {"status": "matches"}} for name in ignored},
+        **{name: {"ignored": False, "filter-match": {"status": "mismatch"}} for name in excluded},
+    }}}})
+
+
+full = module.selected(document("workspace", ["same", "other"], ignored=["ignored"], excluded=["filtered"]) + "\n" + document("st2", ["same"]))
+assert full == {("workspace", "same"), ("workspace", "other"), ("st2", "same")}
+module.verify(full, {("workspace", "same")}, {("workspace", "other"), ("st2", "same")})
+for first, second in [(full, full), (set(), full), ({("workspace", "same")}, {("st2", "same")}),
+                       ({("workspace", "same")}, full - {("workspace", "same")} | {("new", "extra")})]:
+    try:
+        module.verify(full, first, second)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a broken partition proof passed")
+
+with tempfile.TemporaryDirectory() as temp:
+    scratch = Path(temp)
+    cargo = scratch / "cargo"
+    cargo.write_text('#!/usr/bin/env python3\nimport json, os, sys\nwith open(os.environ["CALLS"], "a") as stream: stream.write(json.dumps(sys.argv[1:]) + "\\n")\nsys.exit(1 if "--workspace" in sys.argv else 0)\n')
+    cargo.chmod(0o755)
+    for action, extra in [("run", []), ("run", ["--no-run"]), ("list", ["--message-format", "json"])]:
+        calls = scratch / "calls"
+        calls.unlink(missing_ok=True)
+        env = {**os.environ, "PATH": f"{scratch}:{os.environ['PATH']}", "CALLS": str(calls), "CI_TEST_PARTITION": "hash:2/2"}
+        result = subprocess.run(["bash", "scripts/ci-nextest", action, *extra], cwd=root, env=env, capture_output=True)
+        assert result.returncode == 1, "workspace failure must survive a passing st2 group"
+        commands = [json.loads(line) for line in calls.read_text().splitlines()]
+        assert len(commands) == 2, "both groups must still run on failure"
+        assert all(("--partition" in command) == ("--no-run" not in extra) for command in commands)
+        calls.unlink()
+        env["CI_TEST_PARTITION"] = "hash:1/3"
+        result = subprocess.run(["bash", "scripts/ci-nextest", action, *extra], cwd=root, env=env, capture_output=True)
+        assert result.returncode == 2 and not calls.exists(), "incomplete shard count must fail before Cargo"
+
+print("Partition tests passed: full selection, duplicate names across binaries, ignored tests, missing/extra/overlapping shards, invalid partition, and failure propagation")

@@ -24,7 +24,7 @@ head: it tests that head merged with the current base. Strict branch protection 
 that the head itself contain the latest `main`. No `pull_request_target` job runs PR code,
 and the gate has only `contents: read` permission. Forks do not receive publishing secrets.
 
-The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
+The Linux gate runs two test partitions plus Clippy and fleet compatibility on separate runners.
 `linux-gate` is the single required check: it needs the three stage jobs and the named mail redelivery
 check, and passes only when every one succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
 `nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm` and `typescript-client`
@@ -33,16 +33,32 @@ use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggreg
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
 
-- `linux-tests`: prepares the provider component fixtures, installs matching rendered st2 hooks,
-  builds the selected test executables with dev/test debug info and incremental compilation
-  disabled, then runs `bash scripts/ci-nextest run` on every CPU, selected
-  by the profile's default filter (see [gate scope](#gate-scope));
+- `linux-tests` and `linux-tests-shard-2`: prepare the provider component fixtures, build the
+  selected test executables with dev/test debug info and incremental compilation disabled,
+  and install matching hooks directly from the built st2 executable. They run complementary
+  nextest hash partitions with eight test threads each. The profile's default filter still
+  selects the gate scope (see [gate scope](#gate-scope));
 - `linux-clippy`: `cargo clippy --workspace --all-targets --locked`, the standalone conversation
   model check, the [warning ratchet](#clippy-warning-ratchet), then
   `cargo run --locked -p st3-client-codegen -- --check`;
 - `linux-fleet-compat`: the fleet compatibility test against `.github/fleet-compat-baseline.json`'s
   pinned older st3. Building that baseline also runs the pinned pty's own unit tests, two of which
   are timing-sensitive, so the build is retried up to three times.
+
+The primary test job proves that the two actual nextest inventories are disjoint and their union
+equals the full selected suite before running the explicit zero-retry mail canaries. It also
+runs the standalone conversation model feature check. The second shard runs the remaining
+workspace and st2 tests on independent Namespace CPUs. `linux-gate` requires both shards;
+failure, cancellation or skipping either shard fails the gate. Each shard retains passing test
+durations in its logs, and the primary saves `ci-logs/test-partitions.json` with the tested SHA
+and all three inventories.
+
+Both shards keep their own checkouts and builds because many tests embed build-time source and
+executable paths. Namespace's second shard restores the same main-seeded Cargo and Nix cache
+keys as the primary. Moving portable archives between runners remains a follow-up after those
+tests support relocation. Building selected targets before installing hooks removes the earlier
+standalone `cargo run -p st2` build. Local and macOS runs use the complete selection unless
+`CI_TEST_PARTITION` is explicitly set to `hash:1/2` or `hash:2/2`.
 
 Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
 or restoring build archives. When both entries exist it stops after the probes. A miss is flagged
@@ -268,10 +284,10 @@ fall back to hosted or fleet runners.
 ci1 is a dedicated machine of ours that runs GitHub self-hosted runners for this repository, with
 warm caches kept on the machine. GitHub has no overflow between runner labels, so `Workspace CI`
 starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
-through the API and picks one pool for the whole run:
+through the API and picks the primary test partition's pool:
 
-- `ci1` when at least `CI1_MIN_IDLE` (default 1) general runners are online and idle. Work starts
-  on available capacity; the remaining jobs can wait briefly for a runner;
+- `ci1` when at least `CI1_MIN_IDLE` (default 4) general runners are online and idle. This leaves
+  CPU capacity for the priority and merge reservations;
 - `ci1-priority` for trusted PRs labelled `ci-priority`, without an idle-count or token dependency.
   Pending urgent checks get the next free general runners; one slot stays reserved for priority
   and merge work after urgent checks finish;
@@ -283,10 +299,12 @@ through the API and picks one pool for the whole run:
   unavailable, and always for a pull request from a fork. The repository is public and a self-hosted
   runner runs whatever a job asks, so fork code never reaches ci1 (and forks receive no secrets).
 
-Build and test jobs read `pick-runner`'s output and fall back to their Namespace label when
-the output is empty. The aggregate stays on GitHub-hosted capacity regardless of that choice.
-The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
-names its stages and the redelivery canary instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
+Only `linux-tests` reads `pick-runner`'s output and falls back to Namespace when it is empty.
+The second shard, Clippy, compatibility, generated-file checks, TypeScript, isolation and cost
+jobs always use existing Namespace capacity, keeping their builds off ci1's test cores. The
+aggregate stays on GitHub-hosted capacity regardless of that choice. The required check names
+are unchanged; `linux-gate` names both test shards, its supporting stages and the redelivery
+canary instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
 Priority selection follows the fork boundary, so a fork label cannot reach a self-hosted runner.
 The private host controller keeps the priority slot out of the ordinary pool and removes its merge
 label while urgent required checks are pending. It also lends the other general runners to
@@ -297,7 +315,7 @@ Two runs that pick at the same moment can both choose ci1; the later run's jobs 
 runners on ci1.
 
 The switch is the repository variable `CI1_RUNNERS`: unset (the default), `pick-runner` is skipped
-and build/test jobs go to Namespace. `on` turns the choice on, and unsetting it turns
+and all workload jobs go to Namespace. `on` turns the choice on, and unsetting it turns
 it off again without a pull request. `pick-runner` reads the runners with the
 `CI1_RUNNERS_READ_TOKEN` secret, a token that may only read the organization's self-hosted runners;
 without it non-queue runs go to Namespace. Merge-group runs need no organization status token; a failed PR-label lookup retains merge capacity.
@@ -308,8 +326,9 @@ with its own `/tmp`, and nothing the job started outlives it. The runner names a
 cache, use that Cargo home, and Cargo keeps its intermediate build files in a per-runner build
 directory, while sccache shares compiled crates between all runners and the Nix store is the
 machine's own. The machine's configuration lives in the private network repository.
-Initial Cargo build and nextest concurrency on ci1 is four threads per runner, with a 14 GiB
-per-job memory limit; tune those limits from measured runs on the machine.
+Cargo builds use the host's four-job limit. Workspace test shards explicitly use eight test
+threads, with the host's 14 GiB per-job memory limit. The repository variable `CI1_MIN_IDLE`
+can override admission; keep it at four when preserving CPU capacity for reserved lanes.
 
 `CI_RUN_ID` keeps the messaging-fault evidence under `target/messaging-faults/`, which is
 uploaded with the stage logs.
