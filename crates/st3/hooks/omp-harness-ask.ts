@@ -99,7 +99,8 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
     const questions = parseQuestions(event.args);
     if (!questions) return;
     ask = { tool_call_id: event.toolCallId, questions };
-    unsafe = typeof ctx.ui.askDialog === "function" && ctx.hasUI ? undefined : "native-rich-ask-dialog-unavailable";
+    const terminal = process.stdin.isTTY === true && process.stdout.isTTY === true && !process.argv.some((argument, index) => argument.startsWith("--mode=rpc") || (argument === "--mode" && process.argv[index + 1]?.startsWith("rpc")));
+    unsafe = terminal && typeof ctx.ui.askDialog === "function" && ctx.hasUI ? undefined : "native-rich-ask-terminal-unavailable";
     if (questions.some(q => new Set(q.options.map(option => option.label)).size !== q.options.length)) unsafe = "ambiguous-native-ask-options";
     try { install(ctx); } catch { unsafe = "native-terminal-input-guard-unavailable"; }
     observe();
