@@ -127,6 +127,7 @@ async fn collection_items(
     let actor = request.actor.clone();
     let status = request.status.clone();
     let collection = request.collection.clone();
+    let custom_forms = session.custom_forms;
     let (snapshot, mut items, has_more) = super::blocking_store(move || {
         let store = state.store.clone();
         store.read_snapshot(|index| {
@@ -156,6 +157,7 @@ async fn collection_items(
                 )?,
                 _ => unreachable!(),
             };
+            client_attention_compatibility(&mut items, custom_forms);
             if let Some(status) = status {
                 items.retain(|item| item["state"].as_str() == Some(status.as_str()));
             }
@@ -1074,6 +1076,7 @@ const ACTIONS: &[&str] = &[
     "mission.cancel",
     "session.import",
     "work.ask",
+    "custom.reply",
     "work.done",
     "work.cancel-ask",
     "work.claim",
@@ -1109,6 +1112,7 @@ const ACTIONS: &[&str] = &[
     "pairing.revoke",
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
+    "custom.reply",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -1167,6 +1171,7 @@ pub(super) struct ClientSession {
     /// The concrete graph person whose explicitly delegated authority is exercised.
     pub(super) authority_actor: String,
     pub(super) transport: &'static str,
+    pub(super) custom_forms: bool,
     scopes: std::collections::BTreeSet<String>,
 }
 
@@ -1177,11 +1182,13 @@ impl ClientSession {
             actor: actor.into(),
             authority_actor: authority_actor.into(),
             transport,
+            custom_forms: true,
             scopes: std::collections::BTreeSet::new(),
         }
     }
 
     fn local(person: Option<&str>) -> Result<Self, ApiError> {
+        let custom_forms = false;
         if person.is_some_and(|person| {
             !(person.starts_with("person/") && person.matches('/').count() == 1
                 || person.starts_with("agent/"))
@@ -1195,6 +1202,7 @@ impl ClientSession {
                 actor: "client/local/read-only".into(),
                 authority_actor: "client/local/read-only".into(),
                 transport: "unix",
+                custom_forms,
                 scopes: ["read.projections", "terminal.read"]
                     .into_iter()
                     .map(str::to_owned)
@@ -1207,6 +1215,7 @@ impl ClientSession {
             actor: person.into(),
             authority_actor: person.into(),
             transport: "unix",
+            custom_forms,
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
         })
     }
@@ -1216,6 +1225,7 @@ impl ClientSession {
             actor: "client/pairing/completion".into(),
             authority_actor: "client/pairing/completion".into(),
             transport: "fabric-loopback",
+            custom_forms: false,
             scopes: std::collections::BTreeSet::new(),
         }
     }
@@ -1254,6 +1264,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
@@ -1288,7 +1299,7 @@ pub(super) fn fabric_boundary_forbidden() -> ApiError {
     forbidden("the client gateway exposes only the authenticated client-v0 boundary")
 }
 
-fn validation(message: impl Into<String>) -> ApiError {
+pub(super) fn validation(message: impl Into<String>) -> ApiError {
     ApiError {
         status: StatusCode::UNPROCESSABLE_ENTITY,
         code: "validation-failed".into(),
@@ -1315,13 +1326,22 @@ pub(super) fn authenticate(
     request: &Request<Body>,
     transport: &'static str,
 ) -> Result<ClientSession, ApiError> {
+    let custom_forms = request
+        .headers()
+        .get("x-st3-features")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|feature| feature.trim() == "custom-subjects.v1")
+        });
     let Some(value) = request.headers().get(AUTHORIZATION) else {
         if transport == "unix" {
             let person = request
                 .headers()
                 .get(LOCAL_PERSON_HEADER)
                 .and_then(|value| value.to_str().ok());
-            return ClientSession::local(person);
+            let mut session = ClientSession::local(person)?;
+            session.custom_forms = custom_forms;
+            return Ok(session);
         }
         let pairing_completion = request.method() == axum::http::Method::POST
             && request.uri().path().starts_with("/v1/client/pairings/")
@@ -1398,6 +1418,7 @@ pub(super) fn authenticate(
         actor: actor.into(),
         authority_actor: authority_actor.into(),
         transport,
+        custom_forms,
         scopes,
     };
     if request.method() == axum::http::Method::GET {
@@ -3153,6 +3174,7 @@ pub(super) async fn now(
         move |state, snapshot| {
             let mut items =
                 super::client_attention_resources_with_previews(state, person.as_deref(), history)?;
+            client_attention_compatibility(&mut items, session.custom_forms);
             // The default Now view is the person's attention queue. Mission work belongs
             // in Control; only an explicit work filter opts it into this combined view.
             if actor.is_some() || owner_run.is_some() {
@@ -5173,6 +5195,20 @@ fn client_session_id(owner: &str, incarnation: &str) -> String {
 }
 
 fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec<String>, Value) {
+    if record.subject.starts_with("custom/")
+        && state
+            .store
+            .custom_subject(&record.subject)
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        return (
+            "attention.changed".into(),
+            vec![record.subject.clone()],
+            json!({"reason":"registered-custom-source-changed"}),
+        );
+    }
     let fields = record.body.get("fields").unwrap_or(&record.body);
     if record.kind == "harness.timeline" {
         let resource_ids = fields
@@ -6948,7 +6984,7 @@ fn action_scope(action: &str) -> Option<&'static str> {
     ) {
         return Some("control.runtimes");
     }
-    if action == "work.done" {
+    if matches!(action, "work.done" | "custom.reply") {
         return Some("control.attention");
     }
     Some(match action.split_once('.')?.0 {
@@ -7643,6 +7679,27 @@ async fn dispatch_action(
             "attention-migrated",
             "attention is a view; complete or remedy its source",
         ))),
+        "custom.reply" => {
+            let result = state
+                .store
+                .reply_custom_subject(&crate::store::custom::ReplyRequest {
+                    subject: parameter_string(p, "target_id")?,
+                    registration: parameter_string(p, "registration")?,
+                    revision: parameter_string(p, "revision")?,
+                    episode: parameter_string(p, "episode")?,
+                    fields: serde_json::from_value(
+                        p.get("fields")
+                            .cloned()
+                            .ok_or_else(|| validation("reply requires fields"))?,
+                    )
+                    .map_err(|_| validation("reply fields must be an object"))?,
+                    actor: authority_actor.clone(),
+                    idempotency_key: request.idempotency_key.clone(),
+                })
+                .map_err(ApiError::bad)?;
+            signal_changed(state);
+            Ok(vec![result.subject])
+        }
         "work.ask" => {
             if let Some(step) = p.get("step_id").and_then(Value::as_str) {
                 validate_work_fence(state, step, &request.fence)?;
@@ -14526,6 +14583,7 @@ mission "example/zero-run" state="ready" {
             actor: "person/alex/session/device-one".into(),
             authority_actor: "person/alex".into(),
             transport: "paired",
+            custom_forms: false,
             scopes: ["terminal.read".into()].into_iter().collect(),
         };
         let mut remote_request = request.clone();

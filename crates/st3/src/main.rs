@@ -2358,6 +2358,29 @@ struct DevicesArgs {
 
 #[derive(Subcommand)]
 enum SubjectCommand {
+    /// Reply to a custom source under its current revision and waiting episode.
+    Reply {
+        subject: String,
+        #[arg(long)]
+        registration: String,
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        episode: String,
+        #[arg(long)]
+        fields_file: PathBuf,
+        #[arg(long="as",value_parser=parse_actor_subject)]
+        actor: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Read the revision of complete raw custom inputs for a derived-state basis.
+    Basis {
+        subject: String,
+        #[arg(long = "kind", required = true)]
+        kinds: Vec<String>,
+    },
+
     /// Show one typed subject card.
     Show(SubjectShowArgs),
     /// Show bounded immutable history for one subject.
@@ -3381,6 +3404,17 @@ struct HarnessDiagnosticArgs {
 
 #[derive(Subcommand)]
 enum SchemaCommand {
+    /// Register an immutable typed custom schema and bounded projection.
+    Register {
+        file: PathBuf,
+        #[arg(long = "as",value_parser=parse_actor_subject)]
+        actor: String,
+    },
+    /// List registered custom kinds and their pinned revisions.
+    Registrations,
+    /// Read an exact custom registration, KIND@HASH.
+    Registration { kind: String },
+
     /// List registered subject families.
     Subjects,
     /// List registered resource kinds.
@@ -8923,7 +8957,54 @@ async fn follow_conversation(
 
 async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool) -> Result<()> {
     match command {
+        SubjectCommand::Reply {
+            subject,
+            registration,
+            revision,
+            episode,
+            fields_file,
+            actor,
+            idempotency_key,
+        } => {
+            reject_foreign_agent_actor(&actor)?;
+            let fields = serde_json::from_slice(&std::fs::read(fields_file)?)?;
+            let result: Value = client
+                .post(
+                    "/v1/custom/reply",
+                    &st3::store::custom::ReplyRequest {
+                        subject,
+                        registration,
+                        revision,
+                        episode,
+                        fields,
+                        actor,
+                        idempotency_key,
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+        SubjectCommand::Basis { subject, kinds } => {
+            let result: Value = client
+                .get(&format!(
+                    "/v1/custom/basis?subject={}&kinds={}",
+                    urlencoding::encode(&subject),
+                    urlencoding::encode(&kinds.join(","))
+                ))
+                .await?;
+            print_value(&result, json_output)
+        }
         SubjectCommand::Show(args) => {
+            if args.subject.starts_with("custom/") && !args.kdl
+                && let Ok(result) = client
+                    .get::<Value>(&format!(
+                        "/v1/client/custom-subjects/{}",
+                        urlencoding::encode(&args.subject)
+                    ))
+                    .await
+            {
+                return print_value(&result, json_output);
+            }
             if args.kdl {
                 anyhow::ensure!(
                     args.subject.starts_with("agent/"),
@@ -13382,8 +13463,47 @@ async fn run_harness_diagnostic(
 }
 
 async fn run_schema(client: &Client, command: SchemaCommand, json_output: bool) -> Result<()> {
+    match &command {
+        SchemaCommand::Register { file, actor } => {
+            reject_foreign_agent_actor(actor)?;
+            let manifest = serde_json::from_slice(&std::fs::read(file)?)?;
+            let value: Value = client
+                .post(
+                    "/v1/schema/registrations",
+                    &st3::store::custom::RegistrationRequest {
+                        manifest,
+                        actor: actor.clone(),
+                    },
+                )
+                .await?;
+            return print_value(&value, json_output);
+        }
+        SchemaCommand::Registrations => {
+            let value: Value = client.get("/v1/schema/registrations").await?;
+            return print_value(&value, json_output);
+        }
+        SchemaCommand::Registration { kind } => {
+            let (name, hash) = kind
+                .rsplit_once('@')
+                .context("registration needs KIND@HASH")?;
+            let value: Value = client.get("/v1/schema/registrations").await?;
+            let item = value["items"]
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|v| v["manifest"]["kind"] == name && v["registration"] == hash)
+                })
+                .context("registration is unavailable")?;
+            return print_value(item, json_output);
+        }
+        _ => {}
+    }
     let value: Value = client.get("/v1/schema").await?;
     let selected = match command {
+        SchemaCommand::Register { .. }
+        | SchemaCommand::Registrations
+        | SchemaCommand::Registration { .. } => unreachable!("handled above"),
         SchemaCommand::Export => value,
         SchemaCommand::Subjects => value
             .get("subjects")

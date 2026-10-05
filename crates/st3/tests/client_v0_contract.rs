@@ -39,13 +39,19 @@ fn contract_validator(definition: &str) -> jsonschema::Validator {
     fn strict_known_cases(value: &mut Value) {
         match value {
             Value::Object(object) => {
-                let known = object.get("anyOf").and_then(Value::as_array).and_then(|cases| {
-                    if cases.len() == 2 && cases[1]["type"] == "string" {
-                        cases[0].get("enum").cloned()
-                    } else {
-                        None
-                    }
-                });
+                let known = object
+                    .get("anyOf")
+                    .and_then(Value::as_array)
+                    .and_then(|cases| {
+                        if cases.len() == 2
+                            && cases[1]["type"] == "string"
+                            && cases[1].get("pattern").is_none()
+                        {
+                            cases[0].get("enum").cloned()
+                        } else {
+                            None
+                        }
+                    });
                 if let Some(known) = known {
                     object.remove("anyOf");
                     object.insert("enum".into(), known);
@@ -3904,4 +3910,110 @@ async fn status_history_is_typed_and_readable_through_the_paired_gateway() {
     assert!(typed.items.last().unwrap().state.is_none());
     let (status, _) = client_json(fabric, "/v1/client/status-history/cedar").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn custom_subject_contract_pagination_and_paired_person_reply() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let mut manifest: st3_schema::custom::Manifest = serde_json::from_str(include_str!(
+        "../../../examples/st3/custom-review.json"
+    )).unwrap();
+    manifest.attention.as_mut().unwrap().episode = st3_schema::custom::Expr::Constant {
+        value: serde_json::json!("garden question; keep"),
+    };
+    state.store.register_custom_kind(&st3::store::custom::RegistrationRequest {
+        manifest, actor: "agent/garden/seed".into(),
+    }).unwrap();
+    for name in ["one", "two"] {
+        state.store.append_claim(&st3::model::ClaimInput{subject:format!("custom/garden/review/v1/{name}"),kind:"custom.garden.review.v1.requested".into(),actor:Some("agent/garden/seed".into()),fields:serde_json::from_value(serde_json::json!({"title":"Retain the seed history?","detail":"Choose Keep or Discard.","recipient":"person/lichen"})).unwrap(),evidence:vec![],expected_subject:None,idempotency_key:None}).unwrap();
+    }
+    let local = st3::api::router(state.clone());
+    let fabric = st3::api::fabric_router(state.clone());
+    let (status, page) = client_json(
+        local.clone(),
+        "/v1/client/custom-subjects?kind=garden.review&version=1&limit=1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_conforms(&consumer_validator("Envelope"), "custom source page", &page);
+    let cursor = page["value"]["page"]["next_cursor"].as_str().unwrap();
+    let (status, next) = client_json(
+        local.clone(),
+        &format!("/v1/client/custom-subjects?kind=garden.review&version=1&limit=1&cursor={cursor}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_ne!(
+        page["value"]["items"][0]["id"],
+        next["value"]["items"][0]["id"]
+    );
+    let (status,challenge)=client_post_json_person(local.clone(),"/v1/client/pairings","person/lichen",serde_json::json!({"api_version":"st3.client.v0","device_name":"Lichen's garden phone","person_id":"person/lichen"})).await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let pairing = challenge["value"]["pairing_id"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("pairing/");
+    let (status,paired)=client_post_json(fabric.clone(),&format!("/v1/client/pairings/{pairing}/complete"),serde_json::json!({"api_version":"st3.client.v0","code":challenge["value"]["code"],"device_public_key":"garden-test-phone-key-00000000000000000000"})).await;
+    assert_eq!(status, StatusCode::OK, "{paired}");
+    let token = paired["value"]["credential"].as_str().unwrap();
+    let (status, _) = client_post_json_auth(
+        fabric.clone(),
+        "/v1/schema/registrations",
+        token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, legacy) = client_json_auth(fabric.clone(), "/v1/client/attention", token).await;
+    assert_eq!(status, StatusCode::OK, "{legacy}");
+    for card in legacy["value"]["items"].as_array().unwrap() {
+        assert_eq!(card["attention_kind"], "agent-request");
+        assert_eq!(card["actions"], serde_json::json!([]));
+        assert!(card["detail"].as_str().unwrap().contains("st subject reply"));
+        assert!(card["detail"].as_str().unwrap().contains("--episode 'garden question; keep'"));
+    }
+    // Model the pre-extension closed enums: the entire page remains readable.
+    let mut old_schema = json(asset_root().join("schemas/client-v0.schema.json"));
+    let properties = &mut old_schema["$defs"]["Attention"]["allOf"][1]["properties"];
+    properties["attention_kind"] = serde_json::json!({"enum":["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault"]});
+    properties["actions"] = serde_json::json!({"type":"array","items":{"enum":["work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"]}});
+    old_schema["$ref"] = serde_json::json!("#/$defs/Envelope");
+    let old_validator = jsonschema::options().build(&old_schema).unwrap();
+    assert_conforms(&old_validator, "older custom attention fallback", &legacy);
+    let response = fabric.clone().oneshot(Request::builder()
+        .uri("/v1/client/attention")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-st3-features", "custom-subjects.v1")
+        .body(Body::empty()).unwrap()).await.unwrap();
+    let status = response.status();
+    let cards: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(status, StatusCode::OK, "{cards}");
+    assert_conforms(&consumer_validator("Envelope"), "custom attention", &cards);
+    let card = &cards["value"]["items"][0];
+    assert_eq!(card["actions"], serde_json::json!(["custom.reply"]));
+    let mut parameters = card["action_parameters"]["custom.reply"].clone();
+    parameters["fields"] = serde_json::json!({"selection":"keep"});
+    let action = serde_json::json!({"api_version":"st3.client.v0","id":"action/garden-phone","type":"custom.reply","idempotency_key":"garden-phone-answer-001","fence":{"snapshot_id":cards["snapshot"]["id"],"subject_revisions":{(card["id"].as_str().unwrap()):card["revision"]}},"parameters":parameters});
+    assert_conforms(
+        &consumer_validator("ActionRequest"),
+        "custom reply action",
+        &action,
+    );
+    let (status, result) = client_post_json_auth(fabric, "/v1/client/actions", token, action).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let history = state
+        .store
+        .claims_for(card["source_id"].as_str().unwrap(), None)
+        .unwrap();
+    assert_eq!(
+        history.last().unwrap().actor.as_deref(),
+        Some("person/lichen")
+    );
+    let (status, expired) = client_json(
+        local,
+        &format!("/v1/client/custom-subjects?kind=garden.review&version=1&limit=1&cursor={cursor}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE, "{expired}");
 }

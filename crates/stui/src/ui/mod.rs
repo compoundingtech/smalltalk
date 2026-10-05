@@ -3420,6 +3420,11 @@ impl Ui {
                 let Some(kind) = self.current_kind() else {
                     return;
                 };
+                if self.current_item().is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
+                    && matches!(key, 'y' | 'n' | 'r' | 'x') {
+                    self.flash("Reply with c using this source's declared fields");
+                    return;
+                }
                 match (kind, key) {
                     // x dismisses whatever can be dismissed, one key for every kind (Nathan,
                     // 2026-10-03): a request is closed with word to its asker that there is
@@ -4017,7 +4022,15 @@ impl Ui {
                     }),
                     Some(AttentionKind::Request { .. }) => Some(Effect::Attention {
                         id: id.clone(),
-                        action: "work.done".into(),
+                        action: if self
+                            .current_item()
+                            .is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
+                        {
+                            "custom.reply"
+                        } else {
+                            "work.done"
+                        }
+                        .into(),
                         reason: Some(draft),
                         answer: self.changes_answer.take(),
                     }),
@@ -4227,6 +4240,12 @@ impl Ui {
         let Some(id) = self.attention_focus() else {
             return;
         };
+        if self
+            .current_item()
+            .is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
+        {
+            return;
+        }
         if matches!(action, 'y' | 'n' | 'r') && self.current_kind() == Some("request") {
             // r closes a request that needs nothing from the person; the step continues.
             let answer = match action {
@@ -5257,6 +5276,53 @@ fn dump(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_custom_request_sends_the_generic_reply_and_has_no_yes_no_shortcut() {
+        let mut world = demo::world();
+        world.attention = Load::Ready(vec![Attention {
+            id: "attention/garden".into(),
+            tier: Tier::Today,
+            title: "Retain the seed history?".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: None,
+            kind: AttentionKind::Request {
+                from: "Seed".into(),
+                from_id: "agent/garden/seed".into(),
+                question: "selection (keep / discard)".into(),
+                structured: None,
+            },
+            actions: vec!["custom.reply".into()],
+            related: vec![],
+            raised_by: None,
+        }]);
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        ui.selected[0] = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/garden")
+            .unwrap();
+        let rendered = frame(&ui, 120, 50).join("\n");
+        assert!(rendered.contains("Reply with fields"));
+        assert!(!rendered.contains("Dismiss: nothing to do"));
+        ui.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(ui.effects.is_empty());
+        assert!(ui.confirm.is_none());
+        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(ui.editing);
+        for letter in "keep".chars() {
+            ui.key(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE));
+        }
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(ui.effects.last(),Some(Effect::Attention{action,reason:Some(reason),..}) if action=="custom.reply" && reason=="keep")
+        );
+    }
 
     #[test]
     fn drafts_take_the_terminal_editing_keys() {

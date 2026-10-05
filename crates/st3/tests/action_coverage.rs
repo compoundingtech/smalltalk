@@ -447,6 +447,7 @@ async fn dispatch(
         "agent.create" => agent_create, "agent.queue-move" => agent_queue_move,
         "agent.resume" => agent_resume, "agent.start" => agent_start,
         "agent.stop" => agent_stop, "agent.suspend" => agent_suspend,
+        "custom.reply" => custom_reply,
         "attention.resolve" => attention_resolve,
         "lane.approve" => lane_approve, "lane.join" => lane_join, "lane.leave" => lane_leave,
         "lane.mark" => lane_mark, "lane.move" => lane_move,
@@ -4035,5 +4036,177 @@ async fn cli_agent_and_shell_declarations_survive_restart() {
             .unwrap()
             .kind,
         "stop"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_reply_survives_fences_cli_and_daemon_restarts() {
+    let mut daemon = Daemon::new().await;
+    let manifest = daemon.root.path().join("garden-review.json");
+    std::fs::write(
+        &manifest,
+        include_str!("../../../examples/st3/custom-review.json"),
+    )
+    .unwrap();
+    let registered = cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &[
+                    "schema",
+                    "register",
+                    manifest.to_str().unwrap(),
+                    "--as",
+                    "agent/garden/seed",
+                ],
+            )
+            .await,
+    );
+    assert_eq!(registered["state"], "ready");
+    let registrations=cli_value(daemon.cli(PERSON,&["schema","registrations"]).await);
+    assert_eq!(registrations["items"].as_array().unwrap().len(),1);
+    let exact=format!("garden.review@{}",registered["registration"].as_str().unwrap());
+    let registration=cli_value(daemon.cli(PERSON,&["schema","registration",&exact]).await);
+    assert_eq!(registration["registration"],registered["registration"]);
+    let subject = "custom/garden/review/v1/transport-example";
+    cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &[
+                    "claim",
+                    subject,
+                    "custom.garden.review.v1.requested",
+                    "--actor",
+                    "agent/garden/seed",
+                    "--field",
+                    "title=Retain the seed history?",
+                    "--field",
+                    "detail=Choose Keep or Discard.",
+                    "--field",
+                    "recipient=person/lichen",
+                ],
+            )
+            .await,
+    );
+    let source = daemon
+        .client("person/lichen")
+        .custom_subjects_get(subject)
+        .await
+        .unwrap();
+    assert_eq!(source.value.header().id, subject);
+    let basis=cli_value(daemon.cli(PERSON,&["subject","basis",subject,"--kind","custom.garden.review.v1.requested"]).await);
+    assert_eq!(basis["revision"],daemon.store().custom_basis_revision(subject,&["custom.garden.review.v1.requested".into()]).unwrap());
+    let page = daemon
+        .client("person/lichen")
+        .custom_subjects_list(Some("garden.review"), Some(1), None, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(page.value.items.len(), 1);
+    let cards = daemon
+        .client("person/lichen")
+        .attention_list(None, Some(10), false)
+        .await
+        .unwrap();
+    assert_eq!(cards.value.items.len(), 1);
+    let st3_client::Resource::Attention(card) = &cards.value.items[0] else {
+        panic!("expected custom card")
+    };
+    assert_eq!(card.actions, ["custom.reply"]);
+    assert!(card.custom_form.is_some());
+    assert_eq!(card.source_kind, "custom");
+    let mut fence = Fence {
+        snapshot_id: cards.snapshot.id.clone(),
+        ..Default::default()
+    };
+    fence
+        .subject_revisions
+        .insert(card.header.id.clone(), card.header.revision.clone());
+    let mut parameters = card.action_parameters["custom.reply"].clone();
+    parameters["fields"] = json!({"selection":"keep"});
+    let denied = dispatch(
+        &daemon.client("agent/garden/seed"),
+        "custom.reply",
+        "custom-not-a-human-001",
+        Fence {
+            snapshot_id: cards.snapshot.id.clone(),
+            ..Default::default()
+        },
+        parameters.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(denied, ClientError::Api(ErrorCode::Forbidden, ..)));
+    daemon
+        .exercise("person/lichen", "custom.reply", parameters, fence)
+        .await;
+    assert!(
+        daemon
+            .client("person/lichen")
+            .attention_list(None, Some(10), false)
+            .await
+            .unwrap()
+            .value
+            .items
+            .is_empty()
+    );
+    let read = cli_value(
+        daemon
+            .cli("person/lichen", &["subject", "show", subject])
+            .await,
+    );
+    assert_eq!(read["fields"]["selection"], "keep");
+    let second = "custom/garden/review/v1/cli-example";
+    cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &[
+                    "claim",
+                    second,
+                    "custom.garden.review.v1.requested",
+                    "--actor",
+                    "agent/garden/seed",
+                    "--field",
+                    "title=Retain the seed history?",
+                    "--field",
+                    "detail=Choose Keep or Discard.",
+                    "--field",
+                    "recipient=person/lichen",
+                ],
+            )
+            .await,
+    );
+    let view = daemon.store().custom_subject(second).unwrap().unwrap();
+    let fields = daemon.root.path().join("reply.json");
+    std::fs::write(&fields, r#"{"selection":"discard"}"#).unwrap();
+    cli_value(
+        daemon
+            .cli(
+                "person/lichen",
+                &[
+                    "subject",
+                    "reply",
+                    second,
+                    "--registration",
+                    view["registration"].as_str().unwrap(),
+                    "--revision",
+                    view["revision"].as_str().unwrap(),
+                    "--episode",
+                    view["attention"]["episode"].as_str().unwrap(),
+                    "--fields-file",
+                    fields.to_str().unwrap(),
+                    "--idempotency-key",
+                    "custom-cli-answer-001",
+                    "--as",
+                    "person/lichen",
+                ],
+            )
+            .await,
+    );
+    daemon.restart().await;
+    assert_eq!(
+        daemon.store().custom_subject(second).unwrap().unwrap()["fields"]["selection"],
+        "discard"
     );
 }

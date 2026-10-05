@@ -324,6 +324,20 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         structured: item.request.clone().map(Box::new),
                     },
                 ),
+                custom if custom.starts_with("custom.") => (
+                    Tier::Today,
+                    AttentionKind::Request {
+                        from: requester_name(model, item.requester_id.as_deref()),
+                        from_id: item.requester_id.clone().unwrap_or_default(),
+                        question: format!(
+                            "{}\n\n{}\nSource: {}",
+                            item.detail,
+                            crate::custom_form_hint(item.custom_form.as_ref()),
+                            item.source_id
+                        ),
+                        structured: None,
+                    },
+                ),
                 // Home holds only requests and reviews. Messages stay in conversations, and st
                 // sends each fault to the agent that owns it.
                 _ => return None,

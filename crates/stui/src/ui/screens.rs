@@ -1005,6 +1005,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             ..
         } => structured_request(&mut card, from, request, drafts, inner),
         AttentionKind::Request { from, question, .. } => {
+            let custom = item.actions.iter().any(|action| action == "custom.reply");
             card.line(Line::from(vec![
                 span("asks  ", theme::dim()),
                 span(from.clone(), theme::strong(theme::PERSON)),
@@ -1023,6 +1024,8 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                     ("enter", "Send the answer", Hit::Enter, theme::ACCENT),
                     ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
                 ]);
+            } else if custom {
+                card.buttons(&[("c", "Reply with fields", Hit::Key('c'), theme::ACCENT)]);
             } else {
                 let label = match drafts.confirm {
                     Some('y') => format!("Answer {from} “Yes”"),
@@ -1058,9 +1061,11 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             }
             card.wrap(
                 &text::inline(
-                    &format!(
-                        "{from} is waiting on you: answer it, or x to dismiss it when there is nothing for you to do. Either way the step it waits on continues."
-                    ),
+                    &if custom {
+                        "Reply using the choices and fields shown above.".to_owned()
+                    } else {
+                        format!("{from} is waiting on you: answer it, or x to dismiss it when there is nothing for you to do. Either way the step it waits on continues.")
+                    },
                     theme::dim(),
                 ),
                 inner,
