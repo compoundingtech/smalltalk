@@ -64,7 +64,7 @@ case "$stage" in
       export AGENT_SPEC_REVISION="$(git rev-parse HEAD)"
     fi
     # Main's last reports, newest first; the test compares with the worst of them.
-    ST_LOAD_GATE=1 ST_LOAD_REPORT="$out/load.json" ST_LOAD_BASELINE="$RUNNER_TEMP/perf-baseline" \
+    ST3_PROFILE_DIR="$out/profile" ST3_PROFILE_SLOW_MS=50 ST_LOAD_GATE=1 ST_LOAD_REPORT="$out/load.json" ST_LOAD_BASELINE="$RUNNER_TEMP/perf-baseline" \
       cargo test --release -p st3 --features perf-load --test perf_load --locked daemon_load:: -- --nocapture \
       2>&1 | tee "$out/load.log" || status=$?
     if [ -s "$out/load.json" ]; then
