@@ -14,7 +14,9 @@
 //! statement. A foreign-key check or a trigger counts inside the statement that ran it.
 //!
 //! Each request runs once to warm caches, then three times; the least of the three counts, so a
-//! stray background statement cannot fail it. Its work at the larger scale may be at most
+//! stray background statement cannot fail it. Agent-list reads also run after a canonical
+//! harness observation between every sample, so their incremental rebuild is counted. Work at
+//! the larger scale may be at most
 //! [`GROWTH`] times its work at the smaller, after dividing by how much larger its answer grew: a
 //! list that answers ten times more rows may read ten times more, and a request that answers the
 //! same must read about the same. Small differences under [`SLACK`] steps pass.
@@ -881,6 +883,9 @@ fn owned_set_request(name: &str) -> Value {
 /// The running runtime of the first seat, whose driver publishes the harness events.
 const SEAT_RUNTIME: &str = "cost-seat-0-runtime";
 
+/// The same agent list, after one seat changes at each scale.
+const COLD_AGENTS: &str = "GET /v1/client/agents (after harness observation)";
+
 /// The replication summary a peer asks for each exchange; a route of its own above would answer
 /// the same request.
 const SUMMARY: &str = "POST /v1/internal/replication/export (summary)";
@@ -1006,7 +1011,12 @@ async fn no_request_does_work_that_grows_with_the_store() {
             continue;
         }
         // A list that answers more rows may read more; a request answering the same may not.
-        let answered = (after.answer.max(1) as f64 / before.answer.max(1) as f64).max(1.0);
+        // One seat changed at either scale: its rebuild must not grow with fleet size.
+        let answered = if name == COLD_AGENTS {
+            1.0
+        } else {
+            (after.answer.max(1) as f64 / before.answer.max(1) as f64).max(1.0)
+        };
         let grew = |field: fn(&Cost) -> u64| {
             let (before, after) = (field(before), field(after));
             let ratio = after as f64 / before.max(1) as f64 / answered;
@@ -1014,6 +1024,15 @@ async fn no_request_does_work_that_grows_with_the_store() {
         };
         let (steps, steps_grew) = grew(|cost| cost.vm_steps);
         let (scans, scans_grew) = grew(|cost| cost.fullscan_steps);
+        if name == COLD_AGENTS
+            && after.statements > before.statements + 20
+            && after.statements as f64 / before.statements.max(1) as f64 > GROWTH
+        {
+            failures.push(format!(
+                "{name}: statements grow with the fleet: {} -> {}",
+                before.statements, after.statements
+            ));
+        }
         let summary = format!(
             "{} -> {} VM steps, {} -> {} full-scan steps, answer {} -> {} bytes",
             before.vm_steps,
@@ -1389,6 +1408,40 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         };
         costs.insert(probe.route.to_owned(), cost);
     }
+    // A real seat update invalidates its card between every read. Count only the read, using
+    // the same canonical claim path as a driver; the warm probe above remains unchanged.
+    let mut samples = Vec::new();
+    for attempt in 0..4 {
+        let mut observation = claim_input(
+            "harness.observed",
+            &format!("cost-cold-agents-{attempt}"),
+            attempt,
+            "",
+        );
+        observation.subject = fixture.subjects.seats[0].clone();
+        observation.actor = Some(observation.subject.clone());
+        observation
+            .fields
+            .insert("incarnation_id".into(), json!(SEAT_RUNTIME));
+        observation.fields.insert(
+            "state".into(),
+            json!(if attempt % 2 == 0 { "idle" } else { "working" }),
+        );
+        observation.fields.insert("driver".into(), json!("codex"));
+        store.append_claim(&observation).unwrap();
+        let cost = counted(|| async {
+            person
+                .get::<Value>("/v1/client/agents")
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await;
+        if attempt > 0 {
+            samples.push(cost);
+        }
+    }
+    costs.insert(COLD_AGENTS.to_owned(), Cost::least(&samples));
+
     // The summary a peer asks for before each exchange, after the daemon wrote a few claims.
     let mut samples = Vec::new();
     for attempt in 0..4 {

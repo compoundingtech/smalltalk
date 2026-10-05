@@ -2333,20 +2333,43 @@ impl Store {
         append_latest_observation(&self.graph, input, now)
     }
 
-    /// Diagnostic claims on the daemon cannot change agent cards. Ignore them when deciding
-    /// whether an agent projection must be rebuilt, including diagnostics raised by a slow
-    /// agent-list request itself.
-    pub(crate) fn agent_projection_index(&self, snapshot_index: u64) -> Result<u64> {
+    /// Agent-local observations change only their subject's card. Other claims can change
+    /// membership, owners, queues or labels and conservatively require a full rebuild.
+    fn changed_agent_resources(
+        &self,
+        after: u64,
+        through: u64,
+    ) -> Result<Option<BTreeSet<String>>> {
         let connection = self.readers.get();
-        Ok(connection
-            .query_row(
-                "SELECT store_index FROM claims WHERE store_index<=?1
-                 AND kind!='daemon.diagnostic' ORDER BY store_index DESC LIMIT 1",
-                [snapshot_index],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or_default())
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind FROM claims WHERE store_index>?1 AND store_index<=?2",
+        )?;
+        let mut subjects = BTreeSet::new();
+        for row in statement.query_map(params![after, through], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (subject, kind) = row?;
+            if kind == "daemon.diagnostic" {
+                continue;
+            }
+            if subject.starts_with("agent/")
+                && matches!(
+                    kind.as_str(),
+                    "runtime.observed"
+                        | "harness.observed"
+                        | "harness.diagnostic"
+                        | "harness.timeline"
+                        | "harness.todo.observed"
+                        | "harness.session-file"
+                        | "harness.usage"
+                )
+            {
+                subjects.insert(subject);
+            } else {
+                return Ok(None);
+            }
+        }
+        Ok(Some(subjects))
     }
 
     /// The last claim that can change an agent's status: one about an agent, or about the run
@@ -2364,35 +2387,54 @@ impl Store {
             .unwrap_or_default())
     }
 
+    /// Keep bounded immutable snapshots. Advance the nearest older snapshot by rebuilding
+    /// only cards whose local observations changed; historical reads never advance backwards.
     pub(crate) fn cached_agent_resources(
         &self,
         index: u64,
         history: bool,
-        build: impl FnOnce() -> Result<Vec<Value>>,
+        build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
         let mut cache = self
             .smalltalk
             .agent_resources_cache
             .lock()
             .expect("agent resources cache poisoned");
-        if let Some((_, _, _, items)) = cache.iter().find(|(cached_index, _, cached_history, _)| {
-            *cached_index == index && *cached_history == history
-        }) {
-            return Ok((**items).clone());
-        }
-        let projection_index = self.agent_projection_index(index)?;
-        if let Some((cached_index, _, _, items)) =
-            cache
-                .iter_mut()
-                .find(|(_, cached_projection, cached_history, _)| {
-                    *cached_projection == projection_index && *cached_history == history
-                })
+        if let Some((_, _, items)) = cache
+            .iter()
+            .find(|(at, all, _)| *at == index && *all == history)
         {
-            *cached_index = index;
             return Ok((**items).clone());
         }
-        let items = build()?;
-        cache.push_back((index, projection_index, history, Arc::new(items.clone())));
+        let previous = cache
+            .iter()
+            .filter(|(at, all, _)| *at < index && *all == history)
+            .max_by_key(|(at, _, _)| *at);
+        let items = if let Some((at, _, previous)) = previous {
+            match self.changed_agent_resources(*at, index)? {
+                Some(changed) if changed.is_empty() => (**previous).clone(),
+                Some(changed) => {
+                    let fresh = build(Some((&changed, previous)))?;
+                    let mut items = previous
+                        .iter()
+                        .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    items.extend(fresh);
+                    items.sort_by(|a, b| {
+                        a["name"]
+                            .as_str()
+                            .cmp(&b["name"].as_str())
+                            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+                    });
+                    items
+                }
+                None => build(None)?,
+            }
+        } else {
+            build(None)?
+        };
+        cache.push_back((index, history, Arc::new(items.clone())));
         if cache.len() > 8 {
             cache.pop_front();
         }
@@ -9697,7 +9739,7 @@ impl Store {
         self.smalltalk.forget_views();
     }
 
-    fn status_for_subject_names_at(
+    pub(crate) fn status_for_subject_names_at(
         &self,
         subjects: BTreeSet<String>,
         store_index: u64,
@@ -13908,23 +13950,23 @@ impl Store {
         let connection = self.readers.get();
         let mut times = Vec::new();
         if let Some(incarnation) = incarnation {
-            let local: Option<i64> = connection.query_row(
+            let local: Option<i64> = connection.prepare_cached(
                 "SELECT observed_at_unix_ms FROM local_observations
                  WHERE subject=?1 AND kind='harness.timeline'
                    AND json_extract(body, '$.fields.incarnation_id')=?2
                    AND json_extract(body, '$.fields.entry_type') IN ('message','content','tool_call','tool_result')
-                   AND after_store_index<=?3 ORDER BY id DESC LIMIT 1",
+                   AND after_store_index<=?3 ORDER BY id DESC LIMIT 1")?.query_row(
                 params![agent, incarnation, snapshot_index], |row| row.get(0),
             ).optional()?;
             if let Some(time) = local {
                 times.push(time.max(0) as u128);
             }
-            let replicated: Option<String> = connection.query_row(
+            let replicated: Option<String> = connection.prepare_cached(
                 "SELECT accepted_at_unix_ms FROM claims
                  WHERE subject=?1 AND kind='harness.timeline'
                    AND json_extract(body, '$.fields.incarnation_id')=?2
                    AND json_extract(body, '$.fields.entry_type') IN ('message','content','tool_call','tool_result')
-                   AND store_index<=?3 ORDER BY store_index DESC LIMIT 1",
+                   AND store_index<=?3 ORDER BY store_index DESC LIMIT 1")?.query_row(
                 params![agent, incarnation, snapshot_index], |row| row.get(0),
             ).optional()?;
             times.extend(replicated.and_then(|time| time.parse::<u128>().ok()));
@@ -13935,7 +13977,8 @@ impl Store {
             "SELECT accepted_at_unix_ms FROM claims WHERE kind='message.sent' AND json_extract(body, '$.fields.to')=?1 AND store_index<=?2 ORDER BY store_index DESC LIMIT 1",
         ] {
             let time: Option<String> = connection
-                .query_row(query, params![agent, snapshot_index], |row| row.get(0))
+                .prepare_cached(query)?
+                .query_row(params![agent, snapshot_index], |row| row.get(0))
                 .optional()?;
             times.extend(time.and_then(|time| time.parse::<u128>().ok()));
         }
@@ -16244,22 +16287,21 @@ fn enforce_mission_run_capacity(
 
 fn current_desired_row(connection: &Connection, subject: &str) -> Result<Option<DesiredRow>> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT kind, revision, claim_id, body, member, owner_run, owner_generation
              FROM desired WHERE subject=?1",
-            [subject],
-            |row| {
-                Ok(DesiredRow {
-                    kind: row.get(0)?,
-                    revision: row.get(1)?,
-                    claim_id: row.get(2)?,
-                    body: row.get(3)?,
-                    member: row.get(4)?,
-                    owner_run: row.get(5)?,
-                    owner_generation: row.get(6)?,
-                })
-            },
-        )
+        )?
+        .query_row([subject], |row| {
+            Ok(DesiredRow {
+                kind: row.get(0)?,
+                revision: row.get(1)?,
+                claim_id: row.get(2)?,
+                body: row.get(3)?,
+                member: row.get(4)?,
+                owner_run: row.get(5)?,
+                owner_generation: row.get(6)?,
+            })
+        })
         .optional()
         .map_err(Into::into)
 }
@@ -17626,8 +17668,8 @@ fn renew_nested_ancestor_leases_tx(
 
 fn claim_by_id_tx(connection: &Connection, id: &str) -> Result<Option<ClaimRecord>> {
     connection
+        .prepare_cached("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms FROM claims WHERE id=?1")?
         .query_row(
-            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms FROM claims WHERE id=?1",
             [id],
             claim_from_row,
         )
