@@ -1,0 +1,15 @@
+name: Program mailbox forwarder diagnostic
+on:
+  push:
+    branches: [diagnostic/program-mailbox-forward]
+permissions:
+  contents: read
+jobs:
+  forwarding:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Original program rejects sent mail
+        run: python3 diagnostic/program-mailbox-forward/check.py diagnostic/program-mailbox-forward/original.py --expect-regression
+      - name: Corrected program forwards once and survives retries
+        run: python3 diagnostic/program-mailbox-forward/check.py diagnostic/program-mailbox-forward/fixed.py
