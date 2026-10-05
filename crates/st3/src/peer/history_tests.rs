@@ -115,6 +115,18 @@ async fn paired_history_pages_read_the_actual_remote_pty_owner() {
         loop { let (status, page) = read(Some(cursor.clone()), incarnation.clone()).await; if page["code"] == "history-cursor-gap" { assert_eq!(status, StatusCode::CONFLICT, "{page}"); break; } tokio::task::yield_now().await; }
     }).await.unwrap();
     assert_eq!(read(None, "stale-incarnation".into()).await.1["code"], "stale-fence");
+    // Cursor eviction starts before the 100,000-row producer command finishes.
+    // A new spaced input command during that flood can lose its command socket
+    // to producer output backpressure before Enter. Wait for the real child
+    // completion marker without weakening the cursor-gap assertion above.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if runtime.screen("history-smoke").unwrap().lines().any(|line| line.trim() == "EVICTED") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
     runtime.send_line("history-smoke", "oversize").unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
