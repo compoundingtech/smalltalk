@@ -756,7 +756,13 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        for text in [&notes, &pane] {
+        let narrow_pane = detail(&world, None, 24, 40)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for text in [&notes, &pane, &narrow_pane] {
             assert!(text.contains("10 messages"));
             assert!(text.contains("$2.20–$3.30"));
             assert!(
