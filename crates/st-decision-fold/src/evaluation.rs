@@ -1,5 +1,15 @@
-use super::parsing::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use super::model::defect;
 use super::*;
+
+/// Maximum total records (including parse defects) accepted by a fold.
+pub const MAX_RECORDS: usize = 65_536;
+/// Maximum number of dependency edges from any request to a guard leaf.
+pub const MAX_GUARD_DEPTH: usize = 64;
+/// Maximum conjuncts on one request.
+pub const MAX_GUARD_TERMS: usize = 64;
 // ---------------------------------------------------------------------------------------------
 // The fold
 // ---------------------------------------------------------------------------------------------
@@ -108,7 +118,7 @@ impl Fold {
 pub(super) type AnswerSet<'a> = BTreeMap<&'a str, &'a Answer>;
 
 pub(super) struct Evaluator<'a> {
-    store: &'a Store,
+    requests: BTreeMap<&'a str, &'a Request>,
     answers: AnswerSet<'a>,
     resolutions: BTreeMap<String, Resolution>,
     defects: Vec<Defect>,
@@ -117,37 +127,30 @@ pub(super) struct Evaluator<'a> {
 }
 
 impl<'a> Evaluator<'a> {
-    fn new(store: &'a Store, answers: AnswerSet<'a>) -> Self {
-        let options = store
-            .requests
-            .iter()
-            .map(|request| {
-                (
-                    request.id.as_str(),
-                    parse_options(&request.body)
-                        .into_iter()
-                        .map(|option| option.key)
-                        .collect(),
-                )
-            })
-            .collect();
+    fn new(store: &'a Store, answers: AnswerSet<'a>, invalid: &BTreeSet<&str>) -> Self {
+        let requests: BTreeMap<_, _> = store.requests.iter()
+            .map(|request| (request.id.as_str(), request)).collect();
+        let options = requests.iter()
+            .filter(|(id, _)| !invalid.contains(**id))
+            .map(|(id, request)| (
+                *id,
+                parse_options(&request.body).into_iter().map(|option| option.key).collect(),
+            )).collect();
         Self {
-            store,
+            requests,
             answers,
-            resolutions: BTreeMap::new(),
+            resolutions: invalid.iter().map(|id| ((*id).to_string(), Resolution::Undecidable)).collect(),
             defects: Vec::new(),
             options,
         }
     }
 
     fn report(&mut self, about: &str, code: DefectCode, detail: impl Into<String>) {
-        let candidate = defect(Some(about), code, detail);
-        if !self.defects.contains(&candidate) {
-            self.defects.push(candidate);
-        }
+        // fold sorts and deduplicates once, avoiding quadratic reporting costs.
+        self.defects.push(defect(Some(about), code, detail));
     }
 
-    fn term_truth(&mut self, owner: &str, term: &Term, visiting: &mut Vec<String>) -> Truth {
+    fn term_truth(&mut self, owner: &str, term: &Term) -> Truth {
         if looks_like_handle(&term.decision) {
             self.report(
                 owner,
@@ -160,7 +163,7 @@ impl<'a> Evaluator<'a> {
             );
             return Truth::Invalid;
         }
-        let Some(referenced) = self.store.request(&term.decision) else {
+        let Some(&referenced) = self.requests.get(term.decision.as_str()) else {
             self.report(
                 owner,
                 DefectCode::DanglingReference,
@@ -184,7 +187,16 @@ impl<'a> Evaluator<'a> {
             );
             return Truth::Invalid;
         }
-        match self.resolve(&term.decision.clone(), visiting) {
+        if self.answers.get(term.decision.as_str())
+            .is_some_and(|answer| answer.provenance == AnswerProvenance::Imported)
+        {
+            self.report(owner, DefectCode::ImportedAnswer,
+                format!("guard term `{term}` depends on an imported historical answer"));
+            return Truth::Invalid;
+        }
+        match self.resolutions.get(term.decision.as_str()).copied()
+            .unwrap_or(Resolution::Undecidable)
+        {
             Resolution::Undecidable => {
                 self.report(
                     owner,
@@ -229,66 +241,97 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn resolve(&mut self, id: &str, visiting: &mut Vec<String>) -> Resolution {
-        if let Some(cached) = self.resolutions.get(id) {
-            return *cached;
-        }
-        if visiting.iter().any(|seen| seen == id) {
-            let mut cycle = visiting.clone();
-            cycle.push(id.to_string());
-            self.report(
-                id,
-                DefectCode::CyclicReference,
-                format!("guard cycle through `{}`", cycle.join(" -> ")),
-            );
-            return Resolution::Undecidable;
-        }
-        let Some(request) = self.store.request(id) else {
-            return Resolution::Undecidable;
-        };
-        let terms = request.applies_when.clone();
-        let answered = self.answers.contains_key(id);
-
-        let resolution = if terms.is_empty() {
-            Resolution::State(if answered {
+    fn resolve(&mut self, request: &Request) -> Resolution {
+        let truths: Vec<_> = request.applies_when.iter()
+            .map(|term| self.term_truth(&request.id, term)).collect();
+        match conjoin(&truths) {
+            Truth::Invalid => Resolution::Undecidable,
+            // Moot outranks answered; stored answers remain in history.
+            Truth::False => Resolution::State(State::Moot),
+            Truth::Undetermined => Resolution::State(State::Gated),
+            Truth::True => Resolution::State(if self.answers.contains_key(request.id.as_str()) {
                 State::Answered
             } else {
                 State::Pending
-            })
-        } else {
-            visiting.push(id.to_string());
-            let truths: Vec<Truth> = terms
-                .iter()
-                .map(|term| self.term_truth(id, term, visiting))
-                .collect();
-            visiting.pop();
-            match conjoin(&truths) {
-                Truth::Invalid => Resolution::Undecidable,
-                // Moot outranks answered: a decision must never read as live under a branch its
-                // own guard says is dead, and that invariant is what the guard-form eval turned
-                // on. The answer itself is never destroyed — `read` still shows it.
-                Truth::False => Resolution::State(State::Moot),
-                Truth::Undetermined => Resolution::State(State::Gated),
-                Truth::True => Resolution::State(if answered {
-                    State::Answered
-                } else {
-                    State::Pending
-                }),
-            }
-        };
-        self.resolutions.insert(id.to_string(), resolution);
-        resolution
+            }),
+        }
     }
 
     fn run(mut self) -> (BTreeMap<String, Resolution>, Vec<Defect>) {
-        let ids: Vec<String> = self
-            .store
-            .requests
-            .iter()
-            .map(|request| request.id.clone())
-            .collect();
-        for id in ids {
-            self.resolve(&id, &mut Vec::new());
+        // Explicit postorder DFS: even hostile-depth inputs never use the call stack.
+        // Sorted roots make cycle diagnostics independent of input vector order.
+        let ids: Vec<_> = self.requests.keys().copied().collect();
+        for &id in &ids {
+            if let Some(answer) = self.answers.get(id).copied() {
+                let unknown = answer.choice.iter().any(|choice| {
+                    !self.options.get(id).is_some_and(|keys| keys.contains(choice))
+                });
+                if unknown {
+                    self.report(id, DefectCode::UnknownOption,
+                        format!("current answer `{}` selects an option not offered by this request", answer.id));
+                    self.resolutions.insert(id.to_string(), Resolution::Undecidable);
+                }
+            }
+        }
+        let mut completed = BTreeSet::new();
+        let mut depths: BTreeMap<&str, usize> = BTreeMap::new();
+        for &id in &ids {
+            if self.requests[id].applies_when.len() > MAX_GUARD_TERMS {
+                self.report(id, DefectCode::LimitExceeded,
+                    format!("guard exceeds {MAX_GUARD_TERMS} terms"));
+                self.resolutions.insert(id.to_string(), Resolution::Undecidable);
+            }
+            if self.resolutions.contains_key(id) {
+                completed.insert(id);
+            }
+        }
+        for root in ids {
+            if completed.contains(root) {
+                continue;
+            }
+            let mut stack = vec![(root, 0usize)];
+            let mut active = BTreeMap::from([(root, 0usize)]);
+            while let Some(&(id, next)) = stack.last() {
+                let request = self.requests[id];
+                if let Some(term) = request.applies_when.get(next) {
+                    stack.last_mut().expect("nonempty traversal").1 += 1;
+                    let Some((&target, _)) = self.requests.get_key_value(term.decision.as_str()) else {
+                        continue;
+                    };
+                    if completed.contains(target) {
+                        continue;
+                    }
+                    if let Some(&start) = active.get(target) {
+                        let cycle: Vec<_> = stack[start..].iter().map(|(id, _)| *id).collect();
+                        let detail = format!("guard cycle through `{}`", cycle.join(" -> "));
+                        for member in cycle {
+                            self.report(member, DefectCode::CyclicReference, detail.clone());
+                            self.resolutions.insert(member.to_string(), Resolution::Undecidable);
+                        }
+                    } else {
+                        active.insert(target, stack.len());
+                        stack.push((target, 0));
+                    }
+                    continue;
+                }
+                stack.pop();
+                active.remove(id);
+                let depth = request.applies_when.iter()
+                    .filter_map(|term| depths.get(term.decision.as_str()))
+                    .max().map_or(0, |depth| depth.saturating_add(1));
+                depths.insert(id, depth);
+                if !self.resolutions.contains_key(id) {
+                    let resolution = if depth > MAX_GUARD_DEPTH {
+                        self.report(id, DefectCode::LimitExceeded,
+                            format!("guard dependency depth exceeds {MAX_GUARD_DEPTH} edges"));
+                        Resolution::Undecidable
+                    } else {
+                        self.resolve(request)
+                    };
+                    self.resolutions.insert(id.to_string(), resolution);
+                }
+                completed.insert(id);
+            }
         }
         (self.resolutions, self.defects)
     }
@@ -301,85 +344,86 @@ pub(super) fn answer_chain<'a>(
     request_id: &str,
     defects: &mut Vec<Defect>,
 ) -> Vec<&'a Answer> {
+    if record_count(store) > MAX_RECORDS {
+        defects.push(defect(Some(request_id), DefectCode::LimitExceeded,
+            format!("store exceeds {MAX_RECORDS} records")));
+        return Vec::new();
+    }
+    let duplicates = duplicate_ids(store);
     let answers = store.answers_to(request_id);
+    if duplicates.contains(request_id) || answers.iter().any(|answer| duplicates.contains(answer.id.as_str())) {
+        defects.push(defect(Some(request_id), DefectCode::DuplicateId,
+            "answer history contains an ambiguous record identifier"));
+        return Vec::new();
+    }
+    ordered_answer_chain(request_id, answers, defects)
+}
+
+fn ordered_answer_chain<'a>(
+    request_id: &str,
+    mut answers: Vec<&'a Answer>,
+    defects: &mut Vec<Defect>,
+) -> Vec<&'a Answer> {
     if answers.is_empty() {
         return Vec::new();
     }
-    let ids: BTreeSet<&str> = answers.iter().map(|a| a.id.as_str()).collect();
-    let roots: Vec<&&Answer> = answers.iter().filter(|a| a.supersedes.is_none()).collect();
-
+    // Sort diagnostics, never choose a winner: a valid chain has exactly one root
+    // and one successor per predecessor, otherwise there is no usable history.
+    answers.sort_by_key(|answer| &answer.id);
+    let ids: BTreeSet<_> = answers.iter().map(|answer| answer.id.as_str()).collect();
+    let roots: Vec<_> = answers.iter().copied().filter(|answer| answer.supersedes.is_none()).collect();
+    let mut successors: BTreeMap<&str, Vec<&Answer>> = BTreeMap::new();
+    let mut invalid = false;
     for answer in &answers {
-        if let Some(target) = &answer.supersedes
-            && !ids.contains(target.as_str())
-        {
-            defects.push(defect(
-                Some(&answer.id),
-                DefectCode::DanglingSupersession,
-                format!("`supersedes: {target}` names no prior answer to this request"),
-            ));
+        if let Some(target) = &answer.supersedes {
+            if !ids.contains(target.as_str()) {
+                defects.push(defect(Some(&answer.id), DefectCode::DanglingSupersession,
+                    format!("`supersedes: {target}` names no prior answer to this request")));
+                invalid = true;
+            }
+            successors.entry(target).or_default().push(answer);
         }
     }
-    if roots.len() > 1 {
-        defects.push(defect(
-            Some(request_id),
-            DefectCode::ForkedSupersession,
-            format!(
-                "{} answers name no predecessor ({}), so the chain has no single starting point",
-                roots.len(),
-                roots
-                    .iter()
-                    .map(|a| a.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ));
+    if ids.len() != answers.len() {
+        defects.push(defect(Some(request_id), DefectCode::DuplicateId,
+            "answer chain contains duplicate record identifiers"));
+        invalid = true;
     }
-    let mut chain: Vec<&Answer> = Vec::new();
-    let Some(root) = roots.first() else {
-        defects.push(defect(
-            Some(request_id),
-            DefectCode::ForkedSupersession,
-            "every answer names a predecessor, so the chain has no starting point".to_string(),
-        ));
-        return chain;
-    };
-    let mut current: &Answer = root;
+    if roots.len() != 1 {
+        defects.push(defect(Some(request_id), DefectCode::ForkedSupersession,
+            format!("{} answers name no predecessor; the chain requires exactly one root", roots.len())));
+        invalid = true;
+    }
+    for (target, next) in &successors {
+        if next.len() > 1 {
+            defects.push(defect(Some(target), DefectCode::ForkedSupersession,
+                format!("{} answers supersede `{target}` ({}); which is later is undefined",
+                    next.len(), next.iter().map(|a| a.id.as_str()).collect::<Vec<_>>().join(", "))));
+            invalid = true;
+        }
+    }
+    if invalid {
+        return Vec::new();
+    }
+    let mut chain = Vec::with_capacity(answers.len());
+    let mut seen = BTreeSet::new();
+    let mut current = roots[0];
     loop {
-        chain.push(current);
-        let successors: Vec<&&Answer> = answers
-            .iter()
-            .filter(|a| a.supersedes.as_deref() == Some(current.id.as_str()))
-            .collect();
-        match successors.as_slice() {
-            [] => break,
-            [next] => {
-                if chain.iter().any(|seen| seen.id == next.id) {
-                    defects.push(defect(
-                        Some(&next.id),
-                        DefectCode::ForkedSupersession,
-                        "supersession chain is cyclic".to_string(),
-                    ));
-                    break;
-                }
-                current = next;
-            }
-            many => {
-                defects.push(defect(
-                    Some(&current.id),
-                    DefectCode::ForkedSupersession,
-                    format!(
-                        "{} answers supersede `{}` ({}); which is later is undefined",
-                        many.len(),
-                        current.id,
-                        many.iter()
-                            .map(|a| a.id.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                ));
-                break;
-            }
+        if !seen.insert(current.id.as_str()) {
+            defects.push(defect(Some(request_id), DefectCode::ForkedSupersession,
+                "supersession chain is cyclic"));
+            return Vec::new();
         }
+        chain.push(current);
+        let Some(next) = successors.get(current.id.as_str()) else {
+            break;
+        };
+        current = next[0];
+    }
+    if chain.len() != answers.len() {
+        defects.push(defect(Some(request_id), DefectCode::ForkedSupersession,
+            "answer chain contains disconnected records or a cycle"));
+        return Vec::new();
     }
     chain
 }
@@ -392,6 +436,7 @@ pub(super) fn evaluate_at(
     store: &Store,
     chains: &BTreeMap<&str, Vec<&Answer>>,
     depth: usize,
+    invalid: &BTreeSet<&str>,
 ) -> Fold {
     let mut answers: AnswerSet = BTreeMap::new();
     for (request_id, chain) in chains {
@@ -401,7 +446,7 @@ pub(super) fn evaluate_at(
         let index = depth.min(chain.len()) - 1;
         answers.insert(request_id, chain[index]);
     }
-    let (resolutions, defects) = Evaluator::new(store, answers).run();
+    let (resolutions, defects) = Evaluator::new(store, answers, invalid).run();
     Fold {
         resolutions,
         defects,
@@ -410,21 +455,56 @@ pub(super) fn evaluate_at(
 }
 
 pub fn fold(store: &Store) -> Fold {
-    let mut chain_defects: Vec<Defect> = Vec::new();
+    if record_count(store) > MAX_RECORDS {
+        return Fold {
+            // A single store-wide defect bounds output allocation too. resolution()
+            // returns Undecidable for every id when the resolution map is empty.
+            resolutions: BTreeMap::new(),
+            defects: vec![defect(None, DefectCode::LimitExceeded,
+                format!("store exceeds {MAX_RECORDS} records"))],
+            revived: BTreeSet::new(),
+        };
+    }
+    let duplicates = duplicate_ids(store);
+    let mut invalid = BTreeSet::new();
+    let mut chain_defects: Vec<Defect> = duplicates.iter().map(|id| {
+        defect(Some(id), DefectCode::DuplicateId, "identifier is carried by multiple records")
+    }).collect();
+    let requests: BTreeSet<_> = store.requests.iter().map(|r| r.id.as_str()).collect();
+    let mut by_request: BTreeMap<&str, Vec<&Answer>> = BTreeMap::new();
+    for answer in &store.answers {
+        by_request.entry(&answer.answers).or_default().push(answer);
+        if duplicates.contains(answer.id.as_str()) {
+            invalid.insert(answer.answers.as_str());
+        }
+    }
     let mut chains: BTreeMap<&str, Vec<&Answer>> = BTreeMap::new();
-    for request in &store.requests {
-        let chain = answer_chain(store, &request.id, &mut chain_defects);
-        chains.insert(request.id.as_str(), chain);
+    for request_id in requests {
+        if duplicates.contains(request_id) || invalid.contains(request_id) {
+            invalid.insert(request_id);
+            chain_defects.push(defect(Some(request_id), DefectCode::DuplicateId,
+                "request or its answer history has an ambiguous record identifier"));
+            continue;
+        }
+        let answers = by_request.remove(request_id).unwrap_or_default();
+        let has_answers = !answers.is_empty();
+        let chain = ordered_answer_chain(request_id, answers, &mut chain_defects);
+        if has_answers && chain.is_empty() {
+            invalid.insert(request_id);
+            chain_defects.push(defect(Some(request_id), DefectCode::ForkedSupersession,
+                "answer history is not a single complete supersession chain"));
+        }
+        chains.insert(request_id, chain);
     }
     let longest = chains.values().map(Vec::len).max().unwrap_or(0);
-    let mut current = evaluate_at(store, &chains, longest.max(1));
+    let mut current = evaluate_at(store, &chains, longest.max(1), &invalid);
 
     // Revival needs the answer HISTORY, not the current answer set: a decision is revived when it
     // is live now and some earlier prefix left it moot (DT-R17).
     if longest > 1 {
         let mut ever_moot: BTreeSet<String> = BTreeSet::new();
         for depth in 1..longest {
-            let earlier = evaluate_at(store, &chains, depth);
+            let earlier = evaluate_at(store, &chains, depth, &invalid);
             for (id, resolution) in &earlier.resolutions {
                 if *resolution == Resolution::State(State::Moot) {
                     ever_moot.insert(id.clone());
@@ -447,9 +527,47 @@ pub fn fold(store: &Store) -> Fold {
     current.defects.extend(duplicate_handle_defects(store));
     current.defects.extend(orphan_defects(store));
     current.defects.extend(assumption_chain_defects(store));
+    current.defects.extend(answer_choice_defects(store, &duplicates));
     current.defects.sort();
     current.defects.dedup();
     current
+}
+
+fn record_count(store: &Store) -> usize {
+    [store.requests.len(), store.answers.len(), store.assumptions.len(),
+        store.promotions.len(), store.parse_defects.len()]
+        .into_iter().fold(0usize, usize::saturating_add)
+}
+
+fn duplicate_ids(store: &Store) -> BTreeSet<&str> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for id in store.requests.iter().map(|r| r.id.as_str())
+        .chain(store.answers.iter().map(|r| r.id.as_str()))
+        .chain(store.assumptions.iter().map(|r| r.id.as_str()))
+        .chain(store.promotions.iter().map(|r| r.id.as_str()))
+    {
+        *counts.entry(id).or_default() += 1;
+    }
+    counts.into_iter().filter_map(|(id, count)| (count > 1).then_some(id)).collect()
+}
+
+fn answer_choice_defects(store: &Store, duplicates: &BTreeSet<&str>) -> Vec<Defect> {
+    let options: BTreeMap<_, Vec<_>> = store.requests.iter()
+        .filter(|r| !duplicates.contains(r.id.as_str()))
+        .map(|r| (r.id.as_str(), parse_options(&r.body).into_iter().map(|o| o.key).collect()))
+        .collect();
+    let mut defects = Vec::new();
+    for answer in &store.answers {
+        if let Some(keys) = options.get(answer.answers.as_str()) {
+            for choice in &answer.choice {
+                if !keys.contains(choice) {
+                    defects.push(defect(Some(&answer.id), DefectCode::UnknownOption,
+                        format!("answer selects `{choice}`, which request `{}` does not offer", answer.answers)));
+                }
+            }
+        }
+    }
+    defects
 }
 
 pub(super) fn duplicate_handle_defects(store: &Store) -> Vec<Defect> {
@@ -460,7 +578,8 @@ pub(super) fn duplicate_handle_defects(store: &Store) -> Vec<Defect> {
     by_handle
         .into_iter()
         .filter(|(_, ids)| ids.len() > 1)
-        .map(|(handle, ids)| {
+        .map(|(handle, mut ids)| {
+            ids.sort_unstable();
             defect(
                 Some(ids[0]),
                 DefectCode::DuplicateHandle,
@@ -502,31 +621,27 @@ pub(super) fn orphan_defects(store: &Store) -> Vec<Defect> {
 
 pub(super) fn assumption_chain_defects(store: &Store) -> Vec<Defect> {
     let mut defects = Vec::new();
-    for request in &store.requests {
-        let assumptions = store.assumptions_to(&request.id);
-        if assumptions.len() < 2 {
-            continue;
-        }
+    let mut by_request: BTreeMap<&str, Vec<&Assumption>> = BTreeMap::new();
+    for assumption in &store.assumptions {
+        by_request.entry(&assumption.assumes).or_default().push(assumption);
+    }
+    for assumptions in by_request.values() {
+        let known: BTreeSet<_> = assumptions.iter().map(|a| a.id.as_str()).collect();
         let mut predecessors: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for assumption in &assumptions {
+        for assumption in assumptions {
             if let Some(target) = &assumption.supersedes {
-                predecessors
-                    .entry(target.as_str())
-                    .or_default()
-                    .push(&assumption.id);
+                if !known.contains(target.as_str()) {
+                    defects.push(defect(Some(&assumption.id), DefectCode::DanglingSupersession,
+                        format!("`supersedes: {target}` names no prior assumption to this request")));
+                }
+                predecessors.entry(target.as_str()).or_default().push(&assumption.id);
             }
         }
-        for (target, ids) in predecessors {
+        for (target, mut ids) in predecessors {
             if ids.len() > 1 {
-                defects.push(defect(
-                    Some(target),
-                    DefectCode::ForkedSupersession,
-                    format!(
-                        "{} assumptions supersede `{target}` ({})",
-                        ids.len(),
-                        ids.join(", ")
-                    ),
-                ));
+                ids.sort_unstable();
+                defects.push(defect(Some(target), DefectCode::ForkedSupersession,
+                    format!("{} assumptions supersede `{target}` ({})", ids.len(), ids.join(", "))));
             }
         }
     }

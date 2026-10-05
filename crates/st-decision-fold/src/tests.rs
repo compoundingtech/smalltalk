@@ -1,4 +1,5 @@
 use super::*;
+use crate::parsing::*;
 
 /// Builds a request body with the given option keys, well-formed enough to pass validation.
 fn body_with(options: &[&str]) -> String {
@@ -41,6 +42,7 @@ fn answer(id: &str, answers: &str, choice: &[&str], supersedes: Option<&str>) ->
         written_ms: 1,
         answers: answers.to_string(),
         answered_by: "johannes".to_string(),
+        provenance: AnswerProvenance::Native,
         choice: choice.iter().map(|c| c.to_string()).collect(),
         capture_key: None,
         supersedes: supersedes.map(str::to_string),
@@ -54,6 +56,26 @@ fn store_of(requests: Vec<Request>, answers: Vec<Answer>) -> Store {
         answers,
         ..Store::default()
     }
+}
+
+/// Every input ordering, including the single ordering of an empty input.
+fn permutations(len: usize) -> Vec<Vec<usize>> {
+    fn visit(prefix: &mut Vec<usize>, len: usize, result: &mut Vec<Vec<usize>>) {
+        if prefix.len() == len {
+            result.push(prefix.clone());
+            return;
+        }
+        for index in 0..len {
+            if !prefix.contains(&index) {
+                prefix.push(index);
+                visit(prefix, len, result);
+                prefix.pop();
+            }
+        }
+    }
+    let mut result = Vec::new();
+    visit(&mut Vec::new(), len, &mut result);
+    result
 }
 
 fn codes(fold: &Fold) -> Vec<&'static str> {
@@ -541,9 +563,9 @@ fn the_next_handle_is_one_above_the_highest_and_never_fills_a_gap() {
         ],
         vec![],
     );
-    assert_eq!(store.next_handle(), 8);
+    assert_eq!(store.next_handle().expect("handle available"), 8);
     assert_ne!(
-        store.next_handle(),
+        store.next_handle().expect("handle available"),
         store.requests.len() as u64 + 1,
         "a count-based allocator would return 4 and reuse a handle"
     );
@@ -575,7 +597,7 @@ fn a_handle_resolves_to_its_request_and_an_ambiguous_one_refuses() {
 fn the_fold_is_total_and_deterministic_over_every_small_store() {
     // Exhaustive rather than sampled: three requests, each with one of five guard shapes
     // (including a self-cycle, a dangling reference and an unknown option) and one of three
-    // answer shapes (including the reframe that selects nothing). 3^5 * 3^3 stores.
+    // answer shapes (including the reframe that selects nothing). 5^3 * 3^3 stores.
     let guard_shapes: [&[(&str, &str)]; 5] = [
         &[],
         &[("r0", "yes")],
@@ -639,8 +661,18 @@ fn the_fold_is_total_and_deterministic_over_every_small_store() {
                                     );
                                 }
                             }
-                            let second = fold(&store);
-                            assert_eq!(first.resolutions, second.resolutions);
+                            for request_order in permutations(store.requests.len()) {
+                                for answer_order in permutations(store.answers.len()) {
+                                    let permuted = store_of(
+                                        request_order.iter().map(|&i| store.requests[i].clone()).collect(),
+                                        answer_order.iter().map(|&i| store.answers[i].clone()).collect(),
+                                    );
+                                    let second = fold(&permuted);
+                                    assert_eq!(first.resolutions, second.resolutions);
+                                    assert_eq!(first.defects, second.defects);
+                                    assert_eq!(first.revived, second.revived);
+                                }
+                            }
                             checked += 1;
                         }
                     }
@@ -649,4 +681,324 @@ fn the_fold_is_total_and_deterministic_over_every_small_store() {
         }
     }
     assert_eq!(checked, 5 * 5 * 5 * 3 * 3 * 3);
+}
+
+#[test]
+fn forked_roots_and_successors_never_offer_an_arbitrary_current_answer() {
+    for answers in [
+        vec![answer("x0", "r0", &["yes"], None), answer("x1", "r0", &["no"], None)],
+        vec![
+            answer("x0", "r0", &["yes"], None),
+            answer("x1", "r0", &["no"], Some("x0")),
+            answer("x2", "r0", &["yes"], Some("x0")),
+        ],
+    ] {
+        for order in permutations(answers.len()) {
+            let store = store_of(
+                vec![request("r0", 1, &[], &["yes", "no"]),
+                     request("r1", 2, &[("r0", "yes")], &["a"])],
+                order.iter().map(|&i| answers[i].clone()).collect(),
+            );
+            let computed = fold(&store);
+            assert_eq!(computed.resolution("r0"), Resolution::Undecidable);
+            assert_eq!(computed.resolution("r1"), Resolution::Undecidable);
+            assert!(codes(&computed).contains(&"forked-supersession"));
+            assert!(current_answer(&store, "r0").is_none());
+            assert!(answer_history(&store, "r0").is_empty());
+        }
+    }
+}
+
+#[test]
+fn dangling_cyclic_and_disconnected_answer_chains_have_no_usable_history() {
+    for answers in [
+        vec![answer("x0", "r0", &["yes"], Some("missing"))],
+        vec![answer("x0", "r0", &["yes"], Some("x1")),
+             answer("x1", "r0", &["no"], Some("x0"))],
+        vec![answer("x0", "r0", &["yes"], None),
+             answer("x1", "r0", &["no"], Some("x2")),
+             answer("x2", "r0", &["yes"], Some("x1"))],
+    ] {
+        for order in permutations(answers.len()) {
+            let store = store_of(
+                vec![request("r0", 1, &[], &["yes", "no"]),
+                     request("r1", 2, &[("r0", "yes")], &["a"])],
+                order.iter().map(|&i| answers[i].clone()).collect(),
+            );
+            let computed = fold(&store);
+            for id in ["r0", "r1"] {
+                assert_eq!(computed.resolution(id), Resolution::Undecidable);
+                assert!(computed.defects.iter().any(|d| d.about.as_deref() == Some(id)));
+            }
+            assert!(current_answer(&store, "r0").is_none());
+            assert!(answer_history(&store, "r0").is_empty());
+        }
+    }
+}
+
+#[test]
+fn duplicate_request_answer_and_cross_kind_ids_make_owners_and_dependents_undecidable() {
+    let base = store_of(
+        vec![request("r0", 1, &[], &["yes", "no"]),
+             request("r1", 2, &[("r0", "yes")], &["a"])],
+        vec![answer("x0", "r0", &["yes"], None)],
+    );
+    let mut duplicate_request = base.clone();
+    duplicate_request.requests.push(request("r0", 3, &[], &["yes"]));
+    let mut duplicate_answer = base.clone();
+    duplicate_answer.answers.push(answer("x0", "r0", &["no"], Some("x0")));
+    let mut cross_kind = base;
+    cross_kind.answers[0].id = "r0".into();
+    assert!(duplicate_request.request("r0").is_none());
+    assert!(duplicate_request.resolve("r0").is_err());
+    assert!(duplicate_request.resolve("Q1").is_err());
+    assert!(cross_kind.request("r0").is_none());
+    assert!(cross_kind.resolve("Q1").is_err());
+    for store in [duplicate_request, duplicate_answer, cross_kind] {
+        for request_order in permutations(store.requests.len()) {
+            for answer_order in permutations(store.answers.len()) {
+                let permuted = store_of(
+                    request_order.iter().map(|&i| store.requests[i].clone()).collect(),
+                    answer_order.iter().map(|&i| store.answers[i].clone()).collect(),
+                );
+                let computed = fold(&permuted);
+                assert!(computed.defects.iter().any(|d| d.code == DefectCode::DuplicateId));
+                assert_eq!(computed.resolution("r0"), Resolution::Undecidable);
+                assert_eq!(computed.resolution("r1"), Resolution::Undecidable);
+                assert!(current_answer(&permuted, "r0").is_none());
+                assert!(answer_history(&permuted, "r0").is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unknown_selected_choice_invalidates_the_owner_and_its_dependents() {
+    for choices in [&["maybe"][..], &["yes", "maybe"][..]] {
+        let store = store_of(
+            vec![request("r0", 1, &[], &["yes", "no"]),
+                 request("r1", 2, &[("r0", "yes")], &["a"])],
+            vec![answer("x0", "r0", choices, None)],
+        );
+        let computed = fold(&store);
+        assert_eq!(computed.resolution("r0"), Resolution::Undecidable);
+        assert_eq!(computed.resolution("r1"), Resolution::Undecidable);
+        assert!(computed.defects.iter().any(|d|
+            d.code == DefectCode::UnknownOption && d.about.as_deref() == Some("r0")));
+        let mut repaired = store;
+        repaired.answers.push(answer("x1", "r0", &["yes"], Some("x0")));
+        let computed = fold(&repaired);
+        assert_eq!(computed.resolution("r0"), Resolution::State(State::Answered));
+        assert_eq!(computed.resolution("r1"), Resolution::State(State::Pending));
+        assert!(computed.defects.iter().any(|d|
+            d.code == DefectCode::UnknownOption && d.about.as_deref() == Some("x0")));
+    }
+}
+
+#[test]
+fn dangling_assumption_supersession_is_attributed_to_the_assumption() {
+    let mut store = store_of(vec![request("r0", 1, &[], &["yes"])], vec![]);
+    store.assumptions.push(Assumption {
+        id: "assume".into(), written_ms: 1, assumes: "r0".into(),
+        assumed_by: "agent".into(), supersedes: Some("missing".into()), body: String::new(),
+    });
+    let computed = fold(&store);
+    assert!(computed.defects.iter().any(|d|
+        d.code == DefectCode::DanglingSupersession && d.about.as_deref() == Some("assume")));
+}
+
+#[test]
+fn handle_allocation_errors_at_saturation_instead_of_wrapping_or_reusing() {
+    assert_eq!(Store::default().next_handle().expect("first handle"), 1);
+    let mut store = store_of(vec![request("r0", u64::MAX - 1, &[], &["yes"])], vec![]);
+    assert_eq!(store.next_handle().expect("last available handle"), u64::MAX);
+    store.requests.push(request("r1", u64::MAX, &[], &["yes"]));
+    assert!(store.next_handle().is_err());
+    store.requests.reverse();
+    assert!(store.next_handle().is_err());
+}
+
+fn answered_dependency_chain(edges: usize) -> Store {
+    let mut store = Store::default();
+    for index in 0..=edges {
+        let id = format!("r{index}");
+        let parent = format!("r{}", index.saturating_sub(1));
+        let guard = if index == 0 { Vec::new() } else { vec![(parent.as_str(), "yes")] };
+        store.requests.push(request(&id, index as u64 + 1, &guard, &["yes"]));
+        store.answers.push(answer(&format!("x{index}"), &id, &["yes"], None));
+    }
+    store
+}
+
+#[test]
+fn the_guard_depth_limit_accepts_the_boundary_and_rejects_the_next_edge() {
+    let at_limit = answered_dependency_chain(MAX_GUARD_DEPTH);
+    let computed = fold(&at_limit);
+    assert_eq!(computed.resolution(&format!("r{MAX_GUARD_DEPTH}")), Resolution::State(State::Answered));
+    assert!(!computed.defects.iter().any(|d| d.code == DefectCode::LimitExceeded));
+    let beyond = answered_dependency_chain(MAX_GUARD_DEPTH + 1);
+    let id = format!("r{}", MAX_GUARD_DEPTH + 1);
+    let computed = fold(&beyond);
+    assert_eq!(computed.resolution(&id), Resolution::Undecidable);
+    assert!(computed.defects.iter().any(|d|
+        d.code == DefectCode::LimitExceeded && d.about.as_deref() == Some(id.as_str())));
+}
+
+#[test]
+fn twenty_thousand_answered_dependencies_are_safe_on_a_two_mebibyte_stack() {
+    std::thread::Builder::new().stack_size(2 * 1024 * 1024).spawn(|| {
+        let store = answered_dependency_chain(19_999);
+        let computed = fold(&store);
+        assert_eq!(computed.resolution("r19999"), Resolution::Undecidable);
+        assert!(computed.defects.iter().any(|d|
+            d.code == DefectCode::LimitExceeded && d.about.as_deref() == Some("r19999")));
+    }).expect("spawn small-stack fold").join().expect("fold must not panic");
+}
+
+#[test]
+fn the_guard_term_limit_accepts_the_boundary_and_rejects_one_more_term() {
+    let mut store = Store::default();
+    for index in 0..MAX_GUARD_TERMS + 1 {
+        let id = format!("r{index}");
+        store.requests.push(request(&id, index as u64 + 1, &[], &["yes"]));
+        store.answers.push(answer(&format!("x{index}"), &id, &["yes"], None));
+    }
+    let mut child = request("child", MAX_GUARD_TERMS as u64 + 2, &[], &["yes"]);
+    child.applies_when = (0..MAX_GUARD_TERMS).map(|index| Term {
+        decision: format!("r{index}"), option: "yes".into(),
+    }).collect();
+    store.requests.push(child);
+    assert_eq!(fold(&store).resolution("child"), Resolution::State(State::Pending));
+    store.requests.last_mut().expect("child").applies_when.push(Term {
+        decision: format!("r{MAX_GUARD_TERMS}"), option: "yes".into(),
+    });
+    let computed = fold(&store);
+    assert_eq!(computed.resolution("child"), Resolution::Undecidable);
+    assert!(computed.defects.iter().any(|d|
+        d.code == DefectCode::LimitExceeded && d.about.as_deref() == Some("child")));
+}
+
+#[test]
+fn the_record_limit_counts_every_record_vector_and_parse_defects() {
+    let mut store = store_of(vec![request("r0", 1, &[], &["yes"])],
+                             vec![answer("x0", "r0", &["yes"], None)]);
+    store.assumptions.push(Assumption {
+        id: "assume".into(), written_ms: 1, assumes: "r0".into(),
+        assumed_by: "agent".into(), supersedes: None, body: String::new(),
+    });
+    store.promotions.push(Promotion {
+        id: "promote".into(), written_ms: 1, promotes: "r0".into(),
+        target: "context/decision.md".into(), body: String::new(),
+    });
+    store.parse_defects = (0..MAX_RECORDS - 4).map(|index| Defect {
+        about: Some(format!("bad{index}")), code: DefectCode::MalformedRecord,
+        detail: "invalid frontmatter".into(),
+    }).collect();
+    let computed = fold(&store);
+    assert_eq!(computed.resolution("r0"), Resolution::State(State::Answered));
+    assert!(!computed.defects.iter().any(|d| d.code == DefectCode::LimitExceeded));
+    store.parse_defects.push(Defect {
+        about: Some("overflow".into()), code: DefectCode::MalformedRecord,
+        detail: "invalid frontmatter".into(),
+    });
+    let computed = fold(&store);
+    assert_eq!(computed.resolution("r0"), Resolution::Undecidable);
+    assert!(computed.defects.iter().any(|d| d.code == DefectCode::LimitExceeded));
+}
+
+#[test]
+fn imported_yes_no_and_free_text_answers_preserve_history_but_cannot_settle_guards() {
+    for choices in [&["yes"][..], &["no"][..], &[][..]] {
+        let mut imported = answer("import", "r0", choices, None);
+        imported.provenance = AnswerProvenance::Imported;
+        imported.body = "Historical human answer.".into();
+        let mut store = store_of(
+            vec![request("r0", 1, &[], &["yes", "no"]),
+                 request("r1", 2, &[("r0", "yes")], &["a"])],
+            vec![imported],
+        );
+        let computed = fold(&store);
+        assert_eq!(computed.resolution("r0"), Resolution::State(State::Answered));
+        assert_eq!(computed.resolution("r1"), Resolution::Undecidable);
+        assert!(computed.defects.iter().any(|d|
+            d.code == DefectCode::ImportedAnswer && d.about.as_deref() == Some("r1")));
+        assert_eq!(current_answer(&store, "r0").expect("import remains current").id, "import");
+        let history = answer_history(&store, "r0");
+        assert_eq!(history[0].provenance, AnswerProvenance::Imported);
+        assert_eq!(history[0].body, "Historical human answer.");
+        store.answers.push(answer("native", "r0", &["yes"], Some("import")));
+        let computed = fold(&store);
+        assert_eq!(computed.resolution("r1"), Resolution::State(State::Pending));
+        assert!(!computed.defects.iter().any(|d| d.code == DefectCode::ImportedAnswer));
+        assert!(!computed.revived.contains("r1"), "an imported no is not evidence of earlier mootness");
+        assert_eq!(current_answer(&store, "r0").expect("native successor").provenance, AnswerProvenance::Native);
+        let history = answer_history(&store, "r0");
+        assert_eq!(history.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["import", "native"]);
+        assert_eq!(history[0].provenance, AnswerProvenance::Imported);
+    }
+}
+
+#[test]
+fn provenance_parser_defaults_legacy_accepts_known_values_and_rejects_unknown_values() {
+    for (field, expected) in [
+        ("", AnswerProvenance::Native),
+        ("provenance: native\n", AnswerProvenance::Native),
+        ("provenance: imported\n", AnswerProvenance::Imported),
+    ] {
+        let document = format!("---\nrecord: answer\nanswers: r0\nanswered-by: human\n{field}---\nOriginal body.\n");
+        let Record::Answer(parsed) = parse_record("x0", 1, &document).expect("valid provenance") else {
+            panic!("expected answer");
+        };
+        assert_eq!(parsed.provenance, expected);
+        assert_eq!(parsed.body, "Original body.\n");
+    }
+    for value in ["unknown", "Native", "IMPORTED", ""] {
+        let document = format!("---\nrecord: answer\nanswers: r0\nanswered-by: human\nprovenance: {value}\n---\n");
+        assert!(parse_record("x0", 1, &document).is_err(), "reject provenance {value:?}");
+    }
+}
+
+#[test]
+fn an_imported_current_answer_cannot_settle_a_guard_even_when_its_owner_is_moot() {
+    let mut imported = answer("x1", "r1", &["yes"], None);
+    imported.provenance = AnswerProvenance::Imported;
+    let store = store_of(
+        vec![request("r0", 1, &[], &["yes", "no"]),
+             request("r1", 2, &[("r0", "yes")], &["yes"]),
+             request("r2", 3, &[("r1", "yes")], &["a"])],
+        vec![answer("x0", "r0", &["no"], None), imported],
+    );
+    let computed = fold(&store);
+    assert_eq!(computed.resolution("r1"), Resolution::State(State::Moot));
+    assert_eq!(computed.resolution("r2"), Resolution::Undecidable);
+    assert!(computed.defects.iter().any(|d|
+        d.code == DefectCode::ImportedAnswer && d.about.as_deref() == Some("r2")));
+    assert_eq!(current_answer(&store, "r1").expect("history preserved").id, "x1");
+}
+
+#[test]
+fn revival_and_supersession_history_are_invariant_under_all_record_permutations() {
+    let requests = vec![request("r0", 1, &[], &["yes", "no"]),
+                        request("r1", 2, &[("r0", "yes")], &["a"]),
+                        request("r2", 3, &[("r1", "a")], &["z"])];
+    let answers = vec![answer("x0", "r0", &["no"], None),
+                       answer("x1", "r0", &["yes"], Some("x0")),
+                       answer("x2", "r1", &["a"], None)];
+    let expected = fold(&store_of(requests.clone(), answers.clone()));
+    assert!(expected.revived.contains("r2"));
+    assert!(!expected.revived.contains("r1"), "answered requests are not revival obligations");
+    for request_order in permutations(requests.len()) {
+        for answer_order in permutations(answers.len()) {
+            let store = store_of(
+                request_order.iter().map(|&i| requests[i].clone()).collect(),
+                answer_order.iter().map(|&i| answers[i].clone()).collect(),
+            );
+            let computed = fold(&store);
+            assert_eq!(computed.resolutions, expected.resolutions);
+            assert_eq!(computed.defects, expected.defects);
+            assert_eq!(computed.revived, expected.revived);
+            assert_eq!(answer_history(&store, "r0").iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["x0", "x1"]);
+            assert_eq!(current_answer(&store, "r0").expect("chain tip").id, "x1");
+        }
+    }
 }

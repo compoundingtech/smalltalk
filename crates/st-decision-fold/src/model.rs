@@ -67,6 +67,12 @@ pub enum DefectCode {
     /// on the dependent too, so every undecidable decision says why it is undecidable rather
     /// than only the one at the root of the chain.
     DependsOnUndecidable,
+    /// More than one record carries the same immutable identifier.
+    DuplicateId,
+    /// The fold's bounded record, guard-term or guard-depth contract was exceeded.
+    LimitExceeded,
+    /// Imported historical answers cannot settle a live guard.
+    ImportedAnswer,
 }
 
 impl DefectCode {
@@ -85,6 +91,9 @@ impl DefectCode {
             Self::PromotionTargetUnresolvable => "promotion-target-unresolvable",
             Self::OrphanRecord => "orphan-record",
             Self::DependsOnUndecidable => "depends-on-undecidable",
+            Self::DuplicateId => "duplicate-id",
+            Self::LimitExceeded => "limit-exceeded",
+            Self::ImportedAnswer => "imported-answer",
         }
     }
 }
@@ -169,12 +178,20 @@ pub struct Request {
     pub body: String,
 }
 
+/// Provenance is assigned by the trusted adapter, not inferred from `answered_by`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnswerProvenance {
+    Native,
+    Imported,
+}
+
 #[derive(Clone, Debug)]
 pub struct Answer {
     pub id: String,
     pub written_ms: i64,
     pub answers: String,
     pub answered_by: String,
+    pub provenance: AnswerProvenance,
     /// Zero, one or several option keys (DT-R27). Empty means the answer is entirely free text.
     pub choice: Vec<String>,
     /// Stable tool-call event marker; never a supersession key.
@@ -214,7 +231,16 @@ pub struct Store {
 
 impl Store {
     pub fn request(&self, id: &str) -> Option<&Request> {
-        self.requests.iter().find(|r| r.id == id)
+        let mut matches = self.requests.iter().filter(|r| r.id == id);
+        let one = matches.next()?;
+        if matches.next().is_some()
+            || self.answers.iter().any(|r| r.id == id)
+            || self.assumptions.iter().any(|r| r.id == id)
+            || self.promotions.iter().any(|r| r.id == id)
+        {
+            return None;
+        }
+        Some(one)
     }
 
     /// Resolves `Q<n>` (case-insensitively) or a record id to a request. A handle that matches more than one request
@@ -224,7 +250,8 @@ impl Store {
         if let Some(q) = parse_handle(reference) {
             let matches: Vec<&Request> = self.requests.iter().filter(|r| r.q == q).collect();
             return match matches.as_slice() {
-                [one] => Ok(one),
+                [one] => self.request(&one.id)
+                    .ok_or_else(|| invalid(format!("decision identifier `{}` is ambiguous", one.id))),
                 [] => Err(invalid(format!("no decision with handle `{}`", handle(q)))),
                 many => Err(invalid(format!(
                     "handle `{}` is ambiguous across {} requests ({}); \
@@ -242,10 +269,16 @@ impl Store {
             .ok_or_else(|| invalid(format!("no decision `{reference}`")))
     }
 
-    /// The next handle: one above the highest already present, never one above the count.
-    /// Gaps are permanent (DT-R35) — the real store has them at Q11 and Q13.
-    pub fn next_handle(&self) -> u64 {
-        self.requests.iter().map(|r| r.q).max().unwrap_or(0) + 1
+    /// One above the highest handle; gaps are permanent. Exhaustion is an error,
+    /// never wrapping or returning a handle that is already allocated.
+    pub fn next_handle(&self) -> Result<u64> {
+        self.requests
+            .iter()
+            .map(|r| r.q)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| invalid("decision handles exhausted at u64::MAX"))
     }
 
     pub(crate) fn answers_to<'a>(&'a self, request_id: &str) -> Vec<&'a Answer> {

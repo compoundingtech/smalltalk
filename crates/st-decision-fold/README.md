@@ -13,15 +13,10 @@ Ported from the Axe Decision Tree implementation in dotfiles commit
 - `flakes/axe/src/decision/parsing.rs`: grammar and option validation, excluding filesystem reading.
 - `flakes/axe/src/decision/evaluation.rs`: state fold, answer/assumption history, revival and defects.
 
-The algorithms, ordering, accepted grammar, diagnostic strings and fold outcomes
-are unchanged. Module paths/visibility and the error type are adapted to the
-standalone crate; the error type has only the validation variant because I/O and
-JSON serialization are outside this crate. The result alias exposes a defaulted
-error parameter. Existing diagnostics mentioning `axe decision check` are kept
-for parity, not as a claim that this crate supplies that command.
-
-Two nested conditions use equivalent let-chain syntax to satisfy Clippy without
-adding warnings to the workspace ratchet.
+The standalone module paths and validation-only error type are adapted from that
+source. Existing diagnostics mentioning `axe decision check` are retained, not
+as a claim that this crate supplies that command. Defensive divergences from the
+source are listed below; importer comparisons must account for them.
 
 `parse_record` accepts an immutable record's ID, timestamp, and document bytes;
 `Store::push` adds the parsed record to an in-memory store. `fold` computes the
@@ -30,17 +25,77 @@ and promotions are records, never answers. Target existence and capture replay
 policy belong to consumers; the fold does not access a filesystem or deduplicate
 capture keys.
 
+## Trust boundary
+
+There are no tree, owner, seat, recipient, or claim-ID types in this file-store
+model. `answered_by` is unused by the fold: it is retained as historical data, not
+evidence of authority. `parent` is unvalidated structural metadata. This crate
+cannot authenticate an actor, verify a claim's kind or establish same-tree
+membership.
+
+The PR6 custom-subject adapter must check authority, kind and same-tree references
+before accepting records, and must ignore records that fail those checks. Its
+contract requires squatter, wrong-actor, cross-tree-reference and wrong-kind-
+reference tests. The adapter/importer, not untrusted frontmatter, must assign
+`AnswerProvenance::Imported` to imported answers. The legacy parser defaults a
+missing provenance field to `Native` only for file-format compatibility; that is
+not an authentication decision.
+
+## Divergences from dotfiles ae542137
+
+- Ambiguous, dangling, cyclic or disconnected answer chains have no usable
+  current answer/history and make their request and guard dependents undecidable;
+  no root or successor is chosen from vector order. Raw records remain in
+  `Store::answers`. Valid chains are still ordered solely by supersession.
+- Guard evaluation uses iterative postorder traversal, never call-stack recursion.
+  At most 65,536 total records (including parse defects), 64 guard terms per
+  request, and 64 dependency edges to a leaf are accepted. Limit overflow reports
+  `limit-exceeded` and resolves to undecidable, not gated or a panic. Global record
+  overflow yields an empty resolution map and one store-wide defect;
+  `Fold::resolution` returns undecidable for every identifier.
+- Duplicate immutable IDs across all record kinds report `duplicate-id`.
+  Ambiguous requests and owners of ambiguous answers are undecidable. Request
+  lookup refuses ambiguous IDs, including cross-kind collisions.
+- `next_handle` returns `Result<u64>` and errors at `u64::MAX` rather than wrapping,
+  panicking or reusing a handle.
+- Dangling assumption supersession is reported, including a lone assumption or a
+  predecessor belonging to a different request.
+- Answer choices not offered by the referenced request report `unknown-option`,
+  including historical answers. An invalid current choice makes the owner and
+  guard dependents undecidable; a valid later answer may supersede it.
+- `Answer` carries `AnswerProvenance::{Native, Imported}`. The parser accepts
+  `provenance: native|imported`, defaults omission to native and rejects unknown
+  values. Imported answers remain current/history and can make their own request
+  answered, but every guard term on an imported current answer is invalid with
+  `imported-answer` (even if its owner is moot). A native superseding answer can
+  settle the guard. Imported answers cannot manufacture revival through a false
+  guard during prefix replay.
+- Request traversal and diagnostic lists use deterministic ID order. Valid
+  outcomes and defects/revival are invariant under input record permutations;
+  cycle/fork diagnostics are correspondingly deterministic.
+
+The public API is explicitly exported: record/model types, parsing and validation
+entrypoints, fold/history accessors and the three limit constants. Frontmatter,
+option-building and evaluator implementation helpers are not public API.
+
 ## Verification
 
 Run `cargo test -p st-decision-fold` and
 `cargo clippy -p st-decision-fold --all-targets -- -D warnings`.
 
-The 28 pure source unit tests are ported intact, including assumption ordering
-with equal timestamps and the exhaustive 3,375-store totality/determinism test.
-Seven integration tests adapt the fold/parser assertions from
+The 28 pure source unit tests remain, with the exhaustive 3,375-store property
+extended to all request/answer permutations (59,250 comparisons of resolutions,
+defects and revival). The assumption ordering test still covers equal timestamps.
+Additional regressions cover ambiguous chains/IDs, overflow boundaries, provenance,
+invalid choices and a 20,000-node chain on a two-mebibyte stack.
+Eight integration tests adapt the fold/parser assertions from
 `flakes/axe/tests/decision_tree.rs`; each names its source test. They exercise
 lifecycle/revival/reframe, assumption history, answer history, promotion links,
 captured answers/manual supersession, and byte-exact material.
+
+The independent hermetic `checks.<system>.decision-fold` gate runs this crate's
+tests. The required Linux tests lane builds it explicitly; coverage does not
+depend on the st2 workspace check.
 
 Filesystem storage, reserved-ID races/replay, seat discovery, CLI option/handle
 normalization, target resolution, and capture retry/conflict/concurrency contracts

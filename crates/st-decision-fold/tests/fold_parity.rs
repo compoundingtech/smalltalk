@@ -13,7 +13,8 @@ fn request(id: &str, q: u64, guard: &[(&str, &str)]) -> Request {
 }
 fn answer(id: &str, choices: &[&str], supersedes: Option<&str>, body: &str) -> Answer {
     Answer { id: id.into(), written_ms: 1001, answers: "root01".into(),
-        answered_by: "johannes".into(), choice: choices.iter().map(|s| (*s).into()).collect(),
+        answered_by: "johannes".into(), provenance: AnswerProvenance::Native,
+        choice: choices.iter().map(|s| (*s).into()).collect(),
         capture_key: None, supersedes: supersedes.map(str::to_string), body: body.into() }
 }
 fn store() -> Store {
@@ -93,6 +94,7 @@ fn captured_record_preserves_choice_key_provenance_and_body() {
     let captured = current_answer(&store, "root01").unwrap();
     assert_eq!(captured.choice, ["yes", "no"]);
     assert_eq!(captured.answered_by, "johannes");
+    assert_eq!(captured.provenance, AnswerProvenance::Native);
     assert_eq!(captured.capture_key.as_deref(), Some("a0b1"));
     assert_eq!(captured.supersedes, None);
     assert_eq!(captured.body, "Human chose both.\n");
@@ -121,4 +123,27 @@ fn parsed_material_is_byte_identical_to_what_its_author_wrote() {
         panic!("expected request");
     };
     assert_eq!(request.body.as_bytes(), hostile.as_bytes());
+}
+
+// Sources: captured_retries_preserve_one_record_and_conflicting_key_or_content_cannot_supersede;
+// concurrent_captured_free_text_retries_share_one_record_and_manual_answer_still_supersedes.
+#[test]
+fn imported_capture_remains_readable_until_a_native_answer_supersedes_it() {
+    let mut store = store();
+    store.requests.push(request("child1", 2, &[("root01", "yes")]));
+    store.push(parse_record("capt01", 1001, "---\nrecord: answer\nanswers: root01\nanswered-by: johannes\nprovenance: imported\nchoice: [no]\ncapture-key: historical\n---\nOriginal decision.\n").unwrap());
+    let computed = fold(&store);
+    assert_eq!(computed.resolution("root01"), Resolution::State(State::Answered));
+    assert_eq!(computed.resolution("child1"), Resolution::Undecidable);
+    assert!(computed.defects.iter().any(|d| d.code == DefectCode::ImportedAnswer));
+    assert_eq!(current_answer(&store, "root01").unwrap().capture_key.as_deref(), Some("historical"));
+    store.answers.push(answer("manual", &["yes"], Some("capt01"), "Native decision."));
+    let computed = fold(&store);
+    assert_eq!(computed.resolution("child1"), Resolution::State(State::Pending));
+    assert!(!computed.revived.contains("child1"));
+    let history = answer_history(&store, "root01");
+    assert_eq!(history.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["capt01", "manual"]);
+    assert_eq!(history[0].provenance, AnswerProvenance::Imported);
+    assert_eq!(history[0].body, "Original decision.\n");
+    assert_eq!(history[1].provenance, AnswerProvenance::Native);
 }

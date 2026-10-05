@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::*;
 pub fn handle(q: u64) -> String {
     format!("Q{q}")
@@ -231,6 +233,11 @@ pub fn parse_record(
             written_ms,
             answers: frontmatter.required("answers")?.to_string(),
             answered_by: frontmatter.required("answered-by")?.to_string(),
+            provenance: match frontmatter.get("provenance") {
+                None | Some("native") => AnswerProvenance::Native,
+                Some("imported") => AnswerProvenance::Imported,
+                Some(other) => return Err(format!("unknown answer provenance `{other}`")),
+            },
             choice: match frontmatter.get("choice") {
                 Some(raw) => parse_flow_sequence(raw)?,
                 None => Vec::new(),
