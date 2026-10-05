@@ -82,7 +82,9 @@ struct Payload<'a> {
     claim_signatures: &'a BTreeMap<String, ClaimSignature>,
 }
 
-pub(crate) fn encode_claim_spans(payload: &ReplicaEnvelopePayload) -> Result<(Vec<u8>, Spans)> {
+pub(in crate::store) fn encode_claim_spans(
+    payload: &ReplicaEnvelopePayload,
+) -> Result<(Vec<u8>, Spans)> {
     // Exhaustive patterns make new wire fields a compile-time review obligation. The byte
     // parity tests also cover ordering and signature omission against the original types.
     let ReplicaEnvelopePayload {
