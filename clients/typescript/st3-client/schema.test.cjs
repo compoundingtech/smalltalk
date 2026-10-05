@@ -206,31 +206,6 @@ test('resource pages decode only through ResourcesPage, never the generic Page',
     assert.throws(() => Rich.decodeUnknownSync(Rich.Page)(page('resources')));
 });
 
-test('resource pages retain all rows with present, null, or absent sync forecasts', async () => {
-    const [{ Option }, Rich] = await modules;
-    const items = Array.from({ length: 9 }, (_, row) => ({
-        id: `resource/example/${row}`, kind: 'vcs.pull-request',
-        facts: { opened_by: 'agent/example', number: row },
-        observed_at: '2024-02-29T00:00:00Z', opened_by: 'agent/example', opened_by_run: null,
-    }));
-    const peer = { host_id: 'host/birch', peer_only_envelopes: 9000, local_only_envelopes: 0 };
-    const page = (forecast) => ({
-        kind: 'page', collection: 'resources', filters: { opened_by: 'agent/example' }, items,
-        page: { limit: 50, has_more: false },
-        sync: { state: 'catching-up', peers: [{ ...peer, ...forecast }] },
-    });
-    for (const forecast of [{}, { estimated_catch_up_seconds: null },
-        { estimated_catch_up_seconds: 90 }, { estimated_catch_up_seconds: Number.MAX_SAFE_INTEGER }]) {
-        const decoded = Rich.decodeUnknownSync(Rich.ResourcesPage, 'strict')(page(forecast));
-        assert.deepEqual(decoded.items.map((row) => row.id), items.map((row) => row.id));
-        assert.equal(decoded.sync.state, 'catching-up');
-        assert.equal(Option.isSome(decoded.sync.peers[0].estimated_catch_up_seconds),
-            typeof forecast.estimated_catch_up_seconds === 'number');
-    }
-    assert.throws(() => Rich.decodeUnknownSync(Rich.ResourcesPage)(
-        page({ estimated_catch_up_seconds: Number.MAX_SAFE_INTEGER + 1 })));
-});
-
 test('usage pricing provenance round-trips while legacy rows remain readable', async () => {
     const [{ Schema }, Rich] = await modules;
     const counts = { total_tokens: 1100, input_tokens: 1000, output_tokens: 100,

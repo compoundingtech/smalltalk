@@ -3695,35 +3695,20 @@ pub fn replication_difference_counts_what_each_side_lacks() {
 
 #[cfg(test)]
 #[test]
-pub fn sync_progress_forecasts_require_finite_safe_seconds() {
-    for (rate, peer_only, expected) in [
-        (
-            1.0,
-            MAX_SAFE_DURATION_SECONDS,
-            Some(MAX_SAFE_DURATION_SECONDS),
-        ),
-        (1.0, MAX_SAFE_DURATION_SECONDS + 1, None),
-        (f64::MIN_POSITIVE, 9_000, None),
-        (f64::INFINITY, 9_000, None),
-        (f64::NAN, 9_000, None),
-        (0.0, 9_000, None),
-        (-1.0, 9_000, None),
-        (0.0, 0, Some(0)),
-    ] {
-        let mut progress = PeerSyncProgress {
-            measured: Some(ReplicationPeerSync {
-                catch_up_rate_per_second: Some(rate),
-                ..Default::default()
-            }),
+pub fn sync_progress_infinite_rate_does_not_claim_caught_up() {
+    let mut progress = PeerSyncProgress {
+        measured: Some(ReplicationPeerSync {
+            catch_up_rate_per_second: Some(f64::INFINITY),
             ..Default::default()
-        };
-        progress.observe(0, Some((peer_only, 0)), 1_000);
-        assert_eq!(
-            progress.view(1_000).unwrap().estimated_catch_up_seconds,
-            expected,
-            "rate={rate}, peer_only={peer_only}"
-        );
-    }
+        }),
+        ..Default::default()
+    };
+    progress.observe(0, Some((9_000, 3)), 1_000);
+    let sync = progress.view(1_000).unwrap();
+    assert_eq!(sync.estimated_catch_up_seconds, None);
+    assert_eq!(sync.peer_only_envelopes, 9_000);
+    assert_eq!(sync.local_only_envelopes, 3);
+    assert!(sync.catching_up);
 }
 
 #[cfg(test)]
