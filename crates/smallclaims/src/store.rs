@@ -2835,7 +2835,7 @@ fn seed_replica_envelopes_signed_tx(
             accepted_at.parse().unwrap_or_default(),
             &payload,
         );
-        transaction.execute(
+        let inserted = transaction.execute(
             "INSERT OR IGNORE INTO replica_envelopes(
                  writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms,
                  payload, batch_id, relay, receipt_state, received_at_unix_ms
@@ -2851,7 +2851,7 @@ fn seed_replica_envelopes_signed_tx(
                 relay
             ],
         )?;
-        let spans = if record_offsets::matches_payload(
+        let spans = if inserted != 0 || record_offsets::matches_payload(
             transaction,
             &writer,
             sequence,
@@ -3896,6 +3896,16 @@ pub fn validate_and_admit_envelope_tx(
     runtime: &dyn Runtime,
     outcome: &mut ReplicationAdmission,
 ) -> Result<(), St3Error> {
+    validate_envelope_tx(transaction, envelope, runtime, outcome, false)
+}
+
+fn validate_envelope_tx(
+    transaction: &Connection,
+    envelope: &ReplicaEnvelope,
+    runtime: &dyn Runtime,
+    outcome: &mut ReplicationAdmission,
+    payload_from_store: bool,
+) -> Result<(), St3Error> {
     let started = std::time::Instant::now();
     let payload_bytes = envelope.payload.bytes().map_err(|error| {
         St3Error::new(
@@ -3935,25 +3945,12 @@ pub fn validate_and_admit_envelope_tx(
         ));
     }
     verify_replica_batch_header(batch)?;
-    let spans = if record_offsets::matches_payload(
-        transaction,
-        &envelope.writer,
-        envelope.sequence,
-        &envelope.hash,
-        &envelope.payload,
-    )
-    .map_err(internal)?
-    {
-        record_offsets::Spans::parse(payload_bytes).ok()
-    } else {
-        None
-    };
+    let spans = std::cell::OnceCell::new();
     outcome.verify += started.elapsed();
     let now = now_ms().to_string();
     let mut degraded = false;
     for (offset, (hash, bytes)) in payload.blobs.iter().enumerate() {
         let position = batch.claims.len() as u64 + offset as u64;
-        let raw = record_offsets::RecordRaw::blob(spans.as_ref(), position as usize, bytes);
         let record_ref = replica_record_ref(
             &envelope.writer,
             envelope.sequence,
@@ -3967,6 +3964,18 @@ pub fn validate_and_admit_envelope_tx(
             .query_row([&record_ref], |row| row.get::<_, String>(0))
             .optional()
             .map_err(internal)?;
+        let raw = if previous_state.is_some() {
+            record_offsets::RecordRaw::existing()
+        } else {
+            let spans = record_offsets::Spans::for_envelope(
+                &spans,
+                transaction,
+                envelope,
+                payload_from_store,
+            )
+            .map_err(internal)?;
+            record_offsets::RecordRaw::blob(spans, position as usize, bytes)
+        };
         if valid {
             transaction
                 .prepare_cached(
@@ -4054,14 +4063,24 @@ pub fn validate_and_admit_envelope_tx(
             &envelope.hash,
             position,
         );
-        let raw = record_offsets::RecordRaw::claim(spans.as_ref(), position as usize, claim)
-            .map_err(internal)?;
         let previous_state = transaction
             .prepare_cached("SELECT state FROM replica_records WHERE record_ref=?1")
             .map_err(internal)?
             .query_row([&record_ref], |row| row.get::<_, String>(0))
             .optional()
             .map_err(internal)?;
+        let raw = if previous_state.is_some() {
+            record_offsets::RecordRaw::existing()
+        } else {
+            let spans = record_offsets::Spans::for_envelope(
+                &spans,
+                transaction,
+                envelope,
+                payload_from_store,
+            )
+            .map_err(internal)?;
+            record_offsets::RecordRaw::claim(spans, position as usize, claim).map_err(internal)?
+        };
         let started = std::time::Instant::now();
         let classification = validate_replicated_claim(transaction, batch, claim, runtime);
         outcome.verify += started.elapsed();
@@ -5490,11 +5509,14 @@ impl Store {
                         continue;
                     }
                     let mut savepoint = pass.savepoint()?;
-                    let result = validate_and_admit_envelope_tx(
+                    // The loader read these bytes from the stored identity. Once the hash
+                    // verifies, healing can only replace them with the same committed bytes.
+                    let result = validate_envelope_tx(
                         &savepoint,
                         envelope,
                         &*self.runtime,
                         &mut outcome,
+                        true,
                     );
                     match result {
                         Ok(()) => {

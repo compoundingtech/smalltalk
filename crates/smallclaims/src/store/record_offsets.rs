@@ -105,11 +105,11 @@ impl Spans {
         let mut count = reader.container(5)?;
         let mut spans = Self::default();
         while !reader.done(&mut count)? {
-            match reader.text()?.as_str() {
+            match reader.text()?.as_ref() {
                 "batch" => {
                     let mut fields = reader.container(5)?;
                     while !reader.done(&mut fields)? {
-                        if reader.text()? == "claims" {
+                        if reader.text()?.as_ref() == "claims" {
                             let mut claims = reader.container(4)?;
                             while !reader.done(&mut claims)? {
                                 spans.claims.push(reader.item()?);
@@ -122,7 +122,7 @@ impl Spans {
                 "blobs" => {
                     let mut blobs = reader.container(5)?;
                     while !reader.done(&mut blobs)? {
-                        let hash = reader.text()?;
+                        let hash = reader.text()?.into_owned();
                         spans.blobs.insert(hash, reader.item()?);
                     }
                 }
@@ -133,6 +133,34 @@ impl Spans {
         }
         ensure!(reader.at == bytes.len(), "trailing envelope CBOR");
         Ok(spans)
+    }
+    pub(super) fn for_envelope<'a>(
+        cache: &'a std::cell::OnceCell<Option<Self>>,
+        connection: &Connection,
+        envelope: &ReplicaEnvelope,
+        payload_from_store: bool,
+    ) -> Result<Option<&'a Self>> {
+        if cache.get().is_none() {
+            let matches = payload_from_store
+                || matches_payload(
+                    connection,
+                    &envelope.writer,
+                    envelope.sequence,
+                    &envelope.hash,
+                    &envelope.payload,
+                )?;
+            let spans = matches
+                .then(|| {
+                    envelope
+                        .payload
+                        .bytes()
+                        .ok()
+                        .and_then(|bytes| Self::parse(bytes).ok())
+                })
+                .flatten();
+            let _ = cache.set(spans);
+        }
+        Ok(cache.get().and_then(Option::as_ref))
     }
     fn at(&self, position: usize) -> Option<Pointer> {
         if let Some(range) = self.claims.get(position) {
@@ -151,8 +179,8 @@ struct Cbor<'a> {
     bytes: &'a [u8],
     at: usize,
 }
-impl Cbor<'_> {
-    fn take(&mut self, count: usize) -> Result<&[u8]> {
+impl<'a> Cbor<'a> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8]> {
         let end = self
             .at
             .checked_add(count)
@@ -201,9 +229,22 @@ impl Cbor<'_> {
         self.skip(0)?;
         Ok(start..self.at)
     }
-    fn text(&mut self) -> Result<String> {
+    fn text(&mut self) -> Result<std::borrow::Cow<'a, str>> {
+        let start = self.at;
+        let (major, length) = self.head()?;
+        if major == 3
+            && let Some(length) = length
+        {
+            return Ok(std::borrow::Cow::Borrowed(std::str::from_utf8(
+                self.take(length.try_into()?)?,
+            )?));
+        }
+        // Fragmented and tagged field names keep the full decoder's behavior.
+        self.at = start;
         let range = self.item()?;
-        Ok(ciborium::from_reader(&self.bytes[range])?)
+        Ok(std::borrow::Cow::Owned(ciborium::from_reader(
+            &self.bytes[range],
+        )?))
     }
     fn skip(&mut self, depth: usize) -> Result<()> {
         ensure!(depth < 256, "CBOR nesting limit");
@@ -266,6 +307,10 @@ impl RecordRaw {
             length: None,
             mode: None,
         }
+    }
+    // The conflict clause preserves every existing raw field. Its placeholder is unused.
+    pub(super) fn existing() -> Self {
+        Self::inline(Value::Blob(Vec::new()))
     }
     pub(super) fn claim(
         spans: Option<&Spans>,
@@ -601,6 +646,17 @@ mod tests {
             spans.at(1).unwrap().decode(&wire.into()).unwrap(),
             Value::Blob(vec![0, 255])
         );
+    }
+
+    #[test]
+    fn fragmented_field_names_keep_the_same_claim_span() {
+        let mut wire = vec![
+            0xa1, 0x7f, 0x62, b'b', b'a', 0x63, b't', b'c', b'h', 0xff, 0xa1,
+        ];
+        ciborium::into_writer(&"claims", &mut wire).unwrap();
+        wire.extend([0x81, 0x18, 0x2a]);
+        let spans = Spans::parse(&wire).unwrap();
+        assert_eq!(&wire[spans.claims[0].clone()], &[0x18, 0x2a]);
     }
 
     proptest! {

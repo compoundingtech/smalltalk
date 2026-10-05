@@ -287,3 +287,41 @@ fn healing_a_corrupt_or_malformed_envelope_keeps_its_original_forensic_bytes() {
         );
     }
 }
+
+#[test]
+fn direct_admission_keeps_raw_inline_when_incoming_bytes_differ_from_the_stored_payload() {
+    let source = Store::open_memory("alder", Arc::new(Plain)).unwrap();
+    note(&source, 0);
+    let exchange = source
+        .export_replication_exchange("sample-fleet", &ReplicationInventory::default())
+        .unwrap();
+    let expected = raw(&source);
+    let target = Store::open_memory("birch", Arc::new(Plain)).unwrap();
+    target
+        .receive_replication_exchange("alder", "sample-fleet", &exchange)
+        .unwrap();
+    target
+        .connection
+        .write()
+        .execute("UPDATE replica_envelopes SET payload=X'DEADBEEF'", [])
+        .unwrap();
+    let mut outcome = smallclaims::store::ReplicationAdmission::default();
+    smallclaims::store::validate_and_admit_envelope_tx(
+        &target.connection.write(),
+        &exchange.envelopes[0],
+        &Plain,
+        &mut outcome,
+    )
+    .unwrap();
+    assert_eq!(raw(&target), expected);
+    let pointers: u64 = target
+        .connection
+        .write()
+        .query_row(
+            "SELECT COUNT(*) FROM replica_records WHERE raw_mode IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pointers, 0);
+}
