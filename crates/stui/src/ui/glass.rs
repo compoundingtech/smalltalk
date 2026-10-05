@@ -4836,6 +4836,47 @@ mod tests {
     }
 
     #[test]
+    fn an_address_the_renderer_wrapped_is_one_link_on_every_row() {
+        // Nathan, 2026-10-05: clicking a wrapped link copied only the part on the clicked row.
+        let long = "https://github.com/example/widgets/blob/main/docs/a-very-long-file-name-for-wrapping-tests/and-then-some-more-path-segments.md";
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        if let Some(Load::Ready(entries)) = ui
+            .world
+            .conversations
+            .get_mut("agent/example/atlas/builder")
+        {
+            entries.push(Entry {
+                id: "wrapped".into(),
+                at: "17:41".into(),
+                body: Body::Assistant(format!("Start here: {long}\nThen it ends.")),
+            });
+        }
+        ui.follow_latest();
+        screen(&ui);
+        let frame = ui.frame.borrow();
+        let rows = frame
+            .hits
+            .iter()
+            .filter_map(|(rect, hit)| match hit {
+                Hit::Link(url) if url == long => Some(rect.y),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            rows.len() >= 2,
+            "the whole address is the link on each row it covers: {rows:?}"
+        );
+        let partial = frame.hits.iter().any(|(_, hit)| {
+            matches!(hit, Hit::Link(url) if url != long && url.starts_with("https://github.com/example/widgets/blob"))
+        });
+        assert!(!partial, "no link holds only part of the address");
+    }
+
+    #[test]
     fn rename_is_always_in_the_palette_and_asks_for_the_name() {
         let mut ui = glass();
         ctrl(&mut ui, 'k');
