@@ -232,7 +232,8 @@ mod tests {
     const SUBJECT: &str = "agent/model-control";
     fn baseline(store: &Store) -> (NativeState, crate::mailbox::Fence) {
         let intent = crate::graph::parse_intent("version 2\nagent \"model-control\" { workspace \".\"; harness \"omp\" { model \"provider/reasoner\"; } }", "model-owner").unwrap();
-        store.apply_as(&intent, &BTreeMap::new(), "model-test-declaration", Some("person/operator")).unwrap();
+        let planned = store.mission(&intent, crate::model::IntentInput { kdl: String::new(), source_name: None }).unwrap();
+        store.apply_as(&intent, &planned.subject_tokens, "model-test-declaration", Some("person/operator")).unwrap();
         store.append_claim(&ClaimInput {
             subject: SUBJECT.into(), kind: "runtime.observed".into(), actor: Some(SUBJECT.into()),
             fields: BTreeMap::from([("status".into(), json!("running")), ("incarnation_id".into(), json!("incarnation-1")), ("runtime_id".into(), json!("native-runtime"))]),
@@ -529,7 +530,8 @@ mod tests {
         let accepted = store.reserve_harness_model(&request(&state, "declaration")).unwrap();
         store.take_harness_model(&fence).unwrap().unwrap();
         let replacement = crate::graph::parse_intent("version 2\nagent \"model-control\" { workspace \".\"; harness \"omp\" { model \"provider/plain\"; } }", "model-owner").unwrap();
-        store.apply_as(&replacement, &BTreeMap::new(), "model-test-replacement", Some("person/operator")).unwrap();
+        let planned = store.mission(&replacement, crate::model::IntentInput { kdl: String::new(), source_name: None }).unwrap();
+        store.apply_as(&replacement, &planned.subject_tokens, "model-test-replacement", Some("person/operator")).unwrap();
         let frozen = store.harness_model_receipt(&accepted.operation_id).unwrap().unwrap();
         assert_eq!(frozen.status, Outcome::Indeterminate);
         assert_eq!(frozen.reason.as_deref(), Some("native-runtime-ended-or-replaced"));

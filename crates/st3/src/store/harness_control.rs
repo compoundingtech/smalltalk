@@ -314,7 +314,8 @@ mod tests {
     const SUBJECT: &str = "agent/control-smoke";
     fn baseline(store: &Store) -> (NativeState, crate::mailbox::Fence) {
         let intent = crate::graph::parse_intent("version 2\nagent \"control-smoke\" { workspace \".\"; harness \"omp\" { model \"control-smoke/native-smoke\"; } }", "queue-owner").unwrap();
-        store.apply_as(&intent, &BTreeMap::new(), "control-test-declaration", Some("person/operator")).unwrap();
+        let planned = store.mission(&intent, crate::model::IntentInput { kdl: String::new(), source_name: None }).unwrap();
+        store.apply_as(&intent, &planned.subject_tokens, "control-test-declaration", Some("person/operator")).unwrap();
         store.append_claim(&ClaimInput { subject: SUBJECT.into(), kind: "runtime.observed".into(), actor: Some(SUBJECT.into()), fields: BTreeMap::from([("status".into(), json!("running")), ("incarnation_id".into(), json!("incarnation-1")), ("runtime_id".into(), json!("native-runtime"))]), evidence: Vec::new(), expected_subject: None, idempotency_key: None }).unwrap();
         let fence = store.bind_mailbox(&crate::mailbox::Fence::new(SUBJECT, "incarnation-1", "delivery")).unwrap();
         let state = NativeState { subject: SUBJECT.into(), binding: Binding { desired_revision: store.harness_control_desired_revision(&fence).unwrap(), incarnation_id: "incarnation-1".into(), session_id: "session-1".into(), turn_id: None }, idle: false, input_supported: true, steer: Default::default(), models: Models { choices: Vec::new(), selected: None, atomic_model_effort: false, revision: "models-1".into(), available: false, complete: true, source: "native-extension-model-registry".into() }, approval: Approval { supported: false, reason: "native-live-approval-api-unavailable".into() }, reason: None };

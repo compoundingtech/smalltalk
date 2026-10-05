@@ -2683,7 +2683,8 @@ mod tests {
             "version 2\nagent \"queue-worker\" { workspace \"/tmp\"; command \"true\" }",
             "queue-owner",
         ).unwrap();
-        store.apply_as(&intent, &BTreeMap::new(), "queue-relay-declaration", Some("person/operator")).unwrap();
+        let planned = store.mission(&intent, crate::model::IntentInput { kdl: String::new(), source_name: None }).unwrap();
+        store.apply_as(&intent, &planned.subject_tokens, "queue-relay-declaration", Some("person/operator")).unwrap();
         store.append_claim(&ClaimInput {
             subject: "agent/queue-worker".into(), kind: "runtime.observed".into(),
             actor: Some("agent/queue-worker".into()),
