@@ -110,23 +110,61 @@ async fn paired_history_pages_read_the_actual_remote_pty_owner() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop { let (status, page) = read(Some(cursor.clone()), incarnation.clone()).await; if status == StatusCode::OK { assert_eq!(page["value"]["lines"][0]["text"], "L6"); break; } tokio::task::yield_now().await; }
     }).await.unwrap();
+    // Subscribe read-only before the flood: a new one-shot screen/command
+    // connection during the burst can be backpressured before its response.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use pty_core::protocol::{encode_peek, MessageType, PacketReader};
+    let mut completion_socket = tokio::net::UnixStream::connect(
+        owner.pty_root.join("history-smoke.sock"),
+    ).await.unwrap();
+    completion_socket.write_all(&encode_peek(true, false)).await.unwrap();
+    let (screen_ready, initial_screen) = tokio::sync::oneshot::channel();
+    let eviction_completed = tokio::spawn(async move {
+        let mut screen_ready = Some(screen_ready);
+        let mut packets = PacketReader::new();
+        let mut bytes = [0_u8; 16_384];
+        let marker = b"\r\nEVICTED";
+        let mut matched = 0;
+        loop {
+            let count = completion_socket.read(&mut bytes).await?;
+            if count == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "owner stream ended before EVICTED"));
+            }
+            for packet in packets.feed(&bytes[..count])? {
+                match packet.type_ {
+                    MessageType::Screen => {
+                        if let Some(ready) = screen_ready.take() {
+                            ready.send(()).map_err(|_| std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe, "initial SCREEN observer dropped",
+                            ))?;
+                        }
+                    }
+                    MessageType::Data if screen_ready.is_none() => {
+                        for byte in packet.payload {
+                            matched = if byte == marker[matched] { matched + 1 } else { usize::from(byte == marker[0]) };
+                            if matched == marker.len() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    MessageType::Exit => {
+                        return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "owner exited before EVICTED"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), initial_screen).await.unwrap().unwrap();
     runtime.send_line("history-smoke", "evict").unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop { let (status, page) = read(Some(cursor.clone()), incarnation.clone()).await; if page["code"] == "history-cursor-gap" { assert_eq!(status, StatusCode::CONFLICT, "{page}"); break; } tokio::task::yield_now().await; }
     }).await.unwrap();
     assert_eq!(read(None, "stale-incarnation".into()).await.1["code"], "stale-fence");
-    // Cursor eviction starts before the 100,000-row producer command finishes.
-    // A new spaced input command during that flood can lose its command socket
-    // to producer output backpressure before Enter. Wait for the real child
-    // completion marker without weakening the cursor-gap assertion above.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if runtime.screen("history-smoke").unwrap().lines().any(|line| line.trim() == "EVICTED") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    }).await.unwrap();
+    // Cursor eviction starts before the child finishes all 100,000 rows.
+    // The continuously drained actual DATA marker, not a retry or sleep,
+    // proves completion before the next spaced input command.
+    tokio::time::timeout(Duration::from_secs(10), eviction_completed).await.unwrap().unwrap().unwrap();
     runtime.send_line("history-smoke", "oversize").unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
