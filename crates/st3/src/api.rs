@@ -109,10 +109,11 @@ struct CachedClientPage {
     expires_at_unix_ms: u128,
 }
 
-static CLIENT_PAGE_CACHE: OnceLock<Mutex<VecDeque<CachedClientPage>>> = OnceLock::new();
+static CLIENT_PAGE_CACHE: std::sync::LazyLock<parking_lot::Mutex<VecDeque<CachedClientPage>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(VecDeque::new()));
 
-fn client_page_cache() -> &'static Mutex<VecDeque<CachedClientPage>> {
-    CLIENT_PAGE_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+fn client_page_cache() -> &'static parking_lot::Mutex<VecDeque<CachedClientPage>> {
+    &CLIENT_PAGE_CACHE
 }
 
 #[derive(Clone, Copy)]
@@ -1301,9 +1302,7 @@ fn client_page_read(
         if client_now_ms() > cursor.expires_at_unix_ms {
             return Err(client_page_expired("the page cursor expired"));
         }
-        let cache = client_page_cache()
-            .lock()
-            .expect("client page cache poisoned");
+        let cache = client_page_cache().lock();
         let cached = cache
             .iter()
             .find(|entry| {
@@ -1328,7 +1327,6 @@ fn client_page_read(
         let items_digest = hex::encode(Sha256::digest(&serialized));
         let cached = client_page_cache()
             .lock()
-            .expect("client page cache poisoned")
             .iter()
             .find(|entry| {
                 entry.snapshot_id == snapshot.id
@@ -1350,9 +1348,7 @@ fn client_page_read(
     let page_items = items.get(offset..end).unwrap_or_default().to_vec();
     let has_more = end < items.len();
     if query.cursor.is_none() && has_more {
-        let mut cache = client_page_cache()
-            .lock()
-            .expect("client page cache poisoned");
+        let mut cache = client_page_cache().lock();
         cache.retain(|entry| entry.expires_at_unix_ms > client_now_ms());
         if !cache.iter().any(|entry| {
             entry.snapshot_id == snapshot.id
@@ -13858,7 +13854,6 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert!(
             !client_page_cache()
                 .lock()
-                .unwrap()
                 .iter()
                 .any(|entry| { entry.snapshot_id == snapshot.id && entry.collection == "history" }),
             "a history page must not retain every claim in the process cache"

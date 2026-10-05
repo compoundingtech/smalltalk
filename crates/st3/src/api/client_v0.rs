@@ -5191,6 +5191,11 @@ async fn conversation_stream_socket(
         let value = tokio::select! { value = &mut read => value, message = socket.recv() => { if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) { return; } else { continue; } } };
         let value = match value {
             Ok(value) => value,
+            Err(error) if error.code == "stale-fence"
+                && client_error_retryable(error.status, Some(&error.code)) => {
+                tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
+                continue;
+            }
             Err(error) => {
                 close_terminal_stream_with_error(&mut socket, &error).await;
                 return;
@@ -12784,12 +12789,10 @@ mission "example/zero-run" state="ready" {
         let first = prepared_conversations::initial(&state, &session, &session_id).unwrap();
         let cursor = first["initial_page"]["page"]["next_cursor"].as_str().unwrap();
         let decoded = decode_client_cursor(cursor).unwrap();
-        // Fill the ordinary 32-entry cache, evicting the prepared page's history.
-        for entry in 0..CLIENT_PAGE_CACHE_CAPACITY {
-            client_page(&state, &new_client_snapshot(&state), &format!("other/{entry}"),
-                vec![json!({"id":"a"}), json!({"id":"b"})],
-                &ClientListQuery { limit: Some(1), ..Default::default() }).unwrap();
-        }
+        // Evict only this test's backing entry; unrelated parallel cursors stay intact.
+        client_page_cache().lock().retain(|page|
+            !(page.snapshot_id == decoded.snapshot.id && page.collection == decoded.collection
+                && page.items_digest == decoded.items_digest));
         let restored = prepared_conversations::initial(&state, &session, &session_id).unwrap();
         assert_eq!(restored["preparation"], "ready");
         let history = client_page(&state, &decoded.snapshot, &decoded.collection, Vec::new(),
@@ -12797,12 +12800,6 @@ mission "example/zero-run" state="ready" {
         assert_eq!(history.items.iter().map(|entry| (
             entry["id"].as_str().unwrap(), entry["body"]["text"].as_str().unwrap()
         )).collect::<Vec<_>>(), vec![("timeline-entry/prepared-0", "entry 0")]);
-        append("message/other", "message.sent", json!({
-            "from":"person/example", "to":"agent/someone-else", "content":"not here", "status":"sent"
-        }));
-        let unchanged = prepared_conversations::initial(&state, &session, &session_id).unwrap();
-        assert_eq!(unchanged["preparation"], "ready");
-        assert_eq!(unchanged["initial_page"], restored["initial_page"]);
         append(agent, "harness.timeline", json!({
             "operation":"replace", "entry_id":"timeline-entry/prepared-200", "revision":2,
             "role":"assistant", "entry_type":"content", "final":true, "body":{"text":"revised"},
@@ -12814,6 +12811,19 @@ mission "example/zero-run" state="ready" {
             .find(|entry| entry["id"] == "timeline-entry/prepared-200").unwrap();
         assert_eq!(revised_entry["revision"], 2);
         assert_eq!(revised_entry["body"]["text"], "revised");
+        let ready = prepared_conversations::initial(&state, &session, &session_id).unwrap();
+        assert_eq!(ready["preparation"], "ready");
+        // Local revisions keep the claim snapshot ID but create a different history digest.
+        // Serving the new history must not delete the first reader's still-live cursor.
+        let old_history = client_page(&state, &decoded.snapshot, &decoded.collection, Vec::new(),
+            &ClientListQuery { cursor: Some(cursor.to_owned()), ..Default::default() }).unwrap();
+        assert_eq!(old_history.items, history.items);
+        append("message/other", "message.sent", json!({
+            "from":"person/example", "to":"agent/someone-else", "content":"not here", "status":"sent"
+        }));
+        let unchanged = prepared_conversations::initial(&state, &session, &session_id).unwrap();
+        assert_eq!(unchanged["preparation"], "ready");
+        assert_eq!(unchanged["initial_page"], ready["initial_page"]);
         append("message/here", "message.sent", json!({
             "from":"person/example", "to":agent, "session_id":session_id,
             "content":"new message", "status":"sent"

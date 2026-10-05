@@ -1224,6 +1224,8 @@ async fn receive_client_read(
                                 | st3_client::ErrorCode::BlobExpired => StatusCode::GONE,
                                 st3_client::ErrorCode::NotFound
                                 | st3_client::ErrorCode::BlobNotFound => StatusCode::NOT_FOUND,
+                                st3_client::ErrorCode::StaleFence if details.retryable =>
+                                    StatusCode::SERVICE_UNAVAILABLE,
                                 st3_client::ErrorCode::StaleFence => StatusCode::CONFLICT,
                                 _ => StatusCode::UNPROCESSABLE_ENTITY,
                             };

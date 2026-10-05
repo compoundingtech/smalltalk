@@ -1,7 +1,8 @@
 use super::*;
 use std::collections::VecDeque;
 use std::os::unix::fs::MetadataExt as _;
-use std::sync::{LazyLock, Mutex, Weak};
+use std::sync::{LazyLock, Weak};
+use parking_lot::Mutex;
 
 const MAX_PREPARED: usize = 200;
 const MAX_PREPARED_BYTES: usize = 64 * 1024 * 1024;
@@ -84,7 +85,7 @@ fn current(prepared: &Prepared, state: &AppState) -> Result<bool, ApiError> {
     let binding = super::super::managed_session_owner_at(&state.store, index, &prepared.session_id)
         .map_err(ApiError::internal)?.map(|(owner, incarnation, _)| (owner, incarnation));
     if binding != prepared.binding { return Ok(false); }
-    let mut mark = prepared.mark.lock().expect("prepared conversation mark poisoned");
+    let mut mark = prepared.mark.lock();
     let Some(since) = mark.as_mut() else { return Ok(false); };
     if since.changed(state)? {
         // A relevance check advances its watermarks. Never let that make an invalid
@@ -134,9 +135,11 @@ pub(super) fn initial(
         // Preparation owns the backing snapshot even when ordinary pagination evicts it.
         // Re-admit it before returning its cursor, under the same ordinary eviction bound.
         if let Some(page) = &prepared.page {
-            let mut pages = client_page_cache().lock().expect("client page cache poisoned");
+            let mut pages = client_page_cache().lock();
             pages.retain(|entry| entry.expires_at_unix_ms > client_now_ms()
-                && !(entry.snapshot_id == page.snapshot_id && entry.collection == page.collection));
+                && !(entry.snapshot_id == page.snapshot_id && entry.collection == page.collection
+                    && entry.items_digest == page.items_digest
+                    && entry.expires_at_unix_ms == page.expires_at_unix_ms));
             while pages.len() >= CLIENT_PAGE_CACHE_CAPACITY { pages.pop_front(); }
             pages.push_back(page.clone());
         }
@@ -165,7 +168,7 @@ pub(super) fn initial(
 }
 
 fn publish(prepared: Prepared) {
-    let mut entries = cache().lock().expect("prepared conversation cache poisoned");
+    let mut entries = cache().lock();
     entries.retain(|entry| entry.store.strong_count() > 0
         && entry.created.elapsed() < PREPARED_TTL
         && !(entry.store.ptr_eq(&prepared.store) && entry.authority == prepared.authority
@@ -183,7 +186,7 @@ fn find_current(
     session: &ClientSession,
     session_id: &str,
 ) -> Result<Option<Arc<Prepared>>, ApiError> {
-    let prepared = cache().lock().expect("prepared conversation cache poisoned")
+    let prepared = cache().lock()
         .iter().find(|prepared| same_store(prepared, state)
             && prepared.authority == session.authority_actor
             && prepared.session_id == session_id).cloned();
@@ -235,7 +238,7 @@ fn build(
     let page_cursor = value.pointer("/initial_page/page/next_cursor").and_then(Value::as_str)
         .map(decode_client_cursor).transpose()?;
     let page = page_cursor.as_ref().and_then(|cursor| {
-        client_page_cache().lock().expect("client page cache poisoned").iter()
+        client_page_cache().lock().iter()
             .find(|page| page.snapshot_id == cursor.snapshot.id
                 && page.collection == cursor.collection
                 && page.items_digest == cursor.items_digest
@@ -283,7 +286,13 @@ pub(super) async fn prepare(
     session: &ClientSession,
     session_id: &str,
 ) -> Result<bool, ApiError> {
-    prepare_with_budget(state, session, session_id, None).await
+    require_scope(session, "read.projections")?;
+    // Admission is enforced by the transcript owner, including relayed prepare reads.
+    static BUDGET: LazyLock<Arc<tokio::sync::Mutex<tokio::time::Instant>>> =
+        LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())));
+    let budget = BUDGET.clone().lock_owned().await;
+    tokio::time::sleep_until(*budget).await;
+    prepare_with_budget(state, session, session_id, budget).await
 }
 
 type BackgroundBudget = tokio::sync::OwnedMutexGuard<tokio::time::Instant>;
@@ -299,7 +308,7 @@ async fn prepare_with_budget(
     state: &AppState,
     session: &ClientSession,
     session_id: &str,
-    budget: Option<BackgroundBudget>,
+    mut budget: BackgroundBudget,
 ) -> Result<bool, ApiError> {
     require_scope(session, "read.projections")?;
     let permit = slot().await?;
@@ -309,7 +318,7 @@ async fn prepare_with_budget(
         let started = std::time::Instant::now();
         let result = warm(&state, &session, &session_id);
         // The blocking read keeps the budget even if its socket owner is cancelled.
-        if let Some(mut budget) = budget { finish_background(&mut budget, started); }
+        finish_background(&mut budget, started);
         result
     }).await.map_err(ApiError::internal)?
 }
@@ -320,17 +329,11 @@ async fn background(
     session_id: &str,
     remote: Option<&str>,
 ) -> Result<(), ApiError> {
-    static BUDGET: LazyLock<Arc<tokio::sync::Mutex<tokio::time::Instant>>> =
-        LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())));
-    let mut budget = BUDGET.clone().lock_owned().await;
-    tokio::time::sleep_until(*budget).await;
     if remote.is_some() {
-        let started = std::time::Instant::now();
         let result = prepare_conversation_value(state, session, session_id, remote).await;
-        finish_background(&mut budget, started);
         result.map(|_| ())
     } else {
-        prepare_with_budget(state, session, session_id, Some(budget)).await.map(|_| ())
+        prepare(state, session, session_id).await.map(|_| ())
     }
 }
 
