@@ -292,7 +292,7 @@ async fn an_idle_daemon_stays_under_its_cpu_and_request_budget() {
     let state = AppState {
         store: store.clone(),
         notify: notify.clone(),
-        event_notify,
+        event_notify: event_notify.clone(),
         node: NODE.into(),
         state_dir: root.join("daemon"),
         pty_root: root.join("pty"),
@@ -304,6 +304,16 @@ async fn an_idle_daemon_stays_under_its_cpu_and_request_budget() {
         planner_default: st3::model::PlannerSpec::default(),
     };
     std::fs::create_dir_all(root.join("daemon")).unwrap();
+    // The receipt consumer is part of the daemon's idle cost. Its own scans must
+    // not keep waking its filesystem watcher.
+    let receipts = st3::recorder::receipt_path(&root.join("daemon"));
+    std::fs::create_dir_all(&receipts).unwrap();
+    let ingesting_receipts = tokio::spawn(st3::recorder_receipts::run(
+        store.clone(),
+        receipts,
+        notify.clone(),
+        event_notify,
+    ));
     let socket = root.join("st3.sock");
     let server_socket = socket.clone();
     let server = tokio::spawn(async move {
@@ -354,6 +364,7 @@ async fn an_idle_daemon_stays_under_its_cpu_and_request_budget() {
         }
         let _ = seat.wait();
     }
+    ingesting_receipts.abort();
     reconciling.abort();
     server.abort();
 
