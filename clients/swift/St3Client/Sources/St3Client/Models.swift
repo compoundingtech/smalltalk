@@ -43,6 +43,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case invalidQueueContent, invalidIdempotencyKey, staleQueue, queueFull, invalidQueueMove
     case queueRevisionExhausted, staleQueueCursor, queueMetadataTooLarge, queueEntryTooLarge
     case unsupportedHarnessModel, staleHarnessModel, unavailableHarnessModel, unsupportedHarnessEffort, harnessControlBusy
+    case askNoLongerPending, invalidHarnessAnswers, unsupportedHarnessAsk
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired
     case unknown(String)
@@ -70,6 +71,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "unsupported-harness-model": .unsupportedHarnessModel; case "stale-harness-model": .staleHarnessModel
         case "unavailable-harness-model": .unavailableHarnessModel; case "unsupported-harness-effort": .unsupportedHarnessEffort
         case "harness-control-busy": .harnessControlBusy
+        case "ask-no-longer-pending": .askNoLongerPending; case "invalid-harness-answers": .invalidHarnessAnswers; case "unsupported-harness-ask": .unsupportedHarnessAsk
         default: .unknown(raw)
         }
     }
@@ -95,6 +97,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .unsupportedHarnessModel: "unsupported-harness-model"; case .staleHarnessModel: "stale-harness-model"
         case .unavailableHarnessModel: "unavailable-harness-model"; case .unsupportedHarnessEffort: "unsupported-harness-effort"
         case .harnessControlBusy: "harness-control-busy"
+        case .askNoLongerPending: "ask-no-longer-pending"; case .invalidHarnessAnswers: "invalid-harness-answers"; case .unsupportedHarnessAsk: "unsupported-harness-ask"
         case .unknown(let value): value
         }
         var container = encoder.singleValueContainer(); try container.encode(raw)
