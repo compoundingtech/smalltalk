@@ -2,17 +2,18 @@
 // deterministic and zero-cost; neither the ask tool nor terminal/receipt transport is mocked.
 import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 const st = process.env.ST_SMOKE_BIN, daemon = process.env.ST_SMOKE_DAEMON, omp = process.env.OMP_NATIVE_BIN;
 if (!st || !daemon || !omp || !process.env.SMOKE_BULK_DIR) throw Error('ST_SMOKE_BIN, ST_SMOKE_DAEMON, OMP_NATIVE_BIN, SMOKE_BULK_DIR required');
 await mkdir(process.env.SMOKE_BULK_DIR, { recursive: true });
 const root = await mkdtemp(resolve(process.env.SMOKE_BULK_DIR, 'ask-owner-'));
-const sessions = root + '/.omp/agent/sessions/ask-project';
+const identity = 'queue-smoke.control-smoke', subject = 'agent/' + identity;
+const sessions = root + '/drivers/' + createHash('sha256').update(subject).digest('hex').slice(0, 24) + '/sessions/omp/provider-sessions';
 await mkdir(root + '/agent'); await mkdir(sessions, { recursive: true });
 // This isolated provider fixture needs no interactive account onboarding.
 await mkdir(root + '/profile');
 await Bun.write(root + '/profile/config.yml', 'startup:\n  setupWizard: false\n  showSplash: false\n');
-const identity = 'queue-smoke.control-smoke';
-const socket = root + '/daemon.sock', subject = 'agent/' + identity;
+const socket = root + '/daemon.sock';
 const clean = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('ST_') && !key.startsWith('ST3_') && !key.startsWith('AGENT_') && !key.startsWith('PTY_')));
 const providerRequests = [];
 const scenarios = [

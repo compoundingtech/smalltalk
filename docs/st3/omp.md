@@ -22,7 +22,7 @@ Isolated native ask smoke lanes use a PTY tagged with the exact `st3.subject` ac
 publish that PTY's PID/creation incarnation before starting the channel. Browser lanes
 also initialize an isolated signing member so device pairing produces verifiable grants;
 direct owner-HTTP lanes do not require browser pairing. Run the complete disposable
-fixture harness under `setsid -f --wait env -u ST_AGENT -u ST3_SUBJECT` with a bounded
+fixture harness under `setsid -f env -u ST_AGENT -u ST3_SUBJECT` with a bounded
 timeout so its explicit fixture-person requests cannot inherit the invoking coding
 agent's process ancestry. The native and paired listeners retain their normal authentication.
 
