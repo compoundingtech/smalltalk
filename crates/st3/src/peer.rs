@@ -2597,6 +2597,34 @@ mod tests {
         assert!(replicated.complete);
         assert_eq!(replicated.state, "current");
 
+        // A trusted intermediary can carry this invented owner's read through the internal
+        // forwarding route. The owner still authenticates the gateway and supplies the page.
+        let forwarded: Value = crate::client::Client::unix(&sockets[0])
+            .post(
+                CLIENT_READ_FORWARD_PATH,
+                &ClientReadRequest {
+                    authority_actor: "person/avery".into(),
+                    request: ClientReadOperation::Messages {
+                        actor: agent.into(),
+                        history: false,
+                        limit: Some(20),
+                        cursor: None,
+                    },
+                    relay: Some(ClientReadRoute {
+                        target: "host/lag-owner".into(),
+                        path: vec!["lag-source".into()],
+                        hops_left: 3,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let items = forwarded["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "forwarded page has exact owner membership");
+        assert_eq!(items[0]["id"], "message/lag-first");
+        assert_eq!(items[0]["content"], "done, ready for review");
+        assert_eq!(forwarded["page"]["has_more"], false);
+
         // With the owner out of reach the gateway shows what it has and says the list may be
         // missing items; it never passes an empty replica off as the whole list.
         worker.abort();
