@@ -1886,21 +1886,49 @@ export const CollectionFrame = /*#__PURE__*/ (() => Schema.Union([
   Schema.Struct({ "collection": CollectionName, "has_more": Schema.Boolean, "id": Schema.String, "items": Schema.Array(Resource), "kind": Schema.Literal("snapshot"), "order": Schema.Array(Id), "snapshot": Snapshot }),
   Schema.Struct({ "collection": CollectionName, "has_more": Schema.Boolean, "id": Schema.String, "kind": Schema.Literal("changes"), "order": Schema.Array(Id), "removes": Schema.Array(Id), "snapshot": Snapshot, "upserts": Schema.Array(Resource) }),
   Schema.Struct({ "collection": Schema.Literal("terminal"), "id": Schema.String, "kind": Schema.Literal("screen"), "snapshot": Snapshot, "value": TerminalScreen }),
-  Schema.Struct({ "collection": Schema.Literal("conversation"), "has_more": optionalKey(Schema.Boolean), "id": Schema.String, "items": Schema.Array(TimelineEntry), "kind": Schema.Literal("conversation"), "replace": Schema.Boolean, "session_id": Id }),
+  Schema.Struct({ "collection": Schema.Literal("conversation"), "has_more": optionalKey(Schema.Boolean), "id": Schema.String, "items": Schema.Array(TimelineEntry), "kind": Schema.Literal("conversation"), "preparation": optionalKey(Schema.Literals(["ready","miss"])), "replace": Schema.Boolean, "session_id": Id }),
   Schema.Struct({ "code": optionalKey(Schema.String), "collection": optionalKey(Schema.String), "id": Schema.String, "kind": Schema.Literal("resync"), "message": optionalKey(Schema.String), "retryable": optionalKey(Schema.Boolean) }),
   Schema.Struct({ "code": optionalKey(Schema.String), "collection": optionalKey(Schema.String), "id": optionalKey(Schema.String), "kind": Schema.Literal("error"), "message": Schema.String, "retryable": optionalKey(Schema.Boolean) })
 ], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("kind")).annotate({ identifier: "CollectionFrame" }))()
 export type CollectionFrame = typeof CollectionFrame.Type
 export type CollectionFrameEncoded = typeof CollectionFrame.Encoded
 
+export const PageInfo = /*#__PURE__*/ (() => Schema.Struct({
+  "cursor_expires_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
+  "has_more": Schema.Boolean,
+  "limit": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200)),
+  "next_cursor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
+}).annotate({ identifier: "PageInfo" }))()
+export type PageInfo = typeof PageInfo.Type
+export type PageInfoEncoded = typeof PageInfo.Encoded
+
+export const TimelinePage = /*#__PURE__*/ (() => Schema.Struct({
+  "items": Schema.Array(TimelineEntry),
+  "kind": Schema.Literal("timeline-page"),
+  "page": PageInfo,
+  "session_id": Id
+}).annotate({ identifier: "TimelinePage" }))()
+export type TimelinePage = typeof TimelinePage.Type
+export type TimelinePageEncoded = typeof TimelinePage.Encoded
+
 export const ConversationChanges = /*#__PURE__*/ (() => Schema.Struct({
+  "initial_page": optionalKey(TimelinePage),
   "items": Schema.Array(TimelineEntry).check(Schema.isMaxLength(200)),
   "kind": Schema.Literal("conversation-changes"),
   "next_cursor": Cursor,
+  "preparation": optionalKey(Schema.Literals(["ready","miss"])),
   "session_id": Id
 }).annotate({ identifier: "ConversationChanges" }))()
 export type ConversationChanges = typeof ConversationChanges.Type
 export type ConversationChangesEncoded = typeof ConversationChanges.Encoded
+
+export const ConversationPreparation = /*#__PURE__*/ (() => Schema.Struct({
+  "kind": Schema.Literal("conversation-preparation"),
+  "session_id": Id,
+  "state": Schema.Literals(["ready","unavailable"])
+}).annotate({ identifier: "ConversationPreparation" }))()
+export type ConversationPreparation = typeof ConversationPreparation.Type
+export type ConversationPreparationEncoded = typeof ConversationPreparation.Encoded
 
 export const ConversationSearchHit = /*#__PURE__*/ (() => Schema.Struct({
   "agent_id": Schema.OptionFromNullOr(Schema.String),
@@ -1912,15 +1940,6 @@ export const ConversationSearchHit = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "ConversationSearchHit" }))()
 export type ConversationSearchHit = typeof ConversationSearchHit.Type
 export type ConversationSearchHitEncoded = typeof ConversationSearchHit.Encoded
-
-export const PageInfo = /*#__PURE__*/ (() => Schema.Struct({
-  "cursor_expires_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
-  "has_more": Schema.Boolean,
-  "limit": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200)),
-  "next_cursor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
-}).annotate({ identifier: "PageInfo" }))()
-export type PageInfo = typeof PageInfo.Type
-export type PageInfoEncoded = typeof PageInfo.Encoded
 
 export const ConversationSearch = /*#__PURE__*/ (() => Schema.Struct({
   "host_id": Id,
@@ -2099,15 +2118,6 @@ export const SubjectDefinition = /*#__PURE__*/ (() => Schema.Struct({
 export type SubjectDefinition = typeof SubjectDefinition.Type
 export type SubjectDefinitionEncoded = typeof SubjectDefinition.Encoded
 
-export const TimelinePage = /*#__PURE__*/ (() => Schema.Struct({
-  "items": Schema.Array(TimelineEntry),
-  "kind": Schema.Literal("timeline-page"),
-  "page": PageInfo,
-  "session_id": Id
-}).annotate({ identifier: "TimelinePage" }))()
-export type TimelinePage = typeof TimelinePage.Type
-export type TimelinePageEncoded = typeof TimelinePage.Encoded
-
 export const UsageLimit = /*#__PURE__*/ (() => Schema.Struct({
   "account": Schema.String,
   "account_ref": optionalKey(Schema.String),
@@ -2160,7 +2170,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationPreparation, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded

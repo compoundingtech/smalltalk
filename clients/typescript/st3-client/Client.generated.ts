@@ -4,7 +4,7 @@ import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
     SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
-    ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
+    ConversationChanges, ConversationPreparation, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated.ts';
 
@@ -383,6 +383,7 @@ export class St3Client {
     async conversationSearch(text: string, options: { agent?: string; since?: string; cursor?: string; limit?: number } = {}): Promise<EnvelopeOf<ConversationSearch>> { return this.get('/v1/client/conversations/search' + query({ text, ...options })); }
     async timelineList(id: string, options: PageOptions = {}): Promise<EnvelopeOf<TimelinePage>> { return this.get(`/v1/client/sessions/${encodeURIComponent(routedId(id))}/timeline` + query(options)); }
     async conversationChanges(id: string, options: { after?: string; wait_ms?: number } = {}): Promise<EnvelopeOf<ConversationChanges>> { return this.get(`/v1/client/conversations/${encodeURIComponent(routedId(id))}/changes` + query(options)); }
+    async conversationPrepare(id: string): Promise<EnvelopeOf<ConversationPreparation>> { return this.get(`/v1/client/conversations/${encodeURIComponent(routedId(id))}/prepare`); }
     async eventsList(options: EventOptions = {}): Promise<EnvelopeOf<EventPage>> { return this.get('/v1/client/events' + query(options), 'events'); }
     async terminalScreen(id: string): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`); }
     async glassesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/glasses' + query(options)); }

@@ -437,6 +437,7 @@ export type CollectionFrame = ({
   id: string;
   items: Array<TimelineEntry>;
   kind: "conversation";
+  preparation?: "ready" | "miss";
   replace: boolean;
   session_id: Id;
 } | {
@@ -458,10 +459,18 @@ export type CollectionFrame = ({
 export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses";
 
 export type ConversationChanges = {
+  initial_page?: TimelinePage;
   items: Array<TimelineEntry>;
   kind: "conversation-changes";
   next_cursor: Cursor;
+  preparation?: "ready" | "miss";
   session_id: Id;
+};
+
+export type ConversationPreparation = {
+  kind: "conversation-preparation";
+  session_id: Id;
+  state: "ready" | "unavailable";
 };
 
 export type ConversationSearch = {
@@ -552,7 +561,7 @@ export type Envelope = {
   api_version: "st3.client.v0";
   request_id: RequestId;
   snapshot: Snapshot;
-  value: (Capabilities | DocumentContent | SubjectDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
+  value: (Capabilities | DocumentContent | SubjectDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationPreparation | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
 export type ErrorCode = ("attention-migrated" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);

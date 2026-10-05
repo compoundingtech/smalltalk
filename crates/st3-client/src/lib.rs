@@ -1543,6 +1543,16 @@ impl Client {
         self.conversation_changes_internal(session_id, after, wait_ms)
             .await
     }
+    pub async fn conversation_prepare(
+        &self,
+        session_id: &str,
+    ) -> Result<Envelope<ConversationPreparation>, ClientError> {
+        self.get(&format!(
+            "/v1/client/conversations/{}/prepare",
+            percent_encode_segment(session_id.trim_start_matches("session/"))
+        ))
+        .await
+    }
     pub async fn events(
         &self,
         after: Option<&str>,

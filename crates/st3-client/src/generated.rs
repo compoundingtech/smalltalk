@@ -1610,11 +1610,22 @@ pub struct ConversationSearch {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ConversationPreparation {
+    pub kind: String,
+    pub session_id: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ConversationChanges {
     pub kind: String,
     pub session_id: String,
     pub items: Vec<TimelineEntry>,
     pub next_cursor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_page: Option<TimelinePage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

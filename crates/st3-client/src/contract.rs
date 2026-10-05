@@ -112,6 +112,7 @@ pub const READ_OPERATIONS: &[(&str, &str)] = &[
     ("conversation.search", "/v1/client/conversations/search"),
     ("timeline.list", "/v1/client/sessions/{id}/timeline"),
     ("conversation.changes", "/v1/client/conversations/{id}/changes"),
+    ("conversation.prepare", "/v1/client/conversations/{id}/prepare"),
     ("events.list", "/v1/client/events"),
     ("terminal.screen", "/v1/client/terminals/{id}/screen"),
     ("glasses.list", "/v1/client/glasses"),
