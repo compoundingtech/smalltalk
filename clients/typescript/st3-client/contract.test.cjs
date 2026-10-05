@@ -17,7 +17,7 @@ fs.rmSync(temporary, { recursive: true, force: true });
 
 const snapshot = { id: 'snapshot/test', host_id: 'host/test', store_index: 1, projection_version: 'client-projection.v0', created_at: '2026-09-20T00:00:00Z' };
 
-test('native HTTP cancellation covers pending headers and streamed JSON bodies', async t => {
+test('native HTTP cancellation covers pending headers and streamed JSON bodies', { timeout: 5000 }, async t => {
     const http = require('node:http');
     const { once } = require('node:events');
     let arrived;
@@ -37,10 +37,12 @@ test('native HTTP cancellation covers pending headers and streamed JSON bodies',
     t.after(() => { server.closeAllConnections(); server.close(); });
     const client = new St3Client({ baseUrl: `http://127.0.0.1:${server.address().port}` });
     await client.discover();
-    for (const phase of ['headers', 'body']) {
+    for (const phase of ['headers', 'body', 'mail-backlog']) {
         const controller = new AbortController();
         const arrival = new Promise(resolve => { arrived = resolve; });
-        const pending = client.runtimesGet(phase, { signal: controller.signal });
+        const pending = phase === 'mail-backlog'
+            ? client.mailBacklogSummary({ signal: controller.signal })
+            : client.runtimesGet(phase, { signal: controller.signal });
         const rejected = assert.rejects(pending, error => error.name === 'AbortError');
         await arrival;
         controller.abort();

@@ -1120,7 +1120,7 @@ fn typescript_operation_methods(
                 "    async {method}(requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}', undefined, requestOptions); }}"
             )?;
         } else if id == "mail-backlog.summary" {
-            writeln!(out, "    async mailBacklogSummary(): Promise<EnvelopeOf<MailBacklog>> {{ return this.get('/v1/client/mail-backlog'); }}")?;
+            writeln!(out, "    async mailBacklogSummary(requestOptions: RequestOptions = {{}}): Promise<EnvelopeOf<MailBacklog>> {{ return this.get('/v1/client/mail-backlog', undefined, requestOptions); }}")?;
         } else if id == "usage.period" {
             writeln!(
                 out,
