@@ -21,6 +21,7 @@ struct Runtime {
     refuse_start: Mutex<bool>,
     attempts: Mutex<Vec<MemberSpec>>,
     exit_on_start: Mutex<bool>,
+    before_start: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     snapshot_unavailable: Mutex<bool>,
 }
 impl RuntimeControl for Runtime {
@@ -36,6 +37,18 @@ impl RuntimeControl for Runtime {
     }
     fn observe_exec(&self, id: &str) -> anyhow::Result<Option<RuntimeObservation>> {
         Ok(self.observations.lock().unwrap().get(id).cloned())
+    }
+    fn start_guarded(
+        &self,
+        member: &MemberSpec,
+        guard: &dyn Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        guard()?;
+        if let Some(before) = self.before_start.lock().unwrap().take() {
+            before();
+        }
+        guard()?;
+        self.start(member)
     }
     fn start(&self, member: &MemberSpec) -> anyhow::Result<()> {
         self.attempts.lock().unwrap().push(member.clone());
@@ -1928,5 +1941,82 @@ async fn a_native_retry_that_exits_before_readiness_is_failed_even_after_observi
     assert_eq!(
         restart_result(&fixture, &request).kind,
         "runtime.action.failed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_superseded_explicit_attempt_cannot_park_the_new_declaration() {
+    let (fixture, subject) = Fixture::launching(
+        Shape::TopLevel,
+        r#"harness "omp" { model "example-model"; }"#,
+        "always",
+    )
+    .await;
+    hang_up(&fixture);
+    park(&fixture, &subject, "omp");
+    let request = fixture.request(&subject, "superseded-at-spawn").await;
+    let source = format!(
+        r#"version 2
+agent "example/worker" {{
+    workspace {:?}
+    harness "omp" {{ model "replacement-model"; }}
+    restart always
+}}"#,
+        fixture.root.path().to_str().unwrap()
+    );
+    let store = fixture.store.clone();
+    *fixture.runtime.before_start.lock().unwrap() = Some(Box::new(move || {
+        let intent = st3::parse_intent(&source, "restart-test").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                st3::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "replace-at-spawn",
+                Some("person/avery"),
+            )
+            .unwrap();
+    }));
+    let daemon = restarted_daemon(&fixture);
+    reconcile_ready(&fixture, &daemon, &subject);
+    // The stale explicit launch is fenced out; only the healthy new declaration launches.
+    assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 2);
+    let result = restart_result(&fixture, &request);
+    assert_eq!(result.kind, "runtime.action.failed");
+    assert!(
+        result.body["fields"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("superseded")
+    );
+    let token = fixture
+        .store
+        .launch_lineage(&subject)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        !fixture
+            .store
+            .observations_for(&subject, "runtime.reconcile-decision")
+            .unwrap()
+            .iter()
+            .any(|claim| claim.body["fields"]["key"] == format!("runtime-crash-loop:{token}")),
+        "an old restart failure must not park a new declaration"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .member_reconcile_fault(&subject, None)
+            .unwrap(),
+        None
     );
 }

@@ -675,6 +675,9 @@ impl NativeRuntime {
                     )
                 }
             } else {
+                if let Some(guard) = guard {
+                    guard()?;
+                }
                 runtime.spawn(
                     &member.runtime_id,
                     &launch,
@@ -685,6 +688,9 @@ impl NativeRuntime {
                 )
             }
         } else {
+            if let Some(guard) = guard {
+                guard()?;
+            }
             self.exec
                 .spawn(&member.runtime_id, &launch, &cwd, &environment)
                 .map(|_| ())
@@ -4830,6 +4836,13 @@ impl<R: RuntimeControl> Reconciler<R> {
         let desired_token = self.launch_token(&subject.subject)?;
         let guard = || -> Result<()> {
             self.store.owned_desired_guard(subject)?;
+            if let Some(request) = request {
+                anyhow::ensure!(
+                    self.store.selected_desired_token(&subject.subject)?.as_deref()
+                        == request.body.pointer("/evidence/0").and_then(Value::as_str),
+                    "the explicit restart declaration changed before launch"
+                );
+            }
             if let Some(operation) = member.environment.get(crate::rollout::OPERATION_ENV) {
                 anyhow::ensure!(
                     self.store
@@ -5618,27 +5631,40 @@ impl<R: RuntimeControl> Reconciler<R> {
         request: &crate::model::ClaimRecord,
         detail: &str,
     ) -> Result<bool> {
-        let reason = format!("the explicit restart failed and the seat is parked again: {detail}");
+        // Capture the launch lineage before checking the request's fence. A concurrent
+        // declaration change must never make this old failure park a replacement declaration.
         let token = self.launch_token(&subject.subject)?;
+        let current = self
+            .store
+            .selected_desired_token(&subject.subject)?
+            .as_deref()
+            == request.body.pointer("/evidence/0").and_then(Value::as_str);
+        let reason = if current {
+            format!("the explicit restart failed and the seat is parked again: {detail}")
+        } else {
+            format!("the explicit restart was superseded by a declaration change: {detail}")
+        };
         let park = if member.driver.as_deref() == Some("codex") {
             "codex-crash-loop"
         } else {
             "runtime-crash-loop"
         };
-        self.store.append_claim(&ClaimInput {
-            subject: subject.subject.clone(),
-            kind: "runtime.reconcile-decision".into(),
-            actor: None,
-            fields: BTreeMap::from([
-                ("decision".into(), Value::String("raise".into())),
-                ("reachability".into(), Value::String("unreachable".into())),
-                ("key".into(), Value::String(format!("{park}:{token}"))),
-                ("reason".into(), Value::String(reason.clone())),
-            ]),
-            evidence: vec![request.id.clone()],
-            expected_subject: None,
-            idempotency_key: Some(format!("agent-restart-parked:{}", request.id)),
-        })?;
+        if current {
+            self.store.append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "runtime.reconcile-decision".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("decision".into(), Value::String("raise".into())),
+                    ("reachability".into(), Value::String("unreachable".into())),
+                    ("key".into(), Value::String(format!("{park}:{token}"))),
+                    ("reason".into(), Value::String(reason.clone())),
+                ]),
+                evidence: vec![request.id.clone()],
+                expected_subject: None,
+                idempotency_key: Some(format!("agent-restart-parked:{}", request.id)),
+            })?;
+        }
         self.store.append_claim(&ClaimInput {
             subject: subject.subject.clone(),
             kind: "runtime.action.failed".into(),
@@ -5646,7 +5672,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             fields: BTreeMap::from([
                 ("action".into(), Value::String("restart".into())),
                 ("reason".into(), Value::String(reason.clone())),
-                ("desired_token".into(), Value::String(token)),
             ]),
             evidence: vec![request.id.clone()],
             expected_subject: None,
