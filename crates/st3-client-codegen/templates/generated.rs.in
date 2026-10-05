@@ -462,6 +462,41 @@ pub struct UsageRow {
     pub host: Option<String>,
     #[serde(default)]
     pub pricing: Option<String>,
+    #[serde(default)]
+    pub native_session_id: Option<String>,
+    #[serde(default)]
+    pub pricing_provenance: Option<Vec<UsagePricing>>,
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_write_1h_tokens: u64,
+    pub cached_tokens: u64,
+    pub cost_microusd: u64,
+    pub reported_cost_microusd: u64,
+    pub unpriced_tokens: u64,
+}
+
+/// Effective USD-per-million rates applied to the disjoint token buckets.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UsagePricingRates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write_5m: f64,
+    pub cache_write_1h: f64,
+}
+
+/// A price/source contribution, cumulative on claims and differenced on period reads.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UsagePricing {
+    #[serde(default)]
+    pub price_table_id: Option<String>,
+    #[serde(default)]
+    pub price_table_version: Option<String>,
+    pub cost_source: String,
+    #[serde(default)]
+    pub rates_usd_per_million_tokens: Option<UsagePricingRates>,
     pub total_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,

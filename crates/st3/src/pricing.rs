@@ -11,8 +11,26 @@
 /// The prices below. Change it with every edit to [`MODELS`].
 pub const PRICING_REVISION: &str = "2026-10-02";
 
+pub const PRICE_TABLE_ID: &str = "st.api-list";
+
+/// Content-addressed as well as dated: changing any price always changes the version.
+pub fn price_table_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| version_for(MODELS))
+}
+
+fn version_for(table: &[(&str, Rates)]) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{PRICING_REVISION}:{}",
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(table).expect("finite price table")
+        ))
+    )
+}
+
 /// US dollars per million tokens of each disjoint bucket.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct Rates {
     pub input: f64,
     pub output: f64,
@@ -24,7 +42,7 @@ pub struct Rates {
     pub long_context: Option<LongContext>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct LongContext {
     pub above_prompt_tokens: u64,
     pub prompt_multiplier: f64,
@@ -120,18 +138,9 @@ pub struct Tokens {
 /// table has no price for its model.
 pub fn cost_microusd(model: &str, tokens: Tokens) -> Option<u64> {
     let rates = rates(model)?;
-    let prompt = tokens
-        .input
-        .saturating_add(tokens.cache_read)
-        .saturating_add(tokens.cache_write);
-    let (prompt_multiplier, output_multiplier) = match rates.long_context {
-        Some(long) if prompt > long.above_prompt_tokens => {
-            (long.prompt_multiplier, long.output_multiplier)
-        }
-        _ => (1.0, 1.0),
-    };
+    let (prompt_multiplier, output_multiplier) = context_multipliers(rates, tokens);
     let one_hour = tokens.cache_write_1h.min(tokens.cache_write);
-    // Dollars per million tokens is millionths of a dollar per token.
+    // Keep the original arithmetic and per-response rounding when adding provenance.
     let micro = prompt_multiplier
         * (tokens.input as f64 * rates.input
             + tokens.cache_read as f64 * rates.cache_read
@@ -141,9 +150,43 @@ pub fn cost_microusd(model: &str, tokens: Tokens) -> Option<u64> {
     Some(micro.round() as u64)
 }
 
+/// Effective USD-per-million rates, including this response's context multipliers.
+pub fn applied_rates(model: &str, tokens: Tokens) -> Option<Rates> {
+    let mut rates = *rates(model)?;
+    let (prompt_multiplier, output_multiplier) = context_multipliers(&rates, tokens);
+    rates.input *= prompt_multiplier;
+    rates.cache_read *= prompt_multiplier;
+    rates.cache_write_5m *= prompt_multiplier;
+    rates.cache_write_1h *= prompt_multiplier;
+    rates.output *= output_multiplier;
+    rates.long_context = None;
+    Some(rates)
+}
+
+fn context_multipliers(rates: &Rates, tokens: Tokens) -> (f64, f64) {
+    let prompt = tokens
+        .input
+        .saturating_add(tokens.cache_read)
+        .saturating_add(tokens.cache_write);
+    match rates.long_context {
+        Some(long) if prompt > long.above_prompt_tokens => {
+            (long.prompt_multiplier, long.output_multiplier)
+        }
+        _ => (1.0, 1.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_price_change_changes_the_version_without_relying_on_the_label() {
+        let mut changed = MODELS.to_vec();
+        changed[0].1.input += 0.01;
+        assert_ne!(version_for(&changed), price_table_version());
+        assert_eq!(version_for(MODELS), price_table_version());
+    }
 
     #[test]
     fn harness_spellings_resolve_to_the_api_model() {
