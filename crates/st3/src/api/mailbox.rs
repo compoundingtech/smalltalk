@@ -250,7 +250,7 @@ fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
 }
 
 /// The longest a mailbox stream goes without reading its seat's mailbox in full.
-const MAILBOX_FULL_SNAPSHOT: Duration = Duration::from_secs(60);
+const MAILBOX_FULL_SNAPSHOT: Duration = Duration::from_secs(3);
 
 async fn stream(state: AppState, fence: Fence, socket: WebSocket) {
     stream_with_reader(state, fence, socket, snapshot).await;
@@ -267,15 +267,21 @@ where
     };
     // Subscribe before reading to close the replay-to-live race. Watch coalesces writes; every
     // wake recomputes the durable state, so lag needs no lossy event cursor.
-    let mut changed = state.event_notify.subscribe();
+    let mut subscription = state.store.subscribe_mailbox(&fence, &state.event_notify);
     let mut previous_seat = Vec::new();
     let mut previous_mailbox = Vec::new();
     let mut previous_drain = None;
     let mut recovered = std::collections::BTreeSet::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     let mut dirty = true;
+    let mut safety = tokio::time::interval_at(
+        tokio::time::Instant::now() + MAILBOX_FULL_SNAPSHOT,
+        MAILBOX_FULL_SNAPSHOT,
+    );
+    safety.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut force_snapshot = false;
     // What the last snapshot read, and when the last full snapshot ran. A wake reads the seat's
-    // mailbox again only when something it depends on changed, or a minute has passed.
+    // mailbox again only when something it depends on changed, or the safety timer fires.
     let mut last: Option<(
         crate::store::MailboxWatermark,
         Vec<String>,
@@ -283,8 +289,9 @@ where
     )> = None;
     loop {
         if dirty {
-            changed.borrow_and_update();
+            subscription.changed.borrow_and_update();
             if let Some((mark, subjects, at)) = last.clone()
+                && !force_snapshot
                 && at.elapsed() < MAILBOX_FULL_SNAPSHOT
             {
                 let store = state.store.clone();
@@ -372,10 +379,11 @@ where
             // stored in the graph.
             crate::github_watch::add_excerpts(&mut messages).await;
             last = mark.map(|mark| {
-                let subjects = messages
+                let subjects: Vec<String> = messages
                     .iter()
                     .map(|message| message.subject.clone())
                     .collect();
+                subscription.messages(&subjects);
                 (mark, subjects, tokio::time::Instant::now())
             });
             let bytes = serde_json::to_vec(&messages).unwrap_or_default();
@@ -412,9 +420,11 @@ where
                 }
             }
             dirty = false;
+            force_snapshot = false;
         }
         tokio::select! {
-            event = changed.changed() => { if event.is_err() { return; } dirty = true; },
+            event = subscription.changed.changed() => { if event.is_err() { return; } dirty = true; },
+            _ = safety.tick() => { dirty = true; force_snapshot = true; },
             incoming = socket.recv() => match incoming {
                 Some(Ok(WsMessage::Text(report))) => {
                     if state.store.check_mailbox(&fence).is_ok() {
@@ -515,7 +525,7 @@ mod tests {
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
     ) -> Frame {
         loop {
-            match tokio::time::timeout(Duration::from_secs(3), socket.next())
+            match tokio::time::timeout(Duration::from_secs(5), socket.next())
                 .await
                 .unwrap()
                 .unwrap()
@@ -1557,6 +1567,154 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn a_write_during_the_first_snapshot_is_delivered_without_waiting_for_safety() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
+        crate::mailbox::tests::ready(&state.store, "session-1");
+        let fence = state
+            .store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/v1/mailbox",
+                get(
+                    move |State(state): State<AppState>,
+                          Query(fence): Query<Fence>,
+                          websocket: WebSocketUpgrade| {
+                        let injected = injected.clone();
+                        async move {
+                            let events = state.event_notify.clone();
+                            websocket.on_upgrade(move |socket| {
+                                stream_with_reader(state, fence, socket, move |store, fence| {
+                                    let result = snapshot(store, fence)?;
+                                    if !injected.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                        store.append_claim(&ClaimInput {
+                                            subject: "message/during-snapshot".into(),
+                                            kind: "message.sent".into(),
+                                            actor: Some("person/fixture".into()),
+                                            fields: BTreeMap::from([
+                                                ("status".into(), json!("sent")),
+                                                ("from".into(), json!("person/fixture")),
+                                                ("to".into(), json!("agent/eval.worker")),
+                                                ("content".into(), json!("Written after the read.")),
+                                            ]),
+                                            evidence: vec![],
+                                            expected_subject: None,
+                                            idempotency_key: None,
+                                        })?;
+                                        events.send_modify(|generation| *generation += 1);
+                                    }
+                                    Ok(result)
+                                })
+                            })
+                        }
+                    },
+                ),
+            )
+            .with_state(state);
+        let path = root.path().join("daemon.sock");
+        let server_path = path.clone();
+        let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = Client::new(Endpoint::Unix(path));
+        let mut socket = client.open_mailbox(&fence).await.unwrap();
+        assert!(matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.is_empty()));
+        let frame = tokio::time::timeout(Duration::from_secs(1), next(&mut socket))
+            .await
+            .unwrap();
+        assert!(
+            matches!(frame, Frame::Mailbox { messages } if messages.len() == 1 && messages[0].subject == "message/during-snapshot")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn safety_recheck_delivers_a_deliberately_missed_dependency() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
+        crate::mailbox::tests::ready(&state.store, "session-1");
+        let peer = NativeDeliveryPeer {
+            agent: "agent/eval.worker".into(),
+            transport: "app-server",
+            pid: 37,
+            archives_inbox: true,
+        };
+        let app = router(state.clone()).layer(Extension(peer));
+        let path = root.path().join("daemon.sock");
+        let server_path = path.clone();
+        let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = Client::new(Endpoint::Unix(path));
+        let fence: Fence = client
+            .post(
+                "/v1/mailbox/bind",
+                &Fence::new("agent/eval.worker", "session-1", "delivery"),
+            )
+            .await
+            .unwrap();
+        let mut socket = client.open_mailbox(&fence).await.unwrap();
+        assert!(matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.is_empty()));
+        state
+            .store
+            .miss_mailbox_recipient_for_test("agent/eval.worker");
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/missed-dependency".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/fixture".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("person/fixture")),
+                    ("to".into(), json!("agent/eval.worker")),
+                    ("content".into(), json!("Recovered by the safety timer.")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        signal_changed(&state);
+        let started = tokio::time::Instant::now();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), next(&mut socket))
+                .await
+                .is_err(),
+            "missing dependency must suppress the ordinary wake"
+        );
+        let frame = tokio::time::timeout(Duration::from_secs(4), next(&mut socket))
+            .await
+            .unwrap();
+        assert!(
+            matches!(frame, Frame::Mailbox { messages } if messages.len() == 1 && messages[0].subject == "message/missed-dependency")
+        );
+        assert!(started.elapsed() <= MAILBOX_FULL_SNAPSHOT + Duration::from_secs(1));
+        // Suppress the owner's notification too: the same timer must fence ownership changes.
+        state
+            .store
+            .miss_mailbox_owner_for_test("agent/eval.worker", "delivery");
+        state
+            .store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(4), next(&mut socket))
+                .await
+                .unwrap(),
+            Frame::Fenced { .. }
+        ));
+        server.abort();
+    }
+
     #[test]
     fn a_mailbox_stream_reads_again_only_for_what_its_snapshot_depends_on() {
         let store = Store::open_memory("node").unwrap();
@@ -1628,3 +1786,7 @@ mod tests {
         assert!(authorize(&fence, Some(&peer)).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "mailbox_profile.rs"]
+mod profile;

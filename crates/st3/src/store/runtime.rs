@@ -8,6 +8,7 @@ use super::*;
 /// the graph for the caches its reads use.
 #[derive(Default)]
 pub struct SmalltalkRuntime {
+    pub(crate) mailbox_wakes: std::sync::OnceLock<Arc<mailbox_wakes::Wakes>>,
     #[cfg(test)]
     pub(crate) work_extension_roots_rebuilt: std::sync::atomic::AtomicUsize,
     /// Simulate different build registries on isolated nodes in compatibility tests.

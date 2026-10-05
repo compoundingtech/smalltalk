@@ -84,7 +84,19 @@ prepared-statement reuse from #1234. Profiling counts fresh connections as
 
 Each reader keeps up to 128 prepared statements. Mailbox changed-since, owner/binding,
 local watermark, and snapshot fence checks reuse those statements; caching removes repeated
-SQL preparation but does not change the graph-wide wake fan-out.
+SQL preparation. Mailbox streams now use a local dependency index: one dispatcher reads new
+claim subjects and local observations from the existing post-commit feed and wakes only streams
+depending on their seat, message subjects or recipient. Local binding commits wake the affected
+owner/component directly. This routing state is disposable and never replicated.
+
+Streams subscribe before their first read and retain the durable changed-since and fencing
+checks. A full safety read every three seconds recovers missing dependencies, missed notifications
+and ownership changes. There is no debounce. `task mailbox-wake-dispatch`,
+`task mailbox-change-check` and `task mailbox-snapshot` expose the routing, checking and full-read
+costs separately in doctor and profiling counters. Run the isolated many-stream comparison with
+`cargo test --release -p st3 --lib api::mailbox::profile::many_streams -- --ignored --exact --nocapture`;
+`ST_MAILBOX_PROFILE_DIR` retains its generated store, latency/CPU results, doctor counters and
+profile. Its load client and daemon run in separate processes.
 
 Status reachability checks walk the sparse `operations_conflict_index` and seek matching
 claims through `claims_operation_index`. An unrelated idempotency conflict must not turn
@@ -144,3 +156,48 @@ or unhealthy health, a frontier ahead of the log, a non-incremental kind, a work
 malformed operation metadata, an operation conflict, and `incremental-error:CODE`. Healthy
 incremental chunks produce no fallback log. The target is the admitted index observed at entry;
 a full replay can also include claims admitted since that observation.
+
+## Targeted mailbox wake comparison (2026-10-05)
+
+The isolated fixture used 128 invented seats, 256 Unix mailbox streams, a fresh WAL store,
+3,000 writes (100 targeted messages), and 32 owner replacements. Both builds used Nix Rust
+1.97.0 / LLVM 21.1.8, release settings and profiling. The baseline commit
+`0295286eb051650674b769e5c023aa8acb80d990` includes prepared-statement caching (#1492).
+The daemon and load client were separate processes; providers and the reconciler were absent.
+
+| Measurement | Baseline | Targeted wakes |
+| --- | ---: | ---: |
+| Write phase elapsed | 343.25 s | 30.31 s |
+| Actual writes/s (requested 100) | 8.74 | 98.97 |
+| Daemon CPU for all 3,000 writes | 3,344.17 s | 5.58 s |
+| Average daemon CPU cores | 9.74 | 0.184 |
+| Mailbox delivery p50 / p95 / max | 552.68 / 719.22 / 1,156.00 ms | 2.14 / 2.81 / 9.48 ms |
+| Ownership fencing p50 / p95 / max | 212.80 / 702.60 / 945.69 ms | 0.73 / 0.88 / 2.17 ms |
+| Write API p95 | 207.76 ms | 1.80 ms |
+
+Latency runs from API request start to the recipient mailbox frame or old-owner fenced frame,
+including the write. CPU covers the entire write phase plus a 300 ms settle, excluding setup,
+doctor and owner replacements. The baseline saturated below requested pacing, so these are
+identical completed workloads rather than equal write-rate or equal-duration windows.
+
+The actual doctor samples are rolling five-minute counters: the baseline's final sample covers
+292 sampled seconds, and the targeted sample covers 33. They are not full-run deltas.
+
+| Doctor counter | Baseline | Targeted wakes |
+| --- | ---: | ---: |
+| `task mailbox-change-check` count | 420,776 | 200 |
+| Change-check summed wall / CPU | 47,357,010 / 2,684,611 ms | 19.88 / 18.23 ms |
+| `task mailbox-snapshot` count | 1,235 | 3,016 |
+| Snapshot summed wall / CPU | 449,550 / 37,791 ms | 1,247.78 / 1,147.92 ms |
+| `task mailbox-wake-dispatch` count | absent | 3,252 |
+| Dispatcher summed wall / CPU | absent | 336.69 / 313.10 ms |
+
+The targeted run performed two changed-since checks per targeted message (delivery and title)
+and none for the 2,900 unrelated writes. More snapshots are intentional: every stream performs
+its three-second safety read. Task wall times overlap and must not be added as process elapsed
+time. Synthetic latency and CPU values describe this fixture, rather than a production guarantee.
+
+Raw measurements, before/after performance snapshots, doctor task counters and build/fixture
+metadata: [baseline](profiles/targeted-mailbox-wakes-2026-10-05/baseline.json) and
+[targeted wakes](profiles/targeted-mailbox-wakes-2026-10-05/targeted-wakes.json).
+Reproduce with the ignored test above using `--release` on each version and the same fixture.

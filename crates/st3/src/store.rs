@@ -5,6 +5,7 @@ mod arrangements;
 #[cfg(test)]
 mod arrangements_tests;
 mod glasses;
+pub(crate) mod mailbox_wakes;
 pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
@@ -14750,6 +14751,9 @@ impl Store {
             ON CONFLICT(subject,component) DO UPDATE SET incarnation=excluded.incarnation, epoch=excluded.epoch",
             params![bound.subject, bound.component, bound.incarnation, bound.epoch]).map_err(internal)?;
         tx.commit().map_err(internal)?;
+        if let Some(wakes) = self.smalltalk.mailbox_wakes.get() {
+            wakes.owner_changed(&bound.subject, &bound.component);
+        }
         Ok(bound)
     }
 
@@ -14806,8 +14810,9 @@ impl Store {
 
     /// Whether anything a mailbox stream's snapshot reads changed after `mark`: a claim or local
     /// observation of the seat (its declaration, runtime and harness), its channel ownership, a
-    /// message sent to it or newly declared, or a claim of a message in its last snapshot. Every
-    /// graph change wakes every stream, and each used to read the seat's whole mailbox again.
+    /// message sent to it or newly declared, or a claim of a message in its last snapshot. The
+    /// local dispatcher targets dependent streams; this durable check still filters coalesced
+    /// wakes, without trusting the ephemeral routing index for correctness.
     pub(crate) fn mailbox_changed_since(
         &self,
         fence: &crate::mailbox::Fence,
