@@ -30,6 +30,32 @@ latest state. The repository resource keeps only its own facts, such as `reposit
 | `reactions` | `reactions` (each reaction's count), and `last_comment.reactions` |
 | `mentions` | `mentions`: the newest mention of each GitHub login in the item's body or comments (`login`, `by`, `url`, `at`), up to 50 |
 
+`vcs.repository`, `vcs.issue`, and `vcs.pull-request` carry optional GitHub `node_id` facts.
+Subjects keep their existing OWNER/REPO/number names. A repository rename or transfer records
+`moved_to` on the old repository; a relocated item records it on the old item, pointing to the
+canonical `resource/github/OWNER/REPO/issue/NUMBER` or `pull-request/NUMBER` subject. Watches and
+post receipts retain their existing keys. The repository's numeric ID still guards against a
+locator being reused for a different repository.
+
+A merged pull request carries `merge_commit_sha`, `merged_at`, and `merged_by` (a GitHub login).
+Its `state_reason` is `merged`; an unmerged closed pull request has `closed`. An issue carries
+`closed_by` (a GitHub login) and GitHub's `state_reason`. Both can carry `closed_by_resource`, a
+subject reference to the pull request or commit that closed them. An open or reopened item clears
+its previous resolution facts; a speculative test merge is never recorded as a merge resolution.
+Missing facts in older observations remain valid.
+
+REST supplies identities and merge timestamps through the existing since/ETag listings. The
+cursor remembers original item numbers by node ID. The existing throttled GraphQL detail read
+also resolves these nodes, including their latest filtered `ClosedEvent`, to obtain closing
+actors, links, and transfers that disappeared from the old repository's listing. An issues-only
+observer with known identities shares the same detail gate and cache; it reads only identities
+unless another observer also requests open pull requests.
+Each detail page resolves at most 100 remembered identities, rotating across polls, so identity
+tracking does not add pages to the existing open-PR query. Quiet polls use the cached answer;
+settled identities are checked at most every fifteen minutes. Final closed identities leave the
+cursor's pending set after their resolution is read. An open transferred identity remains tracked
+so a watch on its original subject still sees it close.
+
 A comment body never enters the graph. `body_digest` tells one body from another, and `url` leads to
 the text. A subscription that selects `comments`, `reactions`, or `mentions` hears a change of that
 type only; a check, a review's state, or a new head is a `pull_requests` change, and a new entry in

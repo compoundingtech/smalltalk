@@ -45276,6 +45276,62 @@ mission "review-guardrail" state="ready" {
     }
 
     #[test]
+    fn relocated_items_keep_subjects_and_resolution_through_partial_observations() {
+        let repository = "resource/github/acme/garden";
+        let previous = json!({"repository_id": 7});
+        let current = json!({"repository_id": 7, "issues": [{
+            "number": 1, "node_id": "I_orchid", "state": "closed", "new": false,
+            "moved_to": "resource/github/acme/greenhouse/issue/77",
+            "closed_by": "fern", "closed_by_resource": "resource/github/acme/greenhouse/pull-request/2",
+            "state_reason": "completed"
+        }]});
+        let old =
+            json!({"repository": repository, "number": 1, "node_id": "I_orchid", "state": "open"});
+        let changed = discovered_collection_items(
+            repository,
+            "issues",
+            Some(&previous),
+            &current,
+            &mut |_| Some(old.clone()),
+        );
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].subject, "resource/github/acme/garden/issue/1");
+        assert!(!changed[0].deliver);
+        assert_eq!(changed[0].facts["repository"], repository);
+        assert_eq!(changed[0].facts["number"], 1);
+        assert_eq!(
+            changed[0].facts["moved_to"],
+            "resource/github/acme/greenhouse/issue/77"
+        );
+        let partial = Value::Object(item_facts(
+            repository,
+            "issues",
+            1,
+            Some(&changed[0].facts),
+            &json!({"number": 1, "comments": 4}),
+        ));
+        for name in [
+            "node_id",
+            "moved_to",
+            "closed_by",
+            "closed_by_resource",
+            "state_reason",
+        ] {
+            assert_eq!(partial[name], changed[0].facts[name]);
+        }
+        assert!(
+            discovered_collection_items(
+                repository,
+                "issues",
+                Some(&previous),
+                &current,
+                &mut |_| Some(changed[0].facts.clone())
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn repository_collections_create_one_typed_resource_for_each_new_item() {
         let previous = json!({"pull_requests": [], "issues": []});
         let current = json!({
