@@ -129,6 +129,7 @@
             { "$ref": "#/$defs/Resource" },
             { "$ref": "#/$defs/TimelinePage" },
             { "$ref": "#/$defs/ConversationChanges" },
+            { "$ref": "#/$defs/ConversationPreparation" },
             { "$ref": "#/$defs/ConversationSearch" },
             { "$ref": "#/$defs/EventPage" },
             { "$ref": "#/$defs/ActionResult" },
@@ -1584,6 +1585,15 @@
         "page": { "$ref": "#/$defs/PageInfo" }
       }
     },
+    "ConversationPreparation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "session_id", "state"],
+      "properties": {
+        "kind": { "const": "conversation-preparation" },
+        "session_id": { "$ref": "#/$defs/Id" },
+        "state": { "enum": ["ready", "unavailable"] }
+      }
+    },
     "ConversationChanges": {
       "type": "object", "additionalProperties": false,
       "required": ["kind", "session_id", "items", "next_cursor"],
@@ -1591,7 +1601,9 @@
         "kind": { "const": "conversation-changes" },
         "session_id": { "$ref": "#/$defs/Id" },
         "items": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/TimelineEntry" } },
-        "next_cursor": { "$ref": "#/$defs/Cursor" }
+        "next_cursor": { "$ref": "#/$defs/Cursor" },
+        "initial_page": { "$ref": "#/$defs/TimelinePage" },
+        "preparation": { "enum": ["ready", "miss"] }
       }
     },
     "ProjectionEvent": {
@@ -2349,7 +2361,8 @@
             "session_id": { "$ref": "#/$defs/Id" },
             "replace": { "type": "boolean" },
             "items": { "type": "array", "items": { "$ref": "#/$defs/TimelineEntry" } },
-            "has_more": { "type": "boolean" }
+            "has_more": { "type": "boolean" },
+            "preparation": { "enum": ["ready", "miss"] }
           }
         },
         {

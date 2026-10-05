@@ -789,9 +789,14 @@ resume. `{id}` may be a session ID, an agent peer ID (resolved to its current
 session), or a st message ID with a session peer. A cursor remains tied to the
 resolved session, so a new agent incarnation needs a fresh stream.
 The first envelope has a `ConversationChanges` value with an empty `items`
-array and a `next_cursor` when opening at the live edge. Later envelopes contain
-new chronological `TimelineEntry` values, including st messages, and a cursor to
-save after applying the batch. The owner sends no WebSocket data while idle.
+array, a `next_cursor`, and an `initial_page` containing up to 200 newest
+authoritative timeline entries when opening at the live edge. Oversized initial
+windows are byte-bounded to fit the stream and relay envelopes; their history
+cursor includes every omitted older entry. Its `preparation` is
+`ready` when the owner reused a current prepared page, or `miss` when this read
+built it. Reads with `after=CURSOR` omit both initial-only fields. Later envelopes
+contain new chronological `TimelineEntry` values, including st messages, and a
+cursor to save after applying the batch. The owner sends no WebSocket data while idle.
 
 The gateway routes managed sessions to their owning host using the authenticated
 daemon relay. The owner holds a bounded change read for up to ten seconds. A
@@ -799,6 +804,26 @@ reconnect replays at most 200 entries; an older cursor returns `cursor-gap`, so
 the client must reload the timeline before reopening. Cursors belong to one
 session and one owner. `GET /v1/client/conversations/{id}/changes?after=CURSOR&wait_ms=N`
 offers the same bounded change read for clients that cannot open WebSockets.
+
+Held agents collection windows prepare their returned current sessions in the
+background; selection needs no separate client preparation request. Preparation
+is volatile, authorized on every read, and invalidated only by changes concerning
+that agent, loss of one of its messages from the global retention window, or its
+exact native binding and file identity. Background reads share one global budget
+with a 10% sustained read duty cycle; bursts are coalesced.
+Prepared pages own their pagination snapshots within the 64 MiB preparation bound
+and restore them to the ordinary page cache when served. Native snapshot races
+are retryable reads, not terminal subscription errors. A prepared page retains the
+full authoritative claim projection and any native-unavailable notice:
+`ready` does not mean native-complete or promise a daemon-cold latency.
+
+`GET /v1/client/conversations/{id}/prepare` (`conversation.prepare`, requiring
+`read.projections`) uses the same owner routing and preparation cache. It returns
+`ConversationPreparation {kind: "conversation-preparation", session_id, state}`,
+where `state` is `ready` or `unavailable`, without returning transcript items.
+This read lets a relaying daemon prepare an owner-local page; it is not a content
+frame and does not establish first paint. Unmanaged and unreadable bound sources
+are not prepared. Closing an agents window removes its preparation interest.
 
 ## Terminal protocol
 

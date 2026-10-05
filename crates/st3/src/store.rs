@@ -14605,6 +14605,17 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Oldest message in the global conversation retention window at a claim snapshot.
+    pub(crate) fn conversation_message_floor_at(&self, index: u64, limit: usize) -> Result<u64> {
+        let connection = self.readers.get();
+        Ok(connection.prepare_cached(
+            "SELECT COALESCE(MIN(store_index), 0) FROM (
+                SELECT store_index FROM claims WHERE kind='message.sent' AND store_index<=?1
+                ORDER BY store_index DESC LIMIT ?2
+            )",
+        )?.query_row(params![index, limit as u64], |row| row.get(0))?)
+    }
+
     /// The store index of the subject's newest claim of `kind`, or 0 when it has none. Claims are
     /// append-only, so an unchanged index means the subject's claims of that kind are unchanged.
     pub fn newest_claim_index(&self, subject: &str, kind: &str) -> Result<u64> {
@@ -38397,6 +38408,10 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         assert_eq!(subjects(Some(indexes[0]), 3), Vec::<String>::new());
         assert_eq!(subjects(None, 0), Vec::<String>::new());
         assert!(store.conversation_messages_at("agent/missing", None, 3).unwrap().is_empty());
+        assert_eq!(store.conversation_message_floor_at(indexes[1], 3).unwrap(), indexes[0]);
+        assert_eq!(store.conversation_message_floor_at(indexes[3], 3).unwrap(), indexes[1]);
+        assert_eq!(store.conversation_message_floor_at(indexes[4], 3).unwrap(), indexes[2]);
+        assert_eq!(store.conversation_message_floor_at(indexes[4], 0).unwrap(), 0);
     }
 
     #[test]

@@ -90,12 +90,26 @@ A conversation is one more subscription too. Name an agent or a session:
 
 An agent's conversation is its current session's timeline with the Smalltalk to or from the agent
 joined in. The first `conversation` frame carries `id`, `collection` (`conversation`),
-`session_id`, `replace: true`, the newest page of timeline `items`, and `has_more`. Later frames
+`session_id`, `replace: true`, the newest page of timeline `items`, `has_more`, and
+`preparation: "ready" | "miss"`. The page and its replay cursor come from one
+authoritative initial read, not a second timeline request. Later frames
 carry `replace: false` and the entries that changed since; an entry revised in place arrives
 again with its new revision. When too much changed for one frame, or a change can no longer be
 replayed, the newest page arrives again with `replace: true`. An `error` frame ends that
 subscription only, for example while the owning host is unreachable. After a dropped socket,
 subscribe again on the new one.
+
+Held agents windows prepare their returned current sessions without hover,
+selection, or a client prefetch call. Background reads share one global 10%
+sustained read-duty budget and end with that window or socket. Unrelated fleet
+commits do not rebuild every conversation: a moving global message window
+invalidates only agents losing retained messages. Every hit checks authority,
+changes concerning its agent, native binding, and file identity.
+Prepared pages retain their pagination backing under the 64 MiB cache bound.
+Native snapshot races trigger resync and retry without ending the subscription.
+`ready` includes an unchanged native-unavailable notice; it does not mean
+native-complete. A miss reads the full current page. Neither label promises a
+latency for an unprepared daemon or replaces actual content.
 
 Conversation routing resolves the runtime identity at the requested snapshot
 without building the fleet's agent cards. Message reads apply the conversation's

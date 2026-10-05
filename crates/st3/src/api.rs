@@ -99,18 +99,21 @@ const CLIENT_MAX_RESPONSE_BYTES: usize = 1_048_576;
 const CLIENT_PAGE_TTL_MS: u128 = 300_000;
 const CLIENT_PAGE_CACHE_CAPACITY: usize = 32;
 
+#[derive(Clone)]
 struct CachedClientPage {
     snapshot_id: String,
     collection: String,
     items_digest: String,
     items: Arc<Vec<Value>>,
+    items_bytes: usize,
     expires_at_unix_ms: u128,
 }
 
-static CLIENT_PAGE_CACHE: OnceLock<Mutex<VecDeque<CachedClientPage>>> = OnceLock::new();
+static CLIENT_PAGE_CACHE: std::sync::LazyLock<parking_lot::Mutex<VecDeque<CachedClientPage>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(VecDeque::new()));
 
-fn client_page_cache() -> &'static Mutex<VecDeque<CachedClientPage>> {
-    CLIENT_PAGE_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+fn client_page_cache() -> &'static parking_lot::Mutex<VecDeque<CachedClientPage>> {
+    &CLIENT_PAGE_CACHE
 }
 
 #[derive(Clone, Copy)]
@@ -400,6 +403,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route(
             "/v1/client/conversations/{id}/changes",
             get(client_v0::conversation_changes),
+        )
+        .route(
+            "/v1/client/conversations/{id}/prepare",
+            get(client_v0::conversation_prepare),
         )
         .route(
             "/v1/client/conversations/{id}/stream",
@@ -1271,7 +1278,7 @@ fn client_page_read(
         .limit
         .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
         .clamp(1, CLIENT_MAX_PAGE_ITEMS);
-    let (items, items_digest, offset, limit, expires_at_unix_ms) = if let Some(cursor) =
+    let (items, items_digest, items_bytes, offset, limit, expires_at_unix_ms) = if let Some(cursor) =
         &query.cursor
     {
         let cursor = decode_client_cursor(cursor)?;
@@ -1295,9 +1302,7 @@ fn client_page_read(
         if client_now_ms() > cursor.expires_at_unix_ms {
             return Err(client_page_expired("the page cursor expired"));
         }
-        let cache = client_page_cache()
-            .lock()
-            .expect("client page cache poisoned");
+        let cache = client_page_cache().lock();
         let cached = cache
             .iter()
             .find(|entry| {
@@ -1312,17 +1317,16 @@ fn client_page_read(
         (
             cached.items.clone(),
             cursor.items_digest,
+            cached.items_bytes,
             cursor.offset,
             cursor.limit,
             cursor.expires_at_unix_ms,
         )
     } else {
-        let items_digest = hex::encode(Sha256::digest(
-            serde_json::to_vec(&items).map_err(ApiError::internal)?,
-        ));
+        let serialized = serde_json::to_vec(&items).map_err(ApiError::internal)?;
+        let items_digest = hex::encode(Sha256::digest(&serialized));
         let cached = client_page_cache()
             .lock()
-            .expect("client page cache poisoned")
             .iter()
             .find(|entry| {
                 entry.snapshot_id == snapshot.id
@@ -1330,22 +1334,21 @@ fn client_page_read(
                     && entry.items_digest == items_digest
                     && entry.expires_at_unix_ms > client_now_ms()
             })
-            .map(|entry| (entry.items.clone(), entry.expires_at_unix_ms));
-        let (items, expires_at_unix_ms) = cached.unwrap_or_else(|| {
+            .map(|entry| (entry.items.clone(), entry.items_bytes, entry.expires_at_unix_ms));
+        let (items, items_bytes, expires_at_unix_ms) = cached.unwrap_or_else(|| {
             (
                 Arc::new(items),
+                serialized.len(),
                 client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
             )
         });
-        (items, items_digest, 0, requested_limit, expires_at_unix_ms)
+        (items, items_digest, items_bytes, 0, requested_limit, expires_at_unix_ms)
     };
     let end = offset.saturating_add(limit).min(items.len());
     let page_items = items.get(offset..end).unwrap_or_default().to_vec();
     let has_more = end < items.len();
     if query.cursor.is_none() && has_more {
-        let mut cache = client_page_cache()
-            .lock()
-            .expect("client page cache poisoned");
+        let mut cache = client_page_cache().lock();
         cache.retain(|entry| entry.expires_at_unix_ms > client_now_ms());
         if !cache.iter().any(|entry| {
             entry.snapshot_id == snapshot.id
@@ -1361,6 +1364,7 @@ fn client_page_read(
                 collection: collection.into(),
                 items_digest: items_digest.clone(),
                 items: items.clone(),
+                items_bytes,
                 expires_at_unix_ms,
             });
         }
@@ -3832,6 +3836,10 @@ async fn client_sessions_detail(
                         "remote session detail requires a concrete person or agent",
                     )));
                 }
+                let limit = query.limit.map(Ok).unwrap_or_else(|| {
+                    query.cursor.as_deref().map(decode_client_cursor).transpose()
+                        .map(|cursor| cursor.map_or(CLIENT_DEFAULT_PAGE_ITEMS, |cursor| cursor.limit))
+                })?.clamp(1, CLIENT_MAX_PAGE_ITEMS);
                 let value = relay
                     .read(
                         &remote_host,
@@ -3840,7 +3848,7 @@ async fn client_sessions_detail(
                             relay: None,
                             request: crate::peer::ClientReadOperation::Timeline {
                                 session_id,
-                                limit: query.limit.unwrap_or(50).clamp(1, 200),
+                                limit,
                                 cursor: query.cursor.clone(),
                             },
                         },
@@ -13850,7 +13858,6 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert!(
             !client_page_cache()
                 .lock()
-                .unwrap()
                 .iter()
                 .any(|entry| { entry.snapshot_id == snapshot.id && entry.collection == "history" }),
             "a history page must not retain every claim in the process cache"

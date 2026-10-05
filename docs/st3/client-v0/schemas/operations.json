@@ -63,6 +63,7 @@
     { "id": "conversation.search", "method": "GET", "path": "/v1/client/conversations/search", "response": "ConversationSearch" },
     { "id": "timeline.list", "method": "GET", "path": "/v1/client/sessions/{id}/timeline", "response": "TimelinePage" },
     { "id": "conversation.changes", "method": "GET", "path": "/v1/client/conversations/{id}/changes", "response": "ConversationChanges" },
+    { "id": "conversation.prepare", "method": "GET", "path": "/v1/client/conversations/{id}/prepare", "response": "ConversationPreparation", "scope": "read.projections" },
     { "id": "events.list", "method": "GET", "path": "/v1/client/events", "response": "EventPage" },
     { "id": "terminal.screen", "method": "GET", "path": "/v1/client/terminals/{id}/screen", "response": "TerminalScreen" },
     {"id": "glasses.list", "method": "GET", "path": "/v1/client/glasses", "response": "Page", "scope": "read.glasses"},
