@@ -102,8 +102,9 @@ subscribe again on the new one.
 Held agents windows prepare their returned current sessions without hover,
 selection, or a client prefetch call. Background reads share one global 10%
 sustained read-duty budget and end with that window or socket. Unrelated fleet
-commits do not invalidate or rebuild a prepared conversation. Every hit checks
-authority, changes concerning its agent, native binding, and file identity.
+commits do not rebuild every conversation: a moving global message window
+invalidates only agents losing retained messages. Every hit checks authority,
+changes concerning its agent, native binding, and file identity.
 Prepared pages retain their pagination backing under the 64 MiB cache bound.
 Native snapshot races trigger resync and retry without ending the subscription.
 `ready` includes an unchanged native-unavailable notice; it does not mean

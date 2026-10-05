@@ -49,6 +49,7 @@ struct Prepared {
     authority: String,
     session_id: String,
     mark: Mutex<Option<ConversationMark>>,
+    oldest_message: Option<u64>,
     verdict: SourceVerdict,
     binding: Option<(String, Option<String>)>,
     stamp: Option<NativeStamp>,
@@ -87,7 +88,13 @@ fn current(prepared: &Prepared, state: &AppState) -> Result<bool, ApiError> {
     if binding != prepared.binding { return Ok(false); }
     let mut mark = prepared.mark.lock();
     let Some(since) = mark.as_mut() else { return Ok(false); };
-    if since.changed(state)? {
+    let lost_message = if index != since.store_index {
+        prepared.oldest_message.map(|oldest| {
+            state.store.conversation_message_floor_at(index, 10_000)
+                .map(|floor| oldest < floor).map_err(ApiError::internal)
+        }).transpose()?.unwrap_or(false)
+    } else { false };
+    if lost_message || since.changed(state)? {
         // A relevance check advances its watermarks. Never let that make an invalid
         // page look current again on the next preparation pass.
         *mark = None;
@@ -254,11 +261,18 @@ fn build(
         && value["initial_page"]["items"].as_array().is_some_and(|items| {
             items.iter().any(|entry| entry["body"]["code"] == "transcript-not-bound")
         });
+    // Unrelated messages move the global window, but only agents losing one of
+    // their retained messages need a full rebuild.
+    let oldest_message = binding.as_ref().map(|(owner, incarnation)| {
+        session_messages(state, owner, session_id, incarnation.as_deref(), index.checked_add(1))
+            .map(|messages| messages.iter().map(|message| message.store_index).min())
+    }).transpose()?.flatten();
     let prepared = (cacheable && !read_failed && value_bytes <= CLIENT_MAX_RESPONSE_BYTES
         && bytes <= MAX_PREPARED_BYTES && (page_cursor.is_none() || page.is_some())).then(|| Prepared {
         store: Arc::downgrade(&state.store),
         authority: session.authority_actor.clone(),
         session_id: session_id.to_owned(),
+        oldest_message,
         mark: Mutex::new(Some(ConversationMark {
             owner: binding.as_ref().map(|(owner, _)| owner.clone()),
             transcript: verdict.path().map(std::path::Path::to_path_buf),

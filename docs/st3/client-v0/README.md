@@ -808,8 +808,9 @@ offers the same bounded change read for clients that cannot open WebSockets.
 Held agents collection windows prepare their returned current sessions in the
 background; selection needs no separate client preparation request. Preparation
 is volatile, authorized on every read, and invalidated only by changes concerning
-that agent or its exact native binding and file identity. Background reads share
-one global budget with a 10% sustained read duty cycle; bursts are coalesced.
+that agent, loss of one of its messages from the global retention window, or its
+exact native binding and file identity. Background reads share one global budget
+with a 10% sustained read duty cycle; bursts are coalesced.
 Prepared pages own their pagination snapshots within the 64 MiB preparation bound
 and restore them to the ordinary page cache when served. Native snapshot races
 are retryable reads, not terminal subscription errors. A prepared page retains the
