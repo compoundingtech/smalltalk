@@ -3,7 +3,7 @@ import { API_VERSION } from './Models.generated.ts';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
-    SubjectDefinition, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
+    SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated.ts';
@@ -359,6 +359,7 @@ export class St3Client {
     async resourcesList(filters: ResourcesFilter = {}, options: PageOptions = {}): Promise<EnvelopeOf<ResourcesPage>> { return this.get('/v1/client/resources' + query({ ...filters, ...options })); }
     async agentsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/agents' + query(options)); }
     async agentsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/agents/${encodeURIComponent(routedId(id))}`); }
+    async agentWorkspaceGet(id: string): Promise<EnvelopeOf<AgentWorkspace>> { return this.get(`/v1/client/agent-workspaces/${encodeURIComponent(routedId(id))}`); }
     async agentDeclarationGet(id: string, revision?: string, showEnvValues = false): Promise<EnvelopeOf<AgentDeclaration>> { return this.get(`/v1/client/agent-declarations/${encodeURIComponent(routedId(id))}` + query({ revision, show_env_values: showEnvValues })); }
     async statusHistoryGet(id: string): Promise<EnvelopeOf<StatusHistory>> { return this.get(`/v1/client/status-history/${encodeURIComponent(routedId(id))}`); }
     async agentQueueGet(id: string): Promise<EnvelopeOf<AgentQueue>> { return this.get(`/v1/client/agent-queues/${encodeURIComponent(routedId(id))}`); }

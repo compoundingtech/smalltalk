@@ -39,6 +39,7 @@
     { "id": "resources.list", "method": "GET", "path": "/v1/client/resources", "response": "ResourcesPage" },
     { "id": "agents.list", "method": "GET", "path": "/v1/client/agents", "response": "Page" },
     { "id": "agents.get", "method": "GET", "path": "/v1/client/agents/{id}", "response": "Resource" },
+    { "id": "agent-workspace.get", "method": "GET", "path": "/v1/client/agent-workspaces/{id}", "response": "AgentWorkspace", "scope": "read.projections" },
     { "id": "agent-declaration.get", "method": "GET", "path": "/v1/client/agent-declarations/{id}", "response": "AgentDeclaration", "scope": "read.declarations" },
     { "id": "status-history.get", "method": "GET", "path": "/v1/client/status-history/{id}", "response": "StatusHistory", "scope": "read.projections" },
     { "id": "agent-queue.get", "method": "GET", "path": "/v1/client/agent-queues/{id}", "response": "AgentQueue" },

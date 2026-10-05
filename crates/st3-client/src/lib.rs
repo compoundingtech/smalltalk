@@ -1345,6 +1345,16 @@ impl Client {
     pub async fn agents_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("agents", id).await
     }
+    pub async fn agent_workspace_get(
+        &self,
+        id: &str,
+    ) -> Result<Envelope<AgentWorkspace>, ClientError> {
+        self.get(&format!(
+            "/v1/client/agent-workspaces/{}",
+            percent_encode(id)
+        ))
+        .await
+    }
     pub async fn agent_declaration_get(
         &self,
         id: &str,

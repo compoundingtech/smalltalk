@@ -70,6 +70,52 @@ A one-shot member of an owned set retires without changing its source bundle or 
 Publish a new declaration through that set to start it again; ordinary `agents start` continues
 to respect the set's ownership.
 
+## Find a workspace and return to an interactive seat
+
+Read the directory from the seat instead of constructing a path from its identity:
+
+```sh
+st agents workspace agent/garden/interactive
+st agents workspace agent/garden/interactive --json
+```
+
+The plain command prints only the declared workspace directory, so a local launcher can use
+`workspace=$(st agents workspace agent/garden/interactive)`. The JSON envelope also names
+`host_id`: the path belongs to that host, even when read through another fleet member. It is the
+workspace root, not an internal harness directory or a guarantee that the directory still exists.
+The read works while the seat is running, stopped, suspended, or retired as a one-shot. It follows
+an unambiguous stop back to the same declaration; unknown or conflicting declarations produce
+an error instead of a guessed directory.
+
+For a running interactive seat, attach to its existing terminal:
+
+```sh
+st terminals attach agent/garden/interactive --as person/ada
+```
+
+Attach does not start or restart the seat. Detach with Ctrl-\\; the harness keeps running, and
+the same attach command reconnects. After the process exits or you stop it, restore the same
+seat and attach again:
+
+```sh
+st agents stop agent/garden/interactive --as person/ada
+st agents start agent/garden/interactive --as person/ada
+st agents workspace agent/garden/interactive --json
+st terminals attach agent/garden/interactive --as person/ada
+```
+
+Omit `stop` if the seat has already stopped or retired. Start without overrides restores its
+original harness, host, workspace, and saved native session. Native continuation depends on the
+harness having saved its session; use suspend/resume when you need st to verify the exact native
+session before resuming. A mission's `fresh-context` policy intentionally replaces native context
+before claimed work; see [mission runtime](st3/mission-graph-runtime.md). An owned-set seat must
+be restarted through its source publication.
+
+Typed harness declarations start without a boot task prompt and wait for input unless an initial
+message is supplied. Launchers need no separate no-boot mode and no path into st's internal state.
+The equivalent client-v0 read is documented under
+[seat workspace directories](st3/client-v0/README.md#seat-workspace-directories).
+
 ## Bring an existing native session under st
 
 A session started directly in a harness can be imported. Find it and inspect the exact identity and workspace before importing:

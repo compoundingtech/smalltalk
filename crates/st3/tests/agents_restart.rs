@@ -674,6 +674,11 @@ async fn one_shot_exit_retires_an_owned_set_member_without_changing_its_source()
         .store
         .apply_owned_set(&intent, &options, "adopt-one-shot", "person/avery")
         .unwrap();
+    let declaration_token = fixture
+        .store
+        .selected_desired_token(&subject)
+        .unwrap()
+        .unwrap();
     hang_up(&fixture);
     for _ in 0..3 {
         fixture.reconciler.reconcile_once().unwrap();
@@ -697,6 +702,16 @@ async fn one_shot_exit_retires_an_owned_set_member_without_changing_its_source()
     assert!(!succeeded(&st(&socket, &["agents", "ls"]).await).contains(&subject));
     assert!(succeeded(&st(&socket, &["agents", "ls", "--all"]).await).contains(&subject));
     succeeded(&st(&socket, &["agents", "show", &subject, "--all"]).await);
+    let workspace: serde_json::Value = serde_json::from_str(&succeeded(
+        &st(&socket, &["agents", "workspace", &subject, "--json"]).await,
+    ))
+    .unwrap();
+    assert_eq!(workspace["value"]["agent_id"], subject);
+    assert_eq!(
+        workspace["value"]["workspace"],
+        original.member.as_ref().unwrap().workspace
+    );
+    assert_eq!(workspace["value"]["declaration_token"], declaration_token);
 }
 
 #[tokio::test]

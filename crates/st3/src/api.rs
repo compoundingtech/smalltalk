@@ -380,6 +380,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/resources", get(client_v0::resources::list))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
         .route(
+            "/v1/client/agent-workspaces/{*id}",
+            get(client_v0::agent_workspace),
+        )
+        .route(
             "/v1/client/agent-declarations/{*id}",
             get(client_v0::agent_declaration),
         )

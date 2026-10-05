@@ -451,6 +451,15 @@ pub struct SubjectDefinition {
     pub conflicts: Vec<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentWorkspace {
+    pub kind: String,
+    pub agent_id: String,
+    pub host_id: String,
+    pub workspace: String,
+    pub desired_token: String,
+    pub declaration_token: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentDeclaration {
     pub id: String,
     pub revision: String,

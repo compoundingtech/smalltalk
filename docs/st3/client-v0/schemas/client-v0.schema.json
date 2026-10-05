@@ -109,6 +109,7 @@
             { "$ref": "#/$defs/Capabilities" },
             { "$ref": "#/$defs/DocumentContent" },
             { "$ref": "#/$defs/SubjectDefinition" },
+            { "$ref": "#/$defs/AgentWorkspace" },
             { "$ref": "#/$defs/Page" },
             { "$ref": "#/$defs/ResourcesPage" },
             { "$ref": "#/$defs/Resource" },
@@ -772,6 +773,19 @@
           }
         }
       ]
+    },
+    "AgentWorkspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "agent_id", "host_id", "workspace", "desired_token", "declaration_token"],
+      "properties": {
+        "kind": { "const": "agent-workspace" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "host_id": { "$ref": "#/$defs/HostId" },
+        "workspace": { "type": "string", "description": "Declared workspace directory on host_id, not the API gateway's filesystem or the harness's internal state directory." },
+        "desired_token": { "type": "string", "description": "Selected desired claim, including a stop when the seat is retired." },
+        "declaration_token": { "type": "string", "description": "Agent declaration supplying the workspace; reached through unambiguous stop predecessors." }
+      }
     },
     "Agent": {
       "allOf": [

@@ -768,6 +768,73 @@ pub(super) struct AgentDeclarationQuery {
     show_env_values: bool,
 }
 
+/// A workspace belongs to the seat's declaration and host, not this API gateway's filesystem.
+/// Follow the same unambiguous stop predecessors that start uses, including one-shot retirement.
+pub(super) async fn agent_workspace(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    require_scope(&session, "read.projections")?;
+    let subject = client_detail_id("agent", &id);
+    let result = blocking_store(move || {
+        state.store.read_snapshot(|index| {
+            let status = state.store.status_at(Some(&subject), None, Some(index))?;
+            let Some(status) = status
+                .subjects
+                .into_iter()
+                .find(|item| item.subject == subject)
+            else {
+                return Ok(None);
+            };
+            if !status.conflicts.is_empty() {
+                return Err(anyhow::anyhow!(St3Error::new(
+                    "validation-failed",
+                    "agent has conflicting declarations",
+                )));
+            }
+            let Some(token) = status.desired_token else {
+                return Ok(None);
+            };
+            let mut claim = state
+                .store
+                .claim_by_id(&token)?
+                .ok_or_else(|| anyhow::anyhow!("selected declaration is missing"))?;
+            loop {
+                let desired: crate::model::DesiredSubject = serde_json::from_value(claim.body)?;
+                if desired.kind == "agent" {
+                    let Some(member) = desired.member else {
+                        return Ok(None);
+                    };
+                    let value = json!({
+                        "kind": "agent-workspace",
+                        "agent_id": subject,
+                        "host_id": client_host_id(&member.host),
+                        "workspace": member.workspace,
+                        "desired_token": token,
+                        "declaration_token": claim.id,
+                    });
+                    return Ok(Some((client_snapshot_at(&state, index), value)));
+                }
+                if desired.kind != "stop" || claim.predecessors.len() != 1 {
+                    return Err(anyhow::anyhow!(St3Error::new(
+                        "validation-failed",
+                        "agent has no unambiguous prior declaration",
+                    )));
+                }
+                claim = state
+                    .store
+                    .claim_by_id(&claim.predecessors[0])?
+                    .ok_or_else(|| anyhow::anyhow!("prior declaration is missing"))?;
+            }
+        })
+    })
+    .await?;
+    let (snapshot, value) =
+        result.ok_or_else(|| ApiError::not_found("agent workspace not found"))?;
+    Ok((Extension(snapshot), Json(value)))
+}
+
 /// Both redacted and explicit environment-value reads require declaration scope.
 pub(super) async fn agent_declaration(
     State(state): State<AppState>,
@@ -9411,6 +9478,39 @@ mod tests {
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn agent_workspace_requires_projection_scope_only() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let intent = crate::graph::parse_intent(
+            "version 2\nagent \"garden/interactive\" { workspace \"/work/garden\"; harness \"omp\" {} }\n",
+            state.store.origin(),
+        ).unwrap();
+        state
+            .store
+            .apply_internal(&intent, "workspace-scope")
+            .unwrap();
+        let mut session = ClientSession::local(None).unwrap();
+        session.scopes = ["read.projections".to_owned()].into_iter().collect();
+        let (_, Json(value)) = agent_workspace(
+            State(state.clone()),
+            Extension(session.clone()),
+            AxumPath("garden/interactive".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["workspace"], "/work/garden");
+        session.scopes.clear();
+        let error = agent_workspace(
+            State(state),
+            Extension(session),
+            AxumPath("garden/interactive".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
