@@ -1517,6 +1517,11 @@ mission-run "RUN_ID" {
 
 Cancellation revokes active claims and cancels normal work. It then runs the adjacent `finally` graph.
 
+Final work is evaluated normally during cancellation. An agentless final step that remains
+working with no live process is cancelled with a recorded reason, rather than waiting for its
+execution timeout. Nested steps and linked child runs settle before their parent step is
+cancelled. A missing remote runtime observation does not prove that its process stopped.
+
 A terminal normal step failure does the same when the mission has an explicit completion rule.
 
 Cancellation also cancels active descendant mission runs. Each descendant uses its own final phase.
