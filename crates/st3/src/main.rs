@@ -8097,6 +8097,51 @@ fn render_sync_notice(sync: &st3_client::SyncNotice, now: u128) -> String {
     output
 }
 
+/// What kind of thing an attention item is, in the word a person uses for it.
+fn attention_word(item: &st3_client::Attention) -> &'static str {
+    if item.update.is_some() {
+        "update"
+    } else if let Some(request) = &item.request {
+        match request.entry_type.as_str() {
+            "decision" => "decision",
+            "choice" => "choice",
+            "feedback" => "feedback",
+            _ => "request",
+        }
+    } else if item.launch_id.is_some() {
+        "launch"
+    } else if item.review_mode.is_some() {
+        "review"
+    } else if item.message_id.is_some() {
+        "message"
+    } else {
+        "request"
+    }
+}
+
+/// An attention item's first lines: its kind and title, then who it is from and how long ago,
+/// with its priority and state only when they are not the usual normal and open.
+fn attention_heading(item: &st3_client::Attention, now_unix_ms: u128) -> String {
+    let mut about = Vec::new();
+    if let Some(from) = &item.requester_id {
+        about.push(format!("from {}", from.strip_prefix("agent/").unwrap_or(from)));
+    }
+    about.push(ago(&item.requested_at, now_unix_ms));
+    if item.priority != "normal" {
+        about.push(format!("{} priority", item.priority));
+    }
+    if item.state != "open" {
+        about.push(item.state.clone());
+    }
+    format!(
+        "\n{:<9} {}\n{:<9} {}\n",
+        attention_word(item),
+        item.title,
+        "",
+        about.join(" · ")
+    )
+}
+
 /// `target mission/fleet/typecase: cancelled 4h ago`
 fn attention_target_line(target: &st3_client::AttentionTargetState, now_unix_ms: u128) -> String {
     let since = target
@@ -8150,17 +8195,19 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
     for item in &page.items {
         match item {
             ClientResource::Attention(item) => {
-                let _ = writeln!(
-                    output,
-                    "{}  attention  {}  {}  {}",
-                    item.header.id, item.priority, item.state, item.title
-                );
+                output.push_str(&attention_heading(item, now_ms()));
                 for target in &item.target_states {
                     let _ = writeln!(output, "  {}", attention_target_line(target, now_ms()));
                 }
+                // Opening an update is reading it: it leaves the person's home, so the line says so.
+                let reads = if item.update.is_some() {
+                    " (marks it read)"
+                } else {
+                    ""
+                };
                 let _ = writeln!(
                     output,
-                    "  action: st attention show {} --as {}",
+                    "  action{reads}: st attention show {} --as {}",
                     item.source_id, item.person_id
                 );
                 if item.header.operational.as_ref().is_some_and(|operational| {
@@ -23080,16 +23127,25 @@ mod tests {
             render_product_page("NOW", &fixture_product_page(&[], false), "st now"),
             "NOW  0\nNo current items.\n"
         );
+        let mixed = render_product_page(
+            "NOW",
+            &fixture_product_page(&["attention", "work", "operation"], false),
+            "st now",
+        );
+        // An attention item leads with its kind and title, then who it is from and how long ago
+        // (which moves with the clock) and its priority when it is not normal.
+        let (head, rest) = mixed
+            .split_once("  action: st attention show")
+            .expect(&mixed);
+        assert!(
+            head.starts_with("NOW  3\n\nrequest   Review release\n          "),
+            "{mixed}"
+        );
+        assert!(head.ends_with(" ago · high priority\n"), "{mixed}");
         assert_eq!(
-            render_product_page(
-                "NOW",
-                &fixture_product_page(&["attention", "work", "operation"], false),
-                "st now"
-            ),
+            rest,
             concat!(
-                "NOW  3\n",
-                "attention/release-review  attention  high  open  Review release\n",
-                "  action: st attention show launch/release --as person/alex\n",
+                " launch/release --as person/alex\n",
                 "work/release/1/build  work  claimed  build  attempt 1\n",
                 "  assigned: agent/release\n",
                 "  action: st work show work/release/1/build\n",
@@ -23097,6 +23153,54 @@ mod tests {
                 "  recovery: st doctor\n",
             )
         );
+    }
+
+    #[test]
+    fn an_attention_item_names_its_kind_sender_and_age() {
+        let mut item = match fixture_product_page(&["attention"], false)
+            .items
+            .into_iter()
+            .next()
+            .unwrap()
+        {
+            ClientResource::Attention(item) => item,
+            other => panic!("{other:?}"),
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-20T11:07:00Z")
+            .unwrap()
+            .timestamp_millis() as u128;
+        assert_eq!(
+            attention_heading(&item, now),
+            "\nrequest   Review release\n          7m ago · high priority\n"
+        );
+        item.priority = "normal".into();
+        item.requester_id = Some("agent/fleet/example/worker".into());
+        item.update = Some(st3_client::PersonUpdate {
+            version: 1,
+            entry_type: "update".into(),
+            about: "message/abc".into(),
+            subjects: Vec::new(),
+            summary: None,
+        });
+        assert_eq!(
+            attention_heading(&item, now),
+            "\nupdate    Review release\n          from fleet/example/worker · 7m ago\n"
+        );
+        // An update's action line warns that opening it reads it.
+        let mut page = fixture_product_page(&["attention"], false);
+        if let Some(ClientResource::Attention(shown)) = page.items.first_mut() {
+            shown.update = item.update.clone();
+        }
+        let rendered = render_product_page("NOW", &page, "st now");
+        assert!(
+            rendered.contains("  action (marks it read): st attention show launch/release"),
+            "{rendered}"
+        );
+        item.state = "snoozed".into();
+        item.update = None;
+        item.review_mode = Some("approve".into());
+        assert!(attention_heading(&item, now).starts_with("\nreview    "));
+        assert!(attention_heading(&item, now).ends_with(" · 7m ago · snoozed\n"));
     }
 
     #[test]
