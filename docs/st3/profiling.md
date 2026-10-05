@@ -90,8 +90,8 @@ depending on their seat, message subjects or recipient. Local binding commits wa
 owner/component directly. This routing state is disposable and never replicated.
 
 Streams subscribe before their first read and retain the durable changed-since and fencing
-checks. A full safety read every five seconds with a randomized per-binding phase recovers missing dependencies, missed notifications
-and ownership changes. Initial dispatcher-cursor failures never replay from zero: they retry at
+checks. A full safety read every five seconds with a randomized per-binding phase recovers missing
+dependencies, missed notifications and ownership changes. Initial dispatcher-cursor failures never replay from zero: they retry at
 the current head and resync subscribers once. Batch failures retain their cursor and retry every
 five seconds. A warning log and the `mailbox-wake-dispatcher` doctor check expose failures since
 startup and whether routing is currently degraded. There is no debounce. `task mailbox-wake-dispatch`,
@@ -226,3 +226,56 @@ for every delivery stream to show its complete mailbox, and measures 60 seconds 
 writes. CPU covers the daemon process, including safety reads and heartbeats; setup and doctor
 are excluded. The payload is 352 bytes per message. Providers and the reconciler are absent.
 This is an explicit synthetic sizing probe, not an observed production unread distribution.
+
+## Revised five-second timer measurements (2026-10-06)
+
+The revised implementation uses a five-second period and randomized per-binding phase in
+`[0,5)` seconds. The following probes used production sources at
+`019e34d4e742b37526cdfb00a433ea3bff93cf3b`, rebased onto
+`8b020f0aa94cd276bae57ae771e48605132b723c`. The earlier table is preserved as the
+matched before/after comparison of the original three-second implementation.
+
+Idle sizing used 128 invented seats, 256 Unix mailbox streams, 352-byte message bodies, a
+fresh WAL store and separate daemon/load processes. The release build used Nix Rust 1.97.0 /
+LLVM 21.1.8 with profiling enabled; providers and the reconciler were absent.
+CPU includes safety reads, heartbeats and profiling, after setup and before doctor.
+No observed production unread distribution was available; these are explicit synthetic shapes.
+
+| Pending per seat / total | Idle wall / daemon CPU | Average CPU cores | Snapshot count / summed CPU |
+| --- | ---: | ---: | ---: |
+| 100 / 12,800 | 60.00 s / 18.56 s | 0.309 | 3,072 / 17.60 s |
+| 250 / 32,000 | 60.00 s / 45.23 s | 0.754 | 3,072 / 43.78 s |
+
+Both idle windows had zero dispatcher batches and zero changed-since checks. Each had 3,072
+full snapshots: 256 streams at five-second intervals over 60 seconds. Task CPU is summed
+attributed CPU; process CPU includes work outside these tasks. Before/after counter deltas
+are valid here because both samples remain within the same rolling five-minute window.
+Doctor reported zero dispatcher failures and healthy routing in both runs.
+
+The revised timer also completed the same 3,000-write workload: all 100 targeted messages
+arrived and all 32 old owners were fenced. Latencies include the write; CPU excludes setup,
+doctor and owner replacements, as in the initial comparison.
+
+| Measurement | Revised five-second timer |
+| --- | ---: |
+| 3,000-write elapsed / actual writes/s | 30.29 s / 99.03 |
+| Full-write-phase daemon CPU / average cores | 4.98 s / 0.165 |
+| Delivery p50 / p95 / max | 2.02 / 2.56 / 3.44 ms |
+| Owner fencing p50 / p95 / max | 0.67 / 0.91 / 1.71 ms |
+| Write API p95 | 1.52 ms |
+
+The revised workload's final doctor sample covers 33 sampled seconds of its rolling five-minute
+window, including setup; these are not write-phase deltas.
+
+| Doctor task | Count | Summed wall / CPU |
+| --- | ---: | ---: |
+| `task mailbox-snapshot` | 2,131 | 947.22 / 925.26 ms |
+| `task mailbox-wake-dispatch` | 3,250 | 347.44 / 309.97 ms |
+| `task mailbox-change-check` | 200 | 17.72 / 16.50 ms |
+
+Raw evidence: [idle, 100 pending](profiles/targeted-mailbox-wakes-2026-10-06/idle-100.json),
+[idle, 250 pending](profiles/targeted-mailbox-wakes-2026-10-06/idle-250.json), and
+[revised write workload](profiles/targeted-mailbox-wakes-2026-10-06/targeted-wakes.json).
+The fixture saves idle results before doctor and gives only that request a 120-second budget
+because sealing a generated 32,000-message store exceeded the normal 15-second CLI deadline.
+Doctor runs outside the measured CPU phase; production request deadlines are unchanged.

@@ -142,6 +142,41 @@ async fn frame(socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixS
     }
 }
 
+async fn profile_doctor(socket: &Path) -> Value {
+    use http_body_util::BodyExt;
+    // Doctor seals the generated store and can exceed the normal CLI deadline at 32k
+    // messages. Only this fixture uses a longer budget; all CPU measurement has finished.
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .unwrap();
+        let connection = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let response = sender
+            .send_request(
+                axum::http::Request::builder()
+                    .uri("/v1/doctor")
+                    .header("host", "local")
+                    .body(http_body_util::Empty::<axum::body::Bytes>::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let mut envelope: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(envelope["api_version"].is_string());
+        let value = envelope.as_object_mut().unwrap().remove("value").unwrap();
+        connection.abort();
+        value
+    })
+    .await
+    .unwrap()
+}
+
 fn percentile(samples: &mut [f64], percent: usize) -> f64 {
     samples.sort_by(f64::total_cmp);
     samples[(samples.len() - 1) * percent / 100]
@@ -242,12 +277,6 @@ async fn many_streams() {
         let after: Value = client.get("/fixture/stats").await.unwrap();
         let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
         let daemon_cpu_ms = after["cpu_ms"].as_f64().unwrap() - before["cpu_ms"].as_f64().unwrap();
-        let doctor: Value = client.get("/v1/doctor").await.unwrap();
-        fs::write(
-            root.join("doctor.json"),
-            serde_json::to_vec_pretty(&doctor).unwrap(),
-        )
-        .unwrap();
         let result = json!({"mode":"idle", "seats":SEATS, "streams":SEATS*2, "pending_messages_per_seat":per_seat,
             "total_pending_messages":SEATS*per_seat, "message_content_bytes":"Fixture pending mail. ".repeat(16).len(),
             "wall_ms":wall_ms, "daemon_cpu_ms":daemon_cpu_ms, "average_daemon_cores":daemon_cpu_ms/wall_ms,
@@ -255,6 +284,12 @@ async fn many_streams() {
         fs::write(
             root.join("idle.json"),
             serde_json::to_vec_pretty(&result).unwrap(),
+        )
+        .unwrap();
+        let doctor = profile_doctor(&socket).await;
+        fs::write(
+            root.join("doctor.json"),
+            serde_json::to_vec_pretty(&doctor).unwrap(),
         )
         .unwrap();
         println!("{result}");
@@ -297,7 +332,7 @@ async fn many_streams() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let after: Value = client.get("/fixture/stats").await.unwrap();
     let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let doctor: Value = client.get("/v1/doctor").await.unwrap();
+    let doctor = profile_doctor(&socket).await;
     fs::write(
         root.join("doctor.json"),
         serde_json::to_vec_pretty(&doctor).unwrap(),
