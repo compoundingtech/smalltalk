@@ -21916,7 +21916,7 @@ agent "seat" { workspace "/tmp"; command "true" }
         let fields = json!({
             "decision_id": format!("resource/axe/decision/{}/q38req", "a".repeat(64)),
             "request_id": "q38req", "q": 38, "source_sequence": 1,
-            "source_revision": "1".repeat(64), "person": "person/reader",
+            "source_revision": "1".repeat(64), "person": "person/example",
             "decision_kind": "blocker", "state": "pending", "revived": false,
             "activation": "0000000000000000"
         });
@@ -21931,18 +21931,18 @@ agent "seat" { workspace "/tmp"; command "true" }
         let (status, _) = json_request(app.clone(), "/v1/claims", private).await;
         assert!(!status.is_success(), "private answer bodies are not metadata fields");
         let (status, ask) = json_request(app.clone(), "/v1/work/ask", json!({
-            "person":"person/reader", "title":"Decision needs your answer", "reason":"Source decision",
+            "person":"person/example", "title":"Decision needs your answer", "reason":"Source decision",
             "actor":"agent/node.author", "new_run":"decision-activation", "idempotency_key":"decision-ask"
         })).await;
         assert_eq!(status, StatusCode::OK, "{ask}");
-        let (_, native) = get_request(app.clone(), "/v1/attention?person=person%2Freader").await;
+        let (_, native) = get_request(app.clone(), "/v1/attention?person=person%2Fexample").await;
         pending["fields"]["native_ask"] = json!({
             "key":format!("axe:decision:v1:{}:1-q38req:ask:0000000000000000", fields["decision_id"].as_str().unwrap()),
             "subject":ask["subject"], "run":ask["run"], "episode":native[0]["episode"], "status":ask["status"]
         });
         let (status, claim) = json_request(app.clone(), "/v1/claims", pending.clone()).await;
         assert_eq!(status, StatusCode::OK, "{claim}");
-        let (_, page) = get_request(app.clone(), "/v1/client/attention?person=person%2Freader").await;
+        let (_, page) = get_request(app.clone(), "/v1/client/attention?person=person%2Fexample").await;
         let current = &page["items"][0];
         assert_eq!(current["attention_kind"], "decision");
         assert!(!page["items"].as_array().unwrap().iter().any(|item| item["source_id"] == ask["subject"]),
@@ -21959,9 +21959,9 @@ agent "seat" { workspace "/tmp"; command "true" }
         assert_eq!(status, StatusCode::OK, "{claim}");
         let (status, _) = json_request(app.clone(), "/v1/claims", pending).await;
         assert_eq!(status, StatusCode::OK);
-        let (_, page) = get_request(app.clone(), "/v1/client/attention?person=person%2Freader").await;
+        let (_, page) = get_request(app.clone(), "/v1/client/attention?person=person%2Fexample").await;
         assert_eq!(page["items"], json!([]), "stale pending must not reopen");
-        let (_, history) = get_request(app.clone(), "/v1/client/attention?person=person%2Freader&history=true").await;
+        let (_, history) = get_request(app.clone(), "/v1/client/attention?person=person%2Fexample&history=true").await;
         let resolved = &history["items"][0];
         assert_eq!(resolved["id"], id);
         assert_eq!(resolved["decision"]["answer_id"], "ans001");

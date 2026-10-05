@@ -129,7 +129,7 @@ mod tests {
         let mut value = json!({
             "decision_id": format!("resource/axe/decision/{}/q38req", "a".repeat(64)),
             "request_id": "q38req", "q": 38, "source_sequence": sequence,
-            "source_revision": format!("{sequence:064x}"), "person": "person/reader",
+            "source_revision": format!("{sequence:064x}"), "person": "person/example",
             "decision_kind": "blocker", "state": state, "revived": false,
             "activation": "0000000000000000"
         });
@@ -149,20 +149,20 @@ mod tests {
     fn answered_replay_and_partial_source_restore_never_reopen() {
         let store = Store::open_memory("decision-test").unwrap();
         publish(&store, fields(1, "pending", None));
-        let card = store.attention_items(Some("person/reader")).unwrap().remove(0);
+        let card = store.attention_items(Some("person/example")).unwrap().remove(0);
         publish(&store, fields(2, "answered", Some("ans001")));
         publish(&store, fields(1, "pending", None));
         publish(&store, fields(2, "answered", Some("ans001")));
-        assert!(store.attention_items(Some("person/reader")).unwrap().is_empty());
-        let history = store.decision_attention_history(Some("person/reader")).unwrap().remove(0);
+        assert!(store.attention_items(Some("person/example")).unwrap().is_empty());
+        let history = store.decision_attention_history(Some("person/example")).unwrap().remove(0);
         assert_eq!(history.episode, card.episode);
         assert_eq!(history.subject, card.subject);
         assert_eq!(history.request.as_ref().unwrap()["state"], "answered");
         assert_eq!(history.request.as_ref().unwrap()["answer_id"], "ans001");
         // Restoring an incomplete source log and appending unrelated records is not an answer reset.
         publish(&store, fields(10, "pending", None));
-        assert!(store.attention_items(Some("person/reader")).unwrap().is_empty());
-        let restored = store.decision_attention_history(Some("person/reader")).unwrap().remove(0);
+        assert!(store.attention_items(Some("person/example")).unwrap().is_empty());
+        let restored = store.decision_attention_history(Some("person/example")).unwrap().remove(0);
         assert_eq!(restored.request.as_ref().unwrap()["state"], "undecidable");
         assert_eq!(restored.request.as_ref().unwrap()["answer_id"], "ans001");
     }
@@ -172,7 +172,7 @@ mod tests {
         let store = Store::open_memory("decision-test").unwrap();
         let source = fields(1, "pending", None);
         publish(&store, source.clone());
-        let original = store.attention_items(Some("person/reader")).unwrap().remove(0);
+        let original = store.attention_items(Some("person/example")).unwrap().remove(0);
         let mut recovered = source.clone();
         recovered["native_ask"] = json!({
             "key": format!("axe:decision:v1:{}:1-q38req:ask:0000000000000000", source["decision_id"].as_str().unwrap()),
@@ -180,15 +180,15 @@ mod tests {
             "episode": "request-episode", "status": "ready"
         });
         publish(&store, recovered);
-        let recovered = store.attention_items(Some("person/reader")).unwrap().remove(0);
+        let recovered = store.attention_items(Some("person/example")).unwrap().remove(0);
         assert_eq!(recovered.episode, original.episode);
         assert_eq!(recovered.request.as_ref().unwrap()["state"], "pending");
         assert_eq!(recovered.request.as_ref().unwrap()["source_conflict"], false);
         assert_eq!(recovered.request.as_ref().unwrap()["native_asks"][0]["subject"], "step-run/example/ask");
         // A different source answer at that same version is not link repair.
         publish(&store, fields(1, "answered", Some("ans001")));
-        assert!(store.attention_items(Some("person/reader")).unwrap().is_empty());
-        let conflict = store.decision_attention_history(Some("person/reader")).unwrap().remove(0);
+        assert!(store.attention_items(Some("person/example")).unwrap().is_empty());
+        let conflict = store.decision_attention_history(Some("person/example")).unwrap().remove(0);
         assert_eq!(conflict.request.as_ref().unwrap()["state"], "undecidable");
     }
 
@@ -196,14 +196,14 @@ mod tests {
     fn unanswerable_guard_then_genuine_revival_retains_identity() {
         let store = Store::open_memory("decision-test").unwrap();
         publish(&store, fields(1, "pending", None));
-        let first = store.attention_items(Some("person/reader")).unwrap().remove(0);
+        let first = store.attention_items(Some("person/example")).unwrap().remove(0);
         publish(&store, fields(2, "moot", None));
-        assert!(store.attention_items(Some("person/reader")).unwrap().is_empty());
+        assert!(store.attention_items(Some("person/example")).unwrap().is_empty());
         let mut revived = fields(3, "pending", None);
         revived["revived"] = json!(true);
         revived["activation"] = json!("1111111111111111");
         publish(&store, revived);
-        let revived = store.attention_items(Some("person/reader")).unwrap().remove(0);
+        let revived = store.attention_items(Some("person/example")).unwrap().remove(0);
         assert_eq!(revived.episode, first.episode);
         assert_eq!(revived.request.as_ref().unwrap()["state"], "pending");
         assert_eq!(revived.request.as_ref().unwrap()["revived"], true);
@@ -214,15 +214,15 @@ mod tests {
     fn recipient_change_neither_moves_the_card_nor_restores_actionability() {
         let store = Store::open_memory("decision-test").unwrap();
         publish(&store, fields(1, "pending", None));
-        let first = store.attention_items(Some("person/reader")).unwrap().remove(0);
+        let first = store.attention_items(Some("person/example")).unwrap().remove(0);
         let mut moved = fields(2, "pending", None);
         moved["person"] = json!("person/other");
         publish(&store, moved);
         assert!(store.attention_items(None).unwrap().is_empty());
         assert!(store.decision_attention_history(Some("person/other")).unwrap().is_empty());
-        let history = store.decision_attention_history(Some("person/reader")).unwrap().remove(0);
+        let history = store.decision_attention_history(Some("person/example")).unwrap().remove(0);
         assert_eq!(history.person, first.person);
-        assert_eq!(history.request.as_ref().unwrap()["person"], "person/reader");
+        assert_eq!(history.request.as_ref().unwrap()["person"], "person/example");
         assert_eq!(history.request.as_ref().unwrap()["state"], "undecidable");
         publish(&store, fields(3, "pending", None));
         assert!(store.attention_items(None).unwrap().is_empty(), "source recovery cannot silently undo a recipient conflict");
