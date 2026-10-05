@@ -462,12 +462,8 @@ pub(in crate::api) async fn search(
             });
         }
     }
-    // The first lookup gives a small inventory time to become ready. Large inventories
-    // continue in the background; a retry uses that work instead of starting another scan.
-    let start = Instant::now();
-    while held.lock().unwrap().indexed_at.is_none() && start.elapsed() < Duration::from_secs(2) {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // A cold index has explicit readiness. The refresh runs in the background, and the
+    // caller can retry without holding an HTTP request for an unbounded inventory build.
     tokio::task::spawn_blocking(move || search_page(&state, &query, cursor, held, binding, limit))
         .await
         .map_err(ApiError::internal)?
@@ -496,7 +492,12 @@ fn search_page(
     let Some(indexed_at) = &index.indexed_at else {
         return Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "remote-unavailable".into(),
+            code: if index.refreshing {
+                "index-building"
+            } else {
+                "remote-unavailable"
+            }
+            .into(),
             message: index.error.clone().unwrap_or_else(|| {
                 "conversation search index is being built; retry shortly".into()
             }),
