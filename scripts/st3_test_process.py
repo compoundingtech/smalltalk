@@ -23,6 +23,18 @@ def kill_group(pid):
         pass
 
 
+def reap_exited_descendants(task_pid):
+    """Retire adopted PTYs during the test, preserving the task's exit status.
+
+    A stopped PTY must disappear from /proc before suspend/resume checks continue.
+    Only wait on our direct children; leave live descendants owned until teardown.
+    """
+    children = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
+    for pid in map(int, children.read_text().split()):
+        if pid != task_pid:
+            os.waitpid(pid, os.WNOHANG)
+
+
 def reap_descendants():
     """Kill before reaping, keeping each PID reserved while signalling its group.
 
@@ -70,7 +82,7 @@ def guardian(command, watched, result):
             # pidfds avoid PID reuse and the check/launch race. An already dead
             # owner is immediately readable, including after the double fork.
             while not interrupted and not poller.poll(100):
-                pass
+                reap_exited_descendants(task.pid)
     finally:
         if task is not None:
             kill_group(task.pid)

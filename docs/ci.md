@@ -100,7 +100,8 @@ On Linux, tests that launch isolated daemons, drivers, PTYs or long-lived CLI ch
 under `scripts/st3_test_process.py`, a detached subreaper watching pidfds for the Rust runner
 and its launcher. Success, failure, panic, timeout, SIGTERM and SIGKILL of the runner all
 end the owned process tree. Each test has its own process group; detached children are
-adopted and killed and reaped before the supervisor returns the test's status. Cleanup
+adopted and killed and reaped before the supervisor returns the test's status. Exited adopted
+PTYs are also reaped while the test runs, so stop/suspend checks see their PIDs disappear. Cleanup
 uses only the supervisor's descendants, including when evidence collection fails or a
 temporary binary directory has already been removed. The Python boot, no-st2, subagent,
 messaging-fault and delivery-probe entrypoints use the same supervisor when run directly.
