@@ -75,6 +75,24 @@ def wait_for(predicate, message, timeout=10):
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_direct_entrypoint_preserves_consumed_arguments(self):
+        with tempfile.TemporaryDirectory(prefix="guardian-argv-") as directory:
+            script = Path(directory) / "fixture.py"
+            script.write_text(f"""
+import sys
+sys.path.insert(0, {str(HERE)!r})
+from st3_test_process import supervised_main
+argument = sys.argv.pop()
+if __name__ == '__main__':
+    raise SystemExit(supervised_main(lambda: print(argument) or 0))
+""")
+            env = dict(os.environ)
+            env.pop("SMALLTALK_TEST_SUPERVISOR", None)
+            result = subprocess.run([sys.executable, str(script), "preserved-fixture-argument"],
+                                    env=env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "preserved-fixture-argument")
+
     def fixture(self, mode, signal_to_test=None, signal_to_fixture=None):
         with tempfile.TemporaryDirectory(prefix="cleanup-proof-") as directory:
             evidence = Path(directory)

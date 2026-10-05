@@ -113,7 +113,10 @@ def supervised_main(main):
     """Also protect fixtures launched directly, outside Cargo/nextest."""
     if os.environ.get("SMALLTALK_TEST_SUPERVISOR"):
         return main()
-    return run_supervised([sys.executable, *sys.argv])
+    # Fixtures such as delivery-probe consume --binary/--scratch from sys.argv
+    # before their entrypoint. Re-exec the original invocation, preserving those
+    # options (and interpreter flags), so native proofs cannot silently skip.
+    return run_supervised([sys.executable, *sys.orig_argv[1:]])
 
 
 if __name__ == "__main__":

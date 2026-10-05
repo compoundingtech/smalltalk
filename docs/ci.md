@@ -110,6 +110,7 @@ The isolated-process audit covers `boot_canaries`, `broken_gates`, `daemon_envir
 `idle_budget`, `driver_incarnation`, `codex_bootstrap`, `no_st2_seat`, `subagents_seat`,
 `delivery_probe`, and `messaging_faults`. The process-spawning tests in `action_coverage`,
 `agents_restart`, `hook_telemetry`, `terminal_attach` and `command_recorder` use it too.
+The separate `api_accept` target also supervises its descriptor-exhaustion subprocess.
 The remaining daemon fixtures serve their APIs in process or use fake runtime observations;
 their tasks end with their test runtime. New process-spawning fixtures should use this helper.
 
