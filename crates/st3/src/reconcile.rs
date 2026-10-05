@@ -18007,7 +18007,7 @@ mission "self-assigned" state="ready" {
         let published = store.desired_subjects().unwrap();
         assert!(published.iter().all(|subject| {
             subject.subject != format!("agent/{}/bystander", run.id)
-                && crate::graph::declared_uri(&subject.desired).as_deref()
+                && crate::graph::declared_uri(&subject.desired)
                     != Some("urn:example:unrelated")
         }));
     }
