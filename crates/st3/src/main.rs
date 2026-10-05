@@ -18521,7 +18521,11 @@ async fn run_pi_channel(
         None
     };
     let transport = format!("{driver}-channel");
-    if (push_mailbox_enabled() || driver == "omp") && state.pending.fence.is_none() {
+    // A control-only lease must not opt a legacy channel into push mail delivery.
+    if driver == "omp" && !push_mailbox_enabled() && state.control_fence.is_none() {
+        state.control_fence = state.pending.fence.take();
+    }
+    if push_mailbox_enabled() && state.pending.fence.is_none() {
         state.pending.fence = Some(st3::mailbox::Fence::new(subject, &incarnation, "delivery"));
     }
     if let Some(fence) = &mut state.pending.fence { fence.bind(client).await?; }
@@ -18599,7 +18603,7 @@ async fn run_pi_channel(
                         state.lines.push(&bytes);
                         while let Some(line) = state.lines.next_line() {
                             if driver == "omp" {
-                                match state.controls.accept(&line, subject, state.pending.fence.as_ref()) {
+                                match state.controls.accept(&line, subject, state.control_fence.as_ref().or(state.pending.fence.as_ref()).filter(|fence| fence.epoch != 0)) {
                                     Ok(true) => continue,
                                     Ok(false) => {},
                                     Err(error) => { warn_pi_channel(subject, &error, &mut last_warning); continue; }
@@ -18642,10 +18646,10 @@ async fn run_pi_channel(
                             }
                         }
                         if driver == "omp" {
-                            if let Err(error) = state.controls.flush(client, state.pending.fence.as_ref(), &mut stdout, false).await {
+                            if let Err(error) = state.controls.flush(client, state.control_fence.as_ref().or(state.pending.fence.as_ref()).filter(|fence| fence.epoch != 0), &mut stdout, false).await {
                                 warn_pi_channel(subject, &error, &mut last_warning);
                             }
-                            if let Some(fence) = &state.pending.fence {
+                            if let Some(fence) = state.control_fence.as_ref().or(state.pending.fence.as_ref()).filter(|fence| fence.epoch != 0) {
                                 let closed: Result<Value> = client.post("/v1/harness-control/close", fence).await;
                                 if let Err(error) = closed { warn_pi_channel(subject, &error, &mut last_warning); }
                             }
@@ -18666,8 +18670,18 @@ async fn run_pi_channel(
                 }
             }
             _ = interval.tick() => {
-                if driver == "omp" && let Err(error) = state.controls.flush(client, state.pending.fence.as_ref(), &mut stdout, state.first_idle_seen).await {
-                    warn_pi_channel(subject, &error, &mut last_warning);
+                if driver == "omp" && state.controls.is_active() {
+                    if state.pending.fence.is_none() {
+                        let fence = state.control_fence.get_or_insert_with(|| {
+                            st3::mailbox::Fence::new(subject, &incarnation, "delivery")
+                        });
+                        if let Err(error) = fence.bind(client).await {
+                            warn_pi_channel(subject, &error, &mut last_warning);
+                        }
+                    }
+                    if let Err(error) = state.controls.flush(client, state.control_fence.as_ref().or(state.pending.fence.as_ref()).filter(|fence| fence.epoch != 0), &mut stdout, state.first_idle_seen).await {
+                        warn_pi_channel(subject, &error, &mut last_warning);
+                    }
                 }
                 if let Some(observer) = observer.as_mut() {
                     if let Err(error) = observer.heartbeat() {
@@ -18922,6 +18936,8 @@ struct PiChannelResume {
     native_session: Option<String>,
     #[serde(default)]
     controls: native_control_driver::NativeControls,
+    #[serde(default)]
+    control_fence: Option<st3::mailbox::Fence>,
     #[serde(default)]
     todo_outbox: Option<PathBuf>,
     // The latest validated hydration survives graph lag and binary replacement without rebinding.

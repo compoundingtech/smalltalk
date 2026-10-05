@@ -55,6 +55,10 @@ OMP channel callers carry the complete resolved driver-path contract: absolute `
 `ST_DRIVER_AGENT_DIR`, `ST_DRIVER_SESSION_DIR`, and the matching `ST_DRIVER_IDENTITY`.
 Native controls persist their outbox in that session directory; a catalog alone is not a substitute.
 The Rust and Swift clients retain the schema's queue/model error codes as typed values.
+The control lease activates only after an actual native control observation and survives channel
+re-exec. It does not enable push-mail subscriptions on legacy OMP channels: their existing delivery
+and graph-lag behavior remains unchanged. Controls without an accepted lease cannot publish or
+dispatch; a legacy channel without control observations does not acquire a control lease.
 
 Input uses a displayable, user-attributed native custom message with an operation ID, actor, and
 entry ID in its details. Smalltalk retains follow-ups while native input is busy and dispatches

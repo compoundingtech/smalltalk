@@ -16,6 +16,9 @@ pub struct NativeControls {
     outbox: Option<PathBuf>,
 }
 impl NativeControls {
+    pub fn is_active(&self) -> bool {
+        self.observation.is_some() || self.binding.is_some()
+    }
     pub fn bind_outbox(&mut self, dir: PathBuf) -> Result<()> {
         std::fs::create_dir_all(&dir)?;
         self.outbox = Some(dir);
