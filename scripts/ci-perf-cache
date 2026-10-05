@@ -225,6 +225,24 @@ def restore():
     for kind in wanted.keys() - found:
         print(f'::warning::P0: Performance {kind} cache MISS; seed this recipe on main', flush=True)
     restore_sources()
+    # Fix the comparison reports too: these are the five successful main reports used by
+    # the original unchanged-main controls, not newer successes discovered mid-experiment.
+    for report in baseline.glob('load-*.json'):
+        report.unlink()
+    reports = 0
+    for run_id in (37276978494, 37273736714, 37265290064, 37257137831, 37256435588):
+        run = api(f'repos/{repo}/actions/runs/{run_id}')
+        if not trusted(run):
+            raise ValueError('a fixed comparison report must be from successful main')
+        with tempfile.TemporaryDirectory(dir=temp) as tmp:
+            dest = Path(tmp)
+            download(repo, run, 'perf-load-logs', dest)
+            files = list(dest.rglob('load.json'))
+            if len(files) != 1 or not valid_report(json.loads(files[0].read_text())):
+                raise ValueError('invalid fixed comparison report')
+            shutil.copyfile(files[0], baseline / f'load-{run_id}.json')
+            reports += 1
+    print('Performance fixed control baseline: five original successful main reports', flush=True)
     print(f'Performance baseline: {reports} real successful main reports', flush=True)
     with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
         summary.write(f'Performance caches: build **{"HIT" if "build" in found else "MISS (P0)"}**, '
