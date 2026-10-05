@@ -1065,7 +1065,23 @@ async fn conversation_search_uses_the_typed_unix_client_and_private_reader() {
     let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
     wait_for_socket(&socket).await;
     let client = Client::unix_as(&socket,"person/ada");
-    let hits = client.conversation_search("café orchid",Some("agent/scribe"),None,None,Some(50)).await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let hits = loop {
+        match client
+            .conversation_search("café orchid", Some("agent/scribe"), None, None, Some(50))
+            .await
+        {
+            Ok(hits) => break hits,
+            Err(ClientError::Api(ErrorCode::Internal, _, envelope))
+                if envelope.retryable
+                    && envelope.message == "conversation search index is being built; retry shortly"
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("conversation search did not become ready: {error:?}"),
+        }
+    };
     assert_eq!(hits.value.items.len(),1);
     assert_eq!(hits.value.items[0].entry_id,"message/visible");
     assert!(matches!(Client::unix(&socket).conversation_search("orchid",None,None,None,None).await,
