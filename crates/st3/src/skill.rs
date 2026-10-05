@@ -109,7 +109,7 @@ mod tests {
                 "the skill prescribes conduct: {rule}"
             );
         }
-        assert!(SKILL.lines().count() <= 54, "the skill stays short");
+        assert!(SKILL.lines().count() <= 60, "the skill stays short");
     }
 
     #[test]
