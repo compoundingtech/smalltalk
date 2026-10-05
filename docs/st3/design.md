@@ -45,8 +45,8 @@ Every document starts with `version 2`. Declarations follow that node directly. 
 that represents a database transaction.
 
 `st launch preview` validates and renders a planner-authored launch candidate.
-`st missions publish FILE --as ACTOR` previews and then atomically applies exact authored mission
-KDL. In [free mode](kdl-lifecycle.md#free-mode) any agent may publish, as itself. A failed
+`st apply FILE... --as ACTOR` previews and then atomically applies authored KDL for seats,
+missions and schedules. In [free mode](kdl-lifecycle.md#free-mode) any agent may publish, as itself. A failed
 declaration rejects the complete publication.
 
 Removing a prior declaration from a later file has no effect. A cancellation, stop, repair, or new

@@ -41,6 +41,6 @@ Use isolated daemons to prove: one new head requests one run; the same head surv
 After the implementation, an operator prepares one repository's intake KDL with its repository locator, stable resource identity, review and triage mission names, disk-backed workspace, and requester. The owner's final turn-on is only:
 
 ```sh
-"$ST3_BIN" missions publish missions/REPO-intake.kdl --as person/owner
+"$ST3_BIN" apply missions/REPO-intake.kdl --as person/owner
 "$ST3_BIN" missions start fleet/REPO/intake --workspace /srv/st3/runs/REPO --as person/owner
 ```

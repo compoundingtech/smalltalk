@@ -98,8 +98,9 @@ const DEFAULT_DAEMON_WAIT_SECS: u64 = 30;
 
 #[derive(Subcommand)]
 enum Command {
-    /// Atomically publish a complete owned set of seats, missions and schedules.
-    Apply(OwnedSetApplyArgs),
+    /// Validate and publish KDL files containing seats, missions and schedules.
+    /// Use --dry-run to preview, or --set with source flags to publish a complete owned set.
+    Apply(ApplyArgs),
     /// Inspect owned sets and their source publication receipts.
     Sets {
         #[command(subcommand)]
@@ -1646,7 +1647,7 @@ enum MissionViewCommand {
     },
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
-    /// Publish exact authored mission KDL after preview, once its exec gates pass a check.
+    /// Legacy: use `st apply FILE`; publish authored KDL after checking exec gates.
     ///
     /// Goals, constraints and named documents encode every known rule and decision.
     /// `depends-on` orders steps; `missions start --after` orders runs without reports.
@@ -1702,7 +1703,7 @@ struct MissionPublishArgs {
     /// KDL file to publish; use `-` to read standard input.
     file: PathBuf,
     /// Print the resolved publication preview without applying or running exec gates.
-    /// Use `missions check` separately to run the gates.
+    /// Add --check to run the gates during the preview.
     #[arg(long, visible_alias = "preview")]
     dry_run: bool,
     /// Preview against this exact store index.
@@ -1718,6 +1719,12 @@ struct MissionPublishArgs {
     /// Publish without first running each exec gate once to refuse a broken one.
     #[arg(long)]
     no_gate_check: bool,
+    /// Run exec gates even during a dry run.
+    #[arg(long, visible_alias = "check-gates", conflicts_with = "no_gate_check")]
+    check: bool,
+    /// Mission input values for exec gate checks.
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
 }
 
 #[derive(Args)]
@@ -1773,7 +1780,7 @@ enum GateCommand {
 struct MissionRunStartArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Mission)))]
     mission: String,
-    /// Start exactly this published revision, as printed by `missions publish`. A revision
+    /// Start exactly this published revision, as printed by `st apply`. A revision
     /// published on another host is awaited briefly while it replicates here.
     #[arg(long)]
     revision: Option<String>,
@@ -2761,7 +2768,7 @@ enum AgentsCommand {
         #[arg(long)]
         host: Option<String>,
     },
-    /// Preview and apply one KDL file containing durable agent seats.
+    /// Legacy: use `st apply FILE`; preview and apply authored KDL.
     Apply(AgentApplyArgs),
     /// Start a durable seat, patching only explicitly supplied declaration fields. A stopped
     /// mission seat starts again on its run's own declaration.
@@ -2978,38 +2985,57 @@ struct LaneMarkArgs {
 }
 
 #[derive(Args)]
-struct OwnedSetApplyArgs {
-    #[arg(long)]
-    set: String,
-    /// Complete list of input KDL files; '-' reads stdin once.
+struct ApplyArgs {
+    /// Input KDL files; '-' reads stdin once. All files are previewed and applied together.
     files: Vec<PathBuf>,
-    #[arg(long)]
-    repository: String,
-    #[arg(long = "ref")]
-    source_ref: String,
-    #[arg(long)]
-    sha: String,
-    #[arg(long)]
-    source_sequence: u64,
+    /// Publish complete owned membership; requires all source flags and --expect-set.
+    #[arg(long, requires_all = ["repository", "source_ref", "sha", "source_sequence", "expect_set"])]
+    set: Option<String>,
+    #[arg(long, requires = "set")]
+    repository: Option<String>,
+    #[arg(long = "ref", requires = "set")]
+    source_ref: Option<String>,
+    #[arg(long, requires = "set")]
+    sha: Option<String>,
+    #[arg(long, requires = "set")]
+    source_sequence: Option<u64>,
     /// 'absent' for initial creation, otherwise the previous selected set revision.
-    #[arg(long)]
-    expect_set: String,
-    #[arg(long)]
+    #[arg(long, requires = "set")]
+    expect_set: Option<String>,
+    /// Print the resolved preview without publishing or running exec gates (unless --check).
+    #[arg(long, visible_alias = "preview")]
     dry_run: bool,
+    /// Run exec gates even during a dry run, as `st missions check` does.
+    #[arg(long, visible_alias = "check-gates", conflicts_with = "no_gate_check")]
+    check: bool,
+    /// The workspace a run would use, for exec gate checks.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Mission input values for exec gate checks.
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
+    /// Publish without checking exec gates for broken commands.
+    #[arg(long)]
+    no_gate_check: bool,
+    /// Preview against this exact store index (plain files only).
+    #[arg(long, visible_alias = "at", conflicts_with = "set")]
+    at_index: Option<u64>,
     /// Drain changed and retiring seats, then resume their native conversation.
-    #[arg(long, value_parser = ["when-idle"])]
+    #[arg(long, value_parser = ["when-idle"], requires = "set")]
     rollout: Option<String>,
     #[arg(long, default_value = "30m", requires = "rollout")]
     rollout_deadline: String,
     /// Interrupt busy work at the deadline; identity and session fences still apply.
     #[arg(long, requires = "rollout")]
     force_after_deadline: bool,
-    #[arg(long = "adopt")]
+    #[arg(long = "adopt", requires = "set")]
     adopt: Vec<String>,
-    #[arg(long)]
+    #[arg(long, requires = "set")]
     allow_empty: bool,
-    #[arg(long)]
+    #[arg(long, requires = "set")]
     confirm_retire: Option<String>,
+    /// Complete person or agent subject authoring the publication.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", env = "ST_AGENT", value_parser = parse_publication_actor)]
     actor: String,
 }
@@ -3030,22 +3056,18 @@ enum OwnedSetsCommand {
     },
 }
 
-async fn run_owned_set_apply(
-    client: &Client,
-    args: OwnedSetApplyArgs,
-    json_output: bool,
-) -> Result<()> {
-    use st3::store::owned_sets::{Options, Preview, Request, Source};
+/// Bundle each versioned file into one intent so references may cross file boundaries.
+fn read_apply_files(files: &[PathBuf], allow_empty: bool) -> Result<IntentInput> {
     anyhow::ensure!(
-        !args.files.is_empty() || args.allow_empty,
-        "no input files: intentional empty membership needs --allow-empty"
+        !files.is_empty() || allow_empty,
+        "no input files: intentional empty owned membership needs --set and --allow-empty"
     );
     anyhow::ensure!(
-        args.files.iter().filter(|p| p.as_os_str() == "-").count() <= 1,
+        files.iter().filter(|p| p.as_os_str() == "-").count() <= 1,
         "stdin may appear only once"
     );
     let mut bundle = String::from("version 2\n");
-    for path in &args.files {
+    for path in files {
         let (text, _) = read_intent(Some(path))?;
         let mut doc: kdl::KdlDocument = text
             .parse()
@@ -3062,15 +3084,59 @@ async fn run_owned_set_apply(
         bundle.push_str(&doc.to_string());
         bundle.push('\n');
     }
-    let options = Options {
-        set: args.set,
-        source: Source {
-            repository: args.repository,
-            r#ref: args.source_ref,
-            sha: args.sha,
-            sequence: args.source_sequence,
+    Ok(IntentInput {
+        kdl: bundle,
+        source_name: Some(
+            files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    })
+}
+
+async fn run_apply(client: &Client, args: ApplyArgs, json_output: bool) -> Result<()> {
+    let intent = read_apply_files(&args.files, args.allow_empty)?;
+    if args.set.is_some() {
+        return run_owned_set_apply(client, intent, args, json_output).await;
+    }
+    publish_mission_intent(
+        client,
+        intent,
+        MissionPublishArgs {
+            file: PathBuf::new(),
+            dry_run: args.dry_run,
+            at_index: args.at_index,
+            actor: args.actor,
+            workspace: args.workspace,
+            no_gate_check: args.no_gate_check,
+            check: args.check,
+            inputs: args.inputs,
         },
-        expected_set: args.expect_set,
+        json_output,
+    )
+    .await
+}
+
+async fn run_owned_set_apply(
+    client: &Client,
+    intent: IntentInput,
+    args: ApplyArgs,
+    json_output: bool,
+) -> Result<()> {
+    use st3::store::owned_sets::{Options, Preview, Request, Source};
+    let options = Options {
+        set: args.set.context("owned publication needs --set")?,
+        source: Source {
+            repository: args.repository.context("--set needs --repository")?,
+            r#ref: args.source_ref.context("--set needs --ref")?,
+            sha: args.sha.context("--set needs --sha")?,
+            sequence: args
+                .source_sequence
+                .context("--set needs --source-sequence")?,
+        },
+        expected_set: args.expect_set.context("--set needs --expect-set")?,
         rollout: args
             .rollout
             .map(|_| {
@@ -3085,23 +3151,34 @@ async fn run_owned_set_apply(
         expected_subjects: Default::default(),
     };
     let mut request = Request {
-        intent: IntentInput {
-            kdl: bundle,
-            source_name: Some("owned set input files".into()),
-        },
+        intent,
         options,
         actor: args.actor,
         idempotency_key: uuid::Uuid::now_v7().to_string(),
     };
     let preview: Preview = client.post("/v1/sets/preview", &request).await?;
     if args.dry_run {
-        return print_value(&preview, json_output);
+        print_value(&preview, json_output)?;
     }
     anyhow::ensure!(
         preview.blockers.is_empty(),
         "owned set refused: {}",
         preview.blockers.join("; ")
     );
+    // Empty owned membership has no gates and is not a valid plain gate-check intent.
+    if !preview.empty && (args.check || (!args.dry_run && !args.no_gate_check)) {
+        check_before_publish(
+            client,
+            &request.intent,
+            &args.workspace,
+            &args.inputs,
+            args.check,
+        )
+        .await?;
+    }
+    if args.dry_run {
+        return Ok(());
+    }
     request.options.expected_subjects = preview.expected_subjects;
     let response: Value = client.post("/v1/sets/apply", &request).await?;
     print_value(&response, json_output)
@@ -3132,6 +3209,9 @@ struct AgentApplyArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
+    /// Print the resolved publication preview without applying or running exec gates.
+    #[arg(long, visible_alias = "preview")]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -4583,7 +4663,7 @@ async fn run(cli: Cli) -> Result<()> {
     // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
     let immediate = Client::new(endpoint.clone());
     match cli.command {
-        Command::Apply(args) => run_owned_set_apply(&client, args, cli.json).await,
+        Command::Apply(args) => run_apply(&client, args, cli.json).await,
         Command::Sets { command } => run_owned_sets(&endpoint, command, cli.json).await,
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
@@ -6026,7 +6106,10 @@ async fn run_mission_view(
             }
             Ok(())
         }
-        MissionViewCommand::Publish(args) => publish_mission_file(client, args, json_output).await,
+        MissionViewCommand::Publish(args) => {
+            eprintln!("st: missions publish is legacy; use st apply FILE with the same options");
+            publish_mission_file(client, args, json_output).await
+        }
         MissionViewCommand::Check(args) => check_mission_file(client, args, json_output).await,
         MissionViewCommand::Start(args) => start_mission_run(client, args, json_output).await,
         MissionViewCommand::Cancel(args) => {
@@ -6058,6 +6141,15 @@ async fn publish_mission_file(
 ) -> Result<()> {
     let (kdl, source_name) = read_intent(Some(&args.file))?;
     let intent = IntentInput { kdl, source_name };
+    publish_mission_intent(client, intent, args, json_output).await
+}
+
+async fn publish_mission_intent(
+    client: &Client,
+    intent: IntentInput,
+    args: MissionPublishArgs,
+    json_output: bool,
+) -> Result<()> {
     let mission: MissionResponse = client
         .post(
             "/v1/intent/mission",
@@ -6075,13 +6167,20 @@ async fn publish_mission_file(
         "{}",
         mission.blockers.join("; ")
     );
+    if args.check || (!args.dry_run && !args.no_gate_check) {
+        check_before_publish(
+            client,
+            &mission.resolved_intent,
+            &args.workspace,
+            &args.inputs,
+            args.check,
+        )
+        .await?;
+    }
     if args.dry_run {
         return Ok(());
     }
     warn_ignored_authority(&mission);
-    if !args.no_gate_check {
-        check_before_publish(client, &intent, &args.workspace).await?;
-    }
     let resolved = mission.resolved_intent;
     let response: ApplyResponse = client
         .post(
@@ -6109,9 +6208,11 @@ async fn check_before_publish(
     client: &Client,
     intent: &IntentInput,
     workspace: &Path,
+    inputs: &[(String, String)],
+    required: bool,
 ) -> Result<()> {
     let mut announced = false;
-    let checked = run_gate_check(client, intent, workspace, &[], |view, item| {
+    let checked = run_gate_check(client, intent, workspace, inputs, |view, item| {
         if !announced {
             eprintln!("{}", gate_check_heading(view));
             announced = true;
@@ -6120,6 +6221,10 @@ async fn check_before_publish(
     })
     .await?;
     let Some(view) = checked else {
+        anyhow::ensure!(
+            !required,
+            "this st daemon cannot check exec gates; update it"
+        );
         eprintln!("st: this st daemon cannot check exec gates; publishing without the check");
         return Ok(());
     };
@@ -11370,16 +11475,36 @@ async fn run_agents(
             Ok(())
         }
         AgentsCommand::Apply(args) => {
+            eprintln!(
+                "st: agents apply is legacy; use st apply FILE --no-gate-check with the same options"
+            );
             let client = cli_client(endpoint);
-            let (kdl, source_name) = read_intent(Some(&args.file))?;
-            let response = publish_text(
+            if !args.dry_run {
+                let (kdl, source_name) = read_intent(Some(&args.file))?;
+                let response = publish_text(
+                    &client,
+                    kdl,
+                    source_name.unwrap_or_else(|| "standard input".into()),
+                    args.actor,
+                )
+                .await?;
+                return print_value(&response, json_output);
+            }
+            publish_mission_file(
                 &client,
-                kdl,
-                source_name.unwrap_or_else(|| "standard input".into()),
-                args.actor,
+                MissionPublishArgs {
+                    file: args.file,
+                    dry_run: true,
+                    at_index: None,
+                    actor: args.actor,
+                    workspace: PathBuf::from("."),
+                    no_gate_check: true,
+                    check: false,
+                    inputs: vec![],
+                },
+                json_output,
             )
-            .await?;
-            print_value(&response, json_output)
+            .await
         }
         AgentsCommand::Start(args) => {
             let client = cli_client(endpoint);
@@ -11777,7 +11902,7 @@ async fn agent_start_declaration(
         }
         anyhow::ensure!(
             desired.kind == "stop" && claim.predecessors.len() == 1,
-            "`{subject}` has no unambiguous prior agent declaration; use `st agents apply`"
+            "`{subject}` has no unambiguous prior agent declaration; use `st apply`"
         );
         claim = client
             .get(&format!("/v1/claims/by-id/{}", claim.predecessors[0]))
@@ -12020,7 +12145,7 @@ async fn run_agent_new(
                 && agent.state != "stopped"
             {
                 anyhow::bail!(
-                    "`{subject}` already exists and is {}; change it with `st agents apply`, or stop it with `st agents stop` first",
+                    "`{subject}` already exists and is {}; change it with `st apply`, or stop it with `st agents stop` first",
                     agent.state
                 );
             }
@@ -24254,6 +24379,114 @@ mod tests {
     }
 
     #[test]
+    fn apply_accepts_plain_files_and_requires_owned_source_flags_together() {
+        let plain = [
+            "st",
+            "apply",
+            "seats.kdl",
+            "missions.kdl",
+            "schedules.kdl",
+            "--as",
+            "person/operator",
+            "--dry-run",
+            "--check",
+            "--workspace",
+            "/tmp",
+            "--input",
+            "release=1.4.0",
+        ];
+        let cli = Cli::try_parse_from(plain).unwrap();
+        let Command::Apply(args) = cli.command else {
+            panic!("expected apply")
+        };
+        assert!(args.set.is_none());
+        assert_eq!(args.files.len(), 3);
+        assert!(args.dry_run && args.check);
+        assert_eq!(args.inputs, vec![("release".into(), "1.4.0".into())]);
+        let owned = [
+            "st",
+            "apply",
+            "seats.kdl",
+            "--as",
+            "person/operator",
+            "--set",
+            "garden",
+            "--repository",
+            "acme/garden",
+            "--ref",
+            "refs/heads/main",
+            "--sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--source-sequence",
+            "1",
+            "--expect-set",
+            "absent",
+        ];
+        assert!(Cli::try_parse_from(owned).is_ok());
+        for flag in [
+            "--set",
+            "--repository",
+            "--ref",
+            "--sha",
+            "--source-sequence",
+            "--expect-set",
+        ] {
+            let mut incomplete = owned.to_vec();
+            let index = incomplete.iter().position(|arg| *arg == flag).unwrap();
+            incomplete.drain(index..index + 2);
+            assert!(
+                Cli::try_parse_from(incomplete).is_err(),
+                "{flag} is required for owned publication"
+            );
+        }
+        let mut conflicting = plain.to_vec();
+        conflicting.push("--no-gate-check");
+        assert!(Cli::try_parse_from(conflicting).is_err());
+        let mut owned_at_index = owned.to_vec();
+        owned_at_index.extend(["--at-index", "0"]);
+        assert!(Cli::try_parse_from(owned_at_index).is_err());
+        for option in ["--allow-empty", "--adopt", "--confirm-retire", "--rollout"] {
+            let mut unsupported = vec![
+                "st",
+                "apply",
+                "seats.kdl",
+                "--as",
+                "person/operator",
+                option,
+            ];
+            match option {
+                "--allow-empty" => {}
+                "--rollout" => unsupported.push("when-idle"),
+                _ => unsupported.push("agent/example/helper"),
+            }
+            assert!(
+                Cli::try_parse_from(unsupported).is_err(),
+                "{option} needs --set"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_rejects_duplicate_stdin_and_unversioned_files() {
+        assert!(
+            read_apply_files(&["-".into(), "-".into()], false)
+                .unwrap_err()
+                .to_string()
+                .contains("stdin may appear only once")
+        );
+        assert!(read_apply_files(&[], false).is_err());
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("invalid.kdl");
+        fs::write(&file, "agent \"example/helper\" { command \"true\"; }\n").unwrap();
+        assert!(
+            read_apply_files(&[file], false)
+                .unwrap_err()
+                .to_string()
+                .contains("must begin with version 2")
+        );
+    }
+
+    #[test]
     fn mission_publish_requires_an_explicit_person_or_agent_actor() {
         let cli = Cli::try_parse_from([
             "st3",
@@ -26584,6 +26817,8 @@ mission "review" state="ready" {
                 actor: "person/test".into(),
                 workspace: root.to_owned(),
                 no_gate_check: false,
+                check: false,
+                inputs: vec![],
             },
             true,
         )

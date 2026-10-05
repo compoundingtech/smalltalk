@@ -520,11 +520,13 @@
     },
     {
       "command": "st apply",
-      "description": "Publish a complete source-fenced owned set",
+      "description": "Preview and publish KDL files or a complete source-fenced owned set",
       "tests": [
-        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation"
+        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation",
+        "crates/st3/tests/broken_gates.rs::apply_bundles_seats_missions_and_schedules_and_refuses_partial_publication",
+        "crates/st3/tests/broken_gates.rs::apply_can_check_exec_gates_during_plain_and_owned_dry_runs"
       ],
-      "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
+      "verification": "real CLI over isolated disk-backed Unix daemons; mixed-file atomic publication, dry-run side effects, gate checks, source fences, partition/heal and retirement confirmation"
     },
     {
       "command": "st attention approve",

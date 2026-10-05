@@ -108,11 +108,11 @@ agent "probe/delivery/amber" {
 ```
 
 ```sh
-st agents apply probe.kdl --as person/operator
+st apply probe.kdl --as person/operator
 st doctor --json
 ```
 
-`agents apply` previews the intent and refuses unresolved references before
+`apply` previews the intent and refuses unresolved references before
 publishing it. Create the corresponding configuration and seat for every node, with its other
 two nodes as peers. Host and agent identities must agree across configurations.
 An offline node remains configured so its missing source heartbeat and unread

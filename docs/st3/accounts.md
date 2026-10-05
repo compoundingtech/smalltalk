@@ -10,7 +10,7 @@ harness's default login, exactly as before.
 
 ## Declare an account
 
-An `account` is a root declaration, applied like an agent: `st agents apply accounts.kdl --as person/ada`.
+An `account` is a root declaration, applied like an agent: `st apply accounts.kdl --as person/ada`.
 
 ```kdl
 version 2
