@@ -40,6 +40,13 @@ requests. Run affinity ensures that a runner started for a request is assigned t
 so GitHub cannot hand it to a newer run with the same shape. Local `ci1-priority` and `ci1-merge`
 reservations continue to select only the primary test shard.
 
+Profile labels carry affinity inline, for example
+`namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}`.
+Shape labels retain `-with-features` and a separate
+`namespace-features:github.run-id=${{ github.run_id }}` label. Namespace does not support a
+separate `namespace-features:` label with profiles; see the
+[Runner Controls syntax](https://namespace.so/docs/solutions/github-actions/runner-controls).
+
 The queue still shares the existing Linux limit of 320 vCPUs / 640 GiB and must drain its older
 backlog. Queue time is measured separately from execution time; the shared class removes
 indefinite overtaking, rather than promising a fixed start time under arbitrary overload.
@@ -506,6 +513,14 @@ releases. Native releases keep the pinned Zig compiler under a stable version/pl
 per-run entries. Matching native snapshots also retain it, so fresh nodes do not fetch it
 again. These Cargo builds do not produce Zig object-cache directories; empty cache declarations
 would miss on every run and are omitted.
+
+Workspace Cargo and Nix dependency entries are restored on PRs and merge groups. Only
+protected main fills missing entries: Linux main upkeep and main macOS runs save them
+explicitly after preparing valid outputs. Branch-scoped copies of these large archives
+would consume the repository's shared quota and evict the main entries every new PR
+needs. Repeated source heads retain their separate exact-source artifact snapshots.
+The secondary Linux shard reads the same dependency keys as the primary; snapshots
+remain specific to each job, source, platform and build recipe.
 
 Compiled outputs also have three-day artifact snapshots keyed by the actual full source SHA,
 job, platform, architecture, build flags and workflow contents. Native snapshots additionally

@@ -2,12 +2,14 @@ import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from '.
 import {
   defaultActionlintConfig,
   effectUtilsBinaryCaches,
-  namespaceRunner,
   nixDevelopStep,
   plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
 
-export const linuxRunner = namespaceRunner({ profile: 'namespace-profile-linux-x86-64;job.priority=1', runId: '${{ github.run_id }}' })
+// Profiles require controls inline; namespace-features labels apply only to shape labels.
+export const linuxRunnerProfile = 'namespace-profile-linux-x86-64;job.priority=1'
+export const macosRunnerProfile = 'namespace-profile-macos-arm64'
+export const linuxRunner = [`${linuxRunnerProfile};github.run-id=\${{ github.run_id }}`] as const
 /**
  * The Linux gate's stage jobs. On 2026-10-03 the shape label `nscloud-ubuntu-24.04-amd64-16x32`
  * stopped getting runners at about 12:10Z, and the profile allows only about five runners at
@@ -20,7 +22,7 @@ export const linuxStageRunner = [
   `${linuxStageShape};job.priority=1`,
   'namespace-features:github.run-id=${{ github.run_id }}',
 ] as const
-export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-arm64', runId: '${{ github.run_id }}' })
+export const macosRunner = [`${macosRunnerProfile};github.run-id=\${{ github.run_id }}`] as const
 export const linuxActionlintConfig = {
   ...defaultActionlintConfig,
   selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
@@ -146,7 +148,7 @@ export const cargoCacheStep = {
   name: 'Restore the Cargo target and registry',
   id: 'cargo-cache',
   if: "env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'",
-  uses: 'actions/cache@v4',
+  uses: 'actions/cache/restore@v4',
   with: {
     path: '${{ github.workspace }}/target\n${{ runner.temp }}/cargo-home/registry\n${{ runner.temp }}/cargo-home/git',
     key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config.toml') }}",
@@ -158,13 +160,23 @@ export const nixCacheStep = {
   name: 'Restore the local Nix cache',
   id: 'nix-cache',
   if: "env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'",
-  uses: 'actions/cache@v4',
+  uses: 'actions/cache/restore@v4',
   with: {
     path: '${{ runner.temp }}/st-ci-cache',
     key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
     'restore-keys': 'nix5-${{ github.job }}-${{ runner.os }}-\nnix4-${{ github.job }}-${{ runner.os }}-',
   },
 } as const
+
+/** Keep shared dependency entries on protected main; PR builds have exact-source artifacts. */
+export const saveMainDependencyCaches = (setup: readonly unknown[]) => setup
+  .filter((value: any) => value.id === 'cargo-cache' || value.id === 'nix-cache')
+  .map((value: any) => ({
+    name: `Save main ${value.id}`,
+    if: `success() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && env.CI_LOCAL_CACHES != '1' && steps.${value.id}.outputs.cache-hit != 'true'`,
+    uses: 'actions/cache/save@v4',
+    with: { path: value.with.path, key: value.with.key },
+  }))
 
 /**
  * Checkout, the Namespace cache volume, Nix with the read-only effect-utils cache, and an isolated
@@ -278,6 +290,7 @@ export const linuxStageJob = ({
       if: "success() && env.CI_LOCAL_CACHES != '1'",
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
+    ...saveMainDependencyCaches(setup),
     ...buildSnapshotSave,
     {
       name: 'Retain stage logs and timings',

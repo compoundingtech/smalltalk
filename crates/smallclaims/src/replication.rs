@@ -478,8 +478,9 @@ pub struct ReplicationPeerSync {
     /// How fast `peer_only_envelopes` shrinks, net of the envelopes the peer keeps writing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catch_up_rate_per_second: Option<f64>,
-    /// No forecast when the rate is unavailable or the result exceeds
-    /// [`MAX_SAFE_DURATION_SECONDS`].
+    /// Forecast in exact JSON-safe integer seconds up to [`MAX_SAFE_DURATION_SECONDS`];
+    /// absent when no finite positive rate or representable forecast exists.
+    /// Missing a forecast does not mean the peer is caught up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_catch_up_seconds: Option<u64>,
     /// The peer recently held more envelopes than one exchange carries, so this node's views

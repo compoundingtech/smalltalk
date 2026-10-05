@@ -3695,38 +3695,6 @@ pub fn replication_difference_counts_what_each_side_lacks() {
 
 #[cfg(test)]
 #[test]
-pub fn sync_progress_stalled_smoothing_has_no_unsafe_forecast() {
-    let mut progress = PeerSyncProgress::default();
-    progress.observe(0, Some((10_000, 0)), 1_000);
-    progress.observe(1_000, Some((9_000, 0)), 11_000);
-    assert_eq!(
-        progress.view(11_000).unwrap().estimated_catch_up_seconds,
-        Some(90)
-    );
-
-    // Zero-progress windows halve the old rate without ever making it exactly zero.
-    for window in 1..=60 {
-        progress.observe(0, Some((9_000, 0)), 11_000 + window * 10_000);
-    }
-    let sync = progress.view(611_000).unwrap();
-    assert!(sync.catch_up_rate_per_second.unwrap() > 0.0);
-    assert!(
-        sync.catching_up,
-        "a missing forecast must not hide the backlog"
-    );
-    assert_eq!(sync.peer_only_envelopes, 9_000);
-    assert_eq!(sync.estimated_catch_up_seconds, None);
-
-    // Real progress makes a forecast available again.
-    progress.observe(1_000, Some((8_000, 0)), 621_000);
-    assert_eq!(
-        progress.view(621_000).unwrap().estimated_catch_up_seconds,
-        Some(160)
-    );
-}
-
-#[cfg(test)]
-#[test]
 pub fn sync_progress_forecasts_require_finite_safe_seconds() {
     for (rate, peer_only, expected) in [
         (
@@ -3809,6 +3777,51 @@ pub fn sync_progress_estimates_catch_up_from_net_progress() {
         progress.view(30_000).unwrap().estimated_catch_up_seconds,
         Some(0)
     );
+}
+
+#[cfg(test)]
+#[test]
+pub fn sync_progress_omits_forecasts_outside_safe_integer_seconds() {
+    let mut progress = PeerSyncProgress {
+        measured: Some(ReplicationPeerSync {
+            catch_up_rate_per_second: Some(1.0),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    progress.observe(0, Some((MAX_SAFE_DURATION_SECONDS, 7)), 1_000);
+    assert_eq!(
+        progress.view(1_000).unwrap().estimated_catch_up_seconds,
+        Some(MAX_SAFE_DURATION_SECONDS)
+    );
+    progress.observe(0, Some((MAX_SAFE_DURATION_SECONDS + 1, 7)), 2_000);
+    let sync = progress.view(2_000).unwrap();
+    assert_eq!(sync.estimated_catch_up_seconds, None);
+    assert_eq!(sync.peer_only_envelopes, MAX_SAFE_DURATION_SECONDS + 1);
+    assert_eq!(sync.local_only_envelopes, 7);
+    assert!(sync.catching_up);
+}
+
+#[cfg(test)]
+#[test]
+pub fn sync_progress_omits_stalled_forecasts_and_recovers_on_progress() {
+    let mut progress = PeerSyncProgress::default();
+    progress.observe(0, Some((10_000, 3)), 1_000);
+    progress.observe(1_000, Some((9_000, 3)), 11_000);
+    for window in 1..=60 {
+        progress.observe(0, Some((9_000, 3)), 11_000 + window * 10_000);
+    }
+    let sync = progress.view(611_000).unwrap();
+    assert_eq!(sync.estimated_catch_up_seconds, None);
+    assert_eq!(sync.peer_only_envelopes, 9_000);
+    assert_eq!(sync.local_only_envelopes, 3);
+    assert!(sync.catching_up);
+    assert!(sync.catch_up_rate_per_second.unwrap() > 0.0);
+
+    progress.observe(1_000, Some((8_000, 3)), 621_000);
+    let sync = progress.view(621_000).unwrap();
+    assert_eq!(sync.estimated_catch_up_seconds, Some(160));
+    assert_eq!(sync.peer_only_envelopes, 8_000);
 }
 
 pub fn collect_referenced_blobs(
