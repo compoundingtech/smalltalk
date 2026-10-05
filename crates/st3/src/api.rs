@@ -19214,6 +19214,66 @@ version 2
         assert_eq!(thread.as_array().unwrap().len(), 102);
     }
 
+    #[tokio::test]
+    async fn message_thread_ignores_distinct_stale_reply_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("claims.sqlite3");
+        let mut app_state = state(root.path());
+        app_state.store = Arc::new(Store::open(&database, "node").unwrap());
+        let app = router(app_state);
+        let send = |key: &str, parent: Option<String>| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.into(),
+                from: "agent/garden-writer".into(),
+                to: "agent/garden-reader".into(),
+                content: key.into(),
+                title: None,
+                in_reply_to: parent,
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+        };
+        let (_, first) = json_request(app.clone(), "/v1/messages", send("stale-root", None)).await;
+        let first_id = first["subject"].as_str().unwrap().to_owned();
+        let (_, reply) = json_request(
+            app.clone(),
+            "/v1/messages",
+            send("stale-reply", Some(first_id.clone())),
+        )
+        .await;
+        let reply_id = reply["subject"].as_str().unwrap().to_owned();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        for index in 0..201 {
+            connection
+                .execute(
+                    "INSERT INTO message_reply_edges(source, subject, parent) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        format!("historical-{index}"),
+                        format!("message/000-stale-{index:03}"),
+                        first_id
+                    ],
+                )
+                .unwrap();
+        }
+        let (status, thread) = get_request(
+            app,
+            &format!(
+                "/v1/messages/thread/{}",
+                first_id.trim_start_matches("message/")
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{thread}");
+        let subjects = thread
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["subject"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(subjects, vec![first_id.as_str(), reply_id.as_str()]);
+    }
+
 
     #[tokio::test]
     async fn message_lifecycle_requires_the_exact_recipient_actor() {

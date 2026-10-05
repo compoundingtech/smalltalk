@@ -11365,25 +11365,18 @@ impl Store {
             };
             output.push(view);
             let bare = parent.strip_prefix("message/").unwrap_or(&parent);
+            // Historical edges can outnumber current children. Stream candidates so the
+            // 200-message limit applies only after checking canonical parentage.
             let mut statement = connection
                 .prepare_cached(
                     "SELECT DISTINCT edge.subject FROM message_reply_edges AS edge INDEXED BY message_reply_edges_parent
                  WHERE edge.parent IN (?1, ?2)
-                 ORDER BY edge.parent, edge.subject LIMIT 201",
+                 ORDER BY edge.parent, edge.subject",
                 )
                 .map_err(internal)?;
-            let candidates = statement
-                .query_map(params![parent, bare], |row| row.get::<_, String>(0))
-                .map_err(internal)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(internal)?;
-            if candidates.len() > LIMIT {
-                return Err(St3Error::new(
-                    "message-thread-too-large",
-                    "message thread exceeds 200 messages",
-                ));
-            }
-            for child in candidates {
+            let mut candidates = statement.query(params![parent, bare]).map_err(internal)?;
+            while let Some(row) = candidates.next().map_err(internal)? {
+                let child: String = row.get(0).map_err(internal)?;
                 if visited.contains(&child) {
                     continue;
                 }
