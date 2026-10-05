@@ -628,6 +628,9 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(BINARY, "pass --binary to prove the actual native path")
 class NativeProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_read_waits_for_runtime_publication(self):
+        await self.native_read_outage_and_recovery(agent_alert=False, publication_gap=True)
+
     async def test_native_read_outage_attention_and_recovery(self):
         await self.native_read_outage_and_recovery(agent_alert=False)
 
@@ -637,7 +640,7 @@ class NativeProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_unavailable_alert_agent_falls_back_to_reviewer(self):
         await self.native_read_outage_and_recovery(agent_alert=True, unavailable=True)
 
-    async def native_read_outage_and_recovery(self, agent_alert, unavailable=False):
+    async def native_read_outage_and_recovery(self, agent_alert, unavailable=False, publication_gap=False):
         expect_agent_alert = agent_alert and not unavailable
         # This is a receipt/attention regression, not a latency benchmark. Leave room for
         # parallel CI's scheduling and fsyncs while retaining a real bounded deadline.
@@ -651,6 +654,20 @@ class NativeProbeTests(unittest.IsolatedAsyncioTestCase):
             if os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
                 env["DBUS_SESSION_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"]
             nodes = [faults.Node(directory, host, BINARY, env, binary_directory) for host in ("amber", "cobalt")]
+            if publication_gap:
+                # Hold the launcher's return after the real PTY is published. The
+                # native channel can already see its local incarnation while the
+                # reconciler has not yet reported that incarnation as running.
+                # Keep the original delivery, outage and recovery deadlines.
+                pty = shutil.which("pty")
+                self.assertIsNotNone(pty)
+                for node in nodes:
+                    wrapper = node.root / "bin/pty"
+                    wrapper.write_text(f"#!/bin/sh\n{shlex.quote(pty)} \"$@\"\n"
+                                       "result=$?\n"
+                                       'if [ "$1" = run ] && [ "$result" = 0 ]; then sleep 2; fi\n'
+                                       'exit "$result"\n')
+                    wrapper.chmod(0o755)
             # Doctor also builds a scratch crate. Its compiler check is independent of the
             # real native receipt check; report that tool unavailable in this private fixture.
             for node in nodes:
@@ -728,6 +745,11 @@ agent "probe/{node.name}" {{
 
             first = await faults.until(both_read, 60)
             self.assertTrue(all(row["latency_ms"] < deadline_ms for row in first), first)
+            if publication_gap:
+                for node in nodes:
+                    events = [json.loads(line) for line in (node.root / "probe/events.jsonl").read_text().splitlines()]
+                    self.assertFalse([event for event in events if event["event"] == "channel-exited"
+                                      and "stale-mailbox-session" in event["stderr"]["diagnostic"]], events)
             # latest.json is written locally after publishing its report. The other
             # node's doctor can still have the preceding report until replication
             # carries the new success, especially after a late startup probe.
