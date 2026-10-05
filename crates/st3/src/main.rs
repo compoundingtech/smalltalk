@@ -13511,12 +13511,39 @@ async fn run_attention(
                 completion::Matching::Fuzzy,
             )
             .await?;
+            // Public card IDs name a recipient and waiting episode, not just a work source.
+            // Resolve through the actor-scoped read projection; this must not read an update
+            // for the person or let a spent card open a later episode of the same source.
+            let alias = if normalized.starts_with("attention/") {
+                match generated_client(endpoint, Some(&actor))?
+                    .attention_get(&normalized)
+                    .await
+                {
+                    Ok(response) => match response.value {
+                        ClientResource::Attention(card)
+                            if card.header.id == normalized && card.person_id == actor =>
+                        {
+                            Some(card)
+                        }
+                        _ => None,
+                    },
+                    Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                None
+            };
             let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
             let item = client
                 .get::<Vec<AttentionItemView>>(&path)
                 .await?
                 .into_iter()
-                .find(|item| item.subject == normalized)
+                .find(|item| {
+                    alias.as_ref().map_or_else(
+                        || item.subject == normalized,
+                        |card| item.subject == card.source_id && item.episode == card.episode,
+                    )
+                })
                 .with_context(|| {
                     format!("attention item `{normalized}` is not currently actionable")
                 })?;
