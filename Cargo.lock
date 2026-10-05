@@ -4559,6 +4559,7 @@ name = "st3-schema"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

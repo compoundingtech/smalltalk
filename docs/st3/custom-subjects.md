@@ -67,7 +67,11 @@ require the original person. Raw `st claim` writes receive the same validation a
 replies. Fields support required/optional values, scalar types, enum strings, arrays with
 `min_items`/`max_items`, subject reference families, immutable documents (`document: true`)
 and immutable claim IDs (`claim: true`). `additional_fields` defaults to false. Document/claim
-reference flags require string fields. `_registration` and `_basis` are reserved metadata.
+reference flags require string fields. String fields also support `pattern`: a regex matched
+against the entire string. Patterns are limited to 512 bytes, nesting depth 16 and 256 KiB
+compiled size/cache; invalid or over-complex patterns fail registration. `max_bytes` bounds
+the JSON-encoded value, including string quotes and escapes. `_registration` and `_basis` are
+reserved metadata. Omitting `pattern` preserves existing manifest serialization and hashes.
 
 Slots select `first` or `last` in canonical order for an exact declared claim kind. Expressions
 copy a field (`op: field`, `slot`, `field`), an actor or claim ID (`actor`/`claim-id`, `slot`), or a
@@ -81,6 +85,46 @@ Limits include a 64 KiB manifest and claim field object, 32 slots/claim kinds, 6
 facts or outputs disable only their source. Each source evaluates inside a savepoint; genuine
 storage errors remain storage errors. No custom SQL, callbacks, loops, network requests,
 retention rules, native actions, or contributed UI are accepted.
+
+## Shared reference carriers
+
+Register [image-file-reference.json](../../examples/st3/image-file-reference.json) and
+[onepassword-field-reference.json](../../examples/st3/onepassword-field-reference.json)
+to use the same `reference.image-file` and `reference.onepassword-field` v1 kinds across fleets:
+
+```sh
+st schema register examples/st3/image-file-reference.json --as agent/garden/seed
+st schema register examples/st3/onepassword-field-reference.json --as agent/garden/seed
+st claim custom/reference/image-file/v1/seed-picture custom.reference.image-file.v1.created \
+  --actor agent/garden/seed --field 'file=file/alder:/srv/garden/seed.png' \
+  --field content_hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --field media_type=image/png
+st claim custom/reference/onepassword-field/v1/garden-token custom.reference.onepassword-field.v1.created \
+  --actor agent/garden/seed --field locator=op://garden-vault/seed-service/token
+```
+
+The image carrier stores a validated `file/HOST:/ABSOLUTE_PATH` subject reference (native
+subject limit 512 bytes, field limit 1024 JSON bytes) and a lowercase 64-digit SHA-256
+content hash (66 JSON bytes). Neither `file.observed` nor `filesystem.file` declares a media
+type, so the carrier permits an
+optional `image/...` media type (≤128 JSON bytes, without parameters). The reference does not
+read, embed, replicate or verify the image bytes; a consumer must check the file's hash.
+
+The 1Password carrier accepts only an exact `op://vault/item/field` locator (≤1024 JSON
+bytes). Each of its three components starts with an ASCII letter or digit and contains only
+ASCII letters, digits, `_` or `-`. Use IDs or simple names; v1 deliberately excludes spaces,
+section-qualified fields, query strings, fragments and encoded components. st never resolves
+the locator. The schema has no secret-value, document, content or free-text field, and rejects
+extra fields. A locator's identifiers are graph data visible to graph readers; use invented
+names in public examples and keep credentials in the [sekrets](sekrets.md) workflow.
+
+Both carriers project their actual creator as `owner` and select its first creation fact.
+Only that actor can append more creation facts; later ones do not replace the selected
+reference. There is no update or reply kind. Use a new subject for a changed reference.
+Subject suffixes are caller-chosen labels, not an identity binding: consumers must check
+the projected owner against their expected writer. Custom facts do not satisfy native
+approval gates. Members need pattern-capable st builds to interpret these manifests; older builds reject the unknown
+descriptor and cannot provide a typed view.
 
 ## Reads, replication and derived state
 

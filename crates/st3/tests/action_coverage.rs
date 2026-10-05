@@ -152,6 +152,10 @@ struct Daemon {
 
 impl Daemon {
     async fn new() -> Self {
+        Self::new_member(NODE).await
+    }
+
+    async fn new_member(node: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("config/st3")).unwrap();
         std::fs::create_dir_all(root.path().join("home")).unwrap();
@@ -160,7 +164,7 @@ impl Daemon {
             format!("person = {PERSON:?}\n"),
         )
         .unwrap();
-        let state = Self::state(root.path());
+        let state = Self::state(root.path(), node);
         let mut daemon = Self {
             root,
             state,
@@ -170,12 +174,12 @@ impl Daemon {
         daemon
     }
 
-    fn state(root: &Path) -> AppState {
+    fn state(root: &Path, node: &str) -> AppState {
         AppState {
-            store: Arc::new(Store::open(&root.join("graph.db"), NODE).unwrap()),
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(Notify::new()),
             event_notify: watch::channel(0_u64).0,
-            node: NODE.into(),
+            node: node.into(),
             state_dir: root.into(),
             pty_root: root.join("pty"),
             pty_binary: "pty".into(),
@@ -227,7 +231,7 @@ impl Daemon {
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
         std::fs::remove_file(self.socket()).unwrap();
-        self.state = Self::state(self.root.path());
+        self.state = Self::state(self.root.path(), &self.state.node);
         self.serve().await;
     }
 
@@ -4607,4 +4611,261 @@ async fn decision_tree_manifest_cards_fences_retries_damage_and_restarts() {
             .items
             .is_empty()
     );
+}
+
+/// Both manifests register through the CLI on isolated disk-backed daemons. Exchange the
+/// real replication envelopes, then read the replica through its own Unix API and restart it.
+async fn reference_manifest_proof(source: &str, good: Value, malformed: Vec<Value>) {
+    const ACTOR: &str = "agent/garden/seed";
+    const FLEET: &str = "5e3c1a9b-2d4f-4b6e-8a7c-0f1e2d3c4b5a";
+    let manifest: st3_schema::custom::Manifest = serde_json::from_str(source).unwrap();
+    let mut daemon = Daemon::new_member("alder").await;
+    let mut replica = Daemon::new_member("birch").await;
+    daemon.store().bind_fleet(FLEET).unwrap();
+    replica.store().bind_fleet(FLEET).unwrap();
+    let path = daemon.root.path().join("reference.json");
+    std::fs::write(&path, source).unwrap();
+    let registered = cli_value(
+        daemon
+            .cli(
+                ACTOR,
+                &["schema", "register", path.to_str().unwrap(), "--as", ACTOR],
+            )
+            .await,
+    );
+    assert_eq!(registered["state"], "ready");
+    assert_eq!(
+        cli_value(
+            daemon
+                .cli(
+                    ACTOR,
+                    &["schema", "register", path.to_str().unwrap(), "--as", ACTOR]
+                )
+                .await
+        ),
+        registered
+    );
+    let subject = format!("{}seed", manifest.subject_prefix);
+    async fn write(
+        daemon: &Daemon,
+        actor: &str,
+        subject: &str,
+        kind: &str,
+        fields: &Value,
+    ) -> Output {
+        let mut args = vec![
+            "claim".to_owned(),
+            subject.into(),
+            kind.into(),
+            "--actor".into(),
+            actor.into(),
+        ];
+        for (name, value) in fields.as_object().unwrap() {
+            args.extend(["--field".into(), format!("{name}={value}")]);
+        }
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        daemon.cli(actor, &args).await
+    }
+    for fields in malformed {
+        let index = daemon.store().index().unwrap();
+        let output = write(&daemon, ACTOR, &subject, &manifest.creation_kind, &fields).await;
+        assert!(
+            !output.status.success(),
+            "accepted malformed fields: {fields}"
+        );
+        assert_eq!(
+            daemon.store().index().unwrap(),
+            index,
+            "rejected write changed graph"
+        );
+        assert!(
+            daemon
+                .store()
+                .claims_for(&subject, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    cli_value(write(&daemon, ACTOR, &subject, &manifest.creation_kind, &good).await);
+    let expected = cli_value(daemon.cli(ACTOR, &["subject", "show", &subject]).await);
+    assert_eq!(expected["state"], "ready");
+    assert_eq!(expected["fields"]["owner"], ACTOR);
+    for (name, value) in good.as_object().unwrap() {
+        assert_eq!(&expected["fields"][name], value);
+    }
+    // The caller-chosen suffix is not an authority binding; the actual first writer owns it.
+    let index = daemon.store().index().unwrap();
+    assert!(
+        !write(
+            &daemon,
+            "agent/garden/other",
+            &subject,
+            &manifest.creation_kind,
+            &good
+        )
+        .await
+        .status
+        .success()
+    );
+    assert_eq!(daemon.store().index().unwrap(), index);
+    let exchange = daemon
+        .store()
+        .export_replication_exchange(FLEET, &replica.store().replication_inventory().unwrap())
+        .unwrap();
+    replica
+        .store()
+        .receive_replication_exchange("alder", FLEET, &exchange)
+        .unwrap();
+    replica.store().validate_replication_backlog().unwrap();
+    replica.store().project_replication_backlog().unwrap();
+    assert!(replica.store().replica_records(true).unwrap().is_empty());
+    assert_eq!(
+        cli_value(replica.cli(ACTOR, &["subject", "show", &subject]).await),
+        expected
+    );
+    assert_eq!(replica.store().claims_for(&subject, None).unwrap().len(), 1);
+    let registration = cli_value(
+        replica
+            .cli(
+                ACTOR,
+                &[
+                    "schema",
+                    "registration",
+                    &format!(
+                        "{}@{}",
+                        manifest.kind,
+                        registered["registration"].as_str().unwrap()
+                    ),
+                ],
+            )
+            .await,
+    );
+    assert_eq!(registration["registration"], registered["registration"]);
+    assert_eq!(registration["state"], "ready");
+    assert_eq!(
+        registration["manifest"],
+        serde_json::to_value(&manifest).unwrap()
+    );
+    // The replica enforces the replicated descriptor too, rather than treating it as untyped.
+    let bad_subject = format!("{}invalid", manifest.subject_prefix);
+    let mut extra = good.clone();
+    extra["secret_value"] = json!("invented-payload");
+    let index = replica.store().index().unwrap();
+    assert!(
+        !write(
+            &replica,
+            ACTOR,
+            &bad_subject,
+            &manifest.creation_kind,
+            &extra
+        )
+        .await
+        .status
+        .success()
+    );
+    assert_eq!(replica.store().index().unwrap(), index);
+    daemon.restart().await;
+    replica.restart().await;
+    for member in [&daemon, &replica] {
+        assert_eq!(
+            cli_value(member.cli(ACTOR, &["subject", "show", &subject]).await),
+            expected
+        );
+        let index = member.store().index().unwrap();
+        assert!(
+            !write(member, ACTOR, &bad_subject, &manifest.creation_kind, &extra)
+                .await
+                .status
+                .success()
+        );
+        assert_eq!(member.store().index().unwrap(), index);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_file_reference_manifest_registers_validates_replicates_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let good = json!({"file":"file/alder:/srv/garden/seed.png", "content_hash":"a".repeat(64), "media_type":"image/png"});
+    let mut malformed = vec![
+        json!({}),
+        json!({"file":good["file"]}),
+        json!({"content_hash":good["content_hash"]}),
+    ];
+    for (name, value) in [
+        ("file", json!("file/alder:relative.png")),
+        ("file", json!("file/alder:/srv/../seed.png")),
+        ("file", json!("person/lichen")),
+        ("file", json!(42)),
+        ("file", json!(format!("file/alder:/{}", "a".repeat(1024)))),
+        ("content_hash", json!("a".repeat(63))),
+        ("content_hash", json!("g".repeat(64))),
+        ("content_hash", json!("A".repeat(64))),
+        ("content_hash", json!("a".repeat(65))),
+        ("media_type", json!("text/plain")),
+        ("media_type", json!("image/")),
+        ("media_type", json!("image/png\n")),
+        ("media_type", json!(format!("image/{}", "a".repeat(128)))),
+        ("content", json!("invented-image-bytes")),
+    ] {
+        let mut fields = good.clone();
+        fields[name] = value;
+        malformed.push(fields);
+    }
+    let source = include_str!("../../../examples/st3/image-file-reference.json");
+    reference_manifest_proof(source, good.clone(), malformed).await;
+    // The media type is optional; the hash and file identity remain required.
+    let mut without_media = good;
+    without_media.as_object_mut().unwrap().remove("media_type");
+    reference_manifest_proof(source, without_media, vec![]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onepassword_field_reference_manifest_registers_validates_replicates_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let mut malformed = vec![
+        json!({}),
+        json!({"locator":42}),
+        json!({"locator":{"value":"invented-payload"}}),
+        json!({"locator":"op://garden-vault/seed-service/token","secret_value":"invented-payload"}),
+    ];
+    for locator in [
+        "invented-secret-bytes".to_owned(),
+        "https://garden-vault/seed-service/token".into(),
+        "op://".into(),
+        "op:///item/field".into(),
+        "op://vault//field".into(),
+        "op://vault/item/".into(),
+        "op://vault/item".into(),
+        "op://vault/item/section/field".into(),
+        " op://vault/item/field".into(),
+        "op://vault/item/field\n".into(),
+        "op://vault/item/field?value=invented".into(),
+        "op://vault/item/field#fragment".into(),
+        "op://vault/item/field%0A".into(),
+        "op://vault name/item/field".into(),
+        "OP://vault/item/field".into(),
+        "op://vault/item/字段".into(),
+        format!("op://vault/item/{}", "a".repeat(1024)),
+    ] {
+        malformed.push(json!({"locator":locator}));
+    }
+    let source = include_str!("../../../examples/st3/onepassword-field-reference.json");
+    reference_manifest_proof(
+        source,
+        json!({"locator":"op://garden-vault/seed-service/token"}),
+        malformed,
+    )
+    .await;
+    let prefix = "op://vault/item/";
+    let boundary = format!("{prefix}{}", "a".repeat(1022 - prefix.len()));
+    reference_manifest_proof(
+        source,
+        json!({"locator":boundary}),
+        vec![json!({"locator":format!("{boundary}a")})],
+    )
+    .await;
 }
