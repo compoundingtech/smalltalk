@@ -275,6 +275,18 @@ ON claims(
 WHERE json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
     THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NOT NULL;
 
+-- Attachment checks must not walk a quiet seat's accumulated hook and work history.
+-- Only phase transitions publish these diagnostics, so a current-runtime lookup stays small.
+CREATE INDEX IF NOT EXISTS claims_claude_attachment_index
+ON claims(
+    subject,
+    json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END),
+    store_index
+)
+WHERE kind='harness.diagnostic'
+    AND json_extract(body, '$.fields.code') IN ('claude-channel-unattached','claude-channel-attached');
+
 -- Mailbox admission needs the newest state for one incarnation, never optional display fields
 -- from its entire history. Include legacy reports without an incarnation in a separate seek.
 CREATE INDEX IF NOT EXISTS claims_harness_state_incarnation_accepted_index
@@ -19231,6 +19243,53 @@ fn current_harness_at(
     Ok(view)
 }
 
+fn claude_attachment_query() -> String {
+    format!(
+        "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
+         FROM claims INDEXED BY claims_claude_attachment_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.diagnostic' AND claims.store_index<=?2
+           AND {INCARNATION_OF_CLAIM}=?3
+           AND json_extract(claims.body, '$.fields.code') IN ('claude-channel-unattached','claude-channel-attached')
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    )
+}
+
+/// Channel readiness is independent of hook activity. A current driver owns this fence;
+/// MCP initialization under its delivery binding, or runtime replacement, clears it.
+fn claude_attachment_fence(
+    connection: &Connection,
+    subject: &str,
+    incarnation: &str,
+    at_index: u64,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
+    let claim = connection.prepare_cached(&claude_attachment_query())?.query_row(params![subject, at_index, incarnation], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    }).optional()?;
+    let Some((claim, body, at)) = claim else {
+        return Ok(None);
+    };
+    let body: Value = serde_json::from_str(&body)?;
+    if body["fields"]["code"] == "claude-channel-attached" {
+        return Ok(None);
+    }
+    let starting = body["fields"]["status"] == "starting";
+    Ok(Some(crate::model::CurrentHarnessView {
+        state: if starting { "starting" } else { "blocked" }.into(),
+        driver: Some("claude".into()),
+        incarnation_id: incarnation.into(),
+        transport: Some("claude-channel".into()),
+        reason: Some("claude-channel-unattached".into()),
+        blocked_on: Some("channel".into()),
+        ask: None,
+        input_buffer: None,
+        exit: None,
+        claim,
+        since_unix_ms: at.parse()?,
+        observed_at_unix_ms: at.parse()?,
+    }))
+}
+
 fn current_harness_fold_at(
     connection: &Connection,
     subject: &str,
@@ -19319,6 +19378,10 @@ fn current_harness_fold_at(
             since_unix_ms: observed_at_unix_ms.parse::<u128>()?,
             observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
         }));
+    }
+
+    if let Some(harness) = claude_attachment_fence(connection, subject, incarnation_id, at_index)? {
+        return Ok(Some(harness));
     }
 
     // The observations of this runtime epoch, newest first in canonical order, so every node that
@@ -38586,6 +38649,51 @@ version 2
             unindexed.is_empty(),
             "unindexed foreign keys: {unindexed:?}"
         );
+    }
+
+    #[test]
+    fn claude_attachment_lookup_cost_ignores_hook_runtime_and_predecessor_history() {
+        let store = Store::open_memory("node").unwrap();
+        let append = |kind: &str, incarnation: &str, code: &str, key: &str| {
+            let fields = match kind {
+                "harness.diagnostic" => json!({"incarnation_id":incarnation,
+                    "code":code,"status":"blocked","severity":"warning","reason":"cost fixture"}),
+                "harness.observed" => json!({"incarnation_id":incarnation,"state":"idle","driver":"claude"}),
+                "runtime.observed" => json!({"incarnation_id":incarnation,"status":"running",
+                    "runtime_id":"grove/cedar","reachability":"local"}),
+                _ => unreachable!(),
+            };
+            store.append_claim(&ClaimInput {
+                subject: "agent/grove/cedar".into(),
+                kind: kind.into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None,
+                idempotency_key: Some(key.into()),
+            }).unwrap();
+        };
+        append("harness.diagnostic", "current", "claude-channel-unattached", "attach");
+        let work = || {
+            let connection = store.connection.lock().unwrap();
+            let mut statement = connection.prepare(&claude_attachment_query()).unwrap();
+            let claim: String = statement.query_row(
+                params!["agent/grove/cedar", i64::MAX, "current"], |row| row.get(0),
+            ).unwrap();
+            (claim, statement.get_status(rusqlite::StatementStatus::VmStep))
+        };
+        let before = work();
+        for index in 0..128 {
+            for (kind, incarnation, code) in [
+                ("harness.observed", "current", ""),
+                ("runtime.observed", "current", ""),
+                ("harness.diagnostic", "current", "native-delivery-recovered"),
+                ("harness.diagnostic", "previous", "claude-channel-attached"),
+            ] {
+                append(kind, incarnation, code, &format!("history:{kind}:{incarnation}:{index}"));
+            }
+        }
+        let after = work();
+        assert_eq!(after.0, before.0);
+        assert!(after.1 <= before.1 + 20, "attachment lookup grew with unrelated history: {before:?} -> {after:?}");
     }
 
     #[test]

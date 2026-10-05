@@ -16253,6 +16253,10 @@ struct NativeLoopState {
     delivery_episode: u64,
     #[serde(default)]
     mailbox_fence: Option<st3::mailbox::Fence>,
+    #[serde(default)]
+    claude_attachment_phase: String,
+    #[serde(default)]
+    claude_attachment_episode: u64,
 }
 
 /// What a native driver hands its next image across `execve`.
@@ -16444,6 +16448,14 @@ async fn drive_st2_native(
     } = paths.clone();
     let mut mailbox =
         NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
+    let attach_started = Instant::now();
+    if driver == "claude" && mailbox.subscription.is_some()
+        && let Err(error) = check_claude_attachment(
+            client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
+        ).await
+    {
+        let _ = write_driver_log(subject, &format!("Claude attachment check will retry: {error:#}"));
+    }
     let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
@@ -16542,6 +16554,13 @@ async fn drive_st2_native(
                 return outcome;
             }
             _ = interval.tick() => {
+                if driver == "claude" && mailbox.subscription.is_some()
+                    && let Err(error) = check_claude_attachment(
+                        client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
+                    ).await
+                {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
                 if let Err(error) = observations.expire_due() {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
@@ -20104,6 +20123,74 @@ fn push_mailbox_enabled() -> bool {
     std::env::var("ST3_MAILBOX_TRANSPORT").as_deref() == Ok("push")
 }
 
+async fn check_claude_attachment(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    mailbox: &NativeMailbox,
+    started: Instant,
+    state: &mut NativeLoopState,
+) -> Result<()> {
+    let fence = &mailbox.fence;
+    let path = format!(
+        "/v1/mailbox/attachment?subject={}&incarnation={}&component={}&epoch={}&token={}",
+        urlencoding::encode(&fence.subject),
+        urlencoding::encode(&fence.incarnation),
+        fence.component,
+        fence.epoch,
+        fence.token,
+    );
+    let checked: Result<st3::mailbox::Attachment> = match tokio::time::timeout(
+        Duration::from_secs(2), client.get(&path),
+    ).await {
+        Ok(checked) => checked,
+        Err(_) => Err(anyhow::anyhow!("the channel attachment check exceeded two seconds")),
+    };
+    let attached = checked.as_ref().is_ok_and(|attachment| attachment.attached);
+    let phase = if attached {
+        "attached"
+    } else if started.elapsed() >= Duration::from_secs(20)
+        || state.claude_attachment_phase == "blocked"
+    {
+        "blocked"
+    } else {
+        "starting"
+    };
+    let reason = match checked {
+        Ok(_) => "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. Check the plugin load, trust or update screen, and channel process; restart the seat if the plugin did not load.".into(),
+        Err(error) => format!("claude-channel-unattached: attachment could not be verified; mail is held while the driver retries: {error:#}"),
+    };
+    let mut report: Value = serde_json::from_str(&native_delivery_report("claude-channel", None))?;
+    report["ready"] = json!(attached);
+    report["reason"] = json!(&reason);
+    if let Some(subscription) = &mailbox.subscription {
+        subscription.report(report);
+    }
+    if state.claude_attachment_phase == phase {
+        return Ok(());
+    }
+    let code = if attached {
+        "claude-channel-attached"
+    } else {
+        "claude-channel-unattached"
+    };
+    let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
+        subject: subject.into(), kind: "harness.diagnostic".into(), actor: Some(subject.into()),
+        fields: BTreeMap::from([
+            ("severity".into(), json!(if phase == "blocked" { "error" } else { "warning" })),
+            ("status".into(), json!(if attached { "recovered" } else { phase })),
+            ("code".into(), json!(code)),
+            ("reason".into(), json!(if attached { "The current Claude channel is initialized and subscribed; durable mail delivery resumes." } else { &reason })),
+            ("driver".into(), json!("claude")),
+            ("incarnation_id".into(), json!(incarnation)),
+        ]), evidence: Vec::new(), expected_subject: None,
+        idempotency_key: Some(format!("{code}:{subject}:{incarnation}:{}:{}:{phase}", fence.epoch, state.claude_attachment_episode)),
+    }).await?;
+    state.claude_attachment_phase = phase.into();
+    state.claude_attachment_episode += 1;
+    Ok(())
+}
+
 struct NativeMailbox {
     subscription: Option<st3::mailbox::Subscription>,
     fence: st3::mailbox::Fence,
@@ -22143,6 +22230,8 @@ mod tests {
                 predecessor_harness_record: Some(b"ignored".to_vec()),
                 published_timeline: BTreeSet::from(["one:1:1:upsert".to_owned()]),
                 delivery_episode: 2,
+                claude_attachment_phase: "blocked".into(),
+                claude_attachment_episode: 3,
             },
         };
         let back: DriverResume =
@@ -22151,6 +22240,8 @@ mod tests {
         assert_eq!(back.incarnation, resume.incarnation);
         assert!(back.loop_state.ready);
         assert_eq!(back.loop_state.delivery_episode, 2);
+        assert_eq!(back.loop_state.claude_attachment_phase, "blocked");
+        assert_eq!(back.loop_state.claude_attachment_episode, 3);
         assert_eq!(
             back.loop_state.published_timeline,
             resume.loop_state.published_timeline

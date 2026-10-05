@@ -243,6 +243,16 @@ harness!(omp, "omp");
 harness!(opencode, "opencode");
 
 #[test]
+fn claude_missing_channel_blocks_and_recovers_early_mail_without_replay() {
+    canary("claude", "channel-missing");
+}
+
+#[test]
+fn claude_uninitialized_channel_blocks_until_native_attachment() {
+    canary("claude", "channel-uninitialized");
+}
+
+#[test]
 fn codex_transcript_utf8_and_discovery_failures_preserve_delivery_and_private_warnings() {
     if st3::test_support::supervise_test() {
         return;
