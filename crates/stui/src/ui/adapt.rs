@@ -567,6 +567,11 @@ fn agents(model: &Model) -> Vec<Agent> {
                 ("failed", _) => AgentState::Fault,
                 // Signed out of its provider (Claude "Not logged in · Run /login"): a login on
                 // its host fixes it, not a restart (Nathan, 2026-10-04).
+                // st's additive detail names the known error outright; the legacy `unauthenticated`
+                // harness state below says the same to clients that predate it.
+                ("waiting", _) if agent.harness_error_state.as_deref() == Some("needs-login") => {
+                    AgentState::NeedsLogin
+                }
                 ("waiting", Some("unauthenticated" | "needs-login")) => AgentState::NeedsLogin,
                 ("waiting", _) if agent.reason.as_deref() == Some("providerAuth") => {
                     AgentState::NeedsLogin
@@ -1585,6 +1590,12 @@ mod tests {
         };
         // st's own word for it (st-drivers' needs-login) reads the same.
         model.agents = window(vec![resource("waiting", "needs-login", None)]);
+        assert_eq!(agents(&model)[0].state, AgentState::NeedsLogin);
+        // The additive field alone is enough, even when the harness state reads as stale.
+        let mut detail = resource("waiting", "indeterminate", None);
+        detail["harness_error_state"] = "needs-login".into();
+        detail["observation"] = "stale".into();
+        model.agents = window(vec![detail]);
         assert_eq!(agents(&model)[0].state, AgentState::NeedsLogin);
         model.agents = window(vec![resource("waiting", "unauthenticated", Some("providerAuth"))]);
         let agent = &agents(&model)[0];
