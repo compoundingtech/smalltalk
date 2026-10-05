@@ -580,20 +580,20 @@ pub fn detail(world: &World, id: Option<&str>, hours: u64, width: usize) -> Doc 
         None => "All spend".into(),
     };
     doc.line(Line::from(span(title, theme::bold())));
-    if id.is_none() {
-        if let Some(estimate) = &world.agent_messages {
-            let mut card = Doc::new();
-            for line in estimate_lines(estimate) {
-                card.line(line);
-            }
-            doc.card(
-                "agent messages · daily estimate · UTC",
-                theme::OVERLAY1,
-                false,
-                card,
-                width,
-            );
+    if id.is_none()
+        && let Some(estimate) = &world.agent_messages
+    {
+        let mut card = Doc::new();
+        for line in estimate_lines(estimate) {
+            card.line(line);
         }
+        doc.card(
+            "agent messages · daily estimate · UTC",
+            theme::OVERLAY1,
+            false,
+            card,
+            width,
+        );
     }
     if mine.is_empty() {
         doc.line(Line::from(span(
