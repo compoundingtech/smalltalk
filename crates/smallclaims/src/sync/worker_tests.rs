@@ -150,7 +150,7 @@ async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
             "one compact round plus at most one full round, never an unbounded retry"
         );
         assert!(
-            requests.iter().any(|request| *request == (true, 0, 0)),
+            requests.contains(&(true, 0, 0)),
             "a bare digest cannot prove an empty inventory"
         );
     }
