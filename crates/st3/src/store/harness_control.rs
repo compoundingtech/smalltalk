@@ -313,10 +313,11 @@ mod tests {
     use st3_schema::harness_control::{Approval, InputResult, Models, NativeResult};
     const SUBJECT: &str = "agent/control-smoke";
     fn baseline(store: &Store) -> (NativeState, crate::mailbox::Fence) {
-        store.connection.batched(|tx| tx.execute("INSERT INTO desired(subject,kind,revision,claim_id,body) VALUES(?1,'agent','revision','desired-1','{}')", [SUBJECT])).unwrap().unwrap();
+        let intent = crate::graph::parse_intent("version 2\nagent \"control-smoke\" { workspace \".\"; harness \"omp\" { model \"control-smoke/native-smoke\"; } }", "queue-owner").unwrap();
+        store.apply_as(&intent, &BTreeMap::new(), "control-test-declaration", Some("person/operator")).unwrap();
         store.append_claim(&ClaimInput { subject: SUBJECT.into(), kind: "runtime.observed".into(), actor: Some(SUBJECT.into()), fields: BTreeMap::from([("status".into(), json!("running")), ("incarnation_id".into(), json!("incarnation-1")), ("runtime_id".into(), json!("native-runtime"))]), evidence: Vec::new(), expected_subject: None, idempotency_key: None }).unwrap();
         let fence = store.bind_mailbox(&crate::mailbox::Fence::new(SUBJECT, "incarnation-1", "delivery")).unwrap();
-        let state = NativeState { subject: SUBJECT.into(), binding: Binding { desired_revision: "desired-1".into(), incarnation_id: "incarnation-1".into(), session_id: "session-1".into(), turn_id: None }, idle: false, input_supported: true, steer: Default::default(), models: Models { choices: Vec::new(), selected: None, atomic_model_effort: false, revision: "models-1".into(), available: false, complete: true, source: "native-extension-model-registry".into() }, approval: Approval { supported: false, reason: "native-live-approval-api-unavailable".into() }, reason: None };
+        let state = NativeState { subject: SUBJECT.into(), binding: Binding { desired_revision: store.harness_control_desired_revision(&fence).unwrap(), incarnation_id: "incarnation-1".into(), session_id: "session-1".into(), turn_id: None }, idle: false, input_supported: true, steer: Default::default(), models: Models { choices: Vec::new(), selected: None, atomic_model_effort: false, revision: "models-1".into(), available: false, complete: true, source: "native-extension-model-registry".into() }, approval: Approval { supported: false, reason: "native-live-approval-api-unavailable".into() }, reason: None };
         store.observe_harness_control(&state, &fence).unwrap();
         (state, fence)
     }

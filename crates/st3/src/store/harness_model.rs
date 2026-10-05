@@ -231,7 +231,8 @@ mod tests {
 
     const SUBJECT: &str = "agent/model-control";
     fn baseline(store: &Store) -> (NativeState, crate::mailbox::Fence) {
-        store.connection.batched(|tx| tx.execute("INSERT INTO desired(subject,kind,revision,claim_id,body) VALUES(?1,'agent','revision','desired-1','{}')", [SUBJECT])).unwrap().unwrap();
+        let intent = crate::graph::parse_intent("version 2\nagent \"model-control\" { workspace \".\"; harness \"omp\" { model \"provider/reasoner\"; } }", "model-owner").unwrap();
+        store.apply_as(&intent, &BTreeMap::new(), "model-test-declaration", Some("person/operator")).unwrap();
         store.append_claim(&ClaimInput {
             subject: SUBJECT.into(), kind: "runtime.observed".into(), actor: Some(SUBJECT.into()),
             fields: BTreeMap::from([("status".into(), json!("running")), ("incarnation_id".into(), json!("incarnation-1")), ("runtime_id".into(), json!("native-runtime"))]),
@@ -239,7 +240,7 @@ mod tests {
         }).unwrap();
         let fence = store.bind_mailbox(&crate::mailbox::Fence::new(SUBJECT, "incarnation-1", "delivery")).unwrap();
         let state = NativeState {
-            subject: SUBJECT.into(), binding: Binding { desired_revision: "desired-1".into(), incarnation_id: "incarnation-1".into(), session_id: "session-1".into(), turn_id: Some("turn-1".into()) }, idle: true, input_supported: true,
+            subject: SUBJECT.into(), binding: Binding { desired_revision: store.harness_control_desired_revision(&fence).unwrap(), incarnation_id: "incarnation-1".into(), session_id: "session-1".into(), turn_id: Some("turn-1".into()) }, idle: true, input_supported: true,
             steer: Default::default(),
             models: Models {
                 choices: vec![
@@ -527,7 +528,8 @@ mod tests {
         let (state, fence) = baseline(&store);
         let accepted = store.reserve_harness_model(&request(&state, "declaration")).unwrap();
         store.take_harness_model(&fence).unwrap().unwrap();
-        store.connection.batched(|tx| tx.execute("UPDATE desired SET claim_id='desired-2' WHERE subject=?1", [SUBJECT])).unwrap().unwrap();
+        let replacement = crate::graph::parse_intent("version 2\nagent \"model-control\" { workspace \".\"; harness \"omp\" { model \"provider/plain\"; } }", "model-owner").unwrap();
+        store.apply_as(&replacement, &BTreeMap::new(), "model-test-replacement", Some("person/operator")).unwrap();
         let frozen = store.harness_model_receipt(&accepted.operation_id).unwrap().unwrap();
         assert_eq!(frozen.status, Outcome::Indeterminate);
         assert_eq!(frozen.reason.as_deref(), Some("native-runtime-ended-or-replaced"));
