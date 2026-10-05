@@ -85,6 +85,7 @@
         "children": { "type": "array", "items": { "$ref": "#/$defs/CanonicalNode" } }
       }
     },
+    "PublicationDefinition": {"type": "object", "additionalProperties": false, "description": "Canonical publication values with resolved compiler defaults; requires read.declarations.", "required": ["kind", "subject", "declaration", "revision", "token"], "properties": {"kind": {"const": "publication-definition"}, "subject": {"type": "string", "pattern": "^(agent|mission|schedule)/[^\\s]+$"}, "declaration": {"type": "object", "additionalProperties": true}, "revision": {"$ref": "#/$defs/Revision"}, "token": {"type": "string", "minLength": 1}}},
     "SubjectDefinition": {
       "type": "object",
       "additionalProperties": false,
@@ -123,6 +124,7 @@
             { "$ref": "#/$defs/Capabilities" },
             { "$ref": "#/$defs/DocumentContent" },
             { "$ref": "#/$defs/SubjectDefinition" },
+            { "$ref": "#/$defs/PublicationDefinition" },
             { "$ref": "#/$defs/AgentWorkspace" },
             { "$ref": "#/$defs/Page" },
             { "$ref": "#/$defs/ResourcesPage" },

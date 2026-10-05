@@ -2062,6 +2062,17 @@ export const PairingChallenge = /*#__PURE__*/ (() => Schema.Struct({
 export type PairingChallenge = typeof PairingChallenge.Type
 export type PairingChallengeEncoded = typeof PairingChallenge.Encoded
 
+/** Canonical publication values with resolved compiler defaults; requires read.declarations. */
+export const PublicationDefinition = /*#__PURE__*/ (() => Schema.Struct({
+  "declaration": Schema.Record(Schema.String, Schema.Unknown),
+  "kind": Schema.Literal("publication-definition"),
+  "revision": Revision,
+  "subject": Schema.String.check(Schema.isPattern(new RegExp("^(agent|mission|schedule)/[^\\s]+$", "u"))),
+  "token": Schema.String.check(Schema.isMinLength(1))
+}).annotate({ identifier: "PublicationDefinition", description: "Canonical publication values with resolved compiler defaults; requires read.declarations." }))()
+export type PublicationDefinition = typeof PublicationDefinition.Type
+export type PublicationDefinitionEncoded = typeof PublicationDefinition.Encoded
+
 export const RequestId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:request)/[^\\s]+$", "u"), "request").annotate({ identifier: "RequestId" }))()
 export type RequestId = typeof RequestId.Type
 export type RequestIdEncoded = typeof RequestId.Encoded
@@ -2215,7 +2226,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded

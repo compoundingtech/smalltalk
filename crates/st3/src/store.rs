@@ -1,4 +1,5 @@
 pub mod custom;
+pub mod declarations;
 mod glass_heads;
 mod glasses;
 pub mod owned_sets;
@@ -8016,7 +8017,14 @@ impl Store {
         warnings.sort();
         warnings.dedup();
 
+        let declaration_diffs = declarations::diffs(
+            &connection,
+            intent,
+            changes.iter().map(|change| change.subject.as_str()),
+            Some(store_index),
+        )?;
         Ok(MissionResponse {
+            declaration_diffs,
             store_index,
             source_hash: intent.source_hash.clone(),
             normalized: intent.normalized.clone(),
