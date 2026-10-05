@@ -529,7 +529,7 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::IdempotencyConflict => {
             "this was already sent once in another form, so it was not sent again".into()
         }
-        ErrorCode::UnsupportedCapability => {
+        ErrorCode::UnsupportedCapability | ErrorCode::NativePreDequeueApiUnavailable => {
             format!("this st does not do that yet ({message})")
         }
         ErrorCode::NotFound => format!("it is gone: {message}"),
