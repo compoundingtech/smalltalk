@@ -2441,7 +2441,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, HarnessQueueView, HarnessModelCatalogPage, HarnessControlOperationReceipt, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded

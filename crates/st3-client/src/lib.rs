@@ -560,6 +560,24 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::ValidationFailed
         | ErrorCode::AttentionMigrated
         | ErrorCode::RuntimeNotLocal
+        | ErrorCode::StaleHarnessControl
+        | ErrorCode::UnsupportedHarnessControl
+        | ErrorCode::MissingQueueEntry
+        | ErrorCode::AlreadyDispatched
+        | ErrorCode::InvalidQueueContent
+        | ErrorCode::InvalidIdempotencyKey
+        | ErrorCode::StaleQueue
+        | ErrorCode::QueueFull
+        | ErrorCode::InvalidQueueMove
+        | ErrorCode::QueueRevisionExhausted
+        | ErrorCode::StaleQueueCursor
+        | ErrorCode::QueueMetadataTooLarge
+        | ErrorCode::QueueEntryTooLarge
+        | ErrorCode::UnsupportedHarnessModel
+        | ErrorCode::StaleHarnessModel
+        | ErrorCode::UnavailableHarnessModel
+        | ErrorCode::UnsupportedHarnessEffort
+        | ErrorCode::HarnessControlBusy
         | ErrorCode::Unknown => message.to_owned(),
     }
 }
