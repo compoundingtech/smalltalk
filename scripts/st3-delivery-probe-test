@@ -273,8 +273,15 @@ name = "{other.name}"
 url = "http://127.0.0.1:{ports[1 - index]}"
 ''')
                 await node.start()
+                # Retain the real channel's refusal without changing its argv, fences or
+                # deadlines. The probe intentionally keeps channel stderr off its own pipe.
+                channel = node.root / "bin/probe-channel-st3"
+                channel_stderr = node.root / "probe-channel.stderr"
+                channel.write_text("#!/bin/sh\nexec " + shlex.quote(str(node.binary))
+                                   + ' "$@" 2>>' + shlex.quote(str(channel_stderr)) + "\n")
+                channel.chmod(0o700)
                 config = {"host": node.name, "agent": f"agent/probe/{node.name}",
-                          "binary": str(node.binary), "socket": str(node.endpoint),
+                          "binary": str(channel), "socket": str(node.endpoint),
                           "state_dir": str(node.root / "probe"), "reviewer": "person/eval",
                           "interval_ms": 12_000, "deadline_ms": deadline_ms,
                           "peers": [{"host": other.name, "agent": f"agent/probe/{other.name}"}]}
@@ -344,8 +351,8 @@ agent "probe/{node.name}" {{
         except Exception:
             print(f"failed native probe fixture retained: {directory}", file=sys.stderr)
             for node in nodes:
-                for name in ("latest.json", "events.jsonl"):
-                    path = node.root / "probe" / name
+                for name in ("probe/latest.json", "probe/events.jsonl", "probe-channel.stderr"):
+                    path = node.root / name
                     if path.exists():
                         print(f"{node.name} {name}: {path.read_text()[-8000:]}", file=sys.stderr)
             raise
