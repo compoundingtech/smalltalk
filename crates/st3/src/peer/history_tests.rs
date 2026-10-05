@@ -146,20 +146,46 @@ async fn paired_history_pages_read_the_actual_remote_pty_owner() {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop { let (status, page) = read(Some(fresh.clone()), incarnation.clone()).await; if page["code"] == "history-cursor-gap" { assert_eq!(status, StatusCode::CONFLICT, "{page}"); break; } tokio::task::yield_now().await; }
     }).await.unwrap();
-    // Gate an actual producer response across a physical same-name replacement. The
-    // graph deliberately remains on the original incarnation throughout both reads.
-    // This is a transport gate, not an invented page or an emulator-only producer.
+    // Capture a genuine old page, then prepare an actual same-root replacement
+    // outside the consumer's fixed five-second response budget. The gate moves
+    // between the two genuine identity snapshots only after the API's pre-fence.
+    // This tests stale-page identity cutover, not live-daemon stop latency.
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
     let gated_root = roots[0].path().join("gated-pty");
     fs::create_dir(&gated_root).unwrap();
     fs::copy(owner.pty_root.join("history-smoke.json"), gated_root.join("history-smoke.json")).unwrap();
+    let old_metadata = pty_core::registry::read_metadata_in(&owner.pty_root, "history-smoke").unwrap();
+    let captured_request = HistoryRequest {
+        expected_generation: old_metadata.generation.unwrap(),
+        limit: 2,
+        before: None,
+    };
+    eprintln!("Q35_PHYSICAL old_page_begin unix_ms={}", registry_now_ms());
+    let response = pty_client::history::read_in(
+        &owner.pty_root, "history-smoke", &captured_request, Duration::from_secs(5),
+    ).unwrap();
+    assert!(matches!(&response, HistoryResponse::Page { .. }), "{response:?}");
+    eprintln!("Q35_PHYSICAL old_page_captured_stop_begin unix_ms={}", registry_now_ms());
+    runtime.stop("history-smoke").unwrap();
+    eprintln!("Q35_PHYSICAL stopped_remove_begin unix_ms={}", registry_now_ms());
+    runtime.remove("history-smoke").unwrap();
+    eprintln!("Q35_PHYSICAL removed_spawn_begin unix_ms={}", registry_now_ms());
+    let output = std::process::Command::new(&pty).env("PTY_ROOT", &owner.pty_root)
+        .args(["run", "-d", "--force", "--id", "history-smoke", "--rows", "3", "--cols", "80", "--tag", "keep=true", "--", "/bin/sh", "-c", script])
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    eprintln!("Q35_PHYSICAL replacement_spawned unix_ms={}", registry_now_ms());
+    let replacement = runtime.snapshot().unwrap().into_iter().find(|live| live.name == "history-smoke").unwrap();
+    let replacement_incarnation = format!("{}:{}", replacement.pid.unwrap(), replacement.created_at.unwrap());
+    assert_ne!(replacement_incarnation, incarnation);
+    let new_metadata = pty_core::registry::read_metadata_in(&owner.pty_root, "history-smoke").unwrap();
+    assert_ne!(new_metadata.generation.unwrap(), captured_request.expected_generation);
     let gate = std::os::unix::net::UnixListener::bind(gated_root.join("history-smoke.sock")).unwrap();
     let actual_root = owner.pty_root.clone();
-    let replacement_runtime = runtime.clone();
-    let replacement_binary = pty.clone();
     let gate_metadata = gated_root.join("history-smoke.json");
     let gated = std::thread::spawn(move || {
         use std::io::{Read, Write};
-        use pty_core::protocol::{encode_packet, HistoryRequest, HistoryResponse, MessageType, PacketReader};
+        use pty_core::protocol::{encode_packet, MessageType, PacketReader};
         let (mut client, _) = gate.accept().unwrap();
         client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut packets = PacketReader::new();
@@ -171,17 +197,13 @@ async fn paired_history_pages_read_the_actual_remote_pty_owner() {
                 break serde_json::from_slice::<HistoryRequest>(&packet.payload).unwrap();
             }
         };
-        assert!(request.before.is_none(), "the first-page fence must not depend on a cursor");
-        let response = pty_client::history::read_in(&actual_root, "history-smoke", &request, Duration::from_secs(5)).unwrap();
-        assert!(matches!(&response, HistoryResponse::Page { .. }), "{response:?}");
-        replacement_runtime.stop("history-smoke").unwrap();
-        replacement_runtime.remove("history-smoke").unwrap();
-        let output = std::process::Command::new(&replacement_binary).env("PTY_ROOT", &actual_root)
-            .args(["run", "-d", "--force", "--id", "history-smoke", "--rows", "3", "--cols", "80", "--tag", "keep=true", "--", "/bin/sh", "-c", script])
-            .output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(request.expected_generation, captured_request.expected_generation);
+        assert_eq!(request.limit, captured_request.limit);
+        assert_eq!(request.before, captured_request.before);
+        eprintln!("Q35_PHYSICAL request_matched_identity_cutover unix_ms={}", registry_now_ms());
         fs::copy(actual_root.join("history-smoke.json"), gate_metadata).unwrap();
         client.write_all(&encode_packet(MessageType::History, &serde_json::to_vec(&response).unwrap())).unwrap();
+        eprintln!("Q35_PHYSICAL actual_old_page_replied unix_ms={}", registry_now_ms());
     });
     unix.abort();
     let _ = unix.await;
@@ -194,15 +216,18 @@ async fn paired_history_pages_read_the_actual_remote_pty_owner() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop { if tokio::net::UnixStream::connect(&socket).await.is_ok() { break; } tokio::task::yield_now().await; }
     }).await.unwrap();
+    // Native lifecycle preparation can outlast the original 60-second grant.
+    // Renew the same authorized pairing before the request, never after an error.
+    pair(serde_json::json!(["terminal.read"]));
+    eprintln!("Q35_PHYSICAL signed_request_begin unix_ms={}", registry_now_ms());
     let (status, raced) = read(None, incarnation.clone()).await;
+    eprintln!("Q35_PHYSICAL signed_request_completed unix_ms={}", registry_now_ms());
     assert_eq!(status, StatusCode::CONFLICT, "{raced}");
     assert_eq!(raced["code"], "stale-fence");
     gated.join().unwrap();
     let (status, replaced) = read(None, incarnation.clone()).await;
     assert_eq!(status, StatusCode::CONFLICT, "{replaced}");
     assert_eq!(replaced["code"], "stale-fence");
-    let replacement = runtime.snapshot().unwrap().into_iter().find(|live| live.name == "history-smoke").unwrap();
-    let replacement_incarnation = format!("{}:{}", replacement.pid.unwrap(), replacement.created_at.unwrap());
     fleet_claim(&owner.store, "runtime.observed", "agent/history-smoke", serde_json::json!({
         "runtime_id": "history-smoke", "incarnation_id": replacement_incarnation,
         "status": "running", "terminal": true,
