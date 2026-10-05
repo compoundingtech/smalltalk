@@ -634,7 +634,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             Some(observation),
                         )?;
                     }
-                } else if binding.is_some() && current()? {
+                } else if current()? {
                     let start = self
                         .store
                         .observations_for(agent, "runtime.action.succeeded")?
@@ -652,8 +652,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     == Some(operation.desired_token.as_str())
                         });
                     if start {
+                        // The native channel binds its mailbox against runtime.running before
+                        // it can publish a session binding. Publish the physically observed,
+                        // launch-fenced replacement now; the rollout still holds intake until
+                        // that channel proves the original native conversation.
                         self.record_member(subject, observation, true)?;
-                        phase(&operation, "running", None, &[])?;
+                        if binding.is_some() {
+                            phase(&operation, "running", None, &[])?;
+                        }
                     }
                 }
             }
