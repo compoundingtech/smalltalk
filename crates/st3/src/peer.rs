@@ -2688,9 +2688,9 @@ mod tests {
             subject: "agent/queue-worker".into(), kind: "runtime.observed".into(),
             actor: Some("agent/queue-worker".into()),
             fields: BTreeMap::from([
-                ("runtime_id".into(), json!("native-runtime")),
-                ("incarnation_id".into(), json!("incarnation-one")),
-                ("status".into(), json!("running")),
+                ("runtime_id".into(), serde_json::json!("native-runtime")),
+                ("incarnation_id".into(), serde_json::json!("incarnation-one")),
+                ("status".into(), serde_json::json!("running")),
             ]),
             evidence: Vec::new(), expected_subject: None, idempotency_key: None,
         }).unwrap();
@@ -2751,7 +2751,7 @@ mod tests {
             authority_actor: "person/operator".into(), relay: None,
             request: ClientReadOperation::HarnessQueueMutation {
                 action_id: "action/large-enqueue".into(), idempotency_key: "queue-relay-large-enqueue".into(),
-                parameters: json!({"subject":"agent/queue-worker","binding":binding,
+                parameters: serde_json::json!({"subject":"agent/queue-worker","binding":binding,
                     "queue_revision":0,"mutation":{"type":"enqueue","content":content,"lane":"follow_up"}}),
             },
         }).await.unwrap();
@@ -2763,7 +2763,7 @@ mod tests {
             authority_actor: "person/operator".into(), relay: None,
             request: ClientReadOperation::HarnessQueueMutation {
                 action_id: "action/escaped-replace".into(), idempotency_key: "queue-relay-escaped-replace".into(),
-                parameters: json!({"subject":"agent/queue-worker","binding":binding,
+                parameters: serde_json::json!({"subject":"agent/queue-worker","binding":binding,
                     "queue_revision":1,"mutation":{"type":"replace","entry_id":entry_id,"content":escaped}}),
             },
         }).await.unwrap();
