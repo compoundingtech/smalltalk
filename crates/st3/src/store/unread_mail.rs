@@ -12,6 +12,7 @@ const COUNT_SQL: &str = "WITH levels(shift) AS (VALUES(56),(48),(40),(32),(24),(
          )),0) FROM levels";
 
 const SCHEMA: &str = r#"
+BEGIN IMMEDIATE;
 DROP INDEX IF EXISTS claims_message_sent_time_index;
 CREATE TABLE IF NOT EXISTS unread_mail (
     subject TEXT PRIMARY KEY,
@@ -22,6 +23,9 @@ CREATE TABLE IF NOT EXISTS unread_mail_prefixes (
     prefix INTEGER NOT NULL,
     count INTEGER NOT NULL CHECK(count >= 0),
     PRIMARY KEY(shift, prefix)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS unread_mail_pending (
+    subject TEXT PRIMARY KEY
 ) WITHOUT ROWID;
 CREATE TRIGGER IF NOT EXISTS unread_mail_insert AFTER INSERT ON unread_mail
 BEGIN
@@ -46,39 +50,22 @@ BEGIN
         (8,OLD.sent_time >> 8),(0,OLD.sent_time)
     );
 END;
--- Explicit delete/insert fires the prefix triggers even with recursive triggers disabled.
--- Keeping sent_time immutable avoids a second path for updating prefix counts.
-CREATE TRIGGER IF NOT EXISTS unread_mail_claim_sent AFTER INSERT ON claims
-WHEN NEW.kind='message.sent'
+-- Delivery writes only deduplicate a changed message ID. Prefix maintenance runs when
+-- the count is read, so ordinary delivery and replication do not write eight counters.
+DROP TRIGGER IF EXISTS unread_mail_claim_sent;
+DROP TRIGGER IF EXISTS unread_mail_claim_terminal;
+DROP TRIGGER IF EXISTS unread_mail_claim_delete;
+CREATE TRIGGER IF NOT EXISTS unread_mail_claim_pending AFTER INSERT ON claims
+WHEN NEW.kind IN ('message.sent','message.read','message.closed')
 BEGIN
-    DELETE FROM unread_mail WHERE subject=NEW.subject
-        AND sent_time<CAST(NEW.accepted_at_unix_ms AS INTEGER);
-    INSERT OR IGNORE INTO unread_mail(subject,sent_time)
-    SELECT NEW.subject,CAST(NEW.accepted_at_unix_ms AS INTEGER)
-    WHERE NOT EXISTS (
-        SELECT 1 FROM claims WHERE subject=NEW.subject
-        AND kind IN ('message.read','message.closed')
-    );
+    INSERT OR IGNORE INTO unread_mail_pending(subject) VALUES(NEW.subject);
 END;
-CREATE TRIGGER IF NOT EXISTS unread_mail_claim_terminal AFTER INSERT ON claims
-WHEN NEW.kind IN ('message.read','message.closed')
-BEGIN
-    DELETE FROM unread_mail WHERE subject=NEW.subject;
-END;
--- Checkpoint deletion may remove a terminal claim or the latest sent claim. Rebuild only
--- that subject from the remaining log, including an out-of-order terminal-before-sent claim.
-CREATE TRIGGER IF NOT EXISTS unread_mail_claim_delete AFTER DELETE ON claims
+CREATE TRIGGER IF NOT EXISTS unread_mail_claim_pending_delete AFTER DELETE ON claims
 WHEN OLD.kind IN ('message.sent','message.read','message.closed')
 BEGIN
-    DELETE FROM unread_mail WHERE subject=OLD.subject;
-    INSERT INTO unread_mail(subject,sent_time)
-    SELECT OLD.subject,MAX(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
-    WHERE subject=OLD.subject AND kind='message.sent'
-        AND NOT EXISTS (
-            SELECT 1 FROM claims WHERE subject=OLD.subject
-            AND kind IN ('message.read','message.closed')
-        ) HAVING COUNT(*)>0;
+    INSERT OR IGNORE INTO unread_mail_pending(subject) VALUES(OLD.subject);
 END;
+COMMIT;
 "#;
 
 pub(super) fn create_schema(connection: &Connection) -> Result<()> {
@@ -99,6 +86,7 @@ pub(super) fn create_schema(connection: &Connection) -> Result<()> {
                  SELECT 1 FROM claims terminal WHERE terminal.subject=claims.subject
                  AND terminal.kind IN ('message.read','message.closed')
              ) GROUP BY subject;
+             DELETE FROM unread_mail_pending;
              INSERT INTO meta(key,value) VALUES('unread_mail_prefixes','1');
              COMMIT;",
         )?;
@@ -106,9 +94,40 @@ pub(super) fn create_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn count_before(connection: &Connection, before_unix_ms: u128) -> Result<u64> {
+fn flush_pending(connection: &Connection) -> Result<()> {
+    let pending = connection
+        .prepare_cached("SELECT subject FROM unread_mail_pending")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut remove = connection.prepare_cached("DELETE FROM unread_mail WHERE subject=?1")?;
+    let mut insert = connection.prepare_cached(
+        "INSERT INTO unread_mail(subject,sent_time)
+         SELECT ?1,MAX(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
+         WHERE subject=?1 AND kind='message.sent'
+         AND NOT EXISTS (
+             SELECT 1 FROM claims WHERE subject=?1
+             AND kind IN ('message.read','message.closed')
+         ) HAVING COUNT(*)>0",
+    )?;
+    let mut clear =
+        connection.prepare_cached("DELETE FROM unread_mail_pending WHERE subject=?1")?;
+    for subject in pending {
+        remove.execute([&subject])?;
+        insert.execute([&subject])?;
+        clear.execute([&subject])?;
+    }
+    Ok(())
+}
+
+pub(super) fn count_before(transaction: &Transaction<'_>, before_unix_ms: u128) -> Result<u64> {
+    // The caller holds one writer transaction: pending changes and their exact age count
+    // become visible together, and a concurrent message cannot disappear between the two.
+    flush_pending(transaction)?;
     let before = i64::try_from(before_unix_ms).unwrap_or(i64::MAX);
-    let mut statement = connection.prepare_cached(COUNT_SQL)?;
+    let mut statement = transaction.prepare_cached(COUNT_SQL)?;
     Ok(statement.query_row([before], |row| row.get(0))?)
 }
 
@@ -146,6 +165,23 @@ mod tests {
         let times = [1, 255, 256, 257, 65_535, 65_536, 1_700_000_000_000];
         for (index, time) in times.iter().enumerate() {
             append(&format!("message/prefix-{index}"), "message.sent", *time);
+        }
+        {
+            let connection = store.connection.write();
+            // Delivery must not maintain eight prefix counters per sent claim. The first
+            // exact count folds these queued IDs; later counts reuse the completed index.
+            let prefixes: u64 = connection
+                .query_row("SELECT COUNT(*) FROM unread_mail_prefixes", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let pending: u64 = connection
+                .query_row("SELECT COUNT(*) FROM unread_mail_pending", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(prefixes, 0);
+            assert_eq!(pending, times.len() as u64);
         }
         let check = |expected: &[u128]| {
             for cutoff in times
@@ -206,7 +242,7 @@ mod tests {
     #[test]
     fn age_count_work_is_bounded_for_fresh_and_aged_mail() {
         let store = Store::open_memory("node").unwrap();
-        let connection = store.connection.write();
+        let mut connection = store.connection.write();
         let mut insert = connection
             .prepare("INSERT INTO unread_mail(subject,sent_time) VALUES(?1,?2)")
             .unwrap();
@@ -227,7 +263,12 @@ mod tests {
             (cutoff, 5_000),
             (cutoff + 10_000, 10_000),
         ] {
-            assert_eq!(count_before(&connection, before as u128).unwrap(), expected);
+            let transaction = connection.transaction().unwrap();
+            assert_eq!(
+                count_before(&transaction, before as u128).unwrap(),
+                expected
+            );
+            transaction.commit().unwrap();
         }
         let mut statement = connection.prepare_cached(COUNT_SQL).unwrap();
         let count: u64 = statement.query_row([cutoff], |row| row.get(0)).unwrap();

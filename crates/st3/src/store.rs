@@ -10749,8 +10749,12 @@ impl Store {
 
     pub fn unread_mail_count_before(&self, before_unix_ms: u128) -> Result<u64> {
         smallclaims::touched::note_read(|| "kind:message.sent".to_owned());
-        let connection = self.readers.get();
-        unread_mail::count_before(&connection, before_unix_ms)
+        let mut connection = self.connection.write();
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let count = unread_mail::count_before(&transaction, before_unix_ms)?;
+        transaction.commit()?;
+        Ok(count)
     }
 
     pub fn messages(
