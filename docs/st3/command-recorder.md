@@ -14,7 +14,7 @@ A member's declared `PATH` and the st executable directory are applied first. Th
 directory then goes in front of them, so an authored `PATH` cannot put another `git` ahead of it.
 
 `<state>/recorder/bin` holds `git` and `gh` links to the st executable and a marker file,
-`st3-recorder.json`, that names the host and the log. The daemon writes these at startup. It links
+`st3-recorder.json`, that names the host, log, and optional receipts directory. The daemon writes these at startup. It links
 a program only when that program is on the daemon's `PATH` or the login shell's `PATH`, so
 `command -v gh` still fails on a host without `gh`. When the daemon cannot write the directory, it
 prints `st: not recording git and gh calls: ...` and starts anyway.
@@ -62,6 +62,7 @@ Each call appends one line after the real program exits:
 | `exit_code` | The exit code, or `null` when a signal ended the program |
 | `signal` | The signal number that ended the program, or `null` |
 | `duration_ms` | Wall time from start to exit |
+| `receipt_url` | The created GitHub issue or pull request URL, when captured; otherwise absent |
 
 An argument longer than 4096 bytes is cut and ends with `…[N more bytes]`. The recorder replaces URL
 credentials (`https://***@host`), `extraheader=` values, and `Authorization:` header values with
@@ -107,8 +108,9 @@ A recorded call behaves as the real call would:
 - The exit code is the real program's exit code.
 - When a signal ends the real program, the recorder raises the same signal, so a shell that stops a
   loop on an interrupted child still stops.
-- stdin, stdout, and stderr are the caller's own descriptors. The recorder never reads stdin, so
-  input that the real program leaves unread stays for the next command.
+- stdin and stderr are the caller's own descriptors. stdout is also the caller's descriptor except
+  for the non-TTY creation receipts described below. The recorder never reads stdin, so input that
+  the real program leaves unread stays for the next command.
 - The real program runs in the caller's process group, so the terminal, job control, pagers, and
   editors work as before.
 - A signal sent to the recorder, such as `SIGTERM` from a timeout, reaches the real program:
@@ -121,6 +123,52 @@ A recorded call behaves as the real call would:
 
 [`crates/st3/tests/command_recorder.rs`](../../crates/st3/tests/command_recorder.rs) compares
 recorded and direct calls for each of these.
+
+## Creation receipts
+
+For `gh issue create` and `gh pr create`, the recorder captures stdout only when the caller's stdout
+is not a terminal and the marker advertises a `receipts` directory. It forwards every byte unchanged
+and retains only the last line, bounded to 1 KiB. Terminal output and every other command keep the
+direct descriptor. A wrapper before the recorder on `PATH` can exec it without changing this check:
+the recorder checks the caller's real stdout descriptor.
+
+`--dry-run`, browser mode (`--web`/`-w`), and help do not capture receipts. In
+[`cli/cli` v2.100.0's PR create implementation](https://github.com/cli/cli/blob/v2.100.0/pkg/cmd/pr/create/create.go),
+dry-run renders the proposed body instead of submitting, while browser mode returns through
+`previewPR`; neither creates a PR. Issue create also uses browser mode for preview. A body ending
+in an existing PR URL must not credit the caller with creating that PR.
+
+When the last line is a GitHub issue or pull request URL, the log includes `receipt_url` and the
+recorder atomically writes a private mode-0600 receipt under `<state>/recorder/receipts`. The receipt
+names the URL, actor, `ST_MISSION_RUN`, exit code, and timestamp. A URL is published even when the
+command exits nonzero, because creation can succeed before a later attachment fails. Without the
+marker's `receipts` field, no stdout capture or receipt publication occurs.
+
+Signal forwarding remains active when the caller stops reading stdout. Once the signaled child
+exits, a stalled consumer cannot hold up the command's exit status: undeliverable queued output
+is abandoned and the incomplete capture produces no receipt.
+
+The shim never contacts the daemon. The daemon consumes the spool asynchronously and publishes
+the resource's `opened_by` and `opened_by_run` facts. When either opener field is already recorded,
+it consumes the receipt without appending a claim, including a capture by another agent.
+Duplicate receipts for the same URL and actor also collapse through an idempotency key.
+
+Receipts use the existing `resource.observed` claim with `attribution_only: true`. They contain
+attribution and required resource identity fields only, never the daemon's previous observer
+snapshot. The projection merges only the opener into observed facts; a receipt cannot replace
+state, head, title, checks, or the observation's timestamp. Before any observation, it establishes
+identity and attribution. The first real observation retains that opener and still triggers
+issue or review delivery normally, including when the observation arrives through replication.
+The spool directory is mode 0700 (including after reinstall).
+Filesystem notifications wake ingestion immediately; a fallback scan backs off from two seconds
+to at most sixty seconds while idle and returns to one second after ingestion. Failed appends
+retain their retry count in `.attempt-N.json` filenames and a not-before deadline in the file's
+modification time across daemon restarts. The deadline is set before renaming; each scan ignores
+pending retries even when filesystem notifications wake it. Retries wait at least one, two, four,
+then eight seconds; fallback scans may add delay. After five actual failures the receipt becomes
+a `.dead-letter` file, is logged once, and is no longer retried. To retry after correcting the
+cause, rename it to a fresh `.json` name. Abandoned `.tmp` files older than one hour are removed;
+fresh temporary files are left alone so an active publisher can finish.
 
 ## Limits
 

@@ -46,8 +46,6 @@ pub struct World {
     /// Peers this host's graph has diverged from: the same envelopes project a different graph
     /// here, so what stui shows can be wrong until the host is repaired.
     pub diverged: Vec<String>,
-    #[serde(skip)]
-    pub mail_backlog: Load<st3_client::MailBacklog>,
     pub attention: Load<Vec<Attention>>,
     pub agents: Load<Vec<Agent>>,
     pub missions: Load<Vec<Mission>>,
@@ -66,6 +64,8 @@ pub struct World {
     /// Each account's freshest limits reading, from the same read.
     #[serde(skip)]
     pub usage_limits: Vec<st3_client::UsageLimit>,
+    #[serde(skip)]
+    pub agent_messages: Option<st3_client::AgentMessageEstimate>,
     /// The clients connected to this member now and those seen in the last few minutes.
     pub clients: Load<Vec<Connected>>,
 }
@@ -134,6 +134,15 @@ pub struct Attention {
     pub related: Vec<(String, Option<String>)>,
     /// Who raised it, when st says.
     pub raised_by: Option<String>,
+    /// The mission step waiting on this ask, on an ask a mission step made.
+    pub blocked: Option<Blocked>,
+}
+
+/// The mission step that asked and waits for the answer.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Blocked {
+    pub step: String,
+    pub goal: String,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]

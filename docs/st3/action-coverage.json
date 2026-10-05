@@ -51,6 +51,14 @@
       "behavior": "refused without writes across restart"
     },
     {
+      "action": "custom.reply",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::decision_tree_manifest_cards_fences_retries_damage_and_restarts"
+      ],
+      "behavior": "stale source/card fences and wrong actor refused; client and CLI answers survive restart; exact replay writes no duplicate answer"
+    },
+    {
       "action": "lane.approve",
       "tests": [
         "crates/st3/tests/action_coverage.rs::lane_actions_survive_stale_fences_and_restarts"
@@ -512,11 +520,13 @@
     },
     {
       "command": "st apply",
-      "description": "Publish a complete source-fenced owned set",
+      "description": "Preview and publish KDL files or a complete source-fenced owned set",
       "tests": [
-        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation"
+        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation",
+        "crates/st3/tests/broken_gates.rs::apply_bundles_seats_missions_and_schedules_and_refuses_partial_publication",
+        "crates/st3/tests/broken_gates.rs::apply_can_check_exec_gates_during_plain_and_owned_dry_runs"
       ],
-      "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
+      "verification": "real CLI over isolated disk-backed Unix daemons; mixed-file atomic publication, dry-run side effects, gate checks, source fences, partition/heal and retirement confirmation"
     },
     {
       "command": "st attention approve",
@@ -752,6 +762,15 @@
         "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st devices complete",
+      "description": "Complete a single-use pairing and privately persist its credential and signing key",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secrets",
+        "crates/st3-client/tests/device_signing.rs::shared_completion_persists_both_key_types_and_preserves_a_working_device_on_failure"
+      ],
+      "verification": "real CLI against an isolated paired gateway; generated/imported Ed25519/P-256 keys; credential/key profile reloaded; signed messages verify"
     },
     {
       "command": "st devices ls",
@@ -1434,6 +1453,30 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st schema register",
+      "description": "Publish an immutable typed custom schema and bounded projection.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts"
+      ],
+      "verification": "real CLI over private Unix socket; registered reads and fenced person replies across restart"
+    },
+    {
+      "command": "st schema registration",
+      "description": "Read an exact custom registration by kind and hash.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts"
+      ],
+      "verification": "real CLI over private Unix socket; registered reads and fenced person replies across restart"
+    },
+    {
+      "command": "st schema registrations",
+      "description": "List registered custom kinds and their pinned hashes.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts"
+      ],
+      "verification": "real CLI over private Unix socket; registered reads and fenced person replies across restart"
+    },
+    {
       "command": "st schema resources",
       "description": "List registered resource kinds",
       "tests": [
@@ -1706,12 +1749,28 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st subject basis",
+      "description": "Read the complete raw input-set token for a derived-state basis.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts"
+      ],
+      "verification": "real CLI over private Unix socket; registered reads and fenced person replies across restart"
+    },
+    {
       "command": "st subject history",
       "description": "Show bounded immutable history for one subject",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st subject reply",
+      "description": "Answer a current custom source with its declared fields and fences.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts"
+      ],
+      "verification": "real CLI over private Unix socket; registered reads and fenced person replies across restart"
     },
     {
       "command": "st subject show",

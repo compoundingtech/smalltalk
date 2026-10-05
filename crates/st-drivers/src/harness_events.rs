@@ -213,6 +213,34 @@ pub fn read_snapshot(agent_dir: &Path, kind: &str) -> Result<Option<Vec<u8>>> {
         .optional()?)
 }
 
+/// Read saved provider state only when its producer belongs to `runtime`.
+/// A new runtime retains its predecessor's snapshot for durable history, but must not use it
+/// as evidence that its own provider has launched. A driver re-exec keeps the same runtime.
+pub fn read_runtime_state(agent_dir: &Path, runtime: &str) -> Result<Option<Vec<u8>>> {
+    let mut connection = open(agent_dir)?;
+    let tx = connection.transaction()?;
+    let raw: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT body FROM snapshots WHERE kind='harness-state'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else { return Ok(None) };
+    let state: Value = serde_json::from_slice(&raw)?;
+    let Some(token) = state["incarnation"].as_str() else {
+        return Ok(None);
+    };
+    let owner: Option<String> = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [format!("provider-runtime:{token}")],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok((owner.as_deref() == Some(runtime)).then_some(raw))
+}
+
 fn current_token(connection: &Connection) -> Result<Option<String>> {
     let raw: Option<Vec<u8>> = connection
         .query_row(

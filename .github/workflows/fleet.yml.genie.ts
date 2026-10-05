@@ -11,13 +11,14 @@ import {
   buildEnv,
   commonSetupSteps,
   linuxRunner,
-  linuxRunsOn,
   linuxStageJob as namespaceStageJob,
   linuxStageRunner,
   linuxStageRunsOn,
   perfStoresCache,
   pickRunnerJob,
   pickRunnerJobId,
+  supportingLinuxRunsOn,
+  supportingStageRunsOn,
   workspacePreparationSteps,
 } from './workspace-ci.ts'
 
@@ -49,6 +50,7 @@ const linuxStageJob = ({
   env = {},
   before = [],
   extraLogs = '',
+  runsOn = supportingStageRunsOn,
 }: {
   name: string
   stage: string
@@ -57,10 +59,11 @@ const linuxStageJob = ({
   env?: Record<string, string>
   before?: readonly unknown[]
   extraLogs?: string
+  runsOn?: unknown
 }) => ({
   name,
   ...afterPickRunner,
-  'runs-on': linuxStageRunsOn,
+  'runs-on': runsOn,
   'timeout-minutes': 120,
   defaults: { run: { shell: 'bash' } },
   env: { ...buildEnv, ...env, CI_CACHE_DEV_SHELL: 'default' },
@@ -112,7 +115,7 @@ export default githubWorkflow(auditCaches({
   // actionlint must know the Namespace shape label the stage jobs use.
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
+    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
   },
   jobs: {
     [pickRunnerJobId]: pickRunnerJob,
@@ -165,11 +168,11 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       name: 'genie-freshness',
       env: { CI_CACHE_DEV_SHELL: 'genie' },
       ...afterPickRunner,
-      'runs-on': linuxRunsOn,
+      'runs-on': supportingLinuxRunsOn,
       'timeout-minutes': 20,
       steps: [
         ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
-        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
+        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
         ...buildSnapshotSave,
       ],
@@ -177,10 +180,10 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
     // Check the shared client and its iOS consumer before merge.
     'typescript-client': {
       name: 'typescript-client',
-      // Reuse freshness's slot so the five general ci1 runners can cover the initial fan-out.
+      // Keep generated-file validation ahead of its consumers.
       needs: ['pick-runner', 'genie-freshness'],
       if: "${{ !cancelled() && needs.genie-freshness.result == 'success' }}",
-      'runs-on': linuxRunsOn,
+      'runs-on': supportingLinuxRunsOn,
       'timeout-minutes': 10,
       defaults: { run: { shell: 'bash' } },
       steps: [
@@ -225,21 +228,34 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         { name: 'Check shared views, fixtures and iOS consumers', run: 'npm test --prefix clients/typescript/st3-views\nnpm run typecheck --prefix clients/typescript/st3-views\napps/ios/node_modules/.bin/tsc --noEmit -p apps/ios\nnpm test --prefix apps/ios' },
       ],
     },
-    // The Linux gate runs as three jobs on separate runners, each with its own caches.
+    // Two test partitions and the two supporting stages retain independent CPU capacity.
     // `linux-gate` below is the single required check that collects them.
     'linux-tests': { ...linuxStageJob({
       name: 'linux-tests',
       stage: 'tests',
       setup: workspacePreparationSteps,
+      runsOn: linuxStageRunsOn,
       // CI_RUN_ID keeps the messaging-fault evidence under target/messaging-faults and a failed
       // boot canary's evidence under target/boot-canaries.
-      env: { CI_RUN_ID: '${{ github.run_id }}' },
+      env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:1/2', CI_TEST_THREADS: '8' },
       extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
-      before: [{
+      before: [nixDevelopStep({ name: 'Prove both shards cover every selected test', command: ['python3', 'scripts/ci-test-partitions'] }), {
         ...nixDevelopStep({ name: 'Require every harness to hold old mail across boot and reconnect', command: ['python3', 'scripts/ci-mail-redelivery-canaries'] }),
         id: 'mail-redelivery-canaries',
       }],
     }), outputs: { mail_redelivery: '${{ steps.mail-redelivery-canaries.outcome }}' } },
+    'linux-tests-shard-2': linuxStageJob({
+      name: 'linux-tests-shard-2',
+      stage: 'tests',
+      // Reuse the main-seeded test caches; each checkout keeps its own executable paths.
+      setup: workspacePreparationSteps.map((step: any) =>
+        step.id === 'cargo-cache' || step.id === 'nix-cache'
+          ? { ...step, with: { ...step.with, key: step.with.key.replace('${{ github.job }}', 'linux-tests'),
+              'restore-keys': step.with['restore-keys'].replaceAll('${{ github.job }}', 'linux-tests') } }
+          : step),
+      env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:2/2', CI_TEST_THREADS: '8' },
+      extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
+    }),
     'linux-clippy': linuxStageJob({
       name: 'linux-clippy',
       stage: 'clippy',
@@ -268,7 +284,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
     },
     'linux-gate': {
       name: 'linux-gate',
-      needs: [pickRunnerJobId, 'linux-tests', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries'],
+      needs: [pickRunnerJobId, 'linux-tests', 'linux-tests-shard-2', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries'],
       // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
       if: 'always()',
       // Aggregation needs no build caches and must not queue behind the work it summarizes.
@@ -278,7 +294,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         {
           name: 'Require every Linux stage to pass',
           // The stages only: pick-runner is skipped whenever ci1 is off.
-          env: { RESULTS: '${{ needs.linux-tests.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}' },
+          env: { RESULTS: '${{ needs.linux-tests.result }} ${{ needs.linux-tests-shard-2.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}' },
           run: `echo "stage results: $RESULTS"
 for result in $RESULTS; do
   [ "$result" = success ] || exit 1
@@ -309,7 +325,7 @@ done`,
     'isolation-vm': {
       name: 'isolation-vm',
       ...afterPickRunner,
-      'runs-on': linuxRunsOn,
+      'runs-on': supportingLinuxRunsOn,
       'timeout-minutes': 60,
       defaults: { run: { shell: 'bash' } },
       env: { ...buildEnv, CI_CACHE_DEV_SHELL: 'default' },

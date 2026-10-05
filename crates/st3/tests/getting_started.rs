@@ -132,6 +132,9 @@ impl Drop for Newcomer {
 
 #[test]
 fn a_newcomer_gets_signed_claims_with_no_new_step_or_prompt() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let Some(pty) = pty() else {
         assert!(
             std::env::var_os("CI_RUN_ID").is_none(),

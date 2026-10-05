@@ -69,6 +69,18 @@ pub(crate) struct RepositoryCursor {
     pub(crate) comments_since: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) seen: BTreeMap<String, String>,
+    /// Open identities, and closed items awaiting their final detail read. Subject numbers
+    /// stay at their original locations even when GitHub's node now lives elsewhere.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    identities: BTreeMap<String, ItemIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail_after: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ItemIdentity {
+    number: u64,
+    pull: bool,
 }
 
 impl RepositoryCursor {
@@ -96,6 +108,14 @@ struct PullRequestCheck {
     settling: bool,
     changed: bool,
     open: Arc<Vec<serde_json::Map<String, Value>>>,
+    resolved: Arc<Vec<Value>>,
+    emit_pulls: bool,
+}
+
+struct RepositoryDetails {
+    open: Arc<Vec<serde_json::Map<String, Value>>>,
+    resolved: Arc<Vec<Value>>,
+    identities_read: usize,
 }
 
 fn pull_request_checks() -> &'static Mutex<HashMap<String, PullRequestCheck>> {
@@ -288,6 +308,143 @@ fn insert(facts: &mut serde_json::Map<String, Value>, name: &str, value: Option<
     }
 }
 
+/// The public GitHub URL's canonical graph subject. URLs remain on the facts as well;
+/// links use the established OWNER/REPO subjects rather than introducing node-ID subjects.
+fn github_subject(url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(url).ok()?;
+    if url.host_str()? != "github.com" {
+        return None;
+    }
+    let parts = url.path_segments()?.collect::<Vec<_>>();
+    let [owner, repo, kind, key] = parts.as_slice() else {
+        return None;
+    };
+    if owner.is_empty() || repo.is_empty() || key.is_empty() {
+        return None;
+    }
+    let segment = match *kind {
+        "issues" => "issue",
+        "pull" => "pull-request",
+        "commit" => "commit",
+        _ => return None,
+    };
+    Some(format!(
+        "{}/{segment}/{key}",
+        crate::github_watch::default_resource(&format!("{owner}/{repo}"))
+    ))
+}
+
+fn item_move(facts: &mut serde_json::Map<String, Value>, locator: &str, identity: &ItemIdentity) {
+    let original = format!(
+        "{}/{}/{}",
+        crate::github_watch::default_resource(locator),
+        if identity.pull {
+            "pull-request"
+        } else {
+            "issue"
+        },
+        identity.number
+    );
+    if let Some(target) = facts
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(github_subject)
+    {
+        facts.insert(
+            "moved_to".into(),
+            if target == original {
+                Value::Null
+            } else {
+                json!(target)
+            },
+        );
+    }
+}
+
+/// Final resolution and current location of a previously listed identity. `number` is its
+/// original number: a transfer must update the old subject, not silently create a new key.
+fn resolved_item(
+    node: &Value,
+    identity: &ItemIdentity,
+    locator: &str,
+) -> serde_json::Map<String, Value> {
+    let mut facts = serde_json::Map::from_iter([("number".into(), json!(identity.number))]);
+    insert(&mut facts, "node_id", node.get("id"));
+    insert(&mut facts, "url", node.get("url"));
+    let state = lowercase(node.get("state"));
+    facts.insert(
+        "state".into(),
+        if state == "merged" {
+            json!("closed")
+        } else {
+            state.clone()
+        },
+    );
+    let closed = state == "closed" || state == "merged";
+    let event = node.pointer("/timelineItems/nodes/0");
+    if identity.pull {
+        let merged = node.get("merged").and_then(Value::as_bool) == Some(true);
+        facts.insert("merged".into(), json!(merged));
+        facts.insert(
+            "state_reason".into(),
+            if closed {
+                json!(if merged { "merged" } else { "closed" })
+            } else {
+                Value::Null
+            },
+        );
+        for (name, pointer) in [
+            ("merge_commit_sha", "/mergeCommit/oid"),
+            ("merged_at", "/mergedAt"),
+            ("merged_by", "/mergedBy/login"),
+        ] {
+            // An open PR's mergeCommit is a speculative test merge, not its resolution.
+            facts.insert(
+                name.into(),
+                if merged {
+                    node.pointer(pointer).cloned().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                },
+            );
+        }
+    } else {
+        facts.insert("state_reason".into(), lowercase(node.get("stateReason")));
+        facts.insert(
+            "closed_by".into(),
+            if closed {
+                event
+                    .and_then(|event| event.pointer("/actor/login"))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            },
+        );
+    }
+    let closer = closed
+        .then(|| {
+            event
+                .and_then(|event| event.pointer("/closer/url"))
+                .or_else(|| {
+                    if identity.pull && state == "merged" {
+                        node.pointer("/mergeCommit/url")
+                    } else {
+                        None
+                    }
+                })
+        })
+        .flatten()
+        .and_then(Value::as_str)
+        .and_then(github_subject);
+    facts.insert(
+        "closed_by_resource".into(),
+        closer.map_or(Value::Null, Value::String),
+    );
+    item_move(&mut facts, locator, identity);
+    facts
+}
+
 /// An issue or pull request from the issues listing, with the facts each declared data type
 /// reads. `watermark` is how far the observer had read before this poll: an item created before
 /// it is not new.
@@ -295,10 +452,12 @@ fn listed_item(issue: &Value, fields: &BTreeSet<String>, watermark: Option<&str>
     let pull = issue.get("pull_request").is_some();
     let mut facts = serde_json::Map::new();
     insert(&mut facts, "number", issue.get("number"));
+    insert(&mut facts, "node_id", issue.get("node_id"));
     insert(&mut facts, "url", issue.get("html_url"));
     insert(&mut facts, "title", issue.get("title"));
     insert(&mut facts, "author", issue.pointer("/user/login"));
     insert(&mut facts, "created_at", issue.get("created_at"));
+    insert(&mut facts, "updated_at", issue.get("updated_at"));
     let state = issue.get("state").and_then(Value::as_str).unwrap_or("open");
     facts.insert("state".into(), Value::String(state.into()));
     if pull {
@@ -307,8 +466,33 @@ fn listed_item(issue: &Value, fields: &BTreeSet<String>, watermark: Option<&str>
             && let Some(merged_at) = issue.pointer("/pull_request/merged_at")
         {
             facts.insert("merged".into(), Value::Bool(!merged_at.is_null()));
+            facts.insert("merged_at".into(), merged_at.clone());
+            facts.insert(
+                "state_reason".into(),
+                json!(if merged_at.is_null() {
+                    "closed"
+                } else {
+                    "merged"
+                }),
+            );
+        }
+        if state == "open" {
+            for name in [
+                "merged_at",
+                "merged_by",
+                "merge_commit_sha",
+                "state_reason",
+                "closed_by_resource",
+            ] {
+                facts.insert(name.into(), Value::Null);
+            }
         }
     } else {
+        insert(&mut facts, "closed_by", issue.pointer("/closed_by/login"));
+        if state == "open" {
+            facts.insert("closed_by".into(), Value::Null);
+            facts.insert("closed_by_resource".into(), Value::Null);
+        }
         // `state_reason` is null on an open issue that was never closed.
         facts.insert(
             "state_reason".into(),
@@ -395,12 +579,13 @@ fn listed_comment(comment: &Value, fields: &BTreeSet<String>) -> Option<Item> {
     })
 }
 
-const OPEN_PULL_REQUESTS: &str = "query($owner: String!, $name: String!, $after: String) {
-  repository(owner: $owner, name: $name) {
+const OPEN_PULL_REQUESTS: &str =
+    "query($owner: String!, $name: String!, $after: String, $ids: [ID!]!, $pulls: Boolean!) {
+  repository(owner: $owner, name: $name) @include(if: $pulls) {
     pullRequests(states: OPEN, first: 100, after: $after) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        number title url isDraft headRefOid headRefName baseRefName createdAt
+        id number title url isDraft headRefOid headRefName baseRefName createdAt
         author { login }
         reviewDecision
         mergeQueueEntry { state position }
@@ -414,6 +599,28 @@ const OPEN_PULL_REQUESTS: &str = "query($owner: String!, $name: String!, $after:
           } }
         } } } }
       }
+    }
+  }
+  nodes(ids: $ids) {
+    id
+    ... on Issue {
+      number url state stateReason updatedAt
+      timelineItems(last: 1, itemTypes: [CLOSED_EVENT]) { nodes { ... on ClosedEvent {
+        createdAt actor { login }
+        closer {
+          ... on PullRequest { url }
+          ... on Commit { url }
+        }
+      } } }
+    }
+    ... on PullRequest {
+      number url state updatedAt merged mergedAt mergedBy { login } mergeCommit { oid url }
+      timelineItems(last: 1, itemTypes: [CLOSED_EVENT]) { nodes { ... on ClosedEvent {
+        createdAt closer {
+          ... on PullRequest { url }
+          ... on Commit { url }
+        }
+      } } }
     }
   }
 }";
@@ -564,6 +771,7 @@ fn open_pull_request(
 ) -> serde_json::Map<String, Value> {
     let mut facts = serde_json::Map::new();
     insert(&mut facts, "number", node.get("number"));
+    insert(&mut facts, "node_id", node.get("id"));
     insert(&mut facts, "url", node.get("url"));
     insert(&mut facts, "title", node.get("title"));
     insert(&mut facts, "author", node.pointer("/author/login"));
@@ -770,9 +978,10 @@ pub(super) async fn observe_at(
     let base = format!("{api_base}/repos/{owner}/{repository}");
     // A renamed repository answers through a redirect. Its numeric ID proves that the locator
     // still names the repository whose items were observed before.
-    let repository_id = github_json(&client, base.clone(), token, cache_for)
+    let repository_data = github_json(&client, base.clone(), token, cache_for)
         .await?
-        .value
+        .value;
+    let repository_id = repository_data
         .get("id")
         .and_then(Value::as_u64)
         .context("the GitHub repository response has no numeric ID")?;
@@ -787,6 +996,12 @@ pub(super) async fn observe_at(
             "the locator now names GitHub repository {repository_id}, not the observed repository {previous_id}"
         );
     }
+    // REST follows repository redirects; GraphQL's repository lookup needs the current name.
+    let current_location = repository_data
+        .get("full_name")
+        .and_then(Value::as_str)
+        .and_then(|name| name.split_once('/'))
+        .unwrap_or((owner, repository));
     let mut cursor = RepositoryCursor::parse(request.cursor.as_deref());
     // How far the observer had read before this poll. Without one, this poll reads every open
     // item once; from then on it reads only what changed.
@@ -835,7 +1050,26 @@ pub(super) async fn observe_at(
         }
         if !cursor.already_seen("items", listing_digest(&listing)) {
             for issue in &listing.values {
-                let item = listed_item(issue, fields, watermark.as_deref());
+                let mut item = listed_item(issue, fields, watermark.as_deref());
+                if (fields.contains("pull_requests") || fields.contains("issues"))
+                    && let (Some(id), Some(number)) = (
+                        issue.get("node_id").and_then(Value::as_str),
+                        issue.get("number").and_then(Value::as_u64),
+                    )
+                {
+                    let identity = cursor.identities.entry(id.into()).or_insert(ItemIdentity {
+                        number,
+                        pull: item.pull,
+                    });
+                    item.facts.insert("number".into(), json!(identity.number));
+                }
+                if let Some(number) = item.facts.get("number").and_then(Value::as_u64) {
+                    let identity = ItemIdentity {
+                        number,
+                        pull: item.pull,
+                    };
+                    item_move(&mut item.facts, &request.locator, &identity);
+                }
                 if item.pull && item.facts.get("state").and_then(Value::as_str) == Some("open") {
                     changed_open_pull = true;
                     listed_open_pulls.extend(item.facts.get("number").and_then(Value::as_u64));
@@ -974,25 +1208,115 @@ pub(super) async fn observe_at(
         }
     }
 
-    if fields.contains("pull_requests") {
-        let open = open_pull_requests(
+    if fields.contains("pull_requests")
+        || (fields.contains("issues") && !cursor.identities.is_empty())
+    {
+        // Rotate the remembered identities across existing detail pages. Tracking many
+        // issues must not add GraphQL pages to an open-PR poll.
+        let identities = cursor
+            .identities
+            .keys()
+            .filter(|id| cursor.detail_after.as_ref().is_none_or(|after| *id > after))
+            .chain(cursor.identities.keys().filter(|id| {
+                cursor
+                    .detail_after
+                    .as_ref()
+                    .is_some_and(|after| *id <= after)
+            }))
+            .cloned()
+            .collect::<Vec<_>>();
+        let details = open_pull_requests(
             &client,
             api_base,
             token,
             cache_for,
             &request.locator,
-            (owner, repository),
+            current_location,
             request.refresh,
-            changed_open_pull || !cursor.seen.contains_key("pull-requests"),
+            changed_open_pull
+                || !cursor.seen.contains_key("pull-requests")
+                || items
+                    .values()
+                    .any(|item| item.facts.get("state").and_then(Value::as_str) == Some("closed")),
             &listed_open_pulls,
+            fields.contains("pull_requests"),
+            &identities,
         )
         .await?;
+        if details.identities_read > 0 {
+            cursor.detail_after = identities.get(details.identities_read - 1).cloned();
+        }
+        for node in details.resolved.iter() {
+            let Some(id) = node.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(identity) = cursor.identities.get(id).cloned() else {
+                continue;
+            };
+            let facts = resolved_item(node, &identity, &request.locator);
+            let digest = hex::encode(Sha256::digest(serde_json::to_vec(node)?));
+            let seen = cursor.already_seen(&format!("identity/{id}"), digest);
+            // Cache snapshots can predate a closure or reopen just listed through REST.
+            // Remember an incompatible snapshot so it cannot undo that change on the next poll.
+            if items
+                .get(&identity.number)
+                .and_then(|item| item.facts.get("state"))
+                .is_some_and(|listed| facts.get("state") != Some(listed))
+                || node
+                    .get("updatedAt")
+                    .and_then(Value::as_str)
+                    .zip(
+                        items
+                            .get(&identity.number)
+                            .and_then(|item| item.facts.get("updated_at"))
+                            .and_then(Value::as_str),
+                    )
+                    .is_some_and(|(detail, listed)| detail < listed)
+            {
+                continue;
+            }
+            if !seen {
+                let finished = facts.get("state").and_then(Value::as_str) == Some("closed");
+                merge(
+                    &mut items,
+                    Item {
+                        pull: identity.pull,
+                        listed: false,
+                        facts,
+                    },
+                );
+                if finished {
+                    cursor.identities.remove(id);
+                    cursor.seen.remove(&format!("identity/{id}"));
+                }
+            }
+        }
         let digest = hex::encode(Sha256::digest(
-            serde_json::to_vec(open.as_slice()).unwrap_or_default(),
+            serde_json::to_vec(details.open.as_slice()).unwrap_or_default(),
         ));
-        if !cursor.already_seen("pull-requests", digest) {
-            for facts in open.iter() {
+        if !cursor.already_seen("pull-requests", digest) && fields.contains("pull_requests") {
+            for facts in details.open.iter() {
                 let mut facts = facts.clone();
+                if let Some(number) = facts.get("number").and_then(Value::as_u64) {
+                    if items
+                        .get(&number)
+                        .and_then(|item| item.facts.get("state"))
+                        .is_some_and(|state| state != "open")
+                    {
+                        continue;
+                    }
+                    if let Some(id) = facts.get("node_id").and_then(Value::as_str) {
+                        cursor
+                            .identities
+                            .entry(id.into())
+                            .or_insert(ItemIdentity { number, pull: true });
+                    }
+                    item_move(
+                        &mut facts,
+                        &request.locator,
+                        &ItemIdentity { number, pull: true },
+                    );
+                }
                 // Every observer of the repository on this host shares the answer; reviews belong
                 // to `recent_comments` only for an observer that emits comments.
                 if !fields.contains("comments") {
@@ -1013,6 +1337,15 @@ pub(super) async fn observe_at(
 
     let mut facts =
         serde_json::Map::from_iter([("repository_id".to_owned(), Value::from(repository_id))]);
+    insert(&mut facts, "node_id", repository_data.get("node_id"));
+    if let Some(name) = repository_data.get("full_name").and_then(Value::as_str)
+        && !name.eq_ignore_ascii_case(&request.locator)
+    {
+        facts.insert(
+            "moved_to".into(),
+            json!(crate::github_watch::default_resource(name)),
+        );
+    }
     let mut pulls = Vec::new();
     let mut issues = Vec::new();
     for (_, item) in items {
@@ -1067,7 +1400,9 @@ async fn open_pull_requests(
     refresh: bool,
     changed: bool,
     listed: &BTreeSet<u64>,
-) -> Result<Arc<Vec<serde_json::Map<String, Value>>>> {
+    emit_pulls: bool,
+    identities: &[String],
+) -> Result<RepositoryDetails> {
     let key = format!("{api_base} {locator}");
     let previous = {
         let mut checks = pull_request_checks()
@@ -1081,8 +1416,13 @@ async fn open_pull_requests(
             None
         }
     };
+    let emit_pulls = emit_pulls
+        || previous
+            .as_ref()
+            .is_some_and(|previous| previous.emit_pulls);
     if let Some(previous) = previous.filter(|previous| {
         !refresh
+            && (!emit_pulls || previous.emit_pulls)
             && listed.iter().all(|number| {
                 previous
                     .open
@@ -1094,10 +1434,16 @@ async fn open_pull_requests(
                     && !previous.settling
                     && previous.at.elapsed() < SETTLED_PULL_REQUEST_CHECK))
     }) {
-        return Ok(previous.open);
+        return Ok(RepositoryDetails {
+            open: previous.open,
+            resolved: previous.resolved,
+            identities_read: 0,
+        });
     }
     let mut nodes = Vec::new();
+    let mut resolved = Vec::new();
     let mut after = Value::Null;
+    let mut identities_read = 0;
     for page in 0.. {
         anyhow::ensure!(
             page < PULL_REQUEST_PAGES,
@@ -1109,9 +1455,21 @@ async fn open_pull_requests(
             api_base,
             token,
             OPEN_PULL_REQUESTS,
-            json!({"owner": owner, "name": repository, "after": after}),
+            json!({"owner": owner, "name": repository, "after": after,
+                "pulls": emit_pulls, "ids": identities.iter().skip(page * 100).take(100).collect::<Vec<_>>() }),
         )
         .await?;
+        resolved.extend(
+            data.get("nodes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        identities_read = identities.len().min((page + 1) * 100);
+        if !emit_pulls {
+            break;
+        }
         let connection = data
             .pointer("/repository/pullRequests")
             .context("the GitHub GraphQL response has no pull requests")?;
@@ -1161,6 +1519,7 @@ async fn open_pull_requests(
         .collect::<Vec<_>>();
     open.sort_by_key(|facts| facts.get("number").and_then(Value::as_u64));
     let open = Arc::new(open);
+    let resolved = Arc::new(resolved);
     pull_request_checks()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -1171,9 +1530,15 @@ async fn open_pull_requests(
                 settling: open.iter().any(settling),
                 changed: false,
                 open: open.clone(),
+                resolved: resolved.clone(),
+                emit_pulls,
             },
         );
-    Ok(open)
+    Ok(RepositoryDetails {
+        open,
+        resolved,
+        identities_read,
+    })
 }
 
 /// The checks a base branch requires before merging: those its rulesets name and those its
@@ -1288,6 +1653,7 @@ mod tests {
         routes: Arc<Mutex<HashMap<String, (String, String)>>>,
         refused: Arc<Mutex<HashMap<String, String>>>,
         graphql: Arc<Mutex<String>>,
+        graphql_requests: Arc<Mutex<Vec<Value>>>,
         requests: Arc<Mutex<Vec<String>>>,
     }
 
@@ -1346,6 +1712,10 @@ mod tests {
                             )
                         };
                         let response = if target.starts_with("POST /graphql ") {
+                            server.graphql_requests.lock().unwrap().push(
+                                serde_json::from_slice(&request[header_end..header_end + length])
+                                    .unwrap(),
+                            );
                             respond("200 OK", None, &server.graphql.lock().unwrap())
                         } else {
                             let path = target.split(' ').nth(1).unwrap().to_owned();
@@ -1403,6 +1773,12 @@ mod tests {
             .to_string();
         }
 
+        fn resolved_nodes(&self, nodes: Value) {
+            let mut response: Value = serde_json::from_str(&self.graphql.lock().unwrap()).unwrap();
+            response["data"]["nodes"] = nodes;
+            *self.graphql.lock().unwrap() = response.to_string();
+        }
+
         fn take_requests(&self) -> Vec<String> {
             std::mem::take(&mut *self.requests.lock().unwrap())
                 .into_iter()
@@ -1416,9 +1792,13 @@ mod tests {
         let mut checks = pull_request_checks()
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let check = checks
-            .get_mut(&format!("{base} acme/garden"))
-            .expect("GraphQL was read");
+        let key = format!("{base} acme/garden");
+        let key = if checks.contains_key(&key) {
+            key
+        } else {
+            format!("{key} issues")
+        };
+        let check = checks.get_mut(&key).expect("GraphQL was read");
         check.at = check.at.checked_sub(by).expect("the clock reaches back");
     }
 
@@ -1486,6 +1866,433 @@ mod tests {
             issue[name] = value.clone();
         }
         issue
+    }
+
+    #[test]
+    fn resolution_normalization_clears_reopened_and_unmerged_facts() {
+        let identity = ItemIdentity {
+            number: 3,
+            pull: true,
+        };
+        let closed = resolved_item(
+            &json!({"id": "PR_orchid", "state": "CLOSED", "merged": false,
+                "mergeCommit": {"oid": "test-merge", "url": "https://github.com/acme/garden/commit/test-merge"},
+                "timelineItems": {"nodes": [{"closer": {"url": "https://github.com/acme/garden/commit/final"}}]}
+            }),
+            &identity,
+            "acme/garden",
+        );
+        assert_eq!(closed["state_reason"], "closed");
+        assert_eq!(closed["merge_commit_sha"], Value::Null);
+        assert_eq!(
+            closed["closed_by_resource"],
+            "resource/github/acme/garden/commit/final"
+        );
+        let reopened = resolved_item(
+            &json!({"state": "OPEN", "merged": false,
+                "timelineItems": {"nodes": [{"closer": {"url": "https://github.com/acme/garden/pull/8"}}]}
+            }),
+            &identity,
+            "acme/garden",
+        );
+        for name in [
+            "merged_at",
+            "merged_by",
+            "merge_commit_sha",
+            "state_reason",
+            "closed_by_resource",
+        ] {
+            assert_eq!(reopened[name], Value::Null, "{name}");
+        }
+        let reopened_issue = resolved_item(
+            &json!({"state": "OPEN", "stateReason": "REOPENED",
+                "timelineItems": {"nodes": [{"actor": {"login": "fern"}}]}
+            }),
+            &ItemIdentity {
+                number: 1,
+                pull: false,
+            },
+            "acme/garden",
+        );
+        assert_eq!(reopened_issue["closed_by"], Value::Null);
+        assert_eq!(reopened_issue["state_reason"], "reopened");
+        let original = resolved_item(
+            &json!({"state": "OPEN", "url": "https://github.com/acme/garden/issues/1"}),
+            &ItemIdentity {
+                number: 1,
+                pull: false,
+            },
+            "acme/garden",
+        );
+        assert_eq!(original["moved_to"], Value::Null);
+        assert_eq!(
+            RepositoryCursor::parse(Some(r#"{"items_since":"2026-09-01T00:00:00Z"}"#))
+                .identities
+                .len(),
+            0
+        );
+        let legacy = listed_item(
+            &issue(1, "2026-09-10T00:00:00Z", json!({})),
+            &BTreeSet::new(),
+            None,
+        );
+        assert!(!legacy.facts.contains_key("node_id"));
+    }
+
+    #[tokio::test]
+    async fn resolution_details_share_the_gated_query_and_survive_etags() {
+        let (github, base) = FakeGithub::start().await;
+        github.route(
+            "/repos/acme/garden",
+            json!({"id": 7, "node_id": "R_orchid", "full_name": "acme/garden"}),
+        );
+        github.route(
+            "/repos/acme/garden/issues?state=open&per_page=100",
+            json!([
+                issue(1, "2026-09-10T00:00:00Z", json!({"node_id": "I_orchid"})),
+                issue(
+                    2,
+                    "2026-09-10T00:00:00Z",
+                    json!({"node_id": "PR_orchid", "pull_request": {"merged_at": null},
+                "html_url": "https://github.com/acme/garden/pull/2"})
+                )
+            ]),
+        );
+        let mut open = open_pull(2, "head", "SUCCESS");
+        open["id"] = json!("PR_orchid");
+        github.open_pull_requests(json!([open]));
+        github.resolved_nodes(json!([
+            {"id": "I_orchid", "number": 1, "url": "https://github.com/acme/garden/issues/1", "state": "OPEN", "stateReason": null},
+            {"id": "PR_orchid", "number": 2, "url": "https://github.com/acme/garden/pull/2", "state": "OPEN", "merged": false}
+        ]));
+        let first = observe_at(
+            request(&["pull_requests", "issues"], None, None),
+            &base,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.facts["node_id"], "R_orchid");
+        assert_eq!(item(&first.facts, "issues", 1)["node_id"], "I_orchid");
+        assert_eq!(
+            item(&first.facts, "pull_requests", 2)["node_id"],
+            "PR_orchid"
+        );
+        let queries = github.graphql_requests.lock().unwrap().clone();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(
+            queries[0]["variables"]["ids"],
+            json!(["I_orchid", "PR_orchid"])
+        );
+        assert!(
+            queries[0]["query"]
+                .as_str()
+                .unwrap()
+                .contains("itemTypes: [CLOSED_EVENT]")
+        );
+        github.take_requests();
+        github.route("/repos/acme/garden/issues?state=all&sort=updated&direction=asc&since=2026-09-10T00:00:00Z&per_page=100", json!([
+            issue(1, "2026-09-11T00:00:00Z", json!({"node_id": "I_orchid", "state": "closed", "state_reason": "completed"})),
+            issue(2, "2026-09-11T00:00:00Z", json!({"node_id": "PR_orchid", "state": "closed", "pull_request": {"merged_at": "2026-09-11T00:00:00Z"},
+                "html_url": "https://github.com/acme/garden/pull/2"}))
+        ]));
+        github.open_pull_requests(json!([]));
+        github.resolved_nodes(json!([
+            {"id": "I_orchid", "number": 1, "url": "https://github.com/acme/garden/issues/1", "state": "CLOSED", "stateReason": "COMPLETED",
+                "timelineItems": {"nodes": [{"actor": {"login": "fern"}, "closer": {"url": "https://github.com/acme/garden/pull/2"}}]}},
+            {"id": "PR_orchid", "number": 2, "url": "https://github.com/acme/garden/pull/2", "state": "MERGED", "merged": true,
+                "mergedAt": "2026-09-11T00:00:00Z", "mergedBy": {"login": "orchid"},
+                "mergeCommit": {"oid": "final-sha", "url": "https://github.com/acme/garden/commit/final-sha"}}
+        ]));
+        let closed = observe_at(
+            request(
+                &["pull_requests", "issues"],
+                first.cursor.as_deref(),
+                Some(first.facts.clone()),
+            ),
+            &base,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(item(&closed.facts, "pull_requests", 2)["state"], "closed");
+        assert!(
+            !github
+                .take_requests()
+                .iter()
+                .any(|request| request.starts_with("POST"))
+        );
+        github.route("/repos/acme/garden/issues?state=all&sort=updated&direction=asc&since=2026-09-11T00:00:00Z&per_page=100", json!([]));
+        age_pull_request_check(&base, PULL_REQUEST_CHECK_INTERVAL);
+        let final_read = observe_at(
+            request(
+                &["pull_requests", "issues"],
+                closed.cursor.as_deref(),
+                Some(closed.facts),
+            ),
+            &base,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        let pr = item(&final_read.facts, "pull_requests", 2);
+        assert_eq!(pr["merge_commit_sha"], "final-sha");
+        assert_eq!(pr["merged_at"], "2026-09-11T00:00:00Z");
+        assert_eq!(pr["merged_by"], "orchid");
+        assert_eq!(pr["state_reason"], "merged");
+        assert_eq!(
+            pr["closed_by_resource"],
+            "resource/github/acme/garden/commit/final-sha"
+        );
+        let closed_issue = item(&final_read.facts, "issues", 1);
+        assert_eq!(closed_issue["closed_by"], "fern");
+        assert_eq!(
+            closed_issue["closed_by_resource"],
+            "resource/github/acme/garden/pull-request/2"
+        );
+        assert_eq!(closed_issue["state_reason"], "completed");
+        assert!(
+            RepositoryCursor::parse(final_read.cursor.as_deref())
+                .identities
+                .is_empty()
+        );
+        assert_eq!(
+            github
+                .take_requests()
+                .iter()
+                .filter(|request| request.starts_with("POST"))
+                .count(),
+            1
+        );
+        let quiet = observe_at(
+            request(
+                &["pull_requests", "issues"],
+                final_read.cursor.as_deref(),
+                Some(final_read.facts),
+            ),
+            &base,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        assert!(items(&quiet.facts, "pull_requests").is_empty());
+        assert!(items(&quiet.facts, "issues").is_empty());
+        assert!(
+            !github
+                .take_requests()
+                .iter()
+                .any(|request| request.starts_with("POST"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transferred_identity_updates_its_original_number() {
+        let (github, base) = FakeGithub::start().await;
+        github.route("/repos/acme/garden", json!({"id": 7}));
+        github.route(
+            "/repos/acme/garden/issues?state=open&per_page=100",
+            json!([issue(
+                1,
+                "2026-09-10T00:00:00Z",
+                json!({"node_id": "I_orchid"})
+            )]),
+        );
+        github.open_pull_requests(json!([]));
+        github.resolved_nodes(json!([{"id": "I_orchid", "state": "OPEN", "number": 1,
+            "url": "https://github.com/acme/garden/issues/1"}]));
+        let first = observe_at(request(&["issues"], None, None), &base, Some("test"))
+            .await
+            .unwrap();
+        github.take_requests();
+        github.route("/repos/acme/garden/issues?state=all&sort=updated&direction=asc&since=2026-09-10T00:00:00Z&per_page=100", json!([]));
+        github.resolved_nodes(json!([{"id": "I_orchid", "state": "OPEN", "number": 77,
+            "url": "https://github.com/acme/greenhouse/issues/77"}]));
+        age_pull_request_check(&base, SETTLED_PULL_REQUEST_CHECK);
+        let moved = observe_at(
+            request(&["issues"], first.cursor.as_deref(), Some(first.facts)),
+            &base,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        let old = item(&moved.facts, "issues", 1);
+        assert_eq!(old["node_id"], "I_orchid");
+        assert_eq!(old["moved_to"], "resource/github/acme/greenhouse/issue/77");
+        assert_eq!(old["new"], false);
+        assert_eq!(
+            github
+                .take_requests()
+                .iter()
+                .filter(|request| request.starts_with("POST"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            RepositoryCursor::parse(moved.cursor.as_deref())
+                .identities
+                .len(),
+            1
+        );
+        github.resolved_nodes(
+            json!([{"id": "I_orchid", "state": "CLOSED", "stateReason": "COMPLETED", "number": 77,
+            "url": "https://github.com/acme/greenhouse/issues/77",
+            "timelineItems": {"nodes": [{"actor": {"login": "fern"}}]}}]),
+        );
+        age_pull_request_check(&base, SETTLED_PULL_REQUEST_CHECK);
+        let closed = observe_at(
+            request(&["issues"], moved.cursor.as_deref(), Some(moved.facts)),
+            &base,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(item(&closed.facts, "issues", 1)["state"], "closed");
+        assert_eq!(item(&closed.facts, "issues", 1)["closed_by"], "fern");
+        assert_eq!(
+            item(&closed.facts, "issues", 1)["moved_to"],
+            "resource/github/acme/greenhouse/issue/77"
+        );
+    }
+
+    #[tokio::test]
+    async fn remembered_identities_rotate_without_adding_detail_pages() {
+        let (github, base) = FakeGithub::start().await;
+        github.route("/repos/acme/garden", json!({"id": 7}));
+        let issues = (0..101)
+            .map(|number| {
+                issue(
+                    number + 1,
+                    "2026-09-10T00:00:00Z",
+                    json!({"node_id": format!("I_{number:03}")}),
+                )
+            })
+            .collect::<Vec<_>>();
+        github.route(
+            "/repos/acme/garden/issues?state=open&per_page=100",
+            json!(issues),
+        );
+        github.open_pull_requests(json!([]));
+        github.resolved_nodes(json!([]));
+        let first = observe_at(
+            request(&["pull_requests", "issues"], None, None),
+            &base,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        let first_query = github.graphql_requests.lock().unwrap()[0].clone();
+        assert_eq!(
+            first_query["variables"]["ids"].as_array().unwrap().len(),
+            100
+        );
+        assert_eq!(first_query["variables"]["ids"][0], "I_000");
+        assert_eq!(first_query["variables"]["ids"][99], "I_099");
+        assert_eq!(
+            github
+                .take_requests()
+                .iter()
+                .filter(|request| request.starts_with("POST"))
+                .count(),
+            1
+        );
+        github.route("/repos/acme/garden/issues?state=all&sort=updated&direction=asc&since=2026-09-10T00:00:00Z&per_page=100", json!([]));
+        age_pull_request_check(&base, SETTLED_PULL_REQUEST_CHECK);
+        observe_at(
+            request(
+                &["pull_requests", "issues"],
+                first.cursor.as_deref(),
+                Some(first.facts),
+            ),
+            &base,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        let next_query = github.graphql_requests.lock().unwrap()[1].clone();
+        assert_eq!(next_query["variables"]["ids"][0], "I_100");
+        assert_eq!(next_query["variables"]["ids"][1], "I_000");
+        assert_eq!(
+            github
+                .take_requests()
+                .iter()
+                .filter(|request| request.starts_with("POST"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_request_detail_lookup_uses_the_renamed_repository() {
+        let (github, base) = FakeGithub::start().await;
+        github.route(
+            "/repos/acme/garden",
+            json!({"id": 7, "node_id": "R_orchid", "full_name": "Acme/Greenhouse"}),
+        );
+        github.route(
+            "/repos/acme/garden/issues?state=open&per_page=100",
+            json!([issue(
+                2,
+                "2026-09-10T00:00:00Z",
+                json!({"node_id": "PR_orchid", "pull_request": {"merged_at": null},
+                "html_url": "https://github.com/acme/greenhouse/pull/2"})
+            )]),
+        );
+        let mut open = open_pull(2, "head", "SUCCESS");
+        open["id"] = json!("PR_orchid");
+        open["url"] = json!("https://github.com/acme/greenhouse/pull/2");
+        github.open_pull_requests(json!([open]));
+        let moved = observe_at(
+            request(&["pull_requests"], None, Some(json!({"repository_id": 7}))),
+            &base,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(moved.facts["moved_to"], "resource/github/acme/greenhouse");
+        assert_eq!(
+            item(&moved.facts, "pull_requests", 2)["moved_to"],
+            "resource/github/acme/greenhouse/pull-request/2"
+        );
+        let queries = github.graphql_requests.lock().unwrap();
+        assert_eq!(queries[0]["variables"]["owner"], "Acme");
+        assert_eq!(queries[0]["variables"]["name"], "Greenhouse");
+    }
+
+    #[tokio::test]
+    async fn a_repository_rename_keeps_identity_and_links_old_subjects() {
+        let (github, base) = FakeGithub::start().await;
+        github.route(
+            "/repos/acme/garden",
+            json!({"id": 7, "node_id": "R_orchid", "full_name": "Acme/Greenhouse"}),
+        );
+        github.route(
+            "/repos/acme/garden/issues?state=open&per_page=100",
+            json!([issue(
+                1,
+                "2026-09-10T00:00:00Z",
+                json!({"html_url": "https://github.com/acme/greenhouse/issues/1"})
+            )]),
+        );
+        let moved = observe_at(
+            request(&["issues"], None, Some(json!({"repository_id": 7}))),
+            &base,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(moved.facts["repository_id"], 7);
+        assert_eq!(moved.facts["node_id"], "R_orchid");
+        assert_eq!(moved.facts["moved_to"], "resource/github/acme/greenhouse");
+        assert_eq!(
+            item(&moved.facts, "issues", 1)["moved_to"],
+            "resource/github/acme/greenhouse/issue/1"
+        );
+        assert!(
+            !github
+                .take_requests()
+                .iter()
+                .any(|request| request.starts_with("POST"))
+        );
     }
 
     #[test]
@@ -1709,6 +2516,7 @@ mod tests {
             items_since: Some(since.into()),
             comments_since: Some(comments_since.into()),
             seen: BTreeMap::new(),
+            ..RepositoryCursor::default()
         })
         .unwrap();
         let observed = observe_at(
@@ -1804,6 +2612,7 @@ mod tests {
             items_since: Some(since.into()),
             comments_since: Some(since.into()),
             seen: BTreeMap::new(),
+            ..RepositoryCursor::default()
         })
         .unwrap();
         let observed = observe_at(

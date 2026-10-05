@@ -64,7 +64,11 @@ jobs:
         run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""
   linux-tests:
     name: warm-tests
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:
@@ -188,13 +192,13 @@ jobs:
             printf 'ST2_%s_COMPONENT=%s/share/st2/providers/st2_%s_component.component.wasm\n' "$provider" "$components" "$wasm" >> "$GITHUB_ENV"
           done
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
-      - name: Install matching rendered hooks
-        shell: bash
-        run: nix develop -c cargo run --locked -p st2 -- hooks install
-        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Build selected test targets first (no debug info)
         shell: bash
         run: nix develop -c bash scripts/ci-nextest run --no-run
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
+      - name: Install matching rendered hooks
+        shell: bash
+        run: nix develop -c bash scripts/ci-install-built-hooks
         if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Build missing cache contents
         shell: bash
@@ -242,7 +246,11 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   linux-clippy:
     name: warm-clippy
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:
@@ -398,7 +406,11 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   linux-fleet-compat:
     name: warm-fleet-compat
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:
@@ -554,7 +566,11 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   genie-freshness:
     name: warm-genie
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:
@@ -678,7 +694,11 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   isolation-vm:
     name: warm-isolation-vm
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:
@@ -834,7 +854,11 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   typescript-cache:
     name: warm-typescript
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -871,7 +895,11 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   perf-cost:
     name: perf-cost
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:

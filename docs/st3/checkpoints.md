@@ -356,3 +356,21 @@ blocked states older than that window, so trimming cannot reset `since`. Existin
 witnesses can retain other claims; the client read independently enforces its seven-day/200-item
 bound. Checkpoint tombstones make unprovable completeness explicit instead of treating deleted
 observations as evidence of continuity.
+
+Rules version 10 also treats native credential refusal and recovery as observed status
+transitions within the same seven-day / 200-transition cap. It preserves the beginning
+of the current credential episode and its latest native evidence fields, so trimming
+cannot clear a login refusal or reset its start time. Checkpoint participants must run
+matching rules before verifying a new certificate.
+
+During a rules-v9 to rules-v10 rollout, participants on different versions can seal
+identical inventories with different rules digests. They cannot verify that cut together,
+so checkpoint verification and trimming stall fleet-wide until all participants use v10.
+Replication and ordinary work continue; the mismatch does not authorize dropping data.
+Coordinate the participant upgrades before resuming checkpoint verification. Previously
+verified certificate terms stay unchanged.
+
+The first observation on upgrade can reset `since` once when the legacy snapshot has no
+`provider_auth` field and its successor explicitly records null. That is an evidence-shape
+change, not proof that a login succeeded or that a runtime restarted. Later unchanged
+observations preserve `since`; a held credential refusal persists until positive recovery.

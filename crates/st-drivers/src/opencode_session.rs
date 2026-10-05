@@ -544,7 +544,7 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
         while let Ok(event) = event_rx.try_recv() {
             match event {
                 SseMessage::Connected => {
-                    machine = EventMachine::default();
+                    machine.reseed_activity(EventMachine::default());
                     sse_connected = true;
                     session.diagnostics.clear(DiagnosticStage::Sse);
                     // Evidence turns on only once the level seed succeeds: resuming heartbeats
@@ -610,8 +610,15 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
         if evidence {
             session.delivery.confirm_pinned(&session.client);
         }
-        if evidence && let Some(observation) = machine.observation() {
-            let _ = session.writer.observe(observation);
+        if evidence && let Some(mut observation) = machine.observation() {
+            if machine.auth_edge {
+                session.writer.interrupt();
+            } else {
+                observation.provider_auth = None;
+            }
+            if session.writer.observe(observation).is_ok() {
+                machine.auth_edge = false;
+            }
         }
 
         let now = Instant::now();
@@ -1013,7 +1020,7 @@ fn seed_from_server(
             seeded.seed_ask(id.to_string(), kind);
         }
     }
-    *machine = seeded;
+    machine.reseed_activity(seeded);
     Ok(())
 }
 
@@ -1053,11 +1060,23 @@ struct EventMachine {
     poisoned: bool,
     /// Terminal reason, once observed.
     ended: Option<&'static str>,
+    provider_auth: Option<bool>,
+    auth_edge: bool,
+    auth_session: Option<String>,
     /// The most recent non-terminal session error, surfaced as the idle reason once.
     last_error: Option<String>,
 }
 
 impl EventMachine {
+    fn reseed_activity(&mut self, mut seeded: Self) {
+        // A reconnect replaces activity evidence, not the credential failure or its session.
+        // Otherwise an unrelated session's completion after reconnect could clear the refusal.
+        seeded.provider_auth = self.provider_auth;
+        seeded.auth_session = self.auth_session.clone();
+        seeded.auth_edge = self.auth_edge;
+        *self = seeded;
+    }
+
     fn seed_idle(&mut self) {
         self.seen_level = true;
     }
@@ -1131,13 +1150,35 @@ impl EventMachine {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
                 if name == "ProviderAuthError" {
+                    self.auth_session = session_id();
                     self.ended = Some("providerAuth");
+                    self.provider_auth = Some(false);
+                    self.auth_edge = true;
                 } else {
                     if let Some(session_id) = session_id() {
                         self.busy.remove(&session_id);
                     }
                     self.seen_level = true;
                     self.last_error = Some(format!("error:{name}"));
+                }
+            }
+            "message.updated" => {
+                let info = &properties["info"];
+                if info["role"] == "assistant"
+                    && info
+                        .pointer("/time/completed")
+                        .is_some_and(|v| !v.is_null())
+                    && info.get("error").is_none_or(Value::is_null)
+                    && self
+                        .auth_session
+                        .as_deref()
+                        .is_none_or(|session| info["sessionID"].as_str() == Some(session))
+                {
+                    self.provider_auth = Some(true);
+                    self.auth_edge = true;
+                    if self.ended == Some("providerAuth") {
+                        self.ended = None;
+                    }
                 }
             }
             "permission.asked" => {
@@ -1166,6 +1207,12 @@ impl EventMachine {
     }
 
     fn observation(&self) -> Option<Observation> {
+        let mut observation = self.activity_observation()?;
+        observation.provider_auth = self.provider_auth;
+        Some(observation)
+    }
+
+    fn activity_observation(&self) -> Option<Observation> {
         // A sticky terminal outranks poison: `ended` does not depend on the busy map the
         // unknown word made untrustworthy, and withholding it would lose the terminal to the
         // forced reseed's fresh machine.
@@ -2347,6 +2394,20 @@ mod tests {
         let ended = observed(&machine);
         assert_eq!(ended.state, Activity::Ended);
         assert_eq!(ended.reason.as_deref(), Some("providerAuth"));
+        assert_eq!(ended.provider_auth, Some(false));
+        machine.reseed_activity(EventMachine::default());
+        let mut seed = EventMachine::default();
+        seed.seed_idle();
+        machine.reseed_activity(seed);
+        machine.apply(&event(r#"{"type":"message.updated","properties":{"info":{"role":"assistant","sessionID":"ses_b","time":{"completed":1}}}}"#));
+        assert_eq!(observed(&machine).provider_auth, Some(false));
+        machine.apply(&event(
+            r#"{"type":"session.idle","properties":{"sessionID":"ses_a"}}"#,
+        ));
+        assert_eq!(observed(&machine).provider_auth, Some(false));
+        machine.apply(&event(r#"{"type":"message.updated","properties":{"info":{"role":"assistant","sessionID":"ses_a","time":{"completed":2}}}}"#));
+        assert_eq!(observed(&machine).provider_auth, Some(true));
+        assert_ne!(observed(&machine).state, Activity::Ended);
     }
 
     #[test]

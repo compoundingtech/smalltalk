@@ -10,7 +10,7 @@ harness's default login, exactly as before.
 
 ## Declare an account
 
-An `account` is a root declaration, applied like an agent: `st agents apply accounts.kdl --as person/ada`.
+An `account` is a root declaration, applied like an agent: `st apply accounts.kdl --as person/ada`.
 
 ```kdl
 version 2
@@ -117,7 +117,7 @@ a member restart in the durable graph and remains available to other members thr
 
 ## At the limit
 
-`[limits]` in the node's config stops an account's seats at its weekly percentage (README). With
+`[limits]` in the node's config stops an account's seats at its weekly percentage ([configuration below](#usage-totals-and-automatic-stops)). With
 accounts:
 
 - A seat bound to one account stops, as before.
@@ -172,3 +172,50 @@ seats on a particular account, under which namespace) still await smallclaims' c
 grants; its current rules match actor, kind and subject. Once those grants land, account use will
 use them in audit mode. Once sekrets holds model logins, an account will name the sekrets profile
 that holds its login instead of a directory.
+
+## Usage totals and automatic stops
+
+Token spend across the fleet is available by agent, mission, step, model, account, or host, with
+its API-equivalent cost: what the tokens would cost at the provider's list price, from a pricing
+table built into st. Tokens on a model the table does not price are counted as unpriced, and a
+cost that leaves them out ends in `+`. An account is a short digest of the harness's own login,
+never the login itself. The graph keeps hourly usage for about a week and each series' total
+after that; `[observations.otlp]` sends every response to OpenTelemetry for longer history. The
+period ends now:
+
+```sh
+st usage --hours 24
+st usage --hours 24 --by step
+st usage --hours 24 --by account
+```
+
+`st usage` also lists each account's 5-hour and weekly limits: the freshest reading any seat on
+that account reported, with when it was measured and when the weekly window resets.
+
+A node can stop an account's seats as the account nears its weekly limit. It is off until its
+config enables it:
+
+```toml
+person = "person/ada"
+
+[limits]
+enabled = true
+stop_at_weekly_percent = 95
+keep = ["agent/example/coordinator"]
+notify = "agent/example/operations"
+fresh = "1h"
+```
+
+When an account's freshest weekly reading, no older than `fresh`, reaches the percentage, each
+node stops the seats it hosts on that account, except those in `keep`, and the node that measured
+the reading sends one message to `notify`, naming the affected seats and the reset time. The
+operations agent groups alerts, acts on standing instructions, and asks a person through a
+structured request only when a decision is needed. Enabled policies require `notify` to name
+an agent; the legacy `ask` setting is accepted but never sends raw events to a person.
+Each seat is stopped once per weekly window: start it again and it stays up until the reset. Give
+every node that hosts seats the same `[limits]`.
+
+A person who owns more than one Claude or Codex account declares them and binds a seat to one or to
+a pool; a pooled seat at its limit restarts on another account instead of stopping, and `st usage`
+names each declared account. A seat that binds nothing runs on the
+harness's default login.

@@ -206,6 +206,27 @@ test('resource pages decode only through ResourcesPage, never the generic Page',
     assert.throws(() => Rich.decodeUnknownSync(Rich.Page)(page('resources')));
 });
 
+test('usage pricing provenance round-trips while legacy rows remain readable', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const counts = { total_tokens: 1100, input_tokens: 1000, output_tokens: 100,
+        cache_write_tokens: 0, cache_write_1h_tokens: 0, cached_tokens: 0,
+        cost_microusd: 3000, reported_cost_microusd: 0, unpriced_tokens: 0 };
+    const legacy = { agent: 'agent/example.usage', pricing: 'old-label', ...counts };
+    const decode = Rich.decodeUnknownSync(Rich.UsageRow, 'strict');
+    assert.deepEqual(Schema.encodeSync(Rich.UsageRow)(decode(legacy)), legacy);
+    const wire = { ...legacy, native_session_id: 'native-example', pricing_provenance: [{
+        price_table_id: 'st.api-list', price_table_version: 'example-version', cost_source: 'computed',
+        rates_usd_per_million_tokens: { input: 2, output: 10, cache_read: 0.1, cache_write_5m: 2.5, cache_write_1h: 2.5 },
+        ...counts,
+    }] };
+    assert.deepEqual(Schema.encodeSync(Rich.UsageRow)(decode(wire)), wire);
+    for (const cost_source of ['provider_reported', 'unpriced']) {
+        const value = { ...legacy, pricing_provenance: [{ cost_source, ...counts }] };
+        assert.deepEqual(Schema.encodeSync(Rich.UsageRow)(decode(value)), value);
+    }
+    assert.throws(() => decode({ ...wire, pricing_provenance: [{ ...wire.pricing_provenance[0], cost_source: 'invented' }] }));
+    assert.throws(() => decode({ ...wire, pricing_provenance: [{ ...wire.pricing_provenance[0], rates_usd_per_million_tokens: { input: 2 } }] }));
+});
 
 test('usage identity metadata is additive and independent of quota age', async () => {
     const [{ Schema }, Rich] = await modules;

@@ -33,6 +33,7 @@ use crate::resource::{
 };
 use crate::store::Store;
 
+mod channel_recovery;
 mod placement;
 
 /// The actor of every attention request the reconciler raises.
@@ -675,6 +676,9 @@ impl NativeRuntime {
                     )
                 }
             } else {
+                if let Some(guard) = guard {
+                    guard()?;
+                }
                 runtime.spawn(
                     &member.runtime_id,
                     &launch,
@@ -685,6 +689,9 @@ impl NativeRuntime {
                 )
             }
         } else {
+            if let Some(guard) = guard {
+                guard()?;
+            }
             self.exec
                 .spawn(&member.runtime_id, &launch, &cwd, &environment)
                 .map(|_| ())
@@ -2309,6 +2316,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 &suspension,
                             );
                         }
+                        if self.reconcile_claude_channel_recovery(
+                            subject,
+                            member,
+                            observed.as_ref(),
+                            blocked.as_ref(),
+                            now_ms(),
+                        )? {
+                            return Ok(());
+                        }
                         if self.reconcile_requested_restart(
                             subject,
                             member,
@@ -2355,7 +2371,22 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     )?;
                                     return Ok(());
                                 }
-                                self.reconcile_blocking_screen(subject, member, &observation)?;
+                                let screen = member
+                                    .terminal
+                                    .then(|| self.member_screen(&member.runtime_id).ok())
+                                    .flatten();
+                                self.reconcile_harness_authentication(
+                                    subject,
+                                    member,
+                                    &observation,
+                                    screen.as_deref(),
+                                )?;
+                                self.reconcile_blocking_screen(
+                                    subject,
+                                    member,
+                                    &observation,
+                                    screen.as_deref(),
+                                )?;
                                 self.reconcile_claude_trust_screen(
                                     subject,
                                     member,
@@ -2918,9 +2949,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .current_harness(&subject.subject)?
             .is_some_and(|harness| harness.incarnation_id == incarnation && harness.is_ready());
         if harness_ready {
-            if driver == "claude" {
-                self.resolve_superseded_claude_auth_attention(&subject.subject, incarnation)?;
-            }
+            self.resolve_superseded_harness_auth_attention(&subject.subject, incarnation)?;
             self.resolve_recovered_seat_attention(&subject.subject, incarnation)?;
             self.resolve_pending_alert(
                 &attention_key,
@@ -2934,7 +2963,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             .current_harness(&subject.subject)?
             .is_some_and(|harness| {
                 harness.incarnation_id == incarnation
-                    && matches!(harness.state.as_str(), "unauthenticated" | "blocked")
+                    && matches!(
+                        harness.state.as_str(),
+                        "unauthenticated" | "needs-login" | "blocked"
+                    )
             })
         {
             return Ok(());
@@ -3029,7 +3061,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    fn resolve_superseded_claude_auth_attention(
+    fn resolve_superseded_harness_auth_attention(
         &self,
         subject: &str,
         current_incarnation: &str,
@@ -3051,8 +3083,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 continue;
             }
             self.resolve_pending_alert(
-                &format!("claude-auth-expired:{subject}:{old_incarnation}"),
-                "a new Claude runtime incarnation became ready",
+                claim.body["fields"]["auth_attention_key"]
+                    .as_str()
+                    .unwrap_or(&format!("claude-auth-expired:{subject}:{old_incarnation}")),
+                "a new runtime incarnation became ready",
             )?;
         }
         Ok(())
@@ -3122,6 +3156,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         subject: &DesiredSubject,
         member: &MemberSpec,
         observation: &RuntimeObservation,
+        screen: Option<&str>,
     ) -> Result<()> {
         if subject.kind != "agent" || !member.terminal {
             return Ok(());
@@ -3132,24 +3167,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         ) else {
             return Ok(());
         };
-        let Ok(screen) = self.member_screen(&member.runtime_id) else {
+        let Some(screen) = screen else {
             return Ok(());
         };
-        let matched = st_drivers::blocking_screen::detect(driver, &screen);
-        for (code, restored, prefix, condition) in [
-            (
-                "provider-auth-expired",
-                "provider-auth-restored",
-                "claude-auth-expired",
-                "provider-auth",
-            ),
-            (
-                "provider-update-prompt",
-                "provider-update-restored",
-                "provider-update-prompt",
-                "provider-update",
-            ),
-        ] {
+        let matched = st_drivers::blocking_screen::detect(driver, screen);
+        for (code, restored, prefix, condition) in [(
+            "provider-update-prompt",
+            "provider-update-restored",
+            "provider-update-prompt",
+            "provider-update",
+        )] {
             // Retain Claude's original episode keys, including repeated prompts after a lift.
             let mut fence = None;
             let mut key = format!("{prefix}:{}:{incarnation}", subject.subject);
@@ -3200,7 +3227,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             {
                 continue;
             }
-            let login = code == "provider-auth-expired";
             self.store.append_claim(&ClaimInput {
                 subject: subject.subject.clone(),
                 kind: "harness.diagnostic".into(),
@@ -3208,10 +3234,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 fields: BTreeMap::from([
                     ("code".into(), Value::String(code.into())),
                     ("severity".into(), Value::String("error".into())),
-                    (
-                        "status".into(),
-                        Value::String(if login { "unauthenticated" } else { "blocked" }.into()),
-                    ),
+                    ("status".into(), Value::String("blocked".into())),
                     ("driver".into(), Value::String(driver.into())),
                     ("reason".into(), Value::String(current.text.clone())),
                     ("matched_line".into(), Value::String(current.text.clone())),
@@ -3240,15 +3263,24 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .and_then(|(_, actor)| actor)
                 .filter(|actor| actor.starts_with("person/")))
             .unwrap_or_else(|| "person/alex".into());
-            self.store.record_runtime_failure(&attention_subject, &AttentionRequest {
-                reviewer,
-                title: if login { format!("{driver} needs login") } else { format!("{driver} update menu needs a response") },
-                reason: format!("{}: {}. {}", subject.subject, current.text,
-                    if login { "Log in in this seat's terminal; work resumes when the prompt clears" }
-                    else { "The update menu holds work; choose how to proceed in this seat's terminal" }),
-                severity: "error".into(), targets: vec![subject.subject.clone()],
-                actor: RECONCILER_ACTOR.into(), idempotency_key: format!("{key}:attention"),
-            }, condition)?;
+            self.store.record_runtime_failure(
+                &attention_subject,
+                &AttentionRequest {
+                    reviewer,
+                    title: format!("{driver} update menu needs a response"),
+                    reason: format!(
+                        "{}: {}. {}",
+                        subject.subject,
+                        current.text,
+                        "The update menu holds work; choose how to proceed in this seat's terminal"
+                    ),
+                    severity: "error".into(),
+                    targets: vec![subject.subject.clone()],
+                    actor: RECONCILER_ACTOR.into(),
+                    idempotency_key: format!("{key}:attention"),
+                },
+                condition,
+            )?;
             self.resolve_pending_alert(
                 &format!("harness-readiness:{}:{incarnation}", subject.subject),
                 "the terminal screen identifies the startup blocker",
@@ -3256,6 +3288,160 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.signal_changed();
         }
         Ok(())
+    }
+
+    fn reconcile_harness_authentication(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: &RuntimeObservation,
+        screen: Option<&str>,
+    ) -> Result<()> {
+        if subject.kind != "agent" {
+            return Ok(());
+        }
+        let Some(incarnation) = observation.incarnation_id.as_deref() else {
+            return Ok(());
+        };
+        let driver = member.driver.as_deref().unwrap_or("unknown");
+        let auth = self
+            .store
+            .harness_auth_evidence(&subject.subject, incarnation)?;
+        let auth_accepted = auth.as_ref().and_then(|v| v["provider_auth"].as_bool());
+        let auth_sequence = auth
+            .as_ref()
+            .and_then(|v| v["provider_auth_sequence"].as_u64())
+            .unwrap_or(0);
+        let auth_owner = auth
+            .as_ref()
+            .and_then(|v| v["ownership_sequence"].as_u64())
+            .unwrap_or(0);
+        let matched_line = if member.terminal {
+            screen.and_then(|screen| {
+                let matched = st_drivers::blocking_screen::detect(driver, screen)?;
+                if matched.code != "provider-auth-expired" {
+                    return None;
+                }
+                // A successful native turn supersedes an old standalone reply in scrollback.
+                let reply = matched.text.trim_start_matches(['●', '⎿']).trim();
+                if auth_accepted == Some(true)
+                    && st_drivers::claude_session::claude_login_reply(reply)
+                {
+                    None
+                } else {
+                    Some(matched.text)
+                }
+            })
+        } else {
+            None
+        };
+        let (fence, key) = self.harness_auth_fence(&subject.subject, incarnation)?;
+        if let Some(fence) = fence {
+            let prior = self.store.claim_by_id(&fence)?;
+            let prior_sequence = prior
+                .as_ref()
+                .and_then(|claim| claim.body["fields"]["provider_auth_sequence"].as_u64())
+                .unwrap_or(0);
+            let prior_owner = prior
+                .as_ref()
+                .and_then(|claim| claim.body["fields"]["ownership_sequence"].as_u64())
+                .unwrap_or(0);
+            // Losing a screen line or seeing ordinary activity is not authentication proof.
+            if auth_accepted == Some(true)
+                && (auth_owner, auth_sequence) > (prior_owner, prior_sequence)
+            {
+                self.store.append_claim(&ClaimInput {
+                    subject: subject.subject.clone(),
+                    kind: "harness.diagnostic".into(),
+                    actor: Some(subject.subject.clone()),
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("authenticated".into())),
+                        (
+                            "code".into(),
+                            Value::String("provider-auth-restored".into()),
+                        ),
+                        (
+                            "reason".into(),
+                            Value::String(
+                                "A successful authenticated turn restored this harness".into(),
+                            ),
+                        ),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: vec![fence],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("{key}:restored")),
+                })?;
+                self.resolve_pending_alert(
+                    &key,
+                    "a successful authenticated turn restored this harness",
+                )?;
+                self.signal_changed();
+            } else {
+                self.ensure_login_fallback_fault(subject, &key)?;
+            }
+            return Ok(());
+        }
+        if auth_accepted != Some(false) && matched_line.is_none() {
+            return Ok(());
+        }
+        self.store.append_claim(&ClaimInput {
+            subject: subject.subject.clone(),
+            kind: "harness.diagnostic".into(),
+            actor: Some(subject.subject.clone()),
+            fields: BTreeMap::from([
+                ("severity".into(), Value::String("error".into())),
+                ("status".into(), Value::String("needs-login".into())),
+                ("code".into(), Value::String("provider-auth-expired".into())),
+                (
+                    "reason".into(),
+                    Value::String(format!(
+                        "{driver} reports missing or expired authentication"
+                    )),
+                ),
+                ("driver".into(), Value::String(driver.into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+                ("provider_auth_sequence".into(), Value::from(auth_sequence)),
+                ("ownership_sequence".into(), Value::from(auth_owner)),
+                ("auth_attention_key".into(), Value::String(key.clone())),
+                (
+                    "matched_line".into(),
+                    matched_line.map(Value::String).unwrap_or(Value::Null),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(key.clone()),
+        })?;
+        self.ensure_login_fallback_fault(subject, &key)?;
+        self.signal_changed();
+        Ok(())
+    }
+
+    fn ensure_login_fallback_fault(&self, subject: &DesiredSubject, key: &str) -> Result<()> {
+        if self.store.agent_person(&subject.subject)?.is_some() {
+            return Ok(());
+        }
+        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        self.store.record_runtime_failure(&format!("attention/{}", &digest[..32]), &AttentionRequest {
+            reviewer: subject.subject.clone(), title: "Harness needs login; person ownership is unresolved".into(),
+            reason: format!("{} needs login. Resolve its account/person ownership and attach to authenticate this harness.", subject.subject),
+            severity: "error".into(), targets: vec![subject.subject.clone()], actor: RECONCILER_ACTOR.into(),
+            idempotency_key: format!("{key}:attention"),
+        }, "provider-auth")?;
+        Ok(())
+    }
+
+    /// The login fence of one harness incarnation: the claim that fences it, if it is fenced now,
+    /// and the key of that fence, or of the next one. A fence lifted once can fence the same
+    /// incarnation again, so a fence after a lift is keyed by that lift.
+    fn harness_auth_fence(
+        &self,
+        subject: &str,
+        incarnation: &str,
+    ) -> Result<(Option<String>, String)> {
+        let (claim, key) = self.store.harness_login_episode_key(subject, incarnation)?;
+        Ok((claim.map(|claim| claim.id), key))
     }
 
     /// Claude's workspace trust prompt appears before any hook or channel can report the session,
@@ -4599,22 +4785,44 @@ impl<R: RuntimeControl> Reconciler<R> {
         member: &MemberSpec,
         reason: &str,
     ) -> Result<()> {
+        self.perform_start_for_request(subject, member, reason, None)?;
+        Ok(())
+    }
+
+    /// A person can spend one explicit retry despite an automatic failed-start hold. The
+    /// ordinary launch path, native-session selection and provider admission remain shared.
+    fn perform_start_for_request(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        reason: &str,
+        request: Option<&crate::model::ClaimRecord>,
+    ) -> Result<bool> {
         self.store.owned_desired_guard(subject)?;
+        let explicit_person = request.is_some_and(|request| {
+            request
+                .actor
+                .as_deref()
+                .is_some_and(|actor| actor.starts_with("person/"))
+        });
         let placement_evidence = if subject.kind == "agent" {
             let Some(evidence) = self.placement_start_evidence(&subject.subject)? else {
-                return Ok(());
+                return Ok(false);
             };
             evidence
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
         // A member whose start keeps failing waits between attempts and then parks with one
         // attention request, instead of spawning again on every pass. A gate runner fails its gate.
-        if matches!(subject.kind.as_str(), "agent" | "exec" | "pty")
+        if !explicit_person
+            && matches!(subject.kind.as_str(), "agent" | "exec" | "pty")
             && member.driver.as_deref() != Some("codex")
             && self.defer_or_park_failed_start(subject)?
         {
-            return Ok(());
+            return Ok(false);
         }
-        if member.driver.as_deref() == Some("codex") {
+        if !explicit_person && member.driver.as_deref() == Some("codex") {
             let token = self.launch_token(&subject.subject)?;
             if self.codex_crash_loop_raised(&subject.subject, &token)? {
                 self.raise_codex_crash_loop(
@@ -4622,7 +4830,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     &token,
                     "the prior Codex crash loop remains stopped",
                 )?;
-                return Ok(());
+                return Ok(false);
             }
             let recent_failures = self
                 .store
@@ -4650,7 +4858,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     &token,
                     &format!("Codex failed to launch three times: {detail}"),
                 )?;
-                return Ok(());
+                return Ok(false);
             }
         }
         let workspace = Path::new(&member.workspace);
@@ -4808,6 +5016,13 @@ impl<R: RuntimeControl> Reconciler<R> {
         let desired_token = self.launch_token(&subject.subject)?;
         let guard = || -> Result<()> {
             self.store.owned_desired_guard(subject)?;
+            if let Some(request) = request {
+                anyhow::ensure!(
+                    self.store.selected_desired_token(&subject.subject)?.as_deref()
+                        == request.body.pointer("/evidence/0").and_then(Value::as_str),
+                    "the explicit restart declaration changed before launch"
+                );
+            }
             if let Some(operation) = member.environment.get(crate::rollout::OPERATION_ENV) {
                 anyhow::ensure!(
                     self.store
@@ -4818,6 +5033,27 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             Ok(())
         };
+        if let Some(request) = request {
+            // Persist before the side effect. An interrupted attempt is never launched twice,
+            // including when the owner daemon loses its in-memory state between passes.
+            guard()?;
+            let (_, appended) = self.store.append_claim_outcome(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "runtime.action.requested".into(),
+                // Actor-bound control receipts survive checkpoint trimming.
+                actor: request.actor.clone(),
+                fields: BTreeMap::from([
+                    ("action".into(), Value::String("start".into())),
+                    ("reason".into(), Value::String(reason.into())),
+                ]),
+                evidence: vec![request.id.clone()],
+                expected_subject: None,
+                idempotency_key: Some(format!("agent-restart-attempt:{}", request.id)),
+            })?;
+            if !appended {
+                return Ok(false);
+            }
+        }
         if let Err(error) = self.runtime.start_guarded(&launch_member, &guard) {
             let reason = error.to_string();
             let prior_failures = self.start_failures(&subject.subject, &desired_token)?;
@@ -4893,7 +5129,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             ]),
         )?;
         self.signal_changed();
-        Ok(())
+        Ok(true)
     }
 
     /// Point a seat whose harness block binds an account (or a pool) at that account's login
@@ -5409,9 +5645,22 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(false);
         }
         let completion = format!("agent-restart-completed:{}", request.id);
-        if self.store.operation_claim(&completion)?.is_some() {
+        if let Some(result) = self.store.operation_claim(&completion)? {
+            if result.kind == "runtime.action.failed" {
+                // Keep the completed failure in the existing agents fault projection until a
+                // newer request or declaration supersedes it; an automatic pass is no retry.
+                anyhow::bail!(
+                    "{}",
+                    result.body["fields"]["reason"]
+                        .as_str()
+                        .unwrap_or("the explicit restart failed and the seat is parked")
+                );
+            }
             return Ok(false);
         }
+        let attempted = self
+            .store
+            .operation_claim(&format!("agent-restart-attempt:{}", request.id))?;
         let previous = request.body["fields"]["incarnation_id"]
             .as_str()
             .unwrap_or("");
@@ -5422,12 +5671,67 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .as_deref()
                 .is_some_and(|value| value != previous)
         {
+            // A launcher can succeed while its wrapper immediately refuses the provider (for
+            // example, the version gate). Observe that replacement before completing restart.
+            if attempted.is_some()
+                && matches!(
+                    observation.status.as_str(),
+                    "exited" | "vanished" | "stopped"
+                )
+            {
+                self.record_member(subject, observation, false)?;
+                let detail = if member.terminal {
+                    self.runtime.screen(&member.runtime_id).ok()
+                } else {
+                    self.runtime
+                        .read_exec_log(&member.runtime_id)
+                        .ok()
+                        .flatten()
+                }
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| text.chars().take(2048).collect::<String>())
+                .unwrap_or_else(|| {
+                    let exit = observation
+                        .exit_code
+                        .map(|code| format!(" (exit code {code})"))
+                        .unwrap_or_default();
+                    format!(
+                        "the replacement {} before restart completed{exit}",
+                        observation.status
+                    )
+                });
+                return self.fail_requested_restart(subject, member, &request, &detail);
+            }
+            if attempted.is_some()
+                && member.driver.is_some()
+                && (!self
+                    .store
+                    .current_harness(&subject.subject)?
+                    .is_some_and(|harness| {
+                        Some(harness.incarnation_id.as_str())
+                            == observation.incarnation_id.as_deref()
+                            && harness.is_ready()
+                    })
+                    || (request.body["fields"]["operation"] == "claude-channel-recovery"
+                        && !self.store.claude_channel_attached(
+                            &subject.subject,
+                            observation.incarnation_id.as_deref().unwrap(),
+                        )?))
+            {
+                // Continue ordinary observation and prompt handling while the new wrapper boots.
+                // Launch acceptance alone cannot prove the native provider passed its gate.
+                return Ok(false);
+            }
             self.store.append_claim(&ClaimInput {
                 subject: subject.subject.clone(),
                 kind: "runtime.action.succeeded".into(),
                 actor: request.actor.clone(),
                 fields: BTreeMap::from([
                     ("action".into(), Value::String("restart".into())),
+                    (
+                        "reason".into(),
+                        Value::String("the replacement incarnation was observed".into()),
+                    ),
                     (
                         "incarnation_id".into(),
                         Value::String(observation.incarnation_id.clone().unwrap()),
@@ -5443,7 +5747,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         if let Some(observation) = observation.filter(|item| item.status == "running") {
             // Rendering must succeed before we shut down a still-running seat.
             if let Some(error) = blocked {
-                anyhow::bail!("restart blocked: {error:#}");
+                return self.fail_requested_restart(
+                    subject,
+                    member,
+                    &request,
+                    &format!("restart blocked: {error:#}"),
+                );
             }
             self.record_member(subject, observation, true)?;
             self.reconcile_runtime_stop(
@@ -5462,30 +5771,99 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(true);
         }
         if let Some(error) = blocked {
-            anyhow::bail!("restart blocked: {error:#}");
+            return self.fail_requested_restart(
+                subject,
+                member,
+                &request,
+                &format!("restart blocked: {error:#}"),
+            );
         }
-        let before = self
+        if attempted.is_some() {
+            return self.fail_requested_restart(
+                subject,
+                member,
+                &request,
+                "the explicit launch attempt was interrupted before its result was recorded",
+            );
+        }
+        match self.perform_start_for_request(
+            subject,
+            member,
+            "an explicit seat restart was requested",
+            Some(&request),
+        ) {
+            Ok(false) => return Ok(true), // Placement or an automatic hold still defers this start.
+            Err(error) => {
+                return self.fail_requested_restart(
+                    subject,
+                    member,
+                    &request,
+                    &format!("{error:#}"),
+                );
+            }
+            Ok(true) => {}
+        }
+        // A subsequent runtime observation completes the request. This also catches wrappers
+        // that exit at startup after the physical launcher accepted the attempt.
+        self.signal_changed();
+        Ok(true)
+    }
+
+    fn fail_requested_restart(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        request: &crate::model::ClaimRecord,
+        detail: &str,
+    ) -> Result<bool> {
+        // Capture the launch lineage before checking the request's fence. A concurrent
+        // declaration change must never make this old failure park a replacement declaration.
+        let token = self.launch_token(&subject.subject)?;
+        let current = self
             .store
-            .latest_observation(&subject.subject, "runtime.action.succeeded")?
-            .map(|claim| claim.id);
-        self.perform_start(subject, member, "an explicit seat restart was requested")?;
-        let after = self
-            .store
-            .latest_observation(&subject.subject, "runtime.action.succeeded")?
-            .map(|claim| claim.id);
-        if after != before {
+            .selected_desired_token(&subject.subject)?
+            .as_deref()
+            == request.body.pointer("/evidence/0").and_then(Value::as_str);
+        let reason = if current {
+            format!("the explicit restart failed and the seat is parked again: {detail}")
+        } else {
+            format!("the explicit restart was superseded by a declaration change: {detail}")
+        };
+        let park = if member.driver.as_deref() == Some("codex") {
+            "codex-crash-loop"
+        } else {
+            "runtime-crash-loop"
+        };
+        if current {
             self.store.append_claim(&ClaimInput {
                 subject: subject.subject.clone(),
-                kind: "runtime.action.succeeded".into(),
-                actor: request.actor.clone(),
-                fields: BTreeMap::from([("action".into(), Value::String("restart".into()))]),
-                evidence: vec![request.id],
+                kind: "runtime.reconcile-decision".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("decision".into(), Value::String("raise".into())),
+                    ("reachability".into(), Value::String("unreachable".into())),
+                    ("key".into(), Value::String(format!("{park}:{token}"))),
+                    ("reason".into(), Value::String(reason.clone())),
+                ]),
+                evidence: vec![request.id.clone()],
                 expected_subject: None,
-                idempotency_key: Some(completion),
+                idempotency_key: Some(format!("agent-restart-parked:{}", request.id)),
             })?;
-            self.signal_changed();
         }
-        Ok(true)
+        self.store.append_claim(&ClaimInput {
+            subject: subject.subject.clone(),
+            kind: "runtime.action.failed".into(),
+            actor: request.actor.clone(),
+            fields: BTreeMap::from([
+                ("action".into(), Value::String("restart".into())),
+                ("reason".into(), Value::String(reason.clone())),
+            ]),
+            evidence: vec![request.id.clone()],
+            expected_subject: None,
+            idempotency_key: Some(format!("agent-restart-completed:{}", request.id)),
+        })?;
+        self.signal_changed();
+        anyhow::bail!("{reason}")
     }
 
     fn reconcile_restart(
@@ -6581,7 +6959,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             };
             // One step that fails records a fault on that step. The run's other steps and its
             // status are still evaluated.
-            changed |= self
+            let step_changed = self
                 .isolate("step", &view.subject, || -> Result<bool> {
                     let mut changed = false;
                     let eligible_phase = ((run.phase == "normal"
@@ -6898,8 +7276,36 @@ impl<R: RuntimeControl> Reconciler<R> {
                             .set_step_state(&view.subject, "completed", None)?;
                     }
                     Ok(changed)
+                });
+            changed |= step_changed.unwrap_or(false);
+            // Finally work gets its ordinary evaluation first, including starting its gates
+            // and declarations. Once it only waits on evidence, cancellation must not hold
+            // the mission's active-run slot until the step's execution budget expires.
+            if step_changed == Some(false)
+                && run.phase == "final-cancelled"
+                && view.agentless
+                && view.status == "working"
+                && step.spec.nested_mission.as_ref().is_none_or(|nested| {
+                    let prefix = format!("{}/{}/", step.spec.path, nested.id);
+                    views
+                        .iter()
+                        .filter(|(path, _)| path.starts_with(&prefix))
+                        .all(|(_, child)| {
+                            matches!(child.status.as_str(), "completed" | "failed" | "cancelled")
+                        })
                 })
-                .unwrap_or(false);
+                && ((step.spec.uses_mission.is_none() && step.spec.loop_spec.is_none())
+                    || !self.store.step_has_active_child_runs(&view.subject)?)
+                && !self.step_has_live_process(&view.subject)?
+            {
+                changed |= self.store.set_step_state(
+                    &view.subject,
+                    "cancelled",
+                    Some(
+                        "the mission run was cancelled and this agentless step has no live process",
+                    ),
+                )?;
+            }
         }
         if run.phase == "normal" {
             let refreshed = self
@@ -7394,11 +7800,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ]),
             )?;
         }
-        let first_execution = self.loop_first_execution_at(run, view)?;
-        let timed_out = loop_spec.timeout_ms.is_some_and(|timeout| {
-            first_execution
+        let timed_out = if let Some(timeout) = loop_spec.timeout_ms {
+            self.loop_first_execution_at(run, view)?
                 .is_some_and(|started| now_ms().saturating_sub(started) >= timeout as u128)
-        });
+        } else {
+            false
+        };
         if timed_out {
             return self.finish_exhausted_loop(
                 run,
@@ -8883,29 +9290,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .root_mission_run
             .strip_prefix("mission-run/")
             .unwrap_or(&run.root_mission_run);
-        let mut started = None;
-        for child in self
-            .store
-            .mission_runs_for_root(root)?
-            .into_iter()
-            .filter(|child| child.parent_step_run.as_deref() == Some(view.subject.as_str()))
-        {
-            let has_claimable_work = child.steps.iter().any(|step| !step.agentless);
-            if !has_claimable_work {
-                started = Some(started.map_or(child.created_at_unix_ms, |current: u128| {
-                    current.min(child.created_at_unix_ms)
-                }));
-                continue;
-            }
-            for step in &child.steps {
-                for claim in self.store.claims_for(&step.subject, Some("work.claimed"))? {
-                    started = Some(started.map_or(claim.accepted_at_unix_ms, |current: u128| {
-                        current.min(claim.accepted_at_unix_ms)
-                    }));
-                }
-            }
-        }
-        Ok(started)
+        self.store.loop_first_execution_at(root, &view.subject)
     }
 
     fn loop_child_timed_out_without_claim(&self, child: &MissionRunView) -> Result<bool> {
@@ -9756,6 +10141,69 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         Ok(())
+    }
+
+    fn step_has_live_process(&self, step_subject: &str) -> Result<bool> {
+        for subject in self.store.desired_subjects_for_owner_step(step_subject)? {
+            let Some(member) = subject.member.as_ref() else {
+                continue;
+            };
+            if self.owned_process_is_live(
+                &subject.subject,
+                &member.host,
+                &member.runtime_id,
+                member.terminal,
+            )? {
+                return Ok(true);
+            }
+        }
+        for runner in self.store.mission_gate_runners()? {
+            if runner.owner_step.as_deref() == Some(step_subject)
+                && self.owned_process_is_live(
+                    &runner.subject,
+                    &runner.host,
+                    &runner.subject.replace('/', "."),
+                    false,
+                )?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn owned_process_is_live(
+        &self,
+        subject: &str,
+        host: &str,
+        runtime_id: &str,
+        terminal: bool,
+    ) -> Result<bool> {
+        let actual = self.store.latest_actual_value(subject)?;
+        if host != self.host {
+            // Missing remote observations are not proof that a process has stopped.
+            return Ok(!actual.is_some_and(|actual| {
+                matches!(
+                    actual_field(&actual, "status").and_then(Value::as_str),
+                    Some("stopped" | "absent" | "exited" | "vanished")
+                )
+            }));
+        }
+        let observation = if terminal {
+            self.runtime
+                .snapshot_ptys()?
+                .into_iter()
+                .find(|item| item.runtime_id == runtime_id)
+        } else {
+            smallclaims::touched::note_read(|| format!("exec:{runtime_id}"));
+            self.runtime.observe_exec(runtime_id)?
+        };
+        Ok(observation.is_some_and(|item| {
+            !matches!(
+                item.status.as_str(),
+                "stopped" | "absent" | "exited" | "vanished"
+            )
+        }))
     }
 
     fn step_declarations_hold(&self, step_subject: &str) -> Result<bool> {
@@ -14743,6 +15191,7 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    mod channel_recovery;
     mod differential;
     mod incremental_deadlines;
     mod rollout_tests;
@@ -24292,6 +24741,66 @@ mission "loop" state="ready" {
     }
 
     #[test]
+    fn an_untimed_loop_does_not_read_the_root_execution_history() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"version 2
+mission "untimed-clock" state="ready" {
+  goal "Wait for a round without a loop timeout."
+  loop "improve" {
+    max-rounds 2
+    round {
+      completion { when "all-steps-exhausted" }
+      step "work" { assigned-to "agent/worker" }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "untimed-clock-source");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "untimed-clock".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "untimed-clock-run".into(),
+            })
+            .unwrap();
+        let mission = store
+            .mission_spec("untimed-clock", Some(&run.revision))
+            .unwrap()
+            .unwrap();
+        let steps = flatten_mission_steps(&mission);
+        let step = &steps[0];
+        let view = &run.steps[0];
+        let loop_spec = step.spec.loop_spec.as_ref().unwrap();
+        assert!(loop_spec.timeout_ms.is_none());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        assert!(
+            reconciler
+                .evaluate_loop_step(&run, step, view, loop_spec)
+                .unwrap()
+        );
+        let (changed, reads) = smallclaims::touched::record(|| {
+            reconciler
+                .evaluate_loop_step(&run, step, view, loop_spec)
+                .unwrap()
+        });
+        assert!(!changed);
+        assert!(
+            !reads.contains(&format!("children:{}", run.root_mission_run))
+                && !reads.contains(&format!("children-of-step:{}", view.subject)),
+            "an untimed loop must not load the root's round history: {reads:?}"
+        );
+    }
+
+    #[test]
     fn an_unclaimed_timed_out_round_is_redispatched_without_spending_a_round() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
@@ -24928,6 +25437,176 @@ mission "alert-exhaustion" state="ready" {
         );
     }
 
+    fn diagnostic(store: &Store, subject: &str, code: &str, reason: &str) {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("code".into(), Value::String(code.into())),
+                    ("reason".into(), Value::String(reason.into())),
+                    ("severity".into(), Value::String("error".into())),
+                    ("status".into(), Value::String("failed".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("diagnostic:{subject}:{code}")),
+            })
+            .unwrap();
+    }
+
+    /// A seat that is declared and that nothing ever observed leaves no record of failing, so
+    /// after ten minutes it becomes a fault for the fleet's fault agent, with the driver's last
+    /// word if it said any, and the fault ends with the first observation.
+    #[test]
+    fn a_seat_that_never_starts_becomes_a_fault_after_ten_minutes() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+agent "node.ops" { workspace "/tmp"; command "true"; handles-faults }
+agent "node.lonely" { workspace "/tmp"; command "true" }
+"#,
+            "unstarted-seats",
+        );
+        let faults = |after_minutes: u128| {
+            store
+                .fault_snapshot(now_ms() + after_minutes * 60_000)
+                .unwrap()
+                .into_iter()
+                .filter(|fault| fault.item.title == "An agent seat has not started")
+                .map(|fault| (fault.item.subject.clone(), fault))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert!(faults(9).is_empty(), "nine minutes is not yet a fault");
+        let lonely = "agent/node.lonely";
+        let fault = faults(11)
+            .remove(lonely)
+            .expect("no fault after ten minutes");
+        assert_eq!(fault.owner.as_deref(), Some("agent/node.ops"));
+        assert!(
+            fault.item.detail.contains("still `desired`"),
+            "{}",
+            fault.item.detail
+        );
+        assert!(
+            fault.item.detail.contains("has left no diagnostic"),
+            "{}",
+            fault.item.detail
+        );
+        assert_eq!(fault.item.actions[0].argv, ["st", "agents", "show", lonely]);
+        // The driver's last word travels with the fault.
+        diagnostic(
+            &store,
+            lonely,
+            "codex-driver-failed",
+            "Codex control failed while the TUI was live: waiting for the daemon mailbox replay",
+        );
+        let fault = faults(11).remove(lonely).unwrap();
+        assert!(
+            fault
+                .item
+                .detail
+                .contains("codex-driver-failed: Codex control failed while the TUI was live"),
+            "{}",
+            fault.item.detail
+        );
+        // The faults go to an agent, never to a person's now.
+        assert!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .is_empty()
+        );
+        // The first runtime observation ends it, whatever it says.
+        store
+            .append_claim(&ClaimInput {
+                subject: lonely.into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("starting".into())),
+                    ("runtime_id".into(), Value::String("node.lonely".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("lonely-starting".into()),
+            })
+            .unwrap();
+        assert!(faults(11).remove(lonely).is_none());
+    }
+
+    /// A parked seat is already a fault; it now carries what its driver last said, which is the
+    /// first thing anyone asks.
+    #[test]
+    fn a_parked_seat_fault_carries_the_drivers_last_diagnostic() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+agent "node.ops" { workspace "/tmp"; command "true"; handles-faults }
+agent "node.parked" { workspace "/tmp"; command "true" }
+"#,
+            "parked-seat",
+        );
+        let parked = "agent/node.parked";
+        let token = store.selected_desired_token(parked).unwrap().unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: parked.into(),
+                kind: "runtime.reconcile-decision".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("decision".into(), Value::String("raise".into())),
+                    (
+                        "key".into(),
+                        Value::String(format!("runtime-crash-loop:{token}")),
+                    ),
+                    (
+                        "reason".into(),
+                        Value::String("the runtime failed three times in a row".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("parked-decision".into()),
+            })
+            .unwrap();
+        let find = || {
+            store
+                .fault_snapshot(now_ms())
+                .unwrap()
+                .into_iter()
+                .find(|fault| {
+                    fault.item.title == "An agent stopped after repeated runtime failures"
+                })
+                .expect("a parked seat is not a fault")
+        };
+        let before = find();
+        assert_eq!(before.owner.as_deref(), Some("agent/node.ops"));
+        assert!(
+            !before.item.detail.contains("last diagnostic"),
+            "{}",
+            before.item.detail
+        );
+        diagnostic(
+            &store,
+            parked,
+            "driver-exited",
+            "the provider exited before it was ready",
+        );
+        let after = find();
+        assert!(
+            after.item.detail.contains(
+                "The driver's last diagnostic: driver-exited: the provider exited before it was ready."
+            ),
+            "{}",
+            after.item.detail
+        );
+    }
     /// A person's now holds only requests and reviews. A message stays in conversations, and
     /// each fault, on a live run or a terminal one, goes once to the agent that owns it.
     #[test]
@@ -32054,9 +32733,212 @@ version 2
         );
     }
 
-    /// A seat whose screen shows the detector's own source, as a builder's grep output did on
-    /// 2026-09-27, stays authenticated. A seat that shows Claude's login prompt is fenced, and its
-    /// diagnostic records the exact screen line that matched.
+    #[test]
+    fn login_attention_owner_prefers_bound_account_and_pool_before_the_declarer() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            r#"version 2
+account "shared" {{ provider "claude"; owner "person/robin" }}
+agent "bound" {{ workspace {:?}; harness "claude" {{ account "shared" }} }}
+agent "pooled" {{ workspace {:?}; harness "claude" {{ account-pool "person/robin" }} }}
+agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
+"#,
+            workspace.path().display().to_string(),
+            workspace.path().display().to_string(),
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &plan.subject_tokens,
+                "login-account-owner",
+                Some("person/avery"),
+            )
+            .unwrap();
+        let (owner, reads) =
+            smallclaims::touched::record(|| store.agent_person("agent/node.bound").unwrap());
+        assert_eq!(owner.as_deref(), Some("person/robin"));
+        assert!(
+            reads.contains("account/shared"),
+            "an account owner edit must refresh the login person"
+        );
+        assert_eq!(
+            store.agent_person("agent/node.pooled").unwrap().as_deref(),
+            Some("person/robin")
+        );
+        assert_eq!(
+            store.agent_person("agent/node.plain").unwrap().as_deref(),
+            Some("person/avery")
+        );
+    }
+
+    #[test]
+    fn native_login_failure_routes_once_to_its_person_and_recovers_then_repeats() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"seat\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &plan.subject_tokens,
+                "auth-owned-seat",
+                Some("person/avery"),
+            )
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        *runtime.ptys.lock().unwrap() = vec![claude_seat_pty("seat", "running", "one")];
+        let publish = |accepted: bool, sequence: u64, epoch: &str, owner: u64| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "agent/node.seat".into(),
+                    kind: "harness.observed".into(),
+                    actor: Some("agent/node.seat".into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String("idle".into())),
+                        ("incarnation_id".into(), Value::String(epoch.into())),
+                        ("provider_auth".into(), Value::Bool(accepted)),
+                        ("provider_auth_sequence".into(), Value::from(sequence)),
+                        ("ownership_sequence".into(), Value::from(owner)),
+                        (
+                            "reason".into(),
+                            if accepted {
+                                Value::Null
+                            } else {
+                                Value::String("providerAuth".into())
+                            },
+                        ),
+                    ])
+                    .into_iter()
+                    .filter(|(_, v)| !v.is_null())
+                    .collect(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        publish(false, 1, "one", 1);
+        store
+            .record_runtime_failure(
+                "attention/retained-login-episode",
+                &AttentionRequest {
+                    reviewer: "person/avery".into(),
+                    title: "Retained login fault".into(),
+                    reason: "pre-upgrade credential refusal".into(),
+                    severity: "error".into(),
+                    targets: vec!["agent/node.seat".into()],
+                    actor: RECONCILER_ACTOR.into(),
+                    idempotency_key: "retained-login-episode".into(),
+                },
+                "provider-auth",
+            )
+            .unwrap();
+
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store
+                .current_harness("agent/node.seat")
+                .unwrap()
+                .unwrap()
+                .state,
+            "needs-login"
+        );
+        assert!(
+            store.fault_items(None).unwrap().is_empty(),
+            "the derived login item replaces the retained agent fault"
+        );
+        assert_eq!(
+            store.attention_items(Some("person/avery")).unwrap().len(),
+            1
+        );
+        assert!(
+            store
+                .attention_items(Some("person/alex"))
+                .unwrap()
+                .is_empty()
+        );
+        publish(true, 9, "stale", 99);
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store
+                .current_harness("agent/node.seat")
+                .unwrap()
+                .unwrap()
+                .state,
+            "needs-login"
+        );
+        publish(true, 2, "one", 1);
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .current_harness("agent/node.seat")
+                .unwrap()
+                .unwrap()
+                .is_ready()
+        );
+        assert!(
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .is_empty()
+        );
+        publish(false, 3, "one", 1);
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store.attention_items(Some("person/avery")).unwrap().len(),
+            1
+        );
+        // Re-exec preserves the runtime but advances driver ownership and resets its auth counter.
+        publish(true, 1, "one", 2);
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .current_harness("agent/node.seat")
+                .unwrap()
+                .unwrap()
+                .is_ready()
+        );
+        assert!(
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(runtime.keys.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn a_claude_login_prompt_line_fences_the_seat_and_records_the_matched_line() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -32117,13 +32999,21 @@ version 2
         );
         let harness = store.current_harness("agent/node.seat-b").unwrap().unwrap();
         assert_eq!(harness.reason.as_deref(), Some("providerAuth"));
-        let attention = store.fault_items(None).unwrap();
-        assert_eq!(attention.len(), 1);
-        assert_eq!(attention[0].targets, ["agent/node.seat-b"]);
+        assert_eq!(
+            store.fault_items(None).unwrap().len(),
+            1,
+            "unknown ownership retains an agent fault"
+        );
+        assert!(store.attention_items(None).unwrap().is_empty());
+        let attention = store.fault_items(Some("person/alex")).unwrap();
+        assert!(
+            attention.is_empty(),
+            "an unowned seat must not alert a fixed person"
+        );
     }
 
     #[test]
-    fn a_claude_login_fence_lifts_when_the_prompt_leaves_the_screen() {
+    fn a_claude_login_fence_lifts_only_after_an_authenticated_turn() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = format!(
@@ -32157,21 +33047,34 @@ version 2
         show("> Work.\n\n● Login expired · Please run /login\n");
         reconciler.reconcile_once().unwrap();
         assert!(fenced());
-        assert_eq!(
-            store.fault_items(None).unwrap().len(),
-            1
-        );
+        assert_eq!(store.fault_items(Some("person/alex")).unwrap().len(), 0);
 
-        // The prompt is gone, so the same incarnation takes work again.
+        // Disappearance alone is insufficient; a successful native turn lifts the fence.
         show("> Work.\n\n● Done.\n");
         reconciler.reconcile_once().unwrap();
-        assert!(!fenced());
         assert!(
-            store
-                .fault_items(None)
-                .unwrap()
-                .is_empty()
+            fenced(),
+            "screen disappearance alone is not positive authentication evidence"
         );
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.seat".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/node.seat".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("incarnation_id".into(), Value::String("seat-one".into())),
+                    ("provider_auth".into(), Value::Bool(true)),
+                    ("provider_auth_sequence".into(), Value::from(1)),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert!(!fenced());
+        assert!(store.fault_items(Some("person/alex")).unwrap().is_empty());
         reconciler.reconcile_once().unwrap();
         let codes = store
             .claims_for("agent/node.seat", Some("harness.diagnostic"))
@@ -32187,14 +33090,30 @@ version 2
             .collect::<Vec<_>>();
         assert_eq!(codes, ["provider-auth-expired", "provider-auth-restored"]);
 
-        // The prompt returns: the incarnation is fenced again, with a new request.
+        // Old screen content cannot refence a successfully authenticated native turn.
         show("> Work.\n\n● Login expired · Please run /login\n");
         reconciler.reconcile_once().unwrap();
+        assert!(!fenced());
+        // A fresh explicit refusal starts a new episode on this same incarnation.
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.seat".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/node.seat".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("incarnation_id".into(), Value::String("seat-one".into())),
+                    ("provider_auth".into(), Value::Bool(false)),
+                    ("provider_auth_sequence".into(), Value::from(2)),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
         assert!(fenced());
-        assert_eq!(
-            store.fault_items(None).unwrap().len(),
-            1
-        );
+        assert_eq!(store.fault_items(Some("person/alex")).unwrap().len(), 0);
     }
 
     #[test]
@@ -32287,7 +33206,7 @@ version 2
             assert_eq!(
                 harness.state,
                 if code == "provider-auth-expired" {
-                    "unauthenticated"
+                    "needs-login"
                 } else {
                     "blocked"
                 },
@@ -32342,7 +33261,7 @@ version 2
                             .unwrap()
                             .unwrap()
                             .state,
-                        "unauthenticated"
+                        "needs-login"
                     );
                     assert_eq!(store.fault_items(None).unwrap().len(), 1);
                     assert_eq!(
@@ -32367,12 +33286,34 @@ version 2
             );
             *runtime.screen_error.lock().unwrap() = false;
 
-            // Clearing the screen releases the same incarnation and its single attention item.
+            let publish_auth = |accepted, sequence| {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: "agent/node.seat".into(),
+                        kind: "harness.observed".into(),
+                        actor: Some("agent/node.seat".into()),
+                        fields: BTreeMap::from([
+                            ("state".into(), Value::String("idle".into())),
+                            ("driver".into(), Value::String(driver.into())),
+                            ("incarnation_id".into(), Value::String("one".into())),
+                            ("provider_auth".into(), Value::Bool(accepted)),
+                            ("provider_auth_sequence".into(), Value::from(sequence)),
+                        ]),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            };
+            // Update menus clear on screen proof; login requires a successful native turn.
             runtime
                 .screens
                 .lock()
                 .unwrap()
                 .insert("node.seat".into(), "Ready for work".into());
+            if code == "provider-auth-expired" {
+                publish_auth(true, 1);
+            }
             reconciler.reconcile_once().unwrap();
             assert!(
                 store
@@ -32387,6 +33328,9 @@ version 2
                 .lock()
                 .unwrap()
                 .insert("node.seat".into(), screen.into());
+            if code == "provider-auth-expired" {
+                publish_auth(false, 2);
+            }
             reconciler.reconcile_once().unwrap();
             assert!(
                 !store
@@ -32418,7 +33362,7 @@ version 2
                         .unwrap()
                         .state,
                     if code == "provider-auth-expired" {
-                        "unauthenticated"
+                        "needs-login"
                     } else {
                         "blocked"
                     }

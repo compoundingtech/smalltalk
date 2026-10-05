@@ -107,6 +107,9 @@ pub(super) fn root_help(all: bool) -> String {
     output.push('\n');
     output.push_str(&options.render_help().to_string());
     output.push_str("\nUse st help COMMAND for command help; st help --all also lists plumbing.\n");
+    output.push_str(
+        "\nIssues and suggestions are welcome. Please file an upstream issue:\n  gh issue create --repo compoundingtech/smalltalk\nPull requests are welcome too: https://github.com/compoundingtech/smalltalk\n",
+    );
     output
 }
 
@@ -138,7 +141,7 @@ pub(super) fn agent_state(
             "Still starting — the agent process cannot currently be reached.".into()
         }
         "waiting" => match harness {
-            Some("unauthenticated") => {
+            Some("unauthenticated" | "needs-login") => {
                 "Waiting for you — attach to sign in to the agent's provider.".into()
             }
             _ => "Waiting for you — attach to inspect what the agent needs.".into(),
@@ -239,6 +242,10 @@ pub(super) fn pairing_next_steps(person: &str) -> String {
     next_steps(
         "Waiting for your device — enter the pairing code in its st client before it expires.",
         &[
+            (
+                "Complete on the device",
+                "st devices complete MEMBER_URL PAIRING_ID".to_owned(),
+            ),
             ("Show paired devices", format!("st devices --as {person}")),
             (
                 "Pair again",

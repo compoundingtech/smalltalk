@@ -61,6 +61,7 @@ use crate::store::Store;
 mod client_blobs;
 mod client_presence;
 mod client_v0;
+mod custom;
 mod delivery_presence;
 mod delivery_probes;
 mod github_watch;
@@ -71,6 +72,12 @@ mod owned_sets;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
+
+/// Recheck the initialized live delivery owner before replacing an unattached seat.
+pub(crate) fn claude_channel_attached(store: &Store, subject: &str, incarnation: &str) -> bool {
+    delivery_presence::attachment(subject, incarnation)
+        .is_some_and(|fence| store.check_mailbox(&fence).is_ok())
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -459,6 +466,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::raw_terminal::stream),
         )
         .route("/v1/schema", get(schema))
+        .route(
+            "/v1/schema/registrations",
+            get(custom::registrations).post(custom::register),
+        )
+        .route("/v1/custom/reply", post(custom::reply))
+        .route("/v1/custom/basis", get(custom::basis))
+        .route("/v1/client/custom-subjects", get(custom::list))
+        .route("/v1/client/custom-subjects/{*id}", get(custom::read))
         .route("/v1/intent/mission", post(mission))
         .route("/v1/gate-checks", post(start_gate_check))
         .route("/v1/gate-checks/{id}", get(read_gate_check))
@@ -541,6 +556,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/mailbox", get(mailbox::subscribe))
         .route("/v1/harness-events", post(harness_events::publish))
         .route("/v1/mailbox/bind", post(mailbox::bind))
+        .route("/v1/mailbox/attachment", get(mailbox::attachment))
         .route("/v1/mailbox/receipts", post(mailbox::receipt))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/read/{*subject}", get(read_message))
@@ -719,6 +735,19 @@ async fn response_envelope(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Anonymous pairing discovery is public, static compatibility metadata. Bypass
+    // authentication, snapshots, presence and the normal envelope/activity counter entirely.
+    if matches!(transport, ClientTransportBoundary::FabricLoopback)
+        && request.method() == axum::http::Method::GET
+        && request.uri().path() == "/v1/client/capabilities"
+        && !request.headers().contains_key(axum::http::header::AUTHORIZATION)
+    {
+        return Json(json!({
+            "api_version": CLIENT_API_VERSION,
+            "capabilities": [{"id":"device-key-proofs", "version":1, "state":"granted"}],
+        }))
+        .into_response();
+    }
     let started = Instant::now();
     let request_path = request.uri().path().to_owned();
     let request_route = request
@@ -2206,7 +2235,7 @@ fn client_agent_resources_selected(
                 (
                     Some("running" | "ready" | "working" | "idle"),
                     Some(_),
-                    Some("indeterminate" | "unknown" | "unauthenticated" | "blocked"),
+                    Some("indeterminate" | "unknown" | "unauthenticated" | "needs-login" | "blocked"),
                     _,
                 ) => "waiting",
                 (Some("running" | "ready" | "working" | "idle"), Some(_), _, _) => "starting",
@@ -2283,7 +2312,8 @@ fn client_agent_resources_selected(
                 "runtime_ids": runtime_ids,
                 "owner_run_id": subject.owner_run,
                 "driver": driver,
-                "harness_state": harness_state,
+                "harness_state": harness_state.as_deref().map(|state| if state == "needs-login" { "unauthenticated" } else { state }),
+                "harness_error_state": (harness_state.as_deref() == Some("needs-login")).then_some("needs-login"),
                 "since": subject.harness.as_ref().map(|harness| client_timestamp(harness.since_unix_ms)),
                 "_status_source": subject.harness,
                 "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
@@ -2636,6 +2666,9 @@ fn snapshot_time_ms(timestamp: &str) -> u128 {
 }
 
 fn client_attention_actions(kind: &str, review_mode: Option<&str>) -> Vec<&'static str> {
+    if kind.starts_with("custom.") {
+        return vec!["custom.reply"];
+    }
     match kind {
         "human-gate" if review_mode == Some("feedback") => {
             vec!["review.approve", "review.request-changes"]
@@ -2720,9 +2753,24 @@ fn client_attention_resources(
         if let Some(mode) = item.review_mode {
             resource["review_mode"] = json!(mode);
         }
+        if item.kind.starts_with("custom.")
+            && let Some(source) = store.custom_subject(&item.subject)?
+        {
+            resource["source_kind"] = json!("custom");
+            resource["revision"] = source["revision"].clone();
+            resource["custom_form"] = source["attention"]["reply"].clone();
+            resource["action_parameters"] = json!({"custom.reply":{"target_id":item.subject,"registration":source["registration"],"revision":source["revision"],"episode":item.episode}});
+        }
         if item.kind == "person-step" {
             resource["action_parameters"] =
                 json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
+            // An ask a mission step made carries its mission and the step that waits on it.
+            if let Some(context) = store.person_ask_context(&item.subject)? {
+                if let Some(mission) = context["mission_id"].as_str() {
+                    resource["mission_id"] = json!(mission);
+                }
+                resource["blocked"] = context["blocked"].clone();
+            }
             match item.request {
                 // An update asks nothing, so it is not a `request`: a client that predates
                 // updates shows a free-text card, and any response to it reads it.
@@ -2744,6 +2792,30 @@ fn client_attention_resources(
         resources.push(resource);
     }
     Ok(resources)
+}
+
+// Older client-v0 models use closed enums for attention kinds and action names.
+fn client_attention_compatibility(items: &mut [Value], custom_forms: bool) {
+    if custom_forms {
+        return;
+    }
+    for item in items {
+        if item["kind"] == "attention" && item["source_kind"] == "custom" {
+            item["custom_attention_kind"] = item["attention_kind"].clone();
+            item["attention_kind"] = json!("agent-request");
+            item["actions"] = json!([]);
+            let p = &item["action_parameters"]["custom.reply"];
+            let command = [
+                "st", "subject", "reply", item["source_id"].as_str().unwrap_or_default(),
+                "--registration", p["registration"].as_str().unwrap_or_default(),
+                "--revision", p["revision"].as_str().unwrap_or_default(),
+                "--episode", p["episode"].as_str().unwrap_or_default(),
+                "--fields-file", "REPLY.json", "--idempotency-key", "REPLY-KEY",
+                "--as", item["person_id"].as_str().unwrap_or_default(),
+            ].map(crate::gate_report::shell_quote).join(" ");
+            item["detail"] = json!(format!("{}\n\nReply with {command}", item["detail"].as_str().unwrap_or_default()));
+        }
+    }
 }
 
 fn client_attention_resources_with_previews(
@@ -3953,7 +4025,11 @@ async fn client_attention(
         snapshot,
         "attention",
         &effective_query,
-        move |state, _| client_attention_resources_with_previews(state, person.as_deref(), history),
+        move |state, _| {
+            let mut items = client_attention_resources_with_previews(state, person.as_deref(), history)?;
+            client_attention_compatibility(&mut items, session.custom_forms);
+            Ok(items)
+        },
     )
     .await
 }
@@ -3965,12 +4041,10 @@ async fn client_attention_detail(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
-    client_detail(
-        client_attention_resources_with_previews(&state, person.as_deref(), query.history)
-            .map_err(ApiError::internal)?,
-        "attention",
-        &id,
-    )
+    let mut items = client_attention_resources_with_previews(&state, person.as_deref(), query.history)
+        .map_err(ApiError::internal)?;
+    client_attention_compatibility(&mut items, session.custom_forms);
+    client_detail(items, "attention", &id)
 }
 
 async fn client_messages(
@@ -4959,6 +5033,8 @@ async fn guard_bound_request(
         "/v1/subscription-requests/",
         "/v1/reviews/",
         "/v1/claims",
+        "/v1/schema/registrations",
+        "/v1/custom/reply",
         "/v1/diagnostic",
         "/v1/rules/",
     ]
@@ -5018,6 +5094,7 @@ fn isolation_name(mode: st_runtime::Isolation) -> &'static str {
 }
 
 async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, ApiError> {
+    let reader_store = state.store.clone();
     let environment = tokio::task::spawn_blocking(crate::environment::snapshot)
         .await
         .map_err(ApiError::internal)?;
@@ -5099,6 +5176,12 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         client_now_ms(),
     ));
     report.checks.push(descriptor_check());
+    report.checks.push(reader_memory_check(
+        reader_store.readers.usage(),
+        smallclaims::sqlite::read_cache_kib(),
+        smallclaims::sqlite::max_idle_read_connections(),
+        crate::memory::service_memory(),
+    ));
     report.status = if report.checks.iter().any(|check| check.status == "fail") {
         "fail"
     } else if report.checks.iter().any(|check| check.status == "warn") {
@@ -5134,6 +5217,71 @@ fn descriptor_check() -> DoctorCheck {
         .ok()
         .map(|entries| entries.count().saturating_sub(1) as u64);
     descriptor_usage_check(limit.rlim_cur, limit.rlim_max, usage)
+}
+
+/// A planning reserve for schema/statements, projections, tasks and allocator overhead, not
+/// an enforced or measured limit. Active bursts can exceed idle retention and this envelope.
+const DAEMON_MEMORY_HEADROOM_KIB: u128 = 512 * 1024;
+
+fn reader_memory_check(
+    readers: smallclaims::sqlite::ReaderUsage,
+    cache_kib: usize,
+    retained: usize,
+    groups: anyhow::Result<Option<Vec<crate::memory::GroupMemory>>>,
+) -> DoctorCheck {
+    let targets = readers.open as u128 * cache_kib as u128;
+    let envelope_kib = readers.open.max(retained) as u128 * cache_kib as u128
+        + smallclaims::sqlite::WRITE_CACHE_KIB as u128
+        + DAEMON_MEMORY_HEADROOM_KIB;
+    let mut message = format!(
+        "{} open readers ({} idle, {} active), peak {}, {} opened since startup; per-reader cache target {} KiB; current reader targets {} MiB; idle retention {}; planning envelope {} MiB (reader targets + 32 MiB writer + 512 MiB reserve). Warning: concurrent reader bursts are unbounded; cache targets exclude schema, prepared statements and query results, and this envelope is not a process memory limit",
+        readers.open,
+        readers.idle,
+        readers.open.saturating_sub(readers.idle),
+        readers.peak,
+        readers.opened,
+        cache_kib,
+        targets / 1024,
+        retained,
+        envelope_kib / 1024,
+    );
+    let mut warned = false;
+    match groups {
+        Ok(Some(groups)) => {
+            if let Some(group) = groups
+                .iter()
+                .filter(|group| group.max_bytes.is_some())
+                .min_by_key(|group| group.max_bytes.unwrap())
+            {
+                let max = group.max_bytes.unwrap();
+                message.push_str(&format!(
+                    "; cgroup memory.max {} MiB at {}",
+                    max / (1024 * 1024),
+                    group.path.display()
+                ));
+                if u128::from(max) < envelope_kib * 1024 {
+                    warned = true;
+                    message.push_str(" is below the planning envelope; review the service cap and reader cache/retention settings");
+                }
+            } else {
+                message.push_str("; cgroup memory.max is unlimited in the visible hierarchy");
+            }
+            for group in groups.iter().filter(|group| group.max_events > 0) {
+                warned = true;
+                message.push_str(&format!("; memory.events:max {} at {} (historical pressure in this cgroup, including descendants; not proof of a current OOM)", group.max_events, group.path.display()));
+            }
+        }
+        Ok(None) => message.push_str("; cgroup memory diagnostics are Linux-only"),
+        Err(error) => {
+            warned = true;
+            message.push_str(&format!("; cannot inspect daemon cgroup memory: {error:#}"));
+        }
+    }
+    DoctorCheck {
+        name: "reader-memory".into(),
+        status: if warned { "warn" } else { "pass" }.into(),
+        message,
+    }
 }
 
 fn descriptor_usage_check(soft: u64, hard: u64, usage: Option<u64>) -> DoctorCheck {
@@ -9853,15 +10001,17 @@ async fn get_usage(
         )));
     }
     let store = state.store.clone();
-    let (rows, limits) = blocking_store(move || {
+    let (rows, agent_messages, limits) = blocking_store(move || {
+        let (rows, agent_messages) = store.usage_period_report(since_ms, until_ms)?;
         Ok((
-            store.usage_period_rows(since_ms, until_ms)?,
+            rows,
+            agent_messages,
             store.account_limits()?,
         ))
     })
     .await?;
     Ok(Json(
-        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits}),
+        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages}),
     ))
 }
 
@@ -13827,6 +13977,8 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/missions/example%2Fdemo/retire",
             "/v1/subscription-requests/release/subscription-request%2Fexample",
             "/v1/reviews/step-run/example",
+            "/v1/schema/registrations",
+            "/v1/custom/reply",
         ] {
             for actor in ["agent/peer", "person/operator"] {
                 let request = Request::builder()
@@ -13991,6 +14143,58 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         );
         assert_eq!(descriptor_usage_check(8192, 8192, Some(92)).status, "pass");
         assert_eq!(descriptor_usage_check(8192, 8192, None).status, "warn");
+    }
+
+    #[test]
+    fn doctor_reader_memory_reports_targets_and_warns_on_limits_and_pressure() {
+        let usage = smallclaims::sqlite::ReaderUsage {
+            open: 97,
+            idle: 90,
+            peak: 100,
+            opened: 100,
+        };
+        let groups = |max_bytes, max_events| {
+            Ok(Some(vec![crate::memory::GroupMemory {
+                path: "/invented/service".into(),
+                max_bytes,
+                max_events,
+            }]))
+        };
+        let normal = reader_memory_check(usage, 2048, 128, groups(Some(1 << 30), 0));
+        assert_eq!(normal.status, "pass");
+        assert!(
+            normal
+                .message
+                .contains("97 open readers (90 idle, 7 active)")
+        );
+        assert!(normal.message.contains("current reader targets 194 MiB"));
+        assert!(normal.message.contains("planning envelope 800 MiB"));
+        assert!(normal.message.contains("bursts are unbounded"));
+        assert_eq!(
+            reader_memory_check(usage, 8192, 128, groups(Some(1 << 30), 0)).status,
+            "warn"
+        );
+        let pressure = reader_memory_check(usage, 2048, 128, groups(Some(1 << 30), 1225));
+        assert_eq!(pressure.status, "warn");
+        assert!(pressure.message.contains("memory.events:max 1225"));
+        assert_eq!(
+            reader_memory_check(usage, 2048, 128, groups(None, 0)).status,
+            "pass"
+        );
+        assert_eq!(
+            reader_memory_check(usage, 2048, 128, Err(anyhow::anyhow!("unavailable"))).status,
+            "warn"
+        );
+        let burst = smallclaims::sqlite::ReaderUsage {
+            open: 300,
+            idle: 0,
+            peak: 300,
+            opened: 300,
+        };
+        assert_eq!(
+            reader_memory_check(burst, 2048, 128, groups(Some(1 << 30), 0)).status,
+            "warn"
+        );
     }
 
     #[test]
@@ -19366,7 +19570,8 @@ mission "wake" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = &state.store;
-        let source = "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
+        let source =
+            "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
         let intent = crate::graph::parse_test_intent(source, "node").unwrap();
         let planned = store
             .mission(
@@ -19428,6 +19633,42 @@ mission "wake" state="ready" {
                     .find(|card| card["id"] == "agent/node.cobalt")
                     .unwrap()
             );
+        }
+        // Native credentials can change while activity stays working. Both cached
+        // history modes must carry the refusal/recovery, preserving the legacy wire state.
+        for provider_auth in [false, true, false, true] {
+            append(
+                "agent/node.amber",
+                "harness.observed",
+                json!({
+                    "state":"working", "driver":"codex", "incarnation_id":"amber-1",
+                    "provider_auth":provider_auth,
+                }),
+            );
+            let at = store.index().unwrap();
+            for history in [false, true] {
+                let cards = checked_agent_cache(store, history, at);
+                let amber = cards
+                    .iter()
+                    .find(|card| card["id"] == "agent/node.amber")
+                    .unwrap();
+                assert_eq!(
+                    amber["harness_state"],
+                    if provider_auth {
+                        "working"
+                    } else {
+                        "unauthenticated"
+                    }
+                );
+                assert_eq!(
+                    amber["harness_error_state"],
+                    if provider_auth {
+                        Value::Null
+                    } else {
+                        json!("needs-login")
+                    }
+                );
+            }
         }
         // Evicted old snapshots rebuild independently of the newest cache.
         assert_eq!(checked_agent_cache(store, false, before), original);
@@ -19906,7 +20147,11 @@ mission "agent-auth" state="ready" {
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
         assert_eq!(resources[0]["harness_state"], "unauthenticated");
+        assert_eq!(resources[0]["harness_error_state"], "needs-login");
         assert_eq!(resources[0]["state"], "waiting");
+        assert_eq!(resources[0]["observation"], "current");
+        assert!(resources[0]["since"].is_string());
+        assert!(resources[0].get("_status_source").is_none());
     }
 
     #[tokio::test]

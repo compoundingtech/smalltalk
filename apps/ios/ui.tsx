@@ -1,5 +1,5 @@
 import type { ReactNode, Ref } from 'react';
-import { Pressable, StyleSheet, Text, TextInput, View, type StyleProp, type TextInputProps, type TextStyle, type ViewStyle } from 'react-native';
+import { Linking, Pressable, StyleSheet, Text, TextInput, View, type StyleProp, type TextInputProps, type TextStyle, type ViewStyle } from 'react-native';
 import { fonts, theme } from './theme';
 import type { Run } from './markdown';
 import { markdown } from './markdown';
@@ -75,7 +75,7 @@ function runStyle(run: Run, base: TextStyle): StyleProp<TextStyle> {
   }
 }
 function Runs({ runs, base }: { runs: Run[]; base: TextStyle }) {
-  return <>{runs.map((run, index) => <Text key={index} style={runStyle(run, base)}>{run.text}</Text>)}</>;
+  return <>{runs.map((run, index) => <Text key={index} style={runStyle(run, base)} onPress={run.url ? () => void Linking.openURL(run.url!) : undefined}>{run.text}</Text>)}</>;
 }
 
 /** Markdown as stui renders a reply: peach headings, lavender bullets, code in a gutter. */

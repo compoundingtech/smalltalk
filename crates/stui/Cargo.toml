@@ -40,6 +40,7 @@ name = "stui"
 path = "src/main.rs"
 
 [dev-dependencies]
+smallclaims = { path = "../smallclaims" }
 st3 = { path = "../st3" }
 tempfile = "3"
 axum = { version = "0.8", features = ["ws"] }

@@ -1,24 +1,34 @@
 import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import {
+  defaultActionlintConfig,
   effectUtilsBinaryCaches,
   namespaceRunner,
   nixDevelopStep,
   plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
 
-export const linuxRunner = namespaceRunner({ profile: 'namespace-profile-linux-x86-64', runId: '${{ github.run_id }}' })
+export const linuxRunner = namespaceRunner({ profile: 'namespace-profile-linux-x86-64;job.priority=1', runId: '${{ github.run_id }}' })
 /**
  * The Linux gate's stage jobs. On 2026-10-03 the shape label `nscloud-ubuntu-24.04-amd64-16x32`
  * stopped getting runners at about 12:10Z, and the profile allows only about five runners at
  * once, so with every job on it Workspace CI runs went one at a time. The 8x16 shape label still
  * got runners at once.
  */
-export const linuxStageRunner = ['nscloud-ubuntu-24.04-amd64-8x16'] as const
+const linuxStageShape = 'nscloud-ubuntu-24.04-amd64-8x16-with-features'
+/** All Linux Namespace work shares one class: older benchmarks cannot be overtaken forever. */
+export const linuxStageRunner = [
+  `${linuxStageShape};job.priority=1`,
+  'namespace-features:github.run-id=${{ github.run_id }}',
+] as const
 export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-arm64', runId: '${{ github.run_id }}' })
+export const linuxActionlintConfig = {
+  ...defaultActionlintConfig,
+  selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
+} as const
 
 /**
- * ci1, our own CI machine, takes a Workspace CI run when any general runner is idle; Namespace takes
- * runs when no general runner is available. The other jobs may wait briefly on ci1. GitHub has no
+ * ci1 takes the primary Workspace CI test partition when enough general runners are idle;
+ * Namespace takes the second partition and supporting jobs on independent CPUs. GitHub has no
  * overflow between runner labels, so the `pick-runner` job asks the
  * GitHub API how many ci1 runners are idle before the other jobs start, and their `runs-on` reads its
  * output. Trusted PRs labelled `ci-priority` use the reserved `ci1-priority` lane.
@@ -26,13 +36,13 @@ export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-a
  * instead of moving to a busy Namespace pool when a reserved runner is occupied.
  *
  * Off unless the repository variable `CI1_RUNNERS` is `on`: then `pick-runner` is skipped, its output
- * is empty and every job runs on Namespace exactly as before. A pull request from a fork never runs on
+ * is empty and every workload job runs on Namespace. A pull request from a fork never runs on
  * ci1: this repository is public, and a self-hosted runner runs whatever a job asks of it.
  */
 export const pickRunnerJobId = 'pick-runner'
 
-/** Start work on available ci1 capacity without requiring room for all five jobs at once. */
-const ci1MinIdle = 1
+/** Leave CPU capacity for the priority and merge lanes; only one shard uses ci1 per run. */
+const ci1MinIdle = 4
 
 export const pickRunnerJob = {
   name: pickRunnerJobId,
@@ -107,13 +117,21 @@ printf 'Runner: **ci1** (%s, %s idle)\\n' "$label" "$idle" >> "$GITHUB_STEP_SUMM
 const pickedOr = (namespaceLabels: string) =>
   `\${{ fromJSON(needs.${pickRunnerJobId}.outputs.ci1 || ${namespaceLabels}) }}`
 
-/** `runs-on` for a stage job: ci1 when picked, else the Namespace shape label. */
-export const linuxStageRunsOn = pickedOr(`'${JSON.stringify(linuxStageRunner)}'`)
-
-/** `runs-on` for the other Linux jobs: ci1 when picked, else the Namespace profile with run affinity. */
-export const linuxRunsOn = pickedOr(
-  `format('${JSON.stringify(namespaceRunner({ profile: linuxRunner[0], runId: '{0}' }))}', github.run_id)`,
+// Same priority for required, optional and manual jobs. Run affinity makes Namespace's
+// scheduled order deterministic; a newer required run cannot steal an older benchmark's runner.
+/** `runs-on` for a stage job: picked ci1, else the shared Namespace queue class. */
+export const linuxStageRunsOn = pickedOr(
+  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
 )
+
+/** `runs-on` for a Linux profile job: picked ci1, else the shared Namespace queue class. */
+export const linuxRunsOn = pickedOr(
+  `format('${JSON.stringify(linuxRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+)
+
+/** Supporting jobs use independent CPUs; only the primary test shard takes the picked lane. */
+export const supportingLinuxRunsOn = linuxRunner
+export const supportingStageRunsOn = linuxStageRunner
 
 /** A job that needs `pick-runner` still runs when it was skipped (ci1 off). */
 export const afterPickRunner = { needs: [pickRunnerJobId], if: '${{ !cancelled() }}' } as const
@@ -204,8 +222,10 @@ for provider in GITHUB_ISSUE GITHUB_PR PTY_STATS VISTA; do
   printf 'ST2_%s_COMPONENT=%s/share/st2/providers/st2_%s_component.component.wasm\\n' "$provider" "$components" "$wasm" >> "$GITHUB_ENV"
 done`,
   },
-  nixDevelopStep({ name: 'Install matching rendered hooks', command: ['cargo', 'run', '--locked', '-p', 'st2', '--', 'hooks', 'install'] }),
   nixDevelopStep({ name: 'Build selected test targets first (no debug info)', command: ['bash', 'scripts/ci-nextest', 'run', '--no-run'] }),
+  // The integration target already built st2 with the workspace's unified features. Running it
+  // directly avoids a separate cargo run build before those features are unified.
+  nixDevelopStep({ name: 'Install matching rendered hooks', command: ['bash', 'scripts/ci-install-built-hooks'] }),
 ]
 
 /** Everything a job that runs the workspace tests needs. */

@@ -27,7 +27,7 @@ A message is a direct connection: it wakes the recipient agent for a full turn, 
 `work progress` records progress in the graph at no cost to anyone; people read it in stui. `work complete`, `work fail`, and `work release` record what happened to a claimed step, each with `--as "$ST_AGENT"`.
 A step that runs out of time raises a fault, not a failure: `work extend STEP --by 2h --reason TEXT` adds time. The seat's driver renews the claim's lease while the seat runs. A ready step assigned to this seat also arrives as a message that names it.
 
-A mission's goals, constraints and named documents encode every known rule and decision. `depends-on` orders steps; `missions start --after` orders runs without reports. A final step assigned to the author, depending on the last real step, reaches the author once when work is done. Review gates mark decisions only a person can make. `missions publish FILE` publishes a mission; `--dry-run` (alias `--preview`) prints its preview without applying or running exec gates. `work revise RUN FILE` proposes a revision.
+A mission's goals, constraints and named documents encode every known rule and decision. `depends-on` orders steps; `missions start --after` orders runs without reports. A final step assigned to the author, depending on the last real step, reaches the author once when work is done. Review gates mark decisions only a person can make. `apply FILE...` publishes seats, missions and schedules together; `--dry-run` (alias `--preview`) validates and prints the resolved preview without publishing or running exec gates. Add `--check` to run exec gates during the preview, with `--workspace DIR` and repeated `--input NAME=VALUE` as needed; answers appear on stderr. Publication checks for broken gates by default; `--no-gate-check` skips them. `missions check FILE` checks gates alone. `apply --set NAME` retains complete owned-set publication and requires its repository, ref, SHA, source sequence and expected-set flags. `agents apply` and `missions publish` still work and log a legacy notice naming `apply`. `work revise RUN FILE` proposes a revision.
 
 ## Spontaneous work and handoff
 
@@ -52,3 +52,9 @@ A fault arrives as a message to the agent that owns it, which retries, revises o
 ## Other agents' terminals
 
 st reaches every seat through its harness's own channel. Keys typed into another agent's terminal land in whatever that terminal shows, such as a person's unsent draft or a permission prompt, and st cannot see or record them. `conversations send` reaches another agent through the graph.
+
+## Upstream feedback
+
+Issues and suggestions are welcome at https://github.com/compoundingtech/smalltalk.
+File an upstream issue with `gh issue create --repo compoundingtech/smalltalk`.
+Pull requests are welcome too.

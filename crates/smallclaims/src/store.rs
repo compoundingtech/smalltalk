@@ -439,7 +439,7 @@ impl Store {
         // Keep the hot graph and replication index pages in SQLite's bounded
         // page cache. The default (~2 MiB per connection) churns against the
         // large durable claim store during otherwise quiet replication.
-        connection.execute_batch("PRAGMA cache_size = -32768;")?;
+        connection.pragma_update(None, "cache_size", -(crate::sqlite::WRITE_CACHE_KIB as i64))?;
         Self::create_schema(&connection, &*runtime)?;
         separate_staged_blobs(&mut connection)?;
         {
@@ -3039,7 +3039,8 @@ pub fn replication_bucket_start(sequence: u64) -> u64 {
 /// peer provably lacks, bounded per exchange, and the local identities of the ranges both
 /// sides hold with different digests, so the peer can compute the reverse difference. Whole
 /// ranges are listed in order while they fit `listing_limit`. The first differing range is
-/// always listed, so each exchange settles at least one range and later ones follow.
+/// always listed. If payloadless checkpoint differences prevent it from settling, the sync
+/// worker requests a full inventory rather than repeating this prefix indefinitely.
 pub fn compact_replication_difference(
     inventory: &CompactReplicationInventory,
     buckets: &[ReplicationInventoryBucket],
@@ -4320,6 +4321,7 @@ impl Store {
                 )
                 .map_err(internal)?;
                 select_replicated_document(transaction, &record, record.store_index)?;
+                self.runtime.after_projection(transaction)?;
                 let version = DocumentVersion {
                     name: name.into(),
                     hash,
@@ -6247,6 +6249,7 @@ impl Store {
         };
         let waiting_claims = count("unknown")?;
         let registry_digest = self.runtime.schema_digest();
+        let projection_deferred = self.replication_projection_deferred();
         let now = now_ms();
         let sync = self.replication_peer_sync_held(
             configured_peers,
@@ -6332,6 +6335,15 @@ impl Store {
                 status.last_error = None;
             }
             status.sync = sync.get(peer).cloned();
+            // A comparison can finish after the peer row's receipt timestamp. Once that
+            // peer is last-seen after a failed exchange, its cached measurement is stale
+            // even if the comparison's own age has not reached the quiet interval yet.
+            if status.status == "last-seen"
+                && status.last_failure_at_unix_ms.is_some()
+                && let Some(sync) = status.sync.as_mut()
+            {
+                sync.stale = true;
+            }
             let encoded: Option<String> = connection
                 .query_row(
                     "SELECT value FROM meta WHERE key=?1",
@@ -6343,6 +6355,7 @@ impl Store {
                 .map(|value| serde_json::from_str(&value))
                 .transpose()?
                 .unwrap_or_default();
+            let mut inventory_aligned = status.projection_digests.is_empty();
             if !status.projection_digests.is_empty() {
                 status.graph_digest = Some(projection_digest::root(&status.projection_digests));
                 let peer_inventory: Option<String> = connection
@@ -6352,8 +6365,10 @@ impl Store {
                         |row| row.get(0),
                     )
                     .optional()?;
-                if peer_inventory.as_deref() == Some(snapshot.inventory.digest.as_str())
-                    && !self.replication_projection_deferred()
+                inventory_aligned =
+                    peer_inventory.as_deref() == Some(snapshot.inventory.digest.as_str());
+                if inventory_aligned
+                    && !projection_deferred
                     && !unsealed_local
                     && status.schema_digest.as_deref() == Some(registry_digest.as_str())
                     && waiting_claims == 0
@@ -6365,6 +6380,10 @@ impl Store {
                 }
             }
             status.projection_comparison_waiting = waiting_claims != 0
+                || unsealed_local
+                || projection_deferred
+                || !inventory_aligned
+                || (!status.projection_digests.is_empty() && status.schema_digest.is_none())
                 || status
                     .schema_digest
                     .as_deref()

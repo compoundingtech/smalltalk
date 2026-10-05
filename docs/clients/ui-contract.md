@@ -1,8 +1,8 @@
-# Small Talk client UI contract
+# Smalltalk client UI contract
 
 For package choices and a runnable client, see [Build your own client](build-your-own.md).
 
-What every Small Talk client shows and does. stui (the terminal client, `crates/stui/src/ui`) is
+What every Smalltalk client shows and does. stui (the terminal client, `crates/stui/src/ui`) is
 the reference; the iOS app (`apps/ios`) implements the same contract the Expo way. When the two
 disagree, fix the one that breaks this document, or change this document first.
 
@@ -27,7 +27,7 @@ Every screen is judged by these.
    why, and offers no approval.
 2. **The conversation is the product.** One stream per agent, rendered like pi: the person's
    messages as tinted blocks, replies as real Markdown, tool calls as small boxes tinted by
-   outcome and collapsed to their last lines, Small Talk mail in the same stream. It is stable:
+   outcome and collapsed to their last lines, Smalltalk mail in the same stream. It is stable:
    a refresh that changes nothing moves nothing, new content only appends, and the view follows
    the end only while the reader is at the end.
 3. **Everything visible is actionable.** Every tab, row, name and button responds to a tap.
@@ -81,7 +81,7 @@ resources: until then it could only show invented data.
   - **message**: the real message (load it by the item's source id: the attention item carries
     only a generic title); Reply, Mark read, Remind me later (demo: kept on the device only).
 - Confirm destructive or binding actions (approve, cancel, reject, resolve) with a second tap.
-- **Chat about this** sends a *new* Small Talk message to the agent involved (or the chief of
+- **Chat about this** sends a *new* Smalltalk message to the agent involved (or the chief of
   staff when no agent is), titled `About: <item title>`, with the item's id, title and mission
   as context. The card shows that thread's replies.
 
@@ -97,7 +97,7 @@ resources: until then it could only show invented data.
 - Selecting an agent shows its conversation (see below) and a composer. A details panel shows
   what it holds now (mission › step, the step's goal, since when), its subagents, what is queued
   next, and how it runs (harness and state, runtime, host, worktree, parent, fault).
-- An agent on another host may show only its Small Talk mail, not its transcript; say so.
+- An agent on another host may show only its Smalltalk mail, not its transcript; say so.
 - An agent not started by st: show its saved transcript when st can identify it; otherwise
   explain in plain words why there is no conversation. A found process whose native session
   is unidentified opens into this explanatory state, not a missing-session error. OMP internal
@@ -149,7 +149,7 @@ runs until the person approves it there.
 
 Rules both clients follow; `transcripts/*.expected.json` checks the cleaning.
 
-- Merge the harness timeline and the agent's Small Talk messages, ordered by time.
+- Merge the harness timeline and the agent's Smalltalk messages, ordered by time.
 - Claude and Codex add markup for the model. Turn it into what it means:
   - `<task-notification>` → one event line: `background task <status>: <summary>`.
   - `<channel …>` (an st delivery) → `delivered to the agent: <subject> · from <sender>`; the

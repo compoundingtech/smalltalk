@@ -9,7 +9,7 @@ st conversations search "release date" --cursor CURSOR --json
 The client must identify a concrete person (`--as person/ada` or the configured person).
 Search requires `read.projections`. A paired device searches under its delegated person,
 never a person supplied in a query. The mailbox source contains that person's sent and
-received Small Talk messages, including archived messages. Transcript visibility follows
+received Smalltalk messages, including archived messages. Transcript visibility follows
 the same session inventory and normalized timeline reads as `conversations sessions --all`
 and `conversations timeline`; free mode currently makes those agent transcripts visible
 to every person with the projection scope. Remote agent timelines use the existing
