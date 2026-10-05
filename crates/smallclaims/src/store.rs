@@ -6023,10 +6023,15 @@ impl Store {
         } else {
             ""
         };
+        let seek_index = if unresolved_only {
+            " INDEXED BY replica_records_unresolved_page"
+        } else {
+            ""
+        };
         let mut statement = connection.prepare_cached(&format!(
             "SELECT record_ref, writer, sequence, envelope_hash, position, state, claim_id,
                     subject_hint, kind_hint, error_code, error_message, replacement_claim_id
-             FROM replica_records
+             FROM replica_records{seek_index}
              WHERE (writer, sequence, envelope_hash, position) > (?1, ?2, ?3, ?4){filter}
              ORDER BY writer, sequence, envelope_hash, position LIMIT ?5"
         ))?;

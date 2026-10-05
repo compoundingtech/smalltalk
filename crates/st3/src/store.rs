@@ -39824,7 +39824,7 @@ version 2
         let status = store.replication_status_sealed(false, None, &[]).unwrap();
         assert_eq!((status.invalid_records, status.unknown_records, status.valid_records), (2, 1, 1));
         let plan = store.connection.lock().unwrap().query_row(
-            "EXPLAIN QUERY PLAN SELECT record_ref FROM replica_records
+            "EXPLAIN QUERY PLAN SELECT record_ref FROM replica_records INDEXED BY replica_records_unresolved_page
              WHERE (writer,sequence,envelope_hash,position) > ('',-1,'',-1)
                AND state IN ('invalid','unknown')
              ORDER BY writer,sequence,envelope_hash,position LIMIT 2",
@@ -39883,7 +39883,7 @@ version 2
             .unwrap().is_empty());
         let connection = store.readers.get();
         let mut statement = connection.prepare(
-            "SELECT record_ref FROM replica_records
+            "SELECT record_ref FROM replica_records INDEXED BY replica_records_unresolved_page
              WHERE (writer,sequence,envelope_hash,position)>('',-1,'',-1)
                AND state IN ('invalid','unknown')
              ORDER BY writer,sequence,envelope_hash,position LIMIT 1",

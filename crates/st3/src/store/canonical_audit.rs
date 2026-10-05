@@ -43,6 +43,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "peer_replica_cursors",
         "replica_envelopes",
         "replica_records",
+        "replica_state_counts",
         "projection_health",
         "replication_peers",
         "replication_refusals",
