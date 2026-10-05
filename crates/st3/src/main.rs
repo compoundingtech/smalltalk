@@ -19397,8 +19397,9 @@ async fn refresh_graph_delivery_gate_with_report(
                 // Close before retrying, even if the previous permit has time left. A late
                 // response from the cancelled attempt can never authorize native input.
                 gate.unavailable();
-                report(gate);
                 if attempt == 1 {
+                    // Publish only the final result so a recovered retry does not flap health.
+                    report(gate);
                     return Err(error).context(
                         "new native handoffs held until graph delivery control is available",
                     );
@@ -19415,11 +19416,14 @@ fn native_delivery_control_report(
     transport: &str,
     gate: &st_drivers::session_control::DeliveryGate,
 ) -> Value {
+    use st_drivers::session_control::DeliveryBlockReason;
     let mut report: Value = serde_json::from_str(&native_delivery_report(transport, None))
         .expect("native delivery reports are JSON");
-    let blocked = gate.blocked_reason();
-    report["ready"] = json!(blocked.is_none());
-    report["reason"] = json!(blocked.map(|reason| reason.description()));
+    // A deliberate graph hold is normal control, independent of mailbox readiness.
+    let unavailable = gate.blocked_reason()
+        .filter(|reason| *reason == DeliveryBlockReason::ControlUnavailable);
+    report["ready"] = json!(unavailable.is_none());
+    report["reason"] = json!(unavailable.map(|reason| reason.description()));
     report
 }
 
@@ -26130,10 +26134,22 @@ mission "review" state="ready" {
         assert!(archive.join(filename).is_file());
     }
 
+    #[test]
+    fn graph_delivery_deliberate_hold_keeps_mailbox_ready() {
+        let gate = st_drivers::session_control::DeliveryGate::default();
+        gate.update(true, DELIVERY_CONTROL_LEASE);
+        assert!(gate.held(), "a deliberate hold must still block native input");
+        for transport in ["app-server", "opencode-server"] {
+            let report = native_delivery_control_report(transport, &gate);
+            assert_eq!(report["ready"], true, "a deliberate hold is healthy control");
+            assert!(report["reason"].is_null());
+        }
+    }
+
     #[tokio::test]
     async fn graph_delivery_control_retries_once_and_keeps_late_reads_closed() {
         use axum::{Json, Router, routing::get};
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use st_drivers::session_control::{DeliveryBlockReason, DeliveryGate};
 
         for delayed_reads in [1, usize::MAX] {
@@ -26141,10 +26157,21 @@ mission "review" state="ready" {
             let socket = root.path().join("control.sock");
             let reads = Arc::new(AtomicUsize::new(0));
             let count = reads.clone();
+            let gate = DeliveryGate::default();
+            gate.update(false, DELIVERY_CONTROL_LEASE);
+            let handler_gate = gate.clone();
+            let retry_held = Arc::new(AtomicBool::new(false));
+            let handler_retry_held = retry_held.clone();
             let app = Router::new().route("/v1/delivery/hold", get(move || {
                 let count = count.clone();
+                let gate = handler_gate.clone();
+                let retry_held = handler_retry_held.clone();
                 async move {
-                    if count.fetch_add(1, Ordering::SeqCst) < delayed_reads {
+                    let attempt = count.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 1 {
+                        retry_held.store(gate.held(), Ordering::SeqCst);
+                    }
+                    if attempt < delayed_reads {
                         tokio::time::sleep(Duration::from_millis(350)).await;
                     }
                     Json(json!({"api_version":"st3.v1", "value": {
@@ -26161,8 +26188,6 @@ mission "review" state="ready" {
             }
             assert!(socket.exists());
             let client = Client::unix(&socket);
-            let gate = DeliveryGate::default();
-            gate.update(false, DELIVERY_CONTROL_LEASE);
             let mut reported = Vec::new();
             let started = Instant::now();
             let result = refresh_graph_delivery_gate_with_report(
@@ -26171,14 +26196,14 @@ mission "review" state="ready" {
             ).await;
             assert!(started.elapsed() < DELIVERY_CONTROL_LEASE);
             assert_eq!(reads.load(Ordering::SeqCst), 2, "exactly one retry");
-            assert_eq!(reported[0], Some(DeliveryBlockReason::ControlUnavailable));
+            assert!(retry_held.load(Ordering::SeqCst), "native input must be closed during the retry");
             if delayed_reads == 1 {
                 result.unwrap();
-                assert_eq!(reported, [Some(DeliveryBlockReason::ControlUnavailable), None]);
+                assert_eq!(reported, [None], "a recovered retry must not flap health");
                 assert!(!gate.held());
             } else {
                 assert!(result.is_err());
-                assert_eq!(reported, [Some(DeliveryBlockReason::ControlUnavailable); 2]);
+                assert_eq!(reported, [Some(DeliveryBlockReason::ControlUnavailable)]);
                 assert!(gate.held());
                 tokio::time::sleep(Duration::from_millis(400)).await;
                 assert!(gate.held(), "cancelled reads must never grant a permit later");

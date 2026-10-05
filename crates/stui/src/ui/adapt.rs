@@ -650,6 +650,7 @@ fn agents(model: &Model) -> Vec<Agent> {
                         agent.delivery.as_ref()
                             .filter(|delivery| delivery.state == "stale")
                             .and_then(|delivery| delivery.reason.clone())
+                            .filter(|reason| reason.starts_with("delivery-control-unavailable:"))
                     }),
                     under: agent.under.first().map(|relation| {
                         model
