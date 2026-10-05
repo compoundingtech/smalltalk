@@ -128,6 +128,11 @@ impl Kernel for Proc {
 
 /// Start the gateway and serve until the process ends.
 pub fn serve(config_path: &Path) -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!(
+            "the sekrets gateway runs only on Linux: it identifies callers by Linux credentials and cgroups"
+        );
+    }
     let uid = unsafe { libc::getuid() };
     if uid == 0 {
         bail!("run the gateway as the sekrets user, not root");
@@ -175,6 +180,9 @@ fn check_store(store: &Path, uid: u32) -> Result<()> {
     Ok(())
 }
 
+/// The calling process and its Unix user, as the kernel reports them. Linux only: the gateway's
+/// caller checks rest on Linux credentials and cgroups.
+#[cfg(target_os = "linux")]
 fn peer_credentials(stream: &UnixStream) -> io::Result<(i32, u32)> {
     let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
     let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -191,6 +199,14 @@ fn peer_credentials(stream: &UnixStream) -> io::Result<(i32, u32)> {
         return Err(io::Error::last_os_error());
     }
     Ok((credentials.pid, credentials.uid))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_credentials(_stream: &UnixStream) -> io::Result<(i32, u32)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the sekrets gateway runs only on Linux",
+    ))
 }
 
 fn nonce() -> String {
@@ -1208,7 +1224,7 @@ fn clear_cloexec(fds: &[RawFd]) -> io::Result<()> {
 fn open_pty(size: protocol::Winsize) -> Result<(OwnedFd, OwnedFd)> {
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
-    let winsize = libc::winsize {
+    let mut winsize = libc::winsize {
         ws_row: size.rows,
         ws_col: size.cols,
         ws_xpixel: 0,
@@ -1219,8 +1235,8 @@ fn open_pty(size: protocol::Winsize) -> Result<(OwnedFd, OwnedFd)> {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &winsize,
+            std::ptr::null_mut(),
+            &mut winsize,
         )
     };
     if result != 0 {
