@@ -12,7 +12,7 @@ pub fn unreadable_transcript(timeline: &[TimelineEntry]) -> Option<String> {
         TimelineBody::Error(error) if error.code == "transcript-not-bound" => Some(error),
         _ => None,
     })?;
-    // A seat that has said nothing since it started has no transcript yet; that is not a failure.
+    // Pending binding is shown as an availability notice alongside authorized live entries.
     if not_yet(error) {
         return None;
     }
@@ -30,7 +30,7 @@ pub fn unreadable_transcript(timeline: &[TimelineEntry]) -> Option<String> {
     )
 }
 
-/// st's notice that the seat's harness has written nothing since it started.
+/// st's notice that the transcript is not bound yet; this does not prove an idle harness.
 fn not_yet(error: &st3_client::TimelineErrorBody) -> bool {
     error.details.get("not_yet").and_then(Value::as_bool) == Some(true)
 }
@@ -69,17 +69,53 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    for entry in timeline {
+    for (index, entry) in timeline.iter().enumerate() {
         let at = clock(&entry.timestamp);
         if let TimelineBody::Message(message) = &entry.body {
             mail = message
                 .message_id
                 .starts_with("message/")
                 .then_some(message);
+            if !message.attachments.is_empty()
+                && !timeline
+                    .get(index + 1)
+                    .is_some_and(|next| matches!(next.body, TimelineBody::Content(_)))
+            {
+                stamped.push((
+                    entry.timestamp.clone(),
+                    Entry {
+                        id: message.message_id.clone(),
+                        at,
+                        body: Body::Event(format!(
+                            "media from {}: {}",
+                            name(message.from.as_deref().unwrap_or("Small Talk")),
+                            message
+                                .attachments
+                                .iter()
+                                .map(|attachment| {
+                                    format!("{} · {}", attachment.media_type, attachment.sha256)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )),
+                    },
+                ));
+            }
             continue;
         }
         if let (Some(message), TimelineBody::Content(content)) = (mail.take(), &entry.body) {
-            let body = clean_message_text(content.text.as_deref().unwrap_or(""));
+            let mut body = content_text(content);
+            for attachment in &message.attachments {
+                if !attachment.media_type.starts_with("image/") {
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    body.push_str(&format!(
+                        "[media: {} · {}]",
+                        attachment.media_type, attachment.sha256
+                    ));
+                }
+            }
             let from = message.from.as_deref().unwrap_or_default();
             let body = if from == "daemon/runtime" {
                 // Step-ready pings are graph events, not conversation.
@@ -148,7 +184,7 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     }
                 }
                 // Harness markup becomes what it means; context blocks disappear.
-                let bodies = harness_bodies(
+                let mut bodies = harness_bodies(
                     entry.role == TimelineRole::User,
                     content.text.as_deref().unwrap_or(""),
                     &shown,
@@ -156,6 +192,15 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                 );
                 if bodies.iter().any(|body| matches!(body, Body::User(_))) {
                     skills.clear();
+                }
+                if content.attachment_id.is_some()
+                    || (content.text.is_none() && content.media_type != "text/plain")
+                {
+                    bodies.push(Body::Event(format!(
+                        "[media: {} · {}]",
+                        content.media_type,
+                        content.attachment_id.as_deref().unwrap_or("reference unavailable")
+                    )));
                 }
                 for (index, mut body) in bodies.into_iter().enumerate() {
                     if let Body::Mail { from, to, .. } = &mut body {
@@ -175,14 +220,14 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
             }
             (TimelineRole::Assistant, TimelineBody::Content(content)) => {
                 skills.clear();
-                let text = clean_message_text(content.text.as_deref().unwrap_or(""));
+                let text = content_text(content);
                 if text.is_empty() {
                     continue;
                 }
                 Body::Assistant(text)
             }
             (TimelineRole::Tool, TimelineBody::Content(content)) => {
-                let text = clean_message_text(content.text.as_deref().unwrap_or(""));
+                let text = content_text(content);
                 if text.is_empty() {
                     continue;
                 }
@@ -252,8 +297,8 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                         "delivery failing · retrying".into()
                     })
                 }
-                "transcript-not-bound" if not_yet(error) => {
-                    Body::Event("nothing in the harness yet since this seat started".into())
+                "transcript-not-bound" => {
+                    Body::Event(format!("transcript unavailable: {}", error.message))
                 }
                 "native-delivery-recovered" => {
                     delivery.insert(entry.id.clone(), true);
@@ -265,7 +310,52 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                 }
                 _ => Body::Event(format!("error: {}", error.message)),
             },
-            _ => continue,
+            (_, TimelineBody::Status(status)) => Body::Event(format!(
+                "status: {}{}",
+                match status.status {
+                    st3_client::TimelineStatus::Queued => "queued",
+                    st3_client::TimelineStatus::Running => "running",
+                    st3_client::TimelineStatus::Waiting => "waiting",
+                    st3_client::TimelineStatus::Completed => "completed",
+                    st3_client::TimelineStatus::Failed => "failed",
+                    st3_client::TimelineStatus::Cancelled => "cancelled",
+                    st3_client::TimelineStatus::Unknown => "unknown",
+                },
+                status
+                    .detail
+                    .as_ref()
+                    .map(|detail| format!(" · {detail}"))
+                    .unwrap_or_default()
+            )),
+            (_, TimelineBody::Usage(usage)) => Body::Event(format!(
+                "usage: {}",
+                serde_json::to_string(usage).expect("timeline usage is serializable")
+            )),
+            (_, TimelineBody::Redaction(redaction)) => Body::Event(format!(
+                "content withheld: {} ({} bytes{})",
+                redaction.reason,
+                redaction.withheld_bytes,
+                redaction
+                    .withheld_items
+                    .map(|items| format!(", {items} items"))
+                    .unwrap_or_default()
+            )),
+            (_, TimelineBody::Truncation(truncation)) => Body::Event(format!(
+                "history omitted: {} (sequences {}–{}{})",
+                truncation.reason,
+                truncation.omitted_from_sequence,
+                truncation.omitted_to_sequence,
+                if truncation.continuation_cursor.is_some() {
+                    "; older history available"
+                } else {
+                    ""
+                }
+            )),
+            (_, TimelineBody::Unknown { entry_type, .. }) => Body::Event(format!(
+                "unsupported timeline entry: {entry_type} (content not displayed)"
+            )),
+            (_, TimelineBody::Content(content)) => Body::Event(content_text(content)),
+            (_, TimelineBody::Message(_)) => unreachable!("messages are handled above"),
         };
         stamped.push((
             entry.timestamp.clone(),
@@ -286,6 +376,20 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
         }
     }
     fold_events(stamped.into_iter().map(|(_, entry)| entry), &delivery)
+}
+
+/// Preserve authorized attachment references without fetching payloads or decoding unknown bodies.
+fn content_text(content: &st3_client::TimelineContentBody) -> String {
+    let mut text = clean_message_text(content.text.as_deref().unwrap_or(""));
+    if let Some(reference) = &content.attachment_id {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("[media: {} · {reference}]", content.media_type));
+    } else if text.is_empty() && content.media_type != "text/plain" {
+        text = format!("[media: {} · reference unavailable]", content.media_type);
+    }
+    text
 }
 
 /// A delivery pause that recovered is one quiet line, and a run of the same event line is one

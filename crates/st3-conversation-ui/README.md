@@ -6,6 +6,12 @@ delivery/markup cleaning (`adapt`, `clean_message_text`), pane state and intents
 selection text, density/fold identities, and serializable style rules. The shared transcript
 fixtures in `fixtures/clients/transcripts` are the contract with the phone's TypeScript model.
 
+Exposed status, usage, redaction, truncation and unsupported timeline variants remain visible
+as event notices. Unsupported bodies are not dumped. Attachment-only native content preserves
+its media type and authorized reference without fetching bytes; graph mail keeps image refs
+and labels other media. An unbound transcript is unavailable, not evidence that the harness
+has done nothing. Projection availability warnings keep their supplied explanation.
+
 ```toml
 [dependencies]
 st3-conversation-ui = { path = "../st3-conversation-ui" }

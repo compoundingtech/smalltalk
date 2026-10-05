@@ -577,6 +577,85 @@ fn claude_skill_renders_folded_and_opens_with_its_newlines_and_quoted_tag() {
 }
 
 #[test]
+fn exposed_timeline_variants_and_media_are_visible_without_unknown_payloads() {
+    let bodies = [
+        (
+            "status",
+            serde_json::json!({"status":"waiting","detail":"approval"}),
+        ),
+        (
+            "usage",
+            serde_json::json!({"semantics":"response","driver":"omp","input_tokens":12,"cost":0.25,"attribution":{"agent_id":"agent/a","mission_run_id":null,"generation_id":null,"step_id":null}}),
+        ),
+        (
+            "redaction",
+            serde_json::json!({"reason":"credential","withheld_bytes":42,"withheld_items":2}),
+        ),
+        (
+            "truncation",
+            serde_json::json!({"reason":"window","omitted_from_sequence":1,"omitted_to_sequence":9}),
+        ),
+        ("future-secret", serde_json::json!({"secret":"must-not-render"})),
+        (
+            "content",
+            serde_json::json!({"media_type":"image/png","attachment_id":"attachment/safe"}),
+        ),
+        (
+            "error",
+            serde_json::json!({"code":"transcript-not-bound","message":"transcript not bound: path unknown","retryable":true,"details":{"not_yet":true}}),
+        ),
+    ];
+    let timeline = bodies
+        .iter()
+        .enumerate()
+        .map(|(index, (kind, body))| {
+            serde_json::from_value(serde_json::json!({
+                "id":format!("entry/{index}"),"sequence":index,"revision":1,
+                "timestamp":"2026-10-05T10:00:00Z","role":"assistant","final":true,
+                "type":kind,"body":body
+            }))
+            .unwrap()
+        })
+        .collect::<Vec<st3_client::TimelineEntry>>();
+    let rendered = adapt::conversation(&timeline, &Default::default());
+    let display = serde_json::to_string(&rendered).unwrap();
+    for visible in [
+        "waiting",
+        "approval",
+        "input_tokens",
+        "0.25",
+        "credential",
+        "42",
+        "window",
+        "1–9",
+        "future-secret",
+        "attachment/safe",
+        "image/png",
+        "transcript unavailable",
+    ] {
+        assert!(display.contains(visible), "missing {visible}: {display}");
+    }
+    assert!(!display.contains("must-not-render"));
+    assert!(!display.contains("nothing in the harness"));
+    assert_eq!(rendered.len(), timeline.len());
+}
+
+#[test]
+fn attachment_only_content_survives_for_each_native_role() {
+    for role in ["user", "system", "assistant", "tool", "future-role"] {
+        let entry = serde_json::from_value(serde_json::json!({
+            "id":"image","sequence":1,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+            "role":role,"final":true,"type":"content",
+            "body":{"media_type":"image/png","attachment_id":"attachment/safe"}
+        }))
+        .unwrap();
+        let rendered = adapt::conversation(&[entry], &Default::default());
+        let display = serde_json::to_string(&rendered).unwrap();
+        assert!(display.contains("attachment/safe"), "{role}: {display}");
+    }
+}
+
+#[test]
 fn only_structural_delivery_envelopes_split_harness_content() {
     let envelope = "<smalltalk-message id=\"a1\" from=\"person/example\" to=\"agent/example/quay\" subject=\"Keys &amp; locks\" sha256=\"00\" graph=\"message/a1\">\nRotate &lt;all&gt; keys.\n</smalltalk-message>";
     for raw in [
@@ -685,4 +764,21 @@ fn wrapping_multiline_runs_preserves_blank_rows_styles_and_copy_boundaries() {
         rows.iter().any(|line| text::plain(line) == "## Messages"
             && line.spans[0].style.fg == Some(Color::Blue))
     );
+}
+
+#[test]
+fn attachment_only_mail_and_non_image_refs_remain_visible() {
+    let message: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({
+        "id":"mail","sequence":1,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+        "role":"user","final":true,"type":"message",
+        "body":{"message_id":"message/media","role":"user","from":"person/ada","to":"agent/a",
+            "attachments":[{"blob":"blob/safe-hash","origin":"host/test","sha256":"safe-hash","media_type":"application/pdf","name":"document.pdf","size":12}]}
+    }))
+    .unwrap();
+    let standalone = adapt::conversation(std::slice::from_ref(&message), &Default::default());
+    let display = serde_json::to_string(&standalone).unwrap();
+    assert!(display.contains("safe-hash") && display.contains("application/pdf"));
+    let content = item("content", 2, 1, "");
+    let paired = adapt::conversation(&[message, content], &Default::default());
+    assert!(matches!(&paired[0].body, Body::Mail { body, .. } if body.contains("safe-hash")));
 }
