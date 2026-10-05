@@ -684,6 +684,10 @@ const PROBES: &[Probe] = &[
         "/v1/messages/page?include_closed=false&limit=100&to={seat}",
     ),
     get(
+        "GET /v1/messages/thread/{*subject}",
+        "/v1/messages/thread/{message}",
+    ),
+    get(
         "GET /v1/messages/read/{*subject}",
         "/v1/messages/read/{message}",
     ),
@@ -694,6 +698,7 @@ const PROBES: &[Probe] = &[
     get("GET /v1/status", "/v1/status?subject={seat}"),
     get("GET /v1/desired/{*subject}", "/v1/desired/{seat}"),
     get("GET /v1/events", "/v1/events?limit=100"),
+    get("GET /v1/events/page", "/v1/events/page?after=0&limit=100"),
     // The route streams JSON Lines rather than the JSON document the HTTP probe expects.
     // Measure the same paged exporter directly, normalizing work by archive bytes.
     direct("GET /v1/backup", |store, _, _| {
@@ -727,6 +732,10 @@ const PROBES: &[Probe] = &[
     get(
         "GET /v1/mission-runs",
         "/v1/mission-runs?mission={mission_name}",
+    ),
+    get(
+        "GET /v1/mission-runs/tree",
+        "/v1/mission-runs/tree?run={run}&limit=200",
     ),
     get(
         "GET /v1/mission-overview",
