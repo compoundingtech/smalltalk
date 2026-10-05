@@ -19,7 +19,7 @@ const scenarios = [
   ], answers: [
     { questionId: 'color', options: ['Red'] },
     { questionId: 'extras', options: ['Beta', 'Alpha'], text: 'Gamma extra' },
-    { questionId: 'note', options: [], text: process.env.SMOKE_BROWSER_HOLD ? 'Custom text from the browser' : 'Custom text with a newline\nsecond line' },
+    { questionId: 'note', options: [], text: 'Custom text with a newline\nsecond line' },
   ] },
   { id: 'native-ask-single', questions: [{ id: 'single', question: 'Choose the next answer', options: [{ label: 'Keep' }, { label: 'Change' }] }], answers: [{ questionId: 'single', options: ['Change'] }] },
   { id: 'native-ask-text', questions: [{ id: 'text', question: 'Supply free text', options: [{ label: 'Preset' }] }], text: 'Literal free text' },
@@ -74,10 +74,6 @@ const answer = async (key, parameters, person = true) => {
   const body = { api_version: 'st3.client.v0', id: 'action/' + key, type: 'harness.answer_ask', idempotency_key: 'native-ask-smoke-' + key, fence: { snapshot_id: cap.envelope.snapshot.id }, parameters };
   return { ...await request('/v1/client/actions', body, person), body };
 };
-const browserMode = Boolean(process.env.SMOKE_BROWSER_HOLD);
-const browserScenarios: Readonly<Record<string, true | undefined>> = {
-  'native-ask-mixed': true, 'native-ask-text': true, 'native-ask-conflict': true,
-};
 let daemonProcess;
 const deadline = setTimeout(() => { daemonProcess?.kill(); void pty('kill', 'native-smoke').catch(() => {}); }, process.env.SMOKE_BROWSER_HOLD ? 1800000 : 150000);
 try {
@@ -97,7 +93,6 @@ try {
   let oldRef;
   for (scenarioIndex = 0; scenarioIndex < scenarios.length; scenarioIndex += 1) {
     const scenario = scenarios[scenarioIndex];
-    if (browserMode && !browserScenarios[scenario.id]) continue;
     if (scenario.switchSession) {
       const previousSession = (await read()).native.binding.session_id;
       await pty('send', 'native-smoke', '--seq', '/new', '--seq', 'key:return');
@@ -112,23 +107,17 @@ try {
     }
     const queued = await poll(async () => { const q = await read(); return q.native?.pending_ask?.tool_call_id === scenario.id ? q : false; }, 'native pending ' + scenario.id);
     const pending = queued.native.pending_ask;
-    const parameters = scenario.text === undefined ? { _tag: 'Selection', askRef: pending.ask_ref, answers: scenario.answers } : { _tag: 'Text', askRef: pending.ask_ref, text: scenario.text };
-    let browserOperation: string | undefined;
-    if (browserMode) {
-      if (!queued.native.ask_supported) throw Error('Browser native answer unsupported ' + JSON.stringify(queued.native));
-      const ready = { root, socket, client_socket: root + '/client.sock', subject, scenario_id: scenario.id, phase: 'ready', session_id: queued.native.binding.session_id, pending, parameters };
-      await Bun.write(root + '/browser-ready.json', JSON.stringify(ready));
-      await Bun.write(root + '/browser-state.json', JSON.stringify({ scenario_id: scenario.id, phase: 'ready' }));
-      console.log('ASK_BROWSER_READY ' + JSON.stringify({ root, socket, client_socket: ready.client_socket, subject, scenario_id: scenario.id, session_id: ready.session_id }));
-      browserOperation = await poll(async () => {
-        const marker = Bun.file(root + '/browser-submitted-' + scenario.id + '.json');
-        if (!await marker.exists()) return false;
-        const submitted: unknown = await marker.json();
-        if (!submitted || typeof submitted !== 'object' || !('operation_id' in submitted) || typeof submitted.operation_id !== 'string' || !submitted.operation_id) throw Error('Browser submission marker requires its actual UI operation_id');
-        return submitted.operation_id;
-      }, 'actual browser action response ' + scenario.id);
+    if (process.env.SMOKE_BROWSER_HOLD && scenarioIndex === 0) {
+      const ready = { root, socket, client_socket: root + '/client.sock', subject, session_id: queued.native.binding.session_id, pending, parameters: { _tag: 'Selection', askRef: pending.ask_ref, answers: scenario.answers } };
+      await Bun.write(root + '/browser-ready.json', JSON.stringify(ready)); console.log('ASK_BROWSER_READY ' + JSON.stringify({ root, socket, client_socket: root + '/client.sock', subject, session_id: ready.session_id }));
+      await poll(async () => !(await read()).native.pending_ask, 'browser native answer');
+      const actual = JSON.parse(await readFile(root + '/native-result-' + scenario.id + '.json', 'utf8'));
+      if (actual.is_error) throw Error('Browser answer did not resolve the actual native ask');
+      await poll(async () => (await read()).native.idle, 'browser model continuation idle');
+      console.log('ASK_BROWSER_NATIVE_RESULT ' + JSON.stringify(actual));
+      break;
     }
-    if (oldRef && !browserMode) {
+    if (oldRef) {
       const stale = await answer('stale-' + scenarioIndex, { _tag: 'Selection', askRef: oldRef, answers: scenarios[0].answers });
       if (stale.status < 400 || stale.envelope.code !== 'ask-no-longer-pending') throw Error('Stale askRef admitted ' + JSON.stringify(stale));
       if ((await read()).native.pending_ask.tool_call_id !== scenario.id) throw Error('Stale response changed the new ask');
@@ -158,25 +147,16 @@ try {
       break;
     }
     if (!queued.native.ask_supported) throw Error('Native guarded answer unsupported ' + JSON.stringify(queued.native));
-    if (scenarioIndex === 0 && !browserMode) {
+    const parameters = scenario.text === undefined ? { _tag: 'Selection', askRef: pending.ask_ref, answers: scenario.answers } : { _tag: 'Text', askRef: pending.ask_ref, text: scenario.text };
+    if (scenarioIndex === 0) {
       const malformed = await answer('partial', { ...parameters, answers: scenario.answers.slice(0, 1) });
       if (malformed.status < 400 || malformed.envelope.code !== 'invalid-harness-answers') throw Error('Partial answers were admitted');
       const unauthorized = await answer('unauthorized', parameters, false);
       if (unauthorized.status !== 403) throw Error('Unpaired answer was admitted');
     }
-    let operation: string;
-    let admissionStatus: string;
-    if (browserOperation) {
-      const observed = await request('/v1/client/harness-control-receipts/' + encodeURIComponent(browserOperation) + '?subject=' + encodeURIComponent(subject));
-      if (observed.status !== 200 || observed.value.tool_call_id !== scenario.id || observed.value.subject !== subject || JSON.stringify(observed.value.binding) !== JSON.stringify(queued.native.binding) || !['accepted', 'dispatched', 'applied'].includes(observed.value.status)) throw Error('Browser operation lacks the actual matching owner receipt ' + JSON.stringify(observed));
-      operation = observed.value.operation_id;
-      admissionStatus = observed.value.status;
-    } else {
-      const accepted = await answer('valid-' + scenarioIndex, parameters);
-      if (accepted.status !== 200 || accepted.value.status !== 'accepted') throw Error('Owner did not accept pending answer ' + JSON.stringify(accepted));
-      operation = accepted.value.operation_id;
-      admissionStatus = accepted.value.status;
-    }
+    const accepted = await answer('valid-' + scenarioIndex, parameters);
+    if (accepted.status !== 200 || accepted.value.status !== 'accepted') throw Error('Owner did not accept pending answer ' + JSON.stringify(accepted));
+    const operation = accepted.value.operation_id;
     if (scenario.conflict) {
       await poll(async () => (await read()).native.ask_reason === 'native-ask-answer-in-flight', 'admitted native automation');
       // Native clipboard listeners precede extension TUI listeners. The public
@@ -189,15 +169,10 @@ try {
       if (conflicted.outcome?._tag !== 'Indeterminate' || conflicted.outcome.reason !== 'terminal-input-conflict' || conflicted.result) throw Error('Conflict fabricated native answer proof ' + JSON.stringify(conflicted));
       if ((await read()).native.pending_ask?.tool_call_id !== scenario.id) throw Error('Conflict incorrectly cleared the native ask');
       if (await Bun.file(root + '/native-result-' + scenario.id + '.json').exists()) throw Error('Browser automation submitted after human input');
-      if (browserMode) {
-        await Bun.write(root + '/browser-state.json', JSON.stringify({ scenario_id: scenario.id, phase: 'terminal-handoff', receipt: conflicted }));
-        console.log('ASK_BROWSER_TERMINAL_HANDOFF ' + JSON.stringify({ scenario_id: scenario.id, receipt: conflicted }));
-        await poll(async () => await Bun.file(root + '/browser-observed-' + scenario.id + '.json').exists(), 'browser visually observes terminal handoff');
-      }
       await pty('send', 'native-smoke', '--seq', 'key:escape', '--seq', 'key:escape');
       await poll(async () => !(await read()).native.pending_ask, 'terminal-only cancellation');
       await poll(async () => (await read()).native.idle, 'conflict native continuation idle');
-      proof.push({ scenario: scenario.id, admission: admissionStatus, receipt: conflicted, completion: 'manual-terminal-only' });
+      proof.push({ scenario: scenario.id, accepted: accepted.value.status, receipt: conflicted, completion: 'manual-terminal-only' });
       oldRef = pending.ask_ref;
       continue;
     }
@@ -209,18 +184,11 @@ try {
     const expected = scenario.text === undefined ? scenario.answers : [{ questionId: scenario.questions[0].id, options: [], text: scenario.text }];
     const actualAnswers = scenario.questions.length === 1 ? [actual.details] : actual.details.results;
     if (actualAnswers.length !== expected.length || actualAnswers.some((answer, index) => answer.customInput !== expected[index].text || answer.selectedOptions.length !== expected[index].options.length || expected[index].options.some(option => !answer.selectedOptions.includes(option)))) throw Error('Native answers differ from the atomic submission ' + JSON.stringify(actual));
-    if (!browserMode) {
-      const duplicate = await answer('duplicate-' + scenarioIndex, parameters);
-      if (duplicate.status < 400 || duplicate.envelope.code !== 'ask-no-longer-pending') throw Error('Already-settled askRef was admitted');
-    }
+    const duplicate = await answer('duplicate-' + scenarioIndex, parameters);
+    if (duplicate.status < 400 || duplicate.envelope.code !== 'ask-no-longer-pending') throw Error('Already-settled askRef was admitted');
     oldRef = pending.ask_ref;
-    proof.push({ scenario: scenario.id, admission: admissionStatus, receipt: settled, actual });
+    proof.push({ scenario: scenario.id, accepted: accepted.value.status, receipt: settled, actual });
     await poll(async () => (await read()).native.idle, 'native continuation idle');
-    if (browserMode) {
-      await Bun.write(root + '/browser-state.json', JSON.stringify({ scenario_id: scenario.id, phase: 'applied', receipt: settled, actual }));
-      console.log('ASK_BROWSER_NATIVE_RESULT ' + JSON.stringify({ scenario_id: scenario.id, receipt: settled, actual }));
-      await poll(async () => await Bun.file(root + '/browser-observed-' + scenario.id + '.json').exists(), 'browser visually observes native answer ' + scenario.id);
-    }
   }
   if (!providerRequests.some(body => body.messages?.some(message => message.role === 'tool' && message.content.includes('User')))) throw Error('Actual native tool result did not reach model continuation');
   if (!(await readdir(sessions)).some(file => file.endsWith('.jsonl'))) throw Error('Native persisted transcript missing');
