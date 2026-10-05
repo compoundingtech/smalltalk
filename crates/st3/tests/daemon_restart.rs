@@ -808,7 +808,7 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
     }).to_string()).unwrap();
     let incarnation = format!("{}:{started}", std::process::id());
     use sha2::Digest as _;
-    let dir = root.join("catalog/.st3-channel-outbox")
+    let dir = root.join("pi-family-driver/.st3-channel-outbox")
         .join(hex::encode(sha2::Sha256::digest(seat.as_bytes())))
         .join(hex::encode(sha2::Sha256::digest(incarnation.as_bytes())));
     let todo = json!({"type":"todo", "session":"native", "observed_at":"2026-10-03T20:00:01Z",
@@ -915,7 +915,7 @@ async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribu
         .args(["driver", "omp-channel", "--identity", "drain-accounts"])
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped())
         .spawn().unwrap();
-    let dir = root.join("catalog/.st3-channel-outbox")
+    let dir = root.join("pi-family-driver/.st3-channel-outbox")
         .join(hex::encode(sha2::Sha256::digest(seat.as_bytes())))
         .join(hex::encode(sha2::Sha256::digest(incarnation.as_bytes())));
     wait_until("the native drain binds its spool", Duration::from_secs(10), || {

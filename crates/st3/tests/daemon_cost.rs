@@ -1524,6 +1524,25 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             .fields
             .insert("incarnation_id".into(), json!(SEAT_RUNTIME));
         store.append_claim(&running).unwrap();
+        // Fleet work assigns this seat but does not declare a native runtime.
+        // Give the catalogue fixture a real selected declaration before seeding its projection.
+        let kdl = format!(
+            "version 2\nagent {:?} {{ workspace {:?}; command \"true\"; }}\n",
+            seat.strip_prefix("agent/").unwrap(),
+            root,
+        );
+        let intent = st3::parse_intent(&kdl, NODE).unwrap();
+        let planned = store
+            .mission(&intent, st3::model::IntentInput { kdl, source_name: None })
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &planned.subject_tokens,
+                "cost-native-catalogue-declaration",
+                Some("person/bench-operator"),
+            )
+            .unwrap();
         // Measure the bounded catalogue response, not the unsupported-runtime error path.
         use st3_schema::harness_control::{Approval, Binding, ModelChoice, Models, NativeState};
         let native = NativeState {

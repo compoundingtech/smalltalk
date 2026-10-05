@@ -54,6 +54,8 @@ identifier is minted only on the native `agent_start` event.
 OMP channel callers carry the complete resolved driver-path contract: absolute `ST_DRIVER_ROOT`,
 `ST_DRIVER_AGENT_DIR`, `ST_DRIVER_SESSION_DIR`, and the matching `ST_DRIVER_IDENTITY`.
 Native controls persist their outbox in that session directory; a catalog alone is not a substitute.
+The resolved `ST_DRIVER_ROOT` takes precedence over `--catalog`; standalone todo spools are under
+that root's `.st3-channel-outbox/<subject-hash>/<incarnation-hash>`, not under the observations directory.
 The Rust and Swift clients retain the schema's queue/model error codes as typed values.
 The control lease activates only after an actual native control observation and survives channel
 re-exec. It does not enable push-mail subscriptions on legacy OMP channels: their existing delivery
