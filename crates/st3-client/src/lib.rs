@@ -542,7 +542,9 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::NotFound => format!("it is gone: {message}"),
         ErrorCode::Forbidden => format!("not allowed: {message}"),
         ErrorCode::Internal => format!("st hit a problem: {message}"),
-        ErrorCode::TimelineHistoryIncomplete => message.to_owned(),
+        ErrorCode::TimelineHistoryIncomplete | ErrorCode::InventoryUnavailable => {
+            message.to_owned()
+        }
         ErrorCode::TerminalEnded => "the terminal ended: its process exited".into(),
         ErrorCode::TerminalUnavailable => "the terminal cannot be reached right now".into(),
         ErrorCode::BlobTooLarge => "the image is too large; the limit is 10 MiB".into(),
