@@ -1410,6 +1410,14 @@ fn the_cost_route_inventory_resolves_the_client_read_forward_constant() {
     assert!(declared.contains("POST /v1/internal/client-read/forward"));
 }
 
+#[test]
+#[should_panic(expected = "resolve the nonliteral route path: crate::peer::OTHER_PATH")]
+fn the_cost_route_inventory_rejects_an_unknown_path_expression() {
+    declared_routes(
+        "fn router_for_transport() { Router::new().route(crate::peer::OTHER_PATH, post(handler)) }",
+    );
+}
+
 struct Measured {
     claims: u64,
     costs: BTreeMap<String, Cost>,
