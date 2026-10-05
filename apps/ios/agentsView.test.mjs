@@ -79,3 +79,9 @@ assert.equal(stateOf({ state: 'waiting', harness_state: 'unauthenticated', fault
 assert.equal(stateOf({ state: 'waiting', harness_state: 'idle', reason: 'providerAuth', fault: null, delivery: null }), 'needs-login');
 assert.equal(stateOf({ state: 'running', harness_state: 'idle', fault: null, delivery: null }), 'idle');
 assert.match(loginGuidance({ driver: 'claude', host_id: 'host/harbor' }), /Claude login required on harbor: open its terminal and run \/login/);
+
+// An idle seat st has not heard from lately reads idle, not starting.
+assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: 'stale', reachability: 'reachable', fault: null, delivery: null }), 'idle');
+assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: 'current', reachability: 'reachable', fault: null, delivery: null }), 'starting');
+assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: null, reachability: 'reachable', fault: null, delivery: null }), 'starting');
+assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: 'stale', reachability: 'unreachable', fault: null, delivery: null }), 'starting');
