@@ -11354,10 +11354,9 @@ impl Store {
             let bare = parent.strip_prefix("message/").unwrap_or(&parent);
             let mut statement = connection
                 .prepare_cached(
-                    "SELECT DISTINCT message_index.subject FROM message_reply_edges AS edge
-                 JOIN message_index ON message_index.subject=edge.subject
+                    "SELECT edge.subject FROM message_reply_edges AS edge INDEXED BY message_reply_edges_parent
                  WHERE edge.parent IN (?1, ?2)
-                 ORDER BY message_index.created_index, message_index.subject LIMIT 201",
+                 ORDER BY edge.parent, edge.subject LIMIT 201",
                 )
                 .map_err(internal)?;
             let candidates = statement
