@@ -5263,6 +5263,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
             .map(|relay| relay.with_links(store.clone())),
         native_session_home: std::env::var_os("HOME").map(PathBuf::from),
         planner_default: config.planner.clone(),
+        private_notes: Arc::new(st3::private_notes::Authority {
+            person: config.person.clone(),
+            catalogs: config.private_notes_catalogs.clone(),
+        }),
     };
     st3::gate_check::set_endpoint(config.socket.display().to_string());
     let reconciler = Arc::new(Reconciler::native(
@@ -20988,6 +20992,7 @@ mod tests {
             pty_root: root.path().join("pty"), pty_binary: "pty".into(),
             fleet_id: None, configured_peers: vec![], client_relay: None,
             native_session_home: None, planner_default: Default::default(),
+            private_notes: Default::default(),
         };
         let path = root.path().join("api.sock");
         let socket = path.clone();
@@ -22290,6 +22295,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {
@@ -22382,6 +22388,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {
@@ -22457,6 +22464,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
         let app = router(state).layer(axum::middleware::from_fn(
@@ -24313,6 +24321,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {
@@ -26007,6 +26016,7 @@ mission "review" state="ready" {
             client_relay: None,
             native_session_home: None,
             planner_default: PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {

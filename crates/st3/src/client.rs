@@ -1373,6 +1373,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: Default::default(),
+            private_notes: Default::default(),
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();

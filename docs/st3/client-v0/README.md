@@ -32,6 +32,81 @@ The collections socket's `CollectionCommand` and `CollectionFrame` definitions l
 schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
 command/frame definitions, and subscription bound; see [collections](collections.md).
 
+### Owner-local private notes
+
+`GET /v1/client/private-notes/{uri}` accepts one fully percent-encoded canonical
+`dev.schickling.agent-private-notes://HOST/IDENTITY` URI. The pure canonical URI
+contract lives in `st3-schema::private_notes`; clients never send a filesystem path or UID.
+The response is a `PrivateNotesSubject` envelope value with `ref`, `family`,
+`schema`, `data`, `actions`, and `live`. Its data contains the current Markdown and
+the carrier-generation/revision fence; `live` is null. Missing bytes are empty
+only when the declaration and owned resource directory already exist.
+
+The daemon's `private_notes_catalogs` configuration lists absolute owner-local
+catalog roots. Each source must declare the exact self URI in
+`agents/HOST/IDENTITY/agent.kdl`; its filesystem byte authority remains
+`resources/private-notes.md`. Resolution refuses divergent carriers, symlink
+traversal, foreign ownership, and group/world-writable sources or destinations.
+No Markdown, notes revision, content digest, or local recovery receipt enters
+fleet claims, collections, or replication.
+
+Only the daemon's configured `person` has principal notes entitlement.
+`notes.read` and `notes.write` are explicit requested pairing scopes; neither the
+implicit limited nor full-control pairing defaults includes them. A local person
+header is only an identity selector and never grants private notes access.
+Notes credentials require an immutable, owner-local attestation of the exact
+challenge and completed pairing claim. Public claim writes cannot create,
+complete, or revoke pairings. Legacy unmarked and replicated pairing claims do
+not acquire notes authority, even for the same person. Expiry and revocation
+remain checked on every authenticated request.
+
+Bootstrap delegation requires a positively admitted authenticated local login,
+the configured person, and an unbound client; another already-attested notes
+credential may delegate only its existing notes scopes. Linux admission
+revalidates the kernel socket-peer lifetime and current parent chain on each
+bootstrap. A root-owned system-bus login issuer must report a live PAM `sshd`
+session for the daemon OS-owner UID with the exact ancestor leader lifetime.
+Every direct local notes request carries independent native-peer classification
+on both the primary and paired listeners. Recognized agents and unavailable
+provenance cannot begin or complete delegation or use person notes grants.
+For bootstrap, each relevant OS-owner process up to the exact PAM leader must
+be inspectable; an unreadable or non-dumpable process fails closed, not as a
+verified non-agent. PID 1, detached processes, person selectors and user-service
+cgroups are not bootstrap authority. Missing kernel or system login support
+fails closed; no uncredentialed content access is available.
+
+A direct privileged root peer, distinct from the daemon OS owner and fenced by
+its live kernel pidfd, is a trusted paired transport only. It never receives
+person-header or bootstrap authority. Notes still require the configured
+person's explicitly scoped, immutable owner-local paired credential and current
+expiry/revocation checks. The daemon does not prove whether a human or agent is
+behind that proxy. Likewise, this API is not credential isolation against
+arbitrary processes sharing the owner's OS credentials. Native provenance
+unavailable on a platform means local paired notes access fails closed there;
+cross-platform clients may use an admitted owning gateway.
+
+Recognized direct native peers never write or delegate notes authority. Optional native
+self-read is unavailable without admitted reader-incarnation provenance:
+the detail route returns `unsupported-capability` without content, revision,
+or digest. Ordinary native harness observation delivery has no private-notes
+source admission or mutation-lock dependency.
+
+`private-notes.write` requires `notes.write`, the returned action fence, a stable
+idempotency key, the canonical URI, and complete Markdown. Supported writers must
+use this API: writes serialize across daemon processes, compare carrier generation
+and revision, then durably record intent before an atomic owned sibling replacement.
+Exact retries recover the private outcome without overwriting a newer edit.
+The local-only result carries its successor fence as `ActionResult.private_notes`.
+Its `affected_ids` is empty because a canonical notes URI is not a generic graph ID;
+unrelated collection projections do not receive notes invalidations.
+Changed key reuse conflicts; stale editors and replaced carriers are refused.
+An interrupted replacement remains `private-notes-indeterminate` until its exact
+key is reconciled. External filesystem editors are not coordinated writers;
+changes between operations invalidate the next revision fence.
+Markdown must fit the existing 1 MiB encoded response bound, with room reserved
+for URI/fence and snapshot metadata; writes cannot create an unreadable oversized response.
+
+
 ### Agent activity and human blocking
 
 An agent's `harness_state` describes activity independently of its optional `blocked_on`, `ask`,

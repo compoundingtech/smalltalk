@@ -27,6 +27,7 @@ fn raw_app(root: &Path, node: &str) -> crate::api::AppState {
         client_relay: None,
         native_session_home: None,
         planner_default: crate::model::PlannerSpec::default(),
+        private_notes: Default::default(),
     }
 }
 

@@ -68,6 +68,7 @@ mod harness_events;
 mod mailbox;
 mod mail_backlog;
 mod owned_sets;
+mod private_notes_login;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
@@ -86,6 +87,7 @@ pub struct AppState {
     pub client_relay: Option<crate::peer::ClientRelay>,
     pub native_session_home: Option<std::path::PathBuf>,
     pub planner_default: PlannerSpec,
+    pub private_notes: Arc<crate::private_notes::Authority>,
 }
 
 const CLIENT_API_VERSION: &str = "st3.client.v0";
@@ -245,12 +247,17 @@ impl ApiError {
             | "stale-launch-preview"
             | "fleet-leaving"
             | "glass-deleted"
+            | "stale-fence"
+            | "idempotency-conflict"
+            | "private-notes-carrier-conflict"
             | "glass-limit" => StatusCode::CONFLICT,
             "launch-review-not-authorized"
             | "wrong-message-recipient"
             | "lane-approval-denied"
+            | "forbidden"
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
+            "private-notes-unreachable" | "private-notes-indeterminate" => StatusCode::SERVICE_UNAVAILABLE,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -378,6 +385,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/work/{*id}", get(client_work_detail))
         .route("/v1/client/agents", get(client_agents))
         .route("/v1/client/resources", get(client_v0::resources::list))
+        .route("/v1/client/private-notes/{*uri}", get(client_v0::private_notes::detail))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
         .route(
             "/v1/client/agent-workspaces/{*id}",
@@ -763,6 +771,9 @@ async fn response_envelope(
             .body(Body::empty())
             .expect("the incoming request has a valid method and URI");
         *auth_request.headers_mut() = request.headers().clone();
+        if let Some(identity) = request.extensions().get::<private_notes_login::Identity>().copied() {
+            auth_request.extensions_mut().insert(identity);
+        }
         let auth_state = state.clone();
         let transport = transport.as_str();
         let auth_profile = profile.clone();
@@ -1109,6 +1120,9 @@ fn client_error_code(code: Option<&str>) -> String {
         | "validation-failed"
         | "idempotency-conflict"
         | "stale-fence"
+        | "private-notes-unreachable"
+        | "private-notes-carrier-conflict"
+        | "private-notes-indeterminate"
         | "timeline-history-incomplete"
         | "cursor-gap"
         | "page-cursor-expired"
@@ -1496,6 +1510,7 @@ async fn client_capabilities(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<client_v0::ClientSession>,
+    bound: Option<Extension<BoundAgent>>,
 ) -> Json<Value> {
     let cursor = format!("event-cursor/{}/{}", state.node, snapshot.store_index);
     let oldest = state
@@ -1503,7 +1518,7 @@ async fn client_capabilities(
         .event_bounds()
         .map(|(oldest, _)| oldest.saturating_sub(1))
         .unwrap_or_default();
-    let capabilities = client_v0::capabilities(&session);
+    let capabilities = client_v0::capabilities(&state, &session, bound.as_ref().map(|bound| &bound.0));
     Json(json!({
         "kind": "capabilities",
         "machine_version": st_drivers::version::machine_version(),
@@ -4543,6 +4558,7 @@ async fn serve_unix_with_ancestor(
         };
         // Every local connection names its caller, so request counts by client are always on.
         let peer_pid = local_peer_pid(&stream);
+        let notes_peer = private_notes_login::Peer::capture(&stream);
         let app = app.clone();
         tokio::spawn(async move {
             // /proc ancestry may fault in pages on a loaded host. Keep that work
@@ -4561,13 +4577,33 @@ async fn serve_unix_with_ancestor(
                 .unwrap_or_default(),
                 None => (None, None, None),
             };
+            let notes_peer = notes_peer.filter(|_| bound_agent.is_none()).map(Arc::new);
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
                 let bound_agent = bound_agent.clone();
                 let caller = caller.clone();
                 let delivery_peer = delivery_peer.clone();
+                let notes_peer = notes_peer.clone();
                 async move {
                     let mut request = request.map(Body::new);
+                    if request.uri().path().starts_with("/v1/client/") {
+                        let mut identity = if bound_agent.is_some() {
+                            private_notes_login::Identity::Agent
+                        } else if let Some(peer) = &notes_peer {
+                            peer.clone().classify().await
+                        } else {
+                            private_notes_login::Identity::Unavailable
+                        };
+                        if bind_ancestry && identity != private_notes_login::Identity::Agent
+                            && request.method() == axum::http::Method::POST
+                            && request.uri().path() == "/v1/client/pairings"
+                            && let Some(peer) = notes_peer
+                            && peer.admitted().await {
+                            identity = private_notes_login::Identity::VerifiedNonAgent;
+                            request.extensions_mut().insert(VerifiedNotesPairingPrincipal);
+                        }
+                        request.extensions_mut().insert(identity);
+                    }
                     if let Some(peer) = delivery_peer {
                         request.extensions_mut().insert(peer);
                     }
@@ -4651,6 +4687,12 @@ mod gateway_listener_tests {
         drop(listener);
     }
 }
+
+/// Bootstrap authority only: a configured-person notes pairing requires a
+/// current root-issued PAM login. This never grants uncredentialed notes access.
+#[derive(Clone, Copy)]
+struct VerifiedNotesPairingPrincipal;
+
 
 #[cfg(target_os = "linux")]
 fn harness_ancestor(mut pid: u32) -> Option<String> {
@@ -14328,6 +14370,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             client_relay: None,
             native_session_home: None,
             planner_default: PlannerSpec::default(),
+            private_notes: Default::default(),
         }
     }
 
@@ -21477,6 +21520,7 @@ agent "seat" { workspace "/tmp"; command "true" }
         let (status, body) = json_request(app, "/v1/harness-events", stale).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
+
 }
 
 #[cfg(test)]

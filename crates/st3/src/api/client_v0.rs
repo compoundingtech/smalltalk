@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 pub(super) mod raw_terminal;
 pub(super) mod resources;
 pub(super) mod search;
+pub(super) mod private_notes;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -1045,6 +1046,8 @@ const ALL_SCOPES: &[&str] = &[
     "control.work",
     "control.runtimes",
     "control.pairing",
+    "notes.read",
+    "notes.write",
 ];
 const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "read.projections",
@@ -1054,7 +1057,12 @@ const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "control.attention",
     "control.launches",
 ];
+
+fn requestable_pairing_scope(scope: &str) -> bool {
+    LIMITED_PAIRING_SCOPES.contains(&scope) || matches!(scope, "notes.read" | "notes.write")
+}
 const ACTIONS: &[&str] = &[
+    "private-notes.write",
     "attention.resolve",
     "review.approve",
     "review.reject",
@@ -1109,6 +1117,7 @@ const ACTIONS: &[&str] = &[
     "pairing.revoke",
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
+    "private-notes.write",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -1243,9 +1252,10 @@ fn session_claim_actor(session: &ClientSession) -> String {
     }
 }
 
-pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
+pub(super) fn capabilities(state: &AppState, session: &ClientSession, bound: Option<&BoundAgent>) -> Vec<Value> {
     let mut capabilities = ALL_SCOPES
         .iter()
+        .filter(|scope| !scope.starts_with("notes.") || bound.is_none() && private_notes::entitled(state, session, scope))
         .map(|scope| {
             json!({
                 "id": scope,
@@ -1256,7 +1266,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         .collect::<Vec<_>>();
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
-    capabilities.extend(ACTIONS.iter().map(|action| {
+    capabilities.extend(ACTIONS.iter().filter(|action| **action != "private-notes.write" || bound.is_none() && private_notes::entitled(state, session, "notes.write")).map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
             "unavailable"
@@ -1315,13 +1325,23 @@ pub(super) fn authenticate(
     request: &Request<Body>,
     transport: &'static str,
 ) -> Result<ClientSession, ApiError> {
+    if request.method() == axum::http::Method::GET
+        && request.uri().path().starts_with("/v1/client/private-notes/")
+        && request.extensions().get::<private_notes_login::Identity>() == Some(&private_notes_login::Identity::Agent) {
+        return Err(ApiError::bad(crate::model::St3Error::new("unsupported-capability",
+            "native private-notes self-read is unavailable without admitted reader-incarnation provenance")));
+    }
     let Some(value) = request.headers().get(AUTHORIZATION) else {
         if transport == "unix" {
             let person = request
                 .headers()
                 .get(LOCAL_PERSON_HEADER)
                 .and_then(|value| value.to_str().ok());
-            return ClientSession::local(person);
+            let mut session = ClientSession::local(person)?;
+            // Person headers never grant private notes, even on an unbound Unix connection.
+            session.scopes.remove("notes.read");
+            session.scopes.remove("notes.write");
+            return Ok(session);
         }
         let pairing_completion = request.method() == axum::http::Method::POST
             && request.uri().path().starts_with("/v1/client/pairings/")
@@ -1385,6 +1405,12 @@ pub(super) fn authenticate(
         .and_then(Value::as_str)
         .filter(|actor| actor.starts_with("person/") && actor.matches('/').count() == 1)
         .ok_or_else(|| ApiError::internal("a paired client has no concrete delegated person"))?;
+    let notes_attested = paired.origin == state.store.origin()
+        && state.private_notes.person.as_deref() == Some(authority_actor)
+        && request.extensions().get::<private_notes_login::Identity>().is_some_and(|peer| peer.allows_paired_notes())
+        && paired.body.pointer("/fields/scopes").and_then(Value::as_array)
+            .is_some_and(|scopes| scopes.iter().filter_map(Value::as_str).any(|scope| scope.starts_with("notes.")))
+        && state.private_notes.pairing_attested(&state.state_dir, paired).map_err(ApiError::bad)?;
     let scopes = paired
         .body
         .pointer("/fields/scopes")
@@ -1392,6 +1418,8 @@ pub(super) fn authenticate(
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
+        // Only a locally sealed real pairing grants this node's notes scopes.
+        .filter(|scope| !scope.starts_with("notes.") || notes_attested)
         .map(str::to_owned)
         .collect();
     let session = ClientSession {
@@ -1401,6 +1429,10 @@ pub(super) fn authenticate(
         scopes,
     };
     if request.method() == axum::http::Method::GET {
+        if request.uri().path() == "/v1/client/capabilities"
+            && (private_notes::entitled(state, &session, "notes.read") || private_notes::entitled(state, &session, "notes.write")) {
+            return Ok(session);
+        }
         let scope = if request
             .uri()
             .path()
@@ -1409,6 +1441,8 @@ pub(super) fn authenticate(
             "read.declarations"
         } else if request.uri().path().starts_with("/v1/client/terminals/") {
             "terminal.read"
+        } else if request.uri().path().starts_with("/v1/client/private-notes/") {
+            "notes.read"
         } else {
             "read.projections"
         };
@@ -5446,13 +5480,16 @@ pub(super) struct PairingBegin {
     device_name: String,
     person_id: String,
     full_control: Option<bool>,
-    /// Narrows the default device grant; every entry must be a limited pairing scope.
+    /// Selects from requestable grants; notes scopes are explicit and owner-local.
     scopes: Option<Vec<String>>,
 }
 
 pub(super) async fn pairing_begin(
     State(state): State<AppState>,
     Extension(session): Extension<ClientSession>,
+    bound: Option<Extension<BoundAgent>>,
+    principal: Option<Extension<VerifiedNotesPairingPrincipal>>,
+    notes_peer: Option<Extension<private_notes_login::Identity>>,
     Json(request): Json<PairingBegin>,
 ) -> Result<Json<Value>, ApiError> {
     if session.transport != "unix" {
@@ -5493,32 +5530,34 @@ pub(super) async fn pairing_begin(
                 "the pairing request cannot combine full control with explicit scopes",
             ));
         }
-        (true, None) => ALL_SCOPES.to_vec(),
+        (true, None) => ALL_SCOPES.iter().copied().filter(|scope| !scope.starts_with("notes.")).collect(),
         (false, None) => LIMITED_PAIRING_SCOPES.to_vec(),
         (false, Some(requested)) => {
             if let Some(unknown) = requested
                 .iter()
-                .find(|scope| !LIMITED_PAIRING_SCOPES.contains(&scope.as_str()))
+                .find(|scope| !requestable_pairing_scope(scope))
             {
-                return Err(validation(format!(
-                    "the pairing scope `{unknown}` is not one of the limited pairing scopes: {}",
-                    LIMITED_PAIRING_SCOPES.join(", ")
-                )));
+                return Err(validation(format!("the pairing scope `{unknown}` is not requestable")));
             }
             if requested.is_empty() {
                 return Err(validation("the pairing request must name at least one scope"));
             }
             // Canonical order, duplicates dropped.
-            LIMITED_PAIRING_SCOPES
+            ALL_SCOPES
                 .iter()
                 .copied()
                 .filter(|scope| requested.iter().any(|requested| requested == scope))
                 .collect()
         }
     };
-    state
-        .store
-        .append_claim(&ClaimInput {
+    let grants_notes = scopes.iter().any(|scope| scope.starts_with("notes."));
+    if grants_notes
+        && (bound.is_some() || !notes_peer.is_some_and(|Extension(peer)| peer.allows_paired_notes())
+            || state.private_notes.person.as_deref() != Some(person_id.as_str())
+            || principal.is_none() && scopes.iter().filter(|scope| scope.starts_with("notes.")).any(|scope| !session.allows(scope))) {
+        return Err(forbidden("notes delegation must be explicitly initiated by the owner node's configured person, not a native agent"));
+    }
+    let begun = state.store.append_claim(&ClaimInput {
             subject,
             kind: "custom.client.pairing-begun".into(),
             actor: Some(person_id.clone()),
@@ -5535,6 +5574,10 @@ pub(super) async fn pairing_begin(
             idempotency_key: None,
         })
         .map_err(ApiError::bad)?;
+    if grants_notes {
+        let writer = state.clone();
+        super::blocking_action(move || writer.private_notes.attest_pairing(&writer.state_dir, &begun)).await?;
+    }
     signal_changed(&state);
     Ok(Json(
         json!({ "kind": "pairing-challenge", "pairing_id": pairing_id, "code": code, "expires_at": client_timestamp(expires_at) }),
@@ -5575,6 +5618,8 @@ pub(super) async fn pairing_complete(
     State(state): State<AppState>,
     Extension(_session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
+    bound: Option<Extension<BoundAgent>>,
+    notes_peer: Option<Extension<private_notes_login::Identity>>,
     Json(request): Json<PairingComplete>,
 ) -> Result<Json<Value>, ApiError> {
     if request.api_version != CLIENT_API_VERSION || request.device_public_key.len() < 32 {
@@ -5647,6 +5692,15 @@ pub(super) async fn pairing_complete(
         None => LIMITED_PAIRING_SCOPES.to_vec(),
         Some(_) => return Err(validation("the pairing has invalid delegated scopes")),
     };
+    let grants_notes = scopes.iter().any(|scope| scope.starts_with("notes."));
+    if grants_notes && (bound.is_some() || !notes_peer.is_some_and(|Extension(peer)| peer.allows_paired_notes())) {
+        return Err(forbidden("native or unavailable local peers cannot complete notes authority delegation"));
+    }
+    if grants_notes
+        && (state.private_notes.person.as_deref() != Some(person_id.as_str()) || begun.origin != state.store.origin()
+            || !state.private_notes.pairing_attested(&state.state_dir, &begun).map_err(ApiError::bad)?) {
+        return Err(forbidden("the notes pairing no longer names this owner node's locally authorized configured person"));
+    }
     let completed = state.store.append_claim(&ClaimInput {
         subject: begun.subject.clone(),
         kind: "custom.client.pairing-completed".into(),
@@ -5673,13 +5727,18 @@ pub(super) async fn pairing_complete(
         expected_subject: Some(Some(begun.id.clone())),
         idempotency_key: None,
     });
-    if let Err(error) = completed {
-        if error.code == "stale-subject" {
-            return Err(forbidden(
-                "the pairing code is invalid, expired, or already used",
-            ));
+    let completed = match completed {
+        Ok(completed) => completed,
+        Err(error) => {
+            if error.code == "stale-subject" {
+                return Err(forbidden("the pairing code is invalid, expired, or already used"));
+            }
+            return Err(ApiError::bad(error));
         }
-        return Err(ApiError::bad(error));
+    };
+    if grants_notes {
+        let writer = state.clone();
+        super::blocking_action(move || writer.private_notes.attest_pairing(&writer.state_dir, &completed)).await?;
     }
     // A device with a real key, paired to send messages, is enrolled: the person's root key
     // grants it as a device key. A device paired only to read gets no key that speaks for the
@@ -6927,6 +6986,7 @@ pub(super) struct Fence {
     runtime_desired_revision: Option<String>,
     terminal_sequence: Option<u64>,
     preview_token: Option<String>,
+    private_notes: Option<crate::private_notes::NotesFence>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -6942,6 +7002,7 @@ pub(super) struct ActionRequest {
 }
 
 fn action_scope(action: &str) -> Option<&'static str> {
+    if action == "private-notes.write" { return Some("notes.write"); }
     if matches!(
         action,
         "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume"
@@ -8584,6 +8645,7 @@ pub(super) async fn action(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
+    bound: Option<Extension<BoundAgent>>,
     Json(request): Json<ActionRequest>,
 ) -> Result<Json<Value>, ApiError> {
     if request.api_version != CLIENT_API_VERSION
@@ -8608,6 +8670,9 @@ pub(super) async fn action(
     let scope = action_scope(&request.action_type)
         .ok_or_else(|| validation("the action type is unknown"))?;
     require_scope(&session, scope)?;
+    if request.action_type == "private-notes.write" {
+        return private_notes::write(&state, &session, bound.as_ref().map(|bound| &bound.0), request).await.map(Json);
+    }
     // Snapshot provenance is checked, while freshness belongs to the action's own
     // revision, generation, incarnation, or screen checks.
     let read_only_terminal_lifecycle = matches!(
@@ -9477,6 +9542,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         }
     }
 
@@ -9747,6 +9813,7 @@ subscription "watch/source" {
                 State(state.clone()),
                 Extension(snapshot.clone()),
                 Extension(session.clone()),
+                None,
                 Json(request.clone()),
             )
             .await
@@ -9767,6 +9834,7 @@ subscription "watch/source" {
                 State(state.clone()),
                 Extension(new_client_snapshot(&state)),
                 Extension(session),
+                None,
                 Json(request),
             )
             .await
@@ -9886,6 +9954,7 @@ subscription "watch/source" {
                 State(state.clone()),
                 Extension(snapshot),
                 Extension(session),
+                None,
                 Json(request),
             )
         };
@@ -10867,6 +10936,7 @@ subscription "watch/source" {
                 State(state.clone()),
                 Extension(new_client_snapshot(&state)),
                 Extension(session.clone()),
+                None,
                 Json(request),
             )
         };
@@ -11621,6 +11691,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: None,
                 preview_token: None,
+                private_notes: None,
             },
             parameters: json!({"target_id": external.id}),
         };
@@ -11637,6 +11708,7 @@ mission "example/zero-run" state="ready" {
             State(state.clone()),
             Extension(new_client_snapshot(&state)),
             Extension(session.clone()),
+            None,
             Json(changed),
         )
         .await
@@ -11647,6 +11719,7 @@ mission "example/zero-run" state="ready" {
             State(state.clone()),
             Extension(new_client_snapshot(&state)),
             Extension(session.clone()),
+            None,
             Json(request),
         )
         .await
@@ -11834,6 +11907,7 @@ mission "example/zero-run" state="ready" {
             State(state.clone()),
             Extension(snapshot),
             Extension(session.clone()),
+            None,
         )
         .await
         .0;
@@ -12452,6 +12526,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: None,
                 preview_token: None,
+                private_notes: None,
             },
             parameters,
         };
@@ -13910,6 +13985,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: Some(1),
                 preview_token: None,
+                private_notes: None,
             },
             parameters: json!({ "target_id": "terminal/agent/terminal-owner" }),
         };
@@ -13985,6 +14061,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: None,
                 preview_token: None,
+                private_notes: None,
             },
             parameters: json!({ "target_id": attachment_id }),
         };
@@ -14157,6 +14234,7 @@ mission "example/zero-run" state="ready" {
             State(state.clone()),
             Extension(snapshot.clone()),
             Extension(session.clone()),
+            None,
             Json(request(
                 "terminal.attach",
                 "fence-attach",
@@ -14170,6 +14248,7 @@ mission "example/zero-run" state="ready" {
             State(state.clone()),
             Extension(snapshot.clone()),
             Extension(session.clone()),
+            None,
             Json(request(
                 "terminal.input",
                 "fence-input",
@@ -14200,6 +14279,7 @@ mission "example/zero-run" state="ready" {
                 State(state.clone()),
                 Extension(snapshot.clone()),
                 Extension(session.clone()),
+                None,
                 Json(request(action_type, action_type, fence.clone(), parameters)),
             )
             .await
@@ -14226,6 +14306,7 @@ mission "example/zero-run" state="ready" {
             State(state.clone()),
             Extension(snapshot),
             Extension(session),
+            None,
             Json(request(
                 "terminal.attach",
                 "fence-replaced",
@@ -14282,6 +14363,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: Some(snapshot.store_index),
                 preview_token: None,
+                private_notes: None,
             },
             parameters: json!({ "target_id": "terminal/agent/concurrent-terminal-owner" }),
         };
@@ -14305,6 +14387,7 @@ mission "example/zero-run" state="ready" {
                             State(state),
                             Extension(snapshot),
                             Extension(session),
+                            None,
                             Json(request),
                         ))
                         .map(|Json(result)| result)
@@ -14466,6 +14549,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: Some(owner.store.index().unwrap()),
                 preview_token: None,
+                private_notes: None,
             },
             parameters: json!({ "target_id": "terminal/agent/fleet-terminal" }),
         };

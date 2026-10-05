@@ -2144,6 +2144,7 @@ mod tests {
                 client_relay: None,
                 native_session_home: None,
                 planner_default: Default::default(),
+                private_notes: Default::default(),
             };
             let path = socket.to_owned();
             let server = tokio::spawn(async move {
@@ -2542,6 +2543,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: st3::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let socket = root.path().join("daemon.sock");
         let server_path = socket.clone();
