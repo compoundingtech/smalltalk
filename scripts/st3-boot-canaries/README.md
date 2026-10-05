@@ -12,6 +12,11 @@ stand-in keeps its sessions the way its harness does, so `suspend` proves that a
 back on the session it suspended on. The Rust wrapper
 `crates/st3/tests/boot_canaries.rs` runs every pair as its own test in the required Linux gate.
 
+The Codex-only `utf8` scenario starts and ends the bounded transcript window inside a euro sign,
+withholds live receipts so transcript recovery must release the next message, then forces a
+discovery I/O error. A live status update and receipt must still reach the same seat, and repeated
+warnings must stay rate-limited in its private `driver.log`, outside the PTY.
+
 Every fresh scenario also checks that the native driver creates no `catalog.kdl`, `agent.kdl`,
 or polled `harness-state`, `harness-context`, and `harness-timeline` records, and that each seat
 has its st-owned observation outbox.

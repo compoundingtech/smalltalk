@@ -21,6 +21,13 @@ can instead use `st launch` to create, review, and approve a conversationally pl
 authorized agent uses `st work publish-mission` from the exact claimed producing step for generated
 nested work. Every route keeps intent, authority, and provenance on a typed operation.
 
+`st missions publish FILE --as ACTOR --dry-run` (alias `--preview`) stops after the publication
+preview. It prints the normalized and resolved intent, exact mission revisions, changes, predicted
+actions, blockers, warnings, and subject tokens; `--json` returns the full preview object.
+Blockers are printed before the command exits with failure. It does not apply the intent, publish
+or start a mission, launch helpers, or run exec gates. Use `st missions check FILE` separately to
+run gate commands. `--at-index INDEX` fences the preview snapshot as it does for publication.
+
 ## Definitions do not start work
 
 This publication creates or updates one immutable mission revision. It does not start a run.
@@ -49,6 +56,12 @@ Direct runtime declarations in a mission belong to each run of that mission. Dir
 A native harness starts with no prompt. It takes no turn until a person types or a message is posted. When a step assigned to it becomes ready, st posts it a message that names the step. Mission goals and constraints remain in the graph.
 
 A harness block cannot declare `prompt`. Parsing refuses it with `harness-prompt-removed`; put the instruction in a step goal or send the seat a message.
+
+An agent may declare the bare `one-shot` flag. Once its process exits or vanishes, the daemon
+records a stop, removes it from default inventory, and retains its declaration and history.
+This takes precedence over automatic restart; explicit restart and launch replacements still
+work. Seats without the flag, including `restart "never"` seats, keep their existing behavior.
+See [one-shot seats](../seat-lifecycle.md#one-shot-seats) for authoring and later start.
 
 st no longer writes a `.st3` directory into a native harness workspace. It removes one that older releases wrote there, unless Git tracks something in it, and removes the `.st3/` line from the Git exclude file once no worktree sharing that file still has a `.st3` directory. A declared `render { git-exclude ".st3/" }` adds nothing.
 

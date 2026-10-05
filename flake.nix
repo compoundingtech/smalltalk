@@ -206,6 +206,8 @@
           "--exclude"
           "st3-feed"
           "--exclude"
+          "st3-client-tui"
+          "--exclude"
           "st3-migrate"
           "--exclude"
           "st3-schema"
@@ -375,6 +377,8 @@
             "-p"
             "st3-feed"
             "-p"
+            "st3-client-tui"
+            "-p"
             "st3-migrate"
             "-p"
             "st3-schema"
@@ -422,6 +426,9 @@
           # generator formats the Rust client it checks with rustfmt.
           nativeCheckInputs = [
             pkgs.bashInteractive
+            # The completion tests drive the stub in each supported shell.
+            pkgs.fish
+            pkgs.zsh
             pkgs.jq
             pkgs.rustfmt
             pkgs.which
@@ -459,7 +466,9 @@
           ST3_MESSAGING_COMPAT_BIN = "";
         });
 
-        st3Help = pkgs.runCommand "st3-help-${version}" { } ''
+        st3Help = pkgs.runCommand "st3-help-${version}" {
+          nativeBuildInputs = [ pkgs.bashInteractive pkgs.fish pkgs.zsh ];
+        } ''
           test "$(readlink ${st3}/bin/st)" = st3
           test -x ${st3}/bin/stui
           test -x ${st3}/bin/pty
@@ -477,6 +486,7 @@
           test -s ${st3}/share/bash-completion/completions/st.bash
           test -s ${st3}/share/zsh/site-functions/_st
           test -s ${st3}/share/fish/vendor_completions.d/st.fish
+          bash ${./scripts/check-installed-completions} ${st3}
           ${st3}/bin/st3-migrate --help > /dev/null
           touch $out
         '';
@@ -1110,6 +1120,9 @@
             # st3's messaging fault matrix runs the omp channel hook (TypeScript) under the
             # provider stand-in with Node's built-in type stripping, which Node 24 enables.
             pkgs.nodejs
+            # st3's completion tests drive the installed stub in each supported shell.
+            pkgs.fish
+            pkgs.zsh
           ];
           # Same collector the Nix gate pins, so a bare
           # `cargo test --test integration otel_export::` in this shell runs against it.

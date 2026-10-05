@@ -701,8 +701,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
                 refresh.extend(subscriptions.keys().cloned());
             }
-            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| s.request.collection == "attention") => {
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "attention").map(|(id, _)| id.clone()));
+            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "agents")) => {
+                refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "agents")).map(|(id, _)| id.clone()));
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
@@ -766,6 +766,73 @@ pub(super) struct AgentDeclarationQuery {
     revision: Option<String>,
     #[serde(default)]
     show_env_values: bool,
+}
+
+/// A workspace belongs to the seat's declaration and host, not this API gateway's filesystem.
+/// Follow the same unambiguous stop predecessors that start uses, including one-shot retirement.
+pub(super) async fn agent_workspace(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    require_scope(&session, "read.projections")?;
+    let subject = client_detail_id("agent", &id);
+    let result = blocking_store(move || {
+        state.store.read_snapshot(|index| {
+            let status = state.store.status_at(Some(&subject), None, Some(index))?;
+            let Some(status) = status
+                .subjects
+                .into_iter()
+                .find(|item| item.subject == subject)
+            else {
+                return Ok(None);
+            };
+            if !status.conflicts.is_empty() {
+                return Err(anyhow::anyhow!(St3Error::new(
+                    "validation-failed",
+                    "agent has conflicting declarations",
+                )));
+            }
+            let Some(token) = status.desired_token else {
+                return Ok(None);
+            };
+            let mut claim = state
+                .store
+                .claim_by_id(&token)?
+                .ok_or_else(|| anyhow::anyhow!("selected declaration is missing"))?;
+            loop {
+                let desired: crate::model::DesiredSubject = serde_json::from_value(claim.body)?;
+                if desired.kind == "agent" {
+                    let Some(member) = desired.member else {
+                        return Ok(None);
+                    };
+                    let value = json!({
+                        "kind": "agent-workspace",
+                        "agent_id": subject,
+                        "host_id": client_host_id(&member.host),
+                        "workspace": member.workspace,
+                        "desired_token": token,
+                        "declaration_token": claim.id,
+                    });
+                    return Ok(Some((client_snapshot_at(&state, index), value)));
+                }
+                if desired.kind != "stop" || claim.predecessors.len() != 1 {
+                    return Err(anyhow::anyhow!(St3Error::new(
+                        "validation-failed",
+                        "agent has no unambiguous prior declaration",
+                    )));
+                }
+                claim = state
+                    .store
+                    .claim_by_id(&claim.predecessors[0])?
+                    .ok_or_else(|| anyhow::anyhow!("prior declaration is missing"))?;
+            }
+        })
+    })
+    .await?;
+    let (snapshot, value) =
+        result.ok_or_else(|| ApiError::not_found("agent workspace not found"))?;
+    Ok((Extension(snapshot), Json(value)))
 }
 
 /// Both redacted and explicit environment-value reads require declaration scope.
@@ -3301,6 +3368,20 @@ pub(super) async fn devices(
         items.retain(|item| item["state"] == "active");
     }
     client_page(&state, &snapshot, "devices", items, &effective_query).map(Json)
+}
+
+/// Bounded observed transitions; pairing uses the same projection scope as agent reads.
+pub(super) async fn status_history(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let subject = client_detail_id("agent", &id);
+    let store = state.store.clone();
+    let history = blocking_store(move || store.seat_status_history_at(&subject, client_now_ms(), snapshot.store_index)).await?;
+    Ok(Json(history))
 }
 
 /// One seat's current claim, its queued mission runs in order, and recent moves.
@@ -9400,6 +9481,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_workspace_requires_projection_scope_only() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let intent = crate::graph::parse_intent(
+            "version 2\nagent \"garden/interactive\" { workspace \"/work/garden\"; harness \"omp\" {} }\n",
+            state.store.origin(),
+        ).unwrap();
+        state
+            .store
+            .apply_internal(&intent, "workspace-scope")
+            .unwrap();
+        let mut session = ClientSession::local(None).unwrap();
+        session.scopes = ["read.projections".to_owned()].into_iter().collect();
+        let (_, Json(value)) = agent_workspace(
+            State(state.clone()),
+            Extension(session.clone()),
+            AxumPath("garden/interactive".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["workspace"], "/work/garden");
+        session.scopes.clear();
+        let error = agent_workspace(
+            State(state),
+            Extension(session),
+            AxumPath("garden/interactive".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn agent_declarations_require_sensitive_scope_and_select_exact_revision() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
@@ -14505,6 +14619,41 @@ mission "example/zero-run" state="ready" {
         assert_eq!(indeterminate["terminal_access"]["read"], "unavailable");
         assert_eq!(indeterminate["operational"]["actionable"], false);
     }
+    #[test]
+    fn status_freshness_refreshes_after_the_agent_cache_without_resetting_since() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "status-cache");
+        let subject = "agent/cedar";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+                expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append("runtime.observed", json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}));
+        append("harness.observed", json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "observed_at_ms":(client_now_ms() - 91_000) as u64}));
+        let index = state.store.index().unwrap();
+        let before = client_agent_resources(&state.store, false, "", index).unwrap();
+        let before = before.iter().find(|item| item["id"] == subject).unwrap();
+        assert_eq!(before["observation"], "stale");
+        assert_eq!(before["harness_state"], "indeterminate");
+        assert!(before.get("_status_source").is_none());
+        append("harness.observed", json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "observed_at_ms":client_now_ms() as u64}));
+        assert_eq!(state.store.index().unwrap(), index, "same state stays local within the publish interval");
+        let after = client_agent_resources(&state.store, false, "", index).unwrap();
+        let after = after.iter().find(|item| item["id"] == subject).unwrap();
+        assert_eq!(after["observation"], "current");
+        assert_eq!(after["harness_state"], "idle");
+        assert_eq!(after["since"], before["since"]);
+        append("runtime.observed", json!({"status":"running", "runtime_id":"native", "incarnation_id":"two"}));
+        let reset = client_agent_resources(&state.store, false, "", state.store.index().unwrap()).unwrap();
+        let reset = reset.iter().find(|item| item["id"] == subject).unwrap();
+        assert_eq!(reset["observation"], "missing");
+        assert_eq!(reset["harness_state"], Value::Null);
+        assert_eq!(reset["since"], Value::Null);
+    }
+
 }
 
 fn glass_person(session: &ClientSession, write: bool) -> Result<String, ApiError> {
@@ -14665,4 +14814,5 @@ pub(super) async fn glass_delete(
     Json(request): Json<GlassDelete>,
 ) -> Result<Json<Value>, ApiError> {
     glass_write(state, session, id, headers, None, request.base_revision).await
+
 }

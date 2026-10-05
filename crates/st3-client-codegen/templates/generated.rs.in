@@ -360,6 +360,13 @@ pub struct ClientConnection {
     pub follows: Vec<String>,
 }
 
+/// Undelivered retained mail past the reported age threshold, across all mailboxes.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MailBacklog {
+    pub count: u64,
+    pub threshold_ms: u64,
+    pub cleanup_command: String,
+}
 /// Token spend over a period, one row per agent, mission run, step, model, account and host.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsagePeriod {
@@ -442,6 +449,15 @@ pub struct SubjectDefinition {
     pub desired_revision: String,
     pub desired_token: String,
     pub conflicts: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentWorkspace {
+    pub kind: String,
+    pub agent_id: String,
+    pub host_id: String,
+    pub workspace: String,
+    pub desired_token: String,
+    pub declaration_token: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentDeclaration {
@@ -901,6 +917,10 @@ pub struct Agent {
     #[serde(default)]
     pub harness_state: Option<String>,
     #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub observation: Option<String>,
+    #[serde(default)]
     pub blocked_on: Option<String>,
     #[serde(default)]
     pub ask: Option<String>,
@@ -1079,6 +1099,23 @@ pub enum AgentQueuePlacement {
     After,
 }
 /// One agent seat's current claim and its ordered queue of mission runs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StatusHistory {
+    pub kind: String,
+    pub seat: String,
+    pub items: Vec<StatusTransition>,
+    pub retained_from: String,
+    pub complete: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StatusTransition {
+    pub seat: String,
+    pub runtime_incarnation: String,
+    pub state: Option<String>,
+    pub observed_at: String,
+    pub reset: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentQueue {
     pub kind: String,

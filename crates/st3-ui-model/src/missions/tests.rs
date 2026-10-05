@@ -174,6 +174,8 @@ fn missions_read_joined_steps_and_agent_queues() {
             "assignee": "agent/example/harbor/keeper", "claimant": claimant,
             "since": "2026-09-29T09:58:00Z", "goals": [format!("Do {path}.")],
             "constraints": [], "blockers": [],
+            "blocked_reason": format!("previous reason for {path}"),
+            "last_progress": format!("progress for {path}"),
         })
     };
     let label = |id: &str, path: &str, state: &str| {
@@ -238,6 +240,15 @@ fn missions_read_joined_steps_and_agent_queues() {
             "queued for fleet/harbor/keeper, which is busy with mission/fleet/harbor/audit › scan"
         )
     );
+    let metadata = &mission.step_metadata["step-run/audit-1/report"];
+    assert_eq!(
+        metadata.blocked_reason.as_deref(),
+        Some("previous reason for report")
+    );
+    assert_eq!(
+        metadata.last_progress.as_deref(),
+        Some("progress for report")
+    );
 }
 
 fn run(id: &str, status: &str, steps: Vec<Value>) -> Value {
@@ -267,6 +278,105 @@ fn input(runs: Vec<Value>) -> Inputs {
     }
 }
 
+fn metadata_case(
+    state: &str,
+    reason: Option<&str>,
+    progress: Option<&str>,
+    expected_state: StepState,
+    expected_word: Word,
+    expected_note: Option<&str>,
+) {
+    let mut raw_step = step("assess", state, false);
+    raw_step["id"] = json!("step-run/audit-1/assess");
+    raw_step["blocked_reason"] = json!(reason);
+    raw_step["last_progress"] = json!(progress);
+    let run_state = match state {
+        "failed" | "cancelled" => state,
+        _ => "running",
+    };
+    let mut model = input(vec![run("mission-run/audit-1", run_state, vec![raw_step])]);
+    model.missions[0].state = run_state.into();
+    let missions = adapt(
+        model.missions.iter(),
+        model.agents.iter(),
+        model.attention.iter(),
+        "2026-09-29T10:00:00Z",
+        &Display {
+            mission_label: &|mission| mission.header.id.clone(),
+            agent_label: &|agent| agent.name.clone(),
+            age_label: &|_, _| "2m ago".into(),
+            // Metadata must bypass even a display policy that rewrites text.
+            clean_text: &|_| "normalized".into(),
+        },
+    );
+    let mission = &missions[0];
+    assert_eq!(mission.word, expected_word);
+    assert_eq!(mission.steps[0].id, "step-run/audit-1/assess");
+    assert_eq!(mission.steps[0].state, expected_state);
+    assert_eq!(mission.steps[0].note.as_deref(), expected_note);
+    assert_eq!(mission.step_metadata.len(), 1);
+    let metadata = &mission.step_metadata[&mission.steps[0].id];
+    assert_eq!(metadata.blocked_reason.as_deref(), reason);
+    assert_eq!(metadata.last_progress.as_deref(), progress);
+    // Older JSON consumers retain the existing step presentation; metadata is additive.
+    let serialized = serde_json::to_value(mission).unwrap();
+    assert_eq!(serialized["steps"][0]["note"], json!(expected_note));
+    assert_eq!(
+        serialized["step_metadata"]["step-run/audit-1/assess"],
+        json!({"blocked_reason": reason, "last_progress": progress})
+    );
+}
+
+#[test]
+fn failed_retry_reason_is_retained_without_becoming_a_blocker() {
+    metadata_case(
+        "failed",
+        Some("Retry after Cedar Q1"),
+        None,
+        StepState::Failed,
+        Word::Failed,
+        None,
+    );
+}
+
+#[test]
+fn cancelled_failure_reason_is_retained_without_becoming_a_blocker() {
+    metadata_case(
+        "cancelled",
+        Some("another step failed"),
+        None,
+        StepState::Cancelled,
+        Word::Cancelled,
+        None,
+    );
+}
+
+#[test]
+fn working_progress_and_old_reason_are_retained_verbatim() {
+    metadata_case(
+        "working",
+        Some("the eligible execution started"),
+        Some("  Compared 12 rows.\nChecking the remaining rows.  "),
+        StepState::Working,
+        Word::Working,
+        None,
+    );
+}
+
+#[test]
+fn waiting_blocker_remains_presented_and_retains_raw_metadata() {
+    for (state, word) in [("waiting", Word::Held), ("blocked", Word::Stalled)] {
+        metadata_case(
+            state,
+            Some("waiting on the harbor restart"),
+            Some("the snapshot is ready"),
+            StepState::Waiting,
+            word,
+            Some("waiting on the harbor restart"),
+        );
+    }
+}
+
 #[test]
 fn all_open_runs_contribute_and_only_the_latest_finished_run_is_the_fallback() {
     let mut model = input(vec![
@@ -275,6 +385,14 @@ fn all_open_runs_contribute_and_only_the_latest_finished_run_is_the_fallback() {
         run("second", "running", vec![step("second", "ready", false)]),
     ]);
     let missions = project(&model);
+    assert_eq!(
+        missions[0]
+            .step_metadata
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["step/first", "step/second"]
+    );
     assert_eq!(
         missions[0]
             .steps
@@ -286,6 +404,14 @@ fn all_open_runs_contribute_and_only_the_latest_finished_run_is_the_fallback() {
     model.missions[0].run_details[1].status = "failed".into();
     model.missions[0].run_details[2].status = "completed".into();
     let missions = project(&model);
+    assert_eq!(
+        missions[0]
+            .step_metadata
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["step/second"]
+    );
     assert_eq!(
         missions[0]
             .steps
@@ -353,6 +479,8 @@ fn duplicate_paths_keep_run_identity_and_the_actual_seat_after_pipeline_sort() {
                 "id": format!("step-run/{id}/build"), "path": "build", "state": state,
                 "attempt": 1, "assignee": "agent/assigned", "claimant": claimant,
                 "agentless": agentless, "since": "2026-09-29T09:58:00Z",
+                "blocked_reason": format!("reason for {id}"),
+                "last_progress": format!("progress for {id}"),
             }],
         })
     };
@@ -370,12 +498,30 @@ fn duplicate_paths_keep_run_identity_and_the_actual_seat_after_pipeline_sort() {
         ..Inputs::default()
     };
     let missions = project(&model);
-    let identities = missions[0].steps.iter()
+    let identities = missions[0]
+        .steps
+        .iter()
         .map(|step| (step.id.as_str(), step.seat.as_deref(), step.state))
         .collect::<Vec<_>>();
-    assert_eq!(identities, [
-        ("step-run/c/build", None, StepState::Done),
-        ("step-run/b/build", Some("agent/claimant"), StepState::Working),
-        ("step-run/a/build", Some("agent/assigned"), StepState::Waiting),
-    ]);
+    assert_eq!(
+        identities,
+        [
+            ("step-run/c/build", None, StepState::Done),
+            (
+                "step-run/b/build",
+                Some("agent/claimant"),
+                StepState::Working
+            ),
+            (
+                "step-run/a/build",
+                Some("agent/assigned"),
+                StepState::Waiting
+            ),
+        ]
+    );
+    for id in ["a", "b", "c"] {
+        let metadata = &missions[0].step_metadata[&format!("step-run/{id}/build")];
+        assert_eq!(metadata.blocked_reason, Some(format!("reason for {id}")));
+        assert_eq!(metadata.last_progress, Some(format!("progress for {id}")));
+    }
 }

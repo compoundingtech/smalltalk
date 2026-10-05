@@ -8,7 +8,7 @@ import { harnessColor, theme } from './theme';
 // st found running but did not start listed last.
 
 // Declaration order is the sort order, as in stui's AgentState.
-export const AGENT_STATES = ['needs-you', 'fault', 'working', 'idle', 'starting', 'stopped', 'unknown'] as const;
+export const AGENT_STATES = ['needs-you', 'needs-login', 'fault', 'working', 'idle', 'starting', 'stopped', 'unknown'] as const;
 export type AgentState = typeof AGENT_STATES[number];
 
 export type AgentRowView = {
@@ -41,6 +41,11 @@ export function agentName(agent: Pick<Agent, 'id' | 'name'>): string {
   return label(slug);
 }
 
+// The model its harness last reported using, as reported ("claude-sonnet-5-5"); null when st says none.
+export function agentModel(agent: { usage?: { context?: { model?: string | null } | null } | null }): string | null {
+  return agent.usage?.context?.model?.trim() || null;
+}
+
 export function harnessName(driver: string | null | undefined): string {
   const value = driver ?? '';
   if (value.includes('claude')) return 'claude';
@@ -50,7 +55,7 @@ export function harnessName(driver: string | null | undefined): string {
   return '?';
 }
 
-type StateAgent = Pick<Agent, 'state' | 'harness_state' | 'fault' | 'delivery'>;
+type StateAgent = Pick<Agent, 'state' | 'harness_state' | 'fault' | 'delivery'> & { reason?: string | null };
 export function agentState(agent: StateAgent): AgentState {
   if (agent.fault) return 'fault';
   // A seat whose message path runs a replaced binary or stopped polling takes no messages,
@@ -59,7 +64,8 @@ export function agentState(agent: StateAgent): AgentState {
   switch (agent.state) {
     case 'failed': return 'fault';
     case 'running': return agent.harness_state === 'working' ? 'working' : 'idle';
-    case 'waiting': return agent.harness_state === 'unauthenticated' || agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
+    // Signed out of its provider: a login on its host fixes it, without a restart (Nathan, 2026-10-04).
+    case 'waiting': return agent.harness_state === 'unauthenticated' || agent.harness_state === 'needs-login' || agent.reason === 'providerAuth' ? 'needs-login' : agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
     case 'starting':
     case 'desired': return 'starting';
     case 'stopped': return 'stopped';
@@ -71,6 +77,7 @@ export const SPINNER = '⠿';
 export function agentGlyph(state: AgentState, spinner = SPINNER): { glyph: string; color: string } {
   switch (state) {
     case 'needs-you': return { glyph: '◆', color: theme.person };
+    case 'needs-login': return { glyph: '⚿', color: theme.person };
     case 'fault': return { glyph: '✕', color: theme.fault };
     case 'working': return { glyph: spinner, color: theme.working };
     case 'idle': return { glyph: '●', color: theme.idle };
@@ -83,6 +90,7 @@ export function agentGlyph(state: AgentState, spinner = SPINNER): { glyph: strin
 export function agentWord(state: AgentState): string {
   switch (state) {
     case 'needs-you': return 'needs you';
+    case 'needs-login': return 'needs login';
     case 'fault': return 'broken';
     case 'working': return 'working';
     case 'idle': return 'idle';
@@ -97,6 +105,7 @@ export function agentGroup(row: Pick<AgentRowView, 'state' | 'unmanaged'>): stri
   if (row.unmanaged) return UNMANAGED_GROUP;
   switch (row.state) {
     case 'needs-you': return 'waiting on you';
+    case 'needs-login': return 'needs login';
     case 'fault': return 'broken';
     case 'working': return 'working';
     case 'idle':
@@ -108,6 +117,7 @@ export function agentGroup(row: Pick<AgentRowView, 'state' | 'unmanaged'>): stri
 
 export const AGENT_LEGEND: ReadonlyArray<{ state: AgentState; word: string }> = [
   { state: 'needs-you', word: 'needs you' },
+  { state: 'needs-login', word: 'needs login' },
   { state: 'working', word: 'working' },
   { state: 'idle', word: 'idle' },
   { state: 'fault', word: 'broken' },
@@ -180,7 +190,7 @@ export function agentSections(rows: AgentRowView[]): AgentSection[] {
     const title = agentGroup(row);
     const last = sections.at(-1);
     if (last?.title === title) { last.rows.push(row); last.count++; }
-    else sections.push({ title, count: 1, person: row.state === 'needs-you' && !row.unmanaged, rows: [row] });
+    else sections.push({ title, count: 1, person: (row.state === 'needs-you' || row.state === 'needs-login') && !row.unmanaged, rows: [row] });
   }
   return sections;
 }
@@ -246,3 +256,12 @@ export function compactFolders(paths: string[][]): string[][] {
 }
 
 export { harnessColor };
+
+/** What a person does for an agent signed out of its provider, as stui says it. */
+export function loginGuidance(agent: { driver?: string | null; host_id?: string | null }): string {
+  const host = agent.host_id?.replace(/^host\//, '') ?? 'its host';
+  const harness = harnessName(agent.driver);
+  const how = harness === 'claude' ? 'open its terminal and run /login' : harness === 'codex' ? `run \`codex login\` on ${host} (or in its terminal)` : 'open its terminal and log it in';
+  const provider = harness === 'claude' ? 'Claude' : harness === 'codex' ? 'Codex' : 'Its provider';
+  return `${provider} login required on ${host}: ${how}. Messages wait until it is signed in; it carries on without a restart.`;
+}

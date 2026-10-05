@@ -2,8 +2,7 @@
 //! The local API keeps serving after an accept fails.
 //!
 //! Many agents, PTYs, and websockets can exhaust the daemon's file descriptors. An accept that
-//! fails then must not end the daemon. This test lowers its own descriptor limit, so it lives in
-//! its own test binary and process.
+//! fails then must not end the daemon. Only an explicitly spawned child lowers its limit.
 
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -33,8 +32,31 @@ fn set_descriptor_limit(soft: u64) -> u64 {
     previous
 }
 
+#[test]
+fn the_api_keeps_serving_after_an_accept_runs_out_of_descriptors() {
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "descriptor_exhaustion_child", "--nocapture"])
+        .env("ST_TEST_DESCRIPTOR_EXHAUSTION_CHILD", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert!(
+        child.status.success(),
+        "child failed: {stderr}\n{}",
+        String::from_utf8_lossy(&child.stdout)
+    );
+    let reports = stderr.matches("accept a local API connection").count();
+    assert!(
+        (1..=2).contains(&reports),
+        "expected bounded exhaustion reports, got {reports}: {stderr}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_api_keeps_serving_after_an_accept_runs_out_of_descriptors() {
+async fn descriptor_exhaustion_child() {
+    if std::env::var("ST_TEST_DESCRIPTOR_EXHAUSTION_CHILD").as_deref() != Ok("1") {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = AppState {
@@ -67,7 +89,7 @@ async fn the_api_keeps_serving_after_an_accept_runs_out_of_descriptors() {
     while let Ok(stream) = UnixStream::connect(&socket) {
         held.push(stream);
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(
         !server.is_finished(),
         "the API ended after an accept failed: {:?}",
@@ -76,9 +98,13 @@ async fn the_api_keeps_serving_after_an_accept_runs_out_of_descriptors() {
     drop(held);
     set_descriptor_limit(previous);
 
-    let health = st3::client::Client::new(st3::client::Endpoint::Unix(socket.clone()))
-        .get::<serde_json::Value>("/v1/health")
-        .await;
+    let health = tokio::time::timeout(
+        Duration::from_secs(10),
+        st3::client::Client::new(st3::client::Endpoint::Unix(socket.clone()))
+            .get::<serde_json::Value>("/v1/health"),
+    )
+    .await
+    .unwrap();
     assert!(health.is_ok(), "the API no longer answers: {health:?}");
     server.abort();
 }

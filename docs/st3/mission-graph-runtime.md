@@ -832,6 +832,9 @@ before the work exists, most gates should say not yet. `--workspace` names the w
 check. `--no-gate-check` publishes without it, for a gate whose check cannot run before its run,
 such as one that waits on a lock the run takes.
 
+`--dry-run` (alias `--preview`) prints the publication preview and stops before any gate check or
+apply. Use `missions check` separately when gate commands should run during validation.
+
 Each check records its result on the gate's `gate.result` subject. The result's `verdict` is
 `pass`, `fail` for not yet, or `error` for broken, so every fleet build can read it; its
 `value.answer` is `pass`, `not-yet`, or `broken`, with `check`, `exit_code`, `host`, `output`, and

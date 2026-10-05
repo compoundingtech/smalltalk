@@ -64,6 +64,7 @@ public enum ReadOperation: String, CaseIterable, Sendable {
     case capabilitiesGet = "capabilities.get"
     case documentGet = "document.get"
     case subjectDefinition = "subject.definition"
+    case mailBacklogSummary = "mail-backlog.summary"
     case usagePeriod = "usage.period"
     case clientsList = "clients.list"
     case nowList = "now.list"
@@ -85,7 +86,9 @@ public enum ReadOperation: String, CaseIterable, Sendable {
     case resourcesList = "resources.list"
     case agentsList = "agents.list"
     case agentsGet = "agents.get"
+    case agentWorkspaceGet = "agent-workspace.get"
     case agentDeclarationGet = "agent-declaration.get"
+    case statusHistoryGet = "status-history.get"
     case agentQueueGet = "agent-queue.get"
     case runtimesList = "runtimes.list"
     case runtimesGet = "runtimes.get"
@@ -118,6 +121,7 @@ public let st3ClientReadPaths: [ReadOperation: String] = [
     .capabilitiesGet: "/v1/client/capabilities",
     .documentGet: "/v1/client/documents/content",
     .subjectDefinition: "/v1/client/subject-definition",
+    .mailBacklogSummary: "/v1/client/mail-backlog",
     .usagePeriod: "/v1/client/usage",
     .clientsList: "/v1/client/clients",
     .nowList: "/v1/client/now",
@@ -139,7 +143,9 @@ public let st3ClientReadPaths: [ReadOperation: String] = [
     .resourcesList: "/v1/client/resources",
     .agentsList: "/v1/client/agents",
     .agentsGet: "/v1/client/agents/{id}",
+    .agentWorkspaceGet: "/v1/client/agent-workspaces/{id}",
     .agentDeclarationGet: "/v1/client/agent-declarations/{id}",
+    .statusHistoryGet: "/v1/client/status-history/{id}",
     .agentQueueGet: "/v1/client/agent-queues/{id}",
     .runtimesList: "/v1/client/runtimes",
     .runtimesGet: "/v1/client/runtimes/{id}",

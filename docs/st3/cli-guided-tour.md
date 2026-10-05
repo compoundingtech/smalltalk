@@ -66,6 +66,7 @@ st missions ls
 st missions show --help
 st missions show mission-run/64bcc9227e0166a571e09117d35c572e
 st missions publish --help
+st missions publish mission.kdl --as person/alex --dry-run
 st missions check --help
 st missions start --help
 st missions cancel --help
@@ -76,6 +77,10 @@ st missions retire --help
 `ls` and `show` are live reads. Publication, start, cancel, setting a finished run's outcome, and
 retirement are reviewed through help here and are mutation-tested only in the disposable fixture
 run.
+
+`publish --dry-run` (alias `--preview`) prints the resolved intent and publication diagnostics,
+including blockers, without publishing or running exec gates. Add `--json` for the complete
+preview object. `missions check FILE` runs gate commands separately when needed.
 
 ### 3. `work` — the truthful queue and worker lifecycle
 
@@ -93,6 +98,9 @@ st work show step-run/e3e841ba011236a21fe8bd3e50c21a1d/walkthrough-and-followup
 Then inspect every lifecycle and revision action:
 
 ```sh
+st work start --help
+st work handoff --help
+st work acknowledge --help
 st work claim --help
 st work renew --help
 st work progress --help
@@ -520,16 +528,19 @@ Check that the skill describes st without rules of conduct, that its description
 
 ### 20. `completions` — shell discoverability
 
-Why: generated completion keeps the large but intentional command surface navigable.
+Why: completion keeps the large but intentional command surface navigable, and offers the live
+terminals, agents, missions, and other entities an argument accepts, each with a description
+([spec](cli-completion/spec.md)).
 
 ```sh
 st completions --help
-st completions bash >/dev/null
 st completions zsh >/dev/null
-st completions fish >/dev/null
+COMPLETE=fish st -- st terminals attach ''
+st terminals attach steward
 ```
 
-Check generation, installation guidance, and whether hidden/internal commands remain hidden.
+Check that each stub is printed, that entity candidates carry descriptions, that hidden/internal
+commands remain hidden, and that an ambiguous short name lists its matches.
 
 ## Exit criteria
 

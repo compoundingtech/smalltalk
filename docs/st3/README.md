@@ -14,12 +14,16 @@ Use these documents for implementation details:
 - [Schema registry](schema.md) lists the generated public subject, resource, and claim vocabulary.
 - [Data authority](data-authority.md) separates durable facts from projections and caches.
 - [Claim backups](backups.md) explains live snapshots, offline restore, and recovered writer identities.
+- [Founder signing audit](founder-signing-audit.md) explains read-only capture, preserved unsealed
+  upgrades, and the remaining warnings for already-sealed unsigned delegations.
 - [Fleet replication](replication.md) defines convergence, inspection, and repair.
 - [Agent seat queues](seat-queue.md) explains how each seat orders its mission runs and how moves
   are recorded and replicated.
 - [Checkpoints and trimming](checkpoints.md) explains how every node of a fleet agrees to delete old
   claims together: when a checkpoint is due, seal, verify and trim, which claims a rule may drop and
   why, excusing an unreachable member, and what the first real trim taught.
+- [Shell completion](cli-completion/spec.md) defines live entity candidates, their descriptions,
+  and short-name resolution; [requirements](cli-completion/requirements.md).
 - [Lanes](lanes.md) defines the ordered lanes a mission run works through, such as the merge
   train, and `st lanes`.
 - [Attachments](attachments.md) defines the images a message carries between machines: where the

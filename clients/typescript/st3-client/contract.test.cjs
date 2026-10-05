@@ -287,3 +287,18 @@ test('search encodes text, filters, and cursor and preserves result targets', as
     assert.equal(search.value.items[0].entry_id, 'timeline-entry/note');
     assert.deepEqual(search.value.incomplete_sources, ['session/older: truncation']);
 });
+
+test('reads bounded seat status history through the paired gateway', async () => {
+    const calls = [];
+    const history = { kind: 'status-history', seat: 'agent/cedar', retained_from: '2026-10-04T12:00:00Z', complete: false,
+        items: [{ seat: 'agent/cedar', runtime_incarnation: 'two', state: null, observed_at: '2026-10-04T12:00:00Z', reset: true }] };
+    const client = new St3Client({ baseUrl: 'https://example.test', credential: () => 'proof', fetchImpl: async (url, init) => {
+        calls.push({ url, init });
+        return response(envelope(url.endsWith('/capabilities') ? capabilities : history));
+    } });
+    const result = await client.statusHistoryGet('agent/cedar');
+    assert.equal(calls[1].url, 'https://example.test/v1/client/status-history/agent%2Fcedar');
+    assert.equal(calls[1].init.headers.Authorization, 'Bearer proof');
+    assert.equal(result.value.complete, false);
+    assert.equal(result.value.items[0].reset, true);
+});

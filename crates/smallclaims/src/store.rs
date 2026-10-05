@@ -1098,10 +1098,13 @@ pub fn insert_claim(
     }
     promote_claim_blobs(transaction, body)?;
     crate::touched::note_wrote(|| format!("{kind} {subject}"));
-    transaction.execute(
-        "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
+    // Reuse the compiled claim insert and its projection triggers across local writes.
+    transaction
+        .prepare_cached(
+            "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?
+        .execute(params![
             id,
             batch_id,
             subject,
@@ -1111,8 +1114,7 @@ pub fn insert_claim(
             canonical_json_text(body)?,
             serde_json::to_string(predecessors)?,
             now.to_string(),
-        ],
-    )?;
+        ])?;
     Ok(transaction.last_insert_rowid() as u64)
 }
 
@@ -1223,17 +1225,69 @@ pub fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> 
 thread_local! {
     /// A clock a simulation sets for its own thread; see [`set_thread_clock`].
     static THREAD_CLOCK: std::cell::Cell<Option<u128>> = const { std::cell::Cell::new(None) };
+    /// One reader evaluation compares every deadline against the same instant.
+    static CLOCK_SNAPSHOT: std::cell::Cell<Option<u128>> = const { std::cell::Cell::new(None) };
 }
 
 /// The time every reader and the reconciler compare against: the system clock, or the time a
-/// simulation set for this thread.
+/// simulation set for this thread, held fixed while a [`clock_snapshot`] is alive.
 pub fn now_ms() -> u128 {
-    THREAD_CLOCK.with(std::cell::Cell::get).unwrap_or_else(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    })
+    CLOCK_SNAPSHOT
+        .with(std::cell::Cell::get)
+        .or_else(|| THREAD_CLOCK.with(std::cell::Cell::get))
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        })
+}
+
+/// Hold this thread's reader clock at one instant until the returned guard drops. An item can
+/// then test whether it is due and evaluate its time-dependent inputs at the same instant.
+/// Nests and restores the enclosing snapshot even on unwind; writer timestamps are separate.
+#[must_use = "keep the guard alive while evaluating the item"]
+pub fn clock_snapshot() -> impl Drop {
+    struct Snapshot {
+        previous: Option<u128>,
+        // A thread-local clock must be restored on the thread that sampled it.
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            CLOCK_SNAPSHOT.with(|clock| clock.set(self.previous));
+        }
+    }
+    let now = now_ms();
+    Snapshot {
+        previous: CLOCK_SNAPSHOT.with(|clock| clock.replace(Some(now))),
+        _thread: std::marker::PhantomData,
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::{clock_snapshot, now_ms, set_thread_clock};
+
+    #[test]
+    fn reader_clock_snapshots_nest_and_restore_on_unwind() {
+        set_thread_clock(Some(100));
+        let result = std::panic::catch_unwind(|| {
+            let _outer = clock_snapshot();
+            set_thread_clock(Some(200));
+            assert_eq!(now_ms(), 100);
+            {
+                let _inner = clock_snapshot();
+                set_thread_clock(Some(300));
+                assert_eq!(now_ms(), 100);
+            }
+            assert_eq!(now_ms(), 100);
+            panic!("end the reader evaluation");
+        });
+        assert!(result.is_err());
+        assert_eq!(now_ms(), 300);
+        set_thread_clock(None);
+    }
 }
 
 /// Fix the clock this thread reads at `at` (unix ms), or give it back the system clock with
@@ -3963,21 +4017,22 @@ pub fn validate_and_admit_envelope_tx(
                     0
                 } else {
                     transaction
-                    .execute(
+                    .prepare_cached(
                         "INSERT OR IGNORE INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                        params![
-                            claim.id,
-                            claim.batch_id,
-                            claim.subject,
-                            claim.kind,
-                            claim.origin,
-                            claim.actor,
-                            canonical_json_text(&claim.body).map_err(internal)?,
-                            serde_json::to_string(&claim.predecessors).map_err(internal)?,
-                            claim.accepted_at_unix_ms.to_string(),
-                        ],
                     )
+                    .map_err(internal)?
+                    .execute(params![
+                        claim.id,
+                        claim.batch_id,
+                        claim.subject,
+                        claim.kind,
+                        claim.origin,
+                        claim.actor,
+                        canonical_json_text(&claim.body).map_err(internal)?,
+                        serde_json::to_string(&claim.predecessors).map_err(internal)?,
+                        claim.accepted_at_unix_ms.to_string(),
+                    ])
                     .map_err(internal)?
                 };
                 if let Some(signature) = payload.claim_signatures.get(&claim.id) {

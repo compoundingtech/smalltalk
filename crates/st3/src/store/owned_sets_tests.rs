@@ -66,6 +66,123 @@ fn share(from: &Store, to: &Store) {
 }
 
 #[test]
+fn one_shot_set_retirement_is_fenced_to_the_member_and_its_runtime_host() {
+    let amber = Store::open_memory("amber").unwrap();
+    let cobalt = Store::open_memory("cobalt").unwrap();
+    let source = "version 2\nagent \"garden/orchard\" { command \"sleep 100\"; one-shot }";
+    let declared = parse_intent(source, "amber").unwrap();
+    apply(&amber, &declared, 10);
+    share(&amber, &cobalt);
+    let subject = "agent/garden/orchard";
+    let token = amber.selected_desired_token(subject).unwrap().unwrap();
+    let expected = BTreeMap::from([(subject.to_owned(), vec![token.clone()])]);
+    let stop = parse_intent("version 2\nstop \"agent/garden/orchard\"", "amber").unwrap();
+    for (store, actor, key) in [
+        (&amber, "person/operator", "person-stop"),
+        (&cobalt, "daemon/runtime", "remote-stop"),
+    ] {
+        let index = store.index().unwrap();
+        assert_eq!(
+            store
+                .apply_as(&stop, &expected, key, Some(actor))
+                .unwrap_err()
+                .code,
+            "set-managed-subject"
+        );
+        assert_eq!(store.index().unwrap(), index);
+    }
+    amber
+        .apply_as(&stop, &expected, "one-shot-retire", Some("daemon/runtime"))
+        .unwrap();
+    assert_eq!(
+        amber.selected_desired_kind(subject).unwrap().as_deref(),
+        Some("stop")
+    );
+    assert_eq!(amber.owned_sets().unwrap()[0].receipt.source.sequence, 10);
+    let stopped = amber
+        .desired_subjects_named(&[subject.into()])
+        .unwrap()
+        .remove(0);
+    assert!(amber.owned_desired_guard(&stopped).is_ok());
+    assert_eq!(
+        amber
+            .declaration_ended_by_stop(subject)
+            .unwrap()
+            .unwrap()
+            .declaration,
+        declared.subjects[subject]
+    );
+
+    // Replication and historical reads select the same stop through the exact source member.
+    share(&amber, &cobalt);
+    assert_eq!(
+        cobalt.selected_desired_kind(subject).unwrap().as_deref(),
+        Some("stop")
+    );
+    assert_eq!(
+        amber.selected_desired_token(subject).unwrap(),
+        cobalt.selected_desired_token(subject).unwrap()
+    );
+    let index = cobalt.index().unwrap();
+    let connection = cobalt.readers.get();
+    assert_eq!(
+        owned_sets::desired_at(&connection, subject, index)
+            .unwrap()
+            .unwrap()
+            .kind,
+        "stop"
+    );
+    drop(connection);
+
+    // A new declaration through the owning source re-arms the seat. A delayed old exit cannot
+    // replace it, locally or when its stop later reaches another replica.
+    let replacement = parse_intent(&source.replace("sleep 100", "sleep 200"), "amber").unwrap();
+    apply(&amber, &replacement, 20);
+    let current = amber.selected_desired_token(subject).unwrap();
+    assert_eq!(
+        amber
+            .apply_as(
+                &stop,
+                &expected,
+                "stale-one-shot-exit",
+                Some("daemon/runtime")
+            )
+            .unwrap_err()
+            .code,
+        "stale-subject"
+    );
+    assert_eq!(amber.selected_desired_token(subject).unwrap(), current);
+    share(&amber, &cobalt);
+    assert_eq!(
+        cobalt.selected_desired_kind(subject).unwrap().as_deref(),
+        Some("agent")
+    );
+}
+
+#[test]
+fn daemon_cannot_retire_an_unmarked_set_member_as_a_one_shot() {
+    let store = Store::open_memory("amber").unwrap();
+    apply(&store, &bundle("sleep 100", false), 10);
+    let subject = "agent/garden/orchard";
+    let stop = parse_intent("version 2\nstop \"agent/garden/orchard\"", "amber").unwrap();
+    let expected = BTreeMap::from([(
+        subject.into(),
+        vec![store.selected_desired_token(subject).unwrap().unwrap()],
+    )]);
+    assert_eq!(
+        store
+            .apply_as(&stop, &expected, "unmarked-stop", Some("daemon/runtime"))
+            .unwrap_err()
+            .code,
+        "set-managed-subject"
+    );
+    assert_eq!(
+        store.selected_desired_kind(subject).unwrap().as_deref(),
+        Some("agent")
+    );
+}
+
+#[test]
 fn a_staged_owned_set_member_check_seeks_tagged_claims() {
     let store = Store::open_memory("amber").unwrap();
     let unmanaged = parse_intent(

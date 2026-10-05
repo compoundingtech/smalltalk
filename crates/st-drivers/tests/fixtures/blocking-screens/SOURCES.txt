@@ -1,0 +1,20 @@
+Plain screens captured in isolated, credential-free PTYs on 2026-10-04.
+Temporary workspace and home paths are replaced with invented example paths.
+
+claude-footer.txt, claude-login.txt: Claude Code 2.1.289; fresh config with onboarding completed.
+codex-update.txt, codex-login.txt: Codex 0.159.2; isolated version cache announcing 0.160.0.
+omp-no-key.txt: omp 18.1.22; no credentials, anthropic model, submitted "hello".
+pi-no-key.txt: pi 0.73.1; no credentials, anthropic model, submitted "hello".
+
+OpenCode's equivalent is the native session.error ProviderAuthError event, already
+covered by opencode_session::tests::provider_auth_error_is_terminal_and_other_errors_settle_to_idle_with_a_reason.
+Its "Connect a provider" command also serves authenticated users choosing another
+provider, so that title alone is not evidence of a logged-out seat.
+
+claude-wide-footer.txt: same isolated Claude capture resized to 160 columns.
+The permissions footer and login message share a line; the previous starts-with
+matcher missed this layout. No production terminal input was sent.
+
+claude-authenticating.txt, claude-code-prompt.txt: isolated Claude /login flow,
+browser opening disabled and no credentials entered. The OAuth URL (including
+state and challenge) is replaced with https://example.invalid/oauth/authorize.

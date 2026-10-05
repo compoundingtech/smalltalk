@@ -1335,6 +1335,7 @@ fn parse_agent(
             tags: BTreeMap::new(),
             display_name: display_name.clone(),
             lifecycle: lifecycle.clone(),
+            one_shot: false,
             restart: restart.clone(),
             restart_intensity: restart_intensity.clone(),
             shutdown_timeout_ms,
@@ -1343,6 +1344,7 @@ fn parse_agent(
     }
 
     if let Some(member) = primary.as_mut() {
+        member.one_shot = unique_child(children, "one-shot")?.is_some();
         member.tags.extend(parse_tags(children)?);
         member.tags.insert("st3.subject".into(), subject.clone());
         if fresh_context {
@@ -2501,6 +2503,7 @@ fn driver_member(
         tags: BTreeMap::from([("st3.subject".into(), subject.into())]),
         display_name,
         lifecycle,
+        one_shot: false,
         restart,
         restart_intensity,
         shutdown_timeout_ms,
@@ -2590,6 +2593,7 @@ fn task_member(
         tags: parse_tags(body)?,
         display_name: None,
         lifecycle,
+        one_shot: false,
         restart,
         restart_intensity,
         shutdown_timeout_ms,
@@ -2711,6 +2715,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "render",
         "harness",
         "fresh-context",
+        "one-shot",
         "handles-faults",
         "mission-authority",
         "queue-authority",
@@ -2750,6 +2755,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "render",
         "harness",
         "fresh-context",
+        "one-shot",
         "handles-faults",
         "mission-authority",
         "queue-authority",
@@ -2760,6 +2766,10 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
     }
     if let Some(flag) = unique_child(document, "handles-faults")? {
         ensure_bare(flag)?;
+    }
+    if let Some(flag) = unique_child(document, "one-shot")? {
+        ensure_bare(flag)?;
+        ensure_no_children(flag)?;
     }
     if let Some(tags) = unique_child(document, "tags")? {
         validate_tags(tags)?;
@@ -5738,6 +5748,59 @@ version 2
         }
         // A seat with no account runs on the harness's default login, and may set its own.
         parse_intent(&seat("\"codex\" {}", "env { CODEX_HOME \"/x\" }"), "node").unwrap();
+    }
+
+    #[test]
+    fn one_shot_is_an_explicit_seat_flag_and_does_not_change_restart_or_tasks() {
+        for launch in [r#"command "true""#, r#"harness "omp" {}"#] {
+            let source = format!(
+                "version 2\nagent \"example/once\" {{ one-shot; {launch}; exec \"helper\" {{ command \"true\" }} }}"
+            );
+            let intent = parse_intent(&source, "node").unwrap();
+            let seat = intent.subjects["agent/example/once"]
+                .member
+                .as_ref()
+                .unwrap();
+            assert!(seat.one_shot);
+            assert_eq!(seat.restart, RestartType::Always);
+            assert!(
+                !intent.subjects["exec/example/once/helper"]
+                    .member
+                    .as_ref()
+                    .unwrap()
+                    .one_shot
+            );
+            let legacy = serde_json::to_value(
+                parse_intent(&source.replace("one-shot; ", ""), "node")
+                    .unwrap()
+                    .subjects["agent/example/once"]
+                    .member
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(legacy.get("one_shot").is_none());
+            assert!(
+                !serde_json::from_value::<MemberSpec>(legacy)
+                    .unwrap()
+                    .one_shot
+            );
+        }
+        for invalid in [
+            "one-shot #true",
+            "one-shot value=1",
+            "one-shot {}",
+            "one-shot; one-shot",
+        ] {
+            assert!(
+                parse_intent(
+                    &format!("version 2\nagent \"example/once\" {{ {invalid}; command \"true\" }}"),
+                    "node"
+                )
+                .is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

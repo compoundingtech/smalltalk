@@ -42,20 +42,34 @@ for binary in st3 st3-migrate stui; do
   install -m 0755 "$build_dir/$target/release/$binary" "$work/$package/bin/$binary"
 done
 
-git init -q "$work/pty"
-git -C "$work/pty" remote add origin "$pty_url"
-git -C "$work/pty" fetch --depth 1 origin "$pty_rev"
-git -C "$work/pty" checkout -q --detach FETCH_HEAD
-test "$(git -C "$work/pty" rev-parse HEAD)" = "$pty_rev"
-cargo build --release --locked --manifest-path "$work/pty/Cargo.toml" \
+# Keep the immutable runtime source at a stable Cargo-home path. A random temporary
+# checkout invalidates its fingerprints on every job even when the pin is unchanged.
+pty_source="${CARGO_HOME:-$HOME/.cargo}/git/smalltalk-release-pty/$pty_rev"
+if [ ! -d "$pty_source/.git" ]; then
+  mkdir -p "$pty_source"
+  git init -q "$pty_source"
+  git -C "$pty_source" remote add origin "$pty_url"
+  git -C "$pty_source" fetch --depth 1 origin "$pty_rev"
+  git -C "$pty_source" checkout -q --detach FETCH_HEAD
+fi
+test "$(git -C "$pty_source" remote get-url origin)" = "$pty_url"
+test "$(git -C "$pty_source" rev-parse HEAD)" = "$pty_rev"
+test -z "$(GIT_OPTIONAL_LOCKS=0 git -C "$pty_source" status --porcelain)"
+AGENT_SPEC_REVISION="$pty_rev" cargo build --release --locked --manifest-path "$pty_source/Cargo.toml" \
   --target-dir "$build_dir" --target "$target" -p pty --bin pty
 install -m 0755 "$build_dir/$target/release/pty" "$work/$package/bin/pty"
 if [[ $target == *apple* ]]; then
   # stui's speech helper needs Swift with the macOS 26 SDK; without one the release ships without
   # voice in stui, and says so.
-  if ! apps/macos/listen/build.sh "$work/$package/bin" >/dev/null; then
+  speech="$build_dir/$target/release/StListen.app"
+  if [ "${CI_BUILD_SNAPSHOT_HIT:-}" = 1 ] && [ -d "$speech" ]; then
+    cp -R "$speech" "$work/$package/bin/StListen.app"
+  elif apps/macos/listen/build.sh "$work/$package/bin" >/dev/null; then
+    rm -rf "$speech"
+    cp -R "$work/$package/bin/StListen.app" "$speech"
+  else
     echo "release-smalltalk: the speech helper did not build here; this release has no voice in stui" >&2
-    rm -rf "$work/$package/bin/StListen.app"
+    rm -rf "$work/$package/bin/StListen.app" "$speech"
   fi
 fi
 ln -s st3 "$work/$package/bin/st"
