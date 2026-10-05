@@ -1555,6 +1555,9 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             subject: seat,
             idle: true,
             input_supported: true,
+            ask_supported: false,
+            ask_reason: None,
+            pending_ask: None,
             steer: Default::default(),
             models: Models {
                 choices: vec![ModelChoice {
