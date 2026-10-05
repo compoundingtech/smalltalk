@@ -19274,17 +19274,6 @@ mission "labelled" state="ready" {
         assert_eq!(agents[0]["upcoming_work"], json!([next]));
         assert_eq!(agents[0]["current_work"], json!([]));
 
-        store.append_claim(&ClaimInput {
-            subject: format!("agent/{}/worker", run.id), kind: "harness.observed".into(),
-            actor: None, fields: serde_json::from_value(json!({
-                "state":"idle", "driver":"codex", "incarnation_id":"labelled-1",
-            })).unwrap(), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
-        let cards = checked_agent_cache(&store, false, store.index().unwrap());
-        assert_eq!(cards[0]["next_work"], *next);
-        store.set_step_state(&first, "working", None).unwrap();
-        checked_agent_cache(&store, false, store.index().unwrap());
-
         // The list carries the open run's steps, so a client never joins work to missions.
         let missions = client_v0::mission_resources(&store, index, false, None).unwrap();
         let steps = missions[0]["run_details"][0]["steps"].as_array().unwrap();
@@ -19300,6 +19289,17 @@ mission "labelled" state="ready" {
         );
         assert_eq!(steps[0]["goals"], json!(["Greet the fleet."]));
         assert_eq!(steps[0]["assignee"], format!("agent/{}/worker", run.id));
+
+        store.append_claim(&ClaimInput {
+            subject: format!("agent/{}/worker", run.id), kind: "harness.observed".into(),
+            actor: None, fields: serde_json::from_value(json!({
+                "state":"idle", "driver":"codex", "incarnation_id":"labelled-1",
+            })).unwrap(), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let cards = checked_agent_cache(&store, false, store.index().unwrap());
+        assert_eq!(cards[0]["next_work"], *next);
+        store.set_step_state(&first, "working", None).unwrap();
+        checked_agent_cache(&store, false, store.index().unwrap());
     }
 
     #[test]
