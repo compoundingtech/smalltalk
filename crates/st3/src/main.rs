@@ -16317,12 +16317,12 @@ async fn drive_st2_native(
     let mut mailbox =
         NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
     let attach_started = Instant::now();
-    if driver == "claude" && mailbox.subscription.is_some() {
-        if let Err(error) = check_claude_attachment(
+    if driver == "claude" && mailbox.subscription.is_some()
+        && let Err(error) = check_claude_attachment(
             client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
-        ).await {
-            let _ = write_driver_log(subject, &format!("Claude attachment check will retry: {error:#}"));
-        }
+        ).await
+    {
+        let _ = write_driver_log(subject, &format!("Claude attachment check will retry: {error:#}"));
     }
     let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
