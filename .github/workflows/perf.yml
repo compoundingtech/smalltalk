@@ -58,7 +58,7 @@ jobs:
         nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
-    timeout-minutes: 90
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -105,7 +105,7 @@ jobs:
         run: bash scripts/ci-nix-cache use
       - name: Prepare fast scratch space for a new store recipe
         run: if [ ! -s "$RUNNER_TEMP/st-bench/generated-1.sqlite3" ]; then sudo mount -o remount,size=10G /dev/shm; fi
-      - name: Run the pinned three-source controlled intervention
+      - name: Validate single-pass wire parity then measure three exact sources
         shell: bash
         run: "nix develop '.#perf' -c python3 scripts/ci-record-intervention"
         id: load

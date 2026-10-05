@@ -8,17 +8,17 @@ import shutil
 import subprocess
 import time
 
-HEADS = {'main': 'e4062387fd5bd5538158f63e11bbf5aedc3ebe2c', 'api': '6108c2ce6a14884b7b349a207b8b6b8373341ae0', 'record': 'd0528b58828960223f7b1e454d15d73fa618034b'}
+HEADS = {'api': '566bb042188feb9d87c4f0c720b1bcc7dca858ea', 'existing': '55ce61bed9e84266b76591a1d3bec8dd10768b1a', 'candidate': '345416ca4d1ad7fe69cb71b2a15a03023d83409c'}
 BASELINES = [37276978494, 37273736714, 37265290064, 37257137831, 37256435588]
 MEASURED_TRIPLES = 6
 ORDERS = [
-    ['main', 'api', 'record'],  # predeclared warmup triple
-    ['main', 'api', 'record'],
-    ['record', 'api', 'main'],
-    ['api', 'main', 'record'],
-    ['record', 'main', 'api'],
-    ['main', 'record', 'api'],
-    ['api', 'record', 'main'],
+    ['api', 'existing', 'candidate'],  # predeclared warmup triple
+    ['api', 'existing', 'candidate'],
+    ['candidate', 'existing', 'api'],
+    ['existing', 'api', 'candidate'],
+    ['candidate', 'api', 'existing'],
+    ['api', 'candidate', 'existing'],
+    ['existing', 'candidate', 'api'],
 ]
 workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
 temporary = pathlib.Path(os.environ['RUNNER_TEMP'])
@@ -67,7 +67,7 @@ plan = {
     'warmup_triples': 1,
     'measured_triples': MEASURED_TRIPLES,
     'order': ORDERS,
-    'interventions': 'frozen main; main plus existing API PR; API plus existing record PR',
+    'interventions': 'fresh exact API; API plus exact existing record patch; same parent plus single-pass generated claim spans',
     'fixture_run': 37281901496,
     'fixture_artifact': 11333545011,
     'fixture_sha256': 'e31918ae968d5f101a4ab317fabbb1909a516d13b0f85b2d3d7d4edd9c3b4489',
@@ -76,6 +76,8 @@ plan = {
     'baseline_file_sha256': baseline_hashes,
     'assertions_and_budgets_unchanged': True,
     'profiling_disabled': True,
+    'candidate_core_tests_required_before_timing': True,
+    'prior_cohorts_not_pooled': True,
     'workload_seconds': 120,
     'workload_scale': 1,
     'runner': machine(),
@@ -103,6 +105,19 @@ for side, head in HEADS.items():
     })
     environment = os.environ.copy()
     environment.update(CARGO_TARGET_DIR=str(workspace / 'target'), CARGO_BUILD_JOBS='3', AGENT_SPEC_REVISION=head)
+    if side == 'candidate':
+        # Correctness is a prerequisite. Failure retains the log and stops before timing.
+        with (output / 'candidate-core-tests.log').open('w') as log:
+            validation = subprocess.run(['cargo', 'test', '-p', 'smallclaims', '--locked',
+                                         '--', '--nocapture'], cwd=source, env=environment,
+                                        stdout=log, stderr=subprocess.STDOUT)
+        write('candidate-core-validation.json', {
+            'head': head, 'exit_code': validation.returncode,
+            'test_log_sha256': digest(output / 'candidate-core-tests.log'),
+            'required_before_any_timing': True,
+        })
+        if validation.returncode:
+            raise RuntimeError('Candidate core/wire/span/raw tests failed; no timings accepted')
     command = ['cargo', 'test', '--release', '-p', 'st3', '--features', 'perf-load', '--test',
                'perf_load', '--locked', '--no-run', '--message-format=json']
     with (output / (side + '-build.jsonl')).open('w') as stdout, (output / (side + '-build.log')).open('w') as stderr:
@@ -129,6 +144,18 @@ for side, head in HEADS.items():
     assert not git('status', '--porcelain', cwd=source)
     executables[side] = {'head': head, 'path': str(frozen), 'sha256': digest(frozen)}
     write('frozen-binaries.json', executables)
+workload_hashes = {
+    name: {json.loads((output / (side + '-source.json')).read_text())[name] for side in HEADS}
+    for name in ['daemon_load_sha256', 'daemon_bench_sha256']
+}
+assert all(len(values) == 1 for values in workload_hashes.values())
+for name, before, after in [('existing-record', HEADS['api'], HEADS['existing']),
+                            ('single-pass', HEADS['existing'], HEADS['candidate'])]:
+    (output / (name + '-source.diff')).write_text(git('diff', before, after))
+assert set(git('diff', '--name-only', HEADS['existing'], HEADS['candidate']).splitlines()) == {
+    'crates/smallclaims/src/store.rs', 'crates/smallclaims/src/store/record_offsets.rs',
+    'crates/smallclaims/src/store/record_offsets/encoding.rs',
+}
 assert len({value['sha256'] for value in executables.values()}) == 3
 subprocess.run(['sccache', '--stop-server'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
