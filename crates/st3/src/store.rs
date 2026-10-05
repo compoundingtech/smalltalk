@@ -14753,11 +14753,9 @@ impl Store {
         let index = self.index().map_err(internal)?;
         let connection = self.readers.get();
         let local = connection
-            .query_row(
-                "SELECT COALESCE(MAX(id), 0) FROM local_observations",
-                [],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM local_observations")
+            .map_err(internal)?
+            .query_row([], |row| row.get(0))
             .map_err(internal)?;
         Ok(MailboxWatermark {
             index,
@@ -14784,7 +14782,7 @@ impl Store {
             .unwrap_or(&recipient)
             .to_owned();
         let changed: i64 = connection
-            .query_row(
+            .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND store_index>?2)
                      OR EXISTS(SELECT 1 FROM claims INDEXED BY claims_message_to_order_index
                                WHERE kind='message.sent'
@@ -14797,6 +14795,9 @@ impl Store {
                                WHERE kind='intent.desired' AND store_index>?2
                                  AND subject GLOB 'message/*')
                      OR EXISTS(SELECT 1 FROM local_observations WHERE subject=?1 AND id>?6)",
+            )
+            .map_err(internal)?
+            .query_row(
                 params![
                     fence.subject,
                     mark.index,
@@ -19817,10 +19818,13 @@ fn mailbox_owner_key(
     fence: &crate::mailbox::Fence,
 ) -> Result<Option<(String, i64, bool)>, St3Error> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT owner.incarnation, owner.epoch,
                     EXISTS(SELECT 1 FROM local_mailbox_bindings WHERE token=?3)
              FROM local_mailbox_owners owner WHERE owner.subject=?1 AND owner.component=?2",
+        )
+        .map_err(internal)?
+        .query_row(
             params![fence.subject, fence.component, fence.token],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -19834,12 +19838,15 @@ fn check_mailbox_fence(
 ) -> Result<(), St3Error> {
     check_mailbox_incarnation(connection, fence)?;
     let owner: Option<(String, u64)> = connection
-        .query_row(
+        .prepare_cached(
             "SELECT owner.incarnation, owner.epoch FROM local_mailbox_owners owner
              JOIN local_mailbox_bindings binding ON binding.token=?3
                AND binding.subject=owner.subject AND binding.component=owner.component
                AND binding.incarnation=owner.incarnation AND binding.epoch=owner.epoch
              WHERE owner.subject=?1 AND owner.component=?2",
+        )
+        .map_err(internal)?
+        .query_row(
             params![fence.subject, fence.component, fence.token],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
