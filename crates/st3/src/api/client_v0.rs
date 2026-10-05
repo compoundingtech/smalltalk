@@ -749,6 +749,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
         }
         refresh.sort_unstable();
         refresh.dedup();
+        // A permanently refused dirty window no longer counts toward held-window refreshes.
+        refresh.retain(|id| subscriptions.contains_key(id));
         if refresh.is_empty() {
             continue;
         }
@@ -9122,6 +9124,69 @@ mod tests {
         assert_eq!(frame["id"], "slow");
         assert_eq!(frame["kind"], "snapshot");
         release.notify_one();
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dirty_refused_collection_does_not_erase_another_windows_retry() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let release = Arc::new(Notify::new());
+        let refused = release.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, release, attempts) = (state.clone(), refused.clone(), attempts.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request| {
+                                let (release, attempts) = (release.clone(), attempts.clone());
+                                async move {
+                                    if request.collection == "agents" {
+                                        release.notified().await;
+                                        Err(validation("injected permanent refusal"))
+                                    } else if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                                        Err(ApiError::internal("injected transient failure"))
+                                    } else {
+                                        collection_items(&state, &session, &request).await
+                                    }
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        for (id, collection) in [("retry", "work"), ("refused", "agents")] {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":id,"collection":collection,"limit":2}).to_string().into(),
+            )).await.unwrap();
+        }
+        let frame = socket.next().await.unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "retry");
+        assert_eq!(frame["kind"], "resync");
+        // Let the immediately-ready attention tick mark the pending agents read dirty.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release.notify_one();
+        let mut frames = BTreeMap::new();
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            frames.insert(frame["id"].as_str().unwrap().to_owned(), frame);
+        }
+        assert_eq!(frames["refused"]["kind"], "error");
+        assert_eq!(frames["retry"]["kind"], "snapshot");
         socket.close(None).await.unwrap();
         server.abort();
     }
