@@ -227,10 +227,11 @@ impl Authority {
 }
 
 fn pairing_stamp(claim: &crate::model::ClaimRecord) -> Result<String, St3Error> {
-    // Seal the immutable origin and full authority fields, not a mutable projection.
-    let body = serde_json::to_vec(&(&claim.id, &claim.origin, &claim.kind, &claim.subject, &claim.body))
-        .map_err(|_| refusal("internal", "notes pairing authority could not be encoded"))?;
-    Ok(digest(&body))
+    // Seal the persisted canonical body: object insertion order is not authority.
+    let body = smallclaims::hash::canonical_serialized_json_text(
+        &(&claim.id, &claim.origin, &claim.kind, &claim.subject, &claim.body),
+    ).map_err(|_| refusal("internal", "notes pairing authority could not be encoded"))?;
+    Ok(digest(body.as_bytes()))
 }
 
 fn ledger(state_dir: &Path) -> Result<Connection, St3Error> {
@@ -271,6 +272,9 @@ mod tests {
         assert!(!authority.pairing_attested(root.path(), &claim).unwrap());
         authority.attest_pairing(root.path(), &claim).unwrap();
         assert!(authority.pairing_attested(root.path(), &claim).unwrap());
+        let persisted = store.latest_claim(&claim.subject, Some(&claim.kind)).unwrap().unwrap();
+        assert!(authority.pairing_attested(root.path(), &persisted).unwrap(),
+            "a committed local pairing must retain authority after canonical graph readback");
         assert!(!authority.pairing_attested(other.path(), &claim).unwrap());
         for field in ["person_id", "credential_hash", "scopes", "expires_at_unix_ms"] {
             let mut changed = claim.clone();
