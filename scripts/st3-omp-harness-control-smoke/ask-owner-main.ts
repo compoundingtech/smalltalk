@@ -90,7 +90,7 @@ try {
   // Start the PTY before the owner reads its actual PID/creation incarnation. The
   // launcher waits for the owner's socket before starting OMP and its production channel.
   const command = ['bash', '-c', 'while [ ! -S "$SMOKE_SOCKET" ]; do sleep 0.05; done; exec "$@"', 'ask-launcher', omp, '--no-lsp', '--no-extensions', '--no-skills', '--no-rules', '--no-title', '--tools', 'ask', '--extension', resolve(import.meta.dir, 'ask-owner-extension.ts'), '--extension', resolve(import.meta.dir, '../../crates/st3/hooks/omp-channel.ts'), '--session-dir', sessions, '--model', 'control-smoke/native-smoke', '--thinking', 'off'];
-  await pty('run', '-d', '--id', 'native-smoke', '--cwd', root, ...Object.entries(nativeEnv).flatMap(([key, value]) => ['--env', `${key}=${value}`]), '--', ...command);
+  await pty('run', '-d', '--id', 'native-smoke', '--tag', `st3.subject=${subject}`, '--cwd', root, ...Object.entries(nativeEnv).flatMap(([key, value]) => ['--env', `${key}=${value}`]), '--', ...command);
   daemonProcess = Bun.spawn([daemon, root], { env: { ...clean, SMOKE_REAL_PTY: '1', ST_SMOKE_CLIENT_SOCKET: root + '/client.sock' }, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
   const daemonStderr = new Response(daemonProcess.stderr).text();
   await poll(async () => { try { return (await request('/v1/health')).status === 200; } catch { return false; } }, 'owner daemon');
@@ -164,7 +164,7 @@ try {
     if (!queued.native.ask_supported) throw Error('Native guarded answer unsupported ' + JSON.stringify(queued.native));
     if (scenarioIndex === 0 && !browserMode) {
       const malformed = await answer('partial', { ...parameters, answers: scenario.answers.slice(0, 1) });
-      if (malformed.status < 400 || malformed.envelope.code !== 'invalid-harness-answers') throw Error('Partial answers were admitted');
+      if (malformed.status < 400 || malformed.envelope.code !== 'invalid-harness-answers') throw Error('Partial answer refusal differed: ' + JSON.stringify(malformed));
       const unauthorized = await answer('unauthorized', parameters, false);
       if (unauthorized.status !== 403) throw Error('Unpaired answer was admitted');
     }
