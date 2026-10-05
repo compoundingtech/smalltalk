@@ -91,7 +91,7 @@ jobs:
   namespace-capacity:
     name: namespace-capacity
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["namespace-profile-linux-x86-64","namespace-features:github.run-id={0}"]', github.run_id)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["namespace-profile-linux-x86-64;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 120
     permissions:
       contents: read
@@ -224,7 +224,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on:
       [
-        "namespace-profile-linux-x86-64;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        namespace-profile-linux-x86-64;job.priority=1,
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 20
@@ -313,7 +313,7 @@ jobs:
     if: ${{ !cancelled() && needs.genie-freshness.result == 'success' }}
     runs-on:
       [
-        "namespace-profile-linux-x86-64;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        namespace-profile-linux-x86-64;job.priority=1,
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 10
@@ -370,7 +370,7 @@ jobs:
     name: linux-tests
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={0}","namespace-features:github.run-id={1}"]', (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10, github.run_id)) }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -519,7 +519,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on:
       [
-        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -661,7 +661,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on:
       [
-        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -781,7 +781,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on:
       [
-        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -941,7 +941,11 @@ jobs:
   perf-cost:
     name: perf-cost
     if: github.event_name != 'merge_group'
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:
@@ -1066,7 +1070,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on:
       [
-        "namespace-profile-linux-x86-64;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        namespace-profile-linux-x86-64;job.priority=1,
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 60

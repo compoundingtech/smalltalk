@@ -5,6 +5,7 @@ import {
   buildEnv,
   cargoCacheStep,
   commonSetupSteps,
+  linuxRunner,
   linuxStageJob,
   linuxStageRunner,
   nixCacheStep,
@@ -69,7 +70,7 @@ export default githubWorkflow(auditCaches({
   concurrency: { group: 'main-upkeep-${{ github.run_id }}', 'cancel-in-progress': false },
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
+    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
   },
   jobs: {
     'main-checks': {

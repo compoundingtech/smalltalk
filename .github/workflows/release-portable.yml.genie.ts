@@ -1,10 +1,11 @@
+import { linuxActionlintConfig, linuxRunner } from './workspace-ci.ts'
 import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import { auditCaches } from './cache-audit.ts'
-import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
+import { githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
 
 // Preserve release triggers, source verification and publishing permissions.
 export default githubWorkflow(auditCaches({
-  actionlint: defaultActionlintConfig,
+  actionlint: linuxActionlintConfig,
   "name": "Publish portable st2 source",
   "on": {
     "workflow_dispatch": {
@@ -28,7 +29,7 @@ export default githubWorkflow(auditCaches({
   },
   "jobs": {
     "linux-x86_64": {
-      "runs-on": "namespace-profile-linux-x86-64",
+      "runs-on": linuxRunner,
       "timeout-minutes": 30,
       "env": {
         "SOURCE_SHA": "${{ inputs.source_sha }}",

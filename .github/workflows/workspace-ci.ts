@@ -1,20 +1,30 @@
 import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import {
+  defaultActionlintConfig,
   effectUtilsBinaryCaches,
   namespaceRunner,
   nixDevelopStep,
   plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
 
-export const linuxRunner = namespaceRunner({ profile: 'namespace-profile-linux-x86-64', runId: '${{ github.run_id }}' })
+export const linuxRunner = namespaceRunner({ profile: 'namespace-profile-linux-x86-64;job.priority=1', runId: '${{ github.run_id }}' })
 /**
  * The Linux gate's stage jobs. On 2026-10-03 the shape label `nscloud-ubuntu-24.04-amd64-16x32`
  * stopped getting runners at about 12:10Z, and the profile allows only about five runners at
  * once, so with every job on it Workspace CI runs went one at a time. The 8x16 shape label still
  * got runners at once.
  */
-export const linuxStageRunner = ['nscloud-ubuntu-24.04-amd64-8x16'] as const
+const linuxStageShape = 'nscloud-ubuntu-24.04-amd64-8x16-with-features'
+/** All Linux Namespace work shares one class: older benchmarks cannot be overtaken forever. */
+export const linuxStageRunner = [
+  `${linuxStageShape};job.priority=1`,
+  'namespace-features:github.run-id=${{ github.run_id }}',
+] as const
 export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-arm64', runId: '${{ github.run_id }}' })
+export const linuxActionlintConfig = {
+  ...defaultActionlintConfig,
+  selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
+} as const
 
 /**
  * ci1 takes the primary Workspace CI test partition when enough general runners are idle;
@@ -107,31 +117,21 @@ printf 'Runner: **ci1** (%s, %s idle)\\n' "$label" "$idle" >> "$GITHUB_STEP_SUMM
 const pickedOr = (namespaceLabels: string) =>
   `\${{ fromJSON(needs.${pickRunnerJobId}.outputs.ci1 || ${namespaceLabels}) }}`
 
-// Required Workspace jobs precede optional benchmarks under Namespace contention.
-// Run affinity prevents another workflow with the same shape from taking their runner.
-const workspaceQueuePriority = "(github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10"
-const workspaceStageShape = `${linuxStageRunner[0]}-with-features`
-const workspaceStageLabels = (priority: string, runId: string) => [
-  `${workspaceStageShape};job.priority=${priority}`,
-  `namespace-features:github.run-id=${runId}`,
-] as const
-
-/** `runs-on` for a stage job: picked ci1, else prioritized Namespace with run affinity. */
+// Same priority for required, optional and manual jobs. Run affinity makes Namespace's
+// scheduled order deterministic; a newer required run cannot steal an older benchmark's runner.
+/** `runs-on` for a stage job: picked ci1, else the shared Namespace queue class. */
 export const linuxStageRunsOn = pickedOr(
-  `format('${JSON.stringify(workspaceStageLabels('{0}', '{1}'))}', ${workspaceQueuePriority}, github.run_id)`,
+  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
 )
 
-/** `runs-on` for the other Linux jobs: ci1 when picked, else the Namespace profile with run affinity. */
+/** `runs-on` for a Linux profile job: picked ci1, else the shared Namespace queue class. */
 export const linuxRunsOn = pickedOr(
-  `format('${JSON.stringify(namespaceRunner({ profile: linuxRunner[0], runId: '{0}' }))}', github.run_id)`,
+  `format('${JSON.stringify(linuxRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
 )
 
 /** Supporting jobs use independent CPUs; only the primary test shard takes the picked lane. */
-export const supportingLinuxRunsOn = [
-  `${linuxRunner[0]};job.priority=\${{ ${workspaceQueuePriority} }}`,
-  linuxRunner[1],
-] as const
-export const supportingStageRunsOn = workspaceStageLabels(`\${{ ${workspaceQueuePriority} }}`, '${{ github.run_id }}')
+export const supportingLinuxRunsOn = linuxRunner
+export const supportingStageRunsOn = linuxStageRunner
 
 /** A job that needs `pick-runner` still runs when it was skipped (ci1 off). */
 export const afterPickRunner = { needs: [pickRunnerJobId], if: '${{ !cancelled() }}' } as const
