@@ -1138,6 +1138,25 @@ impl Client {
         .await
     }
 
+    pub async fn custom_subjects_list(
+        &self,
+        kind: Option<&str>,
+        version: Option<u32>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<Page>, ClientError> {
+        let version = version.map(|v| v.to_string());
+        let values = [("kind", kind), ("version", version.as_deref())];
+        let filters = values
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect::<Vec<_>>();
+        self.list_internal_with_filters("custom-subjects", cursor, limit, false, &filters)
+            .await
+    }
+    pub async fn custom_subjects_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.resource_internal("custom-subjects", id).await
+    }
     pub async fn host_repositories(
         &self,
         host: &str,
@@ -1610,6 +1629,17 @@ impl Client {
         parameters: AttentionResolveParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::attention_resolve(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn custom_reply(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: CustomReplyParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::custom_reply(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
@@ -2644,7 +2674,10 @@ impl Client {
                     .await
                 }
                 Endpoint::FabricLoopback(base) => {
-                    let mut request = self.http.request(method, format!("{base}{path}"));
+                    let mut request = self
+                        .http
+                        .request(method, format!("{base}{path}"))
+                        .header("x-st3-features", "custom-subjects.v1");
                     if let Some(key) = key {
                         request = request.header("idempotency-key", key);
                     }
@@ -2765,7 +2798,8 @@ async fn unix_request(
     let mut builder = Request::builder()
         .method(method)
         .uri(path)
-        .header("host", "localhost");
+        .header("host", "localhost")
+        .header("x-st3-features", "custom-subjects.v1");
     if let Some(credential) = credential {
         builder = builder.header("authorization", format!("Bearer {credential}"));
     }
@@ -2837,6 +2871,10 @@ fn websocket_request(
     let mut request = url
         .into_client_request()
         .map_err(|error| ClientError::Protocol(error.to_string()))?;
+    request.headers_mut().insert(
+        hyper::header::HeaderName::from_static("x-st3-features"),
+        hyper::header::HeaderValue::from_static("custom-subjects.v1"),
+    );
     request.headers_mut().insert(
         hyper::header::SEC_WEBSOCKET_PROTOCOL,
         hyper::header::HeaderValue::from_str(&match stream_capability {

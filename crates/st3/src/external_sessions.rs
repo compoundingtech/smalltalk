@@ -726,21 +726,22 @@ fn linux_child_processes(pid: u32) -> BTreeSet<u32> {
     children
 }
 
-/// Read only the exact OMP transcript durably bound by an import claim.
-pub(crate) fn find_imported_omp_transcript(
+/// Read only the exact pi-family transcript durably named by a native binding or import claim.
+pub(crate) fn find_bound_pi_family_transcript(
+    driver: ExternalDriver,
     path: &Path,
     native_id: &str,
 ) -> Result<Option<ExternalSession>> {
-    let Some(metadata) = read_metadata(ExternalDriver::Omp, path)? else {
+    let Some(metadata) = read_metadata(driver, path)? else {
         return Ok(None);
     };
     if metadata.native_id != native_id {
         return Ok(None);
     }
     Ok(Some(ExternalSession {
-        id: external_session_id(ExternalDriver::Omp, native_id),
+        id: external_session_id(driver, native_id),
         revision: metadata.revision,
-        driver: ExternalDriver::Omp,
+        driver,
         native_id: metadata.native_id,
         transcript: metadata.transcript,
         cwd: metadata.cwd,
@@ -3239,7 +3240,7 @@ mod tests {
             )
             .unwrap();
         }
-        let bound = find_imported_omp_transcript(&selected, "shared-id")
+        let bound = find_bound_pi_family_transcript(ExternalDriver::Omp, &selected, "shared-id")
             .unwrap()
             .unwrap();
         let timeline = normalized_timeline(&bound).unwrap();
@@ -3254,7 +3255,7 @@ mod tests {
                 .any(|item| item["body"]["text"] == "stale context")
         );
         assert!(
-            find_imported_omp_transcript(&stale, "wrong-id")
+            find_bound_pi_family_transcript(ExternalDriver::Omp, &stale, "wrong-id")
                 .unwrap()
                 .is_none()
         );

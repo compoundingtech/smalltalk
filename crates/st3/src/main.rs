@@ -2358,6 +2358,29 @@ struct DevicesArgs {
 
 #[derive(Subcommand)]
 enum SubjectCommand {
+    /// Reply to a custom source under its current revision and waiting episode.
+    Reply {
+        subject: String,
+        #[arg(long)]
+        registration: String,
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        episode: String,
+        #[arg(long)]
+        fields_file: PathBuf,
+        #[arg(long="as",value_parser=parse_actor_subject)]
+        actor: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Read the revision of complete raw custom inputs for a derived-state basis.
+    Basis {
+        subject: String,
+        #[arg(long = "kind", required = true)]
+        kinds: Vec<String>,
+    },
+
     /// Show one typed subject card.
     Show(SubjectShowArgs),
     /// Show bounded immutable history for one subject.
@@ -3381,6 +3404,17 @@ struct HarnessDiagnosticArgs {
 
 #[derive(Subcommand)]
 enum SchemaCommand {
+    /// Register an immutable typed custom schema and bounded projection.
+    Register {
+        file: PathBuf,
+        #[arg(long = "as",value_parser=parse_actor_subject)]
+        actor: String,
+    },
+    /// List registered custom kinds and their pinned revisions.
+    Registrations,
+    /// Read an exact custom registration, KIND@HASH.
+    Registration { kind: String },
+
     /// List registered subject families.
     Subjects,
     /// List registered resource kinds.
@@ -8923,7 +8957,54 @@ async fn follow_conversation(
 
 async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool) -> Result<()> {
     match command {
+        SubjectCommand::Reply {
+            subject,
+            registration,
+            revision,
+            episode,
+            fields_file,
+            actor,
+            idempotency_key,
+        } => {
+            reject_foreign_agent_actor(&actor)?;
+            let fields = serde_json::from_slice(&std::fs::read(fields_file)?)?;
+            let result: Value = client
+                .post(
+                    "/v1/custom/reply",
+                    &st3::store::custom::ReplyRequest {
+                        subject,
+                        registration,
+                        revision,
+                        episode,
+                        fields,
+                        actor,
+                        idempotency_key,
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+        SubjectCommand::Basis { subject, kinds } => {
+            let result: Value = client
+                .get(&format!(
+                    "/v1/custom/basis?subject={}&kinds={}",
+                    urlencoding::encode(&subject),
+                    urlencoding::encode(&kinds.join(","))
+                ))
+                .await?;
+            print_value(&result, json_output)
+        }
         SubjectCommand::Show(args) => {
+            if args.subject.starts_with("custom/") && !args.kdl
+                && let Ok(result) = client
+                    .get::<Value>(&format!(
+                        "/v1/client/custom-subjects/{}",
+                        urlencoding::encode(&args.subject)
+                    ))
+                    .await
+            {
+                return print_value(&result, json_output);
+            }
             if args.kdl {
                 anyhow::ensure!(
                     args.subject.starts_with("agent/"),
@@ -13382,8 +13463,47 @@ async fn run_harness_diagnostic(
 }
 
 async fn run_schema(client: &Client, command: SchemaCommand, json_output: bool) -> Result<()> {
+    match &command {
+        SchemaCommand::Register { file, actor } => {
+            reject_foreign_agent_actor(actor)?;
+            let manifest = serde_json::from_slice(&std::fs::read(file)?)?;
+            let value: Value = client
+                .post(
+                    "/v1/schema/registrations",
+                    &st3::store::custom::RegistrationRequest {
+                        manifest,
+                        actor: actor.clone(),
+                    },
+                )
+                .await?;
+            return print_value(&value, json_output);
+        }
+        SchemaCommand::Registrations => {
+            let value: Value = client.get("/v1/schema/registrations").await?;
+            return print_value(&value, json_output);
+        }
+        SchemaCommand::Registration { kind } => {
+            let (name, hash) = kind
+                .rsplit_once('@')
+                .context("registration needs KIND@HASH")?;
+            let value: Value = client.get("/v1/schema/registrations").await?;
+            let item = value["items"]
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|v| v["manifest"]["kind"] == name && v["registration"] == hash)
+                })
+                .context("registration is unavailable")?;
+            return print_value(item, json_output);
+        }
+        _ => {}
+    }
     let value: Value = client.get("/v1/schema").await?;
     let selected = match command {
+        SchemaCommand::Register { .. }
+        | SchemaCommand::Registrations
+        | SchemaCommand::Registration { .. } => unreachable!("handled above"),
         SchemaCommand::Export => value,
         SchemaCommand::Subjects => value
             .get("subjects")
@@ -15718,6 +15838,18 @@ async fn run_st2_native_driver(
         reject_noninteractive_claude_argv(&argv)?;
     }
     let paths = NativePaths::prepare(subject, driver)?;
+    #[cfg(unix)]
+    if matches!(driver, "pi" | "omp")
+        && let Err(skip) = st3::native_resume::pi_family_link_transcript(
+            &argv,
+            &paths.session_dir.join("provider-sessions"),
+        )
+    {
+        let _ = write_driver_log(
+            subject,
+            &json!({"type":"authored_resume_link_skipped","driver":driver,"code":skip.code,"reason":skip.reason}).to_string(),
+        );
+    }
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
     // A driver launched while the daemon restarts waits for it; exiting here would end the seat.
     retry_while_daemon_unreachable(subject, || {
@@ -16848,21 +16980,21 @@ impl NativeObservations {
         } else {
             None
         };
-        let provider_incarnation = if enabled {
-            st_drivers::harness_state::read(
-                &st_drivers::harness_state::harness_state_path(dir),
-                None,
-            )
-            .and_then(|state| state.evidence_incarnation)
+        // The provider token is separate from the runtime incarnation. Only the spool's
+        // producer/runtime binding proves that a saved snapshot belongs to this launch.
+        // Re-exec may restore it; a replacement runtime waits for its own provider event.
+        let snapshot = if enabled {
+            st_drivers::harness_events::read_runtime_state(dir, runtime)?
         } else {
             None
         };
-        let evidence_deadline = if enabled {
-            st_drivers::harness_events::read_snapshot(dir, "harness-state")?
-                .and_then(|raw| serde_json::from_slice(&raw).ok())
-        } else {
-            None
-        };
+        let provider_incarnation = snapshot.as_deref().and_then(|raw| {
+            st_drivers::harness_state::read_raw_at(raw, None, st_drivers::message::now_ms())
+                .evidence_incarnation
+        });
+        let evidence_deadline = snapshot
+            .as_deref()
+            .and_then(|raw| serde_json::from_slice(raw).ok());
         Ok(Self {
             dir: dir.into(),
             runtime: runtime.into(),
@@ -20065,6 +20197,7 @@ struct NativeMailbox {
     messages: Vec<MessageView>,
     queued: BTreeMap<String, st_drivers::message::Message>,
     replayed: bool,
+    last_title_warning: Option<Instant>,
 }
 impl NativeMailbox {
     async fn start(
@@ -20102,6 +20235,7 @@ impl NativeMailbox {
             messages: Vec::new(),
             queued: BTreeMap::new(),
             replayed: false,
+            last_title_warning: None,
         })
     }
     async fn recv(&mut self) -> Option<st3::mailbox::Frame> {
@@ -20120,7 +20254,16 @@ impl NativeMailbox {
             }
             Some(st3::mailbox::Frame::Seat { seat }) => {
                 if let Err(error) = update_native_title(&seat, runtime_id) {
-                    eprintln!("st: could not update seat title: {error:#}");
+                    let now = Instant::now();
+                    if self.last_title_warning.is_none_or(|prior| {
+                        now.duration_since(prior) >= Duration::from_secs(10)
+                    }) {
+                        let _ = write_driver_log(
+                            &self.fence.subject,
+                            &format!("could not update seat title: {error:#}"),
+                        );
+                        self.last_title_warning = Some(now);
+                    }
                 }
                 Ok(())
             }
@@ -20297,8 +20440,13 @@ fn seat_label(seat: &st3::model::DesiredSubject) -> String {
 }
 fn update_native_title(seat: &st3::model::DesiredSubject, runtime_id: &str) -> Result<()> {
     let label = seat_label(seat);
+    // The launcher's registry name can differ from the provider's logical runtime ID.
+    let session = std::env::var("PTY_SESSION")
+        .ok()
+        .filter(|session| !session.is_empty())
+        .unwrap_or_else(|| runtime_id.to_owned());
     let result = std::process::Command::new("pty")
-        .args(["rename", runtime_id, &label])
+        .args(["rename", &session, &label])
         .output()?;
     anyhow::ensure!(
         result.status.success(),
@@ -21850,6 +21998,7 @@ mod tests {
                 messages: vec![view.clone()],
                 queued: BTreeMap::new(),
                 replayed: true,
+                last_title_warning: None,
             };
             view.subject = "message/pending".into();
             view.status = "staged".into();
@@ -26447,6 +26596,61 @@ mission "review" state="ready" {
         assert_eq!(store.local_observations_tail(100).unwrap().len(), 1);
         server.abort();
     }
+    #[tokio::test]
+    async fn initial_snapshot_requires_the_providers_runtime_binding() {
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-old").unwrap();
+        let seq =
+            st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-old")
+                .unwrap();
+        let observations = NativeObservations::start(root.path(), "runtime-old").unwrap();
+        assert_eq!(
+            observations.provider_incarnation.as_deref(),
+            Some("provider-old")
+        );
+        assert!(observations.evidence_deadline.is_some());
+        drop(observations);
+
+        // Enabling the successor changes the runtime metadata, not the snapshot's producer.
+        // Even a delayed write by the predecessor belongs to its original runtime.
+        st_drivers::harness_events::enable(root.path(), "runtime-new").unwrap();
+        st_drivers::harness_state::Writer::new(
+            root.path(),
+            "example/seat",
+            "claude",
+            Some("pty".into()),
+        )
+        .with_ownership("provider-old", seq)
+        .observe(st_drivers::harness_state::Observation::new(
+            st_drivers::harness_state::Activity::Active,
+            st_drivers::harness_state::BlockedOn::None,
+            st_drivers::harness_state::InputBuffer::Unknown,
+        ))
+        .unwrap();
+        let observations = NativeObservations::start(root.path(), "runtime-new").unwrap();
+        assert_eq!(observations.provider_incarnation, None);
+        assert_eq!(observations.evidence_deadline, None);
+        drop(observations);
+        assert!(
+            st_drivers::harness_events::read_snapshot(root.path(), "harness-state")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            st_drivers::harness_events::pending(root.path(), 100).unwrap()[0].runtime_incarnation,
+            "runtime-old"
+        );
+
+        st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-new")
+            .unwrap();
+        let observations = NativeObservations::start(root.path(), "runtime-new").unwrap();
+        assert_eq!(
+            observations.provider_incarnation.as_deref(),
+            Some("provider-new")
+        );
+        assert!(observations.evidence_deadline.is_some());
+    }
+
     #[tokio::test]
     async fn reading_the_outbox_does_not_wake_an_idle_driver() {
         let root = tempfile::tempdir().unwrap();

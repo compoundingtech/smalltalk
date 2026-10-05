@@ -386,6 +386,11 @@ pub struct Ui {
     stalled: HashMap<String, String>,
 }
 
+/// Whether `c` can be part of a written-out web address.
+fn is_address_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
+}
+
 impl Ui {
     /// Call only after the terminal successfully presented this frame.
     pub(crate) fn visible_messages(&self) -> HashSet<String> {
@@ -616,8 +621,14 @@ impl Ui {
     }
 
     /// Make the links drawn in `area` clickable: addresses written out, and markdown links by
-    /// the text they were drawn with.
+    /// the text they were drawn with. An address the renderer wrapped at the edge is one link on
+    /// every row it covers, so a click on any part of it opens or copies all of it.
     fn links(&self, buf: &Buffer, area: Rect) {
+        let chars = |y: u16| -> Vec<(u16, char)> {
+            (area.x..area.x + area.width)
+                .map(|x| (x, buf[(x, y)].symbol().chars().next().unwrap_or(' ')))
+                .collect()
+        };
         for y in area.y..area.y + area.height {
             let cells = (area.x..area.x + area.width)
                 .map(|x| (x, &buf[(x, y)]))
@@ -636,25 +647,59 @@ impl Ui {
                     from = start + 4;
                     continue;
                 }
-                let url = tail
-                    .split(char::is_whitespace)
-                    .next()
-                    .unwrap_or("")
-                    .trim_end_matches(['.', ',', ')', ']', ';', ':', '"', '\'', '>']);
+                let token = tail.split(char::is_whitespace).next().unwrap_or("");
                 let column = text[..start].chars().count();
-                let width = url.chars().count();
+                // Each part of the address: where it sits on its row, and how wide it is.
+                let mut parts = Vec::new();
+                let mut url = token.to_owned();
                 if let Some((x, _)) = cells.get(column) {
-                    self.hit(
-                        Rect {
-                            x: *x,
-                            y,
-                            width: width as u16,
-                            height: 1,
-                        },
-                        Hit::Link(url.to_owned()),
-                    );
+                    parts.push((*x, y, token.chars().count()));
                 }
-                from = start + url.len().max(1);
+                // An address that runs to the right edge goes on at the start of the next row.
+                let mut reaches_edge = token.len() == tail.trim_end().len()
+                    && column + token.chars().count() >= usize::from(area.width).saturating_sub(3);
+                let mut next = y + 1;
+                while reaches_edge && next < area.y + area.height {
+                    let below = chars(next);
+                    let indent = below.iter().take_while(|(_, c)| *c == ' ').count();
+                    let more = below[indent..]
+                        .iter()
+                        .take_while(|(_, c)| !c.is_whitespace())
+                        .collect::<Vec<_>>();
+                    if indent > 4
+                        || more.is_empty()
+                        || more.iter().any(|(_, c)| !is_address_char(*c))
+                    {
+                        break;
+                    }
+                    url.extend(more.iter().map(|(_, c)| *c));
+                    parts.push((below[indent].0, next, more.len()));
+                    reaches_edge = indent + more.len() >= below.len().saturating_sub(3)
+                        && below[indent + more.len()..].iter().all(|(_, c)| *c == ' ');
+                    next += 1;
+                }
+                let trimmed = url
+                    .trim_end_matches(['.', ',', ')', ']', ';', ':', '"', '\'', '>'])
+                    .to_owned();
+                // The last part loses whatever trailing punctuation the address lost.
+                let cut = url.chars().count() - trimmed.chars().count();
+                if let Some(last) = parts.last_mut() {
+                    last.2 = last.2.saturating_sub(cut);
+                }
+                for (x, row_y, width) in parts {
+                    if width > 0 {
+                        self.hit(
+                            Rect {
+                                x,
+                                y: row_y,
+                                width: width as u16,
+                                height: 1,
+                            },
+                            Hit::Link(trimmed.clone()),
+                        );
+                    }
+                }
+                from = start + token.len().max(1);
             }
             // Markdown links: underlined runs whose text names a link.
             let mut index = 0;
@@ -1180,20 +1225,6 @@ impl Ui {
 
     fn footer(&self, buf: &mut Buffer, area: Rect) {
         buf.set_style(area, Style::default().bg(theme::CRUST));
-        let backlog_notice = match &self.world.mail_backlog {
-            Load::Ready(backlog) if backlog.count > 0 => Some(format!(
-                "{} unread >1h · {}", backlog.count, backlog.cleanup_command
-            )),
-            Load::Failed(error) => Some(error.clone()),
-            _ => None,
-        };
-        if let Some(notice) = backlog_notice {
-            buf.set_stringn(
-                area.x + 1, area.y, notice, area.width.saturating_sub(2) as usize,
-                Style::default().fg(theme::YELLOW).bg(theme::CRUST),
-            );
-            return;
-        }
         if let Link::Offline(message) = &self.world.link {
             buf.set_stringn(
                 area.x + 1,
@@ -3434,6 +3465,11 @@ impl Ui {
                 let Some(kind) = self.current_kind() else {
                     return;
                 };
+                if self.current_item().is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
+                    && matches!(key, 'y' | 'n' | 'r' | 'x') {
+                    self.flash("Reply with c using this source's declared fields");
+                    return;
+                }
                 match (kind, key) {
                     // x dismisses whatever can be dismissed, one key for every kind (Nathan,
                     // 2026-10-03): a request is closed with word to its asker that there is
@@ -4031,7 +4067,15 @@ impl Ui {
                     }),
                     Some(AttentionKind::Request { .. }) => Some(Effect::Attention {
                         id: id.clone(),
-                        action: "work.done".into(),
+                        action: if self
+                            .current_item()
+                            .is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
+                        {
+                            "custom.reply"
+                        } else {
+                            "work.done"
+                        }
+                        .into(),
                         reason: Some(draft),
                         answer: self.changes_answer.take(),
                     }),
@@ -4241,6 +4285,12 @@ impl Ui {
         let Some(id) = self.attention_focus() else {
             return;
         };
+        if self
+            .current_item()
+            .is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
+        {
+            return;
+        }
         if matches!(action, 'y' | 'n' | 'r') && self.current_kind() == Some("request") {
             // r closes a request that needs nothing from the person; the step continues.
             let answer = match action {
@@ -5271,6 +5321,53 @@ fn dump(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_custom_request_sends_the_generic_reply_and_has_no_yes_no_shortcut() {
+        let mut world = demo::world();
+        world.attention = Load::Ready(vec![Attention {
+            id: "attention/garden".into(),
+            tier: Tier::Today,
+            title: "Retain the seed history?".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: None,
+            kind: AttentionKind::Request {
+                from: "Seed".into(),
+                from_id: "agent/garden/seed".into(),
+                question: "selection (keep / discard)".into(),
+                structured: None,
+            },
+            actions: vec!["custom.reply".into()],
+            related: vec![],
+            raised_by: None,
+        }]);
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        ui.selected[0] = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/garden")
+            .unwrap();
+        let rendered = frame(&ui, 120, 50).join("\n");
+        assert!(rendered.contains("Reply with fields"));
+        assert!(!rendered.contains("Dismiss: nothing to do"));
+        ui.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(ui.effects.is_empty());
+        assert!(ui.confirm.is_none());
+        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(ui.editing);
+        for letter in "keep".chars() {
+            ui.key(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE));
+        }
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(ui.effects.last(),Some(Effect::Attention{action,reason:Some(reason),..}) if action=="custom.reply" && reason=="keep")
+        );
+    }
 
     #[test]
     fn drafts_take_the_terminal_editing_keys() {
