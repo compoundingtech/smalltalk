@@ -1,145 +1,26 @@
-# Generated file - DO NOT EDIT
-# Source: perf.yml.genie.ts
-
 name: Performance
-
 on:
-  push:
-    branches: [main]
-    paths:
-      - crates/smallclaims/**
-      - crates/st3/src/**
-      - crates/st3/tests/daemon_*.rs
-      - crates/st3/tests/perf_load.rs
-      - crates/st3/Cargo.toml
-      - Cargo.toml
-      - Cargo.lock
-      - .cargo/config.toml
-      - flake.nix
-      - flake.lock
-      - docs/st3/schema.md
-      - scripts/ci-perf*
-      - scripts/ci-nix-cache
-      - .github/workflows/perf.yml
-  schedule:
-    - cron: 23 2 * * *
-  pull_request:
-    paths:
-      - crates/smallclaims/**
-      - crates/st3/src/**
-      - crates/st3/tests/daemon_*.rs
-      - crates/st3/tests/perf_load.rs
-      - crates/st3/Cargo.toml
-      - Cargo.toml
-      - Cargo.lock
-      - .cargo/config.toml
-      - flake.nix
-      - flake.lock
-      - docs/st3/schema.md
-      - scripts/ci-perf*
-      - scripts/ci-nix-cache
-      - .github/workflows/perf.yml
   workflow_dispatch: {}
-
 permissions:
   contents: read
-  actions: read
-  pull-requests: read
-
-concurrency:
-  group: "perf-${{ github.event.pull_request.number || github.run_id }}"
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  perf-load:
-    name: perf-load
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
-    timeout-minutes: 30
-    defaults:
-      run:
-        shell: bash
-    env:
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_INCREMENTAL: "0"
-      SCCACHE_IDLE_TIMEOUT: "0"
-      PERF_PR_NUMBER: ${{ github.event.pull_request.number }}
-      PERF_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+  namespace-capacity:
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-2x4-with-features;job.priority=1
+      - namespace-features:github.run-id=${{ github.run_id }}
+    timeout-minutes: 3
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Name compatible snapshot recipes
-        env:
-          PERF_BUILD_SNAPSHOT: "perf-load-build-v1-${{ hashFiles('Cargo.lock', 'flake.lock', 'flake.nix', 'Cargo.toml', 'crates/st3/Cargo.toml', '.cargo/config.toml') }}"
-          PERF_STORES_SNAPSHOT: "perf-load-stores-v1-${{ hashFiles('crates/st3/tests/daemon_bench.rs', 'docs/st3/schema.md') }}"
-        run: printf "PERF_BUILD_SNAPSHOT=%s\nPERF_STORES_SNAPSHOT=%s\n" "$PERF_BUILD_SNAPSHOT" "$PERF_STORES_SNAPSHOT" >> "$GITHUB_ENV"
-      - name: Restore compatible build, Nix, stores and main baseline snapshots
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/ci-perf-cache restore
-      - name: Install Nix
-        uses: DeterminateSystems/determinate-nix-action@v3
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          extra-conf: |
-            experimental-features = nix-command flakes
-            accept-flake-config = true
-            extra-substituters = https://overeng-effect-utils.cachix.org
-            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
-            access-tokens = github.com=${{ github.token }}
-          summarize: true
-      - name: Isolate test state and keep the compiler cache
+      - name: Read live Namespace limits and usage
         run: |
-          home="$RUNNER_TEMP/test-home"
-          mkdir -p "$home"/{.config,.cache,.local/state} "$RUNNER_TEMP/cargo-home"/{registry,git} "$RUNNER_TEMP/perf-sccache"
-          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\nSCCACHE_DIR=%s\nSCCACHE_CACHE_SIZE=1G\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" "$RUNNER_TEMP/perf-sccache" >> "$GITHUB_ENV"
-          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
-      - name: Use the cached Nix outputs
-        run: bash scripts/ci-nix-cache use
-      - name: Prepare fast scratch space for a new store recipe
-        run: if [ ! -s "$RUNNER_TEMP/st-bench/generated-1.sqlite3" ]; then sudo mount -o remount,size=10G /dev/shm; fi
-      - name: Run the release load test
-        shell: bash
-        run: "nix develop '.#perf' -c bash scripts/ci-perf load"
-        id: load
-      - id: cache
-        name: Save build and Nix snapshots
-        if: "!cancelled() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (steps.load.outcome == 'success' || steps.load.outcome == 'failure')"
-        run: |
-          if ! python3 scripts/ci-perf-cache check-report; then exit 0; fi
-          nix print-dev-env .#perf --profile "$RUNNER_TEMP/perf-shell" > /dev/null
-          nix develop .#perf -c env TMPDIR="$RUNNER_TEMP" sccache --show-stats
-          CI_PERF_SHELL_ROOT="$RUNNER_TEMP/perf-shell" bash scripts/ci-nix-cache save
-          python3 scripts/ci-perf-cache pack
-      - name: Retain the build and Nix cache
-        if: "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PERF_BUILD_SNAPSHOT }}
-          path: "${{ runner.temp }}/perf-snapshots/build.tar.zst"
-          compression-level: 0
-          retention-days: 7
-          if-no-files-found: error
-          overwrite: true
-      - name: Retain the generated stores
-        if: "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PERF_STORES_SNAPSHOT }}
-          path: "${{ runner.temp }}/perf-snapshots/stores.tar.zst"
-          compression-level: 0
-          retention-days: 7
-          if-no-files-found: error
-          overwrite: true
-      - name: Retain the load report, log and timing
-        uses: actions/upload-artifact@v4
+          nsc workspace concurrency --output json | jq '{concurrency: [.concurrency[] | {platforms, limits, activeConcurrency}]}' > "$RUNNER_TEMP/namespace-capacity.json"
+          cat "$RUNNER_TEMP/namespace-capacity.json"
+          nsc github profile list --output json > "$RUNNER_TEMP/namespace-profiles.json"
+          jq 'walk(if type == "object" then del(.token,.credentials,.auth) else . end)' "$RUNNER_TEMP/namespace-profiles.json"
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: perf-load-logs
-          path: "${{ runner.temp }}/perf/"
-          retention-days: 30
-          if-no-files-found: ignore
-          overwrite: true
+          name: namespace-capacity
+          path: |
+            ${{ runner.temp }}/namespace-capacity.json
+            ${{ runner.temp }}/namespace-profiles.json
+          retention-days: 3
