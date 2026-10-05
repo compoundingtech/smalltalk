@@ -59,7 +59,7 @@ export function harnessName(driver: string | null | undefined): string {
   return '?';
 }
 
-type StateAgent = Pick<Agent, 'state' | 'harness_state' | 'fault' | 'delivery'> & { reason?: string | null };
+type StateAgent = Pick<Agent, 'state' | 'harness_state' | 'fault' | 'delivery'> & { reason?: string | null; observation?: string | null; reachability?: string | null };
 export function agentState(agent: StateAgent): AgentState {
   if (agent.fault) return 'fault';
   // A seat whose message path runs a replaced binary or stopped polling takes no messages,
@@ -69,7 +69,10 @@ export function agentState(agent: StateAgent): AgentState {
     case 'failed': return 'fault';
     case 'running': return agent.harness_state === 'working' ? 'working' : 'idle';
     // Signed out of its provider: a login on its host fixes it, without a restart (Nathan, 2026-10-04).
-    case 'waiting': return agent.harness_state === 'unauthenticated' || agent.harness_state === 'needs-login' || agent.reason === 'providerAuth' ? 'needs-login' : agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
+    // st withdraws an idle claim it has not heard renewed lately: the harness reads "indeterminate"
+    // and the seat "waiting", though it is up and reachable. That is an idle seat nobody has
+    // spoken to, not one starting (Nathan, 2026-10-05).
+    case 'waiting': return agent.harness_state === 'indeterminate' && agent.observation === 'stale' && (agent.reachability === 'reachable' || agent.reachability === 'local') ? 'idle' : agent.harness_state === 'unauthenticated' || agent.harness_state === 'needs-login' || agent.reason === 'providerAuth' ? 'needs-login' : agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
     case 'starting':
     case 'desired': return 'starting';
     case 'stopped': return 'stopped';
