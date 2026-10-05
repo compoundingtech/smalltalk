@@ -9,8 +9,8 @@ license = "MIT"
 anyhow = "1"
 libc = "0.2"
 portable-pty = "0.9"
-pty-client = { git = "https://github.com/compoundingtech/pty", rev = "ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f" }
-pty-core = { git = "https://github.com/compoundingtech/pty", rev = "ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f" }
+pty-client = { git = "https://github.com/compoundingtech/pty", rev = "e86580686a2a36e99cd439a8ddef6527e3a0b84c" }
+pty-core = { git = "https://github.com/compoundingtech/pty", rev = "e86580686a2a36e99cd439a8ddef6527e3a0b84c" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
