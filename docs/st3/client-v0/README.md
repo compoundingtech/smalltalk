@@ -1261,7 +1261,9 @@ The CLI equivalent is `st terminals ls --owner agent/example/worker --state runn
 Rust exposes `terminals_list_filtered`, Swift `terminalsListFiltered`, and TypeScript
 `terminalsListFiltered`. Existing list methods, ordering, default limit (50), maximum
 limit (200), and unfiltered paging are unchanged. Filtered pages echo `owner` and `state`
-in `value.filters`; cursors bind those values, so every continuation must repeat them.
+in `value.filters`; other collections ignore these terminal-only fields without acknowledging
+them or binding their cursors to them. Terminal cursors bind those values, so every
+continuation must repeat them.
 Changing or dropping a filter while continuing returns `page-cursor-expired`.
 
 This is an additive client read contract change: the operations manifest documents the
@@ -1271,3 +1273,12 @@ refuse an older server that omits the requested filter acknowledgment, with an u
 message, instead of returning an unfiltered page or scanning pages on the client.
 A running projection is replicated evidence, not a successful PTY handshake: callers
 must still use the existing incarnation-fenced attachment routes to attach.
+
+The real-daemon mixed-build regression is a **manual proof**, not a CI gate: run
+
+```sh
+ST3_TERMINALS_COMPAT_BIN=/path/to/older/st3 cargo test -p st3 --test integration fleet::terminal_owner_filters_are_safe_across_mixed_builds -- --ignored --exact
+```
+
+Choose a binary built before these terminal filters. The fake legacy-server refusal
+and escaping test, server filter/paging tests, and TypeScript client checks run in CI.

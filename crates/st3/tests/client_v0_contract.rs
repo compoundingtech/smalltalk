@@ -4333,3 +4333,91 @@ async fn terminal_filters_use_projected_state_and_preserve_history_selection() {
         assert_eq!(page["value"]["items"][0]["state"], state);
     }
 }
+
+#[tokio::test]
+async fn terminal_filters_are_acknowledged_only_on_terminal_pages() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    for name in ["alder", "birch"] {
+        let subject = format!("agent/lookup/{name}");
+        state
+            .store
+            .append_claim(&st3::model::ClaimInput {
+                subject: subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject),
+                fields: std::collections::BTreeMap::from([
+                    ("runtime_id".into(), serde_json::json!(name)),
+                    (
+                        "incarnation_id".into(),
+                        serde_json::json!(format!("{name}:i1")),
+                    ),
+                    ("status".into(), serde_json::json!("running")),
+                    ("terminal".into(), serde_json::json!(true)),
+                    ("reachability".into(), serde_json::json!("local")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let app = st3::api::router(state);
+    for collection in [
+        "agents",
+        "runtimes",
+        "operations",
+        "history",
+        "missions",
+        "work",
+    ] {
+        let (_, baseline) =
+            client_json(app.clone(), &format!("/v1/client/{collection}?limit=1")).await;
+        let (status, page) = client_json(
+            app.clone(),
+            &format!(
+                "/v1/client/{collection}?limit=1&owner=agent%2Flookup%2Fmissing&state=stopped"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{collection}: {page}");
+        assert_eq!(
+            page["value"]["items"], baseline["value"]["items"],
+            "{collection}"
+        );
+        assert_eq!(
+            page["value"]["filters"], baseline["value"]["filters"],
+            "{collection}"
+        );
+        assert!(
+            page["value"]["filters"].get("owner").is_none(),
+            "{collection}"
+        );
+        assert!(
+            page["value"]["filters"].get("state").is_none(),
+            "{collection}"
+        );
+        if let Some(cursor) = page["value"]["page"]["next_cursor"].as_str() {
+            let (status, continued) = client_json(
+                app.clone(),
+                &format!(
+                    "/v1/client/{collection}?limit=1&cursor={}",
+                    urlencoding::encode(cursor)
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{collection}: {continued}");
+        }
+    }
+    let (status, terminals) = client_json(
+        app,
+        "/v1/client/terminals?owner=agent%2Flookup%2Falder&state=running",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{terminals}");
+    assert_eq!(
+        terminals["value"]["filters"],
+        serde_json::json!({"owner": "agent/lookup/alder", "state": "running"})
+    );
+    assert_eq!(terminals["value"]["items"].as_array().unwrap().len(), 1);
+}
