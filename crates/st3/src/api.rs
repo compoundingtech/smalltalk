@@ -2743,6 +2743,13 @@ fn client_attention_resources(
         if item.kind == "person-step" {
             resource["action_parameters"] =
                 json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
+            // An ask a mission step made carries its mission and the step that waits on it.
+            if let Some(context) = store.person_ask_context(&item.subject)? {
+                if let Some(mission) = context["mission_id"].as_str() {
+                    resource["mission_id"] = json!(mission);
+                }
+                resource["blocked"] = context["blocked"].clone();
+            }
             match item.request {
                 // An update asks nothing, so it is not a `request`: a client that predates
                 // updates shows a free-text card, and any response to it reads it.

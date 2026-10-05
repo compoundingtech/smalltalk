@@ -132,6 +132,13 @@ export function deviceDetail(device: DeviceView, now = Date.now()): string {
   return `${device.state} · paired ${ago(device.updated_at, now)} ago · expires ${device.expires_at.slice(0, 10)}`;
 }
 
+// The mission step waiting on an ask a mission step made, and what it is for.
+export function blockedLine(item: { blocked?: { step: string; goal: string } | null }): string | null {
+  if (!item.blocked) return null;
+  const goal = item.blocked.goal.trim();
+  return `waits ${item.blocked.step}${goal ? ` · ${goal}` : ''} — it continues once you answer`;
+}
+
 // A connected client as it describes itself: its reported name and build, never identity.
 export function clientTitle(item: ClientConnection, connectedActor: string | undefined): string {
   const name = item.client?.trim() || 'unnamed client';

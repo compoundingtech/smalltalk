@@ -3251,6 +3251,113 @@ mission "ios-proof" state="ready" {
 }
 
 #[tokio::test]
+async fn an_ask_a_mission_step_made_names_its_mission_and_the_step_that_waits() {
+    // Nathan, 2026-10-05: a mission-backed request lost its mission link, so the card could not
+    // say which mission, run or step waited on the answer.
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let source = r#"
+version 2
+agent "release-owner" { workspace "/tmp"; command "true" }
+mission "release-proof" state="ready" {
+  goal "Publish the release."
+  step "tag-proof" { assigned-to "agent/release-owner"; goal "Prove the published tag builds." }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-baseline").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "ask-context-mission")
+        .unwrap();
+    let run = state
+        .store
+        .create_mission_run(&st3::model::MissionRunRequest {
+            mission: "release-proof".into(),
+            revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/alex".into()),
+            mode: Some("run".into()),
+            inputs: std::collections::BTreeMap::new(),
+            idempotency_key: "ask-context-run".into(),
+        })
+        .unwrap();
+    let subject = run.steps[0].subject.clone();
+    state.store.set_step_state(&subject, "ready", None).unwrap();
+    let actor = "agent/client-v0-baseline.release-owner";
+    state
+        .store
+        .work_action(
+            &subject,
+            "claim",
+            &st3::model::WorkRequest {
+                actor: Some(actor.into()),
+                incarnation: Some("release-owner-one".into()),
+                summary: None,
+                reason: None,
+                evidence: Vec::new(),
+                idempotency_key: "ask-context-claim".into(),
+            },
+        )
+        .unwrap();
+    let ask = |step: Option<String>, new_run: Option<String>, key: &str| {
+        state
+            .store
+            .ask_person(&st3::model::PersonAskRequest {
+                legacy_request: None,
+                person: "person/alex".into(),
+                title: "Allocate capacity?".into(),
+                reason: "The proof needs a runner.".into(),
+                actor: actor.into(),
+                step,
+                new_run,
+                incarnation: Some("release-owner-one".into()),
+                idempotency_key: key.into(),
+                request: None,
+            })
+            .unwrap()
+    };
+    let from_step = ask(Some(subject.clone()), None, "ask-context-from-step");
+    let standalone = ask(None, Some("standalone".into()), "ask-context-standalone");
+    let app = st3::api::router(state.clone());
+    let (status, response) = client_json_person(app, "/v1/client/attention", "person/alex").await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let items = response["value"]["items"].as_array().unwrap();
+    let card = |source: &str| {
+        items
+            .iter()
+            .find(|item| item["source_id"] == source)
+            .unwrap_or_else(|| panic!("{source}: {response}"))
+    };
+    // The ask a mission step made: its mission, its run, and the step that waits with its goal.
+    let mission_card = card(&from_step.subject);
+    assert_eq!(mission_card["mission_id"], "mission/release-proof", "{mission_card}");
+    assert_eq!(mission_card["mission_run_id"], run.subject, "{mission_card}");
+    assert_eq!(
+        mission_card["blocked"],
+        serde_json::json!({
+            "step_run_id": subject,
+            "step": "tag-proof",
+            "goal": "Prove the published tag builds.",
+            "attempt": 1,
+        }),
+        "{mission_card}"
+    );
+    // A standalone ask belongs to no mission of its own and blocks no step.
+    let alone = card(&standalone.subject);
+    assert!(alone.get("blocked").is_none(), "{alone}");
+}
+
+#[tokio::test]
 async fn stopped_agents_are_annotated_history_not_default_membership() {
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());

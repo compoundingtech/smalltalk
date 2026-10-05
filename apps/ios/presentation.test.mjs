@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { agentHeaderDetail, agentHealth, attentionActionLabel, attentionHeadline, attentionKindLabel, clientDetail, clientTitle, currentWorkSummary, deviceDetail, deviceTitle, missionDetail, missionGroup, missionLabels, missionSteps, olderThanMember, pingPresentation, queuedWorkSummary, smallTalkPresentation } from './presentation.ts';
+import { agentHeaderDetail, agentHealth, attentionActionLabel, attentionHeadline, attentionKindLabel, blockedLine, clientDetail, clientTitle, currentWorkSummary, deviceDetail, deviceTitle, missionDetail, missionGroup, missionLabels, missionSteps, olderThanMember, pingPresentation, queuedWorkSummary, smallTalkPresentation } from './presentation.ts';
 
 const now = Date.parse('2026-09-25T08:25:00Z');
 
@@ -124,3 +124,9 @@ assert.deepEqual(pingPresentation('No envelope here'), { from: null, text: 'No e
   assert.equal(olderThanMember('stui dev', '0.1.0+1ecae71'), false);
   assert.equal(olderThanMember('stui 0.0.9+77d0a13', undefined), false);
 }
+
+// An ask a mission step made names the step that waits and what it is for; a standalone ask names none.
+assert.equal(blockedLine({ blocked: { step: 'tag-proof', goal: 'Prove the published tag builds.' } }), 'waits tag-proof · Prove the published tag builds. — it continues once you answer');
+assert.equal(blockedLine({ blocked: { step: 'tag-proof', goal: '  ' } }), 'waits tag-proof — it continues once you answer');
+assert.equal(blockedLine({}), null);
+assert.equal(blockedLine({ blocked: null }), null);
