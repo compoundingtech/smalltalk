@@ -2378,22 +2378,11 @@ fn managed_session_owner_at(
     snapshot_index: u64,
     session_id: &str,
 ) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
-    for subject in store.agent_runtime_identities_at(snapshot_index)? {
-        let incarnation = subject.incarnation.as_deref();
-        let runtime = subject.runtime.as_deref();
-        let Some(identity) = incarnation.or(runtime) else {
-            continue;
-        };
-        if managed_session_id(&subject.subject, identity) == session_id {
-            let origin = store.selected_actual_origin_at(&subject.subject, snapshot_index)?;
-            return Ok(Some((
-                subject.subject,
-                incarnation.map(str::to_owned),
-                origin,
-            )));
-        }
-    }
-    Ok(None)
+    Ok(store
+        .find_agent_runtime_at(snapshot_index, |subject, identity| {
+            managed_session_id(subject, identity) == session_id
+        })?
+        .map(|runtime| (runtime.subject, runtime.incarnation, runtime.origin)))
 }
 
 /// How many of a subject's claims, oldest first, date its session in the session list.

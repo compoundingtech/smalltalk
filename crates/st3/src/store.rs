@@ -8,12 +8,6 @@ mod resources;
 mod rollouts;
 mod seat_status;
 
-
-pub(crate) struct AgentRuntimeIdentity {
-    pub subject: String,
-    pub incarnation: Option<String>,
-    pub runtime: Option<String>,
-}
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
 use std::fs;
@@ -126,6 +120,12 @@ pub use runtime::SmalltalkRuntime;
 #[cfg(test)]
 pub(crate) use smallclaims::sqlite::STATEMENTS_RUN;
 
+pub(crate) struct AgentRuntimeIdentity {
+    pub subject: String,
+    pub incarnation: Option<String>,
+    pub origin: Option<String>,
+}
+
 /// The graph's checkpoints with smalltalk's checkpoint rules beside them.
 pub mod checkpoint {
     pub use super::checkpoint_rules::*;
@@ -202,6 +202,8 @@ WHERE kind='message.sent';
 CREATE INDEX IF NOT EXISTS claims_resume_host_index
 ON claims(json_extract(body, '$.fields.host'), subject)
 WHERE kind='runtime.action.requested' AND json_extract(body,'$.fields.action')='resume';
+CREATE INDEX IF NOT EXISTS claims_message_legacy_index ON claims(store_index)
+WHERE kind='message.sent' AND json_type(body, '$.fields') IS NULL;
 CREATE INDEX IF NOT EXISTS claims_actor_progress_index
 ON claims(actor, store_index)
 WHERE kind IN ('work.progress', 'work.submitted');
@@ -9718,40 +9720,38 @@ impl Store {
     }
 
     /// Session routing needs runtime identity, not declaration, harness or claim-history folds.
-    pub(crate) fn agent_runtime_identities_at(
+    pub(crate) fn find_agent_runtime_at(
         &self,
         snapshot_index: u64,
-    ) -> Result<Vec<AgentRuntimeIdentity>> {
+        mut matches: impl FnMut(&str, &str) -> bool,
+    ) -> Result<Option<AgentRuntimeIdentity>> {
         let connection = self.readers.get();
         let index = selected_index(current_index(&connection)?, Some(snapshot_index))
             .map_err(anyhow::Error::new)?;
-        let subjects = connection
-            .prepare_cached(RANGE_SUBJECTS)?
-            .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        subjects.into_iter().map(|subject| {
-            let actual = latest_actual_at(&connection, &subject, Some(index))?;
+        let mut statement = connection.prepare_cached(RANGE_SUBJECTS)?;
+        let subjects = statement.query_map(params![index, "agent/", "agent0"], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for subject in subjects {
+            let subject = subject?;
+            let actual = self.cached_actual_at(&connection, &subject, index)?;
             let fields = actual.as_ref().map(|value| value.get("fields").unwrap_or(value));
-            let field = |name| fields
-                .and_then(|fields| fields.get(name))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            Ok(AgentRuntimeIdentity {
-                incarnation: field("incarnation_id"),
-                runtime: field("runtime_id"),
-                subject,
-            })
-        }).collect()
-    }
-
-    pub(crate) fn selected_actual_origin_at(
-        &self,
-        subject: &str,
-        snapshot_index: u64,
-    ) -> Result<Option<String>> {
-        let connection = self.readers.get();
-        selected_actual_source_at(&connection, subject, Some(snapshot_index), None)
-            .map(|(_, origin, _)| origin)
+            let field = |name| fields.and_then(|fields| fields.get(name)).and_then(Value::as_str);
+            let incarnation = field("incarnation_id");
+            let Some(identity) = incarnation.or_else(|| field("runtime_id")) else {
+                continue;
+            };
+            if matches(&subject, identity) {
+                let (_, origin, _) =
+                    selected_actual_source_at(&connection, &subject, Some(index), None)?;
+                return Ok(Some(AgentRuntimeIdentity {
+                    subject,
+                    incarnation: incarnation.map(str::to_owned),
+                    origin,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// Reduce only subjects that have emitted one claim kind at the selected snapshot.
@@ -14565,6 +14565,46 @@ impl Store {
         })
     }
 
+    /// Party messages within the same global newest-message window used by conversation reads.
+    /// Seek candidates before loading bodies, without moving the limit after the party filter.
+    pub(crate) fn conversation_messages_at(
+        &self,
+        party: &str,
+        before_index: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<ClaimRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "WITH floor(lo) AS (
+                SELECT MIN(store_index) FROM (
+                    SELECT store_index FROM claims
+                    WHERE kind='message.sent' AND (?2 IS NULL OR store_index<?2)
+                    ORDER BY store_index DESC LIMIT ?3
+                )
+            ), candidates AS (
+                SELECT id FROM claims INDEXED BY claims_message_to_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.to')=?1
+                  AND (?2 IS NULL OR store_index<?2) AND store_index>=(SELECT lo FROM floor)
+                UNION SELECT id FROM claims INDEXED BY claims_message_from_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.from')=?1
+                  AND (?2 IS NULL OR store_index<?2) AND store_index>=(SELECT lo FROM floor)
+                UNION SELECT id FROM claims INDEXED BY claims_message_legacy_index
+                WHERE kind='message.sent' AND json_type(body, '$.fields') IS NULL
+                  AND (json_extract(body,'$.to')=?1 OR json_extract(body,'$.from')=?1)
+                  AND (?2 IS NULL OR store_index<?2) AND store_index>=(SELECT lo FROM floor)
+            )
+            SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
+                   claims.origin, claims.actor, claims.body, claims.predecessors,
+                   claims.accepted_at_unix_ms
+            FROM claims JOIN candidates ON candidates.id=claims.id
+            ORDER BY claims.store_index DESC",
+        )?;
+        statement
+            .query_map(params![party, before_index, limit as u64], claim_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// The store index of the subject's newest claim of `kind`, or 0 when it has none. Claims are
     /// append-only, so an unchanged index means the subject's claims of that kind are unchanged.
     pub fn newest_claim_index(&self, subject: &str, kind: &str) -> Result<u64> {
@@ -14621,12 +14661,23 @@ impl Store {
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
         smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
+        self.cached_actual_at(&connection, subject, i64::MAX as u64)
+    }
+
+    fn cached_actual_at(
+        &self,
+        connection: &Connection,
+        subject: &str,
+        through: u64,
+    ) -> Result<Option<Value>> {
         // The actual state folds only this subject's append-only claims, so the subject's newest
         // claim identifies it. A write elsewhere in the graph must not make every reconcile pass
         // re-read and re-parse the history of every stopped runtime.
         let newest: u64 = connection
-            .prepare_cached("SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1")?
-            .query_row([subject], |row| row.get(0))?;
+            .prepare_cached(
+                "SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1 AND store_index<=?2",
+            )?
+            .query_row(params![subject, through], |row| row.get(0))?;
         if let Some((_, value)) = self
             .smalltalk
             .actual_cache
@@ -14637,9 +14688,9 @@ impl Store {
         {
             return Ok(value.clone());
         }
-        // A claim committed after `newest` can only make this value newer than its key, and the
-        // next read then misses and folds again.
-        let value = latest_actual(&connection, subject)?;
+        // Bound the fold to its cache key. A concurrent commit must never publish a newer
+        // value under an older head, which a historical snapshot could then reuse.
+        let value = latest_actual_at(connection, subject, Some(newest))?;
         let mut cache = self
             .smalltalk
             .actual_cache
@@ -38308,6 +38359,44 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             assert_eq!(receipt(to, "read").unwrap().id, first.id);
             assert_eq!(store.message(&subject).unwrap().unwrap().status, "read");
         }
+    }
+
+    #[test]
+    fn conversation_message_party_filter_preserves_global_window_and_snapshot() {
+        let store = Store::open_memory("node").unwrap();
+        let mut indexes = Vec::new();
+        for (id, from, to) in [
+            ("old", "person/test", "agent/worker"),
+            ("other", "person/test", "agent/other"),
+            ("outgoing", "agent/worker", "person/test"),
+            ("self", "agent/worker", "agent/worker"),
+            ("new-other", "person/test", "agent/other"),
+        ] {
+            let claim = store.append_claim(&ClaimInput {
+                subject: format!("message/{id}"),
+                kind: "message.sent".into(),
+                actor: Some(from.into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!(from)),
+                    ("to".into(), json!(to)),
+                    ("content".into(), json!(id)),
+                    ("status".into(), json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap();
+            indexes.push(claim.store_index);
+        }
+        let subjects = |before, limit| {
+            store.conversation_messages_at("agent/worker", before, limit).unwrap()
+                .into_iter().map(|claim| claim.subject).collect::<Vec<_>>()
+        };
+        assert_eq!(subjects(None, 3), ["message/self", "message/outgoing"]);
+        assert_eq!(subjects(Some(indexes[2]), 3), ["message/old"]);
+        assert_eq!(subjects(Some(indexes[0]), 3), Vec::<String>::new());
+        assert_eq!(subjects(None, 0), Vec::<String>::new());
+        assert!(store.conversation_messages_at("agent/missing", None, 3).unwrap().is_empty());
     }
 
     #[test]
