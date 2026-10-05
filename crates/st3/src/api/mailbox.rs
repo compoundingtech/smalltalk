@@ -39,10 +39,11 @@ pub(super) async fn attachment(
     let store = state.store.clone();
     let attached = blocking_action(move || {
         store.check_mailbox(&fence)?;
-        Ok(
-            delivery_presence::attachment(&fence.subject, &fence.incarnation)
-                .is_some_and(|delivery| store.check_mailbox(&delivery).is_ok()),
-        )
+        Ok(super::claude_channel_attached(
+            &store,
+            &fence.subject,
+            &fence.incarnation,
+        ))
     })
     .await?;
     Ok(Json(crate::mailbox::Attachment { attached }))

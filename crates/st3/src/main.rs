@@ -20350,7 +20350,7 @@ async fn check_claude_attachment(
         "starting"
     };
     let reason = match checked {
-        Ok(_) => "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. Check the plugin load, trust or update screen, and channel process; restart the seat if the plugin did not load.".into(),
+        Ok(_) => "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. The driver rechecks attachment and st will restart the harness with bounded retries if the channel stays missing.".into(),
         Err(error) => format!("claude-channel-unattached: attachment could not be verified; mail is held while the driver retries: {error:#}"),
     };
     let mut report: Value = serde_json::from_str(&native_delivery_report("claude-channel", None))?;
