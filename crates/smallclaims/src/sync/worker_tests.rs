@@ -28,6 +28,264 @@ fn plain_open(path: &Path, origin: &str) -> anyhow::Result<Store> {
     Ok(store)
 }
 
+/// Different checkpoint lineages leave payloadless ranges that can never settle through
+/// envelope transport. Both live writers already have a shared range, so a summary alone
+/// cannot prove either of their later gaps.
+#[tokio::test]
+async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
+    let root = tempfile::tempdir().unwrap();
+    let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+    let auth = FleetAuth::test(fleet, &[7; 32]);
+    let left = Arc::new(plain_open(&root.path().join("left.sqlite3"), "birch").unwrap());
+    let right = Arc::new(plain_open(&root.path().join("right.sqlite3"), "cedar").unwrap());
+    let note = |store: &Store, text: &str| {
+        store
+            .append_claim(&ClaimInput {
+                subject: format!("note/{text}"),
+                kind: "example.note".into(),
+                actor: None,
+                fields: BTreeMap::from([("text".into(), Value::String(text.into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    };
+    for store in [&left, &right] {
+        store.bind_fleet(fleet).unwrap();
+        note(store, &format!("{}-shared", store.origin));
+    }
+    for (from, to) in [(&left, &right), (&right, &left)] {
+        let shared = from
+            .export_replication_exchange(fleet, &ReplicationInventory::default())
+            .unwrap();
+        to.receive_replication_exchange(&from.origin, fleet, &shared)
+            .unwrap();
+    }
+    for store in [&left, &right] {
+        for index in 0..20 {
+            note(store, &format!("{}-private-{index}", store.origin));
+        }
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        for id in crate::store::test_envelope_ids("alder-retired", 0..768, &store.origin) {
+            transaction
+                .execute(
+                    "INSERT INTO checkpoint_envelopes VALUES (?1, ?2, ?3, 0, ?4)",
+                    rusqlite::params![
+                        id.writer,
+                        id.sequence,
+                        id.hash,
+                        format!("checkpoint/{}", store.origin)
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        store.replica_rows_changed();
+    }
+
+    let state = PeerState {
+        backend: Local(right.clone()),
+        node: right.origin.clone(),
+        auth: auth.clone(),
+        fleet: FleetContext::legacy(BTreeSet::from([left.origin.clone()])),
+        outbound_notify: watch::channel(0_u64).0,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = PeerConfig {
+        name: right.origin.clone(),
+        url: format!("http://{}", listener.local_addr().unwrap()),
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let router = peer_router(state, Router::new()).layer(axum::middleware::from_fn(
+        move |request: Request<Body>, next: axum::middleware::Next| {
+            let observed = observed.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let bytes = to_bytes(body, MAX_EXCHANGE_BYTES).await.unwrap();
+                let decoded = if deflated(&parts.headers) {
+                    inflate(&bytes).unwrap()
+                } else {
+                    bytes.to_vec()
+                };
+                let query: ReplicationExchange = serde_json::from_slice(&decoded).unwrap();
+                assert!(query.envelopes.len() <= crate::store::REPLICATION_PAGE_LIMIT as usize);
+                assert!(
+                    !query.inventory.digest.is_empty(),
+                    "a full-inventory request keeps its digest"
+                );
+                observed.lock().unwrap().push((
+                    query.inventory.buckets.is_empty(),
+                    query.inventory.envelopes.len(),
+                    query.envelopes.len(),
+                ));
+                next.run(Request::from_parts(parts, Body::from(bytes)))
+                    .await
+            }
+        },
+    ));
+    let server = tokio::spawn(axum::serve(listener, router).into_future());
+    let http = replication_http_client();
+    let fleet_context = FleetContext::legacy(BTreeSet::from([right.origin.clone()]));
+    let result = exchange(
+        &http,
+        &Local(left.clone()),
+        &left.origin,
+        &peer,
+        &auth,
+        &fleet_context,
+    )
+    .await
+    .unwrap();
+    assert!(
+        result.0,
+        "a divergent compact exchange must reach live ranges beyond the tombstones"
+    );
+    {
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests.len() <= 4,
+            "one compact round plus at most one full round, never an unbounded retry"
+        );
+        assert!(
+            requests.contains(&(true, 0, 0)),
+            "a bare digest cannot prove an empty inventory"
+        );
+    }
+    for store in [&left, &right] {
+        store.validate_replication_backlog().unwrap();
+        store.project_replication_backlog().unwrap();
+        for writer in ["birch", "cedar"] {
+            for index in 0..20 {
+                let subject = format!("note/{writer}-private-{index}");
+                assert_eq!(
+                    store
+                        .claims_for(&subject, Some("example.note"))
+                        .unwrap()
+                        .len(),
+                    1,
+                    "both directions must receive every later live note: {subject}"
+                );
+            }
+        }
+        assert_eq!(
+            store.checkpointed_envelopes().unwrap(),
+            768,
+            "tombstones are not transported"
+        );
+    }
+    assert_ne!(
+        left.replication_inventory().unwrap().digest,
+        right.replication_inventory().unwrap().digest,
+        "checkpoint-lineage reconciliation remains separate"
+    );
+    assert!(
+        !exchange(
+            &http,
+            &Local(left.clone()),
+            &left.origin,
+            &peer,
+            &auth,
+            &fleet_context
+        )
+        .await
+        .unwrap()
+        .0,
+        "tombstone-only divergence must let the worker rest"
+    );
+    note(&left, "published-after-quiet-comparison");
+    assert!(
+        exchange(
+            &http,
+            &Local(left.clone()),
+            &left.origin,
+            &peer,
+            &auth,
+            &fleet_context
+        )
+        .await
+        .unwrap()
+        .0
+    );
+    assert!(
+        right
+            .latest_claim(
+                "note/published-after-quiet-comparison",
+                Some("example.note")
+            )
+            .unwrap()
+            .is_some(),
+        "a later write must still cross the unresolved tombstone prefix"
+    );
+
+    server.abort();
+}
+
+/// Measure the exceptional full-inventory path at the reported fleet size, on an isolated
+/// disk-backed store. Run explicitly with --ignored --nocapture; no live database is opened.
+#[test]
+#[ignore = "fleet-size inventory cost measurement"]
+fn fleet_size_full_inventory_fallback_cost() {
+    let root = tempfile::tempdir().unwrap();
+    let store = plain_open(&root.path().join("store.sqlite3"), "birch").unwrap();
+    let mut connection = store.connection.write();
+    let transaction = connection.transaction().unwrap();
+    for id in crate::store::test_envelope_ids("alder-retired", 0..70_000, "lineage") {
+        transaction
+            .execute(
+                "INSERT INTO checkpoint_envelopes VALUES (?1, ?2, ?3, 0, 'checkpoint/example')",
+                rusqlite::params![id.writer, id.sequence, id.hash],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+    store.replica_rows_changed();
+    let started = std::time::Instant::now();
+    let summary = store.export_replication_summary("fleet/example").unwrap();
+    let snapshot_ms = started.elapsed().as_secs_f64() * 1000.;
+    let mut divergent = summary.inventory.clone();
+    divergent.digest = "different".into();
+    for bucket in divergent.buckets.iter_mut().take(18) {
+        bucket.digest = "00".repeat(32);
+    }
+    let started = std::time::Instant::now();
+    let compact = store
+        .export_replication_exchange("fleet/example", &divergent)
+        .unwrap();
+    let compact_ms = started.elapsed().as_secs_f64() * 1000.;
+    assert_eq!(compact.inventory.envelopes.len(), 512);
+    let started = std::time::Instant::now();
+    let full = store
+        .export_replication_exchange(
+            "fleet/example",
+            &ReplicationInventory {
+                digest: "different".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let export_ms = started.elapsed().as_secs_f64() * 1000.;
+    let started = std::time::Instant::now();
+    let bytes = serde_json::to_vec(&full).unwrap();
+    let json_ms = started.elapsed().as_secs_f64() * 1000.;
+    let started = std::time::Instant::now();
+    let compressed = deflate(&bytes).unwrap();
+    let deflate_ms = started.elapsed().as_secs_f64() * 1000.;
+    assert_eq!(full.inventory.envelopes.len(), 70_000);
+    assert!(full.envelopes.is_empty());
+    assert!(bytes.len() < MAX_EXCHANGE_BYTES);
+    eprintln!(
+        "identities=70000 summary_bytes={} compact_bytes={} full_bytes={} deflated_bytes={} snapshot_ms={snapshot_ms:.2} compact_ms={compact_ms:.2} export_ms={export_ms:.2} json_ms={json_ms:.2} deflate_ms={deflate_ms:.2}",
+        serde_json::to_vec(&summary).unwrap().len(),
+        serde_json::to_vec(&compact).unwrap().len(),
+        bytes.len(),
+        compressed.len()
+    );
+}
+
 #[tokio::test]
 async fn stalled_replication_http_stream_is_bounded() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

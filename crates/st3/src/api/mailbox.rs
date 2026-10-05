@@ -30,6 +30,25 @@ pub(super) async fn bind(
     Ok(Json(bound))
 }
 
+pub(super) async fn attachment(
+    State(state): State<AppState>,
+    Query(fence): Query<Fence>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
+) -> Result<Json<crate::mailbox::Attachment>, ApiError> {
+    authorize(&fence, peer.as_ref().map(|p| &p.0))?;
+    let store = state.store.clone();
+    let attached = blocking_action(move || {
+        store.check_mailbox(&fence)?;
+        Ok(super::claude_channel_attached(
+            &store,
+            &fence.subject,
+            &fence.incarnation,
+        ))
+    })
+    .await?;
+    Ok(Json(crate::mailbox::Attachment { attached }))
+}
+
 fn authorize(fence: &Fence, peer: Option<&NativeDeliveryPeer>) -> Result<(), ApiError> {
     let Some(peer) = peer else {
         return Err(ApiError::bad(St3Error::new(
@@ -398,9 +417,10 @@ where
             event = changed.changed() => { if event.is_err() { return; } dirty = true; },
             incoming = socket.recv() => match incoming {
                 Some(Ok(WsMessage::Text(report))) => {
-                    if fence.component == "delivery" && state.store.check_mailbox(&fence).is_ok() {
-                        delivery_presence::record(&fence.subject, &report);
+                    if state.store.check_mailbox(&fence).is_ok() {
+                        delivery_presence::record_fenced(&fence, &report);
                         if let Ok(value) = serde_json::from_str::<Value>(&report)
+                            && fence.component == "delivery"
                             && let Some(id) = value["drain_operation"].as_str()
                             && let Ok(Some(operation)) = state.store.rollout(&fence.subject)
                             && operation.id == id && operation.old_incarnation == fence.incarnation && operation.drain_ack.is_none()
@@ -459,6 +479,37 @@ mod tests {
     use super::*;
     use crate::client::{Client, Endpoint};
     use tokio_tungstenite::tungstenite::Message;
+
+    #[tokio::test]
+    async fn attachment_checks_both_runtime_and_current_delivery_epoch() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let subject = "agent/attachment-epoch";
+        for (kind, fields) in [
+            ("runtime.observed", json!({"status":"running","runtime_id":"attachment-epoch","incarnation_id":"current"})),
+            ("harness.observed", json!({"state":"idle","driver":"claude","incarnation_id":"current"})),
+        ] {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
+                expected_subject: None, idempotency_key: Some(format!("attachment-epoch:{kind}")),
+            }).unwrap();
+        }
+        let title = state.store.bind_mailbox(&Fence::new(subject, "current", "title")).unwrap();
+        let delivery = state.store.bind_mailbox(&Fence::new(subject, "current", "delivery")).unwrap();
+        let peer = NativeDeliveryPeer { agent: subject.into(), transport: "claude-channel", pid: 7, archives_inbox: true };
+        let ready = json!({"transport":"claude-channel","ready":true,"channel":{"pid":8,"age_ms":0}}).to_string();
+        delivery_presence::record_fenced(&delivery, &ready);
+        assert!(attachment(State(state.clone()), Query(title.clone()), Some(Extension(peer.clone()))).await.unwrap().0.attached);
+        let replacement = state.store.bind_mailbox(&Fence::new(subject, "current", "delivery")).unwrap();
+        assert!(!attachment(State(state.clone()), Query(title.clone()), Some(Extension(peer.clone()))).await.unwrap().0.attached,
+            "a live report from a superseded delivery owner must not prove attachment");
+        delivery_presence::record_fenced(&replacement, &ready);
+        assert!(attachment(State(state.clone()), Query(title.clone()), Some(Extension(peer.clone()))).await.unwrap().0.attached);
+        let mut foreign = title;
+        foreign.incarnation = "previous".into();
+        assert!(attachment(State(state), Query(foreign), Some(Extension(peer))).await.is_err());
+    }
 
     async fn next(
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,

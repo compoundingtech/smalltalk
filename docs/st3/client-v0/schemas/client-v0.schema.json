@@ -8,9 +8,23 @@
     { "$ref": "#/$defs/ErrorEnvelope" },
     { "$ref": "#/$defs/ActionRequest" },
     { "$ref": "#/$defs/PairingBegin" },
-    { "$ref": "#/$defs/PairingComplete" }
+    { "$ref": "#/$defs/PairingComplete" },
+    { "$ref": "#/$defs/PairingAdvertisement" }
   ],
   "$defs": {
+    "PairingAdvertisement": {
+      "description": "Static unauthenticated pairing preflight; no envelope, presence update or graph information.",
+      "type": "object", "additionalProperties": false,
+      "required": ["api_version", "capabilities"],
+      "properties": {
+        "api_version": {"const": "st3.client.v0"},
+        "capabilities": {"type": "array", "minItems": 1, "maxItems": 1, "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "version", "state"],
+          "properties": {"id": {"const": "device-key-proofs"}, "version": {"const": 1}, "state": {"const": "granted"}}
+        }}
+      }
+    },
+    "CustomReplyParameters": {"type": "object", "additionalProperties": false, "required": ["target_id", "registration", "revision", "episode", "fields"], "properties": {"target_id": {"$ref": "#/$defs/Id"}, "registration": {"type": "string"}, "revision": {"type": "string"}, "episode": {"type": "string"}, "fields": {"type": "object"}}},
     "ConversationSearchHit": {"type": "object", "additionalProperties": false, "required": ["conversation_id", "entry_id", "agent_id", "timestamp", "entry_type", "excerpt"], "properties": {"conversation_id": {"$ref": "#/$defs/Id"}, "entry_id": {"$ref": "#/$defs/Id"}, "agent_id": {"type": ["string", "null"]}, "timestamp": {"$ref": "#/$defs/Timestamp"}, "entry_type": {"type": "string"}, "excerpt": {"type": "string", "maxLength": 512}}},
     "ConversationSearch": {"type": "object", "additionalProperties": false, "required": ["kind", "items", "page", "indexed_at", "host_id", "incomplete_sources", "refreshing"], "properties": {"kind": {"const": "conversation-search"}, "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/ConversationSearchHit"}}, "page": {"$ref": "#/$defs/PageInfo"}, "indexed_at": {"$ref": "#/$defs/Timestamp"}, "host_id": {"$ref": "#/$defs/Id"}, "incomplete_sources": {"type": "array", "items": {"type": "string"}}, "refreshing": {"type": "boolean"}}},
 
@@ -71,6 +85,7 @@
         "children": { "type": "array", "items": { "$ref": "#/$defs/CanonicalNode" } }
       }
     },
+    "PublicationDefinition": {"type": "object", "additionalProperties": false, "description": "Canonical publication values with resolved compiler defaults; requires read.declarations.", "required": ["kind", "subject", "declaration", "revision", "token"], "properties": {"kind": {"const": "publication-definition"}, "subject": {"type": "string", "pattern": "^(agent|mission|schedule)/[^\\s]+$"}, "declaration": {"type": "object", "additionalProperties": true}, "revision": {"$ref": "#/$defs/Revision"}, "token": {"type": "string", "minLength": 1}}},
     "SubjectDefinition": {
       "type": "object",
       "additionalProperties": false,
@@ -109,6 +124,7 @@
             { "$ref": "#/$defs/Capabilities" },
             { "$ref": "#/$defs/DocumentContent" },
             { "$ref": "#/$defs/SubjectDefinition" },
+            { "$ref": "#/$defs/PublicationDefinition" },
             { "$ref": "#/$defs/AgentWorkspace" },
             { "$ref": "#/$defs/Page" },
             { "$ref": "#/$defs/ResourcesPage" },
@@ -201,7 +217,8 @@
           "required": ["kind", "attention_kind", "source_id", "person_id", "title", "detail", "priority", "state", "requested_at", "actions"],
           "properties": {
             "kind": { "const": "attention" },
-            "attention_kind": { "enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "person-step", "agent-request", "fault"] },
+            "attention_kind": {"anyOf": [{"enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "person-step", "agent-request", "fault"]}, {"type": "string", "pattern": "^custom\\.[a-zA-Z0-9_.-]+$"}]},
+          "custom_form": {"type": "object", "description": "Data-only registered reply form; absent on native attention."},
             "source_kind": {"type": "string"},
             "episode": {"type": "string"},
             "action_parameters": {"type": "object"},
@@ -222,6 +239,7 @@
             "mission_id": { "$ref": "#/$defs/Id" },
             "mission_run_id": { "$ref": "#/$defs/Id" },
             "step_run_id": { "$ref": "#/$defs/Id" },
+            "blocked": { "$ref": "#/$defs/AttentionBlocked", "description": "The mission step waiting on this ask, on an ask a mission step made; absent on a standalone ask." },
             "title": { "type": "string" },
             "detail": { "type": "string" },
             "priority": { "enum": ["critical", "high", "normal", "low"] },
@@ -229,10 +247,21 @@
             "requested_at": { "$ref": "#/$defs/Timestamp" },
             "targets": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "target_states": { "type": "array", "items": { "$ref": "#/$defs/AttentionTargetState" } },
-            "actions": { "type": "array", "items": { "type": "string", "enum": ["work.done", "review.approve", "review.reject", "review.request-changes", "launch.approve", "launch.cancel", "mission.approve-revision", "mission.cancel-revision", "message.read"] } }
+            "actions": { "type": "array", "items": { "type": "string", "enum": ["custom.reply", "work.done", "review.approve", "review.reject", "review.request-changes", "launch.approve", "launch.cancel", "mission.approve-revision", "mission.cancel-revision", "message.read"] } }
           }
         }
       ]
+    },
+    "AttentionBlocked": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step_run_id", "step", "goal", "attempt"],
+      "properties": {
+        "step_run_id": { "$ref": "#/$defs/Id", "description": "The step run that asked and waits for the answer." },
+        "step": { "type": "string", "description": "That step's name within its mission." },
+        "goal": { "type": "string", "description": "What that step is for." },
+        "attempt": { "type": "integer", "minimum": 0 }
+      }
     },
     "AttentionTargetState": {
       "type": "object",
@@ -571,7 +600,37 @@
         "since_ms": { "type": "integer", "minimum": 0 },
         "until_ms": { "type": "integer", "minimum": 0 },
         "rows": { "type": "array", "items": { "$ref": "#/$defs/UsageRow" } },
-        "limits": { "type": "array", "items": { "$ref": "#/$defs/UsageLimit" } }
+        "limits": { "type": "array", "items": { "$ref": "#/$defs/UsageLimit" } },
+        "agent_messages": { "$ref": "#/$defs/AgentMessageEstimate" }
+      }
+    },
+    "AgentMessageEstimate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "method", "fallback_low_microusd", "fallback_high_microusd", "days"],
+      "properties": {
+        "calibration": { "type": ["string", "null"] },
+        "source": { "type": "string" },
+        "method": { "type": "string" },
+        "fallback_low_microusd": { "type": "integer", "minimum": 0 },
+        "fallback_high_microusd": { "type": "integer", "minimum": 0 },
+        "days": { "type": "array", "items": { "$ref": "#/$defs/AgentMessageDay" } }
+      }
+    },
+    "AgentMessageDay": {
+      "type": "object", "additionalProperties": false,
+      "required": ["day_start_ms", "since_ms", "until_ms", "messages", "calibrated_messages", "low_microusd", "high_microusd", "usage_cost_microusd", "unpriced_tokens"],
+      "properties": {
+        "day_start_ms": { "type": "integer", "minimum": 0 },
+        "since_ms": { "type": "integer", "minimum": 0 },
+        "until_ms": { "type": "integer", "minimum": 0 },
+        "messages": { "type": "integer", "minimum": 0 },
+        "calibrated_messages": { "type": "integer", "minimum": 0 },
+        "low_microusd": { "type": "integer", "minimum": 0 },
+        "high_microusd": { "type": "integer", "minimum": 0 },
+        "usage_cost_microusd": { "type": "integer", "minimum": 0 },
+        "unpriced_tokens": { "type": "integer", "minimum": 0 },
+        "low_percent": { "type": ["number", "null"], "minimum": 0 },
+        "high_percent": { "type": ["number", "null"], "minimum": 0 }
       }
     },
     "ClientConnections": {
@@ -607,6 +666,7 @@
       "properties": {
         "account": { "type": "string" },
         "account_ref": { "type": "string" },
+        "identified": { "type": "boolean", "description": "The source named a provider identity or declared account; independent of quota freshness. Absent on older servers." },
         "driver": { "type": "string" },
         "plan": { "type": "string" },
         "five_hour_percent": { "type": "number", "minimum": 0 },
@@ -630,6 +690,8 @@
         "account": { "type": "string" },
         "host": { "type": "string" },
         "pricing": { "type": "string" },
+        "native_session_id": { "type": "string" },
+        "pricing_provenance": { "type": "array", "items": { "$ref": "#/$defs/UsagePricing" } },
         "total_tokens": { "type": "integer", "minimum": 0 },
         "input_tokens": { "type": "integer", "minimum": 0 },
         "output_tokens": { "type": "integer", "minimum": 0 },
@@ -639,6 +701,111 @@
         "cost_microusd": { "type": "integer", "minimum": 0 },
         "reported_cost_microusd": { "type": "integer", "minimum": 0 },
         "unpriced_tokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "UsagePricingRates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "output",
+        "cache_read",
+        "cache_write_5m",
+        "cache_write_1h"
+      ],
+      "properties": {
+        "input": {
+          "type": "number",
+          "minimum": 0
+        },
+        "output": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cache_read": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cache_write_5m": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cache_write_1h": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "UsagePricing": {
+      "description": "Cumulative contribution on claims; period contribution on usage reads. Provider-reported costs have no disclosed price table or rates. Missing provenance on historical claims is unknown.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cost_source",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_write_tokens",
+        "cache_write_1h_tokens",
+        "cached_tokens",
+        "cost_microusd",
+        "reported_cost_microusd",
+        "unpriced_tokens"
+      ],
+      "properties": {
+        "price_table_id": {
+          "type": "string"
+        },
+        "price_table_version": {
+          "type": "string"
+        },
+        "cost_source": {
+          "type": "string",
+          "enum": [
+            "provider_reported",
+            "computed",
+            "unpriced"
+          ]
+        },
+        "rates_usd_per_million_tokens": {
+          "$ref": "#/$defs/UsagePricingRates"
+        },
+        "total_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_write_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_write_1h_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cached_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_microusd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reported_cost_microusd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unpriced_tokens": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "Mission": {
@@ -720,7 +887,28 @@
         "blocked_reason": { "type": ["string", "null"] },
         "blockers": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
         "goals": { "type": "array", "items": { "type": "string" } },
-        "constraints": { "type": "array", "items": { "type": "string" } }
+        "constraints": { "type": "array", "items": { "type": "string" } },
+        "loop_round": { "type": ["integer", "null"], "minimum": 0, "description": "Current round of this step's loop, enriched on mission detail reads." },
+        "loop_max_rounds": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_reason": { "type": ["string", "null"] },
+        "next_wake_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "Observed not-before time: earliest work eligibility, not a promise of wake dispatch." },
+        "wake_reason": { "type": ["string", "null"], "description": "The deferral's blocked reason, or the observed wake failure when no deferral reason exists." },
+        "wake": { "oneOf": [{ "$ref": "#/$defs/MissionWake" }, { "type": "null" }] },
+        "claim_expires_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+      }
+    },
+    "MissionWake": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assignee", "assignee_state", "incarnation_id", "attempts"],
+      "properties": {
+        "assignee": { "$ref": "#/$defs/AgentId" },
+        "assignee_state": { "type": "string" },
+        "incarnation_id": { "type": "string" },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "last_attempt_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "acknowledged_by": { "type": ["string", "null"] },
+        "failure": { "type": ["string", "null"] }
       }
     },
     "WorkLabel": {
@@ -805,6 +993,7 @@
             "harness_state": { "type": ["string", "null"], "description": "Observed harness state; stale idle is indeterminate. Desired state and declared work status remain separate." },
             "since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "When this observed state began in this runtime incarnation. Same-state observations never reset it." },
             "observation": { "enum": ["current", "stale", "missing"], "description": "Stale after 90 seconds without a new observation; missing when this runtime has no observation." },
+            "harness_error_state": { "type": ["string", "null"], "description": "Known actionable harness error: needs-login. Login keeps the legacy unauthenticated harness_state for older clients; older daemons omit this optional detail." },
             "blocked_on": { "type": ["string", "null"], "description": "Current incarnation's harness blocking axis; human means a person must answer before it continues." },
             "ask": { "type": ["string", "null"], "description": "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." },
             "reason": { "type": ["string", "null"], "description": "Diagnostic harness reason, not a machine-readable verdict." },
@@ -1612,7 +1801,7 @@
         "api_version": { "const": "st3.client.v0" },
         "id": { "$ref": "#/$defs/Id" },
         "type": {
-          "enum": ["attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.ask", "work.done", "work.cancel-ask", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.create", "agent.stop", "agent.start", "agent.suspend", "agent.resume", "terminal.create", "terminal.end", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
+          "enum": ["custom.reply", "attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.ask", "work.done", "work.cancel-ask", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.create", "agent.stop", "agent.start", "agent.suspend", "agent.resume", "terminal.create", "terminal.end", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
         },
         "idempotency_key": { "x-st-brand": "IdempotencyKey", "type": "string", "minLength": 16, "maxLength": 256 },
         "fence": { "$ref": "#/$defs/Fence" },
@@ -1716,6 +1905,7 @@
     "ActionRequest": {
       "allOf": [{ "$ref": "#/$defs/ActionCommon" }],
       "oneOf": [
+        {"properties": {"type": {"const": "custom.reply"}, "parameters": {"$ref": "#/$defs/CustomReplyParameters"}}},
         {"properties": {"type": {"const": "agent.create"}, "parameters": {"$ref": "#/$defs/AgentCreateParameters"}}},
         {"properties": {"type": {"const": "agent.stop"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["runtime_desired_revision"]}]}, "parameters": {"$ref": "#/$defs/AgentStopParameters"}}},
         {"properties": {"type": {"const": "agent.start"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["runtime_desired_revision"]}]}, "parameters": {"$ref": "#/$defs/AgentStartParameters"}}},
@@ -2018,7 +2208,8 @@
         "credential": { "x-st-codec": "redacted", "type": "string", "minLength": 32 },
         "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "expires_at": { "$ref": "#/$defs/Timestamp" },
-        "device_key_chain": { "type": "array", "items": { "type": "string" } }
+        "device_key_chain": { "type": "array", "items": { "type": "string" } },
+        "device_key_proofs": { "type": "array", "items": { "type": "object" }, "maxItems": 2 }
       }
     },
     "DeviceSignature": {

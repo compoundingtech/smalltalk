@@ -1,5 +1,6 @@
 //! The authoritative st3 subject, resource, and claim registry.
 
+pub mod custom;
 pub mod glasses;
 pub mod owned_terminals;
 
@@ -855,6 +856,8 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
             "A version control repository.",
             &[
                 ("url", string()),
+                ("node_id", string()),
+                ("moved_to", reference()),
                 ("vcs", enumeration(&["git"])),
                 ("default_ref", reference()),
                 ("head", reference()),
@@ -910,6 +913,8 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("repository", reference()),
                 ("number", integer()),
                 ("url", string()),
+                ("node_id", string()),
+                ("moved_to", reference()),
                 ("title", string()),
                 ("author", string()),
                 ("head", reference()),
@@ -922,6 +927,11 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("state", string()),
                 ("draft", boolean()),
                 ("merged", boolean()),
+                ("merge_commit_sha", string()),
+                ("merged_at", string()),
+                ("merged_by", string()),
+                ("state_reason", string()),
+                ("closed_by_resource", reference()),
                 ("created_at", string()),
                 ("updated_at", string()),
                 ("checks_state", string()),
@@ -947,12 +957,16 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("repository", reference()),
                 ("number", integer()),
                 ("url", string()),
+                ("node_id", string()),
+                ("moved_to", reference()),
                 ("title", string()),
                 ("author", string()),
                 ("opened_by", reference()),
                 ("opened_by_run", reference()),
                 ("state", string()),
                 ("state_reason", string()),
+                ("closed_by", string()),
+                ("closed_by_resource", reference()),
                 ("created_at", string()),
                 ("updated_at", string()),
                 ("labels", array()),
@@ -2945,6 +2959,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
                     "indeterminate",
                 ]),
             ),
+            ("provider_auth", boolean()),
+            ("provider_auth_sequence", integer()),
             ("background_jobs", integer()),
             ("driver", string()),
             ("reason", string()),
@@ -2986,6 +3002,9 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("code", string()),
             ("reason", string()),
             ("incarnation_id", string()),
+            ("ownership_sequence", integer()),
+            ("provider_auth_sequence", integer()),
+            ("auth_attention_key", string()),
             ("matched_line", string()),
             ("step_run", reference_to(&["step-run"])),
             ("wake_attempts", integer()),
@@ -3019,6 +3038,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("reported_cost_microusd", integer()),
             ("unpriced_tokens", integer()),
             ("pricing", string()),
+            ("pricing_provenance", array()),
+            ("native_session_id", string()),
             (
                 "semantics",
                 required_enum(&[
@@ -3427,6 +3448,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("kind", string()),
             ("state", any()),
             ("observed_at", integer()),
+            ("attribution_only", boolean()),
         ],
         _ => &[],
     };
@@ -4320,6 +4342,70 @@ mod tests {
         registry()
             .validate_claim("gate-operation/run/step/gate", "gate.result", &fields)
             .unwrap();
+    }
+
+    #[test]
+    fn vcs_identity_and_resolution_fields_are_additive_and_typed() {
+        for kind in ["vcs.repository", "vcs.issue", "vcs.pull-request"] {
+            registry()
+                .validate_resource_facts(kind, &BTreeMap::new())
+                .unwrap();
+            let facts = BTreeMap::from([
+                ("node_id".into(), Value::String("NODE_orchid".into())),
+                (
+                    "moved_to".into(),
+                    Value::String("resource/github/acme/greenhouse".into()),
+                ),
+            ]);
+            registry().validate_resource_facts(kind, &facts).unwrap();
+            for (name, invalid) in [
+                ("node_id", Value::from(7)),
+                ("moved_to", Value::String("not-a-subject".into())),
+            ] {
+                let mut facts = facts.clone();
+                facts.insert(name.into(), invalid);
+                assert!(registry().validate_resource_facts(kind, &facts).is_err());
+            }
+        }
+        let issue = BTreeMap::from([
+            ("closed_by".into(), Value::String("fern".into())),
+            (
+                "closed_by_resource".into(),
+                Value::String("resource/github/acme/garden/pull-request/2".into()),
+            ),
+        ]);
+        registry()
+            .validate_resource_facts("vcs.issue", &issue)
+            .unwrap();
+        let pull = BTreeMap::from([
+            ("merge_commit_sha".into(), Value::String("final-sha".into())),
+            (
+                "merged_at".into(),
+                Value::String("2026-09-11T00:00:00Z".into()),
+            ),
+            ("merged_by".into(), Value::String("orchid".into())),
+            ("state_reason".into(), Value::String("merged".into())),
+            (
+                "closed_by_resource".into(),
+                Value::String("resource/github/acme/garden/commit/final-sha".into()),
+            ),
+        ]);
+        registry()
+            .validate_resource_facts("vcs.pull-request", &pull)
+            .unwrap();
+        for kind in ["vcs.issue", "vcs.pull-request"] {
+            assert!(
+                registry()
+                    .validate_resource_facts(
+                        kind,
+                        &BTreeMap::from([(
+                            "closed_by_resource".into(),
+                            Value::String("https://github.com/acme/garden/pull/2".into())
+                        ),])
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]

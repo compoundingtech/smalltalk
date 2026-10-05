@@ -206,6 +206,8 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn host_repositories(&self, host: &str) -> Result<Envelope<HostRepositories>, ClientError> {{ self.get(&format!(\"/v1/client/hosts/{{}}/repositories\", percent_encode(host))).await }}"
             )?;
+        } else if id == "publication.definition" {
+            writeln!(out, "    pub async fn publication_definition(&self, subject: &str) -> Result<Envelope<PublicationDefinition>, ClientError> {{ self.get(&format!(\"/v1/client/publication-definition?subject={{}}\", percent_encode(subject))).await }}")?;
         } else if id == "subject.definition" {
             writeln!(
                 out,
@@ -270,6 +272,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn agent_declaration_get(&self, id: &str, revision: Option<&str>, show_env_values: bool) -> Result<Envelope<AgentDeclaration>, ClientError> {{ let path = format!(\"/v1/client/agent-declarations/{{}}?show_env_values={{show_env_values}}\", percent_encode(id)); let path = if let Some(revision) = revision {{ format!(\"{{path}}&revision={{}}\", percent_encode(revision)) }} else {{ path }}; self.get(&path).await }}"
             )?;
+        } else if id == "custom-subjects.list" {
+            writeln!(
+                out,
+                "    pub async fn custom_subjects_list(&self, kind: Option<&str>, version: Option<u32>, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<Page>, ClientError> {{ let version = version.map(|v| v.to_string()); let values = [(\"kind\", kind), (\"version\", version.as_deref())]; let filters = values.into_iter().filter_map(|(k,v)| v.map(|v| (k,v))).collect::<Vec<_>>(); self.list_internal_with_filters(\"custom-subjects\", cursor, limit, false, &filters).await }}"
+            )?;
         } else if id == "resources.list" {
             writeln!(
                 out,
@@ -308,10 +315,17 @@ fn rust_operation_methods(
     for (action, definition) in actions {
         let method = action_method(action);
         let parameters = action_parameter(action, definition)?;
-        writeln!(
-            out,
-            "    pub async fn {method}(&self, id: impl Into<String>, idempotency_key: impl Into<String>, fence: Fence, parameters: {parameters}) -> Result<Envelope<ActionResult>, ClientError> {{ let request = ActionRequest::{method}(id, idempotency_key, fence, parameters).map_err(|error| ClientError::Protocol(error.to_string()))?; self.action_internal(&request).await }}"
-        )?;
+        if action == "message.send" {
+            writeln!(
+                out,
+                "    pub async fn {method}(&self, id: impl Into<String>, idempotency_key: impl Into<String>, fence: Fence, mut parameters: {parameters}) -> Result<Envelope<ActionResult>, ClientError> {{ let idempotency_key = idempotency_key.into(); if parameters.signature.is_none() && let Some(device) = &self.signing_device {{ parameters.signature = Some(device.sign_message(&idempotency_key, &parameters).map_err(|error| ClientError::Protocol(error.to_string()))?); }} let request = ActionRequest::{method}(id, idempotency_key, fence, parameters).map_err(|error| ClientError::Protocol(error.to_string()))?; self.action_internal(&request).await }}"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "    pub async fn {method}(&self, id: impl Into<String>, idempotency_key: impl Into<String>, fence: Fence, parameters: {parameters}) -> Result<Envelope<ActionResult>, ClientError> {{ let request = ActionRequest::{method}(id, idempotency_key, fence, parameters).map_err(|error| ClientError::Protocol(error.to_string()))?; self.action_internal(&request).await }}"
+            )?;
+        }
     }
     Ok(out.trim_end().to_owned())
 }
@@ -374,10 +388,17 @@ fn swift_operation_methods(
                 out,
                 "    public func hostRepositories(id: String) async throws -> Envelope<HostRepositories> {{ try await get(\"v1/client/hosts/\\(id)/repositories\") }}"
             )?;
+        } else if id == "publication.definition" {
+            writeln!(out, "    public func publicationDefinition(subject: String) async throws -> Envelope<PublicationDefinition> {{ try await get(\"v1/client/publication-definition\", query: [.init(name: \"subject\", value: subject)]) }}")?;
         } else if id == "subject.definition" {
             writeln!(
                 out,
                 "    public func subjectDefinition(subject: String, showEnvValues: Bool = false) async throws -> Envelope<SubjectDefinition> {{ try await get(\"v1/client/subject-definition\", query: [.init(name: \"subject\", value: subject), .init(name: \"show_env_values\", value: showEnvValues ? \"true\" : \"false\")]) }}"
+            )?;
+        } else if id == "custom-subjects.list" {
+            writeln!(
+                out,
+                "    public func customSubjectsList(kind: String? = nil, version: Int? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<Page> {{ var query: [URLQueryItem] = []; if let kind {{ query.append(.init(name: \"kind\", value: kind)) }}; if let version {{ query.append(.init(name: \"version\", value: String(version))) }}; if let cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/custom-subjects\", query: query) }}"
             )?;
         } else if id == "resources.list" {
             writeln!(
@@ -587,6 +608,7 @@ fn validate_surfaces(
         "ResourceObservation",
         "ResourcesFilter",
         "ResourcesPage",
+        "AttentionBlocked",
         "AttentionTargetState",
         "DocumentContent",
         "AgentDeclaration",
@@ -597,14 +619,21 @@ fn validate_surfaces(
         "HostRepositories",
         "CanonicalNode",
         "SubjectDefinition",
+        "PublicationDefinition",
         "UsagePeriod",
+        "AgentMessageEstimate",
+        "AgentMessageDay",
         "MailBacklog",
         "UsageRow",
+        "UsagePricing",
+        "UsagePricingRates",
         "ClientConnections",
         "ClientConnection",
         "UsageLimit",
         "LaunchPreview",
         "MissionRunSummary",
+        "MissionStep",
+        "MissionWake",
         "AgentQueue",
         "AgentQueueRun",
         "AgentQueueMove",
@@ -1142,6 +1171,11 @@ fn typescript_operation_methods(
                 out,
                 "    async {method}(name: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }})); }}"
             )?;
+        } else if id == "custom-subjects.list" {
+            writeln!(
+                out,
+                "    async customSubjectsList(options: PageOptions & {{ kind?: string; version?: number }} = {{}}): Promise<EnvelopeOf<Page>> {{ return this.get('{route}' + query(options)); }}"
+            )?;
         } else if id == "resources.list" {
             writeln!(
                 out,
@@ -1157,6 +1191,8 @@ fn typescript_operation_methods(
                 out,
                 "    async hostRepositories(id: string): Promise<EnvelopeOf<HostRepositories>> {{ return this.get(`{route}`); }}"
             )?;
+        } else if id == "publication.definition" {
+            writeln!(out, "    async publicationDefinition(subject: string): Promise<EnvelopeOf<PublicationDefinition>> {{ return this.get('{route}' + query({{ subject }})); }}")?;
         } else if id == "subject.definition" {
             writeln!(
                 out,

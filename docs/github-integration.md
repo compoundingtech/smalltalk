@@ -1,6 +1,6 @@
 # GitHub integration
 
-Small Talk can observe a repository and start finite review and triage missions for new pull requests and issues. A durable seat serves those runs; a curator groups what needs a person before it reaches Home.
+Smalltalk can observe a repository and start finite review and triage missions for new pull requests and issues. A durable seat serves those runs; a curator groups what needs a person before it reaches Home.
 
 Use the worker and workspace from [getting started](getting-started.md), and a repository you are allowed to inspect. Install [GitHub CLI](https://cli.github.com/), then log in as the OS user who runs the daemon:
 
@@ -50,7 +50,7 @@ mission "garden/triage-issue" state="ready" {
   }
 }
 EOF
-st missions publish missions/github-work.kdl --as person/ada
+st apply missions/github-work.kdl --as person/ada
 ```
 
 ## Start repository intake
@@ -101,7 +101,7 @@ EOF
 printf 'Repository to observe (OWNER/REPO): '
 read -r garden_repo
 mkdir -p "$PWD/github-intake"
-st missions publish missions/github-intake.kdl --as person/ada
+st apply missions/github-intake.kdl --as person/ada
 st missions start garden/github-intake --id garden/github-intake/main \
   --input "repository=$garden_repo" --workspace "$PWD/github-intake" --as person/ada
 st missions show mission-run/garden/github-intake/main

@@ -22,7 +22,6 @@ pub struct Extras {
     pub bodies: BTreeMap<String, (String, Option<String>, String)>,
     pub live: bool,
     pub offline: Option<String>,
-    pub mail_backlog: Option<Result<st3_client::MailBacklog, String>>,
 }
 
 fn now() -> String {
@@ -142,11 +141,6 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         host,
         link,
         diverged,
-        mail_backlog: match &extras.mail_backlog {
-            Some(Ok(value)) => Load::Ready(value.clone()),
-            Some(Err(error)) => Load::Failed(error.clone()),
-            None => Load::Loading,
-        },
         attention: loaded(model.now.snapshot.is_some(), attention),
         agents: loaded(model.agents.snapshot.is_some(), agents(model)),
         missions: loaded(model.missions.snapshot.is_some(), missions),
@@ -177,6 +171,10 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         usage_limits: match &model.usage {
             Some(Ok(period)) => period.limits.clone(),
             _ => Vec::new(),
+        },
+        agent_messages: match &model.usage {
+            Some(Ok(period)) => period.agent_messages.clone(),
+            _ => None,
         },
         clients: match &model.clients {
             Some(Ok(list)) => Load::Ready(
@@ -330,6 +328,20 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         structured: item.request.clone().map(Box::new),
                     },
                 ),
+                custom if custom.starts_with("custom.") => (
+                    Tier::Today,
+                    AttentionKind::Request {
+                        from: requester_name(model, item.requester_id.as_deref()),
+                        from_id: item.requester_id.clone().unwrap_or_default(),
+                        question: format!(
+                            "{}\n\n{}\nSource: {}",
+                            item.detail,
+                            crate::custom_form_hint(item.custom_form.as_ref()),
+                            item.source_id
+                        ),
+                        structured: None,
+                    },
+                ),
                 // Home holds only requests and reviews. Messages stay in conversations, and st
                 // sends each fault to the agent that owns it.
                 _ => return None,
@@ -415,6 +427,10 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                 agent,
                 related,
                 raised_by,
+                blocked: item.blocked.as_ref().map(|blocked| Blocked {
+                    step: blocked.step.clone(),
+                    goal: clean_message_text(&blocked.goal),
+                }),
                 tier,
                 title: extras
                     .bodies
@@ -555,6 +571,11 @@ fn agents(model: &Model) -> Vec<Agent> {
                 ("failed", _) => AgentState::Fault,
                 // Signed out of its provider (Claude "Not logged in · Run /login"): a login on
                 // its host fixes it, not a restart (Nathan, 2026-10-04).
+                // st's additive detail names the known error outright; the legacy `unauthenticated`
+                // harness state below says the same to clients that predate it.
+                ("waiting", _) if agent.harness_error_state.as_deref() == Some("needs-login") => {
+                    AgentState::NeedsLogin
+                }
                 ("waiting", Some("unauthenticated" | "needs-login")) => AgentState::NeedsLogin,
                 ("waiting", _) if agent.reason.as_deref() == Some("providerAuth") => {
                     AgentState::NeedsLogin
@@ -1296,6 +1317,73 @@ mod tests {
             .join("\n")
     }
 
+    #[test]
+    fn claude_skill_model_folds_the_expansion_and_stui_draws_real_lines() {
+        let fixture = include_str!("../../../../fixtures/clients/transcripts/claude-skill.json");
+        let timeline: Vec<TimelineEntry> = serde_json::from_str(fixture).unwrap();
+        let entries = conversation(&timeline, &BTreeMap::new());
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        let Body::Tool { output, .. } = &entries[0].body else {
+            panic!("{entries:?}")
+        };
+        assert!(output.iter().any(|line| line == "## Messages"));
+        assert!(
+            output
+                .iter()
+                .any(|line| line.starts_with("`<smalltalk-message>`, followed"))
+        );
+        let folded = rendered(fixture);
+        assert!(folded.contains("Skill st"), "{folded}");
+        assert!(!folded.contains("## Messages"), "{folded}");
+        let opened = super::super::conversation::Cache::default().render(
+            &entries,
+            100,
+            &std::collections::HashSet::from(["skill-call".into()]),
+            "",
+            st3_conversation_ui::Density::Full,
+        );
+        assert!(
+            opened
+                .lines
+                .iter()
+                .all(|line| !super::super::text::plain(line).contains('\n'))
+        );
+        let text = opened
+            .lines
+            .iter()
+            .map(super::super::text::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for kept in [
+            "# st",
+            "## Messages",
+            "`<smalltalk-message>`, followed by a bounded preview.",
+            "it prints nothing, st did not start the session and nothing here applies.",
+        ] {
+            assert!(text.contains(kept), "{text}");
+        }
+        // A paged window without the call renders the skill as one user block, with real rows.
+        let orphan = conversation(&timeline[2..3], &BTreeMap::new());
+        assert_eq!(orphan.len(), 1);
+        let doc = super::super::conversation::Cache::default().render(
+            &orphan,
+            100,
+            &Default::default(),
+            "",
+            st3_conversation_ui::Density::Full,
+        );
+        assert!(
+            doc.lines
+                .iter()
+                .all(|line| !super::super::text::plain(line).contains('\n'))
+        );
+        assert!(
+            doc.lines
+                .iter()
+                .any(|line| super::super::text::plain(line).trim() == "## Messages")
+        );
+    }
+
     fn assert_clean(text: &str) {
         for tag in HARNESS_TAGS {
             let needle = if tag.starts_with('<') {
@@ -1573,6 +1661,12 @@ mod tests {
         };
         // st's own word for it (st-drivers' needs-login) reads the same.
         model.agents = window(vec![resource("waiting", "needs-login", None)]);
+        assert_eq!(agents(&model)[0].state, AgentState::NeedsLogin);
+        // The additive field alone is enough, even when the harness state reads as stale.
+        let mut detail = resource("waiting", "indeterminate", None);
+        detail["harness_error_state"] = "needs-login".into();
+        detail["observation"] = "stale".into();
+        model.agents = window(vec![detail]);
         assert_eq!(agents(&model)[0].state, AgentState::NeedsLogin);
         model.agents = window(vec![resource("waiting", "unauthenticated", Some("providerAuth"))]);
         let agent = &agents(&model)[0];

@@ -113,6 +113,13 @@ def turn(prompt, answer):
 
 
 server = mcp.get("mcpServers", {}).get("st3")
+# Fault injection belongs to this private workspace, never to a shared provider setting.
+channel_mode = Path.cwd() / "claude-channel-mode"
+mode = channel_mode.read_text().strip() if channel_mode.exists() else ""
+if mode in ("missing", "missing-once"):
+    server = None
+    if mode == "missing-once":
+        channel_mode.write_text("healthy")
 channel = None
 if server:
     channel = subprocess.Popen([server["command"], *server.get("args", [])], stdin=subprocess.PIPE,
@@ -129,9 +136,11 @@ hooks("SessionStart", {"source": "resume" if resumed else "startup", "model": "c
 append("user", "canary transcript probe")
 append("assistant", "canary transcript answer")
 status_line()
-if channel:
+initialized = False
+if channel and mode != "uninitialized":
     channel.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
     channel.stdin.flush()
+    initialized = True
 turn("canary first turn", "canary first answer")
 
 notices = []
@@ -164,6 +173,10 @@ signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGHUP, stop)
 next_status = time.monotonic() + 5
 while running:
+    if channel and not initialized and not channel_mode.exists():
+        channel.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        channel.stdin.flush()
+        initialized = True
     with lock:
         pending, notices[:] = list(notices), []
     for notice in pending:

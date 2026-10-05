@@ -9,3 +9,6 @@ assert.equal(parseFabricProofLink(base + '&id=pairing/demo'), null);
 assert.equal(parseFabricProofLink(base.replace('demo-client%2F0', 'git%2Fdemo')), null);
 assert.equal(parseFabricProofLink(base.replace('demo-client%2F0', '%0a')), null);
 assert.equal(normalizeGatewayUrl('http://127.0.0.1:12345'), null, 'ordinary pairing must still reject typed loopback');
+assert.deepEqual(parseFabricProofLink(base + '&client=1&mode=relay'), { node: 'ab'.repeat(32), service: 'demo-client/0', fullClient: true, mode: 'relay' });
+assert.equal(parseFabricProofLink(base + '&mode=other'), null);
+assert.equal(parseFabricProofLink(base + '&client=production'), null);

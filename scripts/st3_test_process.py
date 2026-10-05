@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Own an isolated test's entire process tree, including double-forked PTY servers.
+
+The guardian detaches from seat ancestry but retains pidfds for both its launcher and
+the test runner. It is a Linux subreaper: orphaned descendants become its children,
+so cleanup needs neither a live daemon API nor a scan of unrelated fleet processes.
+"""
+import argparse
+import ctypes
+import os
+from pathlib import Path
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def kill_group(pid):
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def reap_exited_descendants(task_pid):
+    """Retire adopted PTYs during the test, preserving the task's exit status.
+
+    A stopped PTY must disappear from /proc before suspend/resume checks continue.
+    Only wait on our direct children; leave live descendants owned until teardown.
+    """
+    children = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
+    for pid in map(int, children.read_text().split()):
+        if pid != task_pid:
+            os.waitpid(pid, os.WNOHANG)
+
+
+def reap_descendants():
+    """Kill before reaping, keeping each PID reserved while signalling its group.
+
+    Killing an adopted parent can adopt more children (even ones in new sessions).
+    Repeat until waitpid confirms we have no children at all.
+    """
+    children = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
+    while True:
+        for pid in map(int, children.read_text().split()):
+            kill_group(pid)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            while os.waitpid(-1, os.WNOHANG)[0]:
+                pass
+        except ChildProcessError:
+            return
+        time.sleep(0.01)
+
+
+def guardian(command, watched, result, temporary_roots=(), keep=False):
+    libc = ctypes.CDLL(None, use_errno=True)
+    # PR_SET_CHILD_SUBREAPER, before launching any descendants.
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
+    interrupted = False
+
+    def interrupt(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, interrupt)
+    task = None
+    roots = []
+    code = 1
+    try:
+        env = {**os.environ, "SMALLTALK_TEST_SUPERVISOR": str(os.getpid())}
+        # Allocate under the guardian, not the killable controller. Remove only
+        # these freshly created roots, and only after their processes are reaped.
+        for name, prefix, parent in temporary_roots:
+            root = tempfile.mkdtemp(prefix=prefix, dir=parent)
+            roots.append(root)
+            env[name] = root
+            if keep:
+                print(f"isolated test keeping {root}", file=sys.stderr, flush=True)
+        task = subprocess.Popen(command, env=env, start_new_session=True)
+        with os.fdopen(os.pidfd_open(task.pid), "rb") as task_fd:
+            poller = select.poll()
+            for fd in [*watched, task_fd.fileno()]:
+                poller.register(fd, select.POLLIN)
+            # pidfds avoid PID reuse and the check/launch race. An already dead
+            # owner is immediately readable, including after the double fork.
+            while not interrupted and not poller.poll(100):
+                reap_exited_descendants(task.pid)
+    finally:
+        if task is not None:
+            kill_group(task.pid)
+            code = task.wait()
+        reap_descendants()
+        if not keep:
+            for root in roots:
+                shutil.rmtree(root)
+        # Return status only AFTER every daemon, worker, driver and PTY is gone.
+        os.write(result, str(code).encode())
+
+
+def run_supervised(command, owners=None, temporary_roots=(), keep=False):
+    owners = owners or [os.getppid()]
+    if "ST_AGENT" in os.environ or "ST3_SUBJECT" in os.environ:
+        # /proc ancestry reads the process's original environment. Removing an
+        # os.environ key after fork does not erase it there; exec a clean launcher
+        # before detaching, while retaining watches for both original callers.
+        env = dict(os.environ)
+        for name in ("ST_AGENT", "ST3_SUBJECT"):
+            env.pop(name, None)
+        owner_args = [arg for pid in [*owners, os.getpid()] for arg in ("--owner", str(pid))]
+        root_args = [arg for root in temporary_roots for arg in ("--temporary-root", *map(str, root))]
+        return subprocess.call([sys.executable, str(Path(__file__).resolve()),
+                                *owner_args, *root_args, *(["--keep"] if keep else []),
+                                "--", *command], env=env)
+    # Open both before forking. The launcher waits for the guardian's result;
+    # killing either the launcher or its Rust test runner cancels the whole tree.
+    watched = [os.pidfd_open(pid) for pid in [*owners, os.getpid()]]
+    reader, writer = os.pipe()
+    intermediate = os.fork()
+    if intermediate == 0:
+        os.close(reader)
+        os.setsid()
+        if os.fork() != 0:
+            os._exit(0)
+        try:
+            guardian(command, watched, writer, temporary_roots, keep)
+        except BaseException as error:
+            print(f"isolated test guardian: {error}", file=sys.stderr)
+        finally:
+            os._exit(0)
+    os.close(writer)
+    for fd in watched:
+        os.close(fd)
+    os.waitpid(intermediate, 0)
+    try:
+        status = os.read(reader, 32)
+    finally:
+        os.close(reader)
+    code = int(status) if status else 1
+    return code if code >= 0 else 128 - code
+
+
+def supervised_main(main):
+    """Also protect fixtures launched directly, outside Cargo/nextest."""
+    if os.environ.get("SMALLTALK_TEST_SUPERVISOR"):
+        return main()
+    # Fixtures such as delivery-probe consume --binary/--scratch from sys.argv
+    # before their entrypoint. Re-exec the original invocation, preserving those
+    # options (and interpreter flags), so native proofs cannot silently skip.
+    return run_supervised([sys.executable, *sys.orig_argv[1:]])
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--owner", type=int, action="append")
+    parser.add_argument("--temporary-root", nargs=3, action="append", default=[],
+                        metavar=("ENV", "PREFIX", "PARENT"))
+    parser.add_argument("--keep", action="store_true")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    command = args.command
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not command:
+        parser.error("a command is required")
+    raise SystemExit(run_supervised(command, args.owner, args.temporary_root, args.keep))

@@ -86,8 +86,7 @@ function tabBarHidden(route: RouteProp<TabParams>): boolean {
   return !!focused && FULL_SCREEN.includes(focused);
 }
 
-function Main() {
-  const [fabricProof, setFabricProof] = useState<FabricProofInput | null>(null);
+function Main({ proofSession = false }: { proofSession?: boolean }) {
   const { credential, url, order, data, caps, actions, setTreeView, requestScroll, glassesOn } = useStore();
   const homeCount = homeRows(data.attention, caps?.session_actor).length;
   const paired = !!url && !!credential;
@@ -98,10 +97,9 @@ function Main() {
     let lastPair = '';
     const handle = (link: string | null) => {
       if (!link) return;
-      const proof = parseFabricProofLink(link);
-      if (proof) { setFabricProof(proof); return; }
       const parsed = parseDevLink(link);
       if (!parsed) return;
+      if (parsed.kind === 'pair' && proofSession) return;
       if (parsed.kind === 'pair') { if (lastPair !== link) { lastPair = link; void actions.pairFromLink(parsed.gateway, parsed.id, parsed.code); } return; }
       if (parsed.kind === 'tree') { setTreeView(parsed.on); if (navigationRef.isReady()) navigationRef.navigate('Agents', { screen: 'AgentsRoot' }); return; }
       if (parsed.kind === 'scroll') { requestScroll(parsed.y); return; }
@@ -125,7 +123,6 @@ function Main() {
     return () => subscription.remove();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (__DEV__ && fabricProof) return <FabricProofScreen input={fabricProof} onClose={() => setFabricProof(null)} />;
   if (!paired) {
     return <Stack.Navigator screenOptions={stackOptions}>
       <Stack.Screen name="HomeRoot" component={PairScreen} options={{ title: 'Pair this device' }} />
@@ -153,14 +150,28 @@ function Main() {
 }
 
 export default function App() {
+  const [fabricProof, setFabricProof] = useState<FabricProofInput | null>(null);
+  useEffect(() => {
+    if (!__DEV__) return;
+    const handle = (link: string | null) => { if (link) { const input = parseFabricProofLink(link); if (input) setFabricProof(current =>
+      // Repeated OS delivery cannot consume a one-time pairing twice. A new mode
+      // or trial uses a fresh pairing link, whose challenge id changes this key.
+      current?.node === input.node && current.service === input.service && current.id === input.id ? current : input); } };
+    void Linking.getInitialURL().then(handle);
+    handle(process.env.EXPO_PUBLIC_ST3_FABRIC_PROOF_LINK ?? null);
+    const subscription = Linking.addEventListener('url', event => handle(event.url));
+    return () => subscription.remove();
+  }, []);
   const [fontsLoaded] = useFonts({ IBMPlexMono_400Regular, IBMPlexMono_400Regular_Italic, IBMPlexMono_600SemiBold, IBMPlexMono_700Bold });
   if (!fontsLoaded) return <View style={{ flex: 1, backgroundColor: theme.base }} />;
   return <SafeAreaProvider>
     <StatusBar barStyle="light-content" />
-    <StoreProvider>
-      <NavigationContainer ref={navigationRef} theme={navigationTheme}>
-        <Main />
-      </NavigationContainer>
-    </StoreProvider>
+    {__DEV__ && fabricProof ? <FabricProofScreen key={fabricProof.id ?? `${fabricProof.node}/${fabricProof.service}`} input={fabricProof} onClose={() => setFabricProof(null)} renderClient={proof =>
+      <StoreProvider proof={proof}>
+        <NavigationContainer ref={navigationRef} theme={navigationTheme}><Main proofSession /></NavigationContainer>
+      </StoreProvider>
+    } /> : <StoreProvider>
+      <NavigationContainer ref={navigationRef} theme={navigationTheme}><Main /></NavigationContainer>
+    </StoreProvider>}
   </SafeAreaProvider>;
 }

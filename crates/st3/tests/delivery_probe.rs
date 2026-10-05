@@ -2,6 +2,9 @@
 #[cfg(target_os = "linux")]
 #[test]
 fn native_delivery_probe_alerts_and_recovers_without_model_turns() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use std::path::PathBuf;
 
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");

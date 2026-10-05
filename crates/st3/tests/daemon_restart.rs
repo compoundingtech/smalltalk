@@ -26,6 +26,7 @@ struct Daemon {
     store: Arc<Store>,
     event_notify: watch::Sender<u64>,
     server: Option<tokio::task::JoinHandle<()>>,
+    isolated_server: Option<(tokio::sync::oneshot::Sender<()>, std::thread::JoinHandle<()>)>,
 }
 
 impl Daemon {
@@ -36,6 +37,7 @@ impl Daemon {
             store: Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap()),
             event_notify: watch::channel(0_u64).0,
             server: None,
+            isolated_server: None,
         }
     }
 
@@ -43,8 +45,8 @@ impl Daemon {
         self.start_with_binding(false).await;
     }
 
-    async fn start_with_binding(&mut self, native: bool) {
-        let state = AppState {
+    fn state(&self) -> AppState {
+        AppState {
             store: self.store.clone(),
             notify: Arc::new(Notify::new()),
             event_notify: self.event_notify.clone(),
@@ -57,7 +59,41 @@ impl Daemon {
             client_relay: None,
             native_session_home: None,
             planner_default: st3::model::PlannerSpec::default(),
-        };
+        }
+    }
+
+    // Dropping this runtime also closes upgraded WebSocket connections, just as exiting
+    // the daemon does. Aborting only the listener would leave those tasks alive.
+    async fn start_isolated(&mut self) {
+        let state = self.state();
+        let socket = self.socket.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                tokio::select! {
+                    result = st3::api::serve_unix_bound(&socket, &socket, st3::api::router(state)) => {
+                        result.unwrap();
+                    }
+                    _ = stopped => {}
+                }
+            });
+        });
+        self.isolated_server = Some((stop, thread));
+        wait_until(
+            "the isolated daemon accepts connections",
+            Duration::from_secs(5),
+            || std::os::unix::net::UnixStream::connect(&self.socket).is_ok(),
+        )
+        .await;
+    }
+
+    async fn start_with_binding(&mut self, native: bool) {
+        let state = self.state();
         let socket = self.socket.clone();
         self.server = Some(tokio::spawn(async move {
             let app = st3::api::router(state);
@@ -77,6 +113,10 @@ impl Daemon {
 
     /// Stop the API the way an exiting daemon does: the socket file stays and refuses.
     async fn stop(&mut self) {
+        if let Some((stop, thread)) = self.isolated_server.take() {
+            let _ = stop.send(());
+            tokio::task::spawn_blocking(move || thread.join().unwrap()).await.unwrap();
+        }
         if let Some(server) = self.server.take() {
             server.abort();
             let _ = server.await;
@@ -246,8 +286,278 @@ fn stop(mut child: Child) -> String {
     stderr
 }
 
+/// A failed assertion must also stop this test's provider process group.
+struct TestSeat(Option<Child>);
+impl std::ops::Deref for TestSeat {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        self.0.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for TestSeat {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.0.as_mut().unwrap()
+    }
+}
+impl TestSeat {
+    fn stop(mut self) -> String {
+        stop(self.0.take().unwrap())
+    }
+}
+impl Drop for TestSeat {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.take() {
+            let _ = stop(child);
+        }
+    }
+}
+
+fn declare_claude(daemon: &Daemon, seat: &str) {
+    let source = format!(
+        "version 2\nagent {:?} {{ workspace {:?}; harness \"claude\" {{ model \"example-model\"; }} }}\n",
+        seat.trim_start_matches("agent/"),
+        daemon.root.join("workspace"),
+    );
+    let intent = st3::parse_intent(&source, "restart-node").unwrap();
+    let preview = daemon
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source,
+                source_name: None,
+            },
+        )
+        .unwrap();
+    daemon
+        .store
+        .apply_as(
+            &intent,
+            &preview.subject_tokens,
+            "declare",
+            Some("person/operator"),
+        )
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quiet_idle_seat_reports_current_after_daemon_restart_without_seat_restart() {
+    use sha2::{Digest as _, Sha256};
+    use st_drivers::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let seat = "agent/grove/quiet-cedar";
+    let incarnation = "quiet-cedar:one";
+    let mut daemon = Daemon::new(root);
+    let mut command = seat_command(root, &daemon.socket);
+    declare_claude(&daemon, seat);
+    daemon.observe_running(seat, incarnation);
+    daemon.start_isolated().await;
+    // A healthy quiet Claude seat includes its initialized delivery channel. The provider
+    // emits no further hook events; the wrapper must keep the owned idle evidence current.
+    let provider = r#"
+import json, os, subprocess, sys, time
+channel = subprocess.Popen(
+    [sys.argv[1], 'driver', 'claude-mcp', '--subject', os.environ['ST_AGENT']],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+channel.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}) + '\n')
+channel.stdin.flush()
+assert json.loads(channel.stdout.readline())['id'] == 1
+channel.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) + '\n')
+channel.stdin.flush()
+time.sleep(300)
+"#;
+    let mut driver = TestSeat(Some(
+        command
+            .env("ST_AGENT", seat)
+            .env("ST3_MAILBOX_TRANSPORT", "push")
+            .args(["driver", "claude", "--subject", seat, "--", "python3", "-c", provider,
+                env!("CARGO_BIN_EXE_st3-fixture")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let original_pid = driver.id();
+    let agent_dir = root
+        .join("drivers")
+        .join(&hex::encode(Sha256::digest(seat.as_bytes()))[..24])
+        .join("observations");
+    let record = st_drivers::harness_state::harness_state_path(&agent_dir);
+    wait_until(
+        "the wrapper claims its harness record",
+        Duration::from_secs(10),
+        || {
+            st_drivers::harness_state::read(&record, None)
+                .is_some_and(|state| state.evidence_incarnation.is_some())
+        },
+    )
+    .await;
+    let owned = st_drivers::harness_state::read(&record, None).unwrap();
+    wait_until("the quiet seat's channel attaches", Duration::from_secs(10), || {
+        daemon.has_diagnostic(seat, incarnation, "claude-channel-attached")
+    })
+    .await;
+    // Stand in for this wrapper's Stop hook. The live wrapper must heartbeat that exact
+    // owned idle evidence; no subsequent provider event or test observation is supplied.
+    Writer::new(
+        &agent_dir,
+        "grove/quiet-cedar",
+        "claude",
+        Some("grove/quiet-cedar".into()),
+    )
+    .with_ownership(
+        owned.evidence_incarnation.unwrap(),
+        owned.ownership_sequence.unwrap(),
+    )
+    .observe(Observation::new(
+        Activity::Idle,
+        BlockedOn::None,
+        InputBuffer::Empty,
+    ))
+    .unwrap();
+    wait_until("the driver publishes idle", Duration::from_secs(10), || {
+        daemon
+            .harness_states(seat, incarnation)
+            .contains(&"idle".into())
+    })
+    .await;
+
+    let client = st3::client::Client::unix(&daemon.socket);
+    let before: Value = client.get("/v1/client/agents").await.unwrap();
+    let before = before["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == seat)
+        .unwrap();
+    assert_eq!(before["harness_state"], "idle", "{before}");
+    assert_eq!(before["observation"], "current", "{before}");
+    daemon.stop().await;
+    // Exceed the real client freshness horizon, not a test-only shortened timeout. Open a
+    // fresh Store too: the driver's spool and mailbox fence must survive real cache loss.
+    tokio::time::sleep(Duration::from_secs(95)).await;
+    assert_alive(&mut driver, "the quiet driver");
+    daemon.store = Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap());
+    daemon.start_isolated().await;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let recovered = loop {
+        let view: Value = client.get("/v1/client/agents").await.unwrap();
+        let row = view["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == seat)
+            .cloned()
+            .unwrap();
+        if (row["observation"] == "current" && row["harness_state"] == "idle")
+            || Instant::now() >= deadline
+        {
+            break row;
+        }
+        assert_alive(&mut driver, "the quiet driver after daemon restart");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(driver.id(), original_pid);
+    let terminal = driver.stop();
+    daemon.stop().await;
+    assert_eq!(recovered["observation"], "current", "{recovered}");
+    assert_eq!(recovered["harness_state"], "idle", "{recovered}");
+    assert!(
+        terminal.is_empty(),
+        "the driver wrote into the terminal: {terminal}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn title_failures_use_the_bound_pty_name_and_a_rate_limited_driver_log() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let seat = "agent/grove/title-cedar";
+    let mut daemon = Daemon::new(root);
+    let mut command = seat_command(root, &daemon.socket);
+    declare_claude(&daemon, seat);
+    daemon.observe_running(seat, "title-cedar:one");
+    daemon.start_with_binding(true).await;
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let pty = bin.join("pty");
+    std::fs::write(&pty, format!(
+        "#!{}\nprintf '%s\\n' \"$@\" >> \"$HOME/title-arguments\"\nprintf 'Session missing\\n' >&2\nexit 1\n",
+        env!("ST3_FIXTURE_BASH"),
+    )).unwrap();
+    std::fs::set_permissions(&pty, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let mut driver = TestSeat(Some(
+        command
+            .env("PATH", path)
+            .env("ST_AGENT", seat)
+            .env("PTY_SESSION", "cedar-pty-7f3a")
+            .env("ST3_MAILBOX_TRANSPORT", "push")
+            .args(["driver", "claude", "--subject", seat, "--", "sleep", "300"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let arguments = root.join("home/title-arguments");
+    wait_until("the first title update", Duration::from_secs(10), || {
+        arguments.exists()
+    })
+    .await;
+    for (index, label) in ["Cedar A", "Cedar B"].into_iter().enumerate() {
+        daemon
+            .store
+            .rename_agent(seat, Some(label), &format!("title-{index}"))
+            .unwrap();
+        daemon
+            .event_notify
+            .send_modify(|value| *value = value.wrapping_add(1));
+        wait_until(
+            "the changed title reaches the driver",
+            Duration::from_secs(5),
+            || {
+                std::fs::read_to_string(&arguments)
+                    .unwrap_or_default()
+                    .contains(label)
+            },
+        )
+        .await;
+    }
+    assert_alive(&mut driver, "the driver with a failed title update");
+    let terminal = driver.stop();
+    let calls = std::fs::read_to_string(arguments).unwrap();
+    for call in calls.lines().collect::<Vec<_>>().chunks_exact(3) {
+        assert_eq!(call[0], "rename");
+        assert_eq!(call[1], "cedar-pty-7f3a", "{calls}");
+    }
+    let log = driver_log(root);
+    assert_eq!(
+        log.matches("could not update seat title").count(),
+        1,
+        "{log}"
+    );
+    assert!(log.contains("Session missing"), "{log}");
+    assert!(log.contains(seat), "{log}");
+    assert!(
+        terminal.is_empty(),
+        "title failures reached the seat's terminal: {terminal}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/restart-claude";
@@ -373,6 +683,9 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/restart-omp";
@@ -464,6 +777,9 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_after_catchup() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/restart-todo";
@@ -570,6 +886,9 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribution() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use sha2::Digest as _;
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
@@ -636,6 +955,9 @@ async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_omp_ask_clears_without_poisoning_the_next_incarnation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/human-omp";
@@ -721,6 +1043,9 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
 
 #[test]
 fn a_cli_command_says_the_daemon_is_unreachable_and_never_to_start_it() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
@@ -746,6 +1071,9 @@ fn a_cli_command_says_the_daemon_is_unreachable_and_never_to_start_it() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cli_command_waits_out_a_daemon_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let mut daemon = Daemon::new(root);
@@ -778,6 +1106,9 @@ async fn a_cli_command_waits_out_a_daemon_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for driver in ["omp", "pi"] {
         for transport in ["poll", "push"] {
             let root = tempfile::tempdir().unwrap();
@@ -935,6 +1266,9 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delivered_unread_mail_stays_in_the_mailbox_after_seat_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for driver in ["omp", "pi"] {
         for transport in ["push", "poll"] {
             let root = tempfile::tempdir().unwrap();
@@ -1146,6 +1480,9 @@ impl ClaudeChannelFixture {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receipt_forms() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for mid_turn in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
@@ -1235,6 +1572,9 @@ async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receip
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_staged_mail_receipted_after_restart_is_not_injected_on_second_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let mut daemon = Daemon::new(root);
@@ -1303,6 +1643,9 @@ async fn claude_staged_mail_receipted_after_restart_is_not_injected_on_second_re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_preboot_mail_is_held_while_live_receipts_survive_outage() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let mut daemon = Daemon::new(root);
@@ -1384,6 +1727,9 @@ async fn claude_preboot_mail_is_held_while_live_receipts_survive_outage() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_delivered_unread_mail_from_an_old_ledger_is_held_in_a_fresh_session() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let mut daemon = Daemon::new(root);

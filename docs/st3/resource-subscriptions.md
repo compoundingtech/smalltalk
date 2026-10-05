@@ -25,10 +25,36 @@ latest state. The repository resource keeps only its own facts, such as `reposit
 | Data type | Facts on each item |
 |---|---|
 | `pull_requests` | `number`, `url`, `title`, `author`, `created_at`, `state`, `merged` once closed, `draft`, `head_sha`, `branch`, `base_branch`, `checks_state`, `checks` (each `name`, `status`, `conclusion`), `required_checks` (`state`, `source`, `checks`, `failed`), `review_decision`, `reviews` (each reviewer's latest `state` and `commit`), `merge_queue` (`state`, `position`) while queued, and `opened_by`/`opened_by_run` |
-| `issues` | `number`, `url`, `title`, `author`, `created_at`, `state`, `state_reason` |
+| `issues` | `number`, `url`, `title`, `author`, `created_at`, `state`, `state_reason`, and optional `opened_by`/`opened_by_run` |
 | `comments` | `comments` (the count), `last_comment` (`id`, `author`, `url`, `created_at`, `updated_at`, `body_digest`), and `recent_comments`: the newest 20 conversation comments and submitted reviews, oldest first, each `kind` (`comment` or `review`), `id`, `author`, `at`, and a review's `state` |
 | `reactions` | `reactions` (each reaction's count), and `last_comment.reactions` |
 | `mentions` | `mentions`: the newest mention of each GitHub login in the item's body or comments (`login`, `by`, `url`, `at`), up to 50 |
+
+`vcs.repository`, `vcs.issue`, and `vcs.pull-request` carry optional GitHub `node_id` facts.
+Subjects keep their existing OWNER/REPO/number names. A repository rename or transfer records
+`moved_to` on the old repository; a relocated item records it on the old item, pointing to the
+canonical `resource/github/OWNER/REPO/issue/NUMBER` or `pull-request/NUMBER` subject. Watches and
+post receipts retain their existing keys. The repository's numeric ID still guards against a
+locator being reused for a different repository.
+
+A merged pull request carries `merge_commit_sha`, `merged_at`, and `merged_by` (a GitHub login).
+Its `state_reason` is `merged`; an unmerged closed pull request has `closed`. An issue carries
+`closed_by` (a GitHub login) and GitHub's `state_reason`. Both can carry `closed_by_resource`, a
+subject reference to the pull request or commit that closed them. An open or reopened item clears
+its previous resolution facts; a speculative test merge is never recorded as a merge resolution.
+Missing facts in older observations remain valid.
+
+REST supplies identities and merge timestamps through the existing since/ETag listings. The
+cursor remembers original item numbers by node ID. The existing throttled GraphQL detail read
+also resolves these nodes, including their latest filtered `ClosedEvent`, to obtain closing
+actors, links, and transfers that disappeared from the old repository's listing. An issues-only
+observer with known identities shares the same detail gate and cache; it reads only identities
+unless another observer also requests open pull requests.
+Each detail page resolves at most 100 remembered identities, rotating across polls, so identity
+tracking does not add pages to the existing open-PR query. Quiet polls use the cached answer;
+settled identities are checked at most every fifteen minutes. Final closed identities leave the
+cursor's pending set after their resolution is read. An open transferred identity remains tracked
+so a watch on its original subject still sees it close.
 
 A comment body never enters the graph. `body_digest` tells one body from another, and `url` leads to
 the text. A subscription that selects `comments`, `reactions`, or `mentions` hears a change of that
@@ -62,7 +88,9 @@ item at the baseline. Only a change records an observation: an unchanged item re
 an observation that read only some facts, such as a new comment, keeps the others.
 
 Agents open pull requests with a shared GitHub identity, so the author login cannot say which agent
-opened one. When a pull request appears or moves to a new head, the observing host looks for the
+opened one. [Command-recorder receipts](command-recorder.md#creation-receipts) publish the exact
+agent and mission run for non-TTY `gh issue create` and `gh pr create` calls. When a pull request
+appears or moves to a new head without an opener, the observing host looks for the
 agent on that host whose workspace has the pull request's branch checked out. When exactly one
 agent has it, the listing records that agent as `opened_by` and its mission run as `opened_by_run`.
 A pull request keeps an opener once named, so a reviewer or fixer that later checks out the branch
@@ -74,8 +102,10 @@ the pull request resource: a publisher's partial snapshot such as `{state: merge
 mission routes its findings to that agent or run.
 
 An issue resource accepts the same optional `opened_by` and `opened_by_run` facts from its
-publisher, such as the seat that opened it. st does not infer an issue opener. Each attribution
-fact, once named, stays across later publisher writes and issue or repository observations.
+publisher. The command recorder supplies these from the creating seat's environment, without
+inferring an opener from the shared GitHub login. Each attribution fact, once named, stays across
+later publisher writes and issue or repository observations. Receipt resources initially have no
+observed state; their first GitHub observation still participates in new-issue and review delivery.
 
 The local file provider supports `status`, `path`, `content_hash`, `size`, `mode`, and `reason`. It never returns file content.
 

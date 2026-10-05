@@ -1,5 +1,6 @@
 //! Debug-only app carrier. The Swift module guards access in Release.
 mod bridge;
+mod diagnostics;
 mod wire;
 
 use anyhow::{Context, Result, bail};
@@ -32,6 +33,8 @@ struct Target {
     service: String,
     #[serde(default)]
     addr: Option<EndpointAddr>,
+    #[serde(default)]
+    mode: bridge::PathMode,
 }
 
 fn reply(operation: impl FnOnce() -> Result<Value>) -> *mut c_char {
@@ -91,12 +94,17 @@ pub unsafe extern "C" fn st_fabric_dial(
             .map_err(|_| anyhow::anyhow!("fabric bridge state unavailable"))?;
         runtime().block_on(async {
             if let Some(old) = current.take() { old.stop().await; }
-            let next = Bridge::start(key, addr, target.service).await?;
+            let next = Bridge::start_with_mode(key, addr, target.service, target.mode).await?;
             let description = json!({"url": next.url, "node": next.node, "fabricVersion": "0.2.30+8bd9017", "irohVersion": "1.0.2"});
             *current = Some(next);
             Ok(description)
         })
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn st_fabric_stats() -> *mut c_char {
+    reply(|| Ok(diagnostics::snapshot()))
 }
 
 #[unsafe(no_mangle)]

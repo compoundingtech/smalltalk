@@ -66,7 +66,6 @@ pub fn world() -> World {
         person: s("person/robin"),
         host: s("lark"),
         link: Link::Live,
-        mail_backlog: Load::Ready(st3_client::MailBacklog { count: 0, threshold_ms: 3_600_000, cleanup_command: String::new() }),
         diverged: Vec::new(),
         attention: Load::Ready(attention()),
         agents: Load::Ready(agents()),
@@ -93,6 +92,7 @@ pub fn world() -> World {
         quiet_missions: 6,
         usage: Load::Ready(usage()),
         usage_limits: usage_limits(),
+        agent_messages: None,
         clients: Load::Ready(vec![
             Connected {
                 client: s("stui 0.1.0+1ecae71"),
@@ -137,7 +137,6 @@ pub fn loading() -> World {
         person: s("person/robin"),
         host: s("lark"),
         link: Link::Connecting,
-        mail_backlog: Load::Loading,
         diverged: Vec::new(),
         attention: Load::Loading,
         agents: Load::Loading,
@@ -149,6 +148,7 @@ pub fn loading() -> World {
         quiet_missions: 0,
         usage: Load::Loading,
         usage_limits: Vec::new(),
+        agent_messages: None,
         clients: Load::Loading,
     }
 }
@@ -162,6 +162,7 @@ fn usage_limits() -> Vec<st3_client::UsageLimit> {
         st3_client::UsageLimit {
             account: s("anthropic"),
             account_ref: None,
+            identified: Some(true),
             driver: s("claude"),
             plan: Some(s("max")),
             five_hour_percent: Some(41.0),
@@ -176,6 +177,7 @@ fn usage_limits() -> Vec<st3_client::UsageLimit> {
         st3_client::UsageLimit {
             account: s("openai"),
             account_ref: None,
+            identified: Some(true),
             driver: s("codex"),
             plan: None,
             five_hour_percent: None,
@@ -211,6 +213,8 @@ fn usage() -> Vec<st3_client::UsageRow> {
         })),
         host: Some(s(host)),
         pricing: Some(s("list-2026-10-02")),
+        native_session_id: None,
+        pricing_provenance: None,
         total_tokens: tokens,
         input_tokens: tokens / 50,
         output_tokens: output,
@@ -300,6 +304,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Review {
                 question: s(
                     "The row counts agree and the contract check passed. Cut over to the new store?",
@@ -333,6 +338,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Feedback {
                 question: s(
                     "Here is the draft of the pricing page. What should change before it goes live?",
@@ -361,6 +367,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Launch {
                 planner: s("Planner"),
                 name: s("harbor/nightly-audit"),
@@ -423,6 +430,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Fault {
                 what: s(
                     "Release Captain exited 4 times in 10 minutes and st stopped restarting it.",
@@ -445,6 +453,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Revision {
                 reason: s(
                     "A key rotated mid-run last week and nobody noticed. An audit step would catch it.",
@@ -472,6 +481,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Message {
                 from: s("Chief of Staff"),
                 body: s(

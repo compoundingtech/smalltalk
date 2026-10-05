@@ -30,6 +30,7 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
         harness: Option<&'a str>,
         prompt: Option<&'a str>,
         update_prompt: bool,
+        provider_auth: Option<bool>,
         state: Option<&'a str>,
     }
     let mut runtime = None;
@@ -56,7 +57,11 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
                 let Some(state) = fields.get("state").and_then(Value::as_str) else {
                     continue;
                 };
-                statuses.entry(incarnation).or_default().harness = Some(state);
+                let status = statuses.entry(incarnation).or_default();
+                status.harness = Some(state);
+                if let Some(auth) = fields.get("provider_auth").and_then(Value::as_bool) {
+                    status.provider_auth = Some(auth);
+                }
             }
             "harness.diagnostic" if statuses.contains_key(incarnation) => {
                 let status = statuses.get_mut(incarnation).unwrap();
@@ -74,6 +79,8 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
         let status = statuses.get_mut(incarnation).unwrap();
         let next = if status.update_prompt {
             Some("blocked")
+        } else if status.provider_auth == Some(false) {
+            Some("unauthenticated")
         } else {
             status.prompt.or(status.harness)
         };
@@ -83,6 +90,7 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
             && fields.get("status_transition").and_then(Value::as_bool) == Some(false);
         let recorded = claim.kind == "harness.observed"
             && status.prompt.is_none()
+            && status.provider_auth != Some(false)
             && !status.update_prompt
             && fields.get("status_transition").and_then(Value::as_bool) == Some(true);
         if (reset || status.state != next || recorded) && !heartbeat {
@@ -161,8 +169,16 @@ pub(super) fn enrich_harness(
          AND json_extract(body,'$.fields.code') IN ('provider-auth-expired','provider-trust-prompt','provider-auth-restored','provider-update-prompt','provider-update-restored'))",
         params![subject, index, view.incarnation_id], |row| row.get(0),
     )?;
-    if has_prompt {
-        // Rare positive prompt fences can interrupt an otherwise unchanged harness state.
+    let unstamped_auth = claim.as_ref().is_some_and(|claim| {
+        claim
+            .body
+            .pointer("/fields/provider_auth")
+            .and_then(Value::as_bool)
+            .is_some()
+            && claim.body.pointer("/fields/observed_since_ms").is_none()
+    });
+    if has_prompt || view.state == "needs-login" || unstamped_auth {
+        // Rare positive prompt and credential fences can interrupt an otherwise unchanged harness state.
         // Replay transition sources only for this incarnation, excluding ordinary heartbeats.
         let query = format!("SELECT {CLAIM_COLUMNS} FROM claims INDEXED BY claims_incarnation_accepted_index
             JOIN batches ON batches.id=claims.batch_id
@@ -176,7 +192,12 @@ pub(super) fn enrich_harness(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let refs = claims.iter().collect::<Vec<_>>();
         if let Some(entry) = transitions(&refs).last()
-            && entry.1.as_deref() == Some(view.state.as_str())
+            && entry.1.as_deref()
+                == Some(if view.state == "needs-login" {
+                    "unauthenticated"
+                } else {
+                    view.state.as_str()
+                })
         {
             view.since_unix_ms = observation_time(&claims[entry.0]);
         }
@@ -651,6 +672,93 @@ mod tests {
     }
 
     #[test]
+    fn a_null_auth_successor_through_publication_keeps_the_login_episode() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms() - 1_000;
+        let publish = |auth: Value, sequence: u64, time: u128| {
+            store
+                .append_latest_observation(
+                    &input(
+                        "harness.observed",
+                        json!({
+                            "incarnation_id":"one", "driver":"claude", "state":"idle",
+                            "provider_auth":auth, "provider_auth_sequence":sequence,
+                            "ownership_sequence":1, "observed_at_ms":time as u64
+                        }),
+                    ),
+                    time,
+                )
+                .unwrap()
+                .0
+        };
+        publish(json!(false), 1, at);
+        let successor = publish(Value::Null, 1, at + 1);
+        assert!(local_observation_position(&successor).is_none());
+        let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(blocked.state, "needs-login");
+        assert_eq!(blocked.since_unix_ms, at);
+        let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
+        assert_eq!(
+            history["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["state"] == "unauthenticated")
+                .count(),
+            1
+        );
+        publish(json!(true), 2, at + 2);
+        let recovered = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(recovered.state, "idle");
+        assert_eq!(recovered.since_unix_ms, at + 2);
+    }
+
+    #[test]
+    fn native_login_since_survives_activity_until_successful_recovery() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let observed_at = std::cell::Cell::new(now_ms() as u64 - 1_000);
+        let native = |state: &str, auth: bool| {
+            observed_at.set(observed_at.get() + 1);
+            store
+                .append_claim(&input(
+                    "harness.observed",
+                    json!({
+                        "incarnation_id":"one", "state":state, "provider_auth":auth,
+                        "driver":"claude", "provider_auth_sequence": if auth { 2 } else { 1 },
+                        "observed_at_ms": observed_at.get()
+                    }),
+                ))
+                .unwrap()
+        };
+        let first = native("idle", false);
+        native("working", false);
+        native("idle", false);
+        let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(blocked.state, "needs-login");
+        assert_eq!(
+            blocked.since_unix_ms,
+            u128::from(first.body["fields"]["observed_at_ms"].as_u64().unwrap())
+        );
+        let restored = native("idle", true);
+        let idle = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(idle.state, "idle");
+        assert_eq!(
+            idle.since_unix_ms,
+            u128::from(restored.body["fields"]["observed_at_ms"].as_u64().unwrap())
+        );
+        let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
+        let states = history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["state"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["unauthenticated", "idle"]);
+    }
+
+    #[test]
     fn status_prompt_transitions_and_repeats_agree_with_current_since() {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
@@ -664,7 +772,7 @@ mod tests {
         let prompt = diagnostic("provider-auth-expired");
         diagnostic("provider-auth-expired");
         let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
-        assert_eq!(blocked.state, "unauthenticated");
+        assert_eq!(blocked.state, "needs-login");
         assert_eq!(blocked.since_unix_ms, prompt.accepted_at_unix_ms);
         let restored = diagnostic("provider-auth-restored");
         let idle = store.current_harness("agent/cedar").unwrap().unwrap();

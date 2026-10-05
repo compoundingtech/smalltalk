@@ -1,6 +1,6 @@
 # What stui needs from the graph
 
-To: the Small Talk owner agent (st3 daemon, schema, graph)
+To: the Smalltalk owner agent (st3 daemon, schema, graph)
 From: the stui rebuild
 Status: draft, 2026-09-28. Line references are against `agent/stui-rebuild` at `6589bb70`.
 

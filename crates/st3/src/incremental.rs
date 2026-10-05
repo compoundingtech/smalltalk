@@ -91,6 +91,11 @@ pub fn change_keys(change: &Change) -> Vec<String> {
         }
         _ => {}
     }
+    if matches!(change.kind.as_str(), "intent.desired" | "owned-set.revised")
+        && keys.iter().any(|key| key.starts_with("agent/"))
+    {
+        keys.push("desired-kind:agent".into());
+    }
     keys
 }
 
@@ -456,6 +461,31 @@ pub fn step_due(step: &crate::model::StepRunView, now: u128) -> Option<u128> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_collection_keys_ignore_message_declarations_and_cover_owned_set_members() {
+        assert!(
+            !super::change_keys(&change("message/m", "intent.desired", None, "{}"))
+                .contains(&"desired-kind:agent".to_owned())
+        );
+        assert!(
+            !super::change_keys(&change("agent/a", "harness.observed", None, "{}"))
+                .contains(&"desired-kind:agent".to_owned())
+        );
+        assert!(
+            super::change_keys(&change("agent/a", "intent.desired", None, "{}"))
+                .contains(&"desired-kind:agent".to_owned())
+        );
+        assert!(
+            super::change_keys(&change(
+                "owned-set/x",
+                "owned-set.revised",
+                None,
+                r#"{"fields":{"body":{"members":{"agent/a":{}}}}}"#
+            ))
+            .contains(&"desired-kind:agent".to_owned())
+        );
+    }
+
     use super::*;
 
     fn change(subject: &str, kind: &str, actor: Option<&str>, body: &str) -> Change {

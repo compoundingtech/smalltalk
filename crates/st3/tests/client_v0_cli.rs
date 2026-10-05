@@ -29,6 +29,242 @@ fn test_state(root: &Path) -> AppState {
     }
 }
 
+#[tokio::test]
+async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secrets() {
+    use ring::{
+        rand::SystemRandom,
+        signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair},
+    };
+    use st3_client::{Client, Fence, MessageSendParameters, PairingBegin, device::Profile};
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Stdio;
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    state
+        .store
+        .bind_fleet("3c9a1f2e-8b7d-4e6c-a5f4-1d2e3c4b5a69")
+        .unwrap();
+    state
+        .store
+        .set_node_key(Arc::new(
+            smallclaims::fleet::MemberKey::generate().unwrap().0,
+        ))
+        .unwrap();
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    for _ in 0..200 {
+        if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let local = Client::unix_as(&socket, "person/avery");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone());
+    let http_server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let config = root.path().join("config");
+    std::fs::create_dir_all(config.join("st3")).unwrap();
+    std::fs::set_permissions(config.join("st3"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(config.join("st3/config.toml"), "invalid local config [").unwrap();
+    let profile = root.path().join("device/profile.json");
+    let run = |args: Vec<String>, code: String| {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut command =
+                st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+            let mut child = command
+                .env("XDG_CONFIG_HOME", config)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            writeln!(child.stdin.take().unwrap(), "{code}").unwrap();
+            child.wait_with_output().unwrap()
+        })
+    };
+    for algorithm in ["ed25519", "p256"] {
+        for import in [false, true] {
+            let challenge = local
+                .pairing_begin(&PairingBegin {
+                    api_version: st3_client::API_VERSION.into(),
+                    device_name: "CLI device".into(),
+                    person_id: "person/avery".into(),
+                    full_control: Some(true),
+                    scopes: None,
+                })
+                .await
+                .unwrap()
+                .value;
+            let mut args = vec![
+                "--json".into(),
+                "devices".into(),
+                "complete".into(),
+                base.clone(),
+                challenge.pairing_id.clone(),
+                "--profile".into(),
+                profile.to_str().unwrap().into(),
+                "--algorithm".into(),
+                algorithm.into(),
+            ];
+            let key_file = root.path().join("import.der");
+            let key_bytes = if import {
+                let document = if algorithm == "ed25519" {
+                    Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap()
+                } else {
+                    EcdsaKeyPair::generate_pkcs8(
+                        &ECDSA_P256_SHA256_FIXED_SIGNING,
+                        &SystemRandom::new(),
+                    )
+                    .unwrap()
+                };
+                std::fs::write(&key_file, document.as_ref()).unwrap();
+                std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                args.extend(["--key-file".into(), key_file.to_str().unwrap().into()]);
+                Some(document.as_ref().to_vec())
+            } else {
+                None
+            };
+            let previous = std::fs::read(&profile).ok();
+            let mut blocked_args = args.clone();
+            blocked_args[3] = "http://203.0.113.1".into();
+            let blocked = run(blocked_args, challenge.code.clone()).await.unwrap();
+            assert!(!blocked.status.success());
+            assert!(String::from_utf8_lossy(&blocked.stderr).contains("--allow-public-http"));
+            assert_eq!(std::fs::read(&profile).ok(), previous);
+            if import {
+                args.push("--allow-public-http".into());
+            }
+            let refused = run(args.clone(), "wrong-code".into()).await.unwrap();
+            assert!(!refused.status.success());
+            assert!(
+                String::from_utf8_lossy(&refused.stderr)
+                    .contains("invalid, expired, or already used")
+            );
+            assert_eq!(std::fs::read(&profile).ok(), previous);
+            let output = run(args.clone(), challenge.code.clone()).await.unwrap();
+            let receipt = value(&output);
+            assert_eq!(receipt["kind"], "device-paired");
+            assert_eq!(receipt["person_id"], "person/avery");
+            assert_eq!(
+                std::fs::metadata(&profile).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let loaded = Profile::load(&profile).unwrap().unwrap();
+            assert_eq!(loaded.devices[0].allow_public_http, import);
+            assert!(String::from_utf8_lossy(&output.stderr).contains("must already be an encrypted path"));
+            assert_eq!(
+                receipt["signing_key"],
+                loaded.devices[0]
+                    .signing_key
+                    .as_ref()
+                    .unwrap()
+                    .public_key()
+                    .unwrap()
+            );
+            for stream in [&output.stdout, &output.stderr] {
+                assert!(
+                    !String::from_utf8_lossy(stream)
+                        .contains(&loaded.devices[0].session.credential)
+                );
+                assert!(!String::from_utf8_lossy(stream).contains("pkcs8"));
+            }
+            if let Some(bytes) = key_bytes {
+                assert_eq!(std::fs::read(&key_file).unwrap(), bytes);
+            }
+            let saved = std::fs::read(&profile).unwrap();
+            assert!(!run(args, challenge.code).await.unwrap().status.success());
+            assert_eq!(std::fs::read(&profile).unwrap(), saved);
+            let client = loaded.clients().unwrap().pop().unwrap();
+            let snapshot = client.capabilities().await.unwrap().snapshot.id;
+            let idem = format!("cli-device-proof-{algorithm}-{import}");
+            let result = client
+                .message_send(
+                    format!("action/{idem}"),
+                    idem,
+                    Fence {
+                        snapshot_id: snapshot,
+                        ..Fence::default()
+                    },
+                    MessageSendParameters {
+                        to: "agent/alder".into(),
+                        content: "CLI signature proof".into(),
+                        title: None,
+                        in_reply_to: None,
+                        session_id: None,
+                        tags: vec![],
+                        attachments: vec![],
+                        signature: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let subject = result
+                .value
+                .affected_ids
+                .iter()
+                .find(|id| id.starts_with("message/"))
+                .unwrap();
+            let claim = state
+                .store
+                .latest_claim(subject, Some("message.sent"))
+                .unwrap()
+                .unwrap();
+            state.store.replication_snapshot().unwrap();
+            assert_eq!(
+                state.store.claim_signature(&claim.id).unwrap().unwrap().key,
+                receipt["signing_key"]
+            );
+            assert_eq!(
+                state.store.claim_verdict(&claim.id).unwrap(),
+                smallclaims::principal::Verdict::Verified
+            );
+        }
+    }
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Display".into(),
+            person_id: "person/avery".into(),
+            full_control: None,
+            scopes: None,
+        })
+        .await
+        .unwrap()
+        .value;
+    let args = vec![
+        "devices".into(),
+        "complete".into(),
+        base.replace("127.0.0.1", "localhost"),
+        challenge.pairing_id,
+    ];
+    let output = run(args, challenge.code).await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The default profile works beside non-secret configuration without chmod-ing its directory.
+    let default_profile = config.join("st3/stui-devices.json");
+    let loaded = Profile::load(&default_profile).unwrap().unwrap();
+    assert_eq!(std::fs::metadata(&default_profile).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(config.join("st3")).unwrap().permissions().mode() & 0o777, 0o755);
+    assert!(loaded.devices[0].signing_key.is_none());
+    assert!(!loaded.devices[0].allow_public_http);
+    assert!(loaded.devices[0].session.device_key_chain.is_empty());
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(&loaded.devices[0].session.credential)
+    );
+    local_server.abort();
+    http_server.abort();
+}
+
 async fn run_cli(socket: &Path, args: &[&str]) -> Output {
     run_cli_mode(socket, true, args).await
 }
@@ -178,6 +414,152 @@ async fn agent_workspace_cli_and_client_read_the_same_declaration_even_after_ret
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_cli_and_client_keep_pricing_provenance_and_native_session_binding() {
+    use serde_json::json;
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let subject = "agent/example.usage";
+    let append = |kind: &str, fields: Value| {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap()
+    };
+    append(
+        "harness.observed",
+        json!({"state":"working","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    let respond = |entry: &str| {
+        let observation = append(
+            "harness.timeline",
+            json!({
+                "operation":"append","entry_id":entry,"revision":1,"role":"system",
+                "entry_type":"usage","final":true,"driver":"codex",
+                "incarnation_id":"inc-one","sequence":1,
+                "body":{"semantics":"response","model":"gpt-6.1-sol",
+                    "input_tokens":1000,"output_tokens":100,"total_tokens":1100}
+            }),
+        );
+        let rollup = store
+            .usage_rollup_for_timeline(&observation)
+            .unwrap()
+            .unwrap();
+        store.append_client_claim(&rollup).unwrap();
+    };
+    respond("first-response");
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        1
+    );
+    // A single response already published has no pending token change. Its late native
+    // binding must still be captured at stop, without publishing at binding time.
+    append(
+        "harness.session-file",
+        json!({"harness":"codex","session_id":"native-example",
+        "incarnation_id":"inc-one"}),
+    );
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        1
+    );
+    append(
+        "harness.observed",
+        json!({"state":"idle","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        2
+    );
+    append(
+        "harness.observed",
+        json!({"state":"working","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    respond("second-response");
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        2,
+        "second response stays pending within five minutes"
+    );
+    append(
+        "harness.observed",
+        json!({"state":"idle","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        3
+    );
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(state))
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let cli = value(&run_cli(&socket, &["usage"]).await);
+    let row = &cli["rows"][0];
+    assert_eq!(row["native_session_id"], "native-example");
+    assert_eq!(row["total_tokens"], 2200);
+    assert_eq!(
+        row["pricing_provenance"][0]["price_table_id"],
+        st3::pricing::PRICE_TABLE_ID
+    );
+    assert_eq!(
+        row["pricing_provenance"][0]["price_table_version"],
+        st3::pricing::price_table_version()
+    );
+    assert_eq!(row["pricing_provenance"][0]["cost_source"], "computed");
+    assert_eq!(
+        row["pricing_provenance"][0]["rates_usd_per_million_tokens"]["input"],
+        2.0
+    );
+    let client = st3_client::Client::unix_as(&socket, "person/avery");
+    let report = client.usage_period(None, None).await.unwrap();
+    let typed = &report.value.rows[0];
+    assert_eq!(typed.native_session_id.as_deref(), Some("native-example"));
+    let provenance = &typed.pricing_provenance.as_ref().unwrap()[0];
+    assert_eq!(provenance.total_tokens, 2200);
+    assert_eq!(provenance.cost_microusd, 6000);
+    assert_eq!(
+        provenance
+            .rates_usd_per_million_tokens
+            .as_ref()
+            .unwrap()
+            .output,
+        10.0
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_policy() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
@@ -237,6 +619,115 @@ async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_p
         )
         .unwrap();
     assert_eq!(outcome.stopped, [fresh, stale]);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_hides_legacy_unknowns_preserves_account_identity_and_stops_at_95_percent() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"worker\" { workspace \"/tmp\"; command \"true\"; }\nagent \"unknown\" { workspace \"/tmp\"; command \"true\"; }",
+        store.origin(),
+    ).unwrap();
+    store.apply_internal(&intent, "usage-identities").unwrap();
+    let worker = "agent/client-v0-cli.worker";
+    let unknown = "agent/client-v0-cli.unknown";
+    let now = st_drivers::message::now_ms();
+    let append = |seat: &str, driver: &str, account: Option<&str>, weekly: f64, at: u64| {
+        let mut fields = serde_json::json!({
+            "driver": driver, "incarnation_id": "example-inc", "weekly_percent": weekly,
+            "weekly_resets_at_unix_ms": now + 3_600_000, "measured_at_unix_ms": at,
+        });
+        if let Some(account) = account {
+            fields["account"] = serde_json::json!(account);
+        }
+        store
+            .append_claim(&ClaimInput {
+                subject: seat.into(),
+                kind: "harness.limits".into(),
+                actor: Some(seat.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    };
+    // Both drivers have old identity-less evidence. Neither observation can be attributed
+    // to any of the real accounts, and an exhausted off-seat account must stay visible.
+    let legacy_at = now - 3 * 86_400_000;
+    append(worker, "claude", None, 100.0, legacy_at);
+    append(worker, "claude", Some("claude/exhausted"), 100.0, now);
+    append(worker, "claude", Some("claude/current"), 95.0, now);
+    append("agent/example/old", "codex", None, 100.0, legacy_at);
+    append("agent/example/old", "codex", Some("codex/one"), 25.0, now);
+    append("agent/example/other", "codex", Some("codex/two"), 15.0, now);
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(state))
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let client = st3_client::Client::unix_as(&socket, "person/avery");
+    let cli = value(&run_cli(&socket, &["usage"]).await);
+    assert_eq!(cli["limits"].as_array().unwrap().len(), 4);
+    assert!(
+        cli["limits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|limit| limit["identified"] == true)
+    );
+    let report = client
+        .usage_period(Some(now - 1000), Some(now + 1000))
+        .await
+        .unwrap();
+    assert_eq!(report.value.limits.len(), 4);
+    let exhausted = report
+        .value
+        .limits
+        .iter()
+        .find(|limit| limit.account == "claude/exhausted")
+        .unwrap();
+    assert_eq!(exhausted.weekly_percent, Some(100.0));
+    assert!(exhausted.seats.is_empty());
+    // Identity-less quota from an active seat remains unknown, independently of freshness.
+    append(unknown, "claude", None, 20.0, legacy_at);
+    let report = client.usage_period(None, None).await.unwrap();
+    assert_eq!(report.value.limits.len(), 5);
+    let limit = report
+        .value
+        .limits
+        .iter()
+        .find(|limit| limit.identified == Some(false))
+        .unwrap();
+    assert_eq!(limit.account, "claude/unknown");
+    assert_eq!(limit.seats, [unknown]);
+    assert_eq!(limit.measured_at_unix_ms, legacy_at);
+    let cli = value(&run_cli(&socket, &["usage"]).await);
+    assert_eq!(cli["limits"].as_array().unwrap().len(), 5);
+    // The same shared selection drives the policy, including an exact 95% boundary.
+    let outcome = store
+        .enforce_account_limits(
+            &st3::store::LimitsPolicy {
+                stop_at_weekly_percent: 95,
+                keep: Default::default(),
+                notify: "agent/example/operations".into(),
+                fresh_ms: 3_600_000,
+            },
+            u128::from(now),
+        )
+        .unwrap();
+    assert_eq!(outcome.stopped, [worker]);
     server.abort();
 }
 
@@ -1112,6 +1603,35 @@ async fn cli_person_ask_is_completed_by_its_assigned_person() {
     let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
     assert_eq!(listed["value"]["items"][0]["source_id"], subject);
     assert_eq!(listed["value"]["items"][0]["attention_kind"], "person-step");
+    let attention_id = listed["value"]["items"][0]["id"].as_str().unwrap();
+    let printed = run_cli_human(&socket, &["attention", "ls", "--as", "person/avery"]).await;
+    assert!(printed.status.success(), "{printed:?}");
+    assert!(String::from_utf8_lossy(&printed.stdout).contains(attention_id));
+    let canonical = value(
+        &run_cli(
+            &socket,
+            &["attention", "show", subject, "--as", "person/avery"],
+        )
+        .await,
+    );
+    let aliased = value(
+        &run_cli(
+            &socket,
+            &["attention", "show", attention_id, "--as", "person/avery"],
+        )
+        .await,
+    );
+    assert_eq!(aliased, canonical);
+    assert_eq!(aliased["subject"], subject);
+    for target in [attention_id, subject] {
+        let refused = run_cli(
+            &socket,
+            &["attention", "show", target, "--as", "person/robin"],
+        )
+        .await;
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("not currently actionable"));
+    }
     let wrong = run_cli(
         &socket,
         &[
@@ -1139,6 +1659,15 @@ async fn cli_person_ask_is_completed_by_its_assigned_person() {
     ];
     assert_eq!(value(&run_cli(&socket, &done).await)["status"], "completed");
     assert_eq!(value(&run_cli(&socket, &done).await)["status"], "completed");
+    for target in [attention_id, subject] {
+        let refused = run_cli(
+            &socket,
+            &["attention", "show", target, "--as", "person/avery"],
+        )
+        .await;
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("not currently actionable"));
+    }
     let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
     assert!(listed["value"]["items"].as_array().unwrap().is_empty());
     assert!(
@@ -1277,6 +1806,15 @@ async fn cli_structured_choice_returns_the_selected_option_as_data() {
 /// poster, only for the person's own work, and opening it reads it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_update_reaches_home_only_for_asked_work_and_opening_reads_it() {
+    assert_update_opening_reads(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_update_public_attention_id_reads_only_when_the_person_opens_it() {
+    assert_update_opening_reads(true).await;
+}
+
+async fn assert_update_opening_reads(public_id: bool) {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = test_state(root.path());
@@ -1362,9 +1900,35 @@ mission "release-report" state="ready" {
         serde_json::json!({"id": "read"})
     );
 
+    let attention_id = item["id"].as_str().unwrap();
+    // Merely resolving the public card cannot read the update for the person.
+    let client = st3_client::Client::unix_as(&socket, "person/avery");
+    client.attention_get(attention_id).await.unwrap();
+    for target in [attention_id, subject.as_str()] {
+        let inspected = value(
+            &run_cli_with_agent_env(
+                &socket,
+                &actor,
+                &["attention", "show", target, "--as", "person/avery"],
+            )
+            .await,
+        );
+        assert_eq!(inspected["subject"], subject);
+        assert_eq!(inspected["request"]["type"], "update");
+    }
+    let still_open = client.attention_list(None, None, false).await.unwrap();
+    assert_eq!(still_open.value.items.len(), 1);
+    assert_eq!(store.step_run(&subject).unwrap().unwrap().status, "ready");
+
     let opened = run_cli_human(
         &socket,
-        &["attention", "show", &subject, "--as", "person/avery"],
+        &[
+            "attention",
+            "show",
+            if public_id { attention_id } else { &subject },
+            "--as",
+            "person/avery",
+        ],
     )
     .await;
     assert!(opened.status.success(), "{opened:?}");
@@ -1380,6 +1944,15 @@ mission "release-report" state="ready" {
     );
     let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
     assert_eq!(listed["value"]["items"], serde_json::json!([]));
+    for target in [attention_id, subject.as_str()] {
+        let refused = run_cli(
+            &socket,
+            &["attention", "show", target, "--as", "person/avery"],
+        )
+        .await;
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("not currently actionable"));
+    }
     let shown = value(&run_cli(&socket, &["work", "show", &subject]).await);
     assert_eq!(
         shown["value"]["person_answers"][0]["answer"],

@@ -442,7 +442,8 @@ pub struct ReplicationPeerStatus {
     /// Comparable shared tables that differ at the last inventory-aligned comparison.
     #[serde(default)]
     pub differing_tables: Vec<String>,
-    /// Different registries or locally waiting claims make projection comparisons premature.
+    /// Pending projection, unsealed claims, different registries, or an older advertised
+    /// inventory make the projection comparison premature.
     #[serde(default)]
     pub projection_comparison_waiting: bool,
     /// How far apart the two envelope sets were at the last exchange that measured them.
@@ -473,6 +474,8 @@ pub struct ReplicationPeerSync {
     /// How fast `peer_only_envelopes` shrinks, net of the envelopes the peer keeps writing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catch_up_rate_per_second: Option<f64>,
+    /// Forecast in exact JSON-safe integer seconds; absent when no positive rate or
+    /// representable forecast exists. Missing a forecast does not mean the peer is caught up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_catch_up_seconds: Option<u64>,
     /// The peer recently held more envelopes than one exchange carries, so this node's views

@@ -78,6 +78,8 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const [findOpen, setFinding] = useState(!!route.params.find);
   const [draft, setDraft] = useState(() => draftCache.current.get(target) ?? '');
   const [away, setAway] = useState(false);
+  // Scrolled a little way up from the newest entry: new entries must then not move what is read.
+  const [reading, setReading] = useState(false);
   // Dictation: listening, what is heard so far, the microphone's recent levels for a waveform,
   // and whether the draft came from dictation (it is sent tagged so, as it may hold mistakes).
   const [listening, setListening] = useState(false), [heard, setHeard] = useState(''), [levels, setLevels] = useState<number[]>([]);
@@ -301,11 +303,15 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
         // A long press opens the entry's text to select any part of it; iOS text selects only whole.
         : <Pressable onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} brief={simpleOn && !finding} /></Pressable>}
       ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (issue ? `Not loaded yet: ${issue}. Trying again.` : status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
-      maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 60 }}
+      // Scrolled up, a new entry must not move what is being read, so the position is kept. At
+      // the newest it must not be: the position-keeping scrolls to a new entry with an animation,
+      // which slid the whole conversation after each send and each reply (Nathan, 2026-10-05).
+      // An inverted list anchored at its newest end simply grows there, without moving.
+      maintainVisibleContentPosition={reading ? { minIndexForVisible: 0 } : undefined}
       keyboardDismissMode="interactive"
       // A tap on the conversation puts the keyboard away, as in Messages; the next tap acts.
       keyboardShouldPersistTaps="never"
-      onScroll={event => { offset.current = event.nativeEvent.contentOffset.y; setAway(offset.current > 240); }}
+      onScroll={event => { offset.current = event.nativeEvent.contentOffset.y; setAway(offset.current > 240); setReading(offset.current > 60); }}
       onScrollBeginDrag={() => { dragged.current = true; }}
       // Inverted: the end is the oldest entry. Reaching it reads the page before.
       onEndReached={loadOlder}
@@ -479,7 +485,7 @@ const MailView = memo(function MailView({ entry, body, open, onToggle, brief = f
   }
   return <Pressable disabled={!long} accessibilityRole={long ? 'button' : undefined} accessibilityState={long ? { expanded: open } : undefined} onPress={() => onToggle(entry.id)}
     style={[styles.entry, styles.barred, { borderLeftColor: c(look.edge) }, toYou ? { backgroundColor: c(rule.to_you_fill) } : null]}>
-    <T><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={look.from_bold} color={look.from_bold ? undefined : c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.dictated ? <T dim>  🎙</T> : null}{mark ? <T color={c(mark.color)}>  {mark.text}</T> : null}</T>
+    <T>{toYou ? <T color={c(look.edge)}>● </T> : null}<T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={look.from_bold} color={look.from_bold ? undefined : c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.dictated ? <T dim>  🎙</T> : null}{mark ? <T color={c(mark.color)}>  {mark.text}</T> : null}</T>
     <View style={long && !open ? { maxHeight: limit, overflow: 'hidden' } : null}>
       {/* Measured at its full height and never shrunk by the fold: a measurement the fold could
           change would fold and unfold the mail in a loop. */}
