@@ -1699,6 +1699,9 @@ enum MissionViewCommand {
 struct MissionShowArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionOrRun)))]
     mission_or_run: String,
+    /// Maximum runs shown from the root tree (1 through 200).
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
     #[arg(long)]
     follow: bool,
 }
@@ -6150,6 +6153,10 @@ async fn run_mission_view(
             )
         }
         MissionViewCommand::Show(args) => {
+            anyhow::ensure!(
+                (1..=200).contains(&args.limit),
+                "--limit must be 1 through 200"
+            );
             let mut selected = args.mission_or_run;
             if !selected.starts_with("mission-run/") {
                 let overview: Value = client
@@ -6181,17 +6188,23 @@ async fn run_mission_view(
                 ))
                 .await?;
             if args.follow {
-                return follow_mission_run(client, run, 0, json_output).await;
+                return follow_mission_run(client, run, 0, args.limit, json_output).await;
             }
             if json_output {
                 return print_value(&run, true);
             }
-            let runs = load_mission_run_tree(client, &run).await?;
+            let (runs, has_more) = load_mission_run_tree(client, &run, args.limit).await?;
             let now = current_unix_ms()?;
             print!(
                 "{}",
                 render_mission_run(&run, &runs, OutputStyle::stdout(), now)
             );
+            if has_more {
+                println!(
+                    "Tree truncated at {} runs; use --limit to show up to 200.",
+                    args.limit
+                );
+            }
             // A daemon without lanes answers 404; the run itself is still shown.
             if let Ok(lanes) = client
                 .get::<Vec<st3::model::LaneView>>(&format!(
@@ -6667,7 +6680,7 @@ async fn start_mission_run(
     if !json_output {
         print!("{}", cli_help::mission_next_steps(&started));
     }
-    follow_mission_run(client, started, response.store_index, json_output).await
+    follow_mission_run(client, started, response.store_index, 20, json_output).await
 }
 
 /// How long `missions start` waits for a mission published on another host to arrive here.
@@ -6806,6 +6819,7 @@ async fn follow_mission_run(
     client: &Client,
     mut run: MissionRunView,
     _cursor: u64,
+    limit: usize,
     json_output: bool,
 ) -> Result<()> {
     let mut prior = String::new();
@@ -6817,10 +6831,15 @@ async fn follow_mission_run(
     };
     let style = OutputStyle::stdout();
     loop {
-        let runs = load_mission_run_tree(client, &run).await?;
+        let (runs, has_more) = load_mission_run_tree(client, &run, limit).await?;
         let summary = mission_run_signature(&runs)?;
         if summary != prior && !json_output {
-            let frame = render_mission_run(&run, &runs, style, current_unix_ms()?);
+            let mut frame = render_mission_run(&run, &runs, style, current_unix_ms()?);
+            if has_more {
+                frame.push_str(&format!(
+                    "Tree truncated at {limit} runs; use --limit to show up to 200.\n"
+                ));
+            }
             print!(
                 "{}",
                 follow_snapshot(&frame, interactive, !prior.is_empty())
@@ -6854,19 +6873,25 @@ async fn follow_mission_run(
 async fn load_mission_run_tree(
     client: &Client,
     selected: &MissionRunView,
-) -> Result<Vec<MissionRunView>> {
-    let runs: Vec<MissionRunView> = client
+    limit: usize,
+) -> Result<(Vec<MissionRunView>, bool)> {
+    #[derive(serde::Deserialize)]
+    struct Page {
+        runs: Vec<MissionRunView>,
+        has_more: bool,
+    }
+    let page: Page = client
         .get(&format!(
-            "/v1/mission-runs?root={}",
-            urlencoding::encode(&selected.root_mission_run)
+            "/v1/mission-runs/tree?run={}&limit={limit}",
+            urlencoding::encode(&selected.subject)
         ))
         .await?;
     anyhow::ensure!(
-        runs.iter().any(|run| run.subject == selected.subject),
+        page.runs.iter().any(|run| run.subject == selected.subject),
         "mission run `{}` is absent from its root graph",
         selected.subject
     );
-    Ok(runs)
+    Ok((page.runs, page.has_more))
 }
 
 fn mission_run_follow_succeeded(status: &str) -> bool {
@@ -7701,6 +7726,11 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
     if !args.follow {
         return Ok(());
     }
+    #[derive(serde::Deserialize)]
+    struct EventPage {
+        items: Vec<EventRecord>,
+        next_after: Option<u64>,
+    }
     loop {
         let mut event_query = vec![format!("after={cursor}")];
         if let Some(subject) = &args.subject {
@@ -7709,10 +7739,10 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
         if let Some(owner_run) = &args.owner_run {
             event_query.push(format!("owner_run={}", urlencoding::encode(owner_run)));
         }
-        let events: Vec<EventRecord> = client
-            .get(&format!("/v1/events?{}", event_query.join("&")))
+        let page: EventPage = client
+            .get(&format!("/v1/events/page?{}", event_query.join("&")))
             .await?;
-        for event in events {
+        for event in page.items {
             cursor = cursor.max(event.store_index);
             if json_output {
                 println!("{}", serde_json::to_string(&event)?);
@@ -7737,6 +7767,11 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
                     );
                 }
             }
+        }
+        if let Some(next_after) = page.next_after {
+            cursor = cursor.max(next_after);
+        } else {
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 }
@@ -15286,24 +15321,13 @@ async fn run_message(
             }
         }
         MessageCommand::Thread(args) => {
-            let selected = read_message(client, &args.reference).await?;
-            // Page through the whole history once; the daemon reads every message for each pass.
-            let mut messages = Vec::new();
-            for_each_message(client, None, true, |message| {
-                messages.push(message);
-                Ok(())
-            })
-            .await?;
-            let links = messages
-                .iter()
-                .map(|message| (message.subject.clone(), message.in_reply_to.clone()))
-                .collect::<BTreeMap<_, _>>();
-            let root = thread_root_from_links(&selected.subject, &links);
-            let mut thread = messages
-                .into_iter()
-                .filter(|message| thread_root_from_links(&message.subject, &links) == root)
-                .collect::<Vec<_>>();
-            thread.sort_by_key(|message| message.created_index);
+            let reference = normalize_message_reference(&args.reference);
+            let thread: Vec<MessageView> = client
+                .get(&format!(
+                    "/v1/messages/thread/{}",
+                    urlencoding::encode(&reference)
+                ))
+                .await?;
             print_value(&thread, json_output)
         }
         MessageCommand::Search {
@@ -15916,26 +15940,6 @@ async fn sync_message_projection(client: &Client) -> Result<()> {
     let mut export = st3::projection::MessageExport::new(Path::new(&root))?;
     for_each_message(client, None, true, |message| export.write(&message)).await?;
     export.finish()
-}
-
-fn thread_root_from_links(subject: &str, links: &BTreeMap<String, Option<String>>) -> String {
-    let mut current = subject.to_owned();
-    let mut seen = BTreeSet::new();
-    while let Some(parent) = links.get(&current).and_then(Option::as_deref) {
-        if !seen.insert(current.clone()) {
-            break;
-        }
-        let normalized = if parent.starts_with("message/") {
-            parent.to_owned()
-        } else {
-            format!("message/{parent}")
-        };
-        if !links.contains_key(&normalized) {
-            break;
-        }
-        current = normalized;
-    }
-    current
 }
 
 struct TerminalScreen;

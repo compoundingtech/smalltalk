@@ -552,6 +552,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(withdraw_attention),
         )
         .route("/v1/messages", get(list_messages).post(send_message))
+        .route("/v1/messages/thread/{*subject}", get(read_message_thread))
         .route("/v1/messages/page", get(list_messages_page))
         .route("/v1/messages/cleanup", post(mail_backlog::cleanup))
         .route("/v1/mailbox", get(mailbox::subscribe))
@@ -565,6 +566,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages/by-key", get(message_by_key))
         .route("/v1/status", get(status))
         .route("/v1/desired/{*subject}", get(get_desired))
+        .route("/v1/events/page", get(events_page))
         .route("/v1/events", get(events))
         .route("/v1/doctor", get(doctor))
         .route("/v1/repair", get(operational_repair_plan))
@@ -639,6 +641,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
+        .route("/v1/mission-runs/tree", get(mission_run_tree_page))
         .route("/v1/mission-runs", get(list_mission_runs))
         .route("/v1/mission-overview", get(mission_overview))
         .route("/v1/outcome-history", get(outcome_history))
@@ -11063,6 +11066,32 @@ async fn read_message(
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))
 }
+async fn read_message_thread(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+) -> Result<Json<Vec<MessageView>>, ApiError> {
+    let subject = if subject.starts_with("message/") {
+        subject
+    } else {
+        format!("message/{subject}")
+    };
+    let store = state.store.clone();
+    let thread = blocking_action(move || {
+        store
+            .read_snapshot(|_| store.message_thread(&subject).map_err(anyhow::Error::new))
+            .map_err(|error| {
+                error
+                    .downcast::<St3Error>()
+                    .unwrap_or_else(|error| St3Error::new("internal", error.to_string()))
+            })
+    })
+    .await?;
+    if thread.is_empty() {
+        return Err(ApiError::not_found("message thread does not exist"));
+    }
+    Ok(Json(thread))
+}
+
 
 async fn post_message_claim(
     State(state): State<AppState>,
@@ -11221,19 +11250,66 @@ struct EventQuery {
     owner_run: Option<String>,
     wait: Option<bool>,
     timeout_ms: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct EventPage {
+    items: Vec<EventRecord>,
+    next_after: Option<u64>,
+}
+
+async fn events_page(
+    State(state): State<AppState>,
+    Query(query): Query<EventQuery>,
+) -> Result<Json<EventPage>, ApiError> {
+    let limit = query.limit.unwrap_or(200);
+    if !(1..=200).contains(&limit) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-event-limit",
+            "event page limit must be 1 through 200",
+        )));
+    }
+    let store = state.store.clone();
+    let (items, next_after) = blocking_store(move || {
+        store.read_snapshot(|_| {
+            store.events_page(
+                query.after,
+                query.subject.as_deref(),
+                query.owner_run.as_deref(),
+                limit,
+            )
+        })
+    })
+    .await?;
+    Ok(Json(EventPage { items, next_after }))
 }
 
 async fn events(
     State(state): State<AppState>,
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<EventRecord>>, ApiError> {
+    if query.owner_run.is_some() {
+        return Err(ApiError::bad(St3Error::new(
+            "event-page-required",
+            "owner-filtered events use /v1/events/page",
+        )));
+    }
+    let limit = query.limit.unwrap_or(200);
+    if !(1..=200).contains(&limit) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-event-limit",
+            "event limit must be 1 through 200",
+        )));
+    }
     let read = |state: &AppState| {
         let store = state.store.clone();
         let subject = query.subject.clone();
-        let owner_run = query.owner_run.clone();
         async move {
             blocking_store(move || {
-                store.events_after_filtered(query.after, subject.as_deref(), owner_run.as_deref())
+                store
+                    .events_page(query.after, subject.as_deref(), None, limit)
+                    .map(|(items, _)| items)
             })
             .await
         }
@@ -11688,6 +11764,44 @@ async fn list_mission_runs(
         ))),
     }
 }
+#[derive(Deserialize)]
+struct MissionRunTreeQuery {
+    run: String,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct MissionRunTreePage {
+    runs: Vec<MissionRunView>,
+    has_more: bool,
+}
+
+async fn mission_run_tree_page(
+    State(state): State<AppState>,
+    Query(query): Query<MissionRunTreeQuery>,
+) -> Result<Json<MissionRunTreePage>, ApiError> {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=200).contains(&limit) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-mission-tree-limit",
+            "mission tree limit must be 1 through 200",
+        )));
+    }
+    let store = state.store.clone();
+    let (runs, has_more) = blocking_store(move || {
+        store.read_snapshot(|_| {
+            let (mut runs, has_more) = store.mission_run_tree_page(&query.run, limit)?;
+            annotate_stuck_gates(&store, &mut runs)?;
+            Ok((runs, has_more))
+        })
+    })
+    .await?;
+    if runs.is_empty() {
+        return Err(ApiError::not_found("mission run does not exist"));
+    }
+    Ok(Json(MissionRunTreePage { runs, has_more }))
+}
+
 
 fn annotate_stuck_gates(store: &Store, runs: &mut [MissionRunView]) -> anyhow::Result<()> {
     let active = runs
@@ -16056,6 +16170,101 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         assert_eq!(body["status"], "verifying");
     }
 
+    #[tokio::test]
+    async fn historical_claim_receipt_does_not_replace_current_http_work_views() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let kdl = r#"version 2
+mission "receipt-fixture" state="ready" {
+  goal "Compare a receipt with current work."
+  step "build" { assigned-to "agent/builder" }
+}"#;
+        let intent = parse_intent(kdl, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "receipt-fixture")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "receipt-fixture".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "receipt-run".into(),
+            })
+            .unwrap();
+        let subject = &run.steps[0].subject;
+        state.store.set_step_state(subject, "ready", None).unwrap();
+        let mut old_receipt = state.store.step_run(subject).unwrap().unwrap();
+        old_receipt.status = "claimed".into();
+        old_receipt.claimant = Some("agent/builder".into());
+        old_receipt.claim_incarnation = Some("old-incarnation".into());
+        state
+            .store
+            .cache_idempotency_response("old-receipt", &old_receipt)
+            .unwrap();
+
+        let app = router(state);
+        let (status, receipt) = json_request(
+            app.clone(),
+            &format!("/v1/work/claim/{subject}"),
+            serde_json::to_value(WorkRequest {
+                actor: Some("agent/builder".into()),
+                incarnation: Some("old-incarnation".into()),
+                summary: None,
+                reason: None,
+                evidence: Vec::new(),
+                idempotency_key: "old-receipt".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["status"], "claimed");
+        assert_eq!(receipt["generation"], old_receipt.generation);
+        assert_eq!(receipt["claim_incarnation"], "old-incarnation");
+
+        let get_envelope = |app: Router, path: String| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        };
+        let direct = get_envelope(app.clone(), format!("/v1/work-items/{subject}")).await;
+        let client = get_envelope(app, format!("/v1/client/work/{subject}")).await;
+        assert_eq!(direct["store_index"], client["snapshot"]["store_index"]);
+        assert_eq!(direct["value"]["status"], "ready");
+        assert_eq!(client["value"]["state"], "ready");
+        assert_eq!(direct["value"]["generation"], client["value"]["generation_id"]);
+        assert_eq!(direct["value"]["readiness_epoch"], old_receipt.readiness_epoch);
+        assert_eq!(client["value"]["readiness_epoch"], old_receipt.readiness_epoch);
+        assert_eq!(direct["value"]["claimant"], Value::Null);
+        assert_eq!(client["value"]["claimant"], Value::Null);
+        assert_eq!(direct["value"]["claim_incarnation"], Value::Null);
+        assert_eq!(client["value"]["claim_incarnation"], Value::Null);
+    }
+
     async fn get_request(app: Router, path: &str) -> (StatusCode, Value) {
         let response = app
             .oneshot(
@@ -16288,6 +16497,7 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
                     owner_run: None,
                     wait: Some(true),
                     timeout_ms: None,
+                    limit: None,
                 }),
             )
             .await
@@ -19068,6 +19278,173 @@ version 2
         .await;
         assert_eq!(original["status"], "sent");
     }
+    #[tokio::test]
+    async fn message_thread_reads_only_the_indexed_conversation() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let send = |key: &str, parent: Option<String>| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.into(),
+                from: "agent/garden-writer".into(),
+                to: "agent/garden-reader".into(),
+                content: key.into(),
+                title: None,
+                in_reply_to: parent,
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+        };
+        let (_, first) =
+            json_request(app.clone(), "/v1/messages", send("garden-first", None)).await;
+        let first_id = first["subject"].as_str().unwrap().to_owned();
+        let (_, reply) = json_request(
+            app.clone(),
+            "/v1/messages",
+            send("garden-reply", Some(first_id.clone())),
+        )
+        .await;
+        let reply_id = reply["subject"].as_str().unwrap().to_owned();
+        let (_, third) = json_request(
+            app.clone(),
+            "/v1/messages",
+            send("garden-third", Some(first_id.clone())),
+        )
+        .await;
+        let third_id = third["subject"].as_str().unwrap().to_owned();
+        let _ = json_request(app.clone(), "/v1/messages", send("unrelated-tree", None)).await;
+        let (status, thread) = get_request(
+            app,
+            &format!(
+                "/v1/messages/thread/{}",
+                reply_id.trim_start_matches("message/")
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{thread}");
+        let subjects = thread
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["subject"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subjects,
+            vec![first_id.as_str(), reply_id.as_str(), third_id.as_str()]
+        );
+    }
+
+    #[tokio::test]
+    async fn message_thread_counts_canonical_children_once_when_edges_have_two_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("claims.sqlite3");
+        let mut app_state = state(root.path());
+        app_state.store = Arc::new(Store::open(&database, "node").unwrap());
+        let app = router(app_state);
+        let send = |key: String, parent: Option<String>| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.clone(),
+                from: "agent/garden-writer".into(),
+                to: "agent/garden-reader".into(),
+                content: key,
+                title: None,
+                in_reply_to: parent,
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+        };
+        let (_, first) =
+            json_request(app.clone(), "/v1/messages", send("garden-root".into(), None)).await;
+        let first_id = first["subject"].as_str().unwrap().to_owned();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        for index in 0..101 {
+            let (_, child) = json_request(
+                app.clone(),
+                "/v1/messages",
+                send(format!("garden-child-{index}"), Some(first_id.clone())),
+            )
+            .await;
+            let child_id = child["subject"].as_str().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO message_reply_edges(source, subject, parent) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![format!("desired:{child_id}"), child_id, first_id],
+                )
+                .unwrap();
+        }
+        let (status, thread) = get_request(
+            app,
+            &format!(
+                "/v1/messages/thread/{}",
+                first_id.trim_start_matches("message/")
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{thread}");
+        assert_eq!(thread.as_array().unwrap().len(), 102);
+    }
+
+    #[tokio::test]
+    async fn message_thread_ignores_distinct_stale_reply_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("claims.sqlite3");
+        let mut app_state = state(root.path());
+        app_state.store = Arc::new(Store::open(&database, "node").unwrap());
+        let app = router(app_state);
+        let send = |key: &str, parent: Option<String>| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.into(),
+                from: "agent/garden-writer".into(),
+                to: "agent/garden-reader".into(),
+                content: key.into(),
+                title: None,
+                in_reply_to: parent,
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+        };
+        let (_, first) = json_request(app.clone(), "/v1/messages", send("stale-root", None)).await;
+        let first_id = first["subject"].as_str().unwrap().to_owned();
+        let (_, reply) = json_request(
+            app.clone(),
+            "/v1/messages",
+            send("stale-reply", Some(first_id.clone())),
+        )
+        .await;
+        let reply_id = reply["subject"].as_str().unwrap().to_owned();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        for index in 0..201 {
+            connection
+                .execute(
+                    "INSERT INTO message_reply_edges(source, subject, parent) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        format!("historical-{index}"),
+                        format!("message/000-stale-{index:03}"),
+                        first_id
+                    ],
+                )
+                .unwrap();
+        }
+        let (status, thread) = get_request(
+            app,
+            &format!(
+                "/v1/messages/thread/{}",
+                first_id.trim_start_matches("message/")
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{thread}");
+        let subjects = thread
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["subject"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(subjects, vec![first_id.as_str(), reply_id.as_str()]);
+    }
+
 
     #[tokio::test]
     async fn message_lifecycle_requires_the_exact_recipient_actor() {
@@ -19263,6 +19640,18 @@ version 2
             .into_iter()
             .find(|subject| subject.subject == "agent/eval/demo/worker")
             .expect("the eval did not apply its mission-less seat");
+        let (status, tree) = get_request(
+            app.clone(),
+            &format!(
+                "/v1/mission-runs/tree?run={}&limit=1",
+                urlencoding::encode(root)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tree}");
+        assert_eq!(tree["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(tree["runs"][0]["subject"], root);
+        assert_eq!(tree["has_more"], false);
         assert_eq!(eval_seat.owner_run.as_deref(), Some(root));
         let (status, mission_runs) = get_request(
             app,

@@ -684,6 +684,10 @@ const PROBES: &[Probe] = &[
         "/v1/messages/page?include_closed=false&limit=100&to={seat}",
     ),
     get(
+        "GET /v1/messages/thread/{*subject}",
+        "/v1/messages/thread/{sent}",
+    ),
+    get(
         "GET /v1/messages/read/{*subject}",
         "/v1/messages/read/{message}",
     ),
@@ -694,6 +698,7 @@ const PROBES: &[Probe] = &[
     get("GET /v1/status", "/v1/status?subject={seat}"),
     get("GET /v1/desired/{*subject}", "/v1/desired/{seat}"),
     get("GET /v1/events", "/v1/events?limit=100"),
+    get("GET /v1/events/page", "/v1/events/page?after=0&limit=100"),
     // The route streams JSON Lines rather than the JSON document the HTTP probe expects.
     // Measure the same paged exporter directly, normalizing work by archive bytes.
     direct("GET /v1/backup", |store, _, _| {
@@ -727,6 +732,10 @@ const PROBES: &[Probe] = &[
     get(
         "GET /v1/mission-runs",
         "/v1/mission-runs?mission={mission_name}",
+    ),
+    get(
+        "GET /v1/mission-runs/tree",
+        "/v1/mission-runs/tree?run={run}&limit=200",
     ),
     get(
         "GET /v1/mission-overview",
@@ -1542,6 +1551,39 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     assert_eq!(selected["receipt"]["source"]["sequence"], 1);
 
     prepare_custom_fixture(&store, &mut fixture, scale);
+
+    // A not-found response has almost no SQL work, so prove each new read probe answers a
+    // populated fixture before comparing its VM steps at the two store sizes.
+    let thread: Value = client
+        .get(&fixture.fill("/v1/messages/thread/{sent}", 0))
+        .await
+        .expect("the thread cost probe must read its sent message");
+    assert!(
+        thread
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["subject"].as_str() == Some(fixture.sent.as_str()))
+            }),
+        "the thread cost probe must contain the sent message: {thread}"
+    );
+    let event_page: Value = client
+        .get("/v1/events/page?after=0&limit=100")
+        .await
+        .expect("the event-page cost probe must read events");
+    assert!(
+        event_page["items"].as_array().is_some_and(|items| !items.is_empty()),
+        "the event-page cost probe must be populated: {event_page}"
+    );
+    let tree: Value = client
+        .get(&fixture.fill("/v1/mission-runs/tree?run={run}&limit=200", 0))
+        .await
+        .expect("the mission-tree cost probe must read a run");
+    assert!(
+        tree["runs"].as_array().is_some_and(|runs| !runs.is_empty()),
+        "the mission-tree cost probe must be populated: {tree}"
+    );
 
     let mut costs = BTreeMap::new();
     for probe in PROBES {

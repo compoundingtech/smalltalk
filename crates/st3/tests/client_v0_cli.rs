@@ -1469,7 +1469,7 @@ async fn conversations_cli_handles_multiple_message_pages_and_exact_reads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_conversation_thread_pages_through_the_history_once() {
+async fn a_conversation_thread_reads_only_the_bounded_thread_route() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = test_state(root.path());
@@ -1501,12 +1501,18 @@ async fn a_conversation_thread_pages_through_the_history_once() {
     }
     let pages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = pages.clone();
+    let threads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted_threads = threads.clone();
     let router = st3::api::router(state).layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let counted = counted.clone();
+            let counted_threads = counted_threads.clone();
             async move {
                 if request.uri().path() == "/v1/messages/page" {
                     counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                if request.uri().path().starts_with("/v1/messages/thread/") {
+                    counted_threads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 next.run(request).await
             }
@@ -1530,11 +1536,12 @@ async fn a_conversation_thread_pages_through_the_history_once() {
         .map(|message| message["subject"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(subjects, ["message/page-000", "message/page-204"]);
-    // 205 messages are three pages of 100. Every page makes the daemon read each message.
+    // The CLI asks for the connected thread once and never pages through unrelated mail.
+    assert_eq!(threads.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(
         pages.load(std::sync::atomic::Ordering::SeqCst),
-        3,
-        "a thread must page through the message history once"
+        0,
+        "a thread must not page through the message history"
     );
     server.abort();
 }
