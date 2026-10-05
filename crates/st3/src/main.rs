@@ -1699,6 +1699,10 @@ struct MissionShowArgs {
 struct MissionPublishArgs {
     /// KDL file to publish; use `-` to read standard input.
     file: PathBuf,
+    /// Print the resolved publication preview without applying or running exec gates.
+    /// Use `missions check` separately to run the gates.
+    #[arg(long, visible_alias = "preview")]
+    dry_run: bool,
     /// Preview against this exact store index.
     #[arg(long, visible_alias = "at")]
     at_index: Option<u64>,
@@ -5954,11 +5958,17 @@ async fn publish_mission_file(
             },
         )
         .await?;
+    if args.dry_run {
+        print_value(&mission, json_output)?;
+    }
     anyhow::ensure!(
         mission.blockers.is_empty(),
         "{}",
         mission.blockers.join("; ")
     );
+    if args.dry_run {
+        return Ok(());
+    }
     warn_ignored_authority(&mission);
     if !args.no_gate_check {
         check_before_publish(client, &intent, &args.workspace).await?;
@@ -26016,6 +26026,7 @@ mission "review" state="ready" {
             client,
             MissionPublishArgs {
                 file,
+                dry_run: false,
                 at_index: None,
                 actor: "person/test".into(),
                 workspace: root.to_owned(),

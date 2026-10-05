@@ -455,9 +455,11 @@ mission "example/first-note" state="ready" {
 }
 ```
 
-Publish it once, then start a run:
+Preview it, publish it once, then start a run. `--dry-run` (alias `--preview`) prints the
+resolved intent and diagnostics without publishing or running exec gates:
 
 ```sh
+st missions publish first-note.kdl --as person/ada --dry-run
 st missions publish first-note.kdl --as person/ada
 st missions start example/first-note --id example/first-note/1 \
   --workspace ~/src/garden --as person/ada --follow
