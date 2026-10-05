@@ -260,6 +260,43 @@ string, not the operational resource union's discriminator. This list route does
 `resources` subscription to `st3.client.collections.v0`.
 
 
+### Seat workspace directories
+
+`GET /v1/client/agent-workspaces/{id}` reads the declared workspace for one exact seat. `{id}`
+accepts `agent/garden/interactive` or `garden/interactive`; encode the path parameter when using
+a raw HTTP client. It requires only `read.projections`, not declaration or terminal-control scope.
+Rust exposes `Client::agent_workspace_get(id)`; Swift and TypeScript expose `agentWorkspaceGet`.
+The CLI is `st agents workspace agent/garden/interactive [--json]`.
+
+The response is `Envelope<AgentWorkspace>`:
+
+```json
+{
+  "kind": "agent-workspace",
+  "agent_id": "agent/garden/interactive",
+  "host_id": "host/garden",
+  "workspace": "/work/garden",
+  "desired_token": "selected-desired-claim",
+  "declaration_token": "original-agent-claim"
+}
+```
+
+The example is the envelope's `value`; its `snapshot.store_index` fences all fields to one SQLite
+read snapshot. `workspace` is the declared workspace root on `host_id`, not the connected
+gateway's filesystem, a harness state directory, or its process's current subdirectory. The read
+does not probe or create the directory and includes no environment values.
+
+Running, mission-owned, suspended, stopped, and retired one-shot seats use the same read; no
+history flag is necessary. The server reads the selected declaration, following unambiguous stop
+predecessors when needed. `desired_token` identifies the current desired claim (possibly a stop),
+while `declaration_token` identifies the agent declaration supplying the path. A replacement
+declaration immediately changes the returned workspace. Unknown seats and observed seats without
+a managed declaration return `not-found`; conflicting declarations or a stop without an
+unambiguous predecessor return `validation-failed`. No directory is inferred from the seat ID.
+
+For the full attach, stop/start, and suspend/resume recipe, see
+[seat lifecycle](../../seat-lifecycle.md#find-a-workspace-and-return-to-an-interactive-seat).
+
 ### Applied subject definitions
 
 `GET /v1/client/subject-definition?subject=agent%2Fexample%2Fworker` reads exactly one agent's
@@ -316,6 +353,11 @@ outside the hour cannot override it. This same selection serves `st usage`, stui
 account pools and the limits policy. The policy tests freshness against the selected source
 time, so a recent low publication cannot freshen an old high observation. Claim kinds and
 client fields remain compatible with older clients.
+Partial reports without a weekly percentage do not replace or refresh a prior weekly source.
+The durable reading survives member restarts. Consumers must check its original measurement time
+and reset window; missing or stale evidence is unknown, never zero. `st doctor` reports missing,
+stale, future-dated or already-reset weekly evidence for active accounts as `account-limits`.
+See [account limits](../accounts.md#at-the-limit) for the policy and external backstop behavior.
 The Rust method is `Client::usage_period(since_ms, until_ms)`;
 Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
 

@@ -1364,6 +1364,109 @@ async fn daemon_build_identity_is_shared_by_doctor_and_capabilities() {
     );
 }
 
+#[tokio::test]
+async fn agent_workspace_read_conforms_for_mission_seats_and_refuses_missing_declarations() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let source = r#"version 2
+mission "garden/workspace" state="ready" {
+  goal "Read the exact seat directory."
+  agent "interactive" { workspace "${ST_WORKSPACE}/interactive"; harness "omp" {} }
+  step "work" { assigned-to "agent/${ST_MISSION_RUN}/interactive"; goal "Wait." }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, state.store.origin()).unwrap();
+    state
+        .store
+        .apply_internal(&intent, "workspace-mission")
+        .unwrap();
+    let run = state
+        .store
+        .create_mission_run(&st3::model::MissionRunRequest {
+            mission: "garden/workspace".into(),
+            revision: None,
+            workspace: "/work/run".into(),
+            requester: Some("person/avery".into()),
+            mode: Some("run".into()),
+            inputs: Default::default(),
+            idempotency_key: "workspace-run".into(),
+        })
+        .unwrap();
+    materialize_run_declarations(&state.store);
+    let seat = state
+        .store
+        .desired_subjects_for_owner_run(&run.subject)
+        .unwrap()
+        .into_iter()
+        .find(|desired| desired.kind == "agent")
+        .unwrap();
+    let app = st3::api::router(state.clone());
+    let path = format!("/v1/client/agent-workspaces/{}", seat.subject);
+    let (status, response) = client_json(app.clone(), &path).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_conforms(
+        &contract_validator("Envelope"),
+        "workspace envelope",
+        &response,
+    );
+    assert_conforms(
+        &contract_validator("AgentWorkspace"),
+        "mission workspace",
+        &response["value"],
+    );
+    assert_eq!(response["value"]["workspace"], "/work/run/interactive");
+    assert_eq!(response["value"]["agent_id"], seat.subject);
+    assert_eq!(
+        response["value"]["host_id"],
+        format!("host/{}", state.store.origin())
+    );
+    assert_eq!(
+        response["snapshot"]["store_index"],
+        state.store.index().unwrap()
+    );
+
+    let (status, error) = client_json(
+        app.clone(),
+        "/v1/client/agent-workspaces/agent/garden/missing",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+    state
+        .store
+        .append_claim(&st3::model::ClaimInput {
+            subject: "agent/garden/observed".into(),
+            kind: "runtime.observed".into(),
+            actor: Some("agent/garden/observed".into()),
+            fields: serde_json::from_value(
+                serde_json::json!({"status":"running", "runtime_id":"observed-seat"}),
+            )
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let (status, error) = client_json(
+        app.clone(),
+        "/v1/client/agent-workspaces/agent/garden/observed",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+    let stop = st3::graph::parse_intent(
+        "version 2\nstop \"agent/garden/undeclared\"\n",
+        state.store.origin(),
+    )
+    .unwrap();
+    state
+        .store
+        .apply_internal(&stop, "workspace-stop-without-prior")
+        .unwrap();
+    let (status, error) =
+        client_json(app, "/v1/client/agent-workspaces/agent/garden/undeclared").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+    assert_eq!(error["code"], "validation-failed");
+}
+
 async fn client_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     let response = app
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())

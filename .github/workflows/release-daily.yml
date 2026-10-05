@@ -38,3 +38,9 @@ jobs:
           fetch-depth: 0
       - name: Publish the verified archives of main when it changed
         run: 'scripts/release-smalltalk-daily ${TAG:+--tag "$TAG"}'
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_REASON: Reuses verified main release artifacts; builds nothing.
+        run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""

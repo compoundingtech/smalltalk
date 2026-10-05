@@ -1,5 +1,7 @@
 # Small Talk client UI contract
 
+For package choices and a runnable client, see [Build your own client](build-your-own.md).
+
 What every Small Talk client shows and does. stui (the terminal client, `crates/stui/src/ui`) is
 the reference; the iOS app (`apps/ios`) implements the same contract the Expo way. When the two
 disagree, fix the one that breaks this document, or change this document first.

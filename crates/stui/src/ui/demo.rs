@@ -66,6 +66,7 @@ pub fn world() -> World {
         person: s("person/robin"),
         host: s("lark"),
         link: Link::Live,
+        mail_backlog: Load::Ready(st3_client::MailBacklog { count: 0, threshold_ms: 3_600_000, cleanup_command: String::new() }),
         diverged: Vec::new(),
         attention: Load::Ready(attention()),
         agents: Load::Ready(agents()),
@@ -136,6 +137,7 @@ pub fn loading() -> World {
         person: s("person/robin"),
         host: s("lark"),
         link: Link::Connecting,
+        mail_backlog: Load::Loading,
         diverged: Vec::new(),
         attention: Load::Loading,
         agents: Load::Loading,
@@ -645,6 +647,7 @@ fn agents() -> Vec<Agent> {
             runtime: Some(s("running · incarnation 3")),
             fault: None,
             under: None,
+            model: Some(s("claude-sonnet-5-5")),
         };
     list[0].details = detail(
         "Cut over to the new store once a person approves.",
@@ -670,6 +673,7 @@ fn agents() -> Vec<Agent> {
         runtime: Some(s("restarts paused")),
         fault: Some(s("401 Unauthorized: the API key expired at 08:40.")),
         under: None,
+        model: Some(s("gpt-5.5-codex")),
     };
     list[3].details = detail(
         "Keep Robin's fleet moving; answer questions.",

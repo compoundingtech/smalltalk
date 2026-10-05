@@ -6,7 +6,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
-import { agentGlyph, agentName, agentState, agentWord, harnessColor, harnessName, loginGuidance } from '../agentsView';
+import { agentGlyph, agentModel, agentName, agentState, agentWord, harnessColor, harnessName, loginGuidance } from '../agentsView';
 import { Banners } from '../chrome';
 import rules from '../../../fixtures/clients/conversation-style.json';
 import { tokenColor, type ConversationRules } from '../conversationStyle';
@@ -366,7 +366,7 @@ function AgentStrip({ agent, onMission }: { agent: NonNullable<ReturnType<typeof
     <View style={{ flexDirection: 'row', alignItems: 'center' }}>
       <T bold color={color}>{glyph} </T><T bold>{agentName(agent)}</T><T color={color}>  {agentWord(state)}</T>
       <View style={{ flex: 1 }} />
-      <T color={harnessColor(harness)}>{harness}</T><T dim> · {agent.host_id?.replace(/^host\//, '') ?? '?'}</T>
+      <T color={harnessColor(harness)}>{harness}</T><T dim>{agentModel(agent) ? ` · ${agentModel(agent)}` : ''} · {agent.host_id?.replace(/^host\//, '') ?? '?'}</T>
     </View>
     <T dim numberOfLines={1}>{agent.id}</T>
     {state === 'needs-login' ? <T color={theme.person}>⚿ {loginGuidance(agent)}</T> : null}

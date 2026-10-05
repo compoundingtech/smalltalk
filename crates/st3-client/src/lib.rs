@@ -1180,6 +1180,9 @@ impl Client {
         ))
         .await
     }
+    pub async fn mail_backlog_summary(&self) -> Result<Envelope<MailBacklog>, ClientError> {
+        self.get("/v1/client/mail-backlog").await
+    }
     pub async fn usage_period(
         &self,
         since_ms: Option<u64>,
@@ -1341,6 +1344,16 @@ impl Client {
     }
     pub async fn agents_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("agents", id).await
+    }
+    pub async fn agent_workspace_get(
+        &self,
+        id: &str,
+    ) -> Result<Envelope<AgentWorkspace>, ClientError> {
+        self.get(&format!(
+            "/v1/client/agent-workspaces/{}",
+            percent_encode(id)
+        ))
+        .await
     }
     pub async fn agent_declaration_get(
         &self,

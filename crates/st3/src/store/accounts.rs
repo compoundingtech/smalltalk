@@ -318,7 +318,8 @@ fn observation_at(
     Ok(claim.into_iter().chain(local).max_by_key(claim_log_order))
 }
 
-/// A previous login's reading cannot stop or move a seat with a new binding or incarnation.
+/// Quota belongs to an account, not an incarnation. A new binding cannot use the previous
+/// login's reading; a relaunch on the same declared account can use its account's evidence.
 pub(super) fn limit_binding_is_current(
     connection: &Connection,
     origin: &str,
@@ -344,8 +345,11 @@ pub(super) fn limit_binding_is_current(
     let Some(leaving) = limit.account_ref.as_deref() else {
         return Ok(false);
     };
+    if binding.driver != limit.driver {
+        return Ok(false);
+    }
     match &binding.binding {
-        Binding::Account(name) if name != leaving => return Ok(false),
+        Binding::Account(name) => return Ok(name == leaving),
         Binding::Pool(owner) => {
             let choice: Option<String> = connection
                 .query_row(
@@ -354,7 +358,7 @@ pub(super) fn limit_binding_is_current(
                     |row| row.get(0),
                 )
                 .optional()?;
-            if choice.is_some_and(|chosen| chosen != leaving) {
+            if choice.as_ref().is_some_and(|chosen| chosen != leaving) {
                 return Ok(false);
             }
             let account_subject = format!("account/{leaving}");
@@ -374,8 +378,12 @@ pub(super) fn limit_binding_is_current(
             }) {
                 return Ok(false);
             }
+            if choice.is_some() {
+                // The durable local pool choice survives member restarts. Without a choice,
+                // retain the legacy source/incarnation fence rather than guessing a login.
+                return Ok(true);
+            }
         }
-        _ => {}
     }
     let Some(source) = observation_at(connection, origin, seat, "harness.limits")? else {
         return Ok(false);

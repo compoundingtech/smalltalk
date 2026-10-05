@@ -1,3 +1,4 @@
+import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import {
   effectUtilsBinaryCaches,
   namespaceRunner,
@@ -126,11 +127,11 @@ export const buildEnv = { CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG
 export const cargoCacheStep = {
   name: 'Restore the Cargo target and registry',
   id: 'cargo-cache',
-  if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
+  if: "env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'",
   uses: 'actions/cache@v4',
   with: {
     path: '${{ github.workspace }}/target\n${{ runner.temp }}/cargo-home/registry\n${{ runner.temp }}/cargo-home/git',
-    key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}",
+    key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config.toml') }}",
     'restore-keys': 'cargo-${{ github.job }}-${{ runner.os }}-',
   },
 } as const
@@ -138,12 +139,12 @@ export const cargoCacheStep = {
 export const nixCacheStep = {
   name: 'Restore the local Nix cache',
   id: 'nix-cache',
-  if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
+  if: "env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'",
   uses: 'actions/cache@v4',
   with: {
     path: '${{ runner.temp }}/st-ci-cache',
-    key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
-    'restore-keys': 'nix4-${{ github.job }}-${{ runner.os }}-',
+    key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
+    'restore-keys': 'nix5-${{ github.job }}-${{ runner.os }}-\nnix4-${{ github.job }}-${{ runner.os }}-',
   },
 } as const
 
@@ -158,14 +159,17 @@ export const commonSetupSteps = [
   // the archives below there would only cost time.
   {
     name: 'Use the runner\'s own caches',
-    run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi',
+    run: `if [ -n "\${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
+printf 'CARGO_HOME=%s\\nCI_CACHE_DIR=%s\\n' "\${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"`,
   },
   // actions/cache is served by Namespace's accelerated cache backend and is keyed, not tied to a node.
   // Namespace cache volumes are per node and replicate in the background, so a job on another node
   // starts empty. /nix itself cannot be cached (see scripts/ci-nix-cache); RUNNER_TEMP/st-ci-cache holds a
   // local Nix binary cache instead. Linux only: the key names the job, so each stage keeps its own.
+  buildSnapshotRestore,
   cargoCacheStep,
   nixCacheStep,
+  buildSnapshotPrepare,
   ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
   {
     name: 'Isolate test home and XDG state',
@@ -178,7 +182,7 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
   },
   {
     name: 'Use the cached Nix outputs',
-    if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
+    if: "env.CI_LOCAL_CACHES != '1'",
     run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"',
   },
 ]
@@ -239,7 +243,7 @@ export const linuxStageJob = ({
   'runs-on': runsOn,
   'timeout-minutes': 120,
   defaults: { run: { shell: 'bash' } },
-  env: { ...buildEnv, ...env },
+  env: { ...buildEnv, ...env, CI_CACHE_DEV_SHELL: 'default' },
   steps: [
     ...setup,
     {
@@ -251,9 +255,10 @@ export const linuxStageJob = ({
     ...after,
     {
       name: 'Save Nix outputs to the local Nix cache',
-      if: 'success()',
+      if: "success() && env.CI_LOCAL_CACHES != '1'",
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
+    ...buildSnapshotSave,
     {
       name: 'Retain stage logs and timings',
       uses: 'actions/upload-artifact@v4',
@@ -273,6 +278,7 @@ export const linuxStageJob = ({
  */
 export const perfStoresCache = (stage: string) => ({
   name: 'Restore the generated stores',
+  if: "env.CI_BUILD_SNAPSHOT_STORES_HIT != '1'",
   uses: 'actions/cache@v4',
   with: {
     path: '${{ runner.temp }}/st-bench',

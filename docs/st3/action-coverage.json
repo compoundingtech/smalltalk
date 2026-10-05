@@ -465,6 +465,14 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st agents workspace",
+      "description": "Print one seat's declared workspace directory on its owning host, even when stopped",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::agent_workspace_cli_and_client_read_the_same_declaration_even_after_retirement"
+      ],
+      "verification": "real CLI and generated Rust client over a private Unix socket; current and stopped declarations"
+    },
+    {
       "command": "st agents start",
       "description": "Start a durable seat, patching only explicitly supplied declaration fields. A stopped mission seat starts again on its run's own declaration",
       "tests": [
@@ -639,6 +647,14 @@
         "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations cleanup",
+      "description": "Archive aged unread mail in one mailbox or all mailboxes, with dry-run preview",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_aged_unread_cleanup_preserves_fresh_and_read_mail_across_restart"
+      ],
+      "verification": "real CLI over private Unix socket; dry run, mailbox scope and repeated cleanup across disk-store restarts"
     },
     {
       "command": "st conversations export",
@@ -1690,6 +1706,15 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st work acknowledge",
+      "description": "Record the recipient read receipt and acknowledge an exact handoff note",
+      "tests": [
+        "crates/st3/tests/adhoc_work.rs::spontaneous_work_survives_restart_handoff_acknowledgment_and_close",
+        "crates/st3/tests/adhoc_work.rs::person_handoff_is_visible_acknowledged_and_closed_with_evidence"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened and replayed between actions"
+    },
+    {
       "command": "st work ask",
       "description": "Ask a person through a runtime step owned by live work",
       "tests": [
@@ -1744,6 +1769,15 @@
         "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
       ],
       "verification": "shared API restart case"
+    },
+    {
+      "command": "st work handoff",
+      "description": "Release the current lease and assign a leaf step with a durable recipient note",
+      "tests": [
+        "crates/st3/tests/adhoc_work.rs::spontaneous_work_survives_restart_handoff_acknowledgment_and_close",
+        "crates/st3/tests/adhoc_work.rs::person_handoff_is_visible_acknowledged_and_closed_with_evidence"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened and replayed between actions"
     },
     {
       "command": "st work ls",
@@ -1848,6 +1882,15 @@
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work start",
+      "description": "Open a minimal spontaneous work run for the calling seat",
+      "tests": [
+        "crates/st3/tests/adhoc_work.rs::spontaneous_work_survives_restart_handoff_acknowledgment_and_close",
+        "crates/st3/tests/adhoc_work.rs::person_handoff_is_visible_acknowledged_and_closed_with_evidence"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened and replayed between actions"
     },
     {
       "command": "st work update",
