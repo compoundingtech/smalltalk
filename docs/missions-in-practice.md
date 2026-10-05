@@ -180,3 +180,35 @@ The explicit incarnation works around [a v0.3.4 Claude shell bug](https://github
 - A cleanup step needs enough timeout to stop its seat. Use minutes, not a few seconds, and inspect the stop result before considering cleanup complete.
 
 See [KDL lifecycle](st3/kdl-lifecycle.md) and [worked examples](../examples/st3/README.md) for larger plans.
+
+## Inspect work from the CLI
+
+```sh
+st now                  # what needs you right now
+st agents ls            # seats and other running agents
+st missions ls          # missions with current runs
+st work ls              # steps that are ready or in progress
+st attention ls         # decisions and requests waiting for you
+st conversations ls person/ada
+```
+
+`st attention approve ID --as person/ada` answers a gate waiting for you by the ID
+`st attention ls` prints; `reject` and `request-changes` also take `--reason TEXT`. A gate
+that no longer waits says why: who answered it, or what changed since it asked.
+
+`st --help` and `st help` open with the main uses, then group commands for everyday use, agent
+seats, and running a machine or fleet. `st help --all` also lists plumbing commands.
+Use `st help agents new` to open a command's full help.
+
+Lists show current state. Add `--all` for history. Every command has `--help`, and the global
+`--json` flag prints the stable client format that the apps read. Run `stui` for the same views
+in a terminal app.
+
+For spontaneous work, `st work start "Inspect the fixture" --as agent/example/worker` opens a
+one-step run and prints how to claim it. Use `work progress --summary` for checkpoints and
+`work complete --summary --evidence` to close it. `work handoff STEP --to agent/example/reviewer
+--note TEXT --as agent/example/worker` releases the sender's claim and delivers a note to the
+recipient. The recipient reads it, uses `work acknowledge STEP --message MESSAGE --as RECIPIENT`,
+then claims it. A person recipient sees the step on their home and closes with `work done`.
+`work show STEP` includes the note and acknowledgment. Start and handoff accept
+`--idempotency-key KEY` for retries after a timeout.

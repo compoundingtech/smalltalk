@@ -5,14 +5,14 @@
 Workspace CI runs on pull requests, merge groups and manual dispatch. The merge queue tests the
 exact commit that lands on `main`; its successful checks stay attached to that SHA, so a main push
 does not repeat the workspace gate. `Main upkeep` verifies those five checks, runs `perf-cost`
-(which the queue skips), and fills missing main-scope caches on Namespace. `macOS CI` still runs
-on main pushes. Each non-PR run uses its own `github.run_id` in the concurrency group, so
-successive pushes do not cancel checks or cache saves. PR updates still cancel stale checks;
-macOS checks on PRs require the `macos-ci` label.
+(which the queue skips), and fills missing main-scope caches on Namespace. macOS CI is currently
+disabled. Each non-PR run uses its own `github.run_id` in the concurrency group, so
+successive pushes do not cancel checks or cache saves. PR updates still cancel stale checks.
 
-The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
-(`.github/workflows/macos.yml`) replace the fleet's former Linux `st/ci` and optional `st/ci-macos`
-execution. The required checks on `main` are `linux-gate`, `isolation-vm`, `genie-freshness`,
+The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) replaces the fleet's
+former Linux `st/ci` execution. The retained macOS workflow (`.github/workflows/macos.yml`) is
+disabled in GitHub Actions; it does not currently run on PRs or main pushes. The required checks
+on `main` are `linux-gate`, `isolation-vm`, `genie-freshness`,
 `typescript-client` and `mail-redelivery-canaries`,
 and `main` lands through GitHub's merge queue (see [Merge queue](#merge-queue)).
 
@@ -20,8 +20,8 @@ Every pull request, including a fork and a draft, gets the Linux gate, the isola
 freshness check, the TypeScript client check and the mail redelivery canaries. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
 the required checks for each queued entry.
 Checkout uses GitHub's default `pull_request` merge ref, not the contributor's unmerged
-head: it tests that head merged with the current base. Strict branch protection also requires
-that the head itself contain the latest `main`. No `pull_request_target` job runs PR code,
+head: it tests that head merged with the current base. The merge queue combines the head with
+the current `main`; the head does not need to be rebased first. No `pull_request_target` job runs PR code,
 and the gate has only `contents: read` permission. Forks do not receive publishing secrets.
 
 The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
@@ -249,6 +249,9 @@ The main ruleset requires `typescript-client`. It was enabled after the new job 
 in [#1256](https://github.com/compoundingtech/smalltalk/pull/1256).
 
 ### macOS
+
+The macOS workflow is currently disabled in GitHub Actions. Its retained definition is described
+below for reference; adding a label does not enable it.
 
 The non-required `macos-ci` job uses `namespace-profile-macos-arm64` and runs on PR events while
 the PR bears the `macos-ci` label. It is a separate workflow so adding a
@@ -522,7 +525,8 @@ gh pr merge NUMBER --auto
 ```
 
 The queue tests the pull request on top of the current `main` and the entries ahead of it with
-`linux-gate`, `isolation-vm`, `genie-freshness` and `typescript-client` (these run on the `merge_group` event; see the
+`linux-gate`, `isolation-vm`, `genie-freshness`, `typescript-client`, and
+`mail-redelivery-canaries` (these run on the `merge_group` event; see the
 trigger in `fleet.yml.genie.ts`) and merges it with a merge commit when they pass. The pull
 request does not need to be rebased onto the latest `main` first. A draft cannot be queued. If a
 queued check fails, the entry leaves the queue and the pull request page says why: fix it and

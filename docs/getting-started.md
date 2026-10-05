@@ -64,9 +64,14 @@ command -v st stui pty
 
 Nix builds `st3`, its `st` alias, `stui`, and `st3-migrate`, and supplies the pinned `pty` runtime and build dependencies. You do not need a separate Rust toolchain or PTY install. Use this **instead of** the archive route; the commands below are the same. Check that the paths above belong to your Nix profile, then continue with the daemon setup.
 
-For a declarative setup, use the [Home Manager module](../README.md#home-manager): it installs the tools, writes the person configuration, and starts the user daemon on Linux or macOS. If that module owns your daemon, configure its person there and skip the manual config/service-install block in step 3. Lingering on Linux, macOS permissions, harness login, and fleet joining remain host setup. Nix profile installs use store paths; the macOS app-bundle setup above belongs to the source/release installers.
+For a declarative setup, use the [Home Manager module](home-manager.md): it installs the tools, writes the person configuration, and starts the user daemon on Linux or macOS. If that module owns your daemon, configure its person there and skip the manual config/service-install block in step 3. Lingering on Linux, macOS permissions, harness login, and fleet joining remain host setup. Nix profile installs use store paths; the macOS app-bundle setup above belongs to the source/release installers.
 
 See [binary releases](st3/binary-releases.md) for pinned versions and upgrades, and [macOS installation](st3/macos-installation.md) for Python, signing, and permission setup.
+
+The default, `st`, `st3`, and `small-talk` Nix package names all select this package.
+The previous generation builds separately as `.#st2`; install it explicitly with
+`nix profile install .#st2`. For a source install without Nix, see
+[development](development.md#build-from-source).
 
 ## 2. Prepare your workspace
 
@@ -111,7 +116,7 @@ On macOS, run the permission helper and follow its instructions:
 st service permissions
 ```
 
-`doctor` should report a reachable daemon and `pty`. A machine with no fleet configured is healthy. Warnings about optional build tools, GitHub login, or Linux IO priority do not block this walkthrough. Fix any failed check before continuing; [daemon setup](../README.md#run-the-daemon) has the details.
+`doctor` should report a reachable daemon and `pty`. A machine with no fleet configured is healthy. Warnings about optional build tools, GitHub login, or Linux IO priority do not block this walkthrough. Fix any failed check before continuing; [daemon setup](#daemon-details) has the details.
 
 ## 4. Declare your first seat
 
@@ -186,6 +191,39 @@ When you are done experimenting:
 ```sh
 st agents stop agent/garden/worker --as person/ada
 ```
+
+## Daemon details
+
+Run `st service install` again after upgrading the binaries. It updates the installed definitions
+and restarts the services so they use the new executables.
+
+On Linux the service is a systemd user unit. It needs a working user manager; enable lingering
+(`loginctl enable-linger`) so seats keep running after you log out. On macOS it is a launchd
+agent; run `st service permissions` once for the Full Disk Access and Developer Tools steps.
+
+State lives in `~/.local/state/st3` and the local API is a Unix socket. Restarting the daemon
+does not stop running seats; it adopts them. While it restarts, a command waits up to 30 seconds
+for it (`--daemon-wait SECONDS` or `ST3_DAEMON_WAIT` changes that) and then exits with status 5.
+Seat drivers wait as long as the restart takes, keep their notes out of the seat's terminal in
+`~/.local/state/st3/driver-api-warnings.log`, and resume from the graph. To run the daemon in the
+foreground instead, use `st up`.
+
+On Linux, the daemon normally listens in `XDG_RUNTIME_DIR`; it also publishes
+`STATE/run/st3.sock` as a link to that socket, so commands without the daemon's
+runtime environment can reach it. On macOS the socket already lives at that state path.
+An explicit `--endpoint` or `ST3_ENDPOINT` still takes precedence.
+
+st records every `git` and `gh` call it starts, including its own, in
+`~/.local/state/st3/recorder/commands.jsonl`, then runs the real program unchanged. A call by
+absolute path is not recorded. The [command recorder](st3/command-recorder.md) describes the
+log.
+
+If the state directory has a long path, set `XDG_RUNTIME_DIR` to a shorter directory or pass
+`--socket` and `--client-gateway-socket` to `st up` so both Unix socket paths fit the OS limit.
+When `st up` receives a private `--state-dir` or `--socket` without an explicit
+`--client-gateway-socket`, its paired gateway is placed beside that private socket (or
+in the private state directory when no socket is specified). An existing live listener
+at either socket path is never replaced; choose a different path instead.
 
 ## Next
 

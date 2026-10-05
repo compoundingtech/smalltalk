@@ -124,3 +124,40 @@ st work done "$person_step" --as person/ada --text 'Explain when visitors can ta
 ```
 
 Choice answers use their named ID in the same way. Feedback, a custom choice, or requested changes need text. The answer is durable: a step-owned ask resumes its worker; an idle-seat ask delivers the answer to its requester as a message.
+
+## Read and find conversations
+
+Messages are for conversation, not for handing out work:
+
+```sh
+st conversations send agent/example/worker --from person/ada \
+  --subject "Hello" --body "Reply with one short sentence."
+st conversations ls person/ada
+st conversations read MESSAGE --as person/ada
+st conversations thread MESSAGE
+st conversations archive MESSAGE --as person/ada
+st conversations search "release date" --agent agent/example/worker --since 2026-10-01T00:00:00Z
+```
+
+Running the same send or reply again never sends it twice. Without `--idempotency-key`, st names
+the message by its sender, recipient (or the message it answers), title, body, tags, attachments
+and the hour, so a repeat within the hour or the next reports the message already sent
+(`already_sent` with `--json`) and sends nothing; the same words a few hours later are a new
+message. An explicit `--idempotency-key` names one message at any hour, and reusing it with
+different words is refused.
+
+If a send goes unanswered, st retries once with the same key. If it is still unconfirmed, the
+message may have landed: the error prints its key and the command that tells whether it did,
+`st conversations status --idempotency-key KEY`. Running the same command again is safe.
+
+`st conversations sessions` lists harness sessions and `st conversations timeline SESSION`
+shows one conversation as stui shows it: messages, Small Talk, and tool calls folded to a line
+or two. `--raw` prints every stored entry instead (message boundaries, tool input and output in
+full), and `--json` prints the page.
+
+`conversations search` searches the authenticated person's sent and received messages and
+the normalized transcripts they can view. It returns conversation and entry IDs with short
+excerpts, newest first. Use `--cursor` for older matches, or `--json` for the typed client
+response. The response dates its index and reports incomplete sources, including retained
+history limits and unavailable hosts. See [conversation search](st3/conversation-search.md)
+for freshness, costs, and the embedding API.

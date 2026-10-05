@@ -63,7 +63,13 @@ tar -xzf "$archive"
 cat "${archive%.tar.gz}/BUILD.json"
 ```
 
-`BUILD.json` records the exact source commit. Release tags are labels; `st --version` alone does not identify the source build. For Nix installations, use the same pinned source on all machines and your normal profile or Home Manager update procedure; see [installation](../README.md#install).
+`BUILD.json` records the exact source commit. Release tags are labels; compare source revisions and build metadata when checking an upgrade. For Nix installations, use the same pinned source on all machines and your normal profile or Home Manager update procedure; see [installation](getting-started.md#1-install).
+
+`st --version` names the source revision and whether the build came from Nix or local source.
+`st --version --json` returns a stable `machine_version` without needing a daemon.
+`st doctor --json` and client capabilities expose the responding daemon's `machine_version`,
+so an installed CLI and a running daemon can be compared. All versions use metadata baked at
+compile time, independent of the caller's directory or environment.
 
 ## Restart the services and verify
 
