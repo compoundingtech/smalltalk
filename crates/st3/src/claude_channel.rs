@@ -386,34 +386,68 @@ fn save_handoffs(path: &Path, state: &State) -> Result<()> {
 #[derive(Default)]
 struct Transcript {
     path: std::path::PathBuf,
+    identity: Option<(u64, u64)>,
     offset: u64,
     lines: st_drivers::reexec::LineBuffer,
+    recover: bool,
+    discard_line: bool,
 }
+// Restart and uncertain-body recovery inspect recent proof, not an unbounded
+// session history. Each poll has the same byte budget; an oversized/incomplete
+// native record cannot retain the rest of the transcript in memory.
+const TRANSCRIPT_WINDOW: usize = 4 * 1024 * 1024;
 impl Transcript {
     fn body_available(&mut self, uncertain: bool) {
-        if uncertain {
-            self.offset = 0;
-            self.lines = Default::default();
-        }
+        self.recover |= uncertain;
     }
     fn appended(&mut self, path: &Path) -> Result<Vec<Value>> {
         use std::io::{Read as _, Seek as _};
+        use std::os::unix::fs::MetadataExt as _;
         let mut file = std::fs::File::open(path)?;
-        if self.path != path || file.metadata()?.len() < self.offset {
+        let metadata = file.metadata()?;
+        let identity = (metadata.dev(), metadata.ino());
+        if self.recover
+            || self.path != path
+            || self.identity != Some(identity)
+            || metadata.len() < self.offset
+        {
             self.path = path.to_owned();
-            self.offset = 0;
+            self.identity = Some(identity);
+            self.offset = metadata.len().saturating_sub(TRANSCRIPT_WINDOW as u64);
             self.lines = Default::default();
+            self.discard_line = false;
+            if self.offset > 0 {
+                // A window may start inside a JSON record. Skip that fragment,
+                // but keep a complete record starting exactly at the boundary.
+                file.seek(std::io::SeekFrom::Start(self.offset - 1))?;
+                let mut previous = [0];
+                file.read_exact(&mut previous)?;
+                self.discard_line = previous[0] != b'\n';
+            }
+            self.recover = false;
         }
         file.seek(std::io::SeekFrom::Start(self.offset))?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        file.take(TRANSCRIPT_WINDOW as u64)
+            .read_to_end(&mut bytes)?;
         self.offset += bytes.len() as u64;
         self.lines.push(&bytes);
         let mut records = Vec::new();
         while let Some(line) = self.lines.next_line() {
+            if self.discard_line {
+                self.discard_line = false;
+                continue;
+            }
+            if line.len() > TRANSCRIPT_WINDOW {
+                continue;
+            }
             if let Ok(record) = serde_json::from_str(&line) {
                 records.push(record);
             }
+        }
+        if self.lines.buffered_len() > TRANSCRIPT_WINDOW || self.discard_line {
+            self.lines = Default::default();
+            self.discard_line = true;
         }
         Ok(records)
     }
@@ -667,6 +701,144 @@ mod tests {
         transcript.body_available(false);
         assert!(transcript.appended(&path).unwrap().is_empty());
         assert!(!root.path().join("resources").exists());
+    }
+
+    #[test]
+    fn claude_100_mb_transcript_bounds_startup_recovery_and_each_append() {
+        fn cpu_time() -> Duration {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+                0
+            );
+            Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        // Dense, valid JSONL exercises splitting rather than a sparse-file seek.
+        // Build the history without allocating a transcript-sized test buffer.
+        let history = format!(
+            "{}\n",
+            json!({"type":"assistant","padding":"x".repeat(980)})
+        );
+        let batch = history.repeat(64);
+        while file.metadata().unwrap().len() < 100 * 1024 * 1024 {
+            file.write_all(batch.as_bytes()).unwrap();
+        }
+        let envelope = "QUARTZ SIGNAL";
+        let acceptance = json!({"type":"queue-operation","operation":"enqueue","content":envelope});
+        let user = json!({"type":"user","message":{"role":"user","content":envelope}});
+        let absorbed = json!({"type":"queue-operation","operation":"remove","reason":"absorbed_mid_turn",
+            "content":envelope,"commandUuid":"native-command","deliveryId":"native-delivery"});
+        writeln!(file, "{acceptance}").unwrap();
+        writeln!(file, "{user}").unwrap();
+        writeln!(file, "{absorbed}").unwrap();
+        let size = file.metadata().unwrap().len();
+        let mut transcript = Transcript::default();
+        let mut recovery_cpu = Duration::ZERO;
+        for _ in 0..3 {
+            let started = cpu_time();
+            let records = transcript.appended(&path).unwrap();
+            assert_eq!(transcript.offset, size);
+            assert!(records.len() <= TRANSCRIPT_WINDOW / history.len() + 3);
+            assert!(
+                records
+                    .iter()
+                    .any(|record| native_acceptance(record, envelope))
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| native_receipt(record, envelope))
+                    .count(),
+                2
+            );
+            assert_eq!(transcript.lines.buffered_len(), 0);
+            let elapsed = cpu_time() - started;
+            recovery_cpu = recovery_cpu.max(elapsed);
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "recovery CPU: {elapsed:?}"
+            );
+            assert!(transcript.appended(&path).unwrap().is_empty());
+            transcript.body_available(true);
+        }
+        // A fresh driver reads the same bounded tail, retaining both forms of
+        // consumption proof and the separate native acceptance evidence.
+        transcript = Transcript::default();
+        assert!(
+            transcript
+                .appended(&path)
+                .unwrap()
+                .iter()
+                .any(|record| native_receipt(record, envelope))
+        );
+        let mut append_cpu = Duration::ZERO;
+        for _ in 0..32 {
+            let started = cpu_time();
+            let before = transcript.offset;
+            writeln!(file, "{acceptance}").unwrap();
+            writeln!(file, "{user}").unwrap();
+            let records = transcript.appended(&path).unwrap();
+            assert_eq!(records, [acceptance.clone(), user.clone()]);
+            assert!(transcript.offset - before < 1024);
+            assert_eq!(transcript.lines.buffered_len(), 0);
+            let elapsed = cpu_time() - started;
+            append_cpu = append_cpu.max(elapsed);
+            assert!(elapsed < Duration::from_secs(1), "append CPU: {elapsed:?}");
+        }
+        eprintln!(
+            "100 MB transcript: maximum recovery CPU {recovery_cpu:?}, maximum append CPU {append_cpu:?}; recovery/read budget {TRANSCRIPT_WINDOW} bytes, append reads <1024 bytes, retained partial bytes 0"
+        );
+    }
+
+    #[test]
+    fn claude_transcript_bounds_backlogs_and_unterminated_records() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let mut transcript = Transcript::default();
+        assert!(transcript.appended(&path).unwrap().is_empty());
+        let block = vec![b'x'; TRANSCRIPT_WINDOW];
+        for _ in 0..4 {
+            file.write_all(&block).unwrap();
+        }
+        for _ in 0..4 {
+            let before = transcript.offset;
+            assert!(transcript.appended(&path).unwrap().is_empty());
+            assert_eq!(transcript.offset - before, TRANSCRIPT_WINDOW as u64);
+            assert!(transcript.lines.buffered_len() <= TRANSCRIPT_WINDOW);
+        }
+        let record = json!({"type":"user","message":{"role":"user","content":"QUARTZ"}});
+        writeln!(file, "\n{record}").unwrap();
+        assert_eq!(transcript.appended(&path).unwrap(), [record.clone()]);
+        // Replacement at the same path can be longer than the old file; inode
+        // identity must still trigger a fresh tail rather than skipping proof.
+        let replacement = root.path().join("replacement.jsonl");
+        let mut replaced = std::fs::File::create(&replacement).unwrap();
+        for _ in 0..5 {
+            replaced.write_all(&block).unwrap();
+        }
+        writeln!(replaced, "\n{record}").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert_eq!(transcript.appended(&path).unwrap(), [record]);
+    }
+
+    #[test]
+    fn claude_transcript_keeps_a_complete_record_at_the_tail_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        let record = json!({"type":"user","message":{"role":"user","content":"QUARTZ"}});
+        let line = format!("{record}\n");
+        let mut bytes = b"old\n".to_vec();
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.resize(TRANSCRIPT_WINDOW + 4, b' ');
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Transcript::default().appended(&path).unwrap(), [record]);
     }
 
     #[test]

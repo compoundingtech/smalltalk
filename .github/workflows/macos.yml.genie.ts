@@ -5,7 +5,7 @@ import {
   githubWorkflow,
   nixDevelopStep,
 } from '../../repos/effect-utils/genie/external.ts'
-import { buildEnv, macosRunner, workspacePreparationSteps } from './workspace-ci.ts'
+import { buildEnv, macosRunner, saveMainDependencyCaches, workspacePreparationSteps } from './workspace-ci.ts'
 
 // Optional on PRs and never required. A separate workflow lets label changes start macOS without
 // restarting the required Linux gate.
@@ -38,6 +38,7 @@ export default githubWorkflow(auditCaches({
         },
         nixDevelopStep({ name: 'Cargo clippy', command: ['cargo', 'clippy', '--workspace', '--all-targets', '--locked'] }),
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
+        ...saveMainDependencyCaches(workspacePreparationSteps),
         ...buildSnapshotSave,
       ],
     },

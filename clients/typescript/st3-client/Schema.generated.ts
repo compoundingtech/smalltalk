@@ -1370,21 +1370,43 @@ export const MissionRunOutcome = /*#__PURE__*/ (() => Schema.Struct({
 export type MissionRunOutcome = typeof MissionRunOutcome.Type
 export type MissionRunOutcomeEncoded = typeof MissionRunOutcome.Encoded
 
+export const MissionWake = /*#__PURE__*/ (() => Schema.Struct({
+  "acknowledged_by": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "assignee": AgentId,
+  "assignee_state": Schema.String,
+  "attempts": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "failure": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "incarnation_id": Schema.String,
+  "last_attempt_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE)
+}).annotate({ identifier: "MissionWake" }))()
+export type MissionWake = typeof MissionWake.Type
+export type MissionWakeEncoded = typeof MissionWake.Encoded
+
 export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   "agentless": optionalKey(Schema.Boolean),
   "assignee": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
   "attempt": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "blocked_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "blockers": optionalKey(Schema.Array(Id)),
+  "claim_expires_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "claimant": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
   "constraints": optionalKey(Schema.Array(Schema.String)),
   "goals": optionalKey(Schema.Array(Schema.String)),
   "id": Id,
   "last_progress": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "loop_max_rounds": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
+  "loop_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  /** Current round of this step's loop, enriched on mission detail reads. */
+  "loop_round": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE).annotate({ description: "Current round of this step's loop, enriched on mission detail reads." }),
+  /** Observed not-before time: earliest work eligibility, not a promise of wake dispatch. */
+  "next_wake_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Observed not-before time: earliest work eligibility, not a promise of wake dispatch." }),
   "path": Schema.String,
   "since": Timestamp,
   "state": WorkState,
-  "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
+  "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "wake": Schema.OptionFromOptionalNullOr(MissionWake, NULL_NONE),
+  /** The deferral's blocked reason, or the observed wake failure when no deferral reason exists. */
+  "wake_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "The deferral's blocked reason, or the observed wake failure when no deferral reason exists." })
 }).annotate({ identifier: "MissionStep" }))()
 export type MissionStep = typeof MissionStep.Type
 export type MissionStepEncoded = typeof MissionStep.Encoded

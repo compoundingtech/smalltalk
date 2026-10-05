@@ -66,6 +66,8 @@ for ref, event in [('refs/pull/1/merge', 'pull_request'), ('refs/heads/example',
 # new jobs/workflows which accidentally bypass the policy wrapper without a YAML dependency.
 import re
 count = 0
+dependency_restores = 0
+main_dependency_saves = 0
 for workflow in sorted((root / '.github/workflows').glob('*.yml')):
     jobs = workflow.read_text().split('\njobs:\n', 1)[1]
     blocks = re.split(r'(?m)^  [A-Za-z0-9_-]+:\n', jobs)[1:]
@@ -80,5 +82,14 @@ for workflow in sorted((root / '.github/workflows').glob('*.yml')):
         else:
             assert 'name: Report job cache coverage' in block, workflow
             assert 'if: always()' in block, workflow
+        for step in re.split(r'(?m)^      - ', block):
+            if re.search(r'(?m)^        id: (cargo|nix)-cache$', step):
+                dependency_restores += 1
+                assert 'uses: actions/cache/restore@v4' in step, 'PR/queue dependency archives must not auto-save branch copies'
+            if 'uses: actions/cache/save@v4' in step and re.search(r'(?m)^          key: .*?(cargo-|nix5-)', step):
+                main_dependency_saves += 1
+                assert "github.ref == 'refs/heads/main'" in step.replace("''", "'"), 'dependency writes require protected main'
+assert dependency_restores >= 10, dependency_restores
+assert main_dependency_saves >= 8, main_dependency_saves
 assert count >= 25, count
 print(f'CI cache audit tests passed: honest coverage, visible P0 misses, bounded pruning, {count} generated jobs')

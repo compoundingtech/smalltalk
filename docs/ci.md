@@ -507,6 +507,14 @@ per-run entries. Matching native snapshots also retain it, so fresh nodes do not
 again. These Cargo builds do not produce Zig object-cache directories; empty cache declarations
 would miss on every run and are omitted.
 
+Workspace Cargo and Nix dependency entries are restored on PRs and merge groups. Only
+protected main fills missing entries: Linux main upkeep and main macOS runs save them
+explicitly after preparing valid outputs. Branch-scoped copies of these large archives
+would consume the repository's shared quota and evict the main entries every new PR
+needs. Repeated source heads retain their separate exact-source artifact snapshots.
+The secondary Linux shard reads the same dependency keys as the primary; snapshots
+remain specific to each job, source, platform and build recipe.
+
 Compiled outputs also have three-day artifact snapshots keyed by the actual full source SHA,
 job, platform, architecture, build flags and workflow contents. Native snapshots additionally
 fingerprint the installed Rust compiler and, on macOS, the Swift compiler and SDK. A fresh
