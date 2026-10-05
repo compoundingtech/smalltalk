@@ -1,80 +1,105 @@
 # Keyed agent-card storage prototype
 
-Source base: draft #1409 at `6fdf89ce8a1ac714226584aa09686bbadf5e589d`.
-This prototype is isolated from the production writer and API. It does not claim a
-compiled test, a correct migration, or a latency result.
+Source base: #1409 at `6fdf89ce8a1ac714226584aa09686bbadf5e589d`.
+This isolated source design has no production writer or API hook and no compiled
+or latency receipt.
 
-## Ordered history and cursors
+## Canonical cuts, ordered membership, and cursors
 
-Persist an immutable balanced search tree of `(effective_name, agent_id) -> card
-version` nodes. Path-copy an update so one changed card creates O(log fleet)
-nodes. The root table points from each canonical source cut to one root for each
-`(history, status)` variant, including `status='*'`. A read chooses the latest
-root at or before its cut, seeks after the cursor's last `(name, id)`, and emits
-at most `limit+1` nodes. A point lookup uses a separate subject-keyed version
-index. Historical cuts and continuations refer to immutable roots. Retain roots
-until their bounded cursor lifetime ends; otherwise return `page-cursor-expired`.
+Persist immutable AVL trees of `(effective_name, agent_id) -> card version`
+nodes. Each node stores its height; rotations path-copy O(log fleet) nodes and
+guarantee height below `1.45 log2(fleet+2)`. The root table identifies a
+`(projection epoch, store index, history, status)` cut, including `status='*'`.
+A page seeks after `(name, id)` and emits `limit+1`; a detail read follows a
+second persistent AVL tree keyed by agent subject from the same cut root.
+Card `version` is an opaque immutable row ID, not a store index. An epoch fork
+can reuse the old point root for unchanged agents; it does not copy their
+version intervals. A predecessor query on `version<=cut` would be incorrect.
 
-The card tree contains stable replicated fields. Keyed local facts hold
-observation, transport, subagent/step lease state and each next expiry. A
-second immutable presentation tree combines stable card versions with those
-facts, ordered by `(name, id)` with roots for each final status filter. An
-expiry can therefore move one card between status classes without a claim.
-A cursor binds its exact presentation root ID, the source cut, local
-generation, frozen read time, filter, page size and last key. An unrelated
-local write creates a newer root but cannot change the old page. Deadline and
-local-fact updates path-copy only affected agent keys.
+Local facts use immutable `(agent, version) -> facts` rows. A separate current
+pointer stores the newest version and next deadline as 16-byte big-endian
+u128, so its index preserves time order. A retained presentation
+node names both its card and local-fact versions, so a cursor pinned before a
+local update still reads the exact prior fields. Facts for observation,
+transport, subagents and step leases define disjoint per-agent intervals of
+final rendered status and fields over the full u128 millisecond domain. Each
+interval is inserted into at most 256 canonical nodes of a fixed-depth
+persistent time segment tree. Each time node has AVL ordered roots by final
+status, including `*`. At frozen time `t`, a read follows one 128-level time
+path, seeks after the last key in each ordered root and merges them to produce
+`limit+1`. Each agent has one active interval at `t`, so the merge has no
+same-agent duplicate. A mass expiry changes only which immutable roots are
+chosen; it cannot trigger synchronous catch-up or return stale status. The
+fixed time-depth factor and interval fanout still need measured work bounds.
 
-These trees must be stored in the same SQLite writer transaction as the claim
-projection and reverse dependencies. No process-local map is authoritative.
-Store/open must check schema and root source cut; a mismatched or missing root is
-not served. Startup repair works off the read path and has a separately measured
-cost. Compaction retains roots referenced by live cursors and required historical
-cuts. A canonical reorder or rollback invalidates roots from the earliest
-changed cut, replays only affected keys using indexed dependencies, and publishes
-replacement roots atomically. The old roots remain available to existing
-cursors only if their source cut is still canonical; otherwise return an explicit
-cursor gap.
+A cursor binds its exact time-root ID, projection epoch, canonical store cut,
+local generation, frozen u128 read time, history/status filters, page size and
+last key. An unrelated claim/local write cannot change that root. A repair or
+reorder fences the old epoch at its first changed store index. Old cursors
+before the fence remain valid; later ones return an explicit cursor gap. A
+cursor whose retained root has expired returns `page-cursor-expired`. Root
+retirement time is persisted when a newer root replaces it; the newest root
+is always retained. Keeping a retired root for at least the cursor TTL means
+every cursor issued while it was current can finish without a read-side pin
+write. Cursor TTL starts at issuance, not root creation.
 
-## Candidate discovery and bounded deltas
+## Indexed candidates and bounded field deltas
 
-Gather candidate agent IDs from **both** sides of the write transaction. Direct
-agent-subject claims contribute that subject. A message.sent contributes old/new
-`fields.from` and `fields.to` when they are agents; work.progress/submitted
-contributes old/new actor. Run and generation changes seek `desired.owner_run`,
-`desired.owner_generation`, and current-generation step rows, then collect
-old/new assignee and lease owner. A step-row change collects only old/new
-assignee and lease owner; `available_to` is an input for their queue selection,
-not another roster key. Local observations, subagents, and deadlines contribute
-their one agent. Queue moves contribute their subject agent. The attached SQL
-lists the reverse indexes required by these lookups.
+Collect candidate agents from both pre- and post-state inside the writer
+transaction. An agent-subject claim contributes that agent. A `message.sent`
+change contributes old/new `fields.from` and `fields.to` agents; a
+`work.progress`/`work.submitted` change contributes old/new actor. Run and
+generation changes seek owner-run/owner-generation desired rows and
+current-generation step rows, then collect old/new assignee and lease owner.
+Step changes collect those two keys; `available_to` can affect their queue
+selection but is not itself a roster key. Local facts, subagents, deadlines and
+queue moves contribute their own agent. `candidate_queries.sql` gives the
+indexed reverse seeks. Discovery alone does not touch a card or order node.
 
-For each candidate, update field summaries in O(log history) or constant time:
-latest selected claim, message/work activity maxima, usage sums, queue counts
-and limited preview, current harness state and its working-run start. The
-`WorkingRun` monoid in `working_run.rs` is the harness-state fold for a balanced
-per-agent/incarnation canonical event tree. An insertion, deletion, or reorder
-changes only the nodes on that event's path; its root gives the first working
-observation after the last non-working observation. The same indexed aggregate
-pattern applies to usage and activity. Comparing old/new complete serialized
-card values after these bounded summaries decides whether to path-copy a card
-node. Candidate discovery by itself does not touch card rows.
+Each candidate uses bounded field summaries: selected claim, message/work
+activity maxima, usage sums, queue counts and limited previews, current
+harness state and its working-run start. `WorkingRun` in `working_run.rs`
+combines a per-agent/incarnation AVL canonical event tree. Insertion,
+deletion or reorder recomputes O(log per-agent history) ancestors, not the
+whole incarnation. The root yields the first `working` observation after the
+last different state. Apply the same indexed aggregate pattern to usage and
+activity. Compare old/new complete serialized card values before path-copying
+an ordered node. The old `agent_working_since` parses accepted timestamps as
+u128; the schema keeps decimal u128 text and orders by a separate canonical
+key rather than narrowing to SQLite INTEGER.
 
-## Integration boundary and proof
+## Repair, reopen, GC, and proof gates
 
-This prototype adds no production module or shared method edit. Integration
-would add projection tables/migration under `Store::open`, transactional hooks
-in claim/desired/step/local-observation writers, and replace only
-`client_agent_resources`, `client_agents`, `client_agents_detail`, and their
-`cached_agent_resources` call path after exact diff review. Preserve #1409
-scoped receipt reuse, timestamp batching and shared rollout selection.
+All published roots, dependency edges and point trees must change in the
+same SQLite writer transaction. Store/open checks schema and epoch source
+digests and resumes a valid root without a fleet scan. Missing roots are built
+in fixed-size writer chunks into a shadow epoch, then published atomically.
+Until publication, the new cut is explicitly unready while the old cut remains
+readable. This availability interval is an open acceptance gap. A canonical
+reorder/rollback fences the old epoch and replays indexed affected keys into
+new roots. GC marks nodes reachable from retained roots, then sweeps at most
+a fixed node count per writer turn. It cannot delete a node reachable from a
+still-valid cursor root. Cursor lifetime and historical retention
+bound root/fact versions; measure retained bytes, startup resume, shadow
+replay and per-turn GC cost independently. GC keeps the latest root and all
+roots retired within the cursor TTL, then sweeps unreachable nodes in bounded
+chunks. Retained bytes depend on write rate times TTL and need a measured cap;
+if that cap cannot be met, first-page admission or cursor lifetime must be
+revised explicitly, never by deleting a still-valid cursor root.
 
-The required proof runs a full recomputation oracle only in tests. For all 134
-registered kinds plus `custom.*.*`, compare IDs, order, membership and every
-public field across cold/warm, historical, status-filtered, unrelated/related
-writes, expiry, replica reorder, repair, rollback, checkpoint and reopen. Assert
-zero touched card/order/dirty rows on unrelated writes. At two fleet sizes and
-two per-agent history sizes, record successful populated read VM steps, full
-scans, touched rows, writer statements, path-copied nodes and startup time.
-History-growth and writer cost are separate from fleet-growth. No budget or p99
-acceptance follows from this source prototype.
+Integration would add projection tables/migration under `Store::open`, hooks in
+claim/desired/step/local-fact writers, and then replace the shared
+`cached_agent_resources`, `client_agent_resources`, `client_agents` and detail
+paths after exact diff review. Preserve #1409 scoped receipt reuse, timestamp
+batching and rollout selection. This prototype makes none of those edits.
+
+A test-only full-fold oracle must compare IDs, order, membership and public
+fields for all 134 registered claim kinds plus `custom.*.*`, cold/warm reads,
+status filters, related/unrelated writes, expiry, canonical reorder, repair,
+rollback, checkpoint and reopen. Specifically: pin page one, update a local
+fact, then assert that page two at the old cursor retains exact old fields,
+status and membership. Compare `WorkingRun` against the actual Store fold over
+insertion, deletion, reorder, rollback and incarnation changes. At two fleet
+and two per-agent history sizes, record populated read VM steps/full scans,
+writer statements/touched rows/path copies, startup and GC. The pure monoid
+and SQL parse checks are source checks, not semantic or p99 acceptance.

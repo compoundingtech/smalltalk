@@ -5,7 +5,7 @@ CREATE TABLE agent_card_nodes (
     name TEXT NOT NULL,
     agent TEXT NOT NULL,
     card_version INTEGER NOT NULL,
-    priority BLOB NOT NULL,
+    height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 63),
     left_id INTEGER REFERENCES agent_card_nodes(id),
     right_id INTEGER REFERENCES agent_card_nodes(id)
 );
@@ -15,25 +15,53 @@ CREATE TABLE agent_card_versions (
     card_json TEXT NOT NULL CHECK (json_valid(card_json)),
     PRIMARY KEY(agent, version)
 );
+-- `version` is an opaque immutable row ID, not a store index. A second
+-- path-copied AVL tree maps agent -> card version at each source root. It
+-- preserves unchanged agents across an epoch fork without fleet copying.
+CREATE TABLE agent_card_subject_nodes (
+    id INTEGER PRIMARY KEY,
+    agent TEXT NOT NULL,
+    card_version INTEGER NOT NULL,
+    height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 63),
+    left_id INTEGER REFERENCES agent_card_subject_nodes(id),
+    right_id INTEGER REFERENCES agent_card_subject_nodes(id)
+);
+-- A canonical repair closes the old epoch at the first changed store index.
+-- Cursor cuts before that fence remain valid; cuts at/after it return a gap.
+CREATE TABLE agent_card_epochs (
+    epoch INTEGER PRIMARY KEY,
+    valid_through_store_index INTEGER,
+    source_digest TEXT NOT NULL
+);
 CREATE TABLE agent_card_roots (
+    epoch INTEGER NOT NULL REFERENCES agent_card_epochs(epoch),
     store_index INTEGER NOT NULL,
     history INTEGER NOT NULL CHECK (history IN (0, 1)),
     status TEXT NOT NULL,
     root_id INTEGER REFERENCES agent_card_nodes(id),
-    PRIMARY KEY(history, status, store_index)
+    point_root_id INTEGER REFERENCES agent_card_subject_nodes(id),
+    retired_at_ms INTEGER,
+    PRIMARY KEY(epoch, history, status, store_index)
 );
 -- Reverse seek by canonical cut: one predecessor root, no roster scan.
 CREATE INDEX agent_card_root_cut_index
-    ON agent_card_roots(history, status, store_index DESC);
+    ON agent_card_roots(epoch, history, status, store_index DESC);
 
-CREATE TABLE agent_card_local_facts (
-    agent TEXT PRIMARY KEY,
+-- Prior versions are immutable because retained presentation roots name them.
+CREATE TABLE agent_card_local_fact_versions (
+    agent TEXT NOT NULL,
     version INTEGER NOT NULL,
     facts_json TEXT NOT NULL CHECK (json_valid(facts_json)),
-    next_deadline_ms INTEGER
+    PRIMARY KEY(agent, version)
+);
+CREATE TABLE agent_card_local_current (
+    agent TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    next_deadline_ms BLOB CHECK (next_deadline_ms IS NULL OR length(next_deadline_ms)=16),
+    FOREIGN KEY(agent, version) REFERENCES agent_card_local_fact_versions(agent, version)
 );
 CREATE INDEX agent_card_local_deadline
-    ON agent_card_local_facts(next_deadline_ms, agent)
+    ON agent_card_local_current(next_deadline_ms, agent)
     WHERE next_deadline_ms IS NOT NULL;
 CREATE TABLE agent_card_presentation_nodes (
     id INTEGER PRIMARY KEY,
@@ -42,21 +70,39 @@ CREATE TABLE agent_card_presentation_nodes (
     card_version INTEGER NOT NULL,
     local_fact_version INTEGER NOT NULL,
     final_status TEXT NOT NULL,
-    priority BLOB NOT NULL,
+    height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 63),
     left_id INTEGER REFERENCES agent_card_presentation_nodes(id),
     right_id INTEGER REFERENCES agent_card_presentation_nodes(id)
 );
 CREATE TABLE agent_card_presentation_roots (
+    epoch INTEGER NOT NULL REFERENCES agent_card_epochs(epoch),
     store_index INTEGER NOT NULL,
     local_generation INTEGER NOT NULL,
     history INTEGER NOT NULL CHECK (history IN (0, 1)),
-    status TEXT NOT NULL,
-    root_id INTEGER REFERENCES agent_card_presentation_nodes(id),
+    time_root_id INTEGER REFERENCES agent_card_time_nodes(id),
     created_ms INTEGER NOT NULL,
-    PRIMARY KEY(store_index, local_generation, history, status)
+    retired_at_ms INTEGER,
+    PRIMARY KEY(epoch, store_index, local_generation, history)
 );
 CREATE INDEX agent_card_presentation_latest
-    ON agent_card_presentation_roots(history, status, store_index DESC, local_generation DESC);
+    ON agent_card_presentation_roots(epoch, history, store_index DESC, local_generation DESC);
+
+-- Fixed-depth binary interval tree over the full u128 millisecond domain.
+-- An agent's exact final-status interval [start,end) is inserted into at most
+-- 256 canonical time nodes. At a frozen time, visit the 128-node path and
+-- merge their ordered per-status AVL roots. No expiry catch-up runs on read.
+CREATE TABLE agent_card_time_nodes (
+    id INTEGER PRIMARY KEY,
+    depth INTEGER NOT NULL CHECK (depth BETWEEN 0 AND 128),
+    left_id INTEGER REFERENCES agent_card_time_nodes(id),
+    right_id INTEGER REFERENCES agent_card_time_nodes(id)
+);
+CREATE TABLE agent_card_time_status_roots (
+    time_node_id INTEGER NOT NULL REFERENCES agent_card_time_nodes(id),
+    status TEXT NOT NULL,
+    ordered_root_id INTEGER REFERENCES agent_card_presentation_nodes(id),
+    PRIMARY KEY(time_node_id, status)
+);
 
 -- Reverse owner-generation seek is missing from the current #1409 schema.
 CREATE INDEX agent_card_desired_owner_generation
@@ -85,8 +131,8 @@ CREATE TABLE agent_harness_state_nodes (
     incarnation TEXT NOT NULL,
     canonical_key BLOB NOT NULL,
     state TEXT NOT NULL,
-    accepted_at_ms INTEGER NOT NULL,
-    priority BLOB NOT NULL,
+    accepted_at_ms TEXT NOT NULL,
+    height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 63),
     left_id INTEGER REFERENCES agent_harness_state_nodes(id),
     right_id INTEGER REFERENCES agent_harness_state_nodes(id),
     summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
@@ -94,7 +140,8 @@ CREATE TABLE agent_harness_state_nodes (
 CREATE TABLE agent_harness_state_roots (
     agent TEXT NOT NULL,
     incarnation TEXT NOT NULL,
+    epoch INTEGER NOT NULL REFERENCES agent_card_epochs(epoch),
     store_index INTEGER NOT NULL,
     root_id INTEGER REFERENCES agent_harness_state_nodes(id),
-    PRIMARY KEY(agent, incarnation, store_index)
+    PRIMARY KEY(agent, incarnation, epoch, store_index)
 );

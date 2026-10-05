@@ -28,18 +28,36 @@ WHERE run_id=?1 AND generation_id=?2 AND lease_owner IS NOT NULL;
 -- passed to the queue selection for these agents, never made into a new key.
 SELECT assignee, lease_owner, available_to FROM step_runs WHERE subject=?1;
 
--- A point card read uses this key, not the ordered fleet root.
-SELECT card_json FROM agent_card_versions
-WHERE agent=?1 AND version<=?2 ORDER BY version DESC LIMIT 1;
+-- A point read seeks the immutable subject AVL root chosen at the cut, then
+-- follows one branch per level. A canonical epoch fork reuses the old root for
+-- unchanged agents; it does not copy their version intervals.
+WITH RECURSIVE seek(id) AS (
+    SELECT point_root_id FROM (
+        SELECT point_root_id FROM agent_card_roots
+        WHERE epoch=?1 AND history=?2 AND status='*' AND store_index<=?3
+        ORDER BY store_index DESC LIMIT 1
+    )
+), walk(id) AS (
+    SELECT id FROM seek
+    UNION ALL
+    SELECT CASE WHEN ?4<node.agent THEN node.left_id ELSE node.right_id END
+    FROM walk JOIN agent_card_subject_nodes AS node ON node.id=walk.id
+    WHERE node.agent<>?4
+)
+SELECT card.card_json FROM walk
+JOIN agent_card_subject_nodes AS node ON node.id=walk.id
+JOIN agent_card_versions AS card
+  ON card.agent=node.agent AND card.version=node.card_version
+WHERE node.agent=?4 LIMIT 1;
 
 -- A history/status ordered page chooses one immutable predecessor root.
 SELECT root_id FROM agent_card_roots
-WHERE history=?1 AND status=?2 AND store_index<=?3
+WHERE epoch=?1 AND history=?2 AND status=?3 AND store_index<=?4
 ORDER BY store_index DESC LIMIT 1;
 
 -- The public page uses the final presentation root. Continuations refer to
 -- its exact root ID, while a first page chooses the latest source/local cut.
-SELECT root_id, store_index, local_generation
+SELECT time_root_id, store_index, local_generation
 FROM agent_card_presentation_roots
-WHERE history=?1 AND status=?2 AND store_index<=?3
+WHERE epoch=?1 AND history=?2 AND store_index<=?3
 ORDER BY store_index DESC, local_generation DESC LIMIT 1;
