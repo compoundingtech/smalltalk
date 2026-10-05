@@ -1900,9 +1900,11 @@ fn client_agent_resources(
     at: &str,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut items = store.cached_agent_resources(snapshot_index, history, || {
-        let mut items = client_agent_resources_uncached(store, history, snapshot_index)?;
-        let subjects = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))
+    let mut items = store.cached_agent_resources(snapshot_index, history, |changed| {
+        let mut items = client_agent_resources_selected(store, history, snapshot_index, changed)?;
+        let subjects = items
+            .iter()
+            .filter_map(|item| item["id"].as_str().map(str::to_owned))
             .collect::<Vec<_>>();
         let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
         for item in &mut items {
@@ -1920,15 +1922,24 @@ fn client_agent_resources(
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
         }
-        let source = item.as_object_mut().unwrap().remove("_status_source").unwrap_or(Value::Null);
+        let source = item
+            .as_object_mut()
+            .unwrap()
+            .remove("_status_source")
+            .unwrap_or(Value::Null);
         let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
         let observation = store.seat_observation_at(
-            item["id"].as_str().unwrap_or_default(), harness.as_ref(), snapshot_index, client_now_ms(),
+            item["id"].as_str().unwrap_or_default(),
+            harness.as_ref(),
+            snapshot_index,
+            client_now_ms(),
         )?;
         item["observation"] = json!(observation);
         if observation == "stale" && item["harness_state"] == "idle" {
             item["harness_state"] = json!("indeterminate");
-            if item["state"] == "running" { item["state"] = json!("waiting"); }
+            if item["state"] == "running" {
+                item["state"] = json!("waiting");
+            }
         }
         overlay_delivery_presence(item, &local_host);
     }
@@ -2012,15 +2023,43 @@ fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
     item["delivery"] = assessment.to_value();
 }
 
+#[cfg(test)]
 fn client_agent_resources_uncached(
     store: &Store,
     history: bool,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
+    client_agent_resources_selected(store, history, snapshot_index, None)
+}
+
+fn client_agent_resources_selected(
+    store: &Store,
+    history: bool,
+    snapshot_index: u64,
+    changed: Option<(&BTreeSet<String>, &[Value])>,
+) -> anyhow::Result<Vec<Value>> {
     // Without history the store reduces only agents that can be current, including unhealthy
     // ones; the filters below keep the current layer either way.
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
-    let work_queues = store.agent_work_queues()?;
+    let status = match changed {
+        Some((subjects, _)) => {
+            store.status_for_subject_names_at(subjects.clone(), snapshot_index, history)?
+        }
+        None => store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?,
+    };
+    // Local harness/runtime observations do not change queues or their labels. Retain those
+    // fields from the previous cards rather than scanning the fleet's work again.
+    let retain_queues = changed.is_some_and(|(subjects, previous)| {
+        subjects.iter().all(|subject| {
+            previous
+                .iter()
+                .any(|item| item["id"].as_str() == Some(subject.as_str()))
+        })
+    });
+    let work_queues = if retain_queues {
+        BTreeMap::new()
+    } else {
+        store.agent_work_queues()?
+    };
     let agent_subjects = status
         .subjects
         .iter()
@@ -2224,7 +2263,7 @@ fn client_agent_resources_uncached(
                 .cloned()
                 .unwrap_or_default();
             let usage = usage_summaries.get(&subject.subject);
-            let value = json!({
+            let mut value = json!({
                 "id": subject.subject,
                 "kind": "agent",
                 "revision": revision,
@@ -2265,6 +2304,13 @@ fn client_agent_resources_uncached(
                 "handoff": handoff,
                 "rollout": crate::rollout::status(store, &subject.subject)?,
             });
+            if let Some((_, previous)) = changed.filter(|_| retain_queues)
+                && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
+                for field in ["current_work_ids", "active_work_count", "next_work_id",
+                    "upcoming_work_ids", "queued_work_count", "current_work", "next_work", "upcoming_work"] {
+                    value[field] = old[field].clone();
+                }
+            }
             Ok((name, value))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -19140,6 +19186,126 @@ mission "wake" state="ready" {
         assert_eq!(wake.assignee_state, "idle");
     }
 
+    fn checked_agent_cache(store: &Store, history: bool, index: u64) -> Vec<Value> {
+        let mut cached = store
+            .cached_agent_resources(index, history, |changed| {
+                client_agent_resources_selected(store, history, index, changed)
+            })
+            .unwrap();
+        // Production cards also cache todo; this comparison isolates the core projection.
+        for item in &mut cached {
+            item.as_object_mut().unwrap().remove("todo");
+        }
+        assert_eq!(
+            cached,
+            client_agent_resources_uncached(store, history, index).unwrap()
+        );
+        cached
+    }
+
+    #[test]
+    fn agent_cards_advance_locally_and_keep_historical_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let source = "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "incremental-cards")
+            .unwrap();
+        let append = |subject: &str, kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: None,
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        append(
+            "agent/node.amber",
+            "runtime.observed",
+            json!({
+                "status":"running", "runtime_id":"node.amber", "incarnation_id":"amber-1",
+            }),
+        );
+        let before = store.index().unwrap();
+        let original = checked_agent_cache(store, false, before);
+        checked_agent_cache(store, true, before);
+        for n in 0..12 {
+            append(
+                "agent/node.amber",
+                "harness.observed",
+                json!({
+                    "state":if n % 2 == 0 { "idle" } else { "working" },
+                    "driver":"codex", "incarnation_id":"amber-1",
+                }),
+            );
+            let at = store.index().unwrap();
+            for history in [false, true] {
+                checked_agent_cache(store, history, at);
+            }
+            // The unchanged card survives every local update.
+            let cards = checked_agent_cache(store, false, at);
+            assert_eq!(
+                cards
+                    .iter()
+                    .find(|card| card["id"] == "agent/node.cobalt")
+                    .unwrap(),
+                original
+                    .iter()
+                    .find(|card| card["id"] == "agent/node.cobalt")
+                    .unwrap()
+            );
+        }
+        // Evicted old snapshots rebuild independently of the newest cache.
+        assert_eq!(checked_agent_cache(store, false, before), original);
+        append(
+            "agent/node.cobalt",
+            "runtime.observed",
+            json!({
+                "status":"running", "runtime_id":"node.cobalt", "incarnation_id":"cobalt-1",
+            }),
+        );
+        checked_agent_cache(store, false, store.index().unwrap());
+        // A declaration changes membership and falls back to the complete projection.
+        let source = "version 2\nagent \"birch\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "incremental-new-card")
+            .unwrap();
+        let cards = checked_agent_cache(store, false, store.index().unwrap());
+        assert_eq!(
+            cards
+                .iter()
+                .map(|card| card["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["node.amber", "node.birch", "node.cobalt"]
+        );
+    }
+
     #[test]
     fn agents_name_their_queued_steps_and_missions_carry_open_run_steps() {
         let root = tempfile::tempdir().unwrap();
@@ -19216,6 +19382,17 @@ mission "labelled" state="ready" {
         );
         assert_eq!(steps[0]["goals"], json!(["Greet the fleet."]));
         assert_eq!(steps[0]["assignee"], format!("agent/{}/worker", run.id));
+
+        store.append_claim(&ClaimInput {
+            subject: format!("agent/{}/worker", run.id), kind: "harness.observed".into(),
+            actor: None, fields: serde_json::from_value(json!({
+                "state":"idle", "driver":"codex", "incarnation_id":"labelled-1",
+            })).unwrap(), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let cards = checked_agent_cache(&store, false, store.index().unwrap());
+        assert_eq!(cards[0]["next_work"], *next);
+        store.set_step_state(&first, "working", None).unwrap();
+        checked_agent_cache(&store, false, store.index().unwrap());
     }
 
     #[test]
@@ -19431,8 +19608,7 @@ mission "agent-human" state="ready" {
         };
         // Exercise the canonical graph projection independently of process-local delivery health.
         let agent = || {
-            client_agent_resources_uncached(&store, true, store.index().unwrap())
-                .unwrap()
+            checked_agent_cache(&store, true, store.index().unwrap())
                 .into_iter()
                 .find(|agent| agent["id"] == subject.as_str())
                 .unwrap()

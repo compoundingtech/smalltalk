@@ -132,7 +132,6 @@ fn shared_folds_never_order_by_local_arrival() {
     let allowed = [
         "AGENT_STATUS_INDEX_QUERY",
         "claims_page_query",
-        "agent_projection_index",
         "work_action",
         "work_action_extending",
         "events_after_bounded",
