@@ -86,7 +86,7 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
           // copied to RUNNER_TEMP before measuring: measurements still use the normal disk.
           run: 'if [ ! -s "$RUNNER_TEMP/st-bench/generated-1.sqlite3" ]; then sudo mount -o remount,size=10G /dev/shm; fi',
         },
-        { ...nixDevelopStep({ name: 'Run the pinned single-runner paired load tests', flake: '.#perf', command: ['python3', 'scripts/ci-record-paired'] }), id: 'load' },
+        { ...nixDevelopStep({ name: 'Run the pinned three-source controlled intervention', flake: '.#perf', command: ['python3', 'scripts/ci-record-intervention'] }), id: 'load' },
         {
           id: 'cache',
           name: 'Save build and Nix snapshots',

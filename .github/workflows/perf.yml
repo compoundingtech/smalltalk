@@ -105,9 +105,9 @@ jobs:
         run: bash scripts/ci-nix-cache use
       - name: Prepare fast scratch space for a new store recipe
         run: if [ ! -s "$RUNNER_TEMP/st-bench/generated-1.sqlite3" ]; then sudo mount -o remount,size=10G /dev/shm; fi
-      - name: Run the pinned single-runner paired load tests
+      - name: Run the pinned three-source controlled intervention
         shell: bash
-        run: "nix develop '.#perf' -c python3 scripts/ci-record-paired"
+        run: "nix develop '.#perf' -c python3 scripts/ci-record-intervention"
         id: load
       - id: cache
         name: Save build and Nix snapshots
