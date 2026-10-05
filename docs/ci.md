@@ -70,7 +70,7 @@ fixtures and budgets; retain completed failures as evidence. See Namespace's
   are timing-sensitive, so the build is retried up to three times.
 
 The primary test job proves that the two actual nextest inventories are disjoint and their union
-equals the full selected suite before running the explicit zero-retry mail canaries. It also
+equals the full selected suite. The explicit zero-retry mail canaries run in a parallel job. The primary also
 runs the standalone conversation model feature check. The second shard runs the remaining
 workspace and st2 tests on independent Namespace CPUs. `linux-gate` requires both shards;
 failure, cancellation or skipping either shard fails the gate. Each shard retains passing test
@@ -553,7 +553,7 @@ accepted-source verification remain in place.
 
 ## Required mail redelivery canaries
 
-Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires twenty named,
+Alongside the two Linux test shards, `scripts/ci-mail-redelivery-canaries` requires twenty named,
 unignored regressions: boot/reconnect mailbox suppression and recent unoffered recovery for
 Claude, Codex, OpenCode, Pi, and OMP; each harness's native suspend/resume canary with hour-old
 mail held and recent unoffered mail consumed exactly once; legacy polling recovery through the
@@ -565,9 +565,12 @@ mail, prove zero historical offers, preserve explicit mailbox access, and recove
 send after a daemon restart with exactly one receipt pair. Every selected test runs with zero retries.
 
 The script fails if any required test is missing, ignored, or filtered out. The named
-`mail-redelivery-canaries` check reads that step's actual outcome; a skipped step cannot pass.
+`mail-redelivery-canaries` check executes the script on its own Namespace 8x16 runner; a skipped
+or failed job cannot pass.
 `linux-gate` requires it, so this protection applies to pull requests and merge groups. It
-reuses the compiled Linux test runner instead of allocating another native-test runner.
+restores the main-seeded Linux test Cargo and Nix caches, prepares the same fixtures and rendered
+hooks, and retains its own logs, timing and failure evidence. It never uses the native priority
+or merge lanes, and neither test shard waits for it before starting its own suite.
 Apply the fifth live ruleset check after this workflow has passed on main.
 
 ## Generated files and existing workflows
