@@ -19153,6 +19153,48 @@ fn current_harness_at(
     Ok(view)
 }
 
+/// Channel readiness is independent of hook activity. A current driver owns this fence;
+/// MCP initialization under its delivery binding, or runtime replacement, clears it.
+fn claude_attachment_fence(
+    connection: &Connection,
+    subject: &str,
+    incarnation: &str,
+    at_index: u64,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
+    let claim = connection.prepare_cached(&format!(
+        "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.diagnostic' AND claims.store_index<=?2
+           AND json_extract(claims.body, '$.fields.incarnation_id')=?3
+           AND json_extract(claims.body, '$.fields.code') IN ('claude-channel-unattached','claude-channel-attached')
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    ))?.query_row(params![subject, at_index, incarnation], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    }).optional()?;
+    let Some((claim, body, at)) = claim else {
+        return Ok(None);
+    };
+    let body: Value = serde_json::from_str(&body)?;
+    if body["fields"]["code"] == "claude-channel-attached" {
+        return Ok(None);
+    }
+    let starting = body["fields"]["status"] == "starting";
+    Ok(Some(crate::model::CurrentHarnessView {
+        state: if starting { "starting" } else { "blocked" }.into(),
+        driver: Some("claude".into()),
+        incarnation_id: incarnation.into(),
+        transport: Some("claude-channel".into()),
+        reason: Some("claude-channel-unattached".into()),
+        blocked_on: Some("channel".into()),
+        ask: None,
+        input_buffer: None,
+        exit: None,
+        claim,
+        since_unix_ms: at.parse()?,
+        observed_at_unix_ms: at.parse()?,
+    }))
+}
+
 fn current_harness_fold_at(
     connection: &Connection,
     subject: &str,
@@ -19241,6 +19283,10 @@ fn current_harness_fold_at(
             since_unix_ms: observed_at_unix_ms.parse::<u128>()?,
             observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
         }));
+    }
+
+    if let Some(harness) = claude_attachment_fence(connection, subject, incarnation_id, at_index)? {
+        return Ok(Some(harness));
     }
 
     // The observations of this runtime epoch, newest first in canonical order, so every node that

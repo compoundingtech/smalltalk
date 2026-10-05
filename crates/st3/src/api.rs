@@ -541,6 +541,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/mailbox", get(mailbox::subscribe))
         .route("/v1/harness-events", post(harness_events::publish))
         .route("/v1/mailbox/bind", post(mailbox::bind))
+        .route("/v1/mailbox/attachment", get(mailbox::attachment))
         .route("/v1/mailbox/receipts", post(mailbox::receipt))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/read/{*subject}", get(read_message))
