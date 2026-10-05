@@ -286,6 +286,12 @@ pub fn run(context: Context) -> Result<()> {
         ui.flash("The old screens are gone: this is spaces, and ? shows its keys");
     }
 
+    // A stui killed from outside leaves its last picture on the screen; the next one says so.
+    let (_run, earlier) = super::lastrun::begin(&crate::version::short(crate::version::now()));
+    if let Some(note) = earlier {
+        // Long enough to read: the usual flash ends after four seconds.
+        ui.flash = Some((note, Instant::now() + Duration::from_secs(26)));
+    }
     let _guard = Guard::enter(ui.glasses.is_some())?;
     // The release smoke test's probe: the terminal is restored after a panic too.
     #[cfg(debug_assertions)]

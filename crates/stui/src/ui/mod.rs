@@ -16,6 +16,7 @@ mod edit;
 mod glass;
 pub use glass::set_glasses_version;
 mod glass_store;
+mod lastrun;
 pub mod layout;
 pub mod live;
 pub mod pane;
