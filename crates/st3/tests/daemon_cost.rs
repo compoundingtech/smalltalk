@@ -36,10 +36,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, HeaderValue};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post as axum_post;
+use axum::Router;
 use serde_json::{Value, json};
 use smallclaims::sqlite::work::{self, SqliteWork};
+use smallclaims::sync::PeerResponse;
 use st3::api::AppState;
 use st3::client::Client;
+use st3::config::{Config, PeerConfig};
+use st3::peer::{ClientReadOperation, ClientReadRequest, ClientReadRoute, ClientRelay, FleetAuth};
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
 
@@ -398,6 +407,15 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    post(
+        "POST /v1/internal/client-read/forward",
+        st3::peer::CLIENT_READ_FORWARD_PATH,
+        |_, _| json!({
+            "authority_actor": "person/bench-operator",
+            "request": {"operation": "messages", "actor": "agent/bench/cost/reader", "history": false, "limit": 20, "cursor": null},
+            "relay": {"target": "host/cost-owner", "path": ["cost-source"], "hops_left": 3}
+        }),
+    ),
     post(
         "POST /v1/schema/registrations",
         "/v1/schema/registrations",
@@ -1346,10 +1364,16 @@ fn declared_routes(source: &str) -> BTreeSet<String> {
             .expect("a .route( call closes");
         let arguments = &rest[..end];
         rest = &rest[end..];
-        let Some(path) = arguments.split('"').nth(1) else {
-            continue;
+        let (path_argument, handlers) = arguments
+            .split_once(',')
+            .expect("a .route call has a path and a handler");
+        let path = match path_argument.trim() {
+            "crate::peer::CLIENT_READ_FORWARD_PATH" => st3::peer::CLIENT_READ_FORWARD_PATH,
+            literal if literal.starts_with('"') && literal.ends_with('"') => {
+                literal.trim_matches('"')
+            }
+            expression => panic!("resolve the nonliteral route path: {expression}"),
         };
-        let handlers = arguments.splitn(3, '"').nth(2).unwrap_or_default();
         for (method, call) in [
             ("GET", "get("),
             ("POST", "post("),
@@ -1380,9 +1404,51 @@ fn declared_routes(source: &str) -> BTreeSet<String> {
     routes
 }
 
+#[test]
+fn the_cost_route_inventory_resolves_the_client_read_forward_constant() {
+    let declared = declared_routes(include_str!("../src/api.rs"));
+    assert!(declared.contains("POST /v1/internal/client-read/forward"));
+}
+
 struct Measured {
     claims: u64,
     costs: BTreeMap<String, Cost>,
+}
+
+/// A signed, populated owner answer isolates the forwarding route's local work from the
+/// owner-side operation, which the read census measures separately for each variant.
+async fn invented_client_read_owner(
+    State(auth): State<FleetAuth>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let sender = auth
+        .verify_sender(&headers, "POST", "/v1/peer/client-read", &body, Some(NODE), None)
+        .expect("the forward probe must use its invented fleet credentials");
+    assert_eq!(sender.name, NODE);
+    let request: ClientReadRequest = serde_json::from_slice(&body).unwrap();
+    assert_eq!(request.authority_actor, "person/bench-operator");
+    assert!(request.relay.is_none(), "direct owner delivery has no relay fence");
+    assert!(matches!(request.request, ClientReadOperation::Messages { actor, history: false, limit: Some(20), cursor: None } if actor == "agent/bench/cost/reader"));
+    let envelope = PeerResponse::new("cost-owner", 1, json!({
+        "items": [{"id": "message/cost-forward", "content": "invented owner answer"}],
+        "page": {"has_more": false}
+    }));
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    let signed = auth
+        .response_headers_for(
+            "/v1/peer/client-read",
+            "cost-owner",
+            &bytes,
+            &FleetAuth::body_digest(&body),
+        )
+        .unwrap();
+    let mut response = bytes.into_response();
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
+    response.headers_mut().extend(signed);
+    response
 }
 
 /// Work counted while `request` runs and until the daemon's own work for it settles.
@@ -1454,6 +1520,30 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
 
     let socket = root.join("st3.sock");
     let pty = stub_pty(root);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let secret = root.join("cost-forward-secret");
+    std::fs::write(&secret, [13_u8; 32]).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let auth = FleetAuth::load(FLEET, &secret).unwrap();
+    let owner_router = Router::new()
+        .route("/v1/peer/client-read", axum_post(invented_client_read_owner))
+        .with_state(auth);
+    let owner_server = tokio::spawn(async move { axum::serve(listener, owner_router).await });
+    let relay = ClientRelay::from_config(&Config {
+        node: NODE.into(),
+        fleet_id: Some(FLEET.into()),
+        shared_secret_file: Some(secret),
+        peers: vec![PeerConfig {
+            name: "cost-owner".into(),
+            url: format!("http://{address}"),
+        }],
+        ..Default::default()
+    })
+    .unwrap();
     let state = AppState {
         store: store.clone(),
         notify: Arc::new(Notify::new()),
@@ -1464,7 +1554,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         pty_binary: pty,
         fleet_id: Some(FLEET.into()),
         configured_peers: vec![PEER.into()],
-        client_relay: None,
+        client_relay: relay,
         native_session_home: Some(root.join("home")),
         planner_default: st3::model::PlannerSpec::default(),
     };
@@ -1575,7 +1665,18 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                         None => client.get::<Value>(&path).await,
                         Some(body) => client.post::<_, Value>(&path, body).await,
                     };
-                    answer.map_err(|error| error.to_string().chars().take(200).collect())
+                    answer
+                        .and_then(|value| {
+                            if probe.route == "POST /v1/internal/client-read/forward"
+                                && (value["items"][0]["id"] != "message/cost-forward"
+                                    || value["items"][0]["content"] != "invented owner answer"
+                                    || value["page"]["has_more"] != false)
+                            {
+                                anyhow::bail!("the authenticated forward answer lost its invented owner content");
+                            }
+                            Ok(value)
+                        })
+                        .map_err(|error| error.to_string().chars().take(200).collect())
                 })
                 .await
             };
@@ -1657,6 +1758,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     }
     costs.insert(SUMMARY.to_owned(), Cost::least(&samples));
     server.abort();
+    owner_server.abort();
 
     // Last, as it deletes most of the store: a checkpoint trim, per row it deletes.
     costs.insert(
