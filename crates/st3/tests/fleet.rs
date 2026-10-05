@@ -231,14 +231,26 @@ impl Node {
         let legacy = fs::read_to_string(self.root.join("config/st3/config.toml"))
             .is_ok_and(|config| config.contains("fleet_id"));
         if legacy || self.state_dir().join("fleet/fleet.toml").exists() {
-            let worker = self
-                .command(&["replication-worker"])
+            self.start_worker();
+        }
+    }
+
+    fn start_worker(&mut self) {
+        assert!(self.worker.is_none());
+        self.worker = Some(
+            self.command(&["replication-worker"])
                 .stdin(Stdio::null())
-                .stdout(log("worker.log"))
-                .stderr(log("worker.stderr.log"))
+                .stdout(fs::File::create(self.root.join("worker.log")).unwrap())
+                .stderr(fs::File::create(self.root.join("worker.stderr.log")).unwrap())
                 .spawn()
-                .unwrap();
-            self.worker = Some(worker);
+                .unwrap(),
+        );
+    }
+
+    fn stop_worker(&mut self) {
+        if let Some(mut child) = self.worker.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
@@ -1621,6 +1633,92 @@ async fn the_secret_never_leaves_its_file() {
         assert!(!contains(documents.as_bytes()));
     }
     let _ = json!({});
+}
+
+/// A rejoining member with tombstones from a different checkpoint lineage must still exchange
+/// later live claims in both directions (#1431). The tombstone rows model already-certified
+/// offline trims; this test does not manufacture certificates or transport tombstones.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejoin_exchanges_live_claims_beyond_differing_checkpoint_tombstones() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut birch = anchor(root.path(), "birch").await;
+    let mut cedar = joined(root.path(), &birch, "cedar", &[]).await;
+    birch.note("birch-shared").await;
+    cedar.note("cedar-shared").await;
+    let shared = BTreeSet::from([
+        "custom/fleet-test/birch-shared".into(),
+        "custom/fleet-test/cedar-shared".into(),
+    ]);
+    for node in [&birch, &cedar] {
+        wait_for_notes(node, &shared, 30, &[&birch, &cedar]).await;
+    }
+    birch.stop();
+    cedar.stop();
+    for node in [&birch, &cedar] {
+        let mut connection =
+            rusqlite::Connection::open(node.state_dir().join("claims.sqlite3")).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for id in smallclaims::store::test_envelope_ids("alder-retired", 0..768, &node.name) {
+            transaction
+                .execute(
+                    "INSERT INTO checkpoint_envelopes VALUES (?1, ?2, ?3, 0, ?4)",
+                    rusqlite::params![
+                        id.writer,
+                        id.sequence,
+                        id.hash,
+                        format!("checkpoint/{}", node.name)
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+    // Publish on both sides with no replication listener open, then rejoin their workers.
+    birch.start().await;
+    birch.stop_worker();
+    cedar.start().await;
+    cedar.stop_worker();
+    let mut expected = shared;
+    for node in [&birch, &cedar] {
+        for index in 0..4 {
+            let text = format!("{}-partition-{index}", node.name);
+            node.note(&text).await;
+            expected.insert(format!("custom/fleet-test/{text}"));
+        }
+    }
+    assert_eq!(birch.notes().await.len(), 6);
+    assert_eq!(cedar.notes().await.len(), 6);
+    let before = [&birch, &cedar].map(|node| {
+        node.st_json(&["replication", "status"])["timings"]["exchanges"]
+            .as_u64()
+            .unwrap()
+    });
+    birch.start_worker();
+    cedar.start_worker();
+    for (node, before) in [&birch, &cedar].into_iter().zip(before) {
+        wait_until("both rejoined workers exchange successfully", 15, || async {
+            node.st_json(&["replication", "status"])["timings"]["exchanges"]
+                .as_u64()
+                .unwrap() >= before + 4
+        }).await;
+        let status = node.st_json(&["replication", "status"]);
+        eprintln!("{} rejoin exchanges={} envelopes_received={}",
+            node.name, status["timings"]["exchanges"], status["timings"]["envelopes_received"]);
+    }
+    for node in [&birch, &cedar] {
+        wait_for_notes(node, &expected, 30, &[&birch, &cedar]).await;
+        let connection =
+            rusqlite::Connection::open(node.state_dir().join("claims.sqlite3")).unwrap();
+        let count: u64 = connection
+            .query_row("SELECT COUNT(*) FROM checkpoint_envelopes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 768, "no tombstone payloads replicate");
+    }
 }
 
 /// `st fleet wait` gates a restart (#1022). A first sync is verified once; after a restart
