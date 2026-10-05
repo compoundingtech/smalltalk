@@ -5224,6 +5224,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 )
             }
             "verifying" => {
+                let due = suspension
+                    .updated_at_unix_ms
+                    .saturating_add(suspended::VERIFY_TIMEOUT_MS)
+                    .saturating_add(1);
                 let overdue = now_ms().saturating_sub(suspension.updated_at_unix_ms)
                     > suspended::VERIFY_TIMEOUT_MS;
                 if let Some(observation) = running {
@@ -5263,7 +5267,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                             ),
                             Vec::new(),
                         ),
-                        None => Ok(()),
+                        None => {
+                            self.arm_deadline_at(agent, due, "timer resume-verification");
+                            Ok(())
+                        }
                     }
                 } else if ended {
                     if let Some(observation) = observation {
@@ -5360,6 +5367,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         Vec::new(),
                     )
                 } else {
+                    self.arm_deadline_at(agent, due, "timer resume-verification");
                     Ok(())
                 }
             }
@@ -7828,10 +7836,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             smallclaims::touched::note_read(|| format!("exec:{runtime_id}"));
             match self.runtime.observe_exec(&runtime_id)? {
-                Some(observation) if observation.status == "running" => {
-                    self.arm_gate_poll(&runtime_id);
-                    return Ok(None);
-                }
                 Some(observation) if observation.status == "exited" => {
                     if self.gate_exit_code(&subject, &observation)? != Some(0) {
                         anyhow::bail!("metric `{}` exited unsuccessfully", metric.name);
@@ -7857,6 +7861,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                     return Ok(Some(value));
                 }
                 _ => {
+                    self.arm_deadline_at(
+                        &subject,
+                        request.accepted_at_unix_ms
+                            .saturating_add(u128::from(*time_limit_ms)),
+                        "timer gate-timeout",
+                    );
                     self.arm_gate_poll(&runtime_id);
                     return Ok(None);
                 }
@@ -7871,6 +7881,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("owner".into(), Value::String(view.subject.clone())),
             ]),
         )?;
+        let request = self
+            .store
+            .latest_claim(&subject, Some("gate.requested"))?
+            .context("the metric request disappeared")?;
         let member = MemberSpec {
             kind: MemberKind::Exec,
             host,
@@ -7903,6 +7917,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             &member,
             "the loop metric was requested",
         )?;
+        self.arm_deadline_at(
+            &subject,
+            request.accepted_at_unix_ms
+                .saturating_add(u128::from(*time_limit_ms)),
+            "timer gate-timeout",
+        );
         self.arm_gate_poll(&member.runtime_id);
         Ok(None)
     }
@@ -10314,6 +10334,15 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.arm_deadline(handle, step, remaining, "timer step-timeout");
     }
 
+    /// Record the exact clock dependency even when no runtime can spawn its wake.
+    fn arm_deadline_at(&self, key: &str, deadline: u128, wake: &'static str) {
+        smallclaims::touched::note_due(deadline);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let remaining = deadline.saturating_sub(now_ms()).min(u128::from(u64::MAX)) as u64;
+            self.arm_deadline(&handle, key, remaining, wake);
+        }
+    }
+
     /// Wake the reconciler in `remaining` ms for `key`, unless `key` already armed a wake at or
     /// before then; `wake` names the timer in wake accounting.
     fn arm_deadline(
@@ -12324,14 +12353,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .saturating_add(self.gate_recheck_delay_ms(previous));
                     let now = now_ms();
                     if !started && now < due {
-                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                            self.arm_deadline(
-                                &handle,
-                                &result_subject,
-                                (due - now).min(u128::from(u64::MAX)) as u64,
-                                "timer gate-recheck",
-                            );
-                        }
+                        self.arm_deadline_at(&result_subject, due, "timer gate-recheck");
                         return Ok(GateOutcome::NotYet);
                     }
                     next
@@ -12389,6 +12411,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                     self.record_gate_check(stage, check)
                 }
                 _ => {
+                    self.arm_deadline_at(
+                        &operation,
+                        requested.accepted_at_unix_ms
+                            .saturating_add(u128::from(time_limit_ms)),
+                        "timer gate-timeout",
+                    );
                     self.arm_gate_poll(&runtime_id);
                     Ok(GateOutcome::Pending)
                 }
@@ -12412,6 +12440,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("owner".into(), Value::String(stage.subject.clone())),
             ]),
         )?;
+        let requested = self
+            .store
+            .latest_claim(&operation, Some("gate.requested"))?
+            .context("the mechanical gate request disappeared")?;
         let mut environment = environment.clone();
         environment.insert(
             crate::gate_report::ENV.into(),
@@ -12456,6 +12488,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             );
             return self.record_gate_check(stage, check);
         }
+        self.arm_deadline_at(
+            &operation,
+            requested.accepted_at_unix_ms
+                .saturating_add(u128::from(time_limit_ms)),
+            "timer gate-timeout",
+        );
         self.arm_gate_poll(&member.runtime_id);
         Ok(GateOutcome::Pending)
     }
@@ -12520,15 +12558,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(match answer {
             "pass" => GateOutcome::Pass,
             "not-yet" => {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let delay = self.gate_recheck_delay_ms(check.check);
-                    self.arm_deadline(
-                        &handle,
-                        check.result_subject,
-                        delay.min(u128::from(u64::MAX)) as u64,
-                        "timer gate-recheck",
-                    );
-                }
+                let result = self
+                    .store
+                    .latest_claim(check.result_subject, Some("gate.result"))?
+                    .context("the mechanical gate result disappeared")?;
+                self.arm_deadline_at(
+                    check.result_subject,
+                    result.accepted_at_unix_ms
+                        .saturating_add(self.gate_recheck_delay_ms(check.check)),
+                    "timer gate-recheck",
+                );
                 GateOutcome::NotYet
             }
             _ => {

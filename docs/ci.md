@@ -465,12 +465,14 @@ accepted-source verification remain in place.
 
 ## Required mail redelivery canaries
 
-Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires eleven named,
-unignored regressions: boot/reconnect mailbox suppression for Claude, Codex, OpenCode, Pi,
-and OMP; each harness's native suspend/resume canary with old mail held and fresh mail read;
-and delivered-but-unread retention across native channel restart. The mailbox cases seed
-sent, staged, and delivered-but-unread mail and prove zero old offers, live delivery, and
-continued explicit mailbox access. Every selected test runs with zero retries.
+Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires seventeen named,
+unignored regressions: boot/reconnect mailbox suppression and recent unoffered recovery for
+Claude, Codex, OpenCode, Pi, and OMP; each harness's native suspend/resume canary with hour-old
+mail held and recent unoffered mail consumed exactly once; legacy polling recovery through the
+current offer's receipt sequence; and delivered-but-unread retention across native channel
+restart. The mailbox cases seed hour-old sent mail and recent staged and delivered-but-unread
+mail, prove zero historical offers, preserve explicit mailbox access, and recover an in-flight
+send after a daemon restart with exactly one receipt pair. Every selected test runs with zero retries.
 
 The script fails if any required test is missing, ignored, or filtered out. The named
 `mail-redelivery-canaries` check reads that step's actual outcome; a skipped step cannot pass.
