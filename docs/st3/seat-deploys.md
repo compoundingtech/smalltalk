@@ -92,11 +92,21 @@ and seats that were already running on the legacy path continue to use ordinary 
 
 Seat updates carry `desired.display_name` and the member record, including the persona suffix.
 They update the PTY title and pi/omp session name on reconnect, `session_start`, and `session_switch`.
+Native driver title updates use the launcher's `PTY_SESSION` registry name; the provider's logical
+runtime ID can differ from that name. Failed title updates go to the private driver warning log,
+at most once every ten seconds, without writing into the harness terminal.
 OMP compares the declared label with its current session name before writing it, so replaying an
 unchanged Seat on reconnect does not append a title change or rewrite the saved title timestamp.
 Older OMP releases without `getSessionName` still apply the declared label without that comparison.
 Claude's status line reads the same graph authority on each render and chains the existing renderer.
 Native `/rename` is temporary: the next authority update restores the declared name.
+
+Live harness evidence is refreshed every twenty seconds, inside the client's ninety-second
+observation freshness horizon. The driver retries its durable observation outbox across daemon
+outages; mailbox subscriptions reconnect under the existing incarnation and fence. Once the daemon
+returns, quiet seats recover their current observation without a provider restart or a new turn.
+Heartbeats remain evidence-gated: missing, ended, superseded, or disconnected provider observations
+are never kept alive merely because an outer process still exists.
 
 A long-lived process keeps executing the file it started from. Linux names that image
 `PATH (deleted)` once the file is replaced. Before this change the processes above kept talking to
