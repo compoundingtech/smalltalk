@@ -15,13 +15,15 @@ at most `limit+1` nodes. A point lookup uses a separate subject-keyed version
 index. Historical cuts and continuations refer to immutable roots. Retain roots
 until their bounded cursor lifetime ends; otherwise return `page-cursor-expired`.
 
-The card tree contains stable replicated fields. A second immutable presentation
-tree holds local observations, transport facts, subagent/step lease state, and
-their next expiry per agent. It also maintains final status filter roots, since
-an expiry can move a card between status classes without a claim. A cursor binds
-both root IDs, the source cut, the frozen read time, filter, page size and last
-key. An unrelated local write creates a newer root but cannot change the old
-page. Deadline and local-fact updates path-copy only affected agent keys.
+The card tree contains stable replicated fields. Keyed local facts hold
+observation, transport, subagent/step lease state and each next expiry. A
+second immutable presentation tree combines stable card versions with those
+facts, ordered by `(name, id)` with roots for each final status filter. An
+expiry can therefore move one card between status classes without a claim.
+A cursor binds its exact presentation root ID, the source cut, local
+generation, frozen read time, filter, page size and last key. An unrelated
+local write creates a newer root but cannot change the old page. Deadline and
+local-fact updates path-copy only affected agent keys.
 
 These trees must be stored in the same SQLite writer transaction as the claim
 projection and reverse dependencies. No process-local map is authoritative.

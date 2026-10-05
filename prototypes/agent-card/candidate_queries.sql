@@ -36,3 +36,10 @@ WHERE agent=?1 AND version<=?2 ORDER BY version DESC LIMIT 1;
 SELECT root_id FROM agent_card_roots
 WHERE history=?1 AND status=?2 AND store_index<=?3
 ORDER BY store_index DESC LIMIT 1;
+
+-- The public page uses the final presentation root. Continuations refer to
+-- its exact root ID, while a first page chooses the latest source/local cut.
+SELECT root_id, store_index, local_generation
+FROM agent_card_presentation_roots
+WHERE history=?1 AND status=?2 AND store_index<=?3
+ORDER BY store_index DESC, local_generation DESC LIMIT 1;

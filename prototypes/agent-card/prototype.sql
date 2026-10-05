@@ -26,20 +26,37 @@ CREATE TABLE agent_card_roots (
 CREATE INDEX agent_card_root_cut_index
     ON agent_card_roots(history, status, store_index DESC);
 
-CREATE TABLE agent_card_local_nodes (
+CREATE TABLE agent_card_local_facts (
+    agent TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    facts_json TEXT NOT NULL CHECK (json_valid(facts_json)),
+    next_deadline_ms INTEGER
+);
+CREATE INDEX agent_card_local_deadline
+    ON agent_card_local_facts(next_deadline_ms, agent)
+    WHERE next_deadline_ms IS NOT NULL;
+CREATE TABLE agent_card_presentation_nodes (
     id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
     agent TEXT NOT NULL,
-    fact_version INTEGER NOT NULL,
-    next_deadline_ms INTEGER,
+    card_version INTEGER NOT NULL,
+    local_fact_version INTEGER NOT NULL,
+    final_status TEXT NOT NULL,
     priority BLOB NOT NULL,
-    left_id INTEGER REFERENCES agent_card_local_nodes(id),
-    right_id INTEGER REFERENCES agent_card_local_nodes(id)
+    left_id INTEGER REFERENCES agent_card_presentation_nodes(id),
+    right_id INTEGER REFERENCES agent_card_presentation_nodes(id)
 );
-CREATE TABLE agent_card_local_roots (
-    generation INTEGER PRIMARY KEY,
-    root_id INTEGER REFERENCES agent_card_local_nodes(id),
-    created_ms INTEGER NOT NULL
+CREATE TABLE agent_card_presentation_roots (
+    store_index INTEGER NOT NULL,
+    local_generation INTEGER NOT NULL,
+    history INTEGER NOT NULL CHECK (history IN (0, 1)),
+    status TEXT NOT NULL,
+    root_id INTEGER REFERENCES agent_card_presentation_nodes(id),
+    created_ms INTEGER NOT NULL,
+    PRIMARY KEY(store_index, local_generation, history, status)
 );
+CREATE INDEX agent_card_presentation_latest
+    ON agent_card_presentation_roots(history, status, store_index DESC, local_generation DESC);
 
 -- Reverse owner-generation seek is missing from the current #1409 schema.
 CREATE INDEX agent_card_desired_owner_generation
