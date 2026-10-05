@@ -66,6 +66,7 @@ st missions ls
 st missions show --help
 st missions show mission-run/64bcc9227e0166a571e09117d35c572e
 st missions publish --help
+st missions publish mission.kdl --as person/alex --dry-run
 st missions check --help
 st missions start --help
 st missions cancel --help
@@ -76,6 +77,10 @@ st missions retire --help
 `ls` and `show` are live reads. Publication, start, cancel, setting a finished run's outcome, and
 retirement are reviewed through help here and are mutation-tested only in the disposable fixture
 run.
+
+`publish --dry-run` (alias `--preview`) prints the resolved intent and publication diagnostics,
+including blockers, without publishing or running exec gates. Add `--json` for the complete
+preview object. `missions check FILE` runs gate commands separately when needed.
 
 ### 3. `work` — the truthful queue and worker lifecycle
 
