@@ -102,6 +102,7 @@ async fn collection_items(
     state: &AppState,
     session: &ClientSession,
     request: &CollectionSubscribe,
+    read_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if !matches!(
         request.collection.as_str(),
@@ -131,6 +132,8 @@ async fn collection_items(
     let status = request.status.clone();
     let collection = request.collection.clone();
     let (snapshot, mut items, has_more) = super::blocking_store(move || {
+        // Keep the physical read slot even if its awaiting subscription is canceled.
+        let _read_permit = read_permit;
         let store = state.store.clone();
         store.read_snapshot(|index| {
             let snapshot = client_snapshot_at(&state, index);
@@ -573,7 +576,7 @@ async fn collection_stream_socket(
         state,
         session,
         Some(presence),
-        |state, session, request| async move { collection_items(&state, &session, &request).await },
+        |state, session, request, permit| async move { collection_items(&state, &session, &request, permit).await },
     )
     .await;
 }
@@ -585,7 +588,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     presence: Option<super::client_presence::StreamGuard>,
     read: F,
 ) where
-    F: Fn(AppState, ClientSession, CollectionSubscribe) -> Fut + Clone + Send + 'static,
+    F: Fn(AppState, ClientSession, CollectionSubscribe, tokio::sync::OwnedSemaphorePermit) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
 {
     // Subscribe before the first snapshot, so a commit while building it wakes
@@ -603,6 +606,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     let mut reread_due = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
     let mut reads = futures_util::stream::FuturesUnordered::new();
+    let read_slots = Arc::new(tokio::sync::Semaphore::new(COLLECTION_MAX_SUBSCRIPTIONS));
     let mut generation = 0_u64;
     loop {
         // The subscriptions to read after this wake-up.
@@ -771,11 +775,15 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             let request = subscription.request.clone();
             let generation = subscription.generation;
             let (state, session, read) = (state.clone(), session.clone(), read.clone());
+            let read_slots = read_slots.clone();
             reads.push(async move {
                 tokio::select! {
                     biased;
                     _ = canceled => None,
-                    result = read(state, session, request) => {
+                    result = async {
+                        let permit = read_slots.acquire_owned().await.expect("socket read slots stay open");
+                        read(state, session, request, permit).await
+                    } => {
                         Some((id, generation, result))
                     }
                 }
@@ -9071,14 +9079,14 @@ mod tests {
                     upgrade.on_upgrade(move |socket| {
                         collection_stream_socket_with_reader(
                             socket, state, ClientSession::local(None).unwrap(), None,
-                            move |state, session, request| {
+                            move |state, session, request, permit| {
                                 let (entered, release) = (entered.clone(), release.clone());
                                 async move {
                                     if request.limit == Some(1) {
                                         entered.notify_one();
                                         release.notified().await;
                                     }
-                                    collection_items(&state, &session, &request).await
+                                    collection_items(&state, &session, &request, permit).await
                                 }
                             },
                         )
@@ -9129,6 +9137,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacing_collection_bounds_detached_blocking_reads() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let (release, held) = tokio::sync::watch::channel(false);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, gate, started) = (state.clone(), held.clone(), started.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let (mut gate, started) = (gate.clone(), started.clone());
+                                async move {
+                                    let permit = tokio::task::spawn_blocking(move || {
+                                        started.send(()).unwrap();
+                                        let _ = tokio::runtime::Handle::current().block_on(gate.wait_for(|released| *released));
+                                        permit
+                                    }).await.unwrap();
+                                    collection_items(&state, &session, &request, permit).await
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        let command = json!({"kind":"subscribe","id":"replace","collection":"work","limit":2}).to_string();
+        for _ in 0..COLLECTION_MAX_SUBSCRIPTIONS {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(command.clone().into())).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap();
+        }
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(command.into())).await.unwrap();
+        let extra = tokio::time::timeout(Duration::from_millis(100), starts.recv()).await;
+        // Release before asserting so a failed assertion cannot strand blocking tasks.
+        release.send(true).unwrap();
+        assert!(extra.is_err(), "replacement exceeded the physical read bound");
+        tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "replace");
+        assert_eq!(frame["kind"], "snapshot");
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn dirty_refused_collection_does_not_erase_another_windows_retry() {
         use futures_util::{SinkExt as _, StreamExt as _};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9145,7 +9207,7 @@ mod tests {
                     upgrade.on_upgrade(move |socket| {
                         collection_stream_socket_with_reader(
                             socket, state, ClientSession::local(None).unwrap(), None,
-                            move |state, session, request| {
+                            move |state, session, request, permit| {
                                 let (release, attempts) = (release.clone(), attempts.clone());
                                 async move {
                                     if request.collection == "agents" {
@@ -9154,7 +9216,7 @@ mod tests {
                                     } else if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                                         Err(ApiError::internal("injected transient failure"))
                                     } else {
-                                        collection_items(&state, &session, &request).await
+                                        collection_items(&state, &session, &request, permit).await
                                     }
                                 }
                             },
@@ -9210,7 +9272,7 @@ mod tests {
                             state,
                             ClientSession::local(None).unwrap(),
                             None,
-                            move |state, session, request| {
+                            move |state, session, request, permit| {
                                 let reads = reads.clone();
                                 async move {
                                     if request.id == "refused" {
@@ -9218,7 +9280,7 @@ mod tests {
                                     } else if reads.fetch_add(1, Ordering::SeqCst) == 0 {
                                         Err(ApiError::internal("injected first read failure"))
                                     } else {
-                                        collection_items(&state, &session, &request).await
+                                        collection_items(&state, &session, &request, permit).await
                                     }
                                 }
                             },
