@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `b05d1ab00aed5e82fd7d2ca0db8c862e57110a92193d3301adafbf40a75197d6`
+Digest: `98eccf896c31b737e44381d35e9597ec9ed1295f7601a88bdc3c08caa2c19eeb`
 
 ## Subject families
 
@@ -76,6 +76,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `checkpoint.verified` | `checkpoint` | `system-only` | `append` | `durable` | `build:string`, `checkpoint_protocol!:integer`, `cut_unix_ms!:integer`, `drop_digest!:string`, `dropped_claims!:integer`, `dropped_envelopes!:integer`, `graph_digest!:string`, `participants:array`, `reader_digest!:string`, `retained_digest!:string`, `rules_digest!:string`, `sealed_digest!:string` |  |
 | `daemon.diagnostic` | `daemon` | `system-only` | `append` | `durable` | `code!:string`, `reason!:string`, `severity!:string`, `status:string` |  |
 | `daemon.started` | `daemon` | `system-only` | `append` | `durable` | `features:object`, `pid:integer`, `schema:string`, `schema_digest:string`, `status!:string`, `version:string` | `reset` |
+| `decision.observed` | `agent` | `same-subject-actor` | `append` | `durable` | `activation!:string`, `answer_id:string`, `decision_id!:subject-reference(resource)`, `decision_kind!:string`, `native_ask:object`, `person!:subject-reference(person)`, `q!:integer`, `request_id!:string`, `revived!:boolean`, `source_revision!:string`, `source_sequence!:integer`, `state!:string` |  |
 | `delivery.hold` | `agent` | `authorized-requester` | `state-transition` | `durable` | `held!:boolean`, `legacy_adoption:boolean`, `reason!:string`, `until_unix_ms!:integer` |  |
 | `doc.bound` | `doc` | `authorized-requester` | `append` | `durable` | `executable:boolean`, `hash:string`, `name:string`, `size:integer` | `doc` |
 | `eval.verdict` | `mission-run` | `system-only` | `once` | `durable` | `reason:string`, `residue:array`, `verdict!:string` |  |

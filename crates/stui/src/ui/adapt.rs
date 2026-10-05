@@ -342,6 +342,17 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         structured: None,
                     },
                 ),
+                "decision" => {
+                    let decision = item.decision.as_ref()?;
+                    (
+                        Tier::Stopped,
+                        AttentionKind::Decision {
+                            state: decision.state.clone(),
+                            source: decision.decision_id.clone(),
+                            question: item.detail.clone(),
+                        },
+                    )
+                }
                 // Home holds only requests and reviews. Messages stay in conversations, and st
                 // sends each fault to the agent that owns it.
                 _ => return None,
@@ -377,6 +388,7 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     AttentionKind::Request { from_id, .. } if from_id.starts_with("agent/") => {
                         Some(from_id.clone())
                     }
+                    AttentionKind::Decision { .. } => item.requester_id.clone(),
                     AttentionKind::Update { .. } => item
                         .requester_id
                         .clone()

@@ -306,6 +306,9 @@ pub struct Attention {
     /// The mission step waiting on this ask, on an ask a mission step made.
     #[serde(default)]
     pub blocked: Option<AttentionBlocked>,
+    /// Metadata-only source decision state and same-gateway answer navigation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<DecisionAttention>,
     pub title: String,
     pub detail: String,
     pub priority: String,
@@ -327,6 +330,43 @@ pub struct AttentionBlocked {
     /// What that step is for.
     pub goal: String,
     pub attempt: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DecisionNativeAsk {
+    pub key: String,
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<String>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DecisionAttention {
+    pub decision_id: String,
+    pub request_id: String,
+    pub q: u64,
+    pub source_sequence: u64,
+    pub source_revision: String,
+    pub person: String,
+    pub decision_kind: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_source_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_link: Option<String>,
+    pub revived: bool,
+    pub activation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_ask: Option<DecisionNativeAsk>,
+    pub native_asks: Vec<DecisionNativeAsk>,
+    pub claim_id: String,
+    pub source_conflict: bool,
+    pub updated_at_unix_ms: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AttentionTargetState {

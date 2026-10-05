@@ -130,8 +130,27 @@ public struct UsageSummary: Codable, Sendable {
     public let cost: Double?; public let currency: String?; public let incarnationCount: Int; public let aggregation: String; public let context: UsageContext?
     enum CodingKeys: String, CodingKey { case totalTokens = "total_tokens", inputTokens = "input_tokens", outputTokens = "output_tokens", cachedTokens = "cached_tokens", cost, currency, incarnationCount = "incarnation_count", aggregation, context }
 }
-public struct AttentionResource: Codable, Sendable { public let customForm: JSONValue?; public let id, kind, revision, updatedAt, attentionKind, sourceID, personID, title, detail, priority, state, requestedAt: String; public let requesterID, launchID, variantID, messageID, previewToken, what, because, reviewMode, missionID, missionRunID, stepRunID, episode, sourceKind: String?; public let actionParameters: JSONValue?; public let request: StructuredRequest?; public let update: PersonUpdate?; public let blocked: AttentionBlocked?; public let preview: LaunchPreview?; public let fix: JSONValue?; public let targets, actions: [String]; public let targetStates: [AttentionTargetState]?; public let operational: Operational?; enum CodingKeys: String, CodingKey { case customForm = "custom_form", id, kind, revision, updatedAt = "updated_at", attentionKind = "attention_kind", episode, sourceKind = "source_kind", actionParameters = "action_parameters", request, update, blocked, sourceID = "source_id", personID = "person_id", requesterID = "requester_id", launchID = "launch_id", variantID = "variant_id", messageID = "message_id", previewToken = "preview_token", preview, what, because, fix, reviewMode = "review_mode", missionID = "mission_id", missionRunID = "mission_run_id", stepRunID = "step_run_id", title, detail, priority, state, requestedAt = "requested_at", targets, targetStates = "target_states", actions, operational } }
+public struct AttentionResource: Codable, Sendable { public let customForm: JSONValue?; public let id, kind, revision, updatedAt, attentionKind, sourceID, personID, title, detail, priority, state, requestedAt: String; public let requesterID, launchID, variantID, messageID, previewToken, what, because, reviewMode, missionID, missionRunID, stepRunID, episode, sourceKind: String?; public let actionParameters: JSONValue?; public let request: StructuredRequest?; public let update: PersonUpdate?; public let blocked: AttentionBlocked?; public let decision: DecisionAttention?; public let preview: LaunchPreview?; public let fix: JSONValue?; public let targets, actions: [String]; public let targetStates: [AttentionTargetState]?; public let operational: Operational?; enum CodingKeys: String, CodingKey { case customForm = "custom_form", id, kind, revision, updatedAt = "updated_at", attentionKind = "attention_kind", episode, sourceKind = "source_kind", actionParameters = "action_parameters", request, update, blocked, decision, sourceID = "source_id", personID = "person_id", requesterID = "requester_id", launchID = "launch_id", variantID = "variant_id", messageID = "message_id", previewToken = "preview_token", preview, what, because, fix, reviewMode = "review_mode", missionID = "mission_id", missionRunID = "mission_run_id", stepRunID = "step_run_id", title, detail, priority, state, requestedAt = "requested_at", targets, targetStates = "target_states", actions, operational } }
 public struct AttentionBlocked: Codable, Sendable { public let stepRunID, step, goal: String; public let attempt: Int; enum CodingKeys: String, CodingKey { case stepRunID = "step_run_id", step, goal, attempt } }
+public struct DecisionNativeAsk: Codable, Sendable {
+    public let key, subject, status: String
+    public let run, episode: String?
+}
+public struct DecisionAttention: Codable, Sendable {
+    public let decisionID, requestID, sourceRevision, person, decisionKind, state, activation, claimID: String
+    public let q, sourceSequence, updatedAtUnixMS: UInt64
+    public let answerID, answerSourceRevision, answerLink: String?
+    public let revived, sourceConflict: Bool
+    public let nativeAsk: DecisionNativeAsk?
+    public let nativeAsks: [DecisionNativeAsk]
+    enum CodingKeys: String, CodingKey {
+        case decisionID = "decision_id", requestID = "request_id", sourceRevision = "source_revision"
+        case person, decisionKind = "decision_kind", state, activation, claimID = "claim_id", q
+        case sourceSequence = "source_sequence", updatedAtUnixMS = "updated_at_unix_ms"
+        case answerID = "answer_id", answerSourceRevision = "answer_source_revision", answerLink = "answer_link"
+        case revived, sourceConflict = "source_conflict", nativeAsk = "native_ask", nativeAsks = "native_asks"
+    }
+}
 public struct AttentionTargetState: Codable, Sendable { public let id, state: String; public let since: String? }
 public struct DocumentContent: Codable, Sendable { public let reference: String; public let bytes: [UInt8] }
 public struct ClientConnections: Codable, Sendable { public let kind, member: String; public let items: [ClientConnection] }

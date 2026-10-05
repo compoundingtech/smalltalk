@@ -2721,9 +2721,12 @@ fn client_attention_id(subject: &str, person: &str, episode: &str) -> anyhow::Re
 fn client_attention_resources(
     store: &Store,
     person: Option<&str>,
-    _history: bool,
+    history: bool,
 ) -> anyhow::Result<Vec<Value>> {
-    let current = store.attention_snapshot(person, client_now_ms())?;
+    let mut current = store.attention_snapshot(person, client_now_ms())?;
+    if history {
+        current.extend(store.decision_attention_history(person)?);
+    }
     let mut resources = Vec::new();
     for item in current {
         let id = client_attention_id(&item.subject, &item.person, &item.episode)?;
@@ -2760,6 +2763,30 @@ fn client_attention_resources(
             resource["revision"] = source["revision"].clone();
             resource["custom_form"] = source["attention"]["reply"].clone();
             resource["action_parameters"] = json!({"custom.reply":{"target_id":item.subject,"registration":source["registration"],"revision":source["revision"],"episode":item.episode}});
+        }
+        if item.kind == "decision" {
+            if let Some(mut decision) = item.request {
+                if let Some(updated_at) = decision["updated_at_unix_ms"].as_u64() {
+                    resource["updated_at"] = json!(client_timestamp(u128::from(updated_at)));
+                }
+                resource["revision"] = decision["source_revision"].clone();
+                resource["state"] = json!(if decision["state"] == "pending" { "open" } else { "resolved" });
+                let actionable = decision["state"] == "pending";
+                resource["operational"] = json!({
+                    "layer": if actionable { "current" } else { "history" },
+                    "actionable": actionable,
+                    "reasons": if decision["source_conflict"] == true { vec!["source-conflict"] }
+                        else if actionable { Vec::<&str>::new() } else { vec!["source-not-pending"] }
+                });
+                if decision["answer_id"].is_string() {
+                    decision["answer_link"] = json!(format!(
+                        "/v1/client/attention/{id}?history=true"
+                    ));
+                }
+                resource["decision"] = decision;
+            }
+            resources.push(resource);
+            continue;
         }
         if item.kind == "person-step" {
             resource["action_parameters"] =
@@ -21876,6 +21903,86 @@ agent "seat" { workspace "/tmp"; command "true" }
         let (status, body) = json_request(app, "/v1/harness-events", stale).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
+    #[tokio::test]
+    async fn decision_attention_answer_navigation_is_same_gateway_and_replay_safe() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let intent = crate::graph::parse_internal_intent(
+            "version 2\nagent \"author\" { workspace \"/tmp\"; command \"true\" }",
+            state.store.origin(),
+        ).unwrap();
+        state.store.apply_internal(&intent, "decision-author").unwrap();
+        let app = router(state);
+        let fields = json!({
+            "decision_id": format!("resource/axe/decision/{}/q38req", "a".repeat(64)),
+            "request_id": "q38req", "q": 38, "source_sequence": 1,
+            "source_revision": "1".repeat(64), "person": "person/example",
+            "decision_kind": "blocker", "state": "pending", "revived": false,
+            "activation": "0000000000000000"
+        });
+        let mut pending = json!({"subject":"agent/node.author", "actor":"agent/node.author",
+            "kind":"decision.observed", "fields":fields, "evidence":[]});
+        let mut foreign = pending.clone();
+        foreign["actor"] = json!("agent/example/other");
+        let (status, _) = json_request(app.clone(), "/v1/claims", foreign).await;
+        assert!(!status.is_success(), "another subject must not publish this decision");
+        let mut private = pending.clone();
+        private["fields"]["answer"] = json!("private-answer-marker");
+        let (status, _) = json_request(app.clone(), "/v1/claims", private).await;
+        assert!(!status.is_success(), "private answer bodies are not metadata fields");
+        let (status, ask) = json_request(app.clone(), "/v1/work/ask", json!({
+            "person":"person/example", "title":"Decision needs your answer", "reason":"Source decision",
+            "actor":"agent/node.author", "new_run":"decision-activation", "idempotency_key":"decision-ask"
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{ask}");
+        let (_, native) = get_request(app.clone(), "/v1/attention?person=person%2Fexample").await;
+        pending["fields"]["native_ask"] = json!({
+            "key":format!("axe:decision:v1:{}:1-q38req:ask:0000000000000000", fields["decision_id"].as_str().unwrap()),
+            "subject":ask["subject"], "run":ask["run"], "episode":native[0]["episode"], "status":ask["status"]
+        });
+        let (status, claim) = json_request(app.clone(), "/v1/claims", pending.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{claim}");
+        let (_, page) = get_request(app.clone(), "/v1/client/attention?person=person%2Fexample").await;
+        let current = &page["items"][0];
+        assert_eq!(current["attention_kind"], "decision");
+        assert!(!page["items"].as_array().unwrap().iter().any(|item| item["source_id"] == ask["subject"]),
+            "the linked native ask must not duplicate the source decision card");
+        assert_eq!(current["decision"]["state"], "pending");
+        assert_eq!(current["actions"], json!([]));
+        let id = current["id"].as_str().unwrap().to_owned();
+        let mut answer = pending.clone();
+        answer["fields"]["source_sequence"] = json!(2);
+        answer["fields"]["source_revision"] = json!("2".repeat(64));
+        answer["fields"]["state"] = json!("answered");
+        answer["fields"]["answer_id"] = json!("ans001");
+        let (status, claim) = json_request(app.clone(), "/v1/claims", answer).await;
+        assert_eq!(status, StatusCode::OK, "{claim}");
+        let (status, _) = json_request(app.clone(), "/v1/claims", pending).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, page) = get_request(app.clone(), "/v1/client/attention?person=person%2Fexample").await;
+        assert_eq!(page["items"], json!([]), "stale pending must not reopen");
+        let (_, history) = get_request(app.clone(), "/v1/client/attention?person=person%2Fexample&history=true").await;
+        let resolved = &history["items"][0];
+        assert_eq!(resolved["id"], id);
+        assert_eq!(resolved["decision"]["answer_id"], "ans001");
+        assert_eq!(resolved["decision"]["answer_source_revision"], "2".repeat(64));
+        assert_eq!(resolved["operational"]["actionable"], false);
+        let link = resolved["decision"]["answer_link"].as_str().unwrap();
+        assert!(link.starts_with("/v1/client/attention/"));
+        let (status, detail) = get_request(app.clone(), link).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["decision"]["answer_id"], "ans001");
+        // A missing current card has an error envelope, not a successful snapshot.
+        let missing = app.oneshot(
+            Request::builder().uri(format!("/v1/client/attention/{id}"))
+                .body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(missing.into_body(), usize::MAX).await.unwrap();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["code"], "not-found");
+    }
+
 }
 
 #[cfg(test)]
