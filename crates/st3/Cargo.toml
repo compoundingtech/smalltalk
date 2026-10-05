@@ -75,6 +75,10 @@ portable-pty = "0.9"
 predicates = "3"
 proptest = "1"
 
+[[example]]
+name = "reader_cache"
+required-features = ["test-support"]
+
 [[bin]]
 name = "st3"
 path = "src/main.rs"

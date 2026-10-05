@@ -439,7 +439,7 @@ impl Store {
         // Keep the hot graph and replication index pages in SQLite's bounded
         // page cache. The default (~2 MiB per connection) churns against the
         // large durable claim store during otherwise quiet replication.
-        connection.execute_batch("PRAGMA cache_size = -32768;")?;
+        connection.pragma_update(None, "cache_size", -(crate::sqlite::WRITE_CACHE_KIB as i64))?;
         Self::create_schema(&connection, &*runtime)?;
         separate_staged_blobs(&mut connection)?;
         {
