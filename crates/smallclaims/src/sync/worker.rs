@@ -1816,80 +1816,97 @@ pub async fn exchange<B: Backend>(
     auth: &FleetAuth,
     fleet: &FleetContext,
 ) -> Result<(bool, bool)> {
-    let first = backend
-        .export(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
-        .await?
-        .exchange;
-    let local_digest = first.inventory.digest.clone();
-    let own_checkpoint = first.inventory.checkpoint.clone();
-    let query = ReplicationExchange {
-        envelopes: Vec::new(),
-        ..first
-    };
-    let started = std::time::Instant::now();
-    let (remote, peer_inflates) = post_signed(http, peer, node, auth, fleet, &query, false).await?;
-    let round_trip = started.elapsed();
-    let different = remote.inventory.digest != local_digest;
-    let received = backend
-        .receive(&peer.name, auth.fleet_id(), &remote, Some(round_trip))
-        .await?;
-    // Progress means new envelopes stored on one side or the other. A peer that keeps sending,
-    // or keeps being sent, envelopes that are never stored must not keep the worker busy.
-    let pulled = received.receipt.received != 0;
-    let mut heal_now = received.receipt.heal;
-    if received.changed {
-        backend.changed().await;
-    }
-    let mut pushed = false;
-    let mut pulled_follow_up = false;
-    // A follow-up also carries the signatures the peer asked for, even when both sides hold
-    // the same envelopes.
-    if different || !remote.signature_requests.is_empty() {
-        let push = backend
-            .export(
-                auth.fleet_id(),
-                &remote.inventory,
-                false,
-                &remote.signature_requests,
-            )
+    let mut heal_now = false;
+    // One compact round, then at most one full-inventory round if the compact prefix
+    // cannot make progress. Payloadless checkpoint identities can differ indefinitely.
+    for full_inventory in [false, true] {
+        let first = backend
+            .export(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
             .await?
             .exchange;
+        let own_checkpoint = first.inventory.checkpoint.clone();
+        let mut query = ReplicationExchange {
+            envelopes: Vec::new(),
+            ..first
+        };
+        if full_inventory {
+            // Keep the digest: an empty listing is not proof of an empty inventory.
+            // Existing peers answer a request without buckets with their complete inventory.
+            query.inventory.buckets.clear();
+        }
         let started = std::time::Instant::now();
-        // A peer that says it takes compressed requests gets a large push compressed.
-        let (response, _) =
-            post_signed(http, peer, node, auth, fleet, &push, peer_inflates).await?;
+        let (remote, peer_inflates) =
+            post_signed(http, peer, node, auth, fleet, &query, false).await?;
         let round_trip = started.elapsed();
-        // The peer stores a push before it answers, so its inventory moved if the push landed.
-        pushed = !push.envelopes.is_empty() && response.inventory.digest != remote.inventory.digest;
+        let different = remote.inventory.digest != query.inventory.digest;
         let received = backend
-            .receive(&peer.name, auth.fleet_id(), &response, Some(round_trip))
+            .receive(&peer.name, auth.fleet_id(), &remote, Some(round_trip))
             .await?;
-        pulled_follow_up = received.receipt.received != 0;
+        // Progress means new envelopes stored on one side or the other. A peer that keeps sending,
+        // or keeps being sent, envelopes that are never stored must not keep the worker busy.
+        let pulled = received.receipt.received != 0;
         heal_now |= received.receipt.heal;
         if received.changed {
             backend.changed().await;
         }
-    }
-    let adopted = match &remote.inventory.checkpoint {
-        Some(advertised) => {
-            adopt_advertised_checkpoint(
-                http,
-                backend,
-                node,
-                peer,
-                auth,
-                fleet,
-                own_checkpoint.as_ref(),
-                advertised,
-            )
-            .await
+        let mut pushed = false;
+        let mut pulled_follow_up = false;
+        // A follow-up also carries the signatures the peer asked for, even when both sides hold
+        // the same envelopes.
+        if different || !remote.signature_requests.is_empty() {
+            let push = backend
+                .export(
+                    auth.fleet_id(),
+                    &remote.inventory,
+                    false,
+                    &remote.signature_requests,
+                )
+                .await?
+                .exchange;
+            let started = std::time::Instant::now();
+            // A peer that says it takes compressed requests gets a large push compressed.
+            let (response, _) =
+                post_signed(http, peer, node, auth, fleet, &push, peer_inflates).await?;
+            let round_trip = started.elapsed();
+            // The peer stores a push before it answers, so its inventory moved if the push landed.
+            pushed =
+                !push.envelopes.is_empty() && response.inventory.digest != remote.inventory.digest;
+            let received = backend
+                .receive(&peer.name, auth.fleet_id(), &response, Some(round_trip))
+                .await?;
+            pulled_follow_up = received.receipt.received != 0;
+            heal_now |= received.receipt.heal;
+            if received.changed {
+                backend.changed().await;
+            }
         }
-        None => false,
-    };
-    if adopted {
-        backend.changed().await;
+        let adopted = match &remote.inventory.checkpoint {
+            Some(advertised) => {
+                adopt_advertised_checkpoint(
+                    http,
+                    backend,
+                    node,
+                    peer,
+                    auth,
+                    fleet,
+                    own_checkpoint.as_ref(),
+                    advertised,
+                )
+                .await
+            }
+            None => false,
+        };
+        if adopted {
+            backend.changed().await;
+        }
+        let progressed = pulled || pulled_follow_up || pushed || adopted;
+        if progressed || !different || remote.inventory.buckets.is_empty() {
+            return Ok((progressed, heal_now));
+        }
     }
-    Ok((pulled || pulled_follow_up || pushed || adopted, heal_now))
+    // A full comparison can still differ only by tombstones. Let the worker rest;
+    // checkpoint-lineage reconciliation, not more envelope requests, must settle those.
+    Ok((false, heal_now))
 }
 
 /// When an adoption last failed, by this node and the checkpoint's drop digest, so a manifest

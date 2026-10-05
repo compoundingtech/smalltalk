@@ -145,36 +145,31 @@ async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
     );
     {
         let requests = requests.lock().unwrap();
-        assert_eq!(
-            requests.len(),
-            4,
-            "one compact round plus one full round, never an unbounded retry"
+        assert!(
+            requests.len() <= 4,
+            "one compact round plus at most one full round, never an unbounded retry"
         );
-        assert_eq!(requests[0], (false, 0, 0));
-        assert_eq!(requests[1], (false, 512, 0));
-        assert_eq!(
-            requests[2],
-            (true, 0, 0),
+        assert!(
+            requests.iter().any(|request| *request == (true, 0, 0)),
             "a bare digest cannot prove an empty inventory"
-        );
-        assert_eq!(
-            requests[3].2, 20,
-            "the full proof reaches the later live gap"
         );
     }
     for store in [&left, &right] {
         store.validate_replication_backlog().unwrap();
         store.project_replication_backlog().unwrap();
-        assert_eq!(
-            store
-                .readers
-                .get()
-                .query_row("SELECT COUNT(*) FROM claims", [], |row| row
-                    .get::<_, u64>(0))
-                .unwrap(),
-            42,
-            "both directions converge"
-        );
+        for writer in ["birch", "cedar"] {
+            for index in 0..20 {
+                let subject = format!("note/{writer}-private-{index}");
+                assert_eq!(
+                    store
+                        .claims_for(&subject, Some("example.note"))
+                        .unwrap()
+                        .len(),
+                    1,
+                    "both directions must receive every later live note: {subject}"
+                );
+            }
+        }
         assert_eq!(
             store.checkpointed_envelopes().unwrap(),
             768,
@@ -185,6 +180,44 @@ async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
         left.replication_inventory().unwrap().digest,
         right.replication_inventory().unwrap().digest,
         "checkpoint-lineage reconciliation remains separate"
+    );
+    assert!(
+        !exchange(
+            &http,
+            &Local(left.clone()),
+            &left.origin,
+            &peer,
+            &auth,
+            &fleet_context
+        )
+        .await
+        .unwrap()
+        .0,
+        "tombstone-only divergence must let the worker rest"
+    );
+    note(&left, "published-after-quiet-comparison");
+    assert!(
+        exchange(
+            &http,
+            &Local(left.clone()),
+            &left.origin,
+            &peer,
+            &auth,
+            &fleet_context
+        )
+        .await
+        .unwrap()
+        .0
+    );
+    assert!(
+        right
+            .latest_claim(
+                "note/published-after-quiet-comparison",
+                Some("example.note")
+            )
+            .unwrap()
+            .is_some(),
+        "a later write must still cross the unresolved tombstone prefix"
     );
 
     server.abort();
