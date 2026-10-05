@@ -1916,17 +1916,23 @@ fn write_claims(store: &Store, origin: &str, round: usize) {
 }
 
 fn sync(from: &Store, from_name: &str, to: &Store) {
-    let exchange = from
-        .export_replication_exchange(
-            FLEET,
-            &to.export_replication_summary(FLEET).unwrap().inventory,
-        )
-        .unwrap();
-    to.receive_replication_exchange(from_name, FLEET, &exchange)
-        .unwrap();
-    to.validate_replication_backlog().unwrap();
-    to.apply_replication_repairs().unwrap();
-    to.project_replication_backlog().unwrap();
+    // Fixture setup must drain every page before adding the measured deltas. A compact
+    // summary can require another listing round and leave an empty first response.
+    // Measured replication requests still use the production compact inventories.
+    for _ in 0..128 {
+        let exchange = from
+            .export_replication_exchange(FLEET, &to.replication_inventory().unwrap())
+            .unwrap();
+        if exchange.envelopes.is_empty() {
+            return;
+        }
+        to.receive_replication_exchange(from_name, FLEET, &exchange)
+            .unwrap();
+        to.validate_replication_backlog().unwrap();
+        to.apply_replication_repairs().unwrap();
+        to.project_replication_backlog().unwrap();
+    }
+    panic!("replication fixture did not drain within 128 pages");
 }
 
 /// A checkpoint trim of everything the checkpoint rules drop, counted per deleted row.
