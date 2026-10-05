@@ -1,0 +1,169 @@
+name: Main perf bisect (temporary experiment)
+on:
+  push:
+    branches: [agent/ci-perf-main-bisect]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: main-perf-bisect-experiment
+  cancel-in-progress: false
+jobs:
+  replay:
+    runs-on: nscloud-ubuntu-24.04-amd64-8x16
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      SCCACHE_IDLE_TIMEOUT: '0'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Preserve the experiment outside historical clean checkouts
+        run: |
+          cp .github/experiments/perf-main-bisect.py "$RUNNER_TEMP/perf-main-bisect.py"
+          cp scripts/ci-perf-cache "$RUNNER_TEMP/ci-perf-cache"
+      - name: Download verified warm snapshots and freeze five main baselines
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" init
+      - uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+      - name: Isolate state and preserve genuine compiler caches
+        run: |
+          test_home="$RUNNER_TEMP/test-home"
+          mkdir -p "$test_home"/{.config,.cache,.local/state}
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\nSCCACHE_DIR=%s\nSCCACHE_CACHE_SIZE=1G\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" "$RUNNER_TEMP/perf-sccache" >> "$GITHUB_ENV"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$test_home" "$test_home" "$test_home" "$test_home" >> "$GITHUB_ENV"
+          sudo mount -o remount,size=10G /dev/shm
+      - name: Measure 01-good (8a555513) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 01-good 8a555513
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-01-good
+          path: ${{ runner.temp }}/main-bisect/results/01-good/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 02-bad (792d6d3e) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 02-bad 792d6d3e
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-02-bad
+          path: ${{ runner.temp }}/main-bisect/results/02-bad/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 03-good-repeat (8a555513) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 03-good-repeat 8a555513
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-03-good-repeat
+          path: ${{ runner.temp }}/main-bisect/results/03-good-repeat/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 04-midpoint (95d5c034) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 04-midpoint 95d5c034
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-04-midpoint
+          path: ${{ runner.temp }}/main-bisect/results/04-midpoint/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 05-first-parent (90d1d2c0) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 05-first-parent 90d1d2c0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-05-first-parent
+          path: ${{ runner.temp }}/main-bisect/results/05-first-parent/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 06-second-merge (8caf74eb) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 06-second-merge 8caf74eb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-06-second-merge
+          path: ${{ runner.temp }}/main-bisect/results/06-second-merge/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 07-fourth-merge (955bf096) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 07-fourth-merge 955bf096
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-07-fourth-merge
+          path: ${{ runner.temp }}/main-bisect/results/07-fourth-merge/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 08-latest (5f8413ae) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 08-latest 5f8413ae
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-08-latest
+          path: ${{ runner.temp }}/main-bisect/results/08-latest/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 09-afternoon (50350be1) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 09-afternoon 50350be1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-09-afternoon
+          path: ${{ runner.temp }}/main-bisect/results/09-afternoon/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 10-paired-repeat (auto:0) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 10-paired-repeat auto:0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-10-paired-repeat
+          path: ${{ runner.temp }}/main-bisect/results/10-paired-repeat/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 11-paired-repeat (auto:1) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 11-paired-repeat auto:1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-11-paired-repeat
+          path: ${{ runner.temp }}/main-bisect/results/11-paired-repeat/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 12-paired-repeat (auto:2) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 12-paired-repeat auto:2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-12-paired-repeat
+          path: ${{ runner.temp }}/main-bisect/results/12-paired-repeat/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Measure 13-paired-repeat (auto:3) with unchanged gates
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" measure 13-paired-repeat auto:3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-13-paired-repeat
+          path: ${{ runner.temp }}/main-bisect/results/13-paired-repeat/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve all evidence, including original baseline hashes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-bisect-evidence
+          path: |
+            ${{ runner.temp }}/main-bisect/results/
+            ${{ runner.temp }}/main-bisect/baselines/
+            ${{ runner.temp }}/main-bisect/provenance.json
+            ${{ runner.temp }}/main-bisect/hardware.json
+          retention-days: 30
+          if-no-files-found: error
+      - name: Propagate original benchmark verdicts
+        run: python3 "$RUNNER_TEMP/perf-main-bisect.py" verdict
