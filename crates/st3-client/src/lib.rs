@@ -559,6 +559,9 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
             "this image was removed after its retention window; the message text remains".into()
         }
         ErrorCode::ValidationFailed
+        | ErrorCode::AskNoLongerPending
+        | ErrorCode::InvalidHarnessAnswers
+        | ErrorCode::UnsupportedHarnessAsk
         | ErrorCode::AttentionMigrated
         | ErrorCode::RuntimeNotLocal
         | ErrorCode::StaleHarnessControl
