@@ -238,14 +238,11 @@ class Engine:
             if node is None or node in seen:
                 return
             seen.add(node)
-            row = self.sql("SELECT depth,left_id,right_id FROM agent_card_time_nodes "
+            row = self.sql("SELECT depth,left_id,right_id,status_roots_json FROM agent_card_time_nodes "
                            "WHERE id=?", (node,)).fetchone()
             assert row["depth"] == depth
-            for status_root in self.sql(
-                "SELECT ordered_root_id FROM agent_card_time_status_roots WHERE time_node_id=?",
-                (node,),
-            ).fetchall():
-                self.verify_avl("ordered", status_root[0])
+            for status_root in json.loads(row["status_roots_json"]).values():
+                self.verify_avl("ordered", status_root)
             check(row["left_id"], depth + 1)
             check(row["right_id"], depth + 1)
 
@@ -255,46 +252,42 @@ class Engine:
     def _time(self, node: int | None) -> tuple[int | None, int | None, dict[str, int]]:
         if node is None:
             return None, None, {}
-        row = self.sql("SELECT left_id,right_id FROM agent_card_time_nodes WHERE id=?",
+        row = self.sql("SELECT left_id,right_id,status_roots_json FROM agent_card_time_nodes WHERE id=?",
                        (node,)).fetchone()
-        roots = self.sql("SELECT status,ordered_root_id FROM agent_card_time_status_roots "
-                         "WHERE time_node_id=?", (node,)).fetchall()
-        return row[0], row[1], {item[0]: item[1] for item in roots}
+        return row[0], row[1], json.loads(row[2])
 
     def _time_make(self, depth: int, left: int | None, right: int | None,
                    roots: dict[str, int]) -> int:
         result = self.sql(
-            "INSERT INTO agent_card_time_nodes(depth,left_id,right_id) VALUES(?,?,?) RETURNING id",
-            (depth, left, right),
+            "INSERT INTO agent_card_time_nodes(depth,left_id,right_id,status_roots_json) "
+            "VALUES(?,?,?,?) RETURNING id",
+            (depth, left, right, json.dumps(roots, sort_keys=True)),
         )
         node = result.fetchone()[0]
         self.nodes += 1
-        for status, ordered in roots.items():
-            self.sql("INSERT INTO agent_card_time_status_roots"
-                     "(time_node_id,status,ordered_root_id) VALUES(?,?,?)",
-                     (node, status, ordered))
         return node
 
     def _time_interval(self, node: int | None, depth: int, lo: int, hi: int,
-                       start: int, end: int, status: str, key: tuple[str, str],
-                       payload: tuple, remove: bool) -> int | None:
+                       start: int, end: int,
+                       actions: tuple[tuple[str, tuple[str, str], tuple, bool], ...]) -> int | None:
         if start >= hi or end <= lo:
             return node
         left, right, roots = self._time(node)
         if start <= lo and hi <= end:
-            old_root = roots.get(status)
-            new_root = (self.drop("ordered", old_root, key) if remove else
-                        self.put("ordered", old_root, key, payload))
-            if new_root is None:
-                roots.pop(status, None)
-            else:
-                roots[status] = new_root
+            for status, key, payload, remove in actions:
+                old_root = roots.get(status)
+                new_root = (self.drop("ordered", old_root, key) if remove else
+                            self.put("ordered", old_root, key, payload))
+                if new_root is None:
+                    roots.pop(status, None)
+                else:
+                    roots[status] = new_root
         else:
             middle = (lo + hi) // 2
             left = self._time_interval(left, depth + 1, lo, middle, start, end,
-                                       status, key, payload, remove)
+                                       actions)
             right = self._time_interval(right, depth + 1, middle, hi, start, end,
-                                        status, key, payload, remove)
+                                        actions)
         if not roots and left is None and right is None:
             return None
         return self._time_make(depth, left, right, roots)
@@ -303,10 +296,9 @@ class Engine:
                   key: tuple[str, str], payload: tuple, remove: bool) -> int | None:
         if start == end:
             return root
-        for selector in ("*", status):
-            root = self._time_interval(root, 0, 0, END, start, end,
-                                       selector, key, payload, remove)
-        return root
+        return self._time_interval(root, 0, 0, END, start, end,
+                                   (("*", key, payload, remove),
+                                    (status, key, payload, remove)))
 
     def put_agent(self, agent: str, name: str, card: dict,
                   facts: dict, expires_at: int = END) -> None:

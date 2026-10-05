@@ -98,13 +98,10 @@ CREATE TABLE agent_card_time_nodes (
     id INTEGER PRIMARY KEY,
     depth INTEGER NOT NULL CHECK (depth BETWEEN 0 AND 128),
     left_id INTEGER REFERENCES agent_card_time_nodes(id),
-    right_id INTEGER REFERENCES agent_card_time_nodes(id)
-);
-CREATE TABLE agent_card_time_status_roots (
-    time_node_id INTEGER NOT NULL REFERENCES agent_card_time_nodes(id),
-    status TEXT NOT NULL,
-    ordered_root_id INTEGER REFERENCES agent_card_presentation_nodes(id),
-    PRIMARY KEY(time_node_id, status)
+    right_id INTEGER REFERENCES agent_card_time_nodes(id),
+    -- An immutable node is fetched and copied as one row. GC must walk each
+    -- encoded ordered-root ID because JSON cannot carry foreign keys.
+    status_roots_json TEXT NOT NULL CHECK (json_valid(status_roots_json))
 );
 
 -- Reverse owner-generation seek is missing from the current #1409 schema.

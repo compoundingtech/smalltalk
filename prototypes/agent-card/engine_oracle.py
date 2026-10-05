@@ -45,10 +45,16 @@ def check(fleet: int, revisions: int) -> dict:
     assert all(row["id"] != target for row in engine.page(new_root, 100, "running", None, fleet))
     assert len(engine.page(new_root, 100, "*", None, fleet)) == fleet
     follow_read = tuple(a-b for a, b in zip(engine.snapshot_cost(), before))
+    assert engine.detail(new_root, target, 99)["status"] == "running"
+    assert engine.detail(old_cursor[0], target, 100)["status"] == "running"
 
     before = engine.snapshot_cost()
     engine.put_local(target, {"observation": f"revision-{revisions-1}"}, 100)
     assert engine.snapshot_cost() == before, "no-op local fact must touch zero rows"
+    engine.put_local(target, {"observation": f"revision-{revisions-1}"}, END)
+    extended_root = engine.publish()
+    assert engine.detail(extended_root, target, 100)["status"] == "running"
+    assert engine.detail(new_root, target, 100)["status"] == "waiting"
     assert engine.verify_avl("point", engine.point_root) >= 1
     assert engine.verify_time_tree(old_cursor[0][2]) >= 1
     assert engine.verify_time_tree(new_root[2]) >= 1

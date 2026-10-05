@@ -35,9 +35,12 @@ chosen; it cannot trigger synchronous catch-up or return stale status. The
 fixed time-depth factor and interval fanout still need measured work bounds.
 The executable invented fixture finds that after a deadline-shape change, a
 field-only update uses two SQL statements and zero new tree nodes. The
-deadline-shape change itself used about 2,451 statements and 1,018 copied
-nodes in the eight-agent fixture. That large writer constant is a design
-cost gap, not acceptance evidence.
+deadline-shape change now uses about 790 statements and 638 copied nodes in
+the eight-agent fixture, down from 2,451 statements and 1,018 nodes before
+combining selector updates and packing each time node's status roots. Those
+constants remain a design cost gap, not acceptance evidence. Packed roots
+need explicit reachability handling in garbage collection because SQLite
+cannot enforce foreign keys inside JSON.
 
 A cursor binds its exact time-root ID, projection epoch, canonical store cut,
 local generation, frozen u128 read time, history/status filters, page size and

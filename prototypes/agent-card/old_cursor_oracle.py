@@ -46,14 +46,9 @@ def node(agent: str, name: str, version: int, status: str, right=None) -> int:
 
 def root(generation: int, status_roots: dict[str, int]) -> int:
     time_node = database.execute(
-        "INSERT INTO agent_card_time_nodes(depth) VALUES(0) RETURNING id"
+        "INSERT INTO agent_card_time_nodes(depth,status_roots_json) VALUES(0,?) RETURNING id",
+        (json.dumps(status_roots, sort_keys=True),),
     ).fetchone()[0]
-    for status, ordered_root in status_roots.items():
-        database.execute(
-            "INSERT INTO agent_card_time_status_roots"
-            "(time_node_id,status,ordered_root_id) VALUES(?,?,?)",
-            (time_node, status, ordered_root),
-        )
     database.execute(
         "INSERT INTO agent_card_presentation_roots"
         "(epoch,store_index,local_generation,history,time_root_id,created_ms) "
@@ -81,11 +76,10 @@ new_root = root(2, {"running": new_anchor, "waiting": new_target})
 
 
 def page_after_anchor(time_root: int, status: str):
-    ordered_root = database.execute(
-        "SELECT ordered_root_id FROM agent_card_time_status_roots "
-        "WHERE time_node_id=? AND status=?",
-        (time_root, status),
-    ).fetchone()[0]
+    ordered_root = json.loads(database.execute(
+        "SELECT status_roots_json FROM agent_card_time_nodes WHERE id=?",
+        (time_root,),
+    ).fetchone()[0])[status]
     next_id = database.execute(
         "SELECT right_id FROM agent_card_presentation_nodes WHERE id=?",
         (ordered_root,),
@@ -107,11 +101,10 @@ assert database.execute(
 ).fetchone() == (2,)
 assert page_after_anchor(old_root, "running") == (target, "running", "fresh")
 assert page_after_anchor(new_root, "running") is None
-new_waiting = database.execute(
-    "SELECT ordered_root_id FROM agent_card_time_status_roots "
-    "WHERE time_node_id=? AND status='waiting'",
+new_waiting = json.loads(database.execute(
+    "SELECT status_roots_json FROM agent_card_time_nodes WHERE id=?",
     (new_root,),
-).fetchone()[0]
+).fetchone()[0])["waiting"]
 assert database.execute(
     "SELECT final_status,local_fact_version FROM agent_card_presentation_nodes WHERE id=?",
     (new_waiting,),
