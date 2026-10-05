@@ -37,7 +37,9 @@ use crate::sqlite::{
 };
 
 mod binary_payloads;
+mod record_offsets;
 pub use binary_payloads::PayloadConversion;
+pub use record_offsets::RecordOffsetConversion;
 pub mod canonical;
 pub mod checkpoint;
 pub mod checkpoint_agreement;
@@ -215,6 +217,9 @@ CREATE TABLE IF NOT EXISTS replica_records (
     envelope_hash TEXT NOT NULL,
     position INTEGER NOT NULL,
     raw BLOB NOT NULL,
+    raw_offset INTEGER,
+    raw_length INTEGER,
+    raw_mode TEXT,
     state TEXT NOT NULL CHECK(state IN ('pending','valid','unknown','invalid','repaired')),
     claim_id TEXT,
     subject_hint TEXT,
@@ -349,7 +354,7 @@ ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 "#;
 
 /// The store's schema version, set once the graph's and the runtime's tables exist.
-pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 16;";
+pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 17;";
 
 /// The graph half of a store. A runtime's store wraps it and derefs to it, so the runtime's
 /// projections read and write through the same connections.
@@ -497,7 +502,8 @@ impl Store {
         // Reassigning user_version dirties the database header even when it is unchanged.
         // Upgrade once, then let ordinary reopens avoid that write and its durable commit.
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 16 {
+        if version != 17 {
+            record_offsets::initialize(connection)?;
             connection.execute_batch(SCHEMA_VERSION)?;
         }
         document_index::initialize(connection)?;
@@ -1057,11 +1063,11 @@ pub fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10..=16),
+        table_count == 0 || matches!(version, 10..=17),
         "this database uses an unsupported st schema; start with a new state directory"
     );
     anyhow::ensure!(
-        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15 | 16),
+        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17),
         "this database uses unsupported st schema version {version}"
     );
     Ok(())
@@ -2667,11 +2673,12 @@ pub fn record_invalid_replica_envelope(
     error: &St3Error,
 ) -> Result<()> {
     let record_ref = replica_record_ref(&envelope.writer, envelope.sequence, &envelope.hash, 0);
+    let raw = record_offsets::RecordRaw::invalid(connection, envelope)?;
     connection.execute(
         "INSERT INTO replica_records(
              record_ref, writer, sequence, envelope_hash, position, raw, state,
-             error_code, error_message, updated_at_unix_ms
-         ) VALUES (?1, ?2, ?3, ?4, 0, ?5, 'invalid', ?6, ?7, ?8)
+             error_code, error_message, updated_at_unix_ms, raw_offset, raw_length, raw_mode
+                 ) VALUES (?1, ?2, ?3, ?4, 0, ?5, 'invalid', ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(record_ref) DO UPDATE SET state='invalid', error_code=excluded.error_code,
             error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
         params![
@@ -2679,10 +2686,13 @@ pub fn record_invalid_replica_envelope(
             envelope.writer,
             envelope.sequence,
             envelope.hash,
-            envelope.payload.base64(),
+            raw.value,
             error.code,
             error.message,
             now_ms().to_string(),
+            raw.offset,
+            raw.length,
+            raw.mode,
         ],
     )?;
     connection.execute(
@@ -2825,7 +2835,7 @@ fn seed_replica_envelopes_signed_tx(
             accepted_at.parse().unwrap_or_default(),
             &payload,
         );
-        transaction.execute(
+        let inserted = transaction.execute(
             "INSERT OR IGNORE INTO replica_envelopes(
                  writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms,
                  payload, batch_id, relay, receipt_state, received_at_unix_ms
@@ -2841,25 +2851,35 @@ fn seed_replica_envelopes_signed_tx(
                 relay
             ],
         )?;
+        let spans = if inserted != 0 || record_offsets::matches_payload(
+            transaction,
+            &writer,
+            sequence,
+            &envelope_hash,
+            &payload,
+        )? {
+            record_offsets::Spans::parse(&payload).ok()
+        } else {
+            None
+        };
         for (position, claim) in claims.iter().enumerate() {
-            let mut raw = Vec::new();
-            ciborium::into_writer(claim, &mut raw)?;
+            let raw = record_offsets::RecordRaw::claim(spans.as_ref(), position, claim)?;
             transaction.execute(
                 "INSERT OR IGNORE INTO replica_records(
                      record_ref, writer, sequence, envelope_hash, position, raw, state,
-                     claim_id, subject_hint, kind_hint, updated_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'valid', ?7, ?8, ?9, ?10)",
+                     claim_id, subject_hint, kind_hint, updated_at_unix_ms, raw_offset, raw_length, raw_mode
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'valid', ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     replica_record_ref(&writer, sequence, &envelope_hash, position as u64),
                     writer,
                     sequence,
                     envelope_hash,
                     position as u64,
-                    raw,
+                    raw.value,
                     claim.id,
                     claim.subject,
                     claim.kind,
-                    accepted_at,
+                    accepted_at, raw.offset, raw.length, raw.mode,
                 ],
             )?;
         }
@@ -3876,6 +3896,16 @@ pub fn validate_and_admit_envelope_tx(
     runtime: &dyn Runtime,
     outcome: &mut ReplicationAdmission,
 ) -> Result<(), St3Error> {
+    validate_envelope_tx(transaction, envelope, runtime, outcome, false)
+}
+
+fn validate_envelope_tx(
+    transaction: &Connection,
+    envelope: &ReplicaEnvelope,
+    runtime: &dyn Runtime,
+    outcome: &mut ReplicationAdmission,
+    payload_from_store: bool,
+) -> Result<(), St3Error> {
     let started = std::time::Instant::now();
     let payload_bytes = envelope.payload.bytes().map_err(|error| {
         St3Error::new(
@@ -3915,6 +3945,7 @@ pub fn validate_and_admit_envelope_tx(
         ));
     }
     verify_replica_batch_header(batch)?;
+    let spans = std::cell::OnceCell::new();
     outcome.verify += started.elapsed();
     let now = now_ms().to_string();
     let mut degraded = false;
@@ -3933,6 +3964,18 @@ pub fn validate_and_admit_envelope_tx(
             .query_row([&record_ref], |row| row.get::<_, String>(0))
             .optional()
             .map_err(internal)?;
+        let raw = if previous_state.is_some() {
+            record_offsets::RecordRaw::existing()
+        } else {
+            let spans = record_offsets::Spans::for_envelope(
+                &spans,
+                transaction,
+                envelope,
+                payload_from_store,
+            )
+            .map_err(internal)?;
+            record_offsets::RecordRaw::blob(spans, position as usize, bytes)
+        };
         if valid {
             transaction
                 .prepare_cached(
@@ -3945,8 +3988,8 @@ pub fn validate_and_admit_envelope_tx(
                 .prepare_cached(
                     "INSERT INTO replica_records(
                          record_ref, writer, sequence, envelope_hash, position, raw, state,
-                         subject_hint, kind_hint, updated_at_unix_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'valid', ?7, 'blob', ?8)
+                         subject_hint, kind_hint, updated_at_unix_ms, raw_offset, raw_length, raw_mode
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'valid', ?7, 'blob', ?8, ?9, ?10, ?11)
                      ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'valid' END,
                         subject_hint=excluded.subject_hint,
                             kind_hint='blob',
@@ -3961,10 +4004,10 @@ pub fn validate_and_admit_envelope_tx(
                         envelope.sequence,
                         envelope.hash,
                         position,
-                        bytes,
+                        raw.value,
                         format!("blob/{hash}"),
-                        now_ms().to_string(),
-                    ])
+                        now_ms().to_string(), raw.offset, raw.length, raw.mode,
+                ])
                 .map_err(internal)?;
             outcome.valid += 1;
             outcome.changed |= previous_state.as_deref() != Some("valid");
@@ -3974,9 +4017,9 @@ pub fn validate_and_admit_envelope_tx(
                 .prepare_cached(
                     "INSERT INTO replica_records(
                          record_ref, writer, sequence, envelope_hash, position, raw, state,
-                         subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'invalid', ?7, 'blob',
-                               'blob-hash-mismatch', ?8, ?9)
+                         subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms, raw_offset, raw_length, raw_mode
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'invalid', ?7, 'blob',
+                               'blob-hash-mismatch', ?8, ?9, ?10, ?11, ?12)
                      ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'invalid' END,
                         subject_hint=excluded.subject_hint, kind_hint='blob', error_code=excluded.error_code,
                         error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
@@ -3988,11 +4031,11 @@ pub fn validate_and_admit_envelope_tx(
                         envelope.sequence,
                         envelope.hash,
                         position,
-                        bytes,
+                        raw.value,
                         format!("blob/{hash}"),
                         format!("replicated blob `{hash}` failed verification"),
-                        now_ms().to_string(),
-                    ])
+                        now_ms().to_string(), raw.offset, raw.length, raw.mode,
+                ])
                 .map_err(internal)?;
             outcome.invalid += 1;
         }
@@ -4020,14 +4063,24 @@ pub fn validate_and_admit_envelope_tx(
             &envelope.hash,
             position,
         );
-        let mut raw = Vec::new();
-        ciborium::into_writer(claim, &mut raw).map_err(internal)?;
         let previous_state = transaction
             .prepare_cached("SELECT state FROM replica_records WHERE record_ref=?1")
             .map_err(internal)?
             .query_row([&record_ref], |row| row.get::<_, String>(0))
             .optional()
             .map_err(internal)?;
+        let raw = if previous_state.is_some() {
+            record_offsets::RecordRaw::existing()
+        } else {
+            let spans = record_offsets::Spans::for_envelope(
+                &spans,
+                transaction,
+                envelope,
+                payload_from_store,
+            )
+            .map_err(internal)?;
+            record_offsets::RecordRaw::claim(spans, position as usize, claim).map_err(internal)?
+        };
         let started = std::time::Instant::now();
         let classification = validate_replicated_claim(transaction, batch, claim, runtime);
         outcome.verify += started.elapsed();
@@ -4067,8 +4120,8 @@ pub fn validate_and_admit_envelope_tx(
                     .prepare_cached(
                         "INSERT INTO replica_records(
                              record_ref, writer, sequence, envelope_hash, position, raw, state,
-                             claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'valid', ?7, ?8, ?9, NULL, NULL, ?10)
+                             claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms, raw_offset, raw_length, raw_mode
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'valid', ?7, ?8, ?9, NULL, NULL, ?10, ?11, ?12, ?13)
                          ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'valid' END,
                             claim_id=excluded.claim_id,
                             subject_hint=excluded.subject_hint, kind_hint=excluded.kind_hint,
@@ -4077,7 +4130,8 @@ pub fn validate_and_admit_envelope_tx(
                             updated_at_unix_ms=excluded.updated_at_unix_ms",
                     )
                     .map_err(internal)?
-                    .execute(params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, now])
+                    .execute(params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw.value, claim.id, claim.subject, claim.kind, now, raw.offset, raw.length, raw.mode,
+                ])
                     .map_err(internal)?;
                 outcome.valid += 1;
                 outcome.changed |= inserted != 0 || previous_state.as_deref() != Some("valid");
@@ -4101,15 +4155,16 @@ pub fn validate_and_admit_envelope_tx(
                     .prepare_cached(
                         "INSERT INTO replica_records(
                              record_ref, writer, sequence, envelope_hash, position, raw, state,
-                             claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unknown', ?7, ?8, ?9, ?10, ?11, ?12)
+                             claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms, raw_offset, raw_length, raw_mode
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unknown', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                          ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'unknown' END,
                             error_code=CASE WHEN state='repaired' THEN error_code ELSE excluded.error_code END,
                             error_message=CASE WHEN state='repaired' THEN error_message ELSE excluded.error_message END,
                             updated_at_unix_ms=excluded.updated_at_unix_ms",
                     )
                     .map_err(internal)?
-                    .execute(params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, error_code, error_message, now])
+                    .execute(params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw.value, claim.id, claim.subject, claim.kind, error_code, error_message, now, raw.offset, raw.length, raw.mode,
+                ])
                     .map_err(internal)?;
                 outcome.unknown += 1;
             }
@@ -4119,14 +4174,15 @@ pub fn validate_and_admit_envelope_tx(
                     .prepare_cached(
                         "INSERT INTO replica_records(
                              record_ref, writer, sequence, envelope_hash, position, raw, state,
-                             claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'invalid', ?7, ?8, ?9, ?10, ?11, ?12)
+                             claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms, raw_offset, raw_length, raw_mode
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'invalid', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                          ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'invalid' END,
                             error_code=excluded.error_code, error_message=excluded.error_message,
                             updated_at_unix_ms=excluded.updated_at_unix_ms",
                     )
                     .map_err(internal)?
-                    .execute(params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, error.code, error.message, now])
+                    .execute(params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw.value, claim.id, claim.subject, claim.kind, error.code, error.message, now, raw.offset, raw.length, raw.mode,
+                ])
                     .map_err(internal)?;
                 outcome.invalid += 1;
             }
@@ -5453,11 +5509,14 @@ impl Store {
                         continue;
                     }
                     let mut savepoint = pass.savepoint()?;
-                    let result = validate_and_admit_envelope_tx(
+                    // The loader read these bytes from the stored identity. Once the hash
+                    // verifies, healing can only replace them with the same committed bytes.
+                    let result = validate_envelope_tx(
                         &savepoint,
                         envelope,
                         &*self.runtime,
                         &mut outcome,
+                        true,
                     );
                     match result {
                         Ok(()) => {

@@ -1,6 +1,19 @@
 # st data authority
 
-This document classifies each SQLite table in schema version 16.
+This document classifies each SQLite table in schema version 17.
+
+Schema version 17 adds nullable `raw_offset`, `raw_length`, and `raw_mode` columns to replica
+records without changing indexes. New records reference the matching immutable envelope
+payload. Existing raw values are reconstructed and compared off the writer queue before
+bounded transactions clear the duplicate and commit `replica_record_offset_cursor`. The
+`claim-v0` codec preserves the legacy claim serialization, including field order and omissions;
+blob mode reconstructs decoded bytes, and hash-verified forensic envelopes retain their
+whole-envelope base64 representation. Malformed, corrupt, orphan, or nonmatching values remain
+inline: healing can replace a corrupt payload, so only hash-verified bytes back pointers.
+`Store::replica_record_raw` returns the original SQLite type and bytes in either form.
+A record retains its first raw representation when admission or repair changes its state.
+The migration is forward-only; older binaries reject version 17.
+
 
 Schema version 16 upgrades schema versions 10 through 15 in place. Envelope payloads are stored
 as their exact decoded bytes. Existing base64 TEXT rows convert to BLOBs after startup in bounded
