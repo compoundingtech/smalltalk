@@ -3108,6 +3108,13 @@ fn normalize_omp(
             }
             return;
         }
+        Some("custom")
+            if driver == ExternalDriver::Omp
+                && value.get("customType").and_then(Value::as_str) == Some("session_exit") =>
+        {
+            push_omp_exit(items, sequence, &timestamp, &value["data"]);
+            return;
+        }
         kind => {
             push_unrecognized(items, sequence, &timestamp, label, "entry", kind, value);
             return;
@@ -3200,6 +3207,110 @@ fn normalize_omp(
         &timestamp,
         role,
     );
+    if driver == ExternalDriver::Omp && native_role == Some("assistant") {
+        let next_sequence = items.last()
+            .and_then(|item| item["sequence"].as_u64())
+            .unwrap_or(sequence)
+            .saturating_add(1);
+        push_omp_stop(items, next_sequence, &timestamp, message, value);
+    }
+}
+
+fn push_omp_stop(
+    items: &mut Vec<Value>,
+    sequence: u64,
+    timestamp: &str,
+    message: &Value,
+    entry: &Value,
+) {
+    let Some(stop) = message.get("stopReason").and_then(Value::as_str) else { return };
+    let mut details = json!({"stopReason": stop});
+    let (code, diagnostic) = match stop {
+        "error" => {
+            let continuation = message.get("willContinue").or_else(|| entry.get("willContinue"))
+                .and_then(Value::as_bool);
+            details["outcome"] = json!(match continuation {
+                Some(true) => "retrying",
+                Some(false) => "terminal_failure",
+                None => "unknown",
+            });
+            for key in ["errorStatus", "errorId"] {
+                if let Some(value) = message.get(key).filter(|value| value.is_u64()) {
+                    details[key] = value.clone();
+                }
+            }
+            details["retry_outcome_known"] = json!(continuation.is_some());
+            ("native_provider_error", match continuation {
+                Some(true) => "The provider reported an error; the harness will retry.",
+                Some(false) => "The provider reported a terminal failure.",
+                None => "The provider reported an error; retry outcome is unknown.",
+            })
+        }
+        "aborted" => {
+            details["outcome"] = json!("aborted");
+            ("native_turn_aborted", "The native assistant turn was aborted; the cause is not inferred.")
+        }
+        "stop" | "length" | "toolUse" => {
+            items.push(timeline_item(sequence, timestamp, "system", "status", json!({
+                "status": if stop == "stop" { "completed" } else { "waiting" },
+                "detail": serde_json::to_string(&details).expect("native stop metadata serializes"),
+            })));
+            return;
+        }
+        _ => {
+            // Unknown/free-form stop values are not newly authorized diagnostic text.
+            details = json!({"stopReason":"unknown","stop_reason_withheld":true,"outcome":"unknown"});
+            ("native_stop_unknown", "The native assistant stopped with an unsupported reason.")
+        }
+    };
+    if message.get("errorMessage").is_some() {
+        // Match live error policy: retain a safe structural diagnostic, never raw provider prose.
+        // Do not digest the withheld text into permanent metadata.
+        details["diagnostic_availability"] = json!("withheld");
+        details["diagnostic_reason"] = json!("provider_text_not_authorized");
+    }
+    let retryable = details["outcome"] == "retrying";
+    items.push(timeline_item(sequence, timestamp, "system", "error", json!({
+        "code":code,"message":diagnostic,"retryable":retryable,"details":details,
+    })));
+}
+
+fn push_omp_exit(items: &mut Vec<Value>, sequence: u64, timestamp: &str, data: &Value) {
+    let mut details = json!({"outcome":"process_exit"});
+    let kind = data.get("kind").and_then(Value::as_str)
+        .filter(|kind| matches!(*kind, "normal" | "signal" | "fatal" | "process_exit"))
+        .unwrap_or("unknown");
+    details["kind"] = json!(kind);
+    let reason = data.get("reason").and_then(Value::as_str)
+        .filter(|reason| matches!(*reason, "exit" | "normal" | "sighup" | "sigint" | "sigterm" | "sigquit" | "process_exit"));
+    if let Some(reason) = reason {
+        details["reason"] = json!(reason);
+    } else if data.get("reason").is_some() {
+        details["reason_availability"] = json!("withheld");
+    }
+    if let Some(pending) = data.get("pendingToolCalls").and_then(Value::as_array) {
+        let mut retained = Vec::new();
+        // Bound the entire checkpoint rather than carrying pending arguments or arbitrary prose.
+        for call in pending.iter().take(16) {
+            let mut identity = json!({});
+            for key in ["toolCallId", "toolName"] {
+                if let Some(value) = call.get(key).and_then(Value::as_str).filter(|value| {
+                    value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/:._-".contains(&byte))
+                }) {
+                    identity[key] = json!(value);
+                }
+            }
+            retained.push(identity);
+        }
+        details["pendingToolCalls"] = json!(retained);
+        details["pending_tools_truncated"] = json!(pending.len() > 16);
+        details["pending_tool_payloads"] = json!("withheld");
+    }
+    items.push(timeline_item(sequence, timestamp, "system", "error", json!({
+        "code":"native_process_exit",
+        "message":"The native process exited; this is not evidence of user cancellation or tool completion.",
+        "retryable":false,"details":details,
+    })));
 }
 
 fn push_omp_content(
@@ -4013,6 +4124,92 @@ mod tests {
             assert_eq!(block["payload"], part);
             assert_eq!(items[1]["body"]["text"], "[image · load from owner]");
         }
+    }
+
+    #[test]
+    fn omp_native_outcomes_distinguish_retry_failure_abort_and_exit_safely() {
+        let mut items = Vec::new();
+        for (offset, continuation) in [Some(true), Some(false), None].into_iter().enumerate() {
+            let mut message = json!({
+                "role":"assistant","content":[],"stopReason":"error",
+                "errorStatus":503,"errorId":135168,
+                "errorMessage":"Authorization: Bearer planted-secret"
+            });
+            if let Some(continuation) = continuation {
+                message["willContinue"] = json!(continuation);
+            }
+            normalize_omp(ExternalDriver::Omp, &json!({"type":"message","id":"failed","message":message}), offset as u64 * 16, "", &mut items);
+        }
+        normalize_omp(ExternalDriver::Omp, &json!({
+            "type":"message","id":"aborted","message":{
+                "role":"assistant","content":[],"stopReason":"aborted",
+                "errorMessage":"Previous OMP process exited before completing the turn"
+            }
+        }), 64, "", &mut items);
+        normalize_omp(ExternalDriver::Omp, &json!({
+            "type":"custom","customType":"session_exit","data":{
+                "kind":"signal","reason":"sighup",
+                "pendingToolCalls":[{"toolCallId":"call-one","toolName":"ask","args":{"secret":"planted-secret"}}]
+            }
+        }), 80, "", &mut items);
+        let errors = items.iter().filter(|item| item["type"] == "error").collect::<Vec<_>>();
+        assert_eq!(errors.len(), 5);
+        assert_eq!(errors[0]["body"]["details"]["outcome"], "retrying");
+        assert_eq!(errors[0]["body"]["retryable"], true);
+        assert_eq!(errors[1]["body"]["details"]["outcome"], "terminal_failure");
+        assert_eq!(errors[2]["body"]["details"]["outcome"], "unknown");
+        assert_eq!(errors[0]["body"]["details"]["errorStatus"], 503);
+        assert_eq!(errors[0]["body"]["details"]["errorId"], 135168);
+        assert_eq!(errors[3]["body"]["details"]["outcome"], "aborted");
+        assert_eq!(errors[4]["body"]["details"]["outcome"], "process_exit");
+        assert_eq!(errors[4]["body"]["details"]["kind"], "signal");
+        assert_eq!(errors[4]["body"]["details"]["reason"], "sighup");
+        assert_eq!(errors[4]["body"]["details"]["pendingToolCalls"], json!([{"toolCallId":"call-one","toolName":"ask"}]));
+        assert!(!serde_json::to_string(&items).unwrap().contains("planted-secret"));
+        assert_eq!(errors[3]["body"]["details"]["stopReason"], "aborted");
+        assert_eq!(errors[0]["body"]["details"]["diagnostic_availability"], "withheld");
+        assert!(items.iter().any(|item| item["body"]["message_id"] == "aborted"));
+    }
+
+    #[test]
+    fn omp_stop_metadata_preserves_completion_and_unknown_without_sequence_collisions() {
+        let mut items = Vec::new();
+        for (offset, stop) in ["stop", "length", "toolUse", "Bearer planted-secret"].into_iter().enumerate() {
+            normalize_omp(ExternalDriver::Omp, &json!({
+                "type":"message","id":format!("m-{offset}"),"message":{
+                    "role":"assistant","content":[{"type":"text","text":"answer"}],"stopReason":stop,
+                }
+            }), offset as u64 * 16, "", &mut items);
+        }
+        let statuses = items.iter().filter(|item| item["type"] == "status").collect::<Vec<_>>();
+        assert_eq!(statuses.len(), 3);
+        for (status, stop) in statuses.iter().zip(["stop", "length", "toolUse"]) {
+            let details: Value = serde_json::from_str(status["body"]["detail"].as_str().unwrap()).unwrap();
+            assert_eq!(details["stopReason"], stop);
+        }
+        assert_eq!(statuses[0]["body"]["status"], "completed");
+        assert_eq!(statuses[1]["body"]["status"], "waiting");
+        assert!(items.windows(2).all(|pair| pair[0]["sequence"].as_u64() < pair[1]["sequence"].as_u64()));
+        assert!(!serde_json::to_string(&items).unwrap().contains("planted-secret"));
+    }
+
+    #[test]
+    fn omp_exit_checkpoint_bounds_and_withholds_unsupported_diagnostics() {
+        let mut items = Vec::new();
+        push_omp_exit(&mut items, 0, "", &json!({
+            "kind":"fatal","reason":"Bearer planted-secret",
+            "pendingToolCalls": (0..20).map(|_| json!({
+                "toolCallId":"x".repeat(128), "toolName":"y".repeat(128),
+                "intent":"planted-secret"
+            })).collect::<Vec<_>>(),
+        }));
+        let details = &items[0]["body"]["details"];
+        assert_eq!(details["pendingToolCalls"].as_array().unwrap().len(), 16);
+        assert_eq!(details["pending_tools_truncated"], true);
+        assert_eq!(details["reason_availability"], "withheld");
+        let encoded = serde_json::to_string(&items[0]).unwrap();
+        assert!(encoded.len() < MAX_TIMELINE_VALUE_BYTES);
+        assert!(!encoded.contains("planted-secret"));
     }
 
     #[test]

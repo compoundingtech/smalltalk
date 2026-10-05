@@ -60,6 +60,27 @@ outbox is unavailable, unforwarded `timeline`, `context`, and `turn` frames prod
 diagnostic. The managed route does not perform the standalone channel's pre-compaction context
 recovery stub.
 
+## Native replay outcomes
+
+Native assistant stop metadata is retained independently of content, including empty turns.
+`stop`, `length` and `toolUse` produce status entries whose JSON `detail` carries `stopReason`;
+length/tool continuation is not reported as completed. Provider failures and aborts produce
+typed error entries carrying `stopReason`, numeric `errorStatus`/`errorId`, and `outcome`.
+Explicit `willContinue: true` means `retrying`, false means `terminal_failure`; its absence
+means `unknown`, not an inferred retry or terminal failure. An abort does not imply a user
+cancellation.
+
+Diagnostics use safe structural text, matching the live provider-error boundary. Native
+`errorMessage` prose is withheld with `diagnostic_availability: withheld` and
+`diagnostic_reason: provider_text_not_authorized`; it is neither copied nor hashed.
+Unsupported free-form stop values are explicitly withheld rather than exported.
+
+Native `custom/session_exit` checkpoints are distinct `native_process_exit` diagnostics.
+They preserve the closed exit kind and recognized signal/exit reason, plus at most 16 bounded
+pending-tool identities. Unknown reasons and pending-tool arguments/intent are withheld;
+clipped identity sets are explicitly marked. A process exit proves neither user cancellation,
+tool completion nor the outcome of the next process.
+
 ## Interrupted ask bridge
 
 Native session continuation belongs to the shared driver mechanism: the daemon names a relaunch's
