@@ -44,6 +44,9 @@ struct CollectionSubscribe {
 
 struct CollectionSubscription {
     request: CollectionSubscribe,
+    generation: u64,
+    reading: Option<tokio::sync::oneshot::Sender<()>>,
+    dirty: bool,
     /// Whether the client has this subscription's first snapshot.
     delivered: bool,
     previous: BTreeMap<String, Value>,
@@ -583,7 +586,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     read: F,
 ) where
     F: Fn(AppState, ClientSession, CollectionSubscribe) -> Fut + Clone + Send + 'static,
-    Fut: std::future::Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
+    Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
 {
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
@@ -599,6 +602,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     let mut weighed = state.store.index().unwrap_or_default();
     let mut reread_due = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
+    let mut reads = futures_util::stream::FuturesUnordered::new();
+    let mut generation = 0_u64;
     loop {
         // The subscriptions to read after this wake-up.
         let mut refresh = Vec::<String>::new();
@@ -676,10 +681,24 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             break 'command;
                         }
                         refresh.push(request.id.clone());
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
+                        generation += 1;
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, generation, reading: None, dirty: false, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
+                }
+            }
+            Some(result) = reads.next(), if !command_waiting && !reads.is_empty() => {
+                let Some((id, generation, result)): Option<(String, u64, _)> = result else { continue; };
+                let Some(subscription) = subscriptions.get_mut(&id) else { continue; };
+                if subscription.generation != generation { continue; }
+                subscription.reading = None;
+                if std::mem::take(&mut subscription.dirty) { refresh.push(id.clone()); }
+                match deliver_collection(&mut socket, subscription, result).await {
+                    Refreshed::Current => {}
+                    Refreshed::Retry => { reread_due = true; }
+                    Refreshed::Dropped => { subscriptions.remove(&id); }
+                    Refreshed::Closed => return,
                 }
             }
             result = changed.changed(), if !command_waiting => {
@@ -728,6 +747,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 continue;
             }
         }
+        refresh.sort_unstable();
+        refresh.dedup();
         if refresh.is_empty() {
             continue;
         }
@@ -735,28 +756,28 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             reread_due = false;
             last_reread = tokio::time::Instant::now();
         }
-        // Read every due window at once, each in its own snapshot, then send them in order:
-        // one slow window never holds back the others' reads.
-        let reads = futures_util::future::join_all(refresh.into_iter().filter_map(|id| {
-            let request = subscriptions.get(&id)?.request.clone();
-            let (state, session, read) = (state.clone(), session.clone(), read.clone());
-            Some(async move { (id, read(state, session, request).await) })
-        }))
-        .await;
-        for (id, read) in reads {
-            let Some(subscription) = subscriptions.get_mut(&id) else {
+        // Keep admission, conversation and terminal delivery live while each window reads.
+        // Replaced/unsubscribed windows are fenced by their subscription generation.
+        for id in refresh {
+            let Some(subscription) = subscriptions.get_mut(&id) else { continue; };
+            if subscription.reading.is_some() {
+                subscription.dirty = true;
                 continue;
-            };
-            match deliver_collection(&mut socket, subscription, read).await {
-                Refreshed::Current => {}
-                Refreshed::Retry => {
-                    reread_due = true;
-                }
-                Refreshed::Dropped => {
-                    subscriptions.remove(&id);
-                }
-                Refreshed::Closed => return,
             }
+            let (cancel, canceled) = tokio::sync::oneshot::channel::<()>();
+            subscription.reading = Some(cancel);
+            let request = subscription.request.clone();
+            let generation = subscription.generation;
+            let (state, session, read) = (state.clone(), session.clone(), read.clone());
+            reads.push(async move {
+                tokio::select! {
+                    biased;
+                    _ = canceled => None,
+                    result = read(state, session, request) => {
+                        Some((id, generation, result))
+                    }
+                }
+            });
         }
     }
 }
@@ -9029,6 +9050,80 @@ mod tests {
             &state.store, true, "2026-10-03T09:00:00Z", state.store.index().unwrap(),
         ).unwrap();
         assert!(items.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
+    }
+
+    #[tokio::test]
+    async fn pending_collection_does_not_block_new_windows_or_conversation_frames() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state(root.path());
+        state.native_session_home = Some(root.path().join("native"));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (started, blocked) = (entered.clone(), release.clone());
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, entered, release) = (state.clone(), started.clone(), blocked.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request| {
+                                let (entered, release) = (entered.clone(), release.clone());
+                                async move {
+                                    if request.limit == Some(1) {
+                                        entered.notify_one();
+                                        release.notified().await;
+                                    }
+                                    collection_items(&state, &session, &request).await
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"slow","collection":"agents","limit":1})
+                .to_string().into(),
+        )).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified()).await.unwrap();
+        for command in [
+            json!({"kind":"subscribe","id":"fast","collection":"work","limit":2}),
+            json!({"kind":"subscribe","id":"chat","collection":"conversation","conversation":"session/missing"}),
+        ] {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(command.to_string().into()))
+                .await.unwrap();
+        }
+        let mut received = BTreeMap::new();
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            received.insert(frame["id"].as_str().unwrap().to_owned(), frame);
+        }
+        assert_eq!(received["fast"]["kind"], "snapshot");
+        assert_eq!(received["chat"]["kind"], "error");
+        assert_eq!(received["chat"]["retryable"], false);
+        // A held ID can be replaced while its previous read is still blocked.
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"slow","collection":"agents","limit":2})
+                .to_string().into(),
+        )).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "slow");
+        assert_eq!(frame["kind"], "snapshot");
+        release.notify_one();
+        socket.close(None).await.unwrap();
+        server.abort();
     }
 
     #[tokio::test]
