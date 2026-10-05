@@ -19213,7 +19213,8 @@ mission "wake" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = &state.store;
-        let source = "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
+        let source =
+            "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
         let intent = crate::graph::parse_test_intent(source, "node").unwrap();
         let planned = store
             .mission(
@@ -19275,6 +19276,42 @@ mission "wake" state="ready" {
                     .find(|card| card["id"] == "agent/node.cobalt")
                     .unwrap()
             );
+        }
+        // Native credentials can change while activity stays working. Both cached
+        // history modes must carry the refusal/recovery, preserving the legacy wire state.
+        for provider_auth in [false, true, false, true] {
+            append(
+                "agent/node.amber",
+                "harness.observed",
+                json!({
+                    "state":"working", "driver":"codex", "incarnation_id":"amber-1",
+                    "provider_auth":provider_auth,
+                }),
+            );
+            let at = store.index().unwrap();
+            for history in [false, true] {
+                let cards = checked_agent_cache(store, history, at);
+                let amber = cards
+                    .iter()
+                    .find(|card| card["id"] == "agent/node.amber")
+                    .unwrap();
+                assert_eq!(
+                    amber["harness_state"],
+                    if provider_auth {
+                        "working"
+                    } else {
+                        "unauthenticated"
+                    }
+                );
+                assert_eq!(
+                    amber["harness_error_state"],
+                    if provider_auth {
+                        Value::Null
+                    } else {
+                        json!("needs-login")
+                    }
+                );
+            }
         }
         // Evicted old snapshots rebuild independently of the newest cache.
         assert_eq!(checked_agent_cache(store, false, before), original);
