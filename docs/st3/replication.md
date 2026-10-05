@@ -367,9 +367,10 @@ checkpoint, its earliest differing ranges may contain only payloadless checkpoin
 The worker runs at most one additional two-phase full-inventory round: it clears the summary's
 range digests, retaining the inventory digest, then sends the reverse difference proved by the
 peer's complete identity list. A bare digest never proves an empty inventory. There are at most
-four signed requests in total; payload page limits, the 64 MiB exchange body cap, envelope
-admission and checkpoint certificate verification remain unchanged. The exceptional full
-comparison costs O(inventory), rather than the compact listing's bounded identity prefix.
+four signed exchange requests in total. Existing checkpoint-manifest paging can make additional
+signed requests under its separate limits. Payload page limits, the 64 MiB exchange body cap,
+envelope admission and checkpoint certificate verification remain unchanged. The exceptional
+full comparison costs O(inventory), rather than the compact listing's bounded identity prefix.
 
 This negotiation already exists in older builds, including `8298c70`; an upgraded worker
 initiating an exchange can transfer live payloads both ways with those peers, without new wire
