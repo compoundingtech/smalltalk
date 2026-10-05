@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shutil
 import signal
@@ -29,6 +30,7 @@ import time
 HERE = Path(__file__).resolve().parent
 WORKER = "ui::terminal_tab::terminal_tab_probe_worker"
 ESC = b"\x1b"
+BARRIER_PATTERN = re.compile(rb"(?:\x02\x01\x02|\x1b\[98[0-9:;]*u\x1b\[97[0-9:;]*u\x1b\[98[0-9:;]*u|\x1b\[27;5;98~\x1b\[27;5;97~\x1b\[27;5;98~)$")
 BARRIER = b"\x02\x01\x02"  # Cannot be mistaken for a tilde at the end of a key sequence.
 # Restore the main screen, default cursor mode and every mode used by the probe.
 RESET = (b"\x1b[?1049l\x1b[?1l\x1b[?66l" + b"".join(
@@ -45,7 +47,8 @@ def wait_for(read, predicate, label, seconds=8):
         if predicate(value):
             return value
         time.sleep(0.005)
-    raise AssertionError(f"{label}: timed out; last={value!r}")
+    last = repr(value)
+    raise AssertionError(f"{label}: timed out; last={last[-700:]}")
 
 
 def json_file(path):
@@ -199,17 +202,17 @@ class Tab:
     def exercise(self, data):
         start = len(self.input())
         self.send(data + BARRIER)
-        received = wait_for(self.input, lambda raw: len(raw) > start and raw.endswith(BARRIER),
+        received = wait_for(self.input, lambda raw: len(raw) > start and BARRIER_PATTERN.search(raw) is not None,
                             f"input {data.hex()}")
-        return received[start:-len(BARRIER)]
+        return received[start:BARRIER_PATTERN.search(received).start()]
 
     def query(self, data):
         start = len(self.input())
         self.emit(data)
         self.send(BARRIER)
-        received = wait_for(self.input, lambda raw: len(raw) > start and raw.endswith(BARRIER),
+        received = wait_for(self.input, lambda raw: len(raw) > start and BARRIER_PATTERN.search(raw) is not None,
                             f"query {data.hex()}")
-        return received[start:-len(BARRIER)]
+        return received[start:BARRIER_PATTERN.search(received).start()]
 
     def close(self):
         (self.root / "stop").touch()
@@ -306,10 +309,11 @@ def matrix(tab):
     rows.append({"case": "characters/lone-escape", "sent": "1b", "received": received[start:].hex()})
     for keypad in (False, True):
         tab.emit(RESET + (b"\x1b=" if keypad else b"\x1b>"))
-        # Numeric and enhanced keypad keys are both decoded; capture whether application
-        # keypad mode preserves their distinct encoding.
-        case(f"keypad/application-{keypad}/numeric", b"0123456789.+-*/\r")
-        case(f"keypad/application-{keypad}/enhanced", b"".join(f"\x1b[{code}u".encode() for code in range(57399, 57417)))
+        # Ordinary digit bytes cannot identify a keypad; enhanced outer keys can.
+        case(f"keypad/application-{keypad}/numeric", b"0123456789.+-*/\r", b"0123456789.+-*/\r")
+        enhanced = b"".join(f"\x1b[{code}u".encode() for code in range(57399, 57417))
+        expected = b"".join(b"\x1bO" + bytes([code]) for code in b"pqrstuvwxynojmkMXl") if keypad else b"0123456789./*-+\r=,"
+        case(f"keypad/application-{keypad}/enhanced", enhanced, expected)
     for enabled in (False, True):
         tab.emit(RESET + (b"\x1b[?2004h" if enabled else b""))
         case(f"paste/bracketed-{enabled}", b"\x1b[200~copper\nline\r\n\xce\xbb\x1b[201~")
@@ -335,6 +339,8 @@ def matrix(tab):
                       ("XTSMGRAPHICS", b"\x1b[?1;1;0S")):
         tab.emit(RESET)
         received = tab.query(raw)
+        if name == "OSC52-read":
+            assert received in (b"\x1b]52;c;\x07", b"\x1b]52;c;\x1b\\"), received
         rows.append({"case": "queries/" + name, "sent": raw.hex(), "received": received.hex()})
     for mode in (1, 66, 1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 1049, 2004, 2026, 2031, 2048, 5522):
         for enabled in (False, True):
@@ -389,12 +395,7 @@ def matrix(tab):
                         lambda rows: any(row["kind"] == "resize" and [row["cols"], row["rows"]] == status["body"][2:] for row in rows),
                         "child SIGWINCH")
     rows.append({"case": "resize", "pane": status["body"][2:], "child_sigwinch": True})
-    # Today's focused-terminal ownership: detach is unconditional. Other advertised space
-    # chords go to the child after glass_key's terminal guard. Capture this distinction.
-    for name, raw in (("ctrl-k", b"\x0b"), ("ctrl-q", b"\x11"), ("ctrl-s", b"\x13"),
-                      ("ctrl-t", b"\x14"), ("ctrl-v", b"\x16"), ("ctrl-w", b"\x17"), ("ctrl-x", b"\x18"),
-                      ("ctrl-h", b"\x08"), ("ctrl-o", b"\x0f"), ("ctrl-f", b"\x06"),
-                      ("ctrl-c-shell", b"\x03"), ("ctrl-d-shell", b"\x04")):
+    for name, raw in (("ctrl-q", b"\x11"), ("ctrl-s", b"\x13"), ("ctrl-t", b"\x14"), ("ctrl-v", b"\x16"), ("ctrl-w", b"\x17"), ("ctrl-x", b"\x18"), ("ctrl-h", b"\x08"), ("ctrl-o", b"\x0f"), ("ctrl-f", b"\x06"), ("ctrl-c-shell", b"\x03"), ("ctrl-d-shell", b"\x04")):
         case("ownership/" + name, raw)
     start = len(tab.input())
     tab.send(b"\x1c")
@@ -424,6 +425,132 @@ def agent_guards(worker):
             tab.close()
 
 
+def controls_and_images(worker):
+    import base64
+    with tempfile.TemporaryDirectory(prefix="stui-controls-") as directory:
+        tab = Tab(worker, [sys.executable, str(HERE / "copper_probe.py"), directory], directory)
+        tab.env["STUI_PROBE_GRAPHICS"] = "1"
+        rows = []
+        try:
+            tab.start()
+            for tracking in (0, 1000, 1002, 1003):
+                for selection in ("drag", "alt", "shift", "toggle"):
+                    if tracking and selection == "drag": continue
+                    tab.emit(RESET + b"copper selection" + (f"\x1b[?{tracking}h\x1b[?1006h".encode() if tracking else b""))
+                    if selection == "toggle":
+                        assert tab.exercise(b"\x1b[115;7u") == b""
+                        wait_for(tab.status, lambda s: s and s["selection_mode"], "selection toggle")
+                    modifier = {"alt": 8, "shift": 4}.get(selection, 0)
+                    time.sleep(0.41)  # Separate drags, rather than double/triple click gestures.
+                    start = len(tab.output)
+                    tab.send(tab.mouse(modifier, x=0, y=0) + tab.mouse(32+modifier, x=5, y=0) + tab.mouse(modifier, x=5, y=0, release=True))
+                    wait_for(tab.status, lambda s: s and s["selected"] == "copper", f"selected text mouse-{tracking}/{selection}")
+                    wait_for(lambda: bytes(tab.output[start:]), lambda raw: b"\x1b]52;c;Y29wcGVy" in raw, "copied selection")
+                    received = tab.exercise(b"")
+                    assert received == b"", (tracking, selection, received)
+                    rows.append({"case": f"selection/mouse-{tracking}/{selection}", "copied": "copper", "received": ""})
+                    if selection == "toggle":
+                        assert tab.exercise(b"\x1b[115;7u") == b""
+                        wait_for(tab.status, lambda s: s and not s["selection_mode"], "program mouse restored")
+                        if tracking:
+                            assert tab.exercise(tab.mouse(0) + tab.mouse(0, release=True)).startswith(b"\x1b[<0;"), "mouse resumes"
+            tab.emit(RESET + b"\x1b[?1003h\x1b[?1006h")
+            assert tab.exercise(tab.mouse(66) + tab.mouse(67)) == b"\x1b[<66;5;3M"*3 + b"\x1b[<67;5;3M"*3
+            rows.append({"case": "mouse/horizontal-wheel", "received": True})
+            tab.emit(RESET + b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\")
+            start = len(tab.output)
+            tab.send(tab.mouse(24, x=0, y=0))
+            wait_for(lambda: bytes(tab.output[start:]), lambda raw: b"\x1b]52;c;aHR0cHM6Ly9leGFtcGxlLmNvbQ==" in raw, "hyperlink copy")
+            rows.append({"case": "render/hyperlink-destination", "copied": True})
+            tab.emit(RESET + b"".join(f"copper history {line}\r\n".encode() for line in range(80)))
+            tab.send(tab.mouse(64))
+            wait_for(tab.status, lambda s: s and s["scrolled"] == 3, "local wheel history")
+            rows.append({"case": "history/local-wheel", "scrolled": 3})
+            assert tab.exercise(b"\x00") == b"\x00", "Ctrl-Space stays NUL"
+            # Recovery reaches the daemon as output-side control, and retains normal history.
+            tab.emit(RESET + b"copper retained\r\n\x1b[>27u\x1b[?1049h\x1b[>31u\x1b[?1003h\x1b[?1006h\x1b[?2004h")
+            assert tab.exercise(b"\x1b[114;7u") == b""
+            wait_for(tab.status, lambda s: s and "MOUSE_" not in s["mode"] and "ALT_SCREEN" not in s["mode"] and "DISAMBIGUATE" not in s["mode"], "input modes reset")
+            assert "copper retained" in tab.status()["text"]
+            assert tab.query(b"\x1b[?1003$p\x1b[?u\x1b[?4m") == b"\x1b[?1003;2$y\x1b[?0u\x1b[>4;0m"
+            rows.append({"case": "recovery/durable-modes", "history": True, "received": ""})
+            # Actual negotiated in-band resize in addition to the SIGWINCH matrix check.
+            tab.emit(RESET + b"\x1b[?2048h")
+            start = len(tab.input())
+            tab.resize(42, 124)
+            wait_for(tab.input, lambda raw: b"\x1b[48;" in raw[start:], "in-band resize")
+            rows.append({"case": "resize/in-band-2048", "received": True})
+            tab.resize(40,120)
+            wait_for(tab.status, lambda s: s and s["body"][2] == 118, "restore size")
+            # Inline Unicode placeholders, with a hole, both image ids and neighbour panes.
+            pixels = base64.b64encode(bytes([220, 90, 40, 255]) * (16 * 32))
+            image = b"\x1b_Ga=t,t=d,f=32,s=16,v=32,i=23,q=2;" + pixels + b"\x1b\\"
+            image += b"\x1b_Ga=p,U=1,i=23,p=1,c=2,r=2,q=2\x1b\\"
+            # First two diacritics in kitty's table are U+0305 and U+030D.
+            def placeholder(row,col):
+                marks=["\u0305", "\u030d"]
+                return ("\U0010eeee" + marks[row] + marks[col]).encode()
+            cells = b"\x1b[38;2;0;0;23m\x1b[58;2;0;0;1m" + placeholder(0,0) + placeholder(0,1) + b"\x1b[2;1H" + placeholder(1,0) + placeholder(1,1)
+            start = len(tab.output)
+            tab.emit(RESET + image + cells + b"\x1b[0m")
+            visible = wait_for(tab.status, lambda s: s and len(s["image_cells"]) == 4, "virtual image cells")
+            wait_for(lambda: bytes(tab.output[start:]), lambda raw: b"a=T" in raw and b"U=1" in raw, "outer remapped pixels")
+            assert b"i=23," not in bytes(tab.output[start:]), "child image id escaped"
+            for x,y in visible["image_cells"]:
+                bx,by,bw,bh=visible["body"]
+                assert bx <= x < bx+bw and by <= y < by+bh
+            # Erasing placeholder text erases the image, then scrolling crops the original.
+            tab.emit(b"\x1b[1;2H ")
+            wait_for(tab.status, lambda s: s and len(s["image_cells"]) == 3, "placeholder hole")
+            tab.emit(b"\x1b[1S")
+            wait_for(tab.status, lambda s: s and len(s["image_cells"]) == 2, "image scroll crop")
+            hidden_start = len(tab.output)
+            (tab.root / "ui-action").write_text("hide")
+            wait_for(tab.status, lambda s: s and not s["focused"] and not s["image_cells"], "hide terminal tab images")
+            wait_for(lambda: bytes(tab.output[hidden_start:]), lambda raw: b"a=d,d=I" in raw, "release hidden image storage")
+            (tab.root / "ui-action").write_text("show")
+            shown = wait_for(tab.status, lambda s: s and s["focused"] and len(s["image_cells"]) == 2, "show terminal tab images")
+            # Move the real tab through the UI's actual drag/drop decoder into a right split.
+            terminal_tab = shown["tabs"][0]
+            x,y,width,_,_,_=terminal_tab
+            bx,by,bw,bh=shown["body"]
+            def outer_mouse(button, x, y, release=False):
+                return f"\x1b[<{button};{x+1};{y+1}{'m' if release else 'M'}".encode()
+            tab.send(outer_mouse(0, x+width//2, y) + outer_mouse(32, bx+bw-1, by+bh//2) + outer_mouse(0, bx+bw-1, by+bh//2, True))
+            moved = wait_for(tab.status, lambda s: s and s["body"][0] > bx and len(s["image_cells"]) == 2, "image pane move")
+            for x,y in moved["image_cells"]:
+                bx,by,bw,bh=moved["body"]
+                assert bx <= x < bx+bw and by <= y < by+bh
+            tab.resize(44,132)
+            wait_for(tab.status, lambda s: s and s["body"][2] != moved["body"][2] and len(s["image_cells"]) == 2, "image resize")
+            tab.emit(b"\x1b_Ga=d,d=I,i=23,q=2\x1b\\\x1b[2J")
+            wait_for(tab.status, lambda s: s and not s["image_cells"], "image delete")
+            rows.append({"case": "images/unicode-lifecycle", "clipped": True, "scroll": True, "move": True, "hide": True, "resize": True, "delete": True})
+            # Direct placements use the same pane-safe outer virtual image path.
+            start = len(tab.output)
+            tab.emit(RESET + b"\x1b_Ga=T,t=d,f=32,s=16,v=32,i=24,c=2,r=2,C=1,q=2;" + pixels + b"\x1b\\")
+            direct = wait_for(tab.status, lambda s: s and len(s["image_cells"]) == 4, "direct image cells")
+            wait_for(lambda: bytes(tab.output[start:]), lambda raw: b"a=T" in raw and b"U=1" in raw, "direct remapped pixels")
+            for x,y in direct["image_cells"]:
+                bx,by,bw,bh=direct["body"]
+                assert bx <= x < bx+bw and by <= y < by+bh
+            tab.emit(b"\x1b_Ga=d,d=I,i=24,q=2\x1b\\")
+            wait_for(tab.status, lambda s: s and not s["image_cells"], "direct image delete")
+            rows.append({"case": "images/direct-placement", "clipped": True, "delete": True})
+            # The palette stays stui's, and detach is available through its overlay.
+            tab.emit(RESET)
+            before = len(tab.input())
+            tab.send(b"\x0b")
+            wait_for(tab.status, lambda s: s and s["palette"], "Ctrl-K palette")
+            tab.send(b"\x1c")
+            wait_for(tab.status, lambda s: s and s["detached"], "detach through palette")
+            assert tab.input()[before:] == b""
+            rows.append({"case": "ownership/palette-and-detach", "received": "", "detached": True})
+            return rows
+        finally:
+            tab.close()
+
+
 def check_program(worker, name, binary):
     with tempfile.TemporaryDirectory(prefix="stui-app-") as directory:
         root = Path(directory)
@@ -445,6 +572,7 @@ def check_program(worker, name, binary):
             time.sleep(0.2)
             wheel = bytes(tab.wire_input[start:])
             after = tab.status()
+            assert before["text"] != after["text"], f"{name}: wheel did not change its screen"
             # Check the program itself can scroll: no network fixture or user input involved.
             start = len(tab.wire_input)
             tab.send(b"j" if name == "cha" else b"\x1b[B")
@@ -480,9 +608,12 @@ def main():
             raise
         finally:
             tab.close()
+    if args.record:
+        args.record.write_text(json.dumps(rows, indent=2) + "\n")
     rows.extend(agent_guards(args.worker.resolve()))
+    rows.extend(controls_and_images(args.worker.resolve()))
     if args.check:
-        expected = json.loads((HERE / "fixtures/terminal-tab-baseline.json").read_text())
+        expected = json.loads((HERE / "fixtures/terminal-tab-current.json").read_text())
         assert len(rows) == len(expected), f"row count {len(rows)} != {len(expected)}"
         for row, old in zip(rows, expected):
             assert row == old, f"{row['case']}:\nexpected {old}\nreceived {row}"

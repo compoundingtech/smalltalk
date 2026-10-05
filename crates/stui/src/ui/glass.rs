@@ -2482,8 +2482,8 @@ impl Ui {
         {
             return false;
         }
-        // In a focused, attached terminal every key is the agent's; Ctrl+\ leaves it first.
-        if terminal_focused {
+        // Space control chords retain their owner; the other terminal keys go to the child.
+        if terminal_focused && !super::terminal_space_key(key) {
             return false;
         }
         // Alt and a letter or digit commands nothing: on a Mac Option types a character instead,

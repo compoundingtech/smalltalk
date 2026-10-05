@@ -1,0 +1,35 @@
+{
+  "program": "terminal-browser",
+  "version": "0.13.4",
+  "headless": true,
+  "started": true,
+  "mode": "TermMode(BRACKETED_PASTE | SGR_MOUSE | MOUSE_MOTION | LINE_WRAP | FOCUS_IN_OUT | ALT_SCREEN | ALTERNATE_SCROLL | URGENCY_HINTS | DISAMBIGUATE_ESC_CODES | REPORT_EVENT_TYPES | REPORT_ALL_KEYS_AS_ESC | REPORT_ASSOCIATED_TEXT)",
+  "graphics_apc_count": 148,
+  "graphics_headers": [
+    "a=T,f=32,o=z,s=944,v=576,t=d,i=1,p=1,C=1,z=0,q=2,m=1",
+    "i=299,a=q,t=s,f=32,s=1,v=1",
+    "i=300,a=q,t=f,f=32,s=1,v=1",
+    "i=4207,a=q,t=d,f=24,s=1,v=1",
+    "m=0",
+    "m=1"
+  ],
+  "outer_graphics_apc_count": 1417,
+  "wheel_received": "1b5b3c36353b33363b34304d1b5b3c36353b33363b34304d1b5b3c36353b33363b34304d",
+  "ctrl_alt_shift_a_received": "1b5b39373b3875",
+  "output_requests": [
+    "\u001b[>1u",
+    "\u001b[>27u",
+    "\u001b[?1003h",
+    "\u001b[?1004h",
+    "\u001b[?1006h",
+    "\u001b[?1016h",
+    "\u001b[?1049h",
+    "\u001b[?2004h",
+    "\u001b[?2026h",
+    "\u001b[?2026l",
+    "\u001b[?2031h",
+    "\u001b[?2048h",
+    "\u001b[?25l",
+    "\u001b[H"
+  ]
+}

@@ -984,6 +984,7 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     {
                         ui.park_for(&agent);
+                        ui.terminal_selection_mode = false;
                         ui.terminal = Some(super::TerminalView {
                             agent: agent.clone(),
                             title: name.clone(),
