@@ -19882,7 +19882,7 @@ async fn sync_native_delivery_control(
         }
     };
     if !waiting && paths.pending_hold_adoption.is_none() {
-        paths.delivery_gate.update(true, Duration::ZERO);
+        paths.delivery_gate.idle();
         report(&paths.delivery_gate);
         return Ok(());
     }
@@ -26782,8 +26782,25 @@ mission "review" state="ready" {
     }
 
     #[test]
-    fn graph_delivery_deliberate_hold_keeps_mailbox_ready() {
+    fn graph_delivery_idle_and_deliberate_hold_keep_mailbox_ready() {
         let gate = st_drivers::session_control::DeliveryGate::default();
+        gate.unavailable();
+        for transport in ["app-server", "opencode-server"] {
+            assert_eq!(
+                native_delivery_control_report(transport, &gate)["ready"],
+                false
+            );
+        }
+        gate.idle();
+        assert!(gate.held(), "idle must close any handoff permission");
+        for transport in ["app-server", "opencode-server"] {
+            let report = native_delivery_control_report(transport, &gate);
+            assert_eq!(
+                report["ready"], true,
+                "idle must clear an obsolete control failure"
+            );
+            assert!(report["reason"].is_null());
+        }
         gate.update(true, DELIVERY_CONTROL_LEASE);
         assert!(gate.held(), "a deliberate hold must still block native input");
         for transport in ["app-server", "opencode-server"] {

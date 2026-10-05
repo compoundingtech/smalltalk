@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 pub enum DeliveryBlockReason {
     ControlUnavailable,
     HoldActive,
+    Idle,
 }
 
 impl DeliveryBlockReason {
@@ -23,6 +24,7 @@ impl DeliveryBlockReason {
             Self::HoldActive => {
                 "delivery-hold-active: new native handoffs are held by graph delivery control"
             }
+            Self::Idle => "delivery-idle: no native mail awaits handoff",
         }
     }
 }
@@ -37,6 +39,14 @@ struct Permit {
 pub struct DeliveryGate(Arc<Mutex<Permit>>);
 
 impl DeliveryGate {
+    /// Empty mail needs no permission. This closes the gate without claiming a failed read.
+    pub fn idle(&self) {
+        if let Ok(mut permit) = self.0.lock() {
+            permit.expires = None;
+            permit.blocked = Some(DeliveryBlockReason::Idle);
+        }
+    }
+
     /// Update from a successful graph read. A hold closes the gate immediately.
     pub fn update(&self, held: bool, lease: Duration) {
         if let Ok(mut permit) = self.0.lock() {
@@ -133,5 +143,15 @@ mod tests {
         );
         gate.update(false, Duration::ZERO);
         assert!(control.held(&status));
+        gate.idle();
+        assert!(control.held(&status));
+        assert_eq!(gate.blocked_reason(), Some(DeliveryBlockReason::Idle));
+        gate.update(false, Duration::from_secs(10));
+        assert!(!control.held(&status), "fresh mail needs a new graph permit");
+        gate.unavailable();
+        assert_eq!(
+            gate.blocked_reason(),
+            Some(DeliveryBlockReason::ControlUnavailable)
+        );
     }
 }
