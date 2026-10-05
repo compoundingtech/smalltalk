@@ -303,6 +303,9 @@ pub struct Attention {
     /// Information the person asked for; reading it clears the card.
     #[serde(default)]
     pub update: Option<PersonUpdate>,
+    /// The mission step waiting on this ask, on an ask a mission step made.
+    #[serde(default)]
+    pub blocked: Option<AttentionBlocked>,
     pub title: String,
     pub detail: String,
     pub priority: String,
@@ -314,6 +317,16 @@ pub struct Attention {
     pub target_states: Vec<AttentionTargetState>,
     #[serde(default)]
     pub actions: Vec<String>,
+}
+/// The mission step that asked and waits for the answer.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AttentionBlocked {
+    pub step_run_id: String,
+    /// That step's name within its mission.
+    pub step: String,
+    /// What that step is for.
+    pub goal: String,
+    pub attempt: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AttentionTargetState {

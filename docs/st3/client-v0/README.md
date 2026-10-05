@@ -418,6 +418,12 @@ information the person asked for and asks nothing: show it, and send `work.done`
 `answer: {"id": "read"}` (its `action_parameters` already carry it) when the person opens it
 or presses read. Agents post updates with `st work update`.
 
+A card for an ask a mission step made carries that mission (`mission_id`), its run
+(`mission_run_id`) and `blocked`: the step run that asked and waits for the answer, its name
+(`step`), what it is for (`goal`) and its `attempt`. A standalone ask (`--new-run`) and an update
+have no `blocked`. Show the step and its goal with the question, so the person can see what
+their answer lets go on, and link the mission.
+
 `work.done` takes `target_id`, `episode`, nonempty `summary`, optional string `evidence`, and
 an optional `answer` (`id` and/or `text`). A structured decision or choice needs `answer.id`,
 or text for an allowed custom choice; requesting changes and feedback need text. Validation

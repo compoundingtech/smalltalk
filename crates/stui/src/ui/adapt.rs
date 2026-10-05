@@ -423,6 +423,10 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                 agent,
                 related,
                 raised_by,
+                blocked: item.blocked.as_ref().map(|blocked| Blocked {
+                    step: blocked.step.clone(),
+                    goal: clean_message_text(&blocked.goal),
+                }),
                 tier,
                 title: extras
                     .bodies

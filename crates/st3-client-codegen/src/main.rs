@@ -597,6 +597,7 @@ fn validate_surfaces(
         "ResourceObservation",
         "ResourcesFilter",
         "ResourcesPage",
+        "AttentionBlocked",
         "AttentionTargetState",
         "DocumentContent",
         "AgentDeclaration",

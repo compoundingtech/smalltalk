@@ -654,6 +654,27 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             .unwrap_or_else(|| mission.trim_start_matches("mission/").to_owned());
         link(&mut card, "mission  ", &label, mission);
     }
+    // The step that waits on this ask, and what it is for: what answering lets go on.
+    if let Some(blocked) = &item.blocked {
+        card.lines(text::wrap(
+            &[
+                text::run(blocked.step.clone(), theme::soft()),
+                text::run(
+                    if blocked.goal.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", blocked.goal)
+                    },
+                    theme::dim(),
+                ),
+                text::run(" — it continues once you answer", theme::dim()),
+            ],
+            inner,
+            &[text::run("waits    ", theme::dim())],
+            &[text::run("         ", theme::dim())],
+            None,
+        ));
+    }
     if let Some(agent) = &item.agent {
         let label = world
             .agents

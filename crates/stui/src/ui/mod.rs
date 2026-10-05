@@ -5352,6 +5352,7 @@ mod tests {
             actions: vec!["custom.reply".into()],
             related: vec![],
             raised_by: None,
+            blocked: None,
         }]);
         let mut ui = Ui::new(world);
         ui.live = true;
@@ -5501,6 +5502,7 @@ mod tests {
             actions: vec!["work.done".into()],
             related: Vec::new(),
             raised_by: None,
+            blocked: None,
         };
         if let Load::Ready(items) = &mut world.attention {
             items.insert(0, asks("attention/request-one"));
@@ -5637,6 +5639,7 @@ mod tests {
             actions: vec!["work.done".into()],
             related: Vec::new(),
             raised_by: None,
+            blocked: None,
         };
         if let Load::Ready(items) = &mut world.attention {
             items.insert(0, item);
@@ -5677,6 +5680,57 @@ mod tests {
     }
 
     #[test]
+    fn a_mission_backed_ask_names_its_mission_and_the_step_that_waits() {
+        // Nathan, 2026-10-05: a request a mission step made lost its mission link.
+        let mut world = demo::world();
+        let mission = "mission/release-proof";
+        let item = Attention {
+            id: "attention/capacity".into(),
+            tier: Tier::Stopped,
+            title: "Allocate capacity?".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: Some(mission.into()),
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Request {
+                from: "Chief of Staff".into(),
+                from_id: "agent/example/cos".into(),
+                question: "The proof needs a runner.".into(),
+                structured: None,
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+            blocked: Some(Blocked {
+                step: "tag-proof".into(),
+                goal: "Prove the published tag builds.".into(),
+            }),
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let at = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/capacity")
+            .unwrap();
+        ui.select(at);
+        let screen = frame(&ui, 140, 50).join("\n");
+        for shown in [
+            "release-proof",
+            "waits    tag-proof · Prove the published tag builds.",
+            "it continues once you answer",
+            "Go to the mission",
+        ] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+    }
+
+    #[test]
     fn an_update_shows_what_was_asked_for_and_clears_once_read() {
         let mut world = demo::world();
         let item = Attention {
@@ -5696,6 +5750,7 @@ mod tests {
             actions: vec!["work.done".into()],
             related: Vec::new(),
             raised_by: None,
+            blocked: None,
         };
         if let Load::Ready(items) = &mut world.attention {
             items.insert(0, item);
@@ -5781,6 +5836,7 @@ mod tests {
                     actions: vec!["work.done".into()],
                     related: Vec::new(),
                     raised_by: None,
+                    blocked: None,
                 },
             );
         }

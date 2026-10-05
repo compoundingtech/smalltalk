@@ -790,6 +790,18 @@ export const Attachment = /*#__PURE__*/ (() => Schema.Struct({
 export type Attachment = typeof Attachment.Type
 export type AttachmentEncoded = typeof Attachment.Encoded
 
+export const AttentionBlocked = /*#__PURE__*/ (() => Schema.Struct({
+  "attempt": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** What that step is for. */
+  "goal": Schema.String.annotate({ description: "What that step is for." }),
+  /** That step's name within its mission. */
+  "step": Schema.String.annotate({ description: "That step's name within its mission." }),
+  /** The step run that asked and waits for the answer. */
+  "step_run_id": Id
+}).annotate({ identifier: "AttentionBlocked" }))()
+export type AttentionBlocked = typeof AttentionBlocked.Type
+export type AttentionBlockedEncoded = typeof AttentionBlocked.Encoded
+
 export const AttentionTargetState = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
   "since": optionalKey(Timestamp),
@@ -826,6 +838,8 @@ export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "actions": Schema.Array(Schema.Literals(["custom.reply","work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"])),
   "attention_kind": Schema.Union([Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault"]), Schema.String.check(Schema.isPattern(new RegExp("^custom\\.[a-zA-Z0-9_.-]+$", "u")))]),
   "because": optionalKey(Schema.String),
+  /** The mission step waiting on this ask, on an ask a mission step made; absent on a standalone ask. */
+  "blocked": optionalKey(AttentionBlocked),
   /** Data-only registered reply form; absent on native attention. */
   "custom_form": optionalKey(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "Data-only registered reply form; absent on native attention." }),
   "detail": Schema.String,

@@ -6,6 +6,50 @@ use crate::model::LoopSpec;
 const FINAL_STEP_FAULT_MS: u128 = 24 * 60 * 60 * 1000;
 
 impl Store {
+    /// The mission context of a person ask a mission step made: its mission, and the step that
+    /// waits on the answer with its goal. `None` for a standalone ask or an update, which belong
+    /// to no mission of their own.
+    pub(crate) fn person_ask_context(&self, subject: &str) -> Result<Option<Value>> {
+        let connection = self.readers.get();
+        let Some(ask) = person_work::request(&connection, subject)? else {
+            return Ok(None);
+        };
+        let fields = &ask.body["fields"];
+        let (Some(origin), Some(view)) = (
+            fields["origin_step"].as_str(),
+            person_work::step(&connection, subject)?,
+        ) else {
+            return Ok(None);
+        };
+        let Some(blocked) = person_work::step(&connection, origin)? else {
+            return Ok(None);
+        };
+        // Runs are stored without their `mission-run/` prefix, and missions without `mission/`.
+        let mission: Option<String> = connection
+            .query_row(
+                "SELECT mission_id FROM mission_runs WHERE id=?1",
+                [view.run.strip_prefix("mission-run/").unwrap_or(&view.run)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|id| {
+                if id.starts_with("mission/") {
+                    id
+                } else {
+                    format!("mission/{id}")
+                }
+            });
+        Ok(Some(json!({
+            "mission_id": mission,
+            "blocked": {
+                "step_run_id": origin,
+                "step": blocked.step,
+                "goal": blocked.goals.join("\n"),
+                "attempt": blocked.attempt,
+            },
+        })))
+    }
+
     pub(super) fn person_attention_items(
         &self,
         person: Option<&str>,

@@ -132,6 +132,15 @@ pub struct Attention {
     pub related: Vec<(String, Option<String>)>,
     /// Who raised it, when st says.
     pub raised_by: Option<String>,
+    /// The mission step waiting on this ask, on an ask a mission step made.
+    pub blocked: Option<Blocked>,
+}
+
+/// The mission step that asked and waits for the answer.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Blocked {
+    pub step: String,
+    pub goal: String,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
