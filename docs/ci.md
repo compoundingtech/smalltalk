@@ -39,7 +39,8 @@ limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
   by the profile's default filter (see [gate scope](#gate-scope));
 - `linux-clippy`: `cargo clippy --workspace --all-targets --locked`, the standalone conversation
   model check, the [warning ratchet](#clippy-warning-ratchet), then
-  `cargo run --locked -p st3-client-codegen -- --check`;
+  `cargo run --locked -p st3-client-codegen -- --check` and
+  `cargo run --locked -p st3-schema --example schema_markdown -- --check docs/st3/schema.md`;
 - `linux-fleet-compat`: the fleet compatibility test against `.github/fleet-compat-baseline.json`'s
   pinned older st3. Building that baseline also runs the pinned pty's own unit tests, two of which
   are timing-sensitive, so the build is retried up to three times.
@@ -334,6 +335,9 @@ the larger scale is more than three times its work at the smaller, after dividin
 answer grew. It also measures a replication round as the worker runs it (summary, push, receive)
 and a checkpoint trim, per deleted row. Counts do not depend on the machine, so the job builds
 with `opt-level = 1` only to generate the stores faster.
+Before sampling, conversation search must finish its asynchronous index warmup within
+120 seconds. Only its explicit index-building response is retried; other fixture
+errors and all measured request errors remain failures.
 
 - Every route `api.rs` declares is measured or listed in `NOT_MEASURED` with its reason; a new
   route fails `the_cost_check_covers_every_route` until it is one or the other.

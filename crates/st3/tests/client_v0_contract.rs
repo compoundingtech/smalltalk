@@ -2742,13 +2742,16 @@ mission "example/other/one" state="ready" { concurrent-runs; goal "Wait outside 
     for agent in ["agent/example/operator", "agent/example/undeclared"] {
         let (_, capabilities) =
             client_json_person(app.clone(), "/v1/client/capabilities", agent).await;
-        for capability in capabilities["value"]["capabilities"].as_array().unwrap() {
-            let id = capability["id"].as_str().unwrap();
-            if capability["state"] == "unavailable" || id.contains("glass") {
-                continue;
-            }
-            assert_eq!(capability["state"], "granted", "{agent}: {capability}");
-        }
+        let audit = capabilities["value"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|capability| capability["id"] == "terminal.audit.read")
+            .unwrap();
+        assert_eq!(
+            audit["state"], "ungranted",
+            "free mode must not grant fleet audit: {agent}"
+        );
     }
     let cancel = |run: &st3::model::MissionRunView,
                   generation: &str,

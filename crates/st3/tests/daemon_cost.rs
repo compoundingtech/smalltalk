@@ -577,6 +577,10 @@ const PROBES: &[Probe] = &[
         "/v1/client/status-history/{agent}",
     ),
     get(
+        "GET /v1/client/terminal-input-audit",
+        "/v1/client/terminal-input-audit?terminal=terminal/{agent}&limit=20",
+    ),
+    get(
         "GET /v1/client/agent-declarations/{*id}",
         "/v1/client/agent-declarations/{agent}",
     ),
@@ -1442,6 +1446,34 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         .await
         .expect("the owned-set detail probe must read a live fixture");
     assert_eq!(selected["receipt"]["source"]["sequence"], 1);
+
+    // Search builds its index asynchronously. Finish that fixture warmup before
+    // sampling steady-state request work; a single warmup request may return 503.
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            match person
+                .get::<Value>("/v1/client/conversations/search?text=invented&limit=20")
+                .await
+            {
+                Ok(_) => break,
+                Err(error)
+                    if st3::client::api_error_parts(&error).is_some_and(
+                        |(status, code, message, _)| {
+                            status == 503
+                                && code == "remote-unavailable"
+                                && message
+                                    == "conversation search index is being built; retry shortly"
+                        },
+                    ) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("conversation search fixture failed: {error:#}"),
+            }
+        }
+    })
+    .await
+    .expect("conversation search fixture must become ready before cost sampling");
 
     let mut costs = BTreeMap::new();
     for probe in PROBES {
