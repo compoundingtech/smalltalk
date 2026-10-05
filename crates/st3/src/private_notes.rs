@@ -134,15 +134,18 @@ impl Authority {
         }
         Ok(Notes { uri: uri.to_string(), markdown, fence })
     }
-    pub fn bind_source(&self, node: &str, state_dir: &Path, uri: &str, agent: &str, incarnation: &str) -> Result<String, St3Error> {
+    pub fn bind_source(&self, node: &str, state_dir: &Path, uri: &str, agent: &str, incarnation: &str) -> Result<Option<String>, St3Error> {
+        // Admission is optional: a busy writer must never park the harness outbox ACK.
+        let Some(_lock) = fs::local_try_lock(&state_dir.join("private-notes.lock")).map_err(io)? else {
+            return Ok(None);
+        };
         let uri = PrivateNotesUri::parse(uri).map_err(|error| refusal("validation-failed", &error.message))?;
         let resolved = self.resolve(node, &uri)?;
-        let _lock = fs::local_lock(&state_dir.join("private-notes.lock")).map_err(io)?;
         ledger(state_dir)?.execute("INSERT INTO notes_sources(uri, agent, incarnation, generation) VALUES(?1,?2,?3,?4)
             ON CONFLICT(uri) DO UPDATE SET agent=excluded.agent, incarnation=excluded.incarnation, generation=excluded.generation
             WHERE notes_sources.agent<>excluded.agent OR notes_sources.incarnation<>excluded.incarnation OR notes_sources.generation<>excluded.generation",
             params![uri.as_str(), agent, incarnation, resolved.generation]).map_err(database_error)?;
-        Ok(resolved.generation)
+        Ok(Some(resolved.generation))
     }
 
     pub fn check_source(&self, node: &str, state_dir: &Path, uri: &str, agent: &str, incarnation: &str) -> Result<(), St3Error> {
@@ -176,15 +179,23 @@ impl Authority {
         if old.as_ref().is_some_and(|old| old.0 != request_digest) {
             return Err(refusal("idempotency-conflict", "the notes idempotency key names a different request"));
         }
+        // Revalidate current source/ownership before even returning a private exact-retry receipt.
+        let resolved = self.resolve(node, &uri)?;
+        let snapshot = fs::read_carrier(&resolved.directory, MAX_BYTES).map_err(io)?;
+        let current = snapshot.revision;
+        if let Some((_, generation, _, _, result)) = &old {
+            if generation != &resolved.generation {
+                return Err(refusal("stale-fence", "the notes receipt belongs to a different carrier generation"));
+            }
+            if let Some(result) = result {
+                return serde_json::from_str(result).map_err(|_| refusal("internal", "private notes outcome is invalid"));
+            }
+        }
         let pending: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM notes_operations WHERE uri=?1 AND result IS NULL AND operation<>?2)",
             params![write.uri, operation], |row| row.get(0)).map_err(database_error)?;
         if pending {
             return Err(refusal("private-notes-indeterminate", "a prior notes replacement requires exact-key recovery before another write"));
         }
-        // Revalidate current source/ownership before even returning a private exact-retry receipt.
-        let resolved = self.resolve(node, &uri)?;
-        let snapshot = fs::read_carrier(&resolved.directory, MAX_BYTES).map_err(io)?;
-        let current = snapshot.revision;
         let replace = || {
             fs::replace(&resolved.directory, &operation, write.markdown.as_bytes(), |expected| {
                 connection.execute("UPDATE notes_operations SET new_revision=?1 WHERE operation=?2", params![expected, operation])
@@ -192,13 +203,7 @@ impl Authority {
                 Ok(())
             }).map_err(|_| refusal("private-notes-indeterminate", "notes replacement remains pending recovery"))
         };
-        if let Some((_, generation, before, after, result)) = old {
-            if generation != resolved.generation {
-                return Err(refusal("stale-fence", "the notes receipt belongs to a different carrier generation"));
-            }
-            if let Some(result) = result {
-                return serde_json::from_str(&result).map_err(|_| refusal("internal", "private notes outcome is invalid"));
-            }
+        if let Some((_, _, before, after, _)) = old {
             if current != before && current != after {
                 return Err(refusal("private-notes-indeterminate", "pending notes replacement cannot be reconciled with the current carrier"));
             }
