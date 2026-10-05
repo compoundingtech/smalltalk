@@ -124,6 +124,9 @@ public actor St3Client {
     }
     public func customSubjectsList(kind: String? = nil, version: Int? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<Page> { var query: [URLQueryItem] = []; if let kind { query.append(.init(name: "kind", value: kind)) }; if let version { query.append(.init(name: "version", value: String(version))) }; if let cursor { query.append(.init(name: "cursor", value: cursor)) }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/custom-subjects", query: query) }
     public func customSubjectsGet(id: String) async throws -> Envelope<Resource> { try await resource("custom-subjects", id: id) }
+    public func harnessQueueGet(id: String, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<HarnessQueueView> { let routedID = Self.encodedPathSegment(id); var query: [URLQueryItem] = []; if let cursor { query.append(.init(name: "cursor", value: cursor)) }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/harness-queue/\(routedID)", query: query) }
+    public func harnessModelsGet(id: String, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<HarnessModelCatalogPage> { let routedID = Self.encodedPathSegment(id); var query: [URLQueryItem] = []; if let cursor { query.append(.init(name: "cursor", value: cursor)) }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/harness-models/\(routedID)", query: query) }
+    public func harnessControlReceiptGet(id: String, subject: String) async throws -> Envelope<HarnessControlOperationReceipt> { let routedID = Self.encodedPathSegment(id); return try await get("v1/client/harness-control-receipts/\(routedID)", query: [.init(name: "subject", value: subject)]) }
     public func hostRepositories(id: String) async throws -> Envelope<HostRepositories> { try await get("v1/client/hosts/\(id)/repositories") }
     public func setsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("sets", cursor: cursor, limit: limit, history: history) }
     public func setsGet(id: String) async throws -> Envelope<Resource> { try await resource("sets", id: id) }
@@ -181,6 +184,8 @@ public actor St3Client {
     public func agentSuspend(id: String, idempotencyKey: String, fence: Fence, parameters: AgentSuspendParameters) async throws -> Envelope<ActionResult> { try await submit(try .agentSuspend(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func attentionResolve(id: String, idempotencyKey: String, fence: Fence, parameters: AttentionResolveParameters) async throws -> Envelope<ActionResult> { try await submit(try .attentionResolve(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func customReply(id: String, idempotencyKey: String, fence: Fence, parameters: CustomReplyParameters) async throws -> Envelope<ActionResult> { try await submit(try .customReply(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
+    public func harnessModelSet(id: String, idempotencyKey: String, fence: Fence, parameters: HarnessModelParameters) async throws -> Envelope<ActionResult> { try await submit(try .harnessModelSet(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
+    public func harnessQueueMutate(id: String, idempotencyKey: String, fence: Fence, parameters: HarnessQueueParameters) async throws -> Envelope<ActionResult> { try await submit(try .harnessQueueMutate(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func laneApprove(id: String, idempotencyKey: String, fence: Fence, parameters: LaneChangeParameters) async throws -> Envelope<ActionResult> { try await submit(try .laneApprove(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func laneJoin(id: String, idempotencyKey: String, fence: Fence, parameters: LaneChangeParameters) async throws -> Envelope<ActionResult> { try await submit(try .laneJoin(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func laneLeave(id: String, idempotencyKey: String, fence: Fence, parameters: LaneChangeParameters) async throws -> Envelope<ActionResult> { try await submit(try .laneLeave(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
@@ -274,6 +279,24 @@ public actor St3Client {
         let (data, response) = try await session.data(for: request); let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if !(200..<300).contains(status) { throw try JSONDecoder().decode(ErrorEnvelope.self, from: data) }
         return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    /// Encode the complete opaque identifier as one RFC 3986 path segment.
+    static func encodedPathSegment(_ value: String) -> String {
+        let hex = Array("0123456789ABCDEF".utf8)
+        var encoded = [UInt8]()
+        encoded.reserveCapacity(value.utf8.count)
+        for byte in value.utf8 {
+            switch byte {
+            case 65...90, 97...122, 48...57, 45, 46, 95, 126:
+                encoded.append(byte)
+            default:
+                encoded.append(37)
+                encoded.append(hex[Int(byte >> 4)])
+                encoded.append(hex[Int(byte & 15)])
+            }
+        }
+        return String(decoding: encoded, as: UTF8.self)
     }
 
     static func routedSessionID(_ value: String) -> String {

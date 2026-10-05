@@ -1170,6 +1170,48 @@ impl Client {
     pub async fn custom_subjects_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("custom-subjects", id).await
     }
+    pub async fn harness_queue_get(
+        &self,
+        id: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<HarnessQueueView>, ClientError> {
+        self.list_internal_with_filters(
+            &format!("harness-queue/{}", percent_encode_segment(id)),
+            cursor,
+            limit,
+            false,
+            &[],
+        )
+        .await
+    }
+    pub async fn harness_models_get(
+        &self,
+        id: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<HarnessModelCatalogPage>, ClientError> {
+        self.list_internal_with_filters(
+            &format!("harness-models/{}", percent_encode_segment(id)),
+            cursor,
+            limit,
+            false,
+            &[],
+        )
+        .await
+    }
+    pub async fn harness_control_receipt_get(
+        &self,
+        id: &str,
+        subject: &str,
+    ) -> Result<Envelope<HarnessControlOperationReceipt>, ClientError> {
+        self.get(&format!(
+            "/v1/client/harness-control-receipts/{}?subject={}",
+            percent_encode_segment(id),
+            percent_encode_segment(subject)
+        ))
+        .await
+    }
     pub async fn host_repositories(
         &self,
         host: &str,
@@ -1663,6 +1705,28 @@ impl Client {
         parameters: CustomReplyParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::custom_reply(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn harness_model_set(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: HarnessModelParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::harness_model_set(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn harness_queue_mutate(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: HarnessQueueParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::harness_queue_mutate(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
