@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""Inventory and time st reads. Run against read_survey_server on an offline store copy.
+
+Output contains route templates, counts and timings only. Resolved IDs and response contents
+are never saved. Error-path timing is explicitly distinguished from a successful read.
+"""
+import argparse
+import hashlib
+import http.client
+import json
+import math
+import os
+from pathlib import Path
+import re
+import socket
+import sqlite3
+import subprocess
+import time
+from urllib.parse import quote, urlencode
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def routes():
+    source = (ROOT / "crates/st3/src/api.rs").read_text()
+    source = source[:source.index('\nasync fn schema()')]
+    found = []
+    for m in re.finditer(r'\.route\(\s*"([^"]+)"\s*,', source):
+        end = source.find('.route(', m.end())
+        body = source[m.end():end if end >= 0 else len(source)]
+        handler = re.search(r'\bget\(([\w:]+)\)', body)
+        if handler:
+            found.append(dict(route=m[1], handler=handler[1],
+                              source_line=source.count('\n', 0, m.start()) + 1))
+    return list({r['route']: r for r in found}.values())
+
+
+def percentile(values, p):
+    return sorted(values)[max(0, math.ceil(len(values) * p / 100) - 1)]
+
+
+def stats(values):
+    return dict(n=len(values), p50_ms=round(percentile(values, 50), 3),
+                p95_ms=round(percentile(values, 95), 3), max_ms=round(max(values), 3))
+
+
+def read_budget(route):
+    """Proposed p99 targets; bulk duration and intentional waits need separate contracts."""
+    if route in ['/v1/health', '/v1/schema', '/v1/client/capabilities']:
+        return 50
+    collections = ('/variants', '/decisions', '/approvals', '/generations', '/requests',
+                   '/claims', '/history', '/versions', '/changes', '/entries')
+    if route.endswith(('/stream', '/raw-stream', *collections)) or route == '/v1/backup':
+        return 100
+    return 50 if '{' in route else 100
+
+
+def cli_inventory(binary, samples):
+    command = (ROOT / 'crates/st3/src/main.rs').read_text().split('enum Command {', 1)[1].split('\n}\n', 1)[0]
+    roots = [re.sub(r'(?<!^)(?=[A-Z])', '-', name).lower()
+             for name in re.findall(r'^    ([A-Z]\w*)\s*(?:\(|\{|,)', command, re.M)]
+    queue = [(r,) for r in roots]
+    queue += [('terminals', 'serve-fabric'), ('claude-channel', 'install-policy'),
+              ('claude-channel', 'uninstall-policy'), ('sekrets', 'serve')]
+    result = []
+    env = {k: v for k, v in os.environ.items() if k != 'ST_AGENT' and not k.startswith('ST3_')}
+    while queue:
+        path = queue.pop(0)
+        times = []
+        for _ in range(samples):
+            start = time.perf_counter()
+            p = subprocess.run([binary, *path, '--help'], env=env, capture_output=True, timeout=10)
+            times.append((time.perf_counter() - start) * 1000)
+        help_text = p.stdout.decode(errors='replace')
+        subcommands = []
+        if 'Commands:\n' in help_text:
+            section = help_text.split('Commands:\n', 1)[1].split('\nOptions:', 1)[0]
+            subcommands = re.findall(r'^  ([a-z][a-z0-9-]*)\s{2,}', section, re.M)
+            subcommands = [s for s in subcommands if s != 'help']
+        queue.extend(path + (s,) for s in subcommands)
+        if not subcommands or path in [('skill',), ('sekrets',), ('fleet', 'invites'), ('agents', 'queue')]:
+            result.append(dict(command='st ' + ' '.join(path), help=stats(times),
+                               help_summary=help_text.splitlines()[0] if help_text else '',
+                               help_exit=p.returncode, proposed_help_p99_ms=50,
+                               proposed_read_p99_ms=200, proposed_write_ack_p99_ms=250,
+                               semantic='pending fixture or read mapping'))
+    return result
+
+
+class UnixHTTP(http.client.HTTPConnection):
+    def __init__(self, path, timeout):
+        super().__init__('localhost', timeout=timeout)
+        self.path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.path)
+
+
+def request(sock, path, timeout=120, method='GET', body=None, first_byte=False, extra_headers=None):
+    c = UnixHTTP(sock, timeout)
+    start = time.perf_counter()
+    try:
+        headers = {'Content-Type': 'application/json', 'x-st3-person': 'person/avery'}
+        headers.update(extra_headers or {})
+        websocket = path.split('?')[0].endswith(('/stream', '/raw-stream'))
+        if websocket:
+            headers.update({'Connection': 'Upgrade', 'Upgrade': 'websocket',
+                            'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                            'Sec-WebSocket-Version': '13'})
+        c.request(method, path, body=body, headers=headers)
+        r = c.getresponse()
+        headers_ms = (time.perf_counter() - start) * 1000
+        if websocket and r.status == 101:
+            data = b''
+        elif first_byte:
+            data = r.read(1)
+        else:
+            data = r.read()
+        wall = (time.perf_counter() - start) * 1000
+        try:
+            value = json.loads(data)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            value = None
+        return wall, r.status, len(data), value, headers_ms
+    finally:
+        c.close()
+
+
+def fixtures(database):
+    c = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)
+    def one(sql, params=()):
+        row = c.execute(sql, params).fetchone()
+        return row[0] if row else None
+    f = dict(seat=one("SELECT subject FROM desired WHERE kind='agent' LIMIT 1"),
+             agent=one("SELECT subject FROM desired WHERE kind='agent' LIMIT 1"),
+             step=one("SELECT subject FROM step_runs WHERE status='claimed' LIMIT 1"),
+             run=one('SELECT id FROM mission_runs ORDER BY updated_at_unix_ms DESC LIMIT 1'),
+             mission=one('SELECT mission_id FROM mission_runs ORDER BY updated_at_unix_ms DESC LIMIT 1'),
+             generation=one('SELECT current_generation_id FROM mission_runs ORDER BY updated_at_unix_ms DESC LIMIT 1'),
+             launch=one('SELECT id FROM planning_sessions LIMIT 1'),
+             claim=one('SELECT id FROM claims ORDER BY store_index DESC LIMIT 1'),
+             record=one('SELECT record_ref FROM replica_records LIMIT 1'),
+             proposal=one('SELECT id FROM revision_proposals LIMIT 1'),
+             host='survey-host', lane=None, history=None, session=None, observer=None,
+             subscription=None, operation=None, attention=None, glass=None, blob=None,
+             variant='main', decision=None, approval=None, left='main', right='other')
+    row = c.execute('SELECT name,hash FROM documents LIMIT 1').fetchone()
+    f['document_reference'] = row[0] + '@' + row[1] if row else None
+    f['mission_name'] = f['mission'].removeprefix('mission/') if f['mission'] else None
+    f['message'] = one("SELECT subject FROM claims WHERE kind='message.sent' ORDER BY store_index DESC LIMIT 1")
+    f['key'] = one("SELECT json_extract(body,'$.fields.idempotency_key') FROM claims WHERE kind='message.sent' ORDER BY store_index DESC LIMIT 1")
+    c.close()
+    return f
+
+
+def cli_reads(binary, sock, database, samples, extra_reads=None, only=None):
+    f = fixtures(database)
+    for collection, key in [('agents', 'agent'), ('missions', 'mission'), ('work', 'step')]:
+        value = request(sock, '/v1/client/' + collection)[3] or {}
+        items = value.get('value', value).get('items', [])
+        if items:
+            f[key] = items[0]['id']
+    if f['run'] and not f['run'].startswith('mission-run/'):
+        f['run'] = 'mission-run/' + f['run']
+    reads = {
+        'now': [], 'usage': [], 'machines': [], 'activity': [], 'clients': [],
+        'doctor': [], 'sets ls': [], 'missions tree': [], 'missions ls': [],
+        'missions show': [f['run']], 'missions queued': [f['seat']],
+        'launch ls': [], 'launch show': [f['launch']],
+        'attention ls': ['--as', 'person/avery'], 'agents ls': [], 'agents tree': [],
+        'agents show': [f['agent']], 'agents workspace': [f['agent']],
+        'agents repos': [], 'agents queue': [f['agent']],
+        'conversations search': ['invented', '--as', 'person/avery'],
+        'conversations ls': ['--as', 'person/avery'],
+        'conversations status': [f['message']],
+        'conversations read': [f['message'], '--as', 'person/avery'],
+        'conversations thread': [f['message']], 'conversations sessions': [],
+        'devices ls': [], 'work ls': [], 'work show': [f['step']],
+        'work revision show': [f['run']], 'work revision generations': [f['run']],
+        'work revision generation': [f['generation']], 'lanes ls': [],
+        'terminals ls': [], 'repair dry-run': [], 'fleet status': [],
+        'fleet invites': [], 'replication status': [], 'replication invalid': [],
+        'replication inspect': [f['record']], 'replication checkpoint status': [],
+        'subject basis': ['custom/garden/review/v1/survey', '--kind', 'custom.garden.review.v1.requested'],
+        'subject show': [f['agent']], 'subject history': [f['agent']],
+        'gh ls': ['--as', f['agent']], 'trace show': [f['agent']], 'schema registrations': [],
+        'schema subjects': [], 'schema resources': [], 'schema claims': [],
+        'schema show': ['harness.observed'], 'schema export': [],
+        'documents ls': [], 'documents get': [f['document_reference']],
+        'rules ls': [], 'rules audit': [], 'import ls': [], 'skill': [],
+        'completions': ['bash'],
+    }
+    reads.update(extra_reads or {})
+    if only is not None:
+        reads = {k: v for k, v in reads.items() if k in only}
+    env = {k: v for k, v in os.environ.items() if k != 'ST_AGENT' and not k.startswith('ST3_')}
+    # Local config lookups must not fall through to this operator's production identity/state.
+    config_root = Path(sock).parent / 'cli-config'
+    config_dir = config_root / 'st3'
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / 'config.toml').write_text(
+        'node = "survey-host"\nperson = "person/avery"\nstate_dir = ' +
+        json.dumps(str(Path(sock).parent)) + '\nsocket = ' + json.dumps(str(sock)) + '\n')
+    env['XDG_CONFIG_HOME'] = str(config_root)
+    env['XDG_STATE_HOME'] = str(Path(sock).parent / 'cli-state')
+    results = []
+    for command, args in reads.items():
+        row = dict(command='st ' + command, proposed_p99_ms=200)
+        if any(v is None for v in args):
+            row['fixture'] = 'missing'
+            results.append(row)
+            continue
+        row['modes'] = {}
+        for mode in ['human', 'json']:
+            times, exits = [], []
+            for _ in range(samples):
+                start = time.perf_counter()
+                try:
+                    child = subprocess.run([binary, '--endpoint', sock, '--daemon-wait', '0',
+                                            *(['--json'] if mode == 'json' else []),
+                                            *command.split(), *args], env=env, stdin=subprocess.DEVNULL,
+                                           # Pipes let communicate observe EOF without wait(timeout)'s
+                                           # exponentially backed-off polling adding latency.
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                    exits.append(child.returncode)
+                except subprocess.TimeoutExpired:
+                    exits.append('timeout')
+                times.append((time.perf_counter() - start) * 1000)
+            row['modes'][mode] = stats(times) | {'exit_counts': {str(x): exits.count(x) for x in set(exits)}}
+        results.append(row)
+        print(row['command'], row['modes']['human']['max_ms'], row['modes']['human']['exit_counts'], flush=True)
+    return results
+
+
+def api_survey(sock, database, samples):
+    f = fixtures(database)
+    # First responses of the bootstrap collections are retained as observations.
+    bootstrap = {}
+    for kind in ['agents', 'missions', 'work', 'messages', 'sessions', 'runtimes',
+                 'observers', 'subscriptions', 'operations', 'attention', 'history', 'lanes',
+                 'launches', 'glasses']:
+        path = '/v1/client/' + kind
+        row = request(sock, path)
+        bootstrap[path] = row[:3] + (None, row[4])
+        value = row[3] or {}
+        value = value.get('value', value)
+        items = value.get('items', []) if isinstance(value, dict) else []
+        singular = {'agents': 'agent', 'missions': 'mission', 'work': 'step',
+                    'messages': 'message', 'sessions': 'session', 'runtimes': 'runtime',
+                    'observers': 'observer', 'subscriptions': 'subscription',
+                    'operations': 'operation', 'attention': 'attention', 'history': 'history',
+                    'lanes': 'lane', 'launches': 'launch', 'glasses': 'glass'}[kind]
+        if items:
+            f[singular] = items[0].get('id')
+    if f.get('agent'):
+        f['seat'] = f['agent']
+    cost = (ROOT / 'crates/st3/tests/daemon_cost.rs').read_text()
+    paths = dict(re.findall(r'get\(\s*"GET ([^"]+)"\s*,\s*"([^"]+)"', cost))
+    paths.update({'/v1/custom/basis': '/v1/custom/basis?subject={seat}&kinds=custom.garden.review.v1.requested',
+                  '/v1/client/conversations/search': '/v1/client/conversations/search?text=invented&limit=20'})
+    report = []
+    for row in sorted(routes(), key=lambda r: r['route'] == '/v1/backup'):
+        route = row['route']
+        pattern = paths.get(route, route)
+        missing = []
+        def replace(m):
+            key = m[1].lstrip('*')
+            if key in f and f[key] is not None:
+                return quote(str(f[key]), safe='/' if '{*' in route else '')
+            missing.append(key)
+            return 'survey-missing'
+        path = re.sub(r'\{([^}]+)\}', replace, pattern)
+        if route == '/v1/client/glasses/{id}':
+            path = '/v1/client/glasses/' + quote(str(f.get('glass') or 'survey-missing'), safe='')
+        stream = route.endswith(('/stream', '/raw-stream')) or route == '/v1/backup'
+        times, statuses, sizes, headers = [], [], [], []
+        if route in bootstrap:
+            wall, status, size, _, head = bootstrap[route]
+            times.append(wall); statuses.append(status); sizes.append(size); headers.append(head)
+        count = 1 if route == '/v1/backup' else samples
+        for _ in range(max(1, count - len(times))):
+            try:
+                wall, status, size, _, head = request(sock, path, first_byte=stream)
+                times.append(wall); statuses.append(status); sizes.append(size); headers.append(head)
+            except (OSError, http.client.HTTPException) as error:
+                row['transport_error'] = type(error).__name__
+                break
+        if times:
+            row.update(stats(times), first_ms=round(times[0], 3),
+                       status_counts={str(s): statuses.count(s) for s in set(statuses)},
+                       max_bytes=max(sizes), max_headers_ms=round(max(headers), 3))
+        row['mode'] = 'first-byte' if stream else 'full-response'
+        row['fixture'] = 'missing:' + ','.join(missing) if missing else 'selected or collection'
+        row['success'] = bool(statuses) and all(200 <= s < 300 or s == 101 for s in statuses)
+        row['proposed_p99_ms'] = read_budget(route)
+        report.append(row)
+        print(route, row.get('max_ms'), row.get('status_counts'), flush=True)
+    return report
+
+
+def protocol_reads(sock, database, samples):
+    fleet = '7c1e2d3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f'
+    empty = dict(digest='', envelopes=[], buckets=[])
+    export = '/v1/internal/replication/export'
+    summary = dict(fleet_id=fleet, inventory=empty, summary_only=True)
+    first = request(sock, export, method='POST', body=json.dumps(summary))
+    value = first[3] or {}
+    value = value.get('value', value)
+    inventory = value.get('exchange', {}).get('inventory', empty)
+    c = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)
+    checkpoint = c.execute('SELECT id,cut_unix_ms FROM checkpoints ORDER BY cut_unix_ms DESC LIMIT 1').fetchone()
+    c.close()
+    probes = [(export, 'summary', summary),
+              (export, 'matching peer inventory', dict(fleet_id=fleet, inventory=inventory)),
+              (export, 'full inventory fallback', dict(fleet_id=fleet, inventory=empty)),
+              ('/v1/internal/replication/checkpoint-need', 'newest needed manifest', {}),
+              ('/v1/internal/replication/heal/answer', 'range digests',
+               dict(peer='survey-peer', fleet_id=fleet, query='ranges'))]
+    if checkpoint:
+        probes.append(('/v1/internal/replication/checkpoint', 'manifest page',
+                       dict(checkpoint=checkpoint[0], cut_unix_ms=int(checkpoint[1]))))
+    results = []
+    for path, variant, body in probes:
+        times, statuses, sizes = [], [], []
+        for _ in range(samples):
+            wall, status, size, _, _ = request(sock, path, method='POST', body=json.dumps(body))
+            times.append(wall); statuses.append(status); sizes.append(size)
+        row = dict(route=path, method='POST', variant=variant, **stats(times),
+                   status_counts={str(s): statuses.count(s) for s in set(statuses)},
+                   success=all(200 <= s < 300 for s in statuses), max_bytes=max(sizes),
+                   proposed_p99_ms=100)
+        results.append(row)
+        print('POST', path, variant, row['max_ms'], row['status_counts'], flush=True)
+    return results
+
+
+def invalidation_reads(sock, database, samples):
+    f = fixtures(database)
+    cohort = str(time.time_ns())
+    value = request(sock, '/v1/client/agents')[3] or {}
+    items = value.get('value', value).get('items', [])
+    if items:
+        f['agent'] = items[0]['id']
+    result = []
+    for variant in ['affected agent label', 'unrelated document publication']:
+        times, statuses, write_statuses, write_ms, advanced = [], [], [], [], []
+        for i in range(samples):
+            if variant.startswith('affected'):
+                path = '/v1/agents/rename'
+                body = dict(subject=f['agent'], name='Invented survey label ' + cohort + '-' + str(i),
+                            actor='person/avery', idempotency_key='read-survey-label-' + cohort + '-' + str(i))
+            else:
+                path = '/v1/documents'
+                body = dict(name='doc/survey/unrelated-' + cohort + '-' + str(i), bytes=list(b'invented survey input'),
+                            idempotency_key='read-survey-document-' + cohort + '-' + str(i))
+            before = request(sock, '/v1/health')[3]['store_index']
+            wall, status, _, _, _ = request(sock, path, method='POST', body=json.dumps(body))
+            write_statuses.append(status); write_ms.append(wall)
+            advanced.append(request(sock, '/v1/health')[3]['store_index'] > before)
+            wall, status, _, _, _ = request(sock, '/v1/client/agents')
+            times.append(wall); statuses.append(status)
+        row = dict(route='/v1/client/agents', variant=variant, **stats(times),
+                   status_counts={str(s): statuses.count(s) for s in set(statuses)},
+                   write_status_counts={str(s): write_statuses.count(s) for s in set(write_statuses)},
+                   write_max_ms=round(max(write_ms), 3), proposed_p99_ms=100,
+                   store_index_advanced_count=sum(advanced),
+                   success=all(advanced) and all(200 <= s < 300 for s in statuses + write_statuses))
+        result.append(row)
+        print(row['route'], variant, row['max_ms'], row['write_status_counts'], flush=True)
+    return result
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--binary')
+    p.add_argument('--socket')
+    p.add_argument('--database', type=Path)
+    p.add_argument('--cli-reads', action='store_true')
+    p.add_argument('--protocol-reads', action='store_true')
+    p.add_argument('--invalidation-reads', action='store_true')
+    p.add_argument('--samples', type=int, default=10)
+    p.add_argument('--output', required=True, type=Path)
+    a = p.parse_args()
+    result = dict(source_sha=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+                  sample_count=a.samples, scope='isolated reads; no reconciler, peer or driver workload',
+                  percentile_note='p95 is descriptive; fewer than 100 observations cannot establish a p99 guarantee')
+    if a.binary:
+        result['binary_sha256'] = hashlib.file_digest(open(a.binary, 'rb'), 'sha256').hexdigest()
+        result['cli'] = cli_inventory(a.binary, a.samples)
+        if a.cli_reads:
+            result['cli_reads'] = cli_reads(a.binary, a.socket, a.database, a.samples)
+    if a.socket:
+        result['reads'] = api_survey(a.socket, a.database, a.samples)
+        if a.protocol_reads:
+            result['protocol_reads'] = protocol_reads(a.socket, a.database, a.samples)
+        if a.invalidation_reads:
+            result['invalidation_reads'] = invalidation_reads(a.socket, a.database, a.samples)
+    a.output.write_text(json.dumps(result, indent=2) + '\n')
+
+
+if __name__ == '__main__':
+    main()
