@@ -287,6 +287,49 @@ fn session_usage_context_decodes_through_flattened_resource() {
 }
 
 #[test]
+fn timeline_tool_result_preserves_timing_metadata_and_decodes_legacy_results() {
+    let mut wire = serde_json::json!({
+        "id": "timeline-entry/tool-timing",
+        "sequence": 1,
+        "revision": 1,
+        "timestamp": "2026-10-05T12:00:00Z",
+        "role": "assistant",
+        "type": "tool_result",
+        "final": true,
+        "body": {
+            "call_id": "call/timing",
+            "status": "success",
+            "media_type": "text/plain",
+            "content": "finished",
+            "metadata": {
+                "wallTimeMs": 1250.5,
+                "timeoutSeconds": 60
+            }
+        }
+    });
+    let entry: TimelineEntry = serde_json::from_value(wire.clone()).unwrap();
+    let TimelineBody::ToolResult(body) = entry.body else {
+        panic!("tool result discriminator was not preserved");
+    };
+    let metadata = body.metadata.expect("tool result timing metadata was lost");
+    assert_eq!(metadata["wallTimeMs"].as_f64(), Some(1250.5));
+    assert_eq!(metadata["timeoutSeconds"].as_u64(), Some(60));
+
+    wire["body"]["metadata"] = serde_json::Value::Null;
+    let null_metadata: TimelineEntry = serde_json::from_value(wire.clone()).unwrap();
+    assert!(matches!(
+        null_metadata.body,
+        TimelineBody::ToolResult(body) if body.metadata.is_none()
+    ));
+    wire["body"].as_object_mut().unwrap().remove("metadata");
+    let legacy: TimelineEntry = serde_json::from_value(wire).unwrap();
+    assert!(matches!(
+        legacy.body,
+        TimelineBody::ToolResult(body) if body.metadata.is_none()
+    ));
+}
+
+#[test]
 fn timeline_models_tolerate_future_discriminators() {
     fn entry(entry_type: &str, body: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
