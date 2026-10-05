@@ -591,9 +591,21 @@ fn canonical_desired(value: &Value, root: &str) -> Result<Value, ApiError> {
         let invalid = || validation("the native desired AST is not canonical");
         let object = value.as_object().ok_or_else(invalid)?;
         let name = object.get("name").and_then(Value::as_str).ok_or_else(invalid)?;
-        let arguments = object.get("arguments").and_then(Value::as_array).ok_or_else(invalid)?;
-        let properties = object.get("properties").and_then(Value::as_object).ok_or_else(invalid)?;
-        let children = object.get("children").and_then(Value::as_array).ok_or_else(invalid)?;
+        // Native KDL serialization omits empty collections; present collections must
+        // still have their canonical types before normalization and redaction.
+        let empty_properties = serde_json::Map::new();
+        let arguments = match object.get("arguments") {
+            None => &[][..],
+            Some(value) => value.as_array().ok_or_else(invalid)?.as_slice(),
+        };
+        let properties = match object.get("properties") {
+            None => &empty_properties,
+            Some(value) => value.as_object().ok_or_else(invalid)?,
+        };
+        let children = match object.get("children") {
+            None => &[][..],
+            Some(value) => value.as_array().ok_or_else(invalid)?.as_slice(),
+        };
         let scalar = |value: &Value| !value.is_array() && !value.is_object();
         if !arguments.iter().all(scalar) || !properties.values().all(scalar) {
             return Err(invalid());
@@ -1267,6 +1279,26 @@ mod disclosure_tests {
         desired["children"][0]["children"][0]["children"] =
             json!([{"name":"nested","arguments":["private"],"properties":{},"children":[]}]);
         assert!(canonical_desired(&desired, "agent").is_err());
+    }
+
+    #[test]
+    fn sparse_native_desired_ast_preserves_redaction_and_type_boundaries() {
+        let desired = json!({"name":"agent","arguments":["example"],"children":[
+            {"name":"harness","arguments":["claude"]},
+            {"name":"env","children":[{"name":"TOKEN","arguments":["private"]}]}]});
+        let mut safe = canonical_desired(&desired, "agent").unwrap();
+        crate::graph::redact_agent_env_values(&mut safe);
+        assert_eq!(safe["children"][0]["arguments"], json!(["claude"]));
+        assert_eq!(safe["children"][1]["children"][0]["arguments"], json!(["<redacted>"]));
+        for (field, invalid) in [
+            ("arguments", json!({})),
+            ("properties", json!([])),
+            ("children", Value::Null),
+        ] {
+            let mut malformed = desired.clone();
+            malformed["children"][0][field] = invalid;
+            assert!(canonical_desired(&malformed, "agent").is_err());
+        }
     }
 
     #[test]

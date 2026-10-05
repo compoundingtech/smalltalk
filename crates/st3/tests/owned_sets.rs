@@ -904,12 +904,11 @@ schedule "garden/daily" {{
 "#
         )
     };
-    let mut schema: Value = serde_json::from_str(include_str!(
+    let schema: Value = serde_json::from_str(include_str!(
         "../../../docs/st3/client-v0/schemas/client-v0.schema.json"
     ))
     .unwrap();
-    schema["oneOf"] = json!([{ "$ref": "#/$defs/PublicationDefinition" }]);
-    let validator = jsonschema::options().build(&schema).unwrap();
+    let validator = crate::client_v0_contract::compile_contract_validator(schema, "PublicationDefinition");
     let mut first = request(&d, 1, source("first", "6h")).await;
     let p = preview(&d, &mut first).await;
     assert_eq!(p.declaration_diffs.len(), 3);

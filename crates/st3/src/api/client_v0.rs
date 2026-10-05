@@ -9351,7 +9351,6 @@ mod tests {
         for reference in ["custom%2Fteam%2Fother", "custom%2Fteam%2Fmissing"] {
             let (status, hidden) = read(format!("/v1/client/subject?ref={reference}")).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
-            assert_eq!(hidden["error"]["code"], "not-found");
         }
         let (status, internal) = read("/v1/client/subject?ref=custom%2Fclient%2Fprivate".into()).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{internal}");

@@ -91,7 +91,7 @@ fn consumer_validator(definition: &str) -> jsonschema::Validator {
     )
 }
 
-fn compile_contract_validator(mut schema: Value, definition: &str) -> jsonschema::Validator {
+pub(super) fn compile_contract_validator(mut schema: Value, definition: &str) -> jsonschema::Validator {
     schema.as_object_mut().unwrap().remove("oneOf");
     schema["$ref"] = Value::String(format!("#/$defs/{definition}"));
     // Unknown x-st-* annotation keywords are ignored by the standard validator.
