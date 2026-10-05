@@ -6,15 +6,23 @@ description = "Generated typed client for the st3.client.v0 API"
 license = "MIT"
 
 [dependencies]
+anyhow = "1"
 base64 = "0.22"
 bytes = "1"
+ciborium = "0.2"
+crossterm = "0.29"
 futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+signal-hook = "0.3"
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite = "0.27"

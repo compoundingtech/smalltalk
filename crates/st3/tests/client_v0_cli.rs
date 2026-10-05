@@ -29,6 +29,242 @@ fn test_state(root: &Path) -> AppState {
     }
 }
 
+#[tokio::test]
+async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secrets() {
+    use ring::{
+        rand::SystemRandom,
+        signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair},
+    };
+    use st3_client::{Client, Fence, MessageSendParameters, PairingBegin, device::Profile};
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Stdio;
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    state
+        .store
+        .bind_fleet("3c9a1f2e-8b7d-4e6c-a5f4-1d2e3c4b5a69")
+        .unwrap();
+    state
+        .store
+        .set_node_key(Arc::new(
+            smallclaims::fleet::MemberKey::generate().unwrap().0,
+        ))
+        .unwrap();
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    for _ in 0..200 {
+        if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let local = Client::unix_as(&socket, "person/avery");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone());
+    let http_server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let config = root.path().join("config");
+    std::fs::create_dir_all(config.join("st3")).unwrap();
+    std::fs::set_permissions(config.join("st3"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(config.join("st3/config.toml"), "invalid local config [").unwrap();
+    let profile = root.path().join("device/profile.json");
+    let run = |args: Vec<String>, code: String| {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut command =
+                st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+            let mut child = command
+                .env("XDG_CONFIG_HOME", config)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            writeln!(child.stdin.take().unwrap(), "{code}").unwrap();
+            child.wait_with_output().unwrap()
+        })
+    };
+    for algorithm in ["ed25519", "p256"] {
+        for import in [false, true] {
+            let challenge = local
+                .pairing_begin(&PairingBegin {
+                    api_version: st3_client::API_VERSION.into(),
+                    device_name: "CLI device".into(),
+                    person_id: "person/avery".into(),
+                    full_control: Some(true),
+                    scopes: None,
+                })
+                .await
+                .unwrap()
+                .value;
+            let mut args = vec![
+                "--json".into(),
+                "devices".into(),
+                "complete".into(),
+                base.clone(),
+                challenge.pairing_id.clone(),
+                "--profile".into(),
+                profile.to_str().unwrap().into(),
+                "--algorithm".into(),
+                algorithm.into(),
+            ];
+            let key_file = root.path().join("import.der");
+            let key_bytes = if import {
+                let document = if algorithm == "ed25519" {
+                    Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap()
+                } else {
+                    EcdsaKeyPair::generate_pkcs8(
+                        &ECDSA_P256_SHA256_FIXED_SIGNING,
+                        &SystemRandom::new(),
+                    )
+                    .unwrap()
+                };
+                std::fs::write(&key_file, document.as_ref()).unwrap();
+                std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                args.extend(["--key-file".into(), key_file.to_str().unwrap().into()]);
+                Some(document.as_ref().to_vec())
+            } else {
+                None
+            };
+            let previous = std::fs::read(&profile).ok();
+            let mut blocked_args = args.clone();
+            blocked_args[3] = "http://203.0.113.1".into();
+            let blocked = run(blocked_args, challenge.code.clone()).await.unwrap();
+            assert!(!blocked.status.success());
+            assert!(String::from_utf8_lossy(&blocked.stderr).contains("--allow-public-http"));
+            assert_eq!(std::fs::read(&profile).ok(), previous);
+            if import {
+                args.push("--allow-public-http".into());
+            }
+            let refused = run(args.clone(), "wrong-code".into()).await.unwrap();
+            assert!(!refused.status.success());
+            assert!(
+                String::from_utf8_lossy(&refused.stderr)
+                    .contains("invalid, expired, or already used")
+            );
+            assert_eq!(std::fs::read(&profile).ok(), previous);
+            let output = run(args.clone(), challenge.code.clone()).await.unwrap();
+            let receipt = value(&output);
+            assert_eq!(receipt["kind"], "device-paired");
+            assert_eq!(receipt["person_id"], "person/avery");
+            assert_eq!(
+                std::fs::metadata(&profile).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let loaded = Profile::load(&profile).unwrap().unwrap();
+            assert_eq!(loaded.devices[0].allow_public_http, import);
+            assert!(String::from_utf8_lossy(&output.stderr).contains("must already be an encrypted path"));
+            assert_eq!(
+                receipt["signing_key"],
+                loaded.devices[0]
+                    .signing_key
+                    .as_ref()
+                    .unwrap()
+                    .public_key()
+                    .unwrap()
+            );
+            for stream in [&output.stdout, &output.stderr] {
+                assert!(
+                    !String::from_utf8_lossy(stream)
+                        .contains(&loaded.devices[0].session.credential)
+                );
+                assert!(!String::from_utf8_lossy(stream).contains("pkcs8"));
+            }
+            if let Some(bytes) = key_bytes {
+                assert_eq!(std::fs::read(&key_file).unwrap(), bytes);
+            }
+            let saved = std::fs::read(&profile).unwrap();
+            assert!(!run(args, challenge.code).await.unwrap().status.success());
+            assert_eq!(std::fs::read(&profile).unwrap(), saved);
+            let client = loaded.clients().unwrap().pop().unwrap();
+            let snapshot = client.capabilities().await.unwrap().snapshot.id;
+            let idem = format!("cli-device-proof-{algorithm}-{import}");
+            let result = client
+                .message_send(
+                    format!("action/{idem}"),
+                    idem,
+                    Fence {
+                        snapshot_id: snapshot,
+                        ..Fence::default()
+                    },
+                    MessageSendParameters {
+                        to: "agent/alder".into(),
+                        content: "CLI signature proof".into(),
+                        title: None,
+                        in_reply_to: None,
+                        session_id: None,
+                        tags: vec![],
+                        attachments: vec![],
+                        signature: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let subject = result
+                .value
+                .affected_ids
+                .iter()
+                .find(|id| id.starts_with("message/"))
+                .unwrap();
+            let claim = state
+                .store
+                .latest_claim(subject, Some("message.sent"))
+                .unwrap()
+                .unwrap();
+            state.store.replication_snapshot().unwrap();
+            assert_eq!(
+                state.store.claim_signature(&claim.id).unwrap().unwrap().key,
+                receipt["signing_key"]
+            );
+            assert_eq!(
+                state.store.claim_verdict(&claim.id).unwrap(),
+                smallclaims::principal::Verdict::Verified
+            );
+        }
+    }
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Display".into(),
+            person_id: "person/avery".into(),
+            full_control: None,
+            scopes: None,
+        })
+        .await
+        .unwrap()
+        .value;
+    let args = vec![
+        "devices".into(),
+        "complete".into(),
+        base.replace("127.0.0.1", "localhost"),
+        challenge.pairing_id,
+    ];
+    let output = run(args, challenge.code).await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The default profile works beside non-secret configuration without chmod-ing its directory.
+    let default_profile = config.join("st3/stui-devices.json");
+    let loaded = Profile::load(&default_profile).unwrap().unwrap();
+    assert_eq!(std::fs::metadata(&default_profile).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(config.join("st3")).unwrap().permissions().mode() & 0o777, 0o755);
+    assert!(loaded.devices[0].signing_key.is_none());
+    assert!(!loaded.devices[0].allow_public_http);
+    assert!(loaded.devices[0].session.device_key_chain.is_empty());
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(&loaded.devices[0].session.credential)
+    );
+    local_server.abort();
+    http_server.abort();
+}
+
 async fn run_cli(socket: &Path, args: &[&str]) -> Output {
     run_cli_mode(socket, true, args).await
 }

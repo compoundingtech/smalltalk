@@ -1283,6 +1283,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         };
         json!({ "id": action, "version": 0, "state": state })
     }));
+    capabilities.push(json!({"id":"device-key-proofs", "version":1, "state":"granted"}));
     capabilities
 }
 
@@ -5639,6 +5640,36 @@ pub(super) fn device_signing_key(public_key: &str) -> Option<&str> {
     }
 }
 
+// Every ordinary refusal after enrollment must withdraw the prepared signing authority.
+// Drop also covers early `?` returns; a process crash or failed storage can still defeat cleanup.
+struct PreparedDeviceGrant<'a> {
+    state: &'a AppState,
+    person: &'a str,
+    key: &'a str,
+    accepted: bool,
+}
+
+impl Drop for PreparedDeviceGrant<'_> {
+    fn drop(&mut self) {
+        if !self.accepted {
+            if let Err(error) = self.state.store.revoke_device_key(
+                self.person,
+                self.key,
+                "pairing refused after enrollment",
+            ) {
+                tracing::warn!(%error, "could not revoke a refused pairing key");
+            } else if let Err(error) = self.state.store.seal_local_batches() {
+                tracing::warn!(%error, "could not seal a refused pairing key's revocation");
+            }
+            signal_changed(self.state);
+        }
+    }
+}
+
+// Proof preparation must not let simultaneous completions enroll a second key after another
+// request has consumed the same code. All checks and store writes follow this serialization.
+static PAIRING_COMPLETIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub(super) async fn pairing_complete(
     State(state): State<AppState>,
     Extension(_session): Extension<ClientSession>,
@@ -5650,6 +5681,7 @@ pub(super) async fn pairing_complete(
             "the pairing completion has an invalid version or public key",
         ));
     }
+    let _completion = PAIRING_COMPLETIONS.lock().await;
     let pairing_id = client_detail_id("pairing", &id);
     let subject = format!("custom/client/pairing-{id}");
     let begun = state
@@ -5715,6 +5747,77 @@ pub(super) async fn pairing_complete(
         None => LIMITED_PAIRING_SCOPES.to_vec(),
         Some(_) => return Err(validation("the pairing has invalid delegated scopes")),
     };
+    // A device with a real key, paired to send messages, is enrolled: the person's root key
+    // grants it as a device key. A device paired only to read gets no key that speaks for the
+    // person, so a wall display can never sign as them.
+    let signs = scopes.contains(&"control.messages");
+    let mut prepared_grant = None;
+    let enrollment = match device_signing_key(&device_public_key).filter(|_| signs) {
+        Some(key) => {
+            // A retry must not consume the code for a key withdrawn by a previous refusal.
+            // Use the exact subject/key query rather than a capped inventory scan.
+            let revoked: bool = state.store.readers.get().query_row(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='principal.key-revoked' AND json_extract(body, '$.fields.key')=?2)",
+                rusqlite::params![person_id, key], |row| row.get(0),
+            ).map_err(ApiError::internal)?;
+            if revoked {
+                return Err(validation("the device signing key was revoked; the pairing code was not consumed. Retry with a fresh signing key"));
+            }
+            let name = begun
+                .body
+                .pointer("/fields/device_name")
+                .and_then(Value::as_str)
+                .unwrap_or("device");
+            let storage = match request.key_storage.as_deref() {
+                Some("secure-enclave") => " (secure enclave)",
+                Some("software") => " (software key)",
+                _ => "",
+            };
+            let chain = state
+                .store
+                .enroll_device_key(&person_id, key, &format!("{name}{storage}"))
+                .map_err(ApiError::bad)?;
+            prepared_grant = Some(PreparedDeviceGrant {
+                state: &state,
+                person: &person_id,
+                key,
+                accepted: false,
+            });
+            // All proof-producing work precedes the single-use completion claim. Failure
+            // here leaves the code unspent; the guard revokes the prepared key best-effort.
+            state
+                .store
+                .seal_local_batches()
+                .map_err(ApiError::internal)?;
+            let cannot_prove = || {
+                validation(
+                    "the member cannot produce verifiable enrollment grants; the pairing code was not consumed. Inspect the member's signing history",
+                )
+            };
+            let mut proofs = Vec::new();
+            for id in &chain {
+                let grant = state
+                    .store
+                    .claim_by_id(id)
+                    .map_err(ApiError::internal)?
+                    .ok_or_else(cannot_prove)?;
+                let signature = state
+                    .store
+                    .claim_signature(id)
+                    .map_err(ApiError::internal)?
+                    .ok_or_else(cannot_prove)?;
+                proofs.push(json!({
+                    "id": grant.id, "batch_id": grant.batch_id, "subject": grant.subject,
+                    "kind": grant.kind, "origin": grant.origin, "actor": grant.actor,
+                    "body": grant.body, "predecessors": grant.predecessors, "signature": signature,
+                }));
+            }
+            st3_client::device::verify_device_key_proofs(&person_id, &chain, &proofs, key)
+                .map_err(|_| cannot_prove())?;
+            Some((chain, proofs))
+        }
+        None => None,
+    };
     let completed = state.store.append_claim(&ClaimInput {
         subject: begun.subject.clone(),
         kind: "custom.client.pairing-completed".into(),
@@ -5749,35 +5852,14 @@ pub(super) async fn pairing_complete(
         }
         return Err(ApiError::bad(error));
     }
-    // A device with a real key, paired to send messages, is enrolled: the person's root key
-    // grants it as a device key. A device paired only to read gets no key that speaks for the
-    // person, so a wall display can never sign as them.
-    let signs = scopes.contains(&"control.messages");
-    let chain = match device_signing_key(&device_public_key).filter(|_| signs) {
-        Some(key) => {
-            let name = begun
-                .body
-                .pointer("/fields/device_name")
-                .and_then(Value::as_str)
-                .unwrap_or("device");
-            let storage = match request.key_storage.as_deref() {
-                Some("secure-enclave") => " (secure enclave)",
-                Some("software") => " (software key)",
-                _ => "",
-            };
-            Some(
-                state
-                    .store
-                    .enroll_device_key(&person_id, key, &format!("{name}{storage}"))
-                    .map_err(ApiError::bad)?,
-            )
-        }
-        None => None,
-    };
+    if let Some(grant) = &mut prepared_grant {
+        grant.accepted = true;
+    }
     signal_changed(&state);
     let mut session = json!({ "kind": "paired-session", "device_id": device_id, "person_id": person_id, "session_actor": session_actor, "credential": credential, "scopes": scopes, "expires_at": client_timestamp(expires_at) });
-    if let Some(chain) = chain {
+    if let Some((chain, proofs)) = enrollment {
         session["device_key_chain"] = json!(chain);
+        session["device_key_proofs"] = json!(proofs);
     }
     Ok(Json(session))
 }

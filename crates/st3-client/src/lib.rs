@@ -2,6 +2,7 @@
 //! Typed `st3.client.v0` client. This crate never parses CLI or harness output.
 
 mod contract;
+pub mod device;
 mod generated;
 pub use contract::*;
 pub use generated::*;
@@ -21,7 +22,7 @@ use std::sync::{
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio_tungstenite::{
-    WebSocketStream, connect_async,
+    WebSocketStream,
     tungstenite::{
         Message as WsMessage, client::IntoClientRequest as _, protocol::WebSocketConfig,
     },
@@ -124,6 +125,8 @@ pub struct Client {
     endpoint: Endpoint,
     credential: Option<String>,
     local_person: Option<String>,
+    signing_device: Option<Arc<device::Device>>,
+    device_http_policy: Option<bool>,
     http: reqwest::Client,
     max_response_bytes: Arc<AtomicUsize>,
     outage_wait: Duration,
@@ -665,6 +668,8 @@ impl Client {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
             credential: None,
             local_person: None,
+            signing_device: None,
+            device_http_policy: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -677,6 +682,8 @@ impl Client {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
             credential: None,
             local_person: Some(person_id.into()),
+            signing_device: None,
+            device_http_policy: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -692,6 +699,8 @@ impl Client {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
             credential: Some(credential.into()),
             local_person: None,
+            signing_device: None,
+            device_http_policy: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -700,12 +709,14 @@ impl Client {
     }
 
     /// Connect to the remote gateway before a device credential exists. The server permits only
-    /// pairing completion on this unauthenticated transport.
+    /// pairing compatibility advertisement and completion on this unauthenticated transport.
     pub fn fabric_pairing(base_url: impl Into<String>) -> Self {
         Self {
             endpoint: Endpoint::FabricLoopback(base_url.into().trim_end_matches('/').to_owned()),
             credential: None,
             local_person: None,
+            signing_device: None,
+            device_http_policy: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -718,6 +729,8 @@ impl Client {
             endpoint: Endpoint::FabricLoopback(base_url.into().trim_end_matches('/').to_owned()),
             credential: Some(credential.into()),
             local_person: None,
+            signing_device: None,
+            device_http_policy: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -1780,8 +1793,18 @@ impl Client {
         id: impl Into<String>,
         idempotency_key: impl Into<String>,
         fence: Fence,
-        parameters: MessageSendParameters,
+        mut parameters: MessageSendParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
+        let idempotency_key = idempotency_key.into();
+        if parameters.signature.is_none()
+            && let Some(device) = &self.signing_device
+        {
+            parameters.signature = Some(
+                device
+                    .sign_message(&idempotency_key, &parameters)
+                    .map_err(|error| ClientError::Protocol(error.to_string()))?,
+            );
+        }
         let request = ActionRequest::message_send(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
@@ -2328,11 +2351,7 @@ impl Client {
                 };
                 let (websocket, response) = tokio::time::timeout(
                     STREAM_HANDSHAKE_DEADLINE,
-                    tokio_tungstenite::connect_async_with_config(
-                        request_for(&websocket_base)?,
-                        Some(config),
-                        false,
-                    ),
+                    self.remote_websocket(request_for(&websocket_base)?, Some(config)),
                 )
                 .await
                 .map_err(|_| {
@@ -2404,15 +2423,15 @@ impl Client {
                     None,
                     Some(stream_capability),
                 )?;
-                let (websocket, response) =
-                    tokio::time::timeout(STREAM_HANDSHAKE_DEADLINE, connect_async(request))
-                        .await
-                        .map_err(|_| {
-                            ClientError::Transport(
-                                "terminal WebSocket handshake deadline exceeded".into(),
-                            )
-                        })?
-                        .map_err(|error| ClientError::Transport(error.to_string()))?;
+                let (websocket, response) = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    self.remote_websocket(request, None),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("terminal WebSocket handshake deadline exceeded".into())
+                })?
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_terminal_subprotocol(&response)?;
                 TerminalSocket::Remote(websocket)
             }
@@ -2473,7 +2492,7 @@ impl Client {
                 };
                 let (socket, response) = tokio::time::timeout(
                     STREAM_HANDSHAKE_DEADLINE,
-                    connect_async(request_for(&websocket_base)?),
+                    self.remote_websocket(request_for(&websocket_base)?, None),
                 )
                 .await
                 .map_err(|_| {
@@ -2548,7 +2567,7 @@ impl Client {
                 };
                 let (socket, response) = tokio::time::timeout(
                     STREAM_HANDSHAKE_DEADLINE,
-                    connect_async(request_for(&websocket_base)?),
+                    self.remote_websocket(request_for(&websocket_base)?, None),
                 )
                 .await
                 .map_err(|_| {
@@ -2563,6 +2582,38 @@ impl Client {
             socket,
             limit: self.response_limit(),
         })
+    }
+
+    /// Reconnects carry the same destination policy as REST, including keyless devices.
+    async fn remote_websocket(
+        &self,
+        request: Request<()>,
+        config: Option<WebSocketConfig>,
+    ) -> Result<
+        (
+            WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            tokio_tungstenite::tungstenite::handshake::client::Response,
+        ),
+        ClientError,
+    > {
+        if self.device_http_policy == Some(false) && request.uri().scheme_str() == Some("ws") {
+            let url = reqwest::Url::parse(&request.uri().to_string())
+                .map_err(|error| ClientError::Protocol(error.to_string()))?;
+            let stream = device::transport::websocket_tcp(&url)
+                .await
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+            // Use exactly the socket connected to the admitted addresses; never resolve again.
+            return tokio_tungstenite::client_async_with_config(
+                request,
+                tokio_tungstenite::MaybeTlsStream::Plain(stream),
+                config,
+            )
+            .await
+            .map_err(|error| ClientError::Transport(error.to_string()));
+        }
+        tokio_tungstenite::connect_async_with_config(request, config, false)
+            .await
+            .map_err(|error| ClientError::Transport(error.to_string()))
     }
 
     fn response_limit(&self) -> usize {
@@ -3625,5 +3676,72 @@ mod tests {
             ));
             server.await.unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod device_stream_policy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn every_remote_stream_refuses_public_http_even_without_a_signing_key() {
+        let device = device::Device {
+            endpoint: "http://localhost:1".into(),
+            allow_public_http: false,
+            signing_key: None,
+            session: PairedSession {
+                kind: "paired-session".into(),
+                device_id: "device/policy".into(),
+                person_id: "person/avery".into(),
+                session_actor: "person/avery/session/policy".into(),
+                credential: "stream-bearer-never-sent".into(),
+                scopes: vec!["read.projections".into()],
+                expires_at: "2026-11-01T00:00:00Z".into(),
+                device_key_chain: vec![],
+                device_key_proofs: vec![],
+            },
+        };
+        let mut client = device.client().unwrap();
+        assert!(client.signing_device.is_none());
+        // The client already exists; a later destination must still pass admission.
+        client.endpoint = Endpoint::FabricLoopback("http://203.0.113.1".into());
+        for _reconnect in 0..2 {
+            let mut errors = Vec::new();
+            errors.push(client.collection_stream().await.err().unwrap().to_string());
+            errors.push(
+                client
+                    .conversation_stream("session/policy", None)
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+            );
+            errors.push(
+                client
+                    .terminal_stream("terminal/policy", None, "fake-capability")
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+            );
+            errors.push(
+                client
+                    .raw_terminal_stream(&RawTerminalAttachment {
+                        terminal_id: "terminal/policy".into(),
+                        runtime_incarnation: "policy-incarnation".into(),
+                        owner_host_id: "host/alder".into(),
+                        mode: RawTerminalMode::Peek,
+                        stream_capability: "fake-capability".into(),
+                    })
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+            );
+            for error in errors {
+                assert!(error.contains("HTTP requires loopback"), "{error}");
+                assert!(!error.contains("stream-bearer-never-sent"));
+            }
+        }
     }
 }
