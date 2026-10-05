@@ -1,10 +1,15 @@
+use crate::diagnostics;
 use crate::wire::{self, CHUNK, Frame, WINDOW};
 use anyhow::{Context, Result, bail};
 use iroh::{
     Endpoint, EndpointAddr, SecretKey,
     endpoint::{Connection, presets},
 };
-use std::{net::Ipv4Addr, time::Duration};
+use serde::Deserialize;
+use std::{
+    net::Ipv4Addr,
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -12,6 +17,15 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PathMode {
+    #[default]
+    Auto,
+    Direct,
+    Relay,
+}
 
 pub struct Bridge {
     pub endpoint: Endpoint,
@@ -22,12 +36,25 @@ pub struct Bridge {
 }
 
 impl Bridge {
+    #[cfg(test)]
     pub async fn start(key: SecretKey, target: EndpointAddr, service: String) -> Result<Self> {
+        Self::start_with_mode(key, target, service, PathMode::Auto).await
+    }
+
+    pub async fn start_with_mode(
+        key: SecretKey,
+        target: EndpointAddr,
+        service: String,
+        mode: PathMode,
+    ) -> Result<Self> {
         validate_service(&service)?;
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(key)
-            .bind()
-            .await?;
+        let builder = Endpoint::builder(presets::N0).secret_key(key);
+        let builder = match mode {
+            PathMode::Auto => builder,
+            PathMode::Direct => builder.clear_relay_transports(),
+            PathMode::Relay => builder.clear_ip_transports(),
+        };
+        let endpoint = builder.bind().await?;
         let node = endpoint.id().to_string();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let url = format!("http://{}", listener.local_addr()?);
@@ -93,10 +120,21 @@ async fn tunnel(
     local: TcpStream,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let connection = tokio::select! {
-        _ = cancel.cancelled() => return Ok(()),
-        connected = tokio::time::timeout(Duration::from_secs(5), endpoint.connect(target, service.as_bytes())) => connected.context("fabric connect timed out")??,
+    let attempt = diagnostics::started();
+    let started = Instant::now();
+    let connected = tokio::select! {
+        _ = cancel.cancelled() => { diagnostics::ended(attempt, "cancelled"); return Ok(()) },
+        connected = tokio::time::timeout(Duration::from_secs(15), endpoint.connect(target, service.as_bytes())) => connected.context("fabric connect timed out").and_then(|r| r.map_err(Into::into)),
     };
+    let connection = match connected {
+        Ok(c) => c,
+        Err(e) => {
+            let refused = e.chain().any(|error| matches!(error.downcast_ref::<iroh::endpoint::ConnectionError>(), Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) if close.error_code == 403u32.into()));
+            diagnostics::ended(attempt, if refused { "refused" } else { "connect-failed" });
+            return Err(e);
+        }
+    };
+    diagnostics::connected(attempt, started.elapsed().as_millis() as u64, &connection);
     let pump = pump(&connection, local, cancel.clone());
     tokio::pin!(pump);
     let result = tokio::select! {
@@ -110,6 +148,17 @@ async fn tunnel(
         }
     };
     // pump waits for the final send bytes to be acknowledged on graceful completion.
+    let refused = matches!(connection.close_reason(), Some(iroh::endpoint::ConnectionError::ApplicationClosed(ref close)) if close.error_code == 403u32.into());
+    diagnostics::ended(
+        attempt,
+        if refused {
+            "refused"
+        } else if result.is_ok() {
+            "completed"
+        } else {
+            "transport-ended"
+        },
+    );
     connection.close(0u32.into(), b"phone tunnel ended");
     result
 }
@@ -238,11 +287,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires FABRIC_BIN pointing at fabric 0.2.30"]
+    #[ignore = "requires FABRIC_BIN and an explicit pinned member version"]
     async fn pinned_daemon_grants_flow_control_and_half_close() -> Result<()> {
         let binary = std::env::var("FABRIC_BIN").context("set FABRIC_BIN")?;
         let version = Command::new(&binary).arg("--version").output()?;
-        assert_eq!(String::from_utf8(version.stdout)?.trim(), "0.2.30+8bd9017");
+        let expected_version =
+            std::env::var("FABRIC_EXPECTED_VERSION").unwrap_or_else(|_| "0.2.30+8bd9017".into());
+        assert_eq!(String::from_utf8(version.stdout)?.trim(), expected_version);
         let home = tempfile::Builder::new()
             .prefix("fabric-proof-")
             .tempdir_in("/tmp")?;
@@ -318,6 +369,14 @@ mod tests {
             let _ = tokio::time::timeout(Duration::from_secs(8), local.read_to_end(&mut response))
                 .await?;
             assert!(response.is_empty());
+            assert_eq!(
+                diagnostics::snapshot()["attempts"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap()["result"],
+                "refused"
+            );
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), target.accept())
                     .await
@@ -338,7 +397,13 @@ mod tests {
             stream.shutdown().await?;
             Ok::<_, anyhow::Error>(())
         });
-        let bridge = Bridge::start(phone.clone(), addr.clone(), "demo-client/0".into()).await?;
+        let bridge = Bridge::start_with_mode(
+            phone.clone(),
+            addr.clone(),
+            "demo-client/0".into(),
+            PathMode::Direct,
+        )
+        .await?;
         let mut local = TcpStream::connect(bridge.url.trim_start_matches("http://")).await?;
         local
             .write_all(b"GET /demo HTTP/1.1\r\nConnection: close\r\n\r\n")
@@ -350,6 +415,58 @@ mod tests {
         served.await??;
         // Let the final Acks reach the member before stopping the whole endpoint.
         tokio::time::sleep(Duration::from_millis(100)).await;
+        bridge.stop().await;
+
+        // Relay-only mode must use a measured relay path even when local IP hints exist.
+        let mut relay_addr = None;
+        for _ in 0..40 {
+            let candidate: EndpointAddr = serde_json::from_str(&command(&["addr"])?)?;
+            if candidate.addrs.iter().any(|a| a.is_relay()) {
+                relay_addr = Some(candidate);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let relay_addr = relay_addr.context("isolated fabric did not advertise a relay")?;
+        let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        command(&[
+            "expose",
+            "demo-client/0",
+            "--tcp",
+            &target.local_addr()?.to_string(),
+            "--ephemeral",
+        ])?;
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await?;
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await?;
+            assert_eq!(request, b"relay probe");
+            stream.write_all(b"relay reply").await?;
+            stream.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let bridge = Bridge::start_with_mode(
+            phone.clone(),
+            relay_addr,
+            "demo-client/0".into(),
+            PathMode::Relay,
+        )
+        .await?;
+        let mut local = TcpStream::connect(bridge.url.trim_start_matches("http://")).await?;
+        local.write_all(b"relay probe").await?;
+        local.shutdown().await?;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), local.read_to_end(&mut response)).await??;
+        assert_eq!(response, b"relay reply");
+        served.await??;
+        assert_eq!(
+            diagnostics::snapshot()["attempts"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["selectedPath"],
+            "relay"
+        );
         bridge.stop().await;
 
         // Explicit stop half-closes an idle local request so the member can reap it.

@@ -706,11 +706,37 @@ to another authenticated scope, or precedes retention, the server returns the ve
 snapshot pages, and resumes from the capabilities response's `event_cursor`. It must not infer
 missing mutations or request graph replication.
 
-A timeline whose retained claims omit an entry's append, or omit older history without a typed
-truncation interval, reports `timeline-history-incomplete` with `retryable: false`, `full_resync: false` and
-`retained_history_incomplete: true`. Its message explains that the retained transcript start is
-incomplete. Retrying a fresh snapshot cannot restore those missing claims; clients show the
-reason and stop automatic retries. Ordinary expired stream cursors remain retryable.
+Claim-backed timelines project at most the newest 4,096 operations. A store query's continuation
+means older rows still exist, not that retention deleted them. A non-retryable
+`timeline-query-limited` system error entry explains this projection bound, including entries
+whose retained append precedes the window and whose updates therefore cannot be projected
+coherently. Page cursors reach only the materialized window, not those omitted store rows.
+The notice remains in the newest page and does not invent an omitted sequence interval.
+Availability notices are anchored at the latest materialized entry timestamp, with sequences
+after the materialized window. A replicated snapshot's older clock cannot place them at the
+oldest scroll-back boundary when local observations have advanced independently.
+Conversation changes carry these projection notices when managed history changes, including
+the first operation that crosses the bound. An updated entry outside the materialized window
+causes the ordinary cursor-gap/newest-page refresh instead of an incomplete revision delta.
+Changes to typed truncation entries also refresh the authoritative newest page, clearing an
+obsolete prefix-unavailable notice when an interval establishes complete prefix coverage.
+These session-stable projection notices are not evidence of overlap between a refreshed newest
+window and retained older pages. Clients preserve paged history only when real transcript
+entries connect those windows; a notice shared by otherwise disconnected windows does not.
+Projection notices also do not determine the oldest real entry of an incoming window.
+When preserving a genuinely overlapping older prefix, discard held projection notices:
+the authoritative replacement frame alone supplies their current presence.
+
+When the physical retained prefix starts after sequence one without a covering typed truncation
+interval, a non-retryable `timeline-history-incomplete` system error entry explains that earlier
+history is unavailable while complete retained entries remain readable. This notice does not
+claim what the missing prefix contained. An update whose append is genuinely absent still
+reports HTTP `timeline-history-incomplete` with `retryable: false`, `full_resync: false` and
+`retained_history_incomplete: true`; a query bound does not excuse it. Retrying a fresh snapshot
+cannot restore missing claims. Ordinary expired stream cursors remain retryable.
+Prefix coverage considers every retained typed truncation append for the same owner and
+incarnation at the snapshot, including intervals outside the 4,096-operation projection window.
+The coverage query reads interval bounds only; it does not materialize older transcript entries.
 
 ## Pairing and remote access
 

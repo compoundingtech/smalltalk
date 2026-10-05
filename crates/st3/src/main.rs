@@ -2330,6 +2330,24 @@ enum DevicesCommand {
         #[arg(long, conflicts_with = "full_control")]
         read_only: bool,
     },
+    /// Complete a single-use pairing on this device; read the code privately from stdin.
+    Complete {
+        /// The member gateway's HTTP or HTTPS origin.
+        member_url: String,
+        pairing_id: String,
+        /// Software key algorithm, also used when importing a key.
+        #[arg(long, value_parser = ["ed25519", "p256"], default_value = "p256")]
+        algorithm: String,
+        /// Import a private mode-0600 DER PKCS#8 file; otherwise generate a key.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Credential and private-key profile, shared with stui by default.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        /// Allow a public HTTP address only when it is already an encrypted path.
+        #[arg(long)]
+        allow_public_http: bool,
+    },
     /// Revoke one paired device.
     Revoke {
         #[arg(add = ArgValueCompleter::new(Complete(Entity::Device)))]
@@ -4479,6 +4497,31 @@ async fn run(cli: Cli) -> Result<()> {
     let own = std::env::var("ST_AGENT").ok();
     let mission_run = std::env::var("ST_MISSION_RUN").ok();
     guard_mutating_cli_actor(&cli.command, own.as_deref(), mission_run.as_deref())?;
+    // Completion is a remote device operation. It needs neither a local daemon nor its config.
+    if let Command::Devices(DevicesArgs {
+        command:
+            Some(DevicesCommand::Complete {
+                member_url,
+                pairing_id,
+                algorithm,
+                key_file,
+                profile,
+                allow_public_http,
+            }),
+        ..
+    }) = &cli.command
+    {
+        return run_devices_complete(
+            member_url,
+            pairing_id,
+            algorithm,
+            key_file.as_deref(),
+            profile.as_deref(),
+            *allow_public_http,
+            cli.json,
+        )
+        .await;
+    }
     if let Command::Up(args) = cli.command {
         return run_up(args).await;
     }
@@ -5376,6 +5419,12 @@ async fn run_up(args: UpArgs) -> Result<()> {
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
+    ));
+    tokio::spawn(st3::recorder_receipts::run(
+        store.clone(),
+        st3::recorder::receipt_path(&config.state_dir),
+        notify.clone(),
+        event_notify.clone(),
     ));
     if config.checkpoint.enabled {
         tokio::spawn(run_checkpoints(
@@ -7745,6 +7794,7 @@ async fn run_devices(
     let person = configured_human(person.as_deref(), configured_person, "devices")?;
     let client = generated_client(&endpoint, Some(&person))?;
     match command.unwrap_or(DevicesCommand::Ls) {
+        DevicesCommand::Complete { .. } => unreachable!("handled before loading local config"),
         DevicesCommand::Ls => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
@@ -7818,6 +7868,61 @@ async fn run_devices(
             print_client_value(&response, json_output)
         }
     }
+}
+
+async fn run_devices_complete(
+    member_url: &str,
+    pairing_id: &str,
+    algorithm: &str,
+    key_file: Option<&Path>,
+    profile: Option<&Path>,
+    allow_public_http: bool,
+    json_output: bool,
+) -> Result<()> {
+    use st3_client::device::{KeyAlgorithm, SigningKey};
+    let algorithm = match algorithm {
+        "ed25519" => KeyAlgorithm::Ed25519,
+        "p256" => KeyAlgorithm::P256,
+        _ => anyhow::bail!("Choose ed25519 or p256"),
+    };
+    let key = match key_file {
+        Some(path) => SigningKey::import(algorithm, path)?,
+        None => SigningKey::generate(algorithm)?,
+    };
+    let path = profile
+        .map(Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(st3_client::device::profile_path)?;
+    let code = st3_client::device::read_pairing_code()?;
+    let device = st3_client::device::complete_with_http_policy(
+        &path, member_url, pairing_id, &code, key, allow_public_http,
+    )
+    .await?;
+    // Always choose explicit safe fields, including --json. PairedSession contains a bearer.
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "kind": "device-paired", "device_id": device.session.device_id,
+                "person_id": device.session.person_id, "scopes": device.session.scopes,
+                "expires_at": device.session.expires_at, "profile": path,
+                "signing_key": device.signing_key.as_ref().map(SigningKey::public_key).transpose()?,
+            }))?
+        );
+    } else {
+        println!(
+            "Paired {} as {}. Saved device credentials{} to {}.",
+            device.session.device_id,
+            device.session.person_id,
+            if device.signing_key.is_some() {
+                " and signing key"
+            } else {
+                ""
+            },
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 async fn run_clients(endpoint: &Endpoint, json_output: bool) -> Result<()> {
@@ -13679,12 +13784,39 @@ async fn run_attention(
                 completion::Matching::Fuzzy,
             )
             .await?;
+            // Public card IDs name a recipient and waiting episode, not just a work source.
+            // Resolve through the actor-scoped read projection; this must not read an update
+            // for the person or let a spent card open a later episode of the same source.
+            let alias = if normalized.starts_with("attention/") {
+                match generated_client(endpoint, Some(&actor))?
+                    .attention_get(&normalized)
+                    .await
+                {
+                    Ok(response) => match response.value {
+                        ClientResource::Attention(card)
+                            if card.header.id == normalized && card.person_id == actor =>
+                        {
+                            Some(card)
+                        }
+                        _ => None,
+                    },
+                    Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                None
+            };
             let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
             let item = client
                 .get::<Vec<AttentionItemView>>(&path)
                 .await?
                 .into_iter()
-                .find(|item| item.subject == normalized)
+                .find(|item| {
+                    alias.as_ref().map_or_else(
+                        || item.subject == normalized,
+                        |card| item.subject == card.source_id && item.episode == card.episode,
+                    )
+                })
                 .with_context(|| {
                     format!("attention item `{normalized}` is not currently actionable")
                 })?;
@@ -16301,6 +16433,10 @@ struct NativeLoopState {
     delivery_episode: u64,
     #[serde(default)]
     mailbox_fence: Option<st3::mailbox::Fence>,
+    #[serde(default)]
+    claude_attachment_phase: String,
+    #[serde(default)]
+    claude_attachment_episode: u64,
 }
 
 /// What a native driver hands its next image across `execve`.
@@ -16492,6 +16628,14 @@ async fn drive_st2_native(
     } = paths.clone();
     let mut mailbox =
         NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
+    let attach_started = Instant::now();
+    if driver == "claude" && mailbox.subscription.is_some()
+        && let Err(error) = check_claude_attachment(
+            client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
+        ).await
+    {
+        let _ = write_driver_log(subject, &format!("Claude attachment check will retry: {error:#}"));
+    }
     let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
@@ -16590,6 +16734,13 @@ async fn drive_st2_native(
                 return outcome;
             }
             _ = interval.tick() => {
+                if driver == "claude" && mailbox.subscription.is_some()
+                    && let Err(error) = check_claude_attachment(
+                        client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
+                    ).await
+                {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
                 if let Err(error) = observations.expire_due() {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
@@ -20152,6 +20303,74 @@ fn push_mailbox_enabled() -> bool {
     std::env::var("ST3_MAILBOX_TRANSPORT").as_deref() == Ok("push")
 }
 
+async fn check_claude_attachment(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    mailbox: &NativeMailbox,
+    started: Instant,
+    state: &mut NativeLoopState,
+) -> Result<()> {
+    let fence = &mailbox.fence;
+    let path = format!(
+        "/v1/mailbox/attachment?subject={}&incarnation={}&component={}&epoch={}&token={}",
+        urlencoding::encode(&fence.subject),
+        urlencoding::encode(&fence.incarnation),
+        fence.component,
+        fence.epoch,
+        fence.token,
+    );
+    let checked: Result<st3::mailbox::Attachment> = match tokio::time::timeout(
+        Duration::from_secs(2), client.get(&path),
+    ).await {
+        Ok(checked) => checked,
+        Err(_) => Err(anyhow::anyhow!("the channel attachment check exceeded two seconds")),
+    };
+    let attached = checked.as_ref().is_ok_and(|attachment| attachment.attached);
+    let phase = if attached {
+        "attached"
+    } else if started.elapsed() >= Duration::from_secs(20)
+        || state.claude_attachment_phase == "blocked"
+    {
+        "blocked"
+    } else {
+        "starting"
+    };
+    let reason = match checked {
+        Ok(_) => "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. Check the plugin load, trust or update screen, and channel process; restart the seat if the plugin did not load.".into(),
+        Err(error) => format!("claude-channel-unattached: attachment could not be verified; mail is held while the driver retries: {error:#}"),
+    };
+    let mut report: Value = serde_json::from_str(&native_delivery_report("claude-channel", None))?;
+    report["ready"] = json!(attached);
+    report["reason"] = json!(&reason);
+    if let Some(subscription) = &mailbox.subscription {
+        subscription.report(report);
+    }
+    if state.claude_attachment_phase == phase {
+        return Ok(());
+    }
+    let code = if attached {
+        "claude-channel-attached"
+    } else {
+        "claude-channel-unattached"
+    };
+    let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
+        subject: subject.into(), kind: "harness.diagnostic".into(), actor: Some(subject.into()),
+        fields: BTreeMap::from([
+            ("severity".into(), json!(if phase == "blocked" { "error" } else { "warning" })),
+            ("status".into(), json!(if attached { "recovered" } else { phase })),
+            ("code".into(), json!(code)),
+            ("reason".into(), json!(if attached { "The current Claude channel is initialized and subscribed; durable mail delivery resumes." } else { &reason })),
+            ("driver".into(), json!("claude")),
+            ("incarnation_id".into(), json!(incarnation)),
+        ]), evidence: Vec::new(), expected_subject: None,
+        idempotency_key: Some(format!("{code}:{subject}:{incarnation}:{}:{}:{phase}", fence.epoch, state.claude_attachment_episode)),
+    }).await?;
+    state.claude_attachment_phase = phase.into();
+    state.claude_attachment_episode += 1;
+    Ok(())
+}
+
 struct NativeMailbox {
     subscription: Option<st3::mailbox::Subscription>,
     fence: st3::mailbox::Fence,
@@ -22209,6 +22428,8 @@ mod tests {
                 predecessor_harness_record: Some(b"ignored".to_vec()),
                 published_timeline: BTreeSet::from(["one:1:1:upsert".to_owned()]),
                 delivery_episode: 2,
+                claude_attachment_phase: "blocked".into(),
+                claude_attachment_episode: 3,
             },
         };
         let back: DriverResume =
@@ -22217,6 +22438,8 @@ mod tests {
         assert_eq!(back.incarnation, resume.incarnation);
         assert!(back.loop_state.ready);
         assert_eq!(back.loop_state.delivery_episode, 2);
+        assert_eq!(back.loop_state.claude_attachment_phase, "blocked");
+        assert_eq!(back.loop_state.claude_attachment_episode, 3);
         assert_eq!(
             back.loop_state.published_timeline,
             resume.loop_state.published_timeline

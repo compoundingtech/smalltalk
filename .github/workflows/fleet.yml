@@ -223,7 +223,10 @@ jobs:
     needs: [pick-runner]
     if: ${{ !cancelled() }}
     runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+      [
+        "namespace-profile-linux-x86-64;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -309,7 +312,10 @@ jobs:
     needs: [pick-runner, genie-freshness]
     if: ${{ !cancelled() && needs.genie-freshness.result == 'success' }}
     runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+      [
+        "namespace-profile-linux-x86-64;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 10
     defaults:
       run:
@@ -364,7 +370,7 @@ jobs:
     name: linux-tests
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || '["nscloud-ubuntu-24.04-amd64-8x16"]') }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={0}","namespace-features:github.run-id={1}"]', (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10, github.run_id)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -511,7 +517,11 @@ jobs:
     name: linux-tests-shard-2
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:
@@ -649,7 +659,11 @@ jobs:
     name: linux-clippy
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:
@@ -765,7 +779,11 @@ jobs:
     name: linux-fleet-compat
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:
@@ -1047,7 +1065,10 @@ jobs:
     needs: [pick-runner]
     if: ${{ !cancelled() }}
     runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+      [
+        "namespace-profile-linux-x86-64;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 60
     defaults:
       run:

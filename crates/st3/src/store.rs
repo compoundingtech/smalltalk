@@ -276,6 +276,18 @@ ON claims(
 WHERE json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
     THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NOT NULL;
 
+-- Attachment checks must not walk a quiet seat's accumulated hook and work history.
+-- Only phase transitions publish these diagnostics, so a current-runtime lookup stays small.
+CREATE INDEX IF NOT EXISTS claims_claude_attachment_index
+ON claims(
+    subject,
+    json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END),
+    store_index
+)
+WHERE kind='harness.diagnostic'
+    AND json_extract(body, '$.fields.code') IN ('claude-channel-unattached','claude-channel-attached');
+
 -- Mailbox admission needs the newest state for one incarnation, never optional display fields
 -- from its entire history. Include legacy reports without an incarnation in a separate seek.
 CREATE INDEX IF NOT EXISTS claims_harness_state_incarnation_accepted_index
@@ -1070,6 +1082,7 @@ pub(crate) struct MissionGateRunner {
     pub subject: String,
     pub host: String,
     pub owner_run: String,
+    pub owner_step: Option<String>,
     pub retired: bool,
 }
 
@@ -1617,9 +1630,11 @@ fn discovered_collection_items(
             if resource.as_ref() == Some(&facts) {
                 return None;
             }
+            // Creation receipts establish identity and attribution, not observer state.
+            let observed_prior = prior.filter(|prior| prior.get("state").is_some());
             let new_item =
-                prior.is_none() && !baseline && item.get("new") != Some(&Value::Bool(false));
-            let deliver = match (field, prior) {
+                observed_prior.is_none() && !baseline && item.get("new") != Some(&Value::Bool(false));
+            let deliver = match (field, observed_prior) {
                 ("pull_requests", Some(prior)) => pull_request_needs_review(Some(prior), &facts),
                 (_, Some(_)) => false,
                 ("pull_requests", None) => new_item && pull_request_needs_review(None, &facts),
@@ -4529,6 +4544,26 @@ impl Store {
             note_run_view_reads(view);
         }
         Ok(view)
+    }
+
+    pub(crate) fn step_has_active_child_runs(&self, step: &str) -> Result<bool> {
+        let step = normalize_step_run(step);
+        smallclaims::touched::note_read(|| format!("children-of-step:{step}"));
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT 'mission-run/' || id, status FROM mission_runs WHERE parent_step_run=?1",
+        )?;
+        let rows = statement.query_map([step], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (subject, status) = row?;
+            smallclaims::touched::note_read(|| subject);
+            if !matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn adopt_mission_revision(
@@ -10643,6 +10678,7 @@ impl Store {
                         subject: subject.clone(),
                         host: host.clone(),
                         owner_run: owner_run.clone(),
+                        owner_step: owner.starts_with("step-run/").then(|| owner.clone()),
                         retired,
                     }));
                 }
@@ -12326,7 +12362,7 @@ impl Store {
                                 &canonical_sql(
                                     "SELECT accepted_at_unix_ms FROM claims
                                      WHERE subject=?1 AND kind='resource.observed'
-                                     ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                                     ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1",
                                 ),
                                 [&subject],
                                 |row| row.get::<_, String>(0),
@@ -14042,6 +14078,9 @@ impl Store {
     /// The page merges replicated timeline claims, which older builds wrote, with
     /// this node's local timeline observations; a local observation sorts after the
     /// claim it follows.
+    /// `next_cursor` means the query omitted existing rows, never physical retention.
+    /// It is not a lossless local-observation cursor: several local IDs may follow
+    /// the same store index.
     pub fn timeline_claims_for_incarnation_at(
         &self,
         subject: &str,
@@ -14093,6 +14132,108 @@ impl Store {
             claims: merged,
             next_cursor,
         })
+    }
+    /// Resolve retained appends in one incarnation scan, without loading their bodies.
+    /// Full store/local positions distinguish query omission from a missing append.
+    pub(crate) fn timeline_entry_append_positions_at(
+        &self,
+        subject: &str,
+        incarnation: &str,
+        entries: &BTreeSet<String>,
+        before_index: Option<u64>,
+    ) -> Result<BTreeMap<String, (u64, u64)>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "WITH operations AS (
+                SELECT json_extract(body, '$.fields.entry_id') AS entry_id,
+                    store_index, 0 AS local_id
+                FROM claims
+                WHERE subject=?1 AND kind='harness.timeline'
+                    AND json_extract(body, '$.fields.incarnation_id')=?2
+                    AND json_extract(body, '$.fields.operation')='append'
+                    AND json_extract(body, '$.fields.entry_id') IN (SELECT value FROM json_each(?3))
+                    AND (?4 IS NULL OR store_index<?4)
+                UNION ALL
+                SELECT json_extract(body, '$.fields.entry_id') AS entry_id,
+                    after_store_index AS store_index, id AS local_id
+                FROM local_observations
+                WHERE subject=?1 AND kind='harness.timeline'
+                    AND json_extract(body, '$.fields.incarnation_id')=?2
+                    AND json_extract(body, '$.fields.operation')='append'
+                    AND json_extract(body, '$.fields.entry_id') IN (SELECT value FROM json_each(?3))
+                    AND (?4 IS NULL OR after_store_index<?4)
+            )
+            SELECT entry_id, store_index, local_id FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY entry_id ORDER BY store_index, local_id
+                ) AS position FROM operations
+            ) WHERE position=1",
+        )?;
+        let rows = statement.query_map(
+            params![subject, incarnation, serde_json::to_string(entries)?, before_index],
+            |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))),
+        )?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// Resolve physical prefix coverage independently of the bounded timeline window.
+    /// Read only typed truncation bounds, never materialize the omitted transcript bodies.
+    pub(crate) fn timeline_retention_is_explicit_at(
+        &self,
+        subject: &str,
+        incarnation: &str,
+        before_index: Option<u64>,
+        required_through: u64,
+    ) -> Result<bool> {
+        if required_through == 0 {
+            return Ok(true);
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT body -> '$.fields.body.omitted_from_sequence',
+                    body -> '$.fields.body.omitted_to_sequence'
+             FROM claims
+             WHERE subject=?1 AND kind='harness.timeline'
+                 AND json_extract(body, '$.fields.incarnation_id')=?2
+                 AND json_extract(body, '$.fields.operation')='append'
+                 AND json_extract(body, '$.fields.entry_type')='truncation'
+                 AND (?3 IS NULL OR store_index<?3)
+             UNION ALL
+             SELECT body -> '$.fields.body.omitted_from_sequence',
+                    body -> '$.fields.body.omitted_to_sequence'
+             FROM local_observations
+             WHERE subject=?1 AND kind='harness.timeline'
+                 AND json_extract(body, '$.fields.incarnation_id')=?2
+                 AND json_extract(body, '$.fields.operation')='append'
+                 AND json_extract(body, '$.fields.entry_type')='truncation'
+                 AND (?3 IS NULL OR after_store_index<?3)",
+        )?;
+        let rows = statement.query_map(params![subject, incarnation, before_index], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut intervals = Vec::new();
+        for row in rows {
+            let (from, to) = row?;
+            // Raw JSON scalars preserve unsigned bounds and reject strings, floats and booleans.
+            if let Some((from, to)) = from.and_then(|value| value.parse::<u64>().ok())
+                .zip(to.and_then(|value| value.parse::<u64>().ok()))
+                .filter(|(from, to)| from <= to)
+            {
+                intervals.push((from, to));
+            }
+        }
+        intervals.sort_unstable();
+        let mut covered_through = 0_u64;
+        for (from, to) in intervals {
+            if from > covered_through.saturating_add(1) {
+                break;
+            }
+            covered_through = covered_through.max(to);
+            if covered_through >= required_through {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The newest local timeline observation for one incarnation at or before a snapshot.
@@ -16444,7 +16585,7 @@ fn resolve_mission_run_inputs(
                 } else {
                     transaction
                         .query_row(
-                            &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                            &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1"),
                             [subject],
                             |row| row.get(0),
                         )
@@ -16996,7 +17137,7 @@ fn normalize_resource_observation(
         // Issue and pull request attribution belongs to its publisher, not to the latest
         // observer or fixer. Keep each named field, including a mission-run-only opener, across
         // observations, so a partial snapshot such as a merge never erases it.
-        if carries_opener(&kind) {
+        if carries_opener(&kind) && input.fields.get("attribution_only") != Some(&Value::Bool(true)) {
             for name in ["opened_by", "opened_by_run"] {
                 if let Some(value) = previous.get(name) {
                     facts.insert(name.into(), value.clone());
@@ -17059,6 +17200,7 @@ fn resource_facts(fields: &BTreeMap<String, Value>) -> Result<BTreeMap<String, V
         "observer",
         "baseline",
         "changed_fields",
+        "attribution_only",
     ];
     Ok(fields
         .iter()
@@ -18907,6 +19049,10 @@ fn latest_actual_at(
         let value: Value = serde_json::from_str(&body)?;
         let source = value.get("fields").unwrap_or(&value);
         if let Some(fields) = source.as_object() {
+            if kind == "resource.observed" {
+                resources::merge_observation(&mut merged, fields);
+                continue;
+            }
             if registry
                 .claim(&kind)
                 .is_some_and(|spec| spec.cardinality == st3_schema::Cardinality::StateTransition)
@@ -19272,6 +19418,53 @@ fn current_harness_at(
     Ok(view)
 }
 
+fn claude_attachment_query() -> String {
+    format!(
+        "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
+         FROM claims INDEXED BY claims_claude_attachment_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.diagnostic' AND claims.store_index<=?2
+           AND {INCARNATION_OF_CLAIM}=?3
+           AND json_extract(claims.body, '$.fields.code') IN ('claude-channel-unattached','claude-channel-attached')
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    )
+}
+
+/// Channel readiness is independent of hook activity. A current driver owns this fence;
+/// MCP initialization under its delivery binding, or runtime replacement, clears it.
+fn claude_attachment_fence(
+    connection: &Connection,
+    subject: &str,
+    incarnation: &str,
+    at_index: u64,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
+    let claim = connection.prepare_cached(&claude_attachment_query())?.query_row(params![subject, at_index, incarnation], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    }).optional()?;
+    let Some((claim, body, at)) = claim else {
+        return Ok(None);
+    };
+    let body: Value = serde_json::from_str(&body)?;
+    if body["fields"]["code"] == "claude-channel-attached" {
+        return Ok(None);
+    }
+    let starting = body["fields"]["status"] == "starting";
+    Ok(Some(crate::model::CurrentHarnessView {
+        state: if starting { "starting" } else { "blocked" }.into(),
+        driver: Some("claude".into()),
+        incarnation_id: incarnation.into(),
+        transport: Some("claude-channel".into()),
+        reason: Some("claude-channel-unattached".into()),
+        blocked_on: Some("channel".into()),
+        ask: None,
+        input_buffer: None,
+        exit: None,
+        claim,
+        since_unix_ms: at.parse()?,
+        observed_at_unix_ms: at.parse()?,
+    }))
+}
+
 fn current_harness_fold_at(
     connection: &Connection,
     subject: &str,
@@ -19360,6 +19553,10 @@ fn current_harness_fold_at(
             since_unix_ms: observed_at_unix_ms.parse::<u128>()?,
             observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
         }));
+    }
+
+    if let Some(harness) = claude_attachment_fence(connection, subject, incarnation_id, at_index)? {
+        return Ok(Some(harness));
     }
 
     // The observations of this runtime epoch, newest first in canonical order, so every node that
@@ -20342,7 +20539,7 @@ fn pull_request_state_tx(connection: &Connection, target: &str) -> Result<Option
             &canonical_sql(
                 "SELECT json_extract(body, '$.fields'), accepted_at_unix_ms FROM claims
              WHERE subject=?1 AND kind='resource.observed'
-             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+             ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1",
             ),
             [subject],
             |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
@@ -38630,6 +38827,51 @@ version 2
     }
 
     #[test]
+    fn claude_attachment_lookup_cost_ignores_hook_runtime_and_predecessor_history() {
+        let store = Store::open_memory("node").unwrap();
+        let append = |kind: &str, incarnation: &str, code: &str, key: &str| {
+            let fields = match kind {
+                "harness.diagnostic" => json!({"incarnation_id":incarnation,
+                    "code":code,"status":"blocked","severity":"warning","reason":"cost fixture"}),
+                "harness.observed" => json!({"incarnation_id":incarnation,"state":"idle","driver":"claude"}),
+                "runtime.observed" => json!({"incarnation_id":incarnation,"status":"running",
+                    "runtime_id":"grove/cedar","reachability":"local"}),
+                _ => unreachable!(),
+            };
+            store.append_claim(&ClaimInput {
+                subject: "agent/grove/cedar".into(),
+                kind: kind.into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None,
+                idempotency_key: Some(key.into()),
+            }).unwrap();
+        };
+        append("harness.diagnostic", "current", "claude-channel-unattached", "attach");
+        let work = || {
+            let connection = store.connection.lock().unwrap();
+            let mut statement = connection.prepare(&claude_attachment_query()).unwrap();
+            let claim: String = statement.query_row(
+                params!["agent/grove/cedar", i64::MAX, "current"], |row| row.get(0),
+            ).unwrap();
+            (claim, statement.get_status(rusqlite::StatementStatus::VmStep))
+        };
+        let before = work();
+        for index in 0..128 {
+            for (kind, incarnation, code) in [
+                ("harness.observed", "current", ""),
+                ("runtime.observed", "current", ""),
+                ("harness.diagnostic", "current", "native-delivery-recovered"),
+                ("harness.diagnostic", "previous", "claude-channel-attached"),
+            ] {
+                append(kind, incarnation, code, &format!("history:{kind}:{incarnation}:{index}"));
+            }
+        }
+        let after = work();
+        assert_eq!(after.0, before.0);
+        assert!(after.1 <= before.1 + 20, "attachment lookup grew with unrelated history: {before:?} -> {after:?}");
+    }
+
+    #[test]
     fn person_reads_seek_what_they_show() {
         let store = Store::open_memory("node").unwrap();
         let connection = store.connection.lock().unwrap();
@@ -44713,6 +44955,121 @@ mission "review-guardrail" state="ready" {
     }
 
     #[test]
+    fn late_receipt_preserves_observation_and_next_head_push_delivers() {
+        let store = Store::open_memory("node").unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        let repository = "resource/github/acme/demo";
+        let subject = format!("{repository}/pull-request/9");
+        let observed = json!({
+            "number": 9, "state": "open", "title": "Ready", "draft": false,
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "checks": [{"name": "build", "conclusion": "success"}]
+        });
+        store.append_claim(&ClaimInput {
+            subject: subject.clone(), kind: "resource.observed".into(), actor: None,
+            fields: BTreeMap::from([
+                ("kind".into(), json!("vcs.pull-request")),
+                ("facts".into(), observed.clone()),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        std::fs::write(spool.path().join("1.json"), serde_json::to_vec(&crate::recorder::Receipt {
+            schema: "st3.recorder.receipt.v1".into(),
+            url: "https://github.com/acme/demo/pull/9".into(),
+            actor: "agent/node.builder".into(), mission_run: Some("created".into()),
+            exit_code: Some(0), at: "2026-10-03T12:00:00Z".into(),
+        }).unwrap()).unwrap();
+        assert_eq!(crate::recorder_receipts::ingest_once(&store, spool.path()).unwrap(), 1);
+        let recorded = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
+        let previous = json!({"pull_requests": [{
+            "number": 9, "state": "open", "draft": false
+        }]});
+        let current = json!({"pull_requests": [{
+            "number": 9, "new": false, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }]});
+        let items = discovered_collection_items(
+            repository, "pull_requests", Some(&previous), &current,
+            &mut |_| Some(recorded.clone()),
+        );
+        assert!(items[0].deliver, "a late receipt must not lose the next head's review");
+        for field in ["state", "title", "head_sha", "checks"] {
+            assert_eq!(recorded[field], observed[field], "{field}");
+        }
+        assert_eq!(recorded["opened_by"], "agent/node.builder");
+        let projected = store.resource_collection_page(None, None, Some(&subject), None, 10).unwrap();
+        assert_eq!(projected[0]["facts"], recorded);
+    }
+
+    #[test]
+    fn receipt_born_resources_receive_first_observer_issue_and_review_delivery() {
+        let store = Store::open_memory("node").unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        let repository = "resource/github/acme/demo";
+        for (field, path, segment) in [
+            ("issues", "issues", "issue"),
+            ("pull_requests", "pull", "pull-request"),
+        ] {
+            let receipt = crate::recorder::Receipt {
+                schema: "st3.recorder.receipt.v1".into(),
+                url: format!("https://github.com/acme/demo/{path}/8"),
+                actor: "agent/node.builder".into(),
+                mission_run: Some("created".into()),
+                exit_code: Some(0),
+                at: "2026-10-03T12:00:00Z".into(),
+            };
+            std::fs::write(
+                spool.path().join(format!("{field}.json")),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::recorder_receipts::ingest_once(&store, spool.path()).unwrap(),
+                1
+            );
+            let subject = format!("{repository}/{segment}/8");
+            let recorded = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
+            assert!(recorded.get("state").is_none());
+            let previous = json!({"repository_id": 1, field: []});
+            let current = json!({"repository_id": 1, field: [{
+                "number": 8, "state": "open", "draft": false,
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }]});
+            let items = discovered_collection_items(
+                repository, field, Some(&previous), &current,
+                &mut |_| Some(recorded.clone()),
+            );
+            assert_eq!(items.len(), 1);
+            assert!(items[0].deliver, "{field} must deliver its first observed state");
+            assert_eq!(items[0].facts["opened_by"], "agent/node.builder");
+            assert_eq!(items[0].facts["opened_by_run"], "mission-run/created");
+            let observed = items[0].facts.clone();
+            assert!(
+                discovered_collection_items(
+                    repository, field, Some(&current), &current,
+                    &mut |_| Some(observed.clone()),
+                )
+                .is_empty(),
+                "the same sighting must not deliver twice"
+            );
+            assert!(
+                !discovered_collection_items(
+                    repository, field, None, &current,
+                    &mut |_| Some(recorded.clone()),
+                )[0].deliver,
+                "a repository baseline must not deliver receipt-born items"
+            );
+            let mut old_item = current.clone();
+            old_item[field][0]["new"] = Value::Bool(false);
+            assert!(
+                !discovered_collection_items(
+                    repository, field, Some(&previous), &old_item,
+                    &mut |_| Some(recorded.clone()),
+                )[0].deliver,
+                "an explicitly historical item must not deliver"
+            );
+        }
+    }
+
+    #[test]
     fn repository_collections_create_one_typed_resource_for_each_new_item() {
         let previous = json!({"pull_requests": [], "issues": []});
         let current = json!({
@@ -47324,6 +47681,18 @@ fn append_claim_with_fences(
                     return Err(St3Error::new("stale-placement",
                         "placement changed; read the current handoff before overriding its sources"));
                 }
+            }
+            // Check under the writer lock: concurrent captures must not append a second opener
+            // or replace an existing observation with another attribution-only claim.
+            if input.kind == "resource.observed"
+                && input.fields.get("attribution_only") == Some(&Value::Bool(true))
+                && let Some(previous) = latest_actual(transaction, &input.subject).map_err(internal)?
+                && previous.get("facts").unwrap_or(&previous).as_object().is_some_and(|facts| {
+                    facts.contains_key("opened_by") || facts.contains_key("opened_by_run")
+                })
+                && let Some(existing) = latest_claim_of_kind_tx(transaction, &input.subject, "resource.observed")?
+            {
+                return Ok((existing, false));
             }
             let mut stored_fields = custom::prepare(transaction, input)?;
             if let Some(fields) = normalize_resource_observation(transaction, input)? {

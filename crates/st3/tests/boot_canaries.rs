@@ -130,7 +130,11 @@ fn canary(harness: &str, scenario: &str) {
             "PYTHONDONTWRITEBYTECODE=1",
             "python3",
         ])
-        .arg(repo.join("scripts/st3-boot-canaries/run"))
+        .arg(repo.join(if scenario == "when-idle" {
+            "scripts/st3-rollout-binding-canary/run"
+        } else {
+            "scripts/st3-boot-canaries/run"
+        }))
         .arg(env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
         .args([harness, scenario, "--bound", "180", "--scratch"])
@@ -143,6 +147,12 @@ fn canary(harness: &str, scenario: &str) {
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
         .is_some_and(|result| result["verdict"] == "pass");
+    if scenario == "when-idle" {
+        eprintln!(
+            "{}",
+            result.as_ref().map(String::as_str).unwrap_or_default()
+        );
+    }
     if !passed {
         eprintln!("boot canary evidence: {}", evidence.display());
         let _ = evidence_root.keep();
@@ -241,6 +251,24 @@ harness!(codex, "codex");
 harness!(pi, "pi");
 harness!(omp, "omp");
 harness!(opencode, "opencode");
+
+#[test]
+fn claude_missing_channel_blocks_and_recovers_early_mail_without_replay() {
+    canary("claude", "channel-missing");
+}
+
+#[test]
+fn claude_uninitialized_channel_blocks_until_native_attachment() {
+    canary("claude", "channel-uninitialized");
+}
+
+#[test]
+fn omp_when_idle_replacement_binds_its_original_native_session() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    canary("omp", "when-idle");
+}
 
 #[test]
 fn codex_transcript_utf8_and_discovery_failures_preserve_delivery_and_private_warnings() {

@@ -2019,6 +2019,7 @@ export const PairedSession = /*#__PURE__*/ (() => Schema.Struct({
   "credential": Schema.RedactedFromValue(Schema.String.check(Schema.isMinLength(32))),
   "device_id": Id,
   "device_key_chain": optionalKey(Schema.Array(Schema.String)),
+  "device_key_proofs": optionalKey(Schema.Array(Schema.Record(Schema.String, Schema.Unknown)).check(Schema.isMaxLength(2))),
   "expires_at": Timestamp,
   "kind": Schema.Literal("paired-session"),
   "person_id": Schema.String.check(Schema.isPattern(new RegExp("^person/[^/]+$", "u"))),
@@ -2203,6 +2204,14 @@ export const HostRepositories = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "HostRepositories" }))()
 export type HostRepositories = typeof HostRepositories.Type
 export type HostRepositoriesEncoded = typeof HostRepositories.Encoded
+
+/** Static unauthenticated pairing preflight; no envelope, presence update or graph information. */
+export const PairingAdvertisement = /*#__PURE__*/ (() => Schema.Struct({
+  "api_version": Schema.Literal("st3.client.v0"),
+  "capabilities": Schema.Array(Schema.Struct({ "id": Schema.Literal("device-key-proofs"), "state": Schema.Literal("granted"), "version": Schema.Literal(1) })).check(Schema.isMinLength(1)).check(Schema.isMaxLength(1))
+}).annotate({ identifier: "PairingAdvertisement", description: "Static unauthenticated pairing preflight; no envelope, presence update or graph information." }))()
+export type PairingAdvertisement = typeof PairingAdvertisement.Type
+export type PairingAdvertisementEncoded = typeof PairingAdvertisement.Encoded
 
 export const PairingBegin = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),

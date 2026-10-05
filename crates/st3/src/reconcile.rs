@@ -6774,7 +6774,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             };
             // One step that fails records a fault on that step. The run's other steps and its
             // status are still evaluated.
-            changed |= self
+            let step_changed = self
                 .isolate("step", &view.subject, || -> Result<bool> {
                     let mut changed = false;
                     let eligible_phase = ((run.phase == "normal"
@@ -7091,8 +7091,36 @@ impl<R: RuntimeControl> Reconciler<R> {
                             .set_step_state(&view.subject, "completed", None)?;
                     }
                     Ok(changed)
+                });
+            changed |= step_changed.unwrap_or(false);
+            // Finally work gets its ordinary evaluation first, including starting its gates
+            // and declarations. Once it only waits on evidence, cancellation must not hold
+            // the mission's active-run slot until the step's execution budget expires.
+            if step_changed == Some(false)
+                && run.phase == "final-cancelled"
+                && view.agentless
+                && view.status == "working"
+                && step.spec.nested_mission.as_ref().is_none_or(|nested| {
+                    let prefix = format!("{}/{}/", step.spec.path, nested.id);
+                    views
+                        .iter()
+                        .filter(|(path, _)| path.starts_with(&prefix))
+                        .all(|(_, child)| {
+                            matches!(child.status.as_str(), "completed" | "failed" | "cancelled")
+                        })
                 })
-                .unwrap_or(false);
+                && ((step.spec.uses_mission.is_none() && step.spec.loop_spec.is_none())
+                    || !self.store.step_has_active_child_runs(&view.subject)?)
+                && !self.step_has_live_process(&view.subject)?
+            {
+                changed |= self.store.set_step_state(
+                    &view.subject,
+                    "cancelled",
+                    Some(
+                        "the mission run was cancelled and this agentless step has no live process",
+                    ),
+                )?;
+            }
         }
         if run.phase == "normal" {
             let refreshed = self
@@ -9928,6 +9956,69 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         Ok(())
+    }
+
+    fn step_has_live_process(&self, step_subject: &str) -> Result<bool> {
+        for subject in self.store.desired_subjects_for_owner_step(step_subject)? {
+            let Some(member) = subject.member.as_ref() else {
+                continue;
+            };
+            if self.owned_process_is_live(
+                &subject.subject,
+                &member.host,
+                &member.runtime_id,
+                member.terminal,
+            )? {
+                return Ok(true);
+            }
+        }
+        for runner in self.store.mission_gate_runners()? {
+            if runner.owner_step.as_deref() == Some(step_subject)
+                && self.owned_process_is_live(
+                    &runner.subject,
+                    &runner.host,
+                    &runner.subject.replace('/', "."),
+                    false,
+                )?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn owned_process_is_live(
+        &self,
+        subject: &str,
+        host: &str,
+        runtime_id: &str,
+        terminal: bool,
+    ) -> Result<bool> {
+        let actual = self.store.latest_actual_value(subject)?;
+        if host != self.host {
+            // Missing remote observations are not proof that a process has stopped.
+            return Ok(!actual.is_some_and(|actual| {
+                matches!(
+                    actual_field(&actual, "status").and_then(Value::as_str),
+                    Some("stopped" | "absent" | "exited" | "vanished")
+                )
+            }));
+        }
+        let observation = if terminal {
+            self.runtime
+                .snapshot_ptys()?
+                .into_iter()
+                .find(|item| item.runtime_id == runtime_id)
+        } else {
+            smallclaims::touched::note_read(|| format!("exec:{runtime_id}"));
+            self.runtime.observe_exec(runtime_id)?
+        };
+        Ok(observation.is_some_and(|item| {
+            !matches!(
+                item.status.as_str(),
+                "stopped" | "absent" | "exited" | "vanished"
+            )
+        }))
     }
 
     fn step_declarations_hold(&self, step_subject: &str) -> Result<bool> {

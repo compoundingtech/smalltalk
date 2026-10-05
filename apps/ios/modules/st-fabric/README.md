@@ -14,7 +14,7 @@ npx expo prebuild --platform ios --no-install
 ST3_FABRIC_PROOF=1 npm run pods
 ```
 
-Build Debug for a simulator of your own. The script targets iOS 16.4, including its C/assembly dependencies, and writes the XCFramework under `ios/build` inside the pod root. On a shared build host, wait until `pgrep -x xcodebuild` finds no process before starting Xcode. Generated static libraries and the device/simulator XCFramework are ignored; do not commit them. To restore the default build, reinstall pods without `ST3_FABRIC_PROOF`.
+Build Debug for an arm64 simulator of your own (`ARCHS=arm64 ONLY_ACTIVE_ARCH=YES`); the proof framework has no x86_64 simulator slice. The script targets iOS 16.4, including its C/assembly dependencies, and writes the XCFramework under `ios/build` inside the pod root. On a shared build host, wait until `pgrep -x xcodebuild` finds no process before starting Xcode. Generated static libraries and the device/simulator XCFramework are ignored; do not commit them. To restore the default build, reinstall pods without `ST3_FABRIC_PROOF`.
 
 ## Isolated proof
 
@@ -59,3 +59,26 @@ The independent byte test checks framing and malformed input. The pinned-daemon 
 On 2026-10-04, an iOS 27 simulator running the Debug native app reached a real isolated st member's paired-only Unix gateway through `demo-client/0`. The unchanged TypeScript client first received an unpaired refusal, then completed pairing and received `st3.client.v0` capabilities for a `person/demo` session. The screen reported fabric `0.2.30+8bd9017` and iroh `1.0.2`. The Keychain NodeID remained the same across app relaunches. Only the exact test-service grant was added; it was removed and peers reloaded after verification. The proof closed its endpoint after the response. The isolated daemon's short detached-session TTL bounds forced teardown during setup retries.
 
 Both device and simulator static libraries and their XCFramework built. Rust fixtures, pinned-daemon checks and clippy passed; app typecheck and 32 tests passed. A physical-device run, network migration, relay/NAT behavior and the broader capabilities listed in the protocol document remain to be proved before adopting this carrier.
+
+## Full-client phone trial
+
+Add `client=1` to the Debug proof pairing link to use the normal Home, conversation and other screens with a temporary, in-memory client. The ordinary store is unmounted during this trial. No loopback URL, proof credential or projection is saved, and the ordinary signing key is not used or replaced. The temporary pairing uses the gateway's legacy unsigned-device path; it does not prove enrolled action signing. Close the trial to restore the ordinary saved gateway. A full-client pairing needs the message scope (`devices pair --full-control` on the test member). For the v0.2.32 phone trial, start the isolated helper with `FABRIC_EXPECTED_VERSION=0.2.32+e31e53b`, then append `auto`, `direct` or `relay` to its `grant` command. That creates a full-control challenge and writes a separate-app link with `client=1` and the requested path mode. Other versions are rejected.
+
+Use `mode=auto`, `mode=direct` or `mode=relay` on the link. Direct mode removes relay transports; relay mode removes IP transports. Measurements show the actually selected path, not an inference from the requested mode. Native `handshakeMs` measures the complete `Endpoint.connect` wait (including discovery/path setup), excluding endpoint creation and HTTP admission; authenticated setup and message acknowledgement have separate timings. The message timing includes its fence and any existing idempotent retry, not an agent's answer.
+
+Backgrounding stops the endpoint and pauses the feed. Foregrounding creates a fresh native listener, authenticates with the retained in-memory bearer and then opens the feed. It does not resume a fabric session or replay pairing. An unanswered pairing needs a fresh proof link. Leaving the app inactive during a Wi-Fi switch can therefore test reconnect rather than continuous QUIC migration; record which occurred.
+
+The Measurements panel samples native paths and estimated QUIC RTT, process CPU/peak resident memory, interface type, thermal state, battery fraction and lifecycle/window/message events. It uses no sampling timer. History is bounded and contains no credentials, addresses, NodeIDs or message content. Battery fraction is coarse; charging prevents attributing drain. Compare an equal-duration idle and active trial under the same conditions and report the limitation.
+
+For a cellular trial without Metro, regenerate the ignored native project and explicitly prepare a separate offline Debug app:
+
+```sh
+cd apps/ios
+npx expo prebuild --platform ios --clean --no-install
+node modules/st-fabric/prepare-phone.mjs --offline-debug
+# Build the Rust framework, then install enabled pods as described above.
+ST3_FABRIC_PROOF=1 npm run pods
+# Use Debug, FORCE_BUNDLING=1, and leave SKIP_BUNDLING unset.
+```
+
+This local preparation uses `com.compoundingtech.smalltalk.fabricproof` and its own URL scheme, so installation does not replace the ordinary app. Its proof link starts `com.compoundingtech.smalltalk.fabricproof://fabric-proof`. The generated local override forces Debug bundling and selects `ST3_FABRIC_OFFLINE_DEBUG=1`; Metro then omits only Expo's devtools message socket, which rejects embedded Debug bundles. Native and JavaScript Debug guards stay enabled; Release still rejects the carrier. Signing and provisioning remain local. See [the phone proof report](../../../../docs/st3/ios-fabric-phone-proof.md) for measured results and pending device trials.

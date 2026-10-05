@@ -354,11 +354,26 @@ async fn a_quiet_idle_seat_reports_current_after_daemon_restart_without_seat_res
     declare_claude(&daemon, seat);
     daemon.observe_running(seat, incarnation);
     daemon.start_isolated().await;
+    // A healthy quiet Claude seat includes its initialized delivery channel. The provider
+    // emits no further hook events; the wrapper must keep the owned idle evidence current.
+    let provider = r#"
+import json, os, subprocess, sys, time
+channel = subprocess.Popen(
+    [sys.argv[1], 'driver', 'claude-mcp', '--subject', os.environ['ST_AGENT']],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+channel.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}) + '\n')
+channel.stdin.flush()
+assert json.loads(channel.stdout.readline())['id'] == 1
+channel.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) + '\n')
+channel.stdin.flush()
+time.sleep(300)
+"#;
     let mut driver = TestSeat(Some(
         command
             .env("ST_AGENT", seat)
             .env("ST3_MAILBOX_TRANSPORT", "push")
-            .args(["driver", "claude", "--subject", seat, "--", "sleep", "300"])
+            .args(["driver", "claude", "--subject", seat, "--", "python3", "-c", provider,
+                env!("CARGO_BIN_EXE_st3-fixture")])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -381,6 +396,10 @@ async fn a_quiet_idle_seat_reports_current_after_daemon_restart_without_seat_res
     )
     .await;
     let owned = st_drivers::harness_state::read(&record, None).unwrap();
+    wait_until("the quiet seat's channel attaches", Duration::from_secs(10), || {
+        daemon.has_diagnostic(seat, incarnation, "claude-channel-attached")
+    })
+    .await;
     // Stand in for this wrapper's Stop hook. The live wrapper must heartbeat that exact
     // owned idle evidence; no subsequent provider event or test observation is supplied.
     Writer::new(
@@ -433,7 +452,9 @@ async fn a_quiet_idle_seat_reports_current_after_daemon_restart_without_seat_res
             .find(|row| row["id"] == seat)
             .cloned()
             .unwrap();
-        if row["observation"] == "current" || Instant::now() >= deadline {
+        if (row["observation"] == "current" && row["harness_state"] == "idle")
+            || Instant::now() >= deadline
+        {
             break row;
         }
         assert_alive(&mut driver, "the quiet driver after daemon restart");

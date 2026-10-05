@@ -674,16 +674,22 @@ fn main() -> Result<()> {
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "stui [--client | --local] [--space NAME | --classic]\nstui pair MEMBER_URL PAIRING_ID\n\nPairing reads the single-use code privately from the terminal (or stdin).\nPaired devices use the network automatically; --local selects the local daemon.\n--client requires a paired device. --demo opens invented data.\nstui opens spaces: splits with their own tabs, Ctrl+K to open anything and Ctrl+S for\nthe sidebar; --space NAME opens that space. --classic keeps the old layout for now; it\nis going away. --version names this build."
+            "stui [--client | --local] [--space NAME | --classic]\nstui pair MEMBER_URL PAIRING_ID [--allow-public-http]\n\nPairing reads the single-use code privately from the terminal (or stdin).\nPaired devices use the network automatically; --local selects the local daemon.\n--client requires a paired device. --demo opens invented data.\nstui opens spaces: splits with their own tabs, Ctrl+K to open anything and Ctrl+S for\nthe sidebar; --space NAME opens that space. --classic keeps the old layout for now; it\nis going away. --version names this build."
         );
         return Ok(());
     }
     if args.get(1).is_some_and(|arg| arg == "pair") {
-        anyhow::ensure!(args.len() == 4, "Usage: stui pair MEMBER_URL PAIRING_ID");
+        let allow_public_http = args.get(4).is_some_and(|arg| arg == "--allow-public-http");
+        anyhow::ensure!(
+            args.len() == 4 || (args.len() == 5 && allow_public_http),
+            "Usage: stui pair MEMBER_URL PAIRING_ID [--allow-public-http]"
+        );
         let path = connection::profile_path()?;
         let code = connection::read_code()?;
         let runtime = tokio::runtime::Runtime::new()?;
-        let person = runtime.block_on(connection::pair(&path, &args[2], &args[3], &code))?;
+        let person = runtime.block_on(connection::pair(
+            &path, &args[2], &args[3], &code, allow_public_http,
+        ))?;
         println!("Paired as {person}. Run stui to connect; no local daemon is needed.");
         return Ok(());
     }
@@ -735,7 +741,7 @@ fn main() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join("|");
             (
-                profile.clients(),
+                profile.clients()?,
                 cache::path(
                     std::path::Path::new(&identity),
                     person.as_deref().unwrap_or_default(),

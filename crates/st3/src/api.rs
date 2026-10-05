@@ -550,6 +550,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/mailbox", get(mailbox::subscribe))
         .route("/v1/harness-events", post(harness_events::publish))
         .route("/v1/mailbox/bind", post(mailbox::bind))
+        .route("/v1/mailbox/attachment", get(mailbox::attachment))
         .route("/v1/mailbox/receipts", post(mailbox::receipt))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/read/{*subject}", get(read_message))
@@ -728,6 +729,19 @@ async fn response_envelope(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Anonymous pairing discovery is public, static compatibility metadata. Bypass
+    // authentication, snapshots, presence and the normal envelope/activity counter entirely.
+    if matches!(transport, ClientTransportBoundary::FabricLoopback)
+        && request.method() == axum::http::Method::GET
+        && request.uri().path() == "/v1/client/capabilities"
+        && !request.headers().contains_key(axum::http::header::AUTHORIZATION)
+    {
+        return Json(json!({
+            "api_version": CLIENT_API_VERSION,
+            "capabilities": [{"id":"device-key-proofs", "version":1, "state":"granted"}],
+        }))
+        .into_response();
+    }
     let started = Instant::now();
     let request_path = request.uri().path().to_owned();
     let request_route = request

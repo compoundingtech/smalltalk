@@ -301,7 +301,8 @@ async fn a_gate_asked_again_refuses_the_old_card_and_takes_the_current_one() {
     reconcile_until(&reconciler, "the gate asked", || {
         store.gate_request_for_owner(&step).unwrap().is_some()
     });
-    let app = st3::api::router(state);
+    let app = st3::api::router(state.clone());
+    let (socket, server) = serve(state, root.path()).await;
     let seen = card(&app, "person/avery", &step).await.expect("no card");
 
     // The step fails and is retried before the person answers. Until st asks again, the gate
@@ -349,6 +350,33 @@ async fn a_gate_asked_again_refuses_the_old_card_and_takes_the_current_one() {
         .await
         .expect("the gate was not asked again");
     assert_ne!(current.0["id"], seen.0["id"]);
+    let old_id = seen.0["id"].as_str().unwrap();
+    let current_id = current.0["id"].as_str().unwrap();
+    let stale = run_cli(
+        &socket,
+        &["attention", "show", old_id, "--as", "person/avery"],
+    )
+    .await;
+    assert!(!stale.status.success(), "{stale:?}");
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("not currently actionable"));
+    for target in [current_id, step.as_str()] {
+        let shown = run_cli(
+            &socket,
+            &[
+                "--json",
+                "attention",
+                "show",
+                target,
+                "--as",
+                "person/avery",
+            ],
+        )
+        .await;
+        assert!(shown.status.success(), "{shown:?}");
+        let item: Value = serde_json::from_slice(&shown.stdout).unwrap();
+        assert_eq!(item["subject"], step);
+        assert_eq!(item["episode"], current.0["episode"]);
+    }
     let (status, approved) = act(
         &app,
         "person/avery",
@@ -362,6 +390,7 @@ async fn a_gate_asked_again_refuses_the_old_card_and_takes_the_current_one() {
     reconcile_until(&reconciler, "the step completed", || {
         step_status(&store, &step) == "completed"
     });
+    server.abort();
 }
 
 async fn run_cli(socket: &Path, args: &[&str]) -> Output {

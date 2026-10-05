@@ -1008,11 +1008,23 @@ export type PairedSession = {
   credential: string;
   device_id: Id;
   device_key_chain?: Array<string>;
+  device_key_proofs?: Array<{
+
+}>;
   expires_at: Timestamp;
   kind: "paired-session";
   person_id: string;
   scopes: Array<string>;
   session_actor: Id;
+};
+
+export type PairingAdvertisement = {
+  api_version: "st3.client.v0";
+  capabilities: Array<{
+  id: "device-key-proofs";
+  state: "granted";
+  version: 1;
+}>;
 };
 
 export type PairingBegin = {
