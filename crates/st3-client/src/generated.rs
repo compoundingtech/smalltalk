@@ -360,6 +360,13 @@ pub struct ClientConnection {
     pub follows: Vec<String>,
 }
 
+/// Undelivered retained mail past the reported age threshold, across all mailboxes.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MailBacklog {
+    pub count: u64,
+    pub threshold_ms: u64,
+    pub cleanup_command: String,
+}
 /// Token spend over a period, one row per agent, mission run, step, model, account and host.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsagePeriod {

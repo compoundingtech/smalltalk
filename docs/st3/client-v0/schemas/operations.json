@@ -17,6 +17,7 @@
     { "id": "capabilities.get", "method": "GET", "path": "/v1/client/capabilities", "response": "Capabilities" },
     { "id": "document.get", "method": "GET", "path": "/v1/client/documents/content", "response": "DocumentContent" },
     { "id": "subject.definition", "method": "GET", "path": "/v1/client/subject-definition", "response": "SubjectDefinition" },
+    { "id": "mail-backlog.summary", "method": "GET", "path": "/v1/client/mail-backlog", "response": "MailBacklog", "scope": "read.projections" },
     { "id": "usage.period", "method": "GET", "path": "/v1/client/usage", "response": "UsagePeriod" },
     { "id": "clients.list", "method": "GET", "path": "/v1/client/clients", "response": "ClientConnections" },
     { "id": "now.list", "method": "GET", "path": "/v1/client/now", "response": "Page" },

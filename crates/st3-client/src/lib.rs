@@ -1180,6 +1180,9 @@ impl Client {
         ))
         .await
     }
+    pub async fn mail_backlog_summary(&self) -> Result<Envelope<MailBacklog>, ClientError> {
+        self.get("/v1/client/mail-backlog").await
+    }
     pub async fn usage_period(
         &self,
         since_ms: Option<u64>,

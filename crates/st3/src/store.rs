@@ -111,6 +111,7 @@ mod convergence;
 mod document_index_tests;
 mod lanes;
 mod operations;
+mod unread_mail;
 mod runtime;
 #[cfg(test)]
 mod tombstones_tests;
@@ -10744,6 +10745,23 @@ impl Store {
             messages.push(self.message_view_cached(&connection, &subject, index)?);
         }
         Ok(messages)
+    }
+
+    pub fn unread_mail_count_before(&self, before_unix_ms: u128) -> Result<u64> {
+        smallclaims::touched::note_read(|| "kind:message.sent".to_owned());
+        if PINNED_READER.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|(pool, _)| *pool == self.readers.key())
+        }) {
+            return unread_mail::count_in_snapshot(&self.readers.get(), before_unix_ms);
+        }
+        let mut connection = self.connection.write();
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let count = unread_mail::count_before(&transaction, before_unix_ms)?;
+        transaction.commit()?;
+        Ok(count)
     }
 
     pub fn messages(
@@ -46570,21 +46588,22 @@ impl Store {
             for claim in &batch.claims {
                 ensure_claim_blobs(&transaction, claim)?;
                 let inserted = transaction
-                    .execute(
+                    .prepare_cached(
                         "INSERT OR IGNORE INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                        params![
-                            claim.id,
-                            claim.batch_id,
-                            claim.subject,
-                            claim.kind,
-                            claim.origin,
-                            claim.actor,
-                            canonical_json_text(&claim.body).map_err(internal)?,
-                            serde_json::to_string(&claim.predecessors).map_err(internal)?,
-                            claim.accepted_at_unix_ms.to_string(),
-                        ],
                     )
+                    .map_err(internal)?
+                    .execute(params![
+                        claim.id,
+                        claim.batch_id,
+                        claim.subject,
+                        claim.kind,
+                        claim.origin,
+                        claim.actor,
+                        canonical_json_text(&claim.body).map_err(internal)?,
+                        serde_json::to_string(&claim.predecessors).map_err(internal)?,
+                        claim.accepted_at_unix_ms.to_string(),
+                    ])
                     .map_err(internal)?;
                 if inserted != 0 {
                     let index = transaction.last_insert_rowid() as u64;
