@@ -9,8 +9,8 @@ import subprocess
 import time
 
 HEADS = {
-    'main': '01766bf84d4ce0bfb5d216449267d1387c1e4e86',
-    'after': 'dac9593d689dc776879443ab5885d5342d2f5dec',
+    'main': '5a1e44740e214ce5cc58a2a4d6b28a95d3791e73',
+    'after': 'efb20e7119b3fb17386615cc024e0d0ec30bc89a',
 }
 BASELINES = [37276978494, 37273736714, 37265290064, 37257137831, 37256435588]
 MEASURED_PAIRS = 3
@@ -68,6 +68,7 @@ plan = {
     'baseline_runs': BASELINES,
     'baseline_file_sha256': baseline_hashes,
     'assertions_and_budgets_unchanged': True,
+    'source_scope': 'API-only baseline versus API plus original record offsets; excluded diagnostic traces',
     'profiling_disabled': False,
     'all_diagnostic_timings_excluded_from_accepted_evidence': True,
     'workload_seconds': 120,
