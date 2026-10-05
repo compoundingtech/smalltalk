@@ -22,7 +22,6 @@ pub struct Extras {
     pub bodies: BTreeMap<String, (String, Option<String>, String)>,
     pub live: bool,
     pub offline: Option<String>,
-    pub mail_backlog: Option<Result<st3_client::MailBacklog, String>>,
 }
 
 fn now() -> String {
@@ -142,11 +141,6 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         host,
         link,
         diverged,
-        mail_backlog: match &extras.mail_backlog {
-            Some(Ok(value)) => Load::Ready(value.clone()),
-            Some(Err(error)) => Load::Failed(error.clone()),
-            None => Load::Loading,
-        },
         attention: loaded(model.now.snapshot.is_some(), attention),
         agents: loaded(model.agents.snapshot.is_some(), agents(model)),
         missions: loaded(model.missions.snapshot.is_some(), missions),
@@ -328,6 +322,20 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                                 .map_or(&item.detail, |request| &request.question),
                         ),
                         structured: item.request.clone().map(Box::new),
+                    },
+                ),
+                custom if custom.starts_with("custom.") => (
+                    Tier::Today,
+                    AttentionKind::Request {
+                        from: requester_name(model, item.requester_id.as_deref()),
+                        from_id: item.requester_id.clone().unwrap_or_default(),
+                        question: format!(
+                            "{}\n\n{}\nSource: {}",
+                            item.detail,
+                            crate::custom_form_hint(item.custom_form.as_ref()),
+                            item.source_id
+                        ),
+                        structured: None,
                     },
                 ),
                 // Home holds only requests and reviews. Messages stay in conversations, and st

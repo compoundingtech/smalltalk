@@ -1,3 +1,4 @@
+pub mod custom;
 mod glass_heads;
 mod glasses;
 pub mod owned_sets;
@@ -11825,6 +11826,7 @@ impl Store {
     ) -> Result<Vec<AttentionItemView>> {
         let mut items = self.mission_run_attention_items(person)?;
         items.extend(self.person_attention_items(person, as_of)?);
+        items.extend(self.custom_attention_items(person)?);
         // A person who published a broken gate is the one to correct it.
         items.extend(
             self.broken_gate_items(person, as_of)?
@@ -18363,6 +18365,7 @@ fn append_claim_tx(
         forced_batch,
     )?;
     insert_event(transaction, record.store_index, kind, subject, body)?;
+    custom::flush(transaction)?;
     if kind == "resource.observed" {
         resources::refresh(transaction, subject)?;
     }
@@ -24253,6 +24256,7 @@ fn replay_graph_from_nothing_tx(transaction: &Transaction<'_>) -> Result<(), St3
     rebuild_planning_tx(transaction).map_err(internal)?;
     resources::rebuild(transaction).map_err(internal)?;
     glass_heads::rebuild(transaction).map_err(internal)?;
+    custom::rebuild(transaction).map_err(internal)?;
     Ok(())
 }
 
@@ -46809,6 +46813,7 @@ impl Store {
         owned_sets::project_tx(&transaction)?;
         project_replicated_mission_runs(&transaction)?;
         rebuild_planning_tx(&transaction).map_err(internal)?;
+        custom::flush(&transaction).map_err(internal)?;
         let accepted_heads = replica_heads(&transaction).map_err(internal)?;
         let accepted_through = accepted_heads.get(&input.peer).copied().unwrap_or(0);
         let missing_sequences = missing_ranges
@@ -46998,7 +47003,10 @@ fn append_claim_with_fences(
                         "placement changed; read the current handoff before overriding its sources"));
                 }
             }
-            let mut stored_fields = normalize_resource_observation(transaction, input)?;
+            let mut stored_fields = custom::prepare(transaction, input)?;
+            if let Some(fields) = normalize_resource_observation(transaction, input)? {
+                stored_fields = Some(fields);
+            }
             if let Some(fields) = glasses::prepare(transaction, input)? {
                 stored_fields = Some(fields);
             }
@@ -47248,6 +47256,9 @@ const PROJECTION_DIGEST_TABLES: &[(&str, &[&str])] = &[
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),
+    ("custom_registrations", &[]),
+    ("custom_sources", &[]),
+    ("custom_dependencies", &[]),
     ("mission_revisions", &["created_index"]),
     ("mission_definitions", &[]),
     ("mission_runs", &[]),

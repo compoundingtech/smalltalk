@@ -101,14 +101,22 @@ enrolls no signing key and persists no private signing material.
 
 Completion checks the private key with a local signing self-test before sending the existing
 pairing request. It does not add a server proof-of-possession requirement or send a message.
-Before sending the single-use code, it reads the member's capability advertisement and requires
-`device-key-proofs` version 1. Older members are refused without submitting or consuming the code.
+Before sending the single-use code, it anonymously reads `GET /v1/client/capabilities` and
+requires `device-key-proofs` version 1. This unauthenticated response contains only `api_version`
+and that one capability. It is static: no machine version, snapshot, event cursor, limits, scopes,
+actions or client-presence update. Authenticated capability reads retain their full response.
+Older members are refused without submitting or consuming the code.
 The member prepares and checks both proofs before recording completion or creating the bearer.
 If a historical root has no usable signature or content hash, completion refuses without consuming
-its code; inspect signing history on the trusted member. Proof preparation can leave an unused key
-grant: that principal claim is signing authority even without a bearer, and is not rolled back.
-Inspect principal grant history on the trusted member if proof preparation fails; there is no
-completed device record for that grant in `st devices ls`. Immutable history is not rewritten. Before committing a messaging profile it verifies the returned device and person-root grant
+its code; inspect signing history on the trusted member. Every refusal after enrollment calls
+`revoke_device_key` best-effort, recording `principal.key-revoked` for the prepared key and sealing
+that revocation. This withdraws signing authority without rewriting the original grant. Retry with
+a fresh signing key. A process crash or a storage failure can prevent cleanup and leave an unused
+signing grant; inspect principal grant and revocation history on the trusted member in that case.
+There is no completed device record for such a grant in `st devices ls`; pairing revocation only
+covers completed devices. Node/person-root fingerprint pinning remains a pending design decision;
+these proofs do not authenticate a gateway against an active attacker.
+Before committing a messaging profile it verifies the returned device and person-root grant
 proofs, their content hashes and signatures, the device-to-root-to-node issuer/role links, and
 the first grant's binding to its submitted public key. A member that does not return those
 proofs must be upgraded; the client refuses to save its response and reports the possible

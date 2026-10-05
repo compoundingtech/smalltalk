@@ -270,6 +270,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn agent_declaration_get(&self, id: &str, revision: Option<&str>, show_env_values: bool) -> Result<Envelope<AgentDeclaration>, ClientError> {{ let path = format!(\"/v1/client/agent-declarations/{{}}?show_env_values={{show_env_values}}\", percent_encode(id)); let path = if let Some(revision) = revision {{ format!(\"{{path}}&revision={{}}\", percent_encode(revision)) }} else {{ path }}; self.get(&path).await }}"
             )?;
+        } else if id == "custom-subjects.list" {
+            writeln!(
+                out,
+                "    pub async fn custom_subjects_list(&self, kind: Option<&str>, version: Option<u32>, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<Page>, ClientError> {{ let version = version.map(|v| v.to_string()); let values = [(\"kind\", kind), (\"version\", version.as_deref())]; let filters = values.into_iter().filter_map(|(k,v)| v.map(|v| (k,v))).collect::<Vec<_>>(); self.list_internal_with_filters(\"custom-subjects\", cursor, limit, false, &filters).await }}"
+            )?;
         } else if id == "resources.list" {
             writeln!(
                 out,
@@ -385,6 +390,11 @@ fn swift_operation_methods(
             writeln!(
                 out,
                 "    public func subjectDefinition(subject: String, showEnvValues: Bool = false) async throws -> Envelope<SubjectDefinition> {{ try await get(\"v1/client/subject-definition\", query: [.init(name: \"subject\", value: subject), .init(name: \"show_env_values\", value: showEnvValues ? \"true\" : \"false\")]) }}"
+            )?;
+        } else if id == "custom-subjects.list" {
+            writeln!(
+                out,
+                "    public func customSubjectsList(kind: String? = nil, version: Int? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<Page> {{ var query: [URLQueryItem] = []; if let kind {{ query.append(.init(name: \"kind\", value: kind)) }}; if let version {{ query.append(.init(name: \"version\", value: String(version))) }}; if let cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/custom-subjects\", query: query) }}"
             )?;
         } else if id == "resources.list" {
             writeln!(
@@ -1148,6 +1158,11 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(name: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }})); }}"
+            )?;
+        } else if id == "custom-subjects.list" {
+            writeln!(
+                out,
+                "    async customSubjectsList(options: PageOptions & {{ kind?: string; version?: number }} = {{}}): Promise<EnvelopeOf<Page>> {{ return this.get('{route}' + query(options)); }}"
             )?;
         } else if id == "resources.list" {
             writeln!(

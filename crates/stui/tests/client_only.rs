@@ -393,11 +393,8 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     let url = format!("http://{address}");
     let route = carrier(listener, gateway.clone());
     let preflight = Client::fabric_pairing(&url);
-    let advertised = preflight.capabilities().await.unwrap();
-    assert!(advertised.value.capabilities.iter().any(|capability| capability.id == "device-key-proofs"));
-    assert!(advertised.value.capabilities.iter().filter(|capability| capability.id != "device-key-proofs")
-        .all(|capability| capability.state != st3_client::CapabilityState::Granted));
-    // Public compatibility discovery grants no authority to read the graph.
+    // The anonymous advertisement is deliberately not a normal authenticated envelope.
+    assert!(preflight.capabilities().await.is_err());
     assert!(preflight.agents_list(None, None, false).await.is_err());
     pair(device.path(), &local, &url).await;
     let online_step = person_ask(&state, "online-proof", "Online proof");

@@ -61,6 +61,7 @@ use crate::store::Store;
 mod client_blobs;
 mod client_presence;
 mod client_v0;
+mod custom;
 mod delivery_presence;
 mod delivery_probes;
 mod github_watch;
@@ -459,6 +460,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::raw_terminal::stream),
         )
         .route("/v1/schema", get(schema))
+        .route(
+            "/v1/schema/registrations",
+            get(custom::registrations).post(custom::register),
+        )
+        .route("/v1/custom/reply", post(custom::reply))
+        .route("/v1/custom/basis", get(custom::basis))
+        .route("/v1/client/custom-subjects", get(custom::list))
+        .route("/v1/client/custom-subjects/{*id}", get(custom::read))
         .route("/v1/intent/mission", post(mission))
         .route("/v1/gate-checks", post(start_gate_check))
         .route("/v1/gate-checks/{id}", get(read_gate_check))
@@ -719,6 +728,19 @@ async fn response_envelope(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Anonymous pairing discovery is public, static compatibility metadata. Bypass
+    // authentication, snapshots, presence and the normal envelope/activity counter entirely.
+    if matches!(transport, ClientTransportBoundary::FabricLoopback)
+        && request.method() == axum::http::Method::GET
+        && request.uri().path() == "/v1/client/capabilities"
+        && !request.headers().contains_key(axum::http::header::AUTHORIZATION)
+    {
+        return Json(json!({
+            "api_version": CLIENT_API_VERSION,
+            "capabilities": [{"id":"device-key-proofs", "version":1, "state":"granted"}],
+        }))
+        .into_response();
+    }
     let started = Instant::now();
     let request_path = request.uri().path().to_owned();
     let request_route = request
@@ -2636,6 +2658,9 @@ fn snapshot_time_ms(timestamp: &str) -> u128 {
 }
 
 fn client_attention_actions(kind: &str, review_mode: Option<&str>) -> Vec<&'static str> {
+    if kind.starts_with("custom.") {
+        return vec!["custom.reply"];
+    }
     match kind {
         "human-gate" if review_mode == Some("feedback") => {
             vec!["review.approve", "review.request-changes"]
@@ -2720,6 +2745,14 @@ fn client_attention_resources(
         if let Some(mode) = item.review_mode {
             resource["review_mode"] = json!(mode);
         }
+        if item.kind.starts_with("custom.")
+            && let Some(source) = store.custom_subject(&item.subject)?
+        {
+            resource["source_kind"] = json!("custom");
+            resource["revision"] = source["revision"].clone();
+            resource["custom_form"] = source["attention"]["reply"].clone();
+            resource["action_parameters"] = json!({"custom.reply":{"target_id":item.subject,"registration":source["registration"],"revision":source["revision"],"episode":item.episode}});
+        }
         if item.kind == "person-step" {
             resource["action_parameters"] =
                 json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
@@ -2744,6 +2777,30 @@ fn client_attention_resources(
         resources.push(resource);
     }
     Ok(resources)
+}
+
+// Older client-v0 models use closed enums for attention kinds and action names.
+fn client_attention_compatibility(items: &mut [Value], custom_forms: bool) {
+    if custom_forms {
+        return;
+    }
+    for item in items {
+        if item["kind"] == "attention" && item["source_kind"] == "custom" {
+            item["custom_attention_kind"] = item["attention_kind"].clone();
+            item["attention_kind"] = json!("agent-request");
+            item["actions"] = json!([]);
+            let p = &item["action_parameters"]["custom.reply"];
+            let command = [
+                "st", "subject", "reply", item["source_id"].as_str().unwrap_or_default(),
+                "--registration", p["registration"].as_str().unwrap_or_default(),
+                "--revision", p["revision"].as_str().unwrap_or_default(),
+                "--episode", p["episode"].as_str().unwrap_or_default(),
+                "--fields-file", "REPLY.json", "--idempotency-key", "REPLY-KEY",
+                "--as", item["person_id"].as_str().unwrap_or_default(),
+            ].map(crate::gate_report::shell_quote).join(" ");
+            item["detail"] = json!(format!("{}\n\nReply with {command}", item["detail"].as_str().unwrap_or_default()));
+        }
+    }
 }
 
 fn client_attention_resources_with_previews(
@@ -3953,7 +4010,11 @@ async fn client_attention(
         snapshot,
         "attention",
         &effective_query,
-        move |state, _| client_attention_resources_with_previews(state, person.as_deref(), history),
+        move |state, _| {
+            let mut items = client_attention_resources_with_previews(state, person.as_deref(), history)?;
+            client_attention_compatibility(&mut items, session.custom_forms);
+            Ok(items)
+        },
     )
     .await
 }
@@ -3965,12 +4026,10 @@ async fn client_attention_detail(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
-    client_detail(
-        client_attention_resources_with_previews(&state, person.as_deref(), query.history)
-            .map_err(ApiError::internal)?,
-        "attention",
-        &id,
-    )
+    let mut items = client_attention_resources_with_previews(&state, person.as_deref(), query.history)
+        .map_err(ApiError::internal)?;
+    client_attention_compatibility(&mut items, session.custom_forms);
+    client_detail(items, "attention", &id)
 }
 
 async fn client_messages(
@@ -4959,6 +5018,8 @@ async fn guard_bound_request(
         "/v1/subscription-requests/",
         "/v1/reviews/",
         "/v1/claims",
+        "/v1/schema/registrations",
+        "/v1/custom/reply",
         "/v1/diagnostic",
         "/v1/rules/",
     ]
@@ -13827,6 +13888,8 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/missions/example%2Fdemo/retire",
             "/v1/subscription-requests/release/subscription-request%2Fexample",
             "/v1/reviews/step-run/example",
+            "/v1/schema/registrations",
+            "/v1/custom/reply",
         ] {
             for actor in ["agent/peer", "person/operator"] {
                 let request = Request::builder()

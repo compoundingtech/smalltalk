@@ -11,7 +11,7 @@ export type ActionCommon = {
   parameters: {
 
 };
-  type: "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
+  type: "custom.reply" | "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
 };
 
 export type ActionResult = {
@@ -238,9 +238,12 @@ export type Attention = ResourceHeader & {
   action_parameters?: {
 
 };
-  actions: Array<"work.done" | "review.approve" | "review.reject" | "review.request-changes" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
-  attention_kind: "human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault";
+  actions: Array<"custom.reply" | "work.done" | "review.approve" | "review.reject" | "review.request-changes" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
+  attention_kind: ("human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault" | string);
   because?: string;
+  custom_form?: {
+
+};
   detail: string;
   episode?: string;
   fix?: {
@@ -449,6 +452,16 @@ export type ConversationSearchHit = {
 };
 
 export type Cursor = string;
+
+export type CustomReplyParameters = {
+  episode: string;
+  fields: {
+
+};
+  registration: string;
+  revision: string;
+  target_id: Id;
+};
 
 export type DecisionOption = {
   description?: string | null;
@@ -972,6 +985,15 @@ export type PairedSession = {
   person_id: string;
   scopes: Array<string>;
   session_actor: Id;
+};
+
+export type PairingAdvertisement = {
+  api_version: "st3.client.v0";
+  capabilities: Array<{
+  id: "device-key-proofs";
+  state: "granted";
+  version: 1;
+}>;
 };
 
 export type PairingBegin = {
@@ -1702,6 +1724,7 @@ export type ActionRequest =
   outcome: string;
   reason?: string;
 }; fence: Fence }) |
+  (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'custom.reply'; parameters: CustomReplyParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'lane.approve'; parameters: {
   anchor_id?: Id;
   detail?: string;

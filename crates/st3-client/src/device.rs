@@ -495,14 +495,17 @@ pub async fn complete_with_http_policy(
     let public = key.public_key()?;
     let (parent, _lock) = prepare(path)?;
     let mut profile = Profile::load(path)?.unwrap_or_default();
-    let capabilities = client.capabilities().await
+    let capabilities: serde_json::Value = client.get("/v1/client/capabilities").await
         .context("Member cannot advertise pairing proof support; upgrade the member before retrying. The pairing code was not submitted")?;
     ensure!(
-        capabilities.value.capabilities.iter().any(|capability| {
-            capability.id == "device-key-proofs"
-                && capability.version >= 1
-                && capability.state == crate::CapabilityState::Granted
-        }),
+        capabilities["api_version"] == crate::API_VERSION
+            && capabilities["capabilities"]
+                .as_array()
+                .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                    capability["id"] == "device-key-proofs"
+                        && capability["version"] == 1
+                        && capability["state"] == "granted"
+                })),
         "Member does not support verifiable device grants; upgrade it before retrying. The pairing code was not submitted"
     );
     let session = client
