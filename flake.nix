@@ -7,7 +7,7 @@
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
     # The runtime, Rust crates and native terminal library share one producer revision.
-    pty.url = "github:compoundingtech/pty/2aa056b3d7527a6cb7931e087676bab904f259db";
+    pty.url = "github:compoundingtech/pty/b9d02f3468b718ceff27031e0b9cb38de3bb6b1c";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared CI generators and the `otelite` collector used by release-integration.
     # Re-pin to effect-utils main once the Rust helpers and repo-settings PRs merge.
@@ -223,7 +223,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-P4kYX1nHE+iREAcLdojXWXzHAV5dZOmPUXXFJTm50pA=";
+              "pty-core-0.13.0-rust" = "sha256-iUey+Jj6CT+Oqa0bWDGFXubqYBbpzlLUvpZ9CLFisBo=";
             };
           };
 
@@ -350,7 +350,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-P4kYX1nHE+iREAcLdojXWXzHAV5dZOmPUXXFJTm50pA=";
+              "pty-core-0.13.0-rust" = "sha256-iUey+Jj6CT+Oqa0bWDGFXubqYBbpzlLUvpZ9CLFisBo=";
             };
           };
           cargoBuildFlags = [
@@ -587,7 +587,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-P4kYX1nHE+iREAcLdojXWXzHAV5dZOmPUXXFJTm50pA=";
+              "pty-core-0.13.0-rust" = "sha256-iUey+Jj6CT+Oqa0bWDGFXubqYBbpzlLUvpZ9CLFisBo=";
             };
           };
           buildPhase = ''
