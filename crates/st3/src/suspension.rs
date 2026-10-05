@@ -543,7 +543,11 @@ mod tests {
             .unwrap()
             .unwrap()
             .0;
-        let kdl = crate::graph::render_agent_desired_kdl(&desired.desired).unwrap();
+        let kdl = crate::graph::render_agent_desired_kdl(
+            &desired.desired,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         assert!(
             crate::parse_intent(&kdl, "jade")
                 .unwrap()
