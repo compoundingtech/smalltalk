@@ -53,8 +53,11 @@ the exact native session, and its observed turn binding. The turn is initially `
 identifier is minted only on the native `agent_start` event.
 
 Input uses a displayable, user-attributed native custom message with an operation ID, actor, and
-entry ID in its details. Idle input starts a turn; busy input keeps native steer or follow-up
-semantics. Neither the void extension return nor matching text proves acceptance: only the exact
+entry ID in its details. Smalltalk retains follow-ups while native input is busy and dispatches
+only after a positive native idle observation. Steering is unsupported:
+`native-pre-dequeue-api-unavailable` identifies the missing public consumption fence; enqueue
+with the steer lane and promote leave the owner queue unchanged. Neither the void extension
+return nor matching text proves acceptance: only the exact
 native `message_start` or `message_end` details settle the operation. Identical text with distinct
 operation IDs remains distinct.
 
