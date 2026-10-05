@@ -90,6 +90,25 @@ async fn daemon(root: &Path) {
                 },
             ),
         )
+        .route("/fixture/seed", post(
+            |State(state): State<AppState>, Json(seed): Json<Value>| async move {
+                let store = state.store.clone();
+                let seat = seed["seat"].as_u64().unwrap() as usize;
+                let per_seat = seed["messages"].as_u64().unwrap() as usize;
+                assert!(seat < SEATS);
+                blocking_action(move || {
+                    for index in 0..per_seat {
+                            store.append_claim(&claim(format!("message/idle-{seat}-{index}"), "message.sent", json!({
+                                "status":"sent", "from":"person/fixture", "to":format!("agent/fixture-{seat}"),
+                                "content":"Fixture pending mail. ".repeat(16)
+                            })))?;
+                    }
+                    Ok::<_, St3Error>(())
+                }).await?;
+                signal_visible_change(&state);
+                Ok::<_, ApiError>(Json(json!({"seeded":per_seat})))
+            }
+        ))
         .route("/v1/doctor", get(doctor))
         .route(
             "/fixture/stats",
@@ -197,6 +216,53 @@ async fn many_streams() {
         }
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
+    if let Some(per_seat) = std::env::var_os("ST_MAILBOX_PROFILE_IDLE") {
+        let per_seat: usize = per_seat.to_str().unwrap().parse().unwrap();
+        assert!(per_seat > 0);
+        for seat in 0..SEATS {
+            let _: Value = client
+                .post("/fixture/seed", &json!({"seat":seat, "messages":per_seat}))
+                .await
+                .unwrap();
+        }
+        let mut ready = std::collections::HashSet::new();
+        while ready.len() < SEATS {
+            let (seat, received, _) = tokio::time::timeout(Duration::from_secs(120), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(received, Frame::Mailbox { messages } if messages.len() == per_seat) {
+                ready.insert(seat);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let before: Value = client.get("/fixture/stats").await.unwrap();
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let after: Value = client.get("/fixture/stats").await.unwrap();
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let daemon_cpu_ms = after["cpu_ms"].as_f64().unwrap() - before["cpu_ms"].as_f64().unwrap();
+        let doctor: Value = client.get("/v1/doctor").await.unwrap();
+        fs::write(
+            root.join("doctor.json"),
+            serde_json::to_vec_pretty(&doctor).unwrap(),
+        )
+        .unwrap();
+        let result = json!({"mode":"idle", "seats":SEATS, "streams":SEATS*2, "pending_messages_per_seat":per_seat,
+            "total_pending_messages":SEATS*per_seat, "message_content_bytes":"Fixture pending mail. ".repeat(16).len(),
+            "wall_ms":wall_ms, "daemon_cpu_ms":daemon_cpu_ms, "average_daemon_cores":daemon_cpu_ms/wall_ms,
+            "before":before["performance"], "after":after["performance"]});
+        fs::write(
+            root.join("idle.json"),
+            serde_json::to_vec_pretty(&result).unwrap(),
+        )
+        .unwrap();
+        println!("{result}");
+        for reader in readers {
+            reader.abort();
+        }
+        return;
+    }
     let before: Value = client.get("/fixture/stats").await.unwrap();
     let start = Instant::now();
     let mut delivery = Vec::new();

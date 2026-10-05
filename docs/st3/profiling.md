@@ -90,8 +90,11 @@ depending on their seat, message subjects or recipient. Local binding commits wa
 owner/component directly. This routing state is disposable and never replicated.
 
 Streams subscribe before their first read and retain the durable changed-since and fencing
-checks. A full safety read every three seconds recovers missing dependencies, missed notifications
-and ownership changes. There is no debounce. `task mailbox-wake-dispatch`,
+checks. A full safety read every five seconds with a randomized per-binding phase recovers missing dependencies, missed notifications
+and ownership changes. Initial dispatcher-cursor failures never replay from zero: they retry at
+the current head and resync subscribers once. Batch failures retain their cursor and retry every
+five seconds. A warning log and the `mailbox-wake-dispatcher` doctor check expose failures since
+startup and whether routing is currently degraded. There is no debounce. `task mailbox-wake-dispatch`,
 `task mailbox-change-check` and `task mailbox-snapshot` expose the routing, checking and full-read
 costs separately in doctor and profiling counters. Run the isolated many-stream comparison with
 `cargo test --release -p st3 --lib api::mailbox::profile::many_streams -- --ignored --exact --nocapture`;
@@ -157,8 +160,10 @@ malformed operation metadata, an operation conflict, and `incremental-error:CODE
 incremental chunks produce no fallback log. The target is the admitted index observed at entry;
 a full replay can also include claims admitted since that observation.
 
-## Targeted mailbox wake comparison (2026-10-05)
+## Initial targeted mailbox wake comparison (2026-10-05)
 
+This comparison measured the initial implementation at `d9bcabb9b619895a73809038f2e429d599a580cd`
+with its original three-second timer; the revised five-second timer is measured separately below.
 The isolated fixture used 128 invented seats, 256 Unix mailbox streams, a fresh WAL store,
 3,000 writes (100 targeted messages), and 32 owner replacements. Both builds used Nix Rust
 1.97.0 / LLVM 21.1.8, release settings and profiling. The baseline commit
@@ -201,3 +206,23 @@ Raw measurements, before/after performance snapshots, doctor task counters and b
 metadata: [baseline](profiles/targeted-mailbox-wakes-2026-10-05/baseline.json) and
 [targeted wakes](profiles/targeted-mailbox-wakes-2026-10-05/targeted-wakes.json).
 Reproduce with the ignored test above using `--release` on each version and the same fixture.
+
+## Reproduce a baseline without modifying main
+
+`scripts/profile-mailbox-wakes` copies the current test-only fixture into a disposable checkout
+of the requested ref. Production code comes from that ref; the added module is `cfg(test)` only.
+The script removes the checkout after the run and retains build identity, logs, store, doctor and
+CPU/latency evidence. Run it inside the pinned development shell with a new output directory:
+
+```sh
+nix develop --command scripts/profile-mailbox-wakes 0295286eb /tmp/mailbox-baseline
+nix develop --command scripts/profile-mailbox-wakes HEAD /tmp/mailbox-targeted
+nix develop --command scripts/profile-mailbox-wakes HEAD /tmp/mailbox-idle-100 --idle 100
+nix develop --command scripts/profile-mailbox-wakes HEAD /tmp/mailbox-idle-250 --idle 250
+```
+
+The idle mode first opens all 256 streams, then seeds 100 or 250 pending messages per seat, waits
+for every delivery stream to show its complete mailbox, and measures 60 seconds without graph
+writes. CPU covers the daemon process, including safety reads and heartbeats; setup and doctor
+are excluded. The payload is 352 bytes per message. Providers and the reconciler are absent.
+This is an explicit synthetic sizing probe, not an observed production unread distribution.

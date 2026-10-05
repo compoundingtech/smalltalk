@@ -5265,6 +5265,7 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         &crate::resource::github_usage_report(),
         client_now_ms(),
     ));
+    report.checks.push(reader_store.mailbox_wake_health());
     report.checks.push(descriptor_check());
     report.checks.push(reader_memory_check(
         reader_store.readers.usage(),

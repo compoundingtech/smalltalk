@@ -1,7 +1,11 @@
 //! Local, disposable routing of mailbox wakes. Durable claims remain the source of truth.
 //! One dispatcher follows the existing post-commit feed, instead of every stream querying it.
 use super::*;
+use crate::model::DoctorCheck;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::watch;
+
+const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Dependency {
@@ -19,6 +23,8 @@ struct Registry {
 #[derive(Default)]
 pub(crate) struct Wakes {
     registry: Mutex<Registry>,
+    failures: AtomicU64,
+    degraded: AtomicBool,
 }
 
 pub(crate) struct Subscription {
@@ -70,6 +76,24 @@ impl Wakes {
                 }
             }
         }
+    }
+
+    fn failure(&self, stage: &str, error: impl std::fmt::Display) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        self.degraded.store(true, Ordering::Relaxed);
+        tracing::warn!(stage, error = %error, "mailbox wake dispatcher failed; safety reads remain active; retrying in five seconds");
+    }
+
+    fn resync(&self) {
+        let keys = self
+            .registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .subscribers
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.notify(keys);
     }
 
     pub(crate) fn owner_changed(&self, subject: &str, component: &str) {
@@ -139,9 +163,16 @@ impl Store {
         // register this stream before its first durable read. No replay-to-live gap.
         let wakes = self.smalltalk.mailbox_wakes.get_or_init(|| {
             let events = events.subscribe();
-            let cursor = self.mailbox_wake_cursor().unwrap_or((0, 0));
+            let cursor = self.mailbox_wake_cursor();
             let weak = Arc::downgrade(self);
             let wakes = Arc::new(Wakes::default());
+            let cursor = match cursor {
+                Ok(cursor) => Some(cursor),
+                Err(error) => {
+                    wakes.failure("initialize", error);
+                    None
+                }
+            };
             let routed = wakes.clone();
             tokio::spawn(async move {
                 dispatch(weak, routed, events, cursor).await;
@@ -149,6 +180,32 @@ impl Store {
             wakes
         });
         wakes.subscribe(fence)
+    }
+
+    /// Local telemetry uses the existing doctor check shape; never claims or replicated state.
+    pub(crate) fn mailbox_wake_health(&self) -> DoctorCheck {
+        let (failures, degraded) = self
+            .smalltalk
+            .mailbox_wakes
+            .get()
+            .map_or((0, false), |wakes| {
+                (
+                    wakes.failures.load(Ordering::Relaxed),
+                    wakes.degraded.load(Ordering::Relaxed),
+                )
+            });
+        DoctorCheck {
+            name: "mailbox-wake-dispatcher".into(),
+            status: if degraded { "warn" } else { "pass" }.into(),
+            message: format!(
+                "{failures} failures since startup; {}; five-second safety reads remain active",
+                if degraded {
+                    "retrying; routing degraded"
+                } else {
+                    "routing healthy or not yet subscribed"
+                }
+            ),
+        }
     }
 
     fn mailbox_wake_cursor(&self) -> Result<(u64, u64)> {
@@ -218,32 +275,75 @@ async fn dispatch(
     store: std::sync::Weak<Store>,
     wakes: Arc<Wakes>,
     mut events: watch::Receiver<u64>,
-    mut cursor: (u64, u64),
+    mut cursor: Option<(u64, u64)>,
 ) {
+    let mut retrying = cursor.is_none();
+    let mut retry = tokio::time::interval_at(tokio::time::Instant::now() + RETRY, RETRY);
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        if events.changed().await.is_err() {
-            return;
+        tokio::select! {
+            result = events.changed(), if !retrying => {
+                if result.is_err() { return; }
+                events.borrow_and_update();
+            },
+            _ = retry.tick(), if retrying => {},
         }
-        events.borrow_and_update();
+        if cursor.is_none() {
+            let Some(store) = store.upgrade() else {
+                return;
+            };
+            match tokio::task::spawn_blocking(move || store.mailbox_wake_cursor()).await {
+                Ok(Ok(at)) => {
+                    // Start at the current head, never at zero. Re-read every subscriber once
+                    // to cover writes skipped while initial cursor acquisition was unavailable.
+                    cursor = Some(at);
+                    wakes.resync();
+                }
+                Ok(Err(error)) => {
+                    wakes.failure("initialize", error);
+                    continue;
+                }
+                Err(error) => {
+                    wakes.failure("initialize-worker", error);
+                    continue;
+                }
+            }
+        }
         loop {
             let Some(store) = store.upgrade() else {
                 return;
             };
+            let at = cursor.expect("cursor acquired before dispatch");
             let result = tokio::task::spawn_blocking(move || {
                 crate::profile::task("task mailbox-wake-dispatch", || {
-                    store.mailbox_wake_batch(cursor)
+                    store.mailbox_wake_batch(at)
                 })
             })
             .await;
-            let Ok(Ok((next, dependencies, more))) = result else {
-                // Keep the old cursor on failure. Streams' full safety reads still recover.
-                break;
-            };
-            wakes.notify(dependencies);
-            cursor = next;
-            if !more {
-                break;
+            match result {
+                Ok(Ok((next, dependencies, more))) => {
+                    wakes.notify(dependencies);
+                    cursor = Some(next);
+                    retrying = false;
+                    wakes.degraded.store(false, Ordering::Relaxed);
+                    if !more {
+                        break;
+                    }
+                }
+                Ok(Err(error)) => {
+                    wakes.failure("read", error);
+                    retrying = true;
+                    break;
+                }
+                Err(error) => {
+                    wakes.failure("worker", error);
+                    retrying = true;
+                    break;
+                }
             }
+        }
+        if retrying {
+            retry.reset_after(RETRY);
         }
     }
 }
@@ -439,5 +539,248 @@ mod tests {
             .unwrap();
         let (_, deps, _) = store.mailbox_wake_batch(next).unwrap();
         assert!(deps.contains(&Dependency::Subject("agent/quartz".into())));
+    }
+    fn sent(store: &Store, subject: &str, to: &str) {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "message.sent".into(),
+                actor: Some("person/fixture".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("person/fixture")),
+                    ("to".into(), json!(to)),
+                    ("content".into(), json!("Fixture note.")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn routing_covers_the_durable_changed_since_dependencies() {
+        for case in [
+            "seat declaration",
+            "recipient",
+            "legacy bare recipient",
+            "snapshot message",
+            "message declaration",
+            "local seat",
+            "owner",
+            "other owner component",
+            "unrelated mail",
+            "unrelated declaration",
+        ] {
+            let store = Store::open_memory("node").unwrap();
+            crate::mailbox::tests::ready(&store, "boot");
+            let fence = store
+                .bind_mailbox(&Fence::new("agent/eval.worker", "boot", "delivery"))
+                .unwrap();
+            // The snapshot subject is deliberately addressed elsewhere: this exercises the
+            // subject dependency independently of recipient routing.
+            sent(&store, "message/observed", "agent/other");
+            let messages = vec!["message/observed".into()];
+            let hub = Arc::new(Wakes::default());
+            let mut subscription = hub.subscribe(&fence);
+            subscription.messages(&messages);
+            let mark = store.mailbox_watermark(&fence).unwrap();
+            let cursor = store.mailbox_wake_cursor().unwrap();
+            match case {
+                "recipient" | "legacy bare recipient" => {
+                    sent(&store, "message/new", "agent/eval.worker");
+                    if case == "legacy bare recipient" {
+                        // Old replicated data can contain bare recipients; new inputs require references.
+                        store.connection.write().execute("UPDATE claims SET body=json_set(body,'$.fields.to','eval.worker') WHERE subject='message/new'", []).unwrap();
+                    }
+                }
+                "snapshot message" => {
+                    store
+                        .append_claim(&ClaimInput {
+                            subject: "message/observed".into(),
+                            kind: "message.staged".into(),
+                            actor: Some("agent/other".into()),
+                            fields: BTreeMap::from([
+                                ("status".into(), json!("staged")),
+                                ("recipient".into(), json!("agent/other")),
+                            ]),
+                            evidence: vec![],
+                            expected_subject: None,
+                            idempotency_key: None,
+                        })
+                        .unwrap();
+                }
+                "local seat" => {
+                    store.append_local_observations_for_test(&[ClaimInput {
+                        subject: "agent/eval.worker".into(),
+                        kind: "harness.telemetry".into(),
+                        actor: Some("agent/eval.worker".into()),
+                        fields: BTreeMap::from([
+                            ("driver".into(), json!("claude")),
+                            ("unit".into(), json!("hook")),
+                            ("incarnation_id".into(), json!("boot")),
+                            ("signals".into(), json!({})),
+                        ]),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    }]);
+                    assert_eq!(
+                        store.index().unwrap(),
+                        mark.index,
+                        "local branch must not move the graph index"
+                    );
+                }
+                "owner" | "other owner component" => {
+                    let component = if case == "owner" { "delivery" } else { "title" };
+                    store
+                        .bind_mailbox(&Fence::new("agent/eval.worker", "boot", component))
+                        .unwrap();
+                    hub.owner_changed("agent/eval.worker", component);
+                }
+                "unrelated mail" => sent(&store, "message/other", "agent/other"),
+                _ => {
+                    let (text, subject) = if case == "seat declaration" {
+                        (
+                            "agent \"eval.worker\" { workspace \"/tmp/fixture\"; harness \"codex\" {} }",
+                            "agent/eval.worker",
+                        )
+                    } else if case == "message declaration" {
+                        (
+                            "message \"declared\" { from \"person/fixture\"; to \"eval.worker\"; content \"Note.\"; }",
+                            "message/declared",
+                        )
+                    } else {
+                        (
+                            "message \"declared\" { from \"person/fixture\"; to \"other\"; content \"Note.\"; }",
+                            "message/declared",
+                        )
+                    };
+                    store
+                        .apply(
+                            &crate::graph::parse_intent(&format!("version 2\n{text}\n"), "fixture")
+                                .unwrap(),
+                            &BTreeMap::from([(subject.into(), vec![])]),
+                            "fixture",
+                        )
+                        .unwrap();
+                }
+            }
+            let (_, dependencies, _) = store.mailbox_wake_batch(cursor).unwrap();
+            hub.notify(dependencies);
+            let changed = store
+                .mailbox_changed_since(&fence, &mark, &messages)
+                .unwrap();
+            let routed = subscription.changed.has_changed().unwrap();
+            let relevant = !matches!(
+                case,
+                "unrelated mail" | "unrelated declaration" | "other owner component"
+            );
+            assert_eq!(routed, relevant, "{case}: dispatcher");
+            // changed-since deliberately treats every message declaration as potentially
+            // relevant. Routing can omit an unrelated declaration while retaining that
+            // conservative guard for the streams which actually depend on it.
+            assert_eq!(
+                changed,
+                relevant || case == "unrelated declaration",
+                "{case}: durable guard"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_initial_cursor_is_visible_and_recovers_without_zero_replay() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        sent(&store, "message/history", "agent/other");
+        store
+            .connection
+            .write()
+            .execute_batch("ALTER TABLE claims RENAME TO unavailable_claims")
+            .unwrap();
+        let events = watch::channel(0).0;
+        let mut subscription =
+            store.subscribe_mailbox(&Fence::new("agent/quartz", "boot", "delivery"), &events);
+        assert_eq!(subscription.wakes.failures.load(Ordering::Relaxed), 1);
+        assert_eq!(store.mailbox_wake_health().status, "warn");
+        store
+            .connection
+            .write()
+            .execute_batch("ALTER TABLE unavailable_claims RENAME TO claims")
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            subscription.changed.changed(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Initial-cursor recovery resyncs subscribers once at the current head rather than
+        // enumerating historical rows. Future writes still route normally.
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while subscription.wakes.degraded.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        subscription.changed.borrow_and_update();
+        sent(&store, "message/new", "agent/quartz");
+        events.send_modify(|generation| *generation += 1);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            subscription.changed.changed(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(store.mailbox_wake_health().status, "pass");
+        assert_eq!(subscription.wakes.failures.load(Ordering::Relaxed), 1);
+    }
+    #[tokio::test]
+    async fn failed_dispatch_retains_its_cursor_and_retries_without_another_write_wake() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let events = watch::channel(0).0;
+        let mut subscription =
+            store.subscribe_mailbox(&Fence::new("agent/quartz", "boot", "delivery"), &events);
+        store
+            .connection
+            .write()
+            .execute_batch("ALTER TABLE claims RENAME TO unavailable_claims")
+            .unwrap();
+        events.send_modify(|generation| *generation += 1);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !subscription.wakes.degraded.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.mailbox_wake_health().status, "warn");
+        assert_eq!(subscription.wakes.failures.load(Ordering::Relaxed), 1);
+        store
+            .connection
+            .write()
+            .execute_batch("ALTER TABLE unavailable_claims RENAME TO claims")
+            .unwrap();
+        sent(&store, "message/retry", "agent/quartz");
+        // Deliberately omit the global notification: recovery must scan from the retained
+        // cursor after its retry timer, rather than starting from the new head or zero.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            subscription.changed.changed(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while subscription.wakes.degraded.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.mailbox_wake_health().status, "pass");
+        assert_eq!(subscription.wakes.failures.load(Ordering::Relaxed), 1);
     }
 }
