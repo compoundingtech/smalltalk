@@ -582,13 +582,22 @@ mod tests {
         }
     }
     async fn read(state: &AppState, person: &str, query: SearchQuery) -> Result<Value, ApiError> {
-        search(
-            State(state.clone()),
-            Extension(ClientSession::local(Some(person)).unwrap()),
-            Query(query),
-        )
-        .await
-        .map(|Json(value)| value)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = search(
+                State(state.clone()),
+                Extension(ClientSession::local(Some(person)).unwrap()),
+                Query(query.clone()),
+            )
+            .await
+            .map(|Json(value)| value);
+            match result {
+                Err(error) if error.code == "index-building" && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                result => return result,
+            }
+        }
     }
     async fn rebuild(state: &AppState, person: &str) {
         let session = ClientSession::local(Some(person)).unwrap();
