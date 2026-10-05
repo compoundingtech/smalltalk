@@ -748,6 +748,29 @@ export const AgentMessageEstimate = /*#__PURE__*/ (() => Schema.Struct({
 export type AgentMessageEstimate = typeof AgentMessageEstimate.Type
 export type AgentMessageEstimateEncoded = typeof AgentMessageEstimate.Encoded
 
+export const HarnessPlanSnapshot = /*#__PURE__*/ (() => Schema.Struct({
+  "harness": Schema.String,
+  "incarnation_id": Schema.String,
+  "observed_at": Timestamp,
+  "phases": Schema.Array(HarnessPhase),
+  "session_id": Schema.String,
+  "source_op": Schema.String,
+  "totals": HarnessTodoTotals,
+  "truncated": Schema.Boolean,
+  "version": Schema.Literal(1)
+}).annotate({ identifier: "HarnessPlanSnapshot" }))()
+export type HarnessPlanSnapshot = typeof HarnessPlanSnapshot.Type
+export type HarnessPlanSnapshotEncoded = typeof HarnessPlanSnapshot.Encoded
+
+export const AgentPlan = /*#__PURE__*/ (() => Schema.Struct({
+  "accepted_at": Timestamp,
+  "claim_id": Schema.String,
+  "snapshot": HarnessPlanSnapshot,
+  "stale": Schema.Boolean
+}).annotate({ identifier: "AgentPlan" }))()
+export type AgentPlan = typeof AgentPlan.Type
+export type AgentPlanEncoded = typeof AgentPlan.Encoded
+
 export const AgentQueueMove = /*#__PURE__*/ (() => Schema.Struct({
   "actor_id": Schema.OptionFromNullOr(Id),
   "anchor_run_id": Schema.OptionFromNullOr(Id),
@@ -983,12 +1006,12 @@ export const ClientConnections = /*#__PURE__*/ (() => Schema.Struct({
 export type ClientConnections = typeof ClientConnections.Type
 export type ClientConnectionsEncoded = typeof ClientConnections.Encoded
 
-export const CollectionName = /*#__PURE__*/ (() => Schema.Literals(["missions","attention","agents","work","glasses"]).annotate({ identifier: "CollectionName" }))()
+export const CollectionName = /*#__PURE__*/ (() => Schema.Literals(["missions","attention","agents","work","glasses","harness"]).annotate({ identifier: "CollectionName" }))()
 export type CollectionName = typeof CollectionName.Type
 export type CollectionNameEncoded = typeof CollectionName.Encoded
 
 export const CollectionCommand = /*#__PURE__*/ (() => Schema.Union([
-  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": CollectionName, "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
+  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "agent": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE), "collection": CollectionName, "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
   Schema.Struct({ "capability": Schema.String, "collection": Schema.Literal("terminal"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "incarnation": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "kind": Schema.Literal("subscribe"), "terminal": Id }),
   Schema.Struct({ "collection": Schema.Literal("conversation"), "conversation": Id, "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe") }),
   Schema.Struct({ "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("unsubscribe") })
@@ -1044,6 +1067,26 @@ export const Glass = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "Glass" }))()
 export type Glass = typeof Glass.Type
 export type GlassEncoded = typeof Glass.Encoded
+
+export const HarnessState = /*#__PURE__*/ (() => Schema.Struct({
+  "agent_id": AgentId,
+  "driver": Schema.OptionFromNullOr(Schema.String),
+  "id": Id,
+  "incarnation_id": Schema.OptionFromNullOr(Schema.String),
+  "kind": Schema.Literal("harness-state"),
+  "operational": optionalKey(Operational),
+  "plan": Schema.OptionFromNullOr(AgentPlan),
+  "revision": Revision,
+  "schema": Schema.Literal("harness-state.v1"),
+  "session_id": Schema.OptionFromNullOr(Schema.String),
+  "state": Schema.OptionFromNullOr(Schema.String),
+  "subagents": Schema.Array(AgentSubagent),
+  "todo": Schema.OptionFromNullOr(AgentTodo),
+  "updated_at": Timestamp,
+  "usage": Schema.OptionFromNullOr(UsageSummary)
+}).annotate({ identifier: "HarnessState" }))()
+export type HarnessState = typeof HarnessState.Type
+export type HarnessStateEncoded = typeof HarnessState.Encoded
 
 export const History = /*#__PURE__*/ (() => Schema.Struct({
   "event_type": Schema.String,
@@ -1564,7 +1607,7 @@ export type SubscriptionEncoded = typeof Subscription.Encoded
 
 export const UnknownResource = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
-  "kind": unknownCase(["attention","message","launch","launch-variant","launch-decision","launch-approval","mission","work","agent","runtime","observer","subscription","lane","machine","device","operation","history","session","glass","owned-set"]),
+  "kind": unknownCase(["attention","message","launch","launch-variant","launch-decision","launch-approval","mission","work","agent","harness-state","runtime","observer","subscription","lane","machine","device","operation","history","session","glass","owned-set"]),
   "operational": optionalKey(Operational),
   "revision": Revision,
   "updated_at": Timestamp
@@ -1641,6 +1684,7 @@ export const Resource = /*#__PURE__*/ (() => Schema.Union([
   Mission,
   Work,
   Agent,
+  HarnessState,
   Runtime,
   Observer,
   Subscription,
