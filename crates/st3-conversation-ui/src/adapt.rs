@@ -1,7 +1,9 @@
 use crate::{Body, Entry, MailImage, ToolState, clean_message_text};
 use serde_json::Value;
 use st3_client::{TimelineBody, TimelineEntry, TimelineRole, TimelineToolStatus};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 /// Why a conversation cannot be shown whole, when st could not read the harness's transcript.
 /// st then sends only the Small Talk around it, which reads as a conversation with the agent's
@@ -20,6 +22,7 @@ pub fn unreadable_transcript(timeline: &[TimelineEntry]) -> Option<String> {
         .message
         .strip_prefix("transcript not bound: ")
         .unwrap_or(&error.message);
+    let reason = bounded_preview(reason, 256);
     Some(
         match error.details.get("transcript").and_then(Value::as_str) {
             Some(path) => {
@@ -58,7 +61,7 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
     // A Small Talk message is two entries: who wrote to whom, then what they wrote. A
     // harness transcript heads its own turns with message entries too; only a graph message,
     // `message/…`, is Small Talk.
-    let mut mail: Option<&st3_client::TimelineMessageBody> = None;
+    let mut mail: Option<(&TimelineEntry, &st3_client::TimelineMessageBody)> = None;
     // A harness that wraps a delivery in its own prompt repeats mail the stream may already show.
     let shown = timeline
         .iter()
@@ -69,44 +72,28 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    for (index, entry) in timeline.iter().enumerate() {
+    for entry in timeline {
         let at = clock(&entry.timestamp);
         if let TimelineBody::Message(message) = &entry.body {
-            mail = message
-                .message_id
-                .starts_with("message/")
-                .then_some(message);
-            if !message.attachments.is_empty()
-                && !timeline
-                    .get(index + 1)
-                    .is_some_and(|next| matches!(next.body, TimelineBody::Content(_)))
-            {
-                stamped.push((
-                    entry.timestamp.clone(),
-                    Entry {
-                        id: message.message_id.clone(),
-                        at,
-                        body: Body::Event(format!(
-                            "media from {}: {}",
-                            name(message.from.as_deref().unwrap_or("Small Talk")),
-                            message
-                                .attachments
-                                .iter()
-                                .map(|attachment| {
-                                    format!("{} · {}", attachment.media_type, attachment.sha256)
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )),
-                    },
-                ));
+            if let Some((pending, message)) = mail.take() {
+                append_unpaired_media(&mut stamped, pending, message, &name);
+            }
+            if message.message_id.starts_with("message/") {
+                mail = Some((entry, message));
+            } else {
+                append_unpaired_media(&mut stamped, entry, message, &name);
             }
             continue;
         }
-        if let (Some(message), TimelineBody::Content(content)) = (mail.take(), &entry.body) {
+        if let TimelineBody::Content(content) = &entry.body
+            && let Some((_, message)) = mail.take()
+        {
             let mut body = content_text(content);
             for attachment in &message.attachments {
-                if !attachment.media_type.starts_with("image/") {
+                if !attachment.media_type.starts_with("image/")
+                    && content.attachment_id.as_deref() != Some(attachment.blob.as_str())
+                    && content.attachment_id.as_deref() != Some(attachment.sha256.as_str())
+                {
                     if !body.is_empty() {
                         body.push('\n');
                     }
@@ -298,7 +285,10 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     })
                 }
                 "transcript-not-bound" => {
-                    Body::Event(format!("transcript unavailable: {}", error.message))
+                    Body::Event(format!(
+                        "transcript unavailable: {}",
+                        bounded_preview(&error.message, 256)
+                    ))
                 }
                 "native-delivery-recovered" => {
                     delivery.insert(entry.id.clone(), true);
@@ -306,9 +296,9 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                 }
                 // A warning is st noting something it is handling, not a failure.
                 _ if error.details.get("severity").and_then(Value::as_str) == Some("warning") => {
-                    Body::Event(error.message.clone())
+                    Body::Event(bounded_preview(&error.message, 256).into_owned())
                 }
-                _ => Body::Event(format!("error: {}", error.message)),
+                _ => Body::Event(format!("error: {}", bounded_preview(&error.message, 256))),
             },
             (_, TimelineBody::Status(status)) => Body::Event(format!(
                 "status: {}{}",
@@ -327,10 +317,7 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     .map(|detail| format!(" · {detail}"))
                     .unwrap_or_default()
             )),
-            (_, TimelineBody::Usage(usage)) => Body::Event(format!(
-                "usage: {}",
-                serde_json::to_string(usage).expect("timeline usage is serializable")
-            )),
+            (_, TimelineBody::Usage(usage)) => Body::Event(usage_line(usage)),
             (_, TimelineBody::Redaction(redaction)) => Body::Event(format!(
                 "content withheld: {} ({} bytes{})",
                 redaction.reason,
@@ -352,9 +339,27 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                 }
             )),
             (_, TimelineBody::Unknown { entry_type, .. }) => Body::Event(format!(
-                "unsupported timeline entry: {entry_type} (content not displayed)"
+                "unsupported timeline entry: {} (content not displayed)",
+                bounded_preview(entry_type, 64)
             )),
-            (_, TimelineBody::Content(content)) => Body::Event(content_text(content)),
+            (_, TimelineBody::Content(content)) => {
+                // Unknown roles do not authorize interpreting their payload as conversation text.
+                if content.attachment_id.is_some() || content.media_type != "text/plain" {
+                    Body::Event(format!(
+                        "[media: {} · {}]",
+                        content.media_type,
+                        content.attachment_id.as_deref().unwrap_or("reference unavailable")
+                    ))
+                } else if content
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty())
+                {
+                    Body::Event("content not displayed (unknown role)".into())
+                } else {
+                    continue;
+                }
+            }
             (_, TimelineBody::Message(_)) => unreachable!("messages are handled above"),
         };
         stamped.push((
@@ -366,6 +371,9 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
             },
         ));
     }
+    if let Some((pending, message)) = mail {
+        append_unpaired_media(&mut stamped, pending, message, &name);
+    }
     stamped.sort_by(|a, b| a.0.cmp(&b.0));
     for (_, entry) in &mut stamped {
         if let Body::Mail {
@@ -376,6 +384,77 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
         }
     }
     fold_events(stamped.into_iter().map(|(_, entry)| entry), &delivery)
+}
+
+/// Flush refs only after the next message or end proves that no content paired with this envelope.
+fn append_unpaired_media(
+    stamped: &mut Vec<(String, Entry)>,
+    entry: &TimelineEntry,
+    message: &st3_client::TimelineMessageBody,
+    name: &impl Fn(&str) -> String,
+) {
+    if message.attachments.is_empty() {
+        return;
+    }
+    let mut text = format!(
+        "media from {}: ",
+        name(message.from.as_deref().unwrap_or("Small Talk"))
+    );
+    for (index, attachment) in message.attachments.iter().enumerate() {
+        if index != 0 {
+            text.push_str(", ");
+        }
+        write!(text, "{} · {}", attachment.media_type, attachment.sha256).unwrap();
+    }
+    stamped.push((
+        entry.timestamp.clone(),
+        Entry {
+            id: message.message_id.clone(),
+            at: clock(&entry.timestamp),
+            body: Body::Event(text),
+        },
+    ));
+}
+
+fn usage_line(usage: &st3_client::TimelineUsageBody) -> String {
+    let semantics = match usage.semantics {
+        st3_client::TimelineUsageSemantics::Response => "response",
+        st3_client::TimelineUsageSemantics::SessionCumulative => "session cumulative",
+        st3_client::TimelineUsageSemantics::ContextOccupancy => "context occupancy",
+        st3_client::TimelineUsageSemantics::Unknown => "unknown",
+    };
+    let mut line = format!("usage: {semantics}");
+    for (label, value) in [
+        ("input", usage.input_tokens),
+        ("output", usage.output_tokens),
+        ("cached", usage.cached_tokens),
+        ("cache write", usage.cache_write_tokens),
+        ("total", usage.total_tokens),
+        ("context used", usage.context_used_tokens),
+        ("context window", usage.context_window_tokens),
+    ] {
+        if let Some(value) = value {
+            write!(line, " · {label} {value}").unwrap();
+        }
+    }
+    if let Some(cost) = usage.cost {
+        if let Some(currency) = &usage.currency {
+            write!(line, " · cost {currency} {cost}").unwrap();
+        } else {
+            write!(line, " · cost {cost} (currency unknown)").unwrap();
+        }
+    }
+    line
+}
+
+fn bounded_preview(text: &str, max: usize) -> Cow<'_, str> {
+    let Some((end, _)) = text.char_indices().nth(max) else {
+        return Cow::Borrowed(text);
+    };
+    let mut preview = String::with_capacity(end + '…'.len_utf8());
+    preview.push_str(&text[..end]);
+    preview.push('…');
+    Cow::Owned(preview)
 }
 
 /// Preserve authorized attachment references without fetching payloads or decoding unknown bodies.

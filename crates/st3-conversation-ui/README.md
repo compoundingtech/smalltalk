@@ -11,6 +11,11 @@ as event notices. Unsupported bodies are not dumped. Attachment-only native cont
 its media type and authorized reference without fetching bytes; graph mail keeps image refs
 and labels other media. An unbound transcript is unavailable, not evidence that the harness
 has done nothing. Projection availability warnings keep their supplied explanation.
+Usage notices show semantics, supplied token counts and supplied cost, omitting nulls and
+attribution IDs. Unknown-role content does not expose its text; empty plain content is skipped,
+and media references remain visible. Diagnostic messages and unsupported type labels are
+bounded Unicode-safe previews. Mail envelopes retain their next content across intervening
+status events and emit unpaired media refs only at the next message or end of the window.
 
 ```toml
 [dependencies]

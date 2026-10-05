@@ -622,8 +622,6 @@ fn exposed_timeline_variants_and_media_are_visible_without_unknown_payloads() {
     for visible in [
         "waiting",
         "approval",
-        "input_tokens",
-        "0.25",
         "credential",
         "42",
         "window",
@@ -810,4 +808,135 @@ fn pending_binding_preserves_authorized_activity_without_claiming_an_empty_harne
     };
     assert!(availability.contains("unavailable"));
     assert!(!availability.contains("nothing"));
+}
+
+fn review_entry(kind: &str, role: &str, body: serde_json::Value) -> st3_client::TimelineEntry {
+    serde_json::from_value(serde_json::json!({
+        "id":kind,"sequence":1,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+        "role":role,"final":true,"type":kind,"body":body
+    }))
+    .unwrap()
+}
+
+#[test]
+fn review_usage_is_compact_and_preserves_supplied_tokens_cost_and_semantics() {
+    for (body, expected) in [
+        (serde_json::json!({"semantics":"response","driver":"omp","input_tokens":12,"output_tokens":5,"cached_tokens":3,"cache_write_tokens":2,"total_tokens":22,"cost":0.25,"currency":"USD"}),
+            "usage: response · input 12 · output 5 · cached 3 · cache write 2 · total 22 · cost USD 0.25"),
+        (serde_json::json!({"semantics":"context_occupancy","driver":"omp","context_used_tokens":0,"context_window_tokens":100}),
+            "usage: context occupancy · context used 0 · context window 100"),
+        (serde_json::json!({"semantics":"session_cumulative","driver":"omp","cost":0}),
+            "usage: session cumulative · cost 0 (currency unknown)"),
+        (serde_json::json!({"semantics":"future","driver":"omp"}),
+            "usage: unknown"),
+    ] {
+        let mut body = body;
+        body["attribution"] = serde_json::json!({"agent_id":"ATTRIBUTION_SENTINEL","mission_run_id":"MISSION_SENTINEL","generation_id":null,"step_id":null});
+        let rendered = adapt::conversation(&[review_entry("usage", "assistant", body)], &Default::default());
+        assert!(matches!(&rendered[..], [Entry { body: Body::Event(line), .. }] if line == expected), "{rendered:?}");
+    }
+}
+
+#[test]
+fn review_unknown_role_content_has_no_blank_event_or_unrecognized_payload() {
+    for text in [None, Some(""), Some(" \n\t")] {
+        let entry = review_entry("content", "future-role", serde_json::json!({
+            "media_type":"text/plain","text":text
+        }));
+        assert!(adapt::conversation(&[entry], &Default::default()).is_empty());
+    }
+    let entry = review_entry("content", "future-role", serde_json::json!({
+        "media_type":"image/png","text":"UNRECOGNIZED_PAYLOAD","attachment_id":"attachment/safe"
+    }));
+    let rendered = adapt::conversation(&[entry], &Default::default());
+    let display = serde_json::to_string(&rendered).unwrap();
+    assert!(display.contains("attachment/safe"));
+    assert!(!display.contains("UNRECOGNIZED_PAYLOAD"));
+    let entry = review_entry("content", "future-role", serde_json::json!({
+        "media_type":"text/plain","text":"UNRECOGNIZED_PAYLOAD"
+    }));
+    let rendered = adapt::conversation(&[entry], &Default::default());
+    let display = serde_json::to_string(&rendered).unwrap();
+    assert!(display.contains("content not displayed"));
+    assert!(!display.contains("UNRECOGNIZED_PAYLOAD"));
+}
+
+#[test]
+fn review_delayed_mail_content_contains_each_media_ref_once() {
+    let message = review_entry("message", "user", serde_json::json!({
+        "message_id":"message/media","from":"person/ada","to":"agent/a",
+        "attachments":[{"blob":"blob/hash","origin":"host/test","sha256":"hash","media_type":"application/pdf","size":12}]
+    }));
+    let status = review_entry("status", "system", serde_json::json!({"status":"running"}));
+    for attachment_id in [None, Some("blob/hash"), Some("hash")] {
+        let content = review_entry("content", "user", serde_json::json!({
+            "media_type":"application/pdf","text":"Document attached","attachment_id":attachment_id
+        }));
+        let rendered = adapt::conversation(
+            &[message.clone(), status.clone(), content],
+            &Default::default(),
+        );
+        let mail = rendered
+            .iter()
+            .find_map(|entry| match &entry.body {
+                Body::Mail { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("delayed content stays associated with its mail envelope");
+        assert!(mail.contains("Document attached") && mail.contains("application/pdf"));
+        assert_eq!(
+            serde_json::to_string(&rendered).unwrap().matches("hash").count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn review_unknown_type_and_diagnostics_are_bounded_on_unicode_boundaries() {
+    let unknown = review_entry(&"界".repeat(1000), "system", serde_json::json!({"secret":"SENTINEL"}));
+    let rendered = adapt::conversation(&[unknown], &Default::default());
+    assert!(matches!(&rendered[0].body, Body::Event(line)
+        if line.contains('…') && line.matches('界').count() == 64));
+    for (code, details) in [
+        ("transcript-not-bound", serde_json::json!({"not_yet":true})),
+        ("transcript-not-bound", serde_json::json!({})),
+        ("other", serde_json::json!({"severity":"warning"})),
+        ("other", serde_json::json!({})),
+    ] {
+        let entry = review_entry("error", "system", serde_json::json!({
+            "code":code,"message":"界".repeat(1000),"retryable":true,"details":details
+        }));
+        let rendered = adapt::conversation(std::slice::from_ref(&entry), &Default::default());
+        assert!(matches!(&rendered[0].body, Body::Event(line)
+            if line.contains('…') && line.matches('界').count() == 256));
+        if let Some(unavailable) = adapt::unreadable_transcript(&[entry]) {
+            assert!(unavailable.contains('…') && unavailable.chars().count() < 300);
+        }
+    }
+    for message in ["界".repeat(256), "line one\nline two".into()] {
+        let entry = review_entry("error", "system", serde_json::json!({
+            "code":"other","message":message,"retryable":true,"details":{"severity":"warning"}
+        }));
+        let rendered = adapt::conversation(&[entry], &Default::default());
+        assert!(matches!(&rendered[0].body, Body::Event(line) if line == &message));
+    }
+}
+
+#[test]
+fn review_unpaired_mail_refs_do_not_leak_into_the_next_envelope() {
+    let first = review_entry("message", "user", serde_json::json!({
+        "message_id":"message/first","from":"person/ada","to":"agent/a",
+        "attachments":[{"blob":"blob/old","origin":"host/test","sha256":"old","media_type":"application/pdf","size":12}]
+    }));
+    let second = review_entry("message", "user", serde_json::json!({
+        "message_id":"message/second","from":"person/ada","to":"agent/a"
+    }));
+    let content = review_entry("content", "user", serde_json::json!({
+        "media_type":"text/plain","text":"Second message"
+    }));
+    let rendered = adapt::conversation(&[first, second, content], &Default::default());
+    assert!(matches!(&rendered[..], [
+        Entry { id: first, body: Body::Event(refs), .. },
+        Entry { id: second, body: Body::Mail { body, .. }, .. }
+    ] if first == "message/first" && refs.contains("application/pdf") && second == "message/second" && body == "Second message"), "{rendered:?}");
 }
