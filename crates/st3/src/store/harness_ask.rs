@@ -41,7 +41,7 @@ fn validate(tx: &Connection, parameters: &AskParameters) -> Result<bool, St3Erro
         let custom = answer.custom_input.as_deref();
         if answer.id != question.id || answer.selected_options.iter().any(|label| !question.options.iter().any(|option| &option.label == label))
             || answer.selected_options.iter().enumerate().any(|(index, label)| answer.selected_options[..index].contains(label))
-            || custom.is_some_and(|value| value.trim().is_empty() || value.len() > 64 * 1024 || value.chars().any(|ch| ch.is_control() && ch != '\n' && ch != '\t'))
+            || custom.is_some_and(|value| value.trim().is_empty() || value.len() > 64 * 1024 || value.chars().any(|ch| ch.is_control() && ch != '\n'))
             || (!question.multi.unwrap_or(false) && answer.selected_options.len() + usize::from(custom.is_some()) != 1) {
             return Err(St3Error::new("invalid-harness-answers", "answers must match question IDs, choices, cardinality, and safe nonempty custom text"));
         }
@@ -198,6 +198,11 @@ mod tests {
         assert_eq!(store.reserve_harness_ask(&bad).unwrap_err().code, "invalid-harness-answers");
         bad.parameters.answers = good.parameters.answers.clone(); bad.parameters.answers[0].selected_options.push("A".into());
         assert_eq!(store.reserve_harness_ask(&bad).unwrap_err().code, "invalid-harness-answers");
+        for control in ['\t', '\r', '\u{1b}', '\u{85}'] {
+            bad.parameters.answers = good.parameters.answers.clone();
+            bad.parameters.answers[1].custom_input = Some(format!("before{control}after"));
+            assert_eq!(store.reserve_harness_ask(&bad).unwrap_err().code, "invalid-harness-answers");
+        }
         state.ask_supported = false; state.ask_reason = Some("native-ask-edited-in-terminal".into());
         store.observe_harness_control(&state, &fence).unwrap();
         assert_eq!(store.reserve_harness_ask(&good).unwrap_err().code, "unsupported-harness-ask");
