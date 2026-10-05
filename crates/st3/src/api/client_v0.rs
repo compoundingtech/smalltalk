@@ -12288,7 +12288,7 @@ mission "example/zero-run" state="ready" {
         assert!(external.process.is_none());
 
         let mut state = test_state_named(root.path(), "import-test");
-        state.native_session_home = Some(home);
+        state.native_session_home = Some(home.clone());
         let session = ClientSession::local(Some("person/tester")).unwrap();
         let request = ActionRequest {
             api_version: CLIENT_API_VERSION.into(),
@@ -12357,6 +12357,25 @@ mission "example/zero-run" state="ready" {
             .expect("the imported durable seat is declared");
         assert_eq!(imported.kind, "agent");
         assert!(imported.owner_run.is_none());
+        let member = imported.member.as_ref().unwrap();
+        assert_eq!(
+            member.environment[crate::suspension::RESUME_ENV],
+            "native-import-test"
+        );
+        assert_eq!(
+            member.environment["CODEX_HOME"],
+            std::fs::canonicalize(home.join(".codex"))
+                .unwrap()
+                .to_string_lossy()
+        );
+        let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+            panic!("the imported seat needs a typed native launch");
+        };
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg == "resume" || arg == "native-import-test")
+        );
         let session_file = state
             .store
             .latest_claim(&affected[1], Some("harness.session-file"))

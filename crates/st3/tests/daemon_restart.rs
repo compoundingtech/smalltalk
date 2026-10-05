@@ -473,6 +473,15 @@ time.sleep(300)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn title_failures_use_the_bound_pty_name_and_a_rate_limited_driver_log() {
+    title_failure(Some("cedar-pty-7f3a"), "cedar-pty-7f3a").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn title_fallback_converts_a_slash_seat_id_to_its_dot_pty_id() {
+    title_failure(None, "grove.title-cedar").await;
+}
+
+async fn title_failure(pty_session: Option<&str>, expected_session: &str) {
     use std::os::unix::fs::PermissionsExt as _;
 
     let root = tempfile::tempdir().unwrap();
@@ -495,11 +504,14 @@ async fn title_failures_use_the_bound_pty_name_and_a_rate_limited_driver_log() {
         &std::env::var_os("PATH").unwrap_or_default(),
     )))
     .unwrap();
+    command.env_remove("PTY_SESSION");
+    if let Some(session) = pty_session {
+        command.env("PTY_SESSION", session);
+    }
     let mut driver = TestSeat(Some(
         command
             .env("PATH", path)
             .env("ST_AGENT", seat)
-            .env("PTY_SESSION", "cedar-pty-7f3a")
             .env("ST3_MAILBOX_TRANSPORT", "push")
             .args(["driver", "claude", "--subject", seat, "--", "sleep", "300"])
             .stdin(Stdio::null())
@@ -537,7 +549,7 @@ async fn title_failures_use_the_bound_pty_name_and_a_rate_limited_driver_log() {
     let calls = std::fs::read_to_string(arguments).unwrap();
     for call in calls.lines().collect::<Vec<_>>().chunks_exact(3) {
         assert_eq!(call[0], "rename");
-        assert_eq!(call[1], "cedar-pty-7f3a", "{calls}");
+        assert_eq!(call[1], expected_session, "{calls}");
     }
     let log = driver_log(root);
     assert_eq!(
