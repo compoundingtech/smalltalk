@@ -10,35 +10,48 @@ Choose one route. If you already use Nix, go straight to [With Nix](#with-nix).
 
 ### Prebuilt release
 
-Use a terminal running Bash or Zsh. The prebuilt tools support Linux x86_64 with glibc 2.35+ (Ubuntu 22.04+), and Apple Silicon with macOS 15+; you need `curl` and `tar`, plus Python 3 on macOS. On a fresh Ubuntu machine, install the prerequisites:
+Use a terminal running Bash or Zsh. Choose the script for your machine.
+
+#### Linux x86_64
+
+The prebuilt tools need glibc 2.35+ (Ubuntu 22.04+) and `curl` and `tar`. On a fresh Ubuntu machine, install the prerequisites:
 
 ```sh
 sudo apt-get update
 sudo apt-get install -y curl ca-certificates git
 ```
 
-**On macOS — not yet verified on a fresh Mac:** Python 3 is required. The source installer (`scripts/install`) and extracted release installer put `st3` and `stui` inside `~/Applications/SmallTalk.app`, with links in your bin directory. macOS ties permissions, such as the microphone for stui's voice mode, to this stable app identity so grants can survive updates. Without a signing identity, the app is ad-hoc signed and macOS may ask again after each update. An optional Developer ID setting avoids that repeated approval; configure it **before installing**, using [macOS signing](st3/macos-installation.md).
-
-The optional voice helper, `StListen.app`, needs Xcode with the macOS 26 SDK to build. You can use st without it; voice mode says when the helper is missing.
-
-Download the latest release into a new directory:
+Download, verify, and install the latest release:
 
 ```sh
 mkdir -p ~/smalltalk-install
 cd ~/smalltalk-install
-case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64) archive=smalltalk-x86_64-unknown-linux-gnu.tar.gz ;;
-  Darwin-arm64) archive=smalltalk-aarch64-apple-darwin.tar.gz ;;
-  *) echo 'Use the Nix installation below for this platform'; exit 1 ;;
-esac
+archive=smalltalk-x86_64-unknown-linux-gnu.tar.gz
 release=https://github.com/compoundingtech/smalltalk/releases/latest/download
 curl -fLO "$release/$archive"
 curl -fLO "$release/$archive.sha256"
-if command -v sha256sum >/dev/null; then
-  sha256sum -c "$archive.sha256"
-else
-  shasum -a 256 -c "$archive.sha256"
-fi
+sha256sum -c "$archive.sha256"
+tar -xzf "$archive"
+"./${archive%.tar.gz}/install.sh" --bin-dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+#### macOS Apple Silicon
+
+**Not yet verified on a fresh Mac:** the prebuilt tools need macOS 15+, `curl`, `tar`, and Python 3. The source installer (`scripts/install`) and extracted release installer put `st3` and `stui` inside `~/Applications/SmallTalk.app`, with links in your bin directory. macOS ties permissions, such as the microphone for stui's voice mode, to this stable app identity so grants can survive updates. Without a signing identity, the app is ad-hoc signed and macOS may ask again after each update. An optional Developer ID setting avoids that repeated approval; configure it **before installing**, using [macOS signing](st3/macos-installation.md).
+
+The optional voice helper, `StListen.app`, needs Xcode with the macOS 26 SDK to build. You can use st without it; voice mode says when the helper is missing.
+
+Download, verify, and install the latest release:
+
+```sh
+mkdir -p ~/smalltalk-install
+cd ~/smalltalk-install
+archive=smalltalk-aarch64-apple-darwin.tar.gz
+release=https://github.com/compoundingtech/smalltalk/releases/latest/download
+curl -fLO "$release/$archive"
+curl -fLO "$release/$archive.sha256"
+shasum -a 256 -c "$archive.sha256"
 tar -xzf "$archive"
 "./${archive%.tar.gz}/install.sh" --bin-dir "$HOME/.local/bin"
 export PATH="$HOME/.local/bin:$PATH"
@@ -75,7 +88,7 @@ The previous generation builds separately as `.#st2`; install it explicitly with
 
 ## 2. Prepare your workspace
 
-A seat uses a separate coding tool and its account. This walkthrough assumes you already installed and logged in to [Claude Code](https://code.claude.com/docs/en/setup) as the OS user who will run `st`. Create the example workspace:
+This walkthrough assumes you already installed and logged in to [Claude Code](https://code.claude.com/docs/en/setup) as the OS user who will run `st`. `~/st/garden` is just the test area for these examples; put it anywhere you like:
 
 ```sh
 mkdir -p ~/st/garden
@@ -83,7 +96,7 @@ cd ~/st/garden
 git init
 ```
 
-Install Smalltalk's Claude message channel (it may ask for your administrator password). Finish any workspace trust prompt when you attach to the seat in step 4:
+Install Smalltalk's Claude message channel (it may ask for your administrator password):
 
 ```sh
 st claude-channel install
@@ -118,9 +131,23 @@ st service permissions
 
 `doctor` should report a reachable daemon and `pty`. A machine with no fleet configured is healthy. Warnings about optional build tools, GitHub login, or Linux IO priority do not block this walkthrough. Fix any failed check before continuing; [daemon setup](#daemon-details) has the details.
 
-## 4. Declare your first seat
+## 4. Start an agent and attach
 
-A seat declares the agent's workspace and harness. Save this KDL file in the workspace you just trusted:
+From your test workspace, start an agent and open its terminal in one command:
+
+```sh
+st agents new garden/explorer --workspace "$PWD" --attach
+```
+
+Finish any first-run login or workspace trust prompts in that terminal. Press **Ctrl+\\** to detach; the agent keeps running. Stop this example when you are done exploring:
+
+```sh
+st agents stop agent/garden/explorer --as person/ada
+```
+
+## 5. Declare a durable seat
+
+A declared seat restarts with its declaration and can be given missions. Save its workspace and harness in a KDL file in your test area:
 
 ```sh
 cd ~/st/garden
@@ -141,7 +168,7 @@ st terminals attach agent/garden/worker
 
 The harness starts and waits for work. Finish any first-run prompts in its terminal, then press **Ctrl+\\** to detach; the seat keeps running.
 
-## 5. Give it a mission
+## 6. Give it a mission
 
 Create a short work brief and a finite mission. Goals describe the result; the brief supplies instructions.
 
@@ -176,7 +203,7 @@ st missions show mission-run/garden/first-note/one
 cat garden-note.md
 ```
 
-## 6. Send a message
+## 7. Send a message
 
 ```sh
 st conversations send agent/garden/worker --from person/ada \
