@@ -53,7 +53,8 @@
     {
       "action": "custom.reply",
       "tests": [
-        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts"
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::decision_tree_manifest_cards_fences_retries_damage_and_restarts"
       ],
       "behavior": "stale source/card fences and wrong actor refused; client and CLI answers survive restart; exact replay writes no duplicate answer"
     },

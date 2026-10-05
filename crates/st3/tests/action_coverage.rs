@@ -4210,3 +4210,237 @@ async fn custom_reply_survives_fences_cli_and_daemon_restarts() {
         "discard"
     );
 }
+
+/// The decision-tree extension manifest over the real CLI and typed client: one tree subject per
+/// seat, an owner-written fenced status as the card, and the person's fenced answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decision_tree_manifest_cards_fences_retries_damage_and_restarts() {
+    use sha2::{Digest, Sha256};
+    const SEAT: &str = "agent/example/decisions";
+    const DECIDER: &str = "person/lichen";
+    const TREE: &str = "custom/decision/tree/v1/example/decisions";
+    async fn run(daemon: &Daemon, actor: &str, args: &[String]) -> Value {
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        cli_value(daemon.cli(actor, &args).await)
+    }
+    /// The tool reads the tree's raw-input revision and fences its derived status on it.
+    async fn basis(daemon: &Daemon, kinds: &[String]) -> String {
+        let mut args = vec!["subject".to_owned(), "basis".to_owned(), TREE.to_owned()];
+        for kind in kinds {
+            args.extend(["--kind".to_owned(), kind.clone()]);
+        }
+        let revision = run(daemon, PERSON, &args).await["revision"].clone();
+        json!([{"subject": TREE, "kinds": kinds, "revision": revision}]).to_string()
+    }
+    /// Store immutable document bytes and return their hash-pinned reference.
+    async fn document(daemon: &Daemon, name: &str, bytes: &[u8]) -> String {
+        let file = daemon.root.path().join(name.replace('/', "-"));
+        std::fs::write(&file, bytes).unwrap();
+        let args = ["documents", "put", file.to_str().unwrap(), "--as", name];
+        cli_value(daemon.cli(PERSON, &args).await);
+        format!("{name}@{}", hex::encode(Sha256::digest(bytes)))
+    }
+    fn claim(kind: &str, fields: Vec<String>) -> Vec<String> {
+        let mut args = vec![
+            "claim".to_owned(),
+            TREE.to_owned(),
+            format!("custom.decision.tree.v1.{kind}"),
+            "--actor".to_owned(),
+            SEAT.to_owned(),
+        ];
+        for field in fields {
+            args.extend(["--field".to_owned(), field]);
+        }
+        args
+    }
+    let mut daemon = Daemon::new().await;
+    let manifest = daemon.root.path().join("decision-tree.json");
+    std::fs::write(
+        &manifest,
+        include_str!("../../../examples/st3/decision-tree.json"),
+    )
+    .unwrap();
+    let registered = cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &["schema", "register", manifest.to_str().unwrap(), "--as", SEAT],
+            )
+            .await,
+    );
+    assert_eq!(registered["state"], "ready");
+    let raw_kinds = ["opened", "requested", "answered", "assumed", "promoted", "damaged"]
+        .map(|k| format!("custom.decision.tree.v1.{k}"));
+    let opened = claim("opened", vec![format!("seat={SEAT}"), format!("recipient={DECIDER}")]);
+    run(&daemon, PERSON, &opened).await;
+    let body = document(
+        &daemon,
+        "doc/decision/example/q1",
+        b"## Options\n### keep\nKeep it.\n### drop\nDrop it.\n",
+    )
+    .await;
+    let ask = vec![
+        "question=Keep the seed history?".to_owned(),
+        "kind=blocker".into(),
+        format!("body={body}"),
+        "q=1".into(),
+        "legacy_id=k3x9qa".into(),
+    ];
+    run(&daemon, PERSON, &claim("requested", ask)).await;
+    let request = daemon
+        .store()
+        .claims_for(TREE, Some("custom.decision.tree.v1.requested"))
+        .unwrap()[0]
+        .id
+        .clone();
+    // A person cannot write the owner's assumption; the owner cannot write the person's answer.
+    for (kind, actor, choice) in [
+        ("assumed", DECIDER, "text=Keep."),
+        ("answered", SEAT, "selection=[\"keep\"]"),
+    ] {
+        let kind = format!("custom.decision.tree.v1.{kind}");
+        let request = format!("request={request}");
+        let args = ["claim", TREE, &kind, "--actor", actor, "--field", &request, "--field", choice];
+        assert!(!daemon.cli(PERSON, &args).await.status.success(), "{kind} as {actor}");
+    }
+    let pending = vec![
+        "state=pending".to_owned(),
+        "title=Q1: Keep the seed history?".into(),
+        "detail=Options: keep, drop.".into(),
+        format!("request={request}"),
+        "q=1".into(),
+        "pending=1".into(),
+        format!("_basis={}", basis(&daemon, &raw_kinds).await),
+    ];
+    run(&daemon, PERSON, &claim("status", pending)).await;
+
+    let cards = daemon
+        .client(DECIDER)
+        .attention_list(None, Some(10), false)
+        .await
+        .unwrap();
+    assert_eq!(cards.value.items.len(), 1);
+    let st3_client::Resource::Attention(card) = &cards.value.items[0] else {
+        panic!("expected the decision card")
+    };
+    assert_eq!(card.actions, ["custom.reply"]);
+    assert_eq!(card.source_kind, "custom");
+    assert!(card.custom_form.is_some());
+    let mut fence = Fence {
+        snapshot_id: cards.snapshot.id.clone(),
+        ..Default::default()
+    };
+    fence
+        .subject_revisions
+        .insert(card.header.id.clone(), card.header.revision.clone());
+    let mut parameters = card.action_parameters["custom.reply"].clone();
+    parameters["fields"] = json!({"selection": ["keep"], "text": "Keep only recent history."});
+    let denied = dispatch(
+        &daemon.client(SEAT),
+        "custom.reply",
+        "decision-not-the-person",
+        Fence {
+            snapshot_id: cards.snapshot.id.clone(),
+            ..Default::default()
+        },
+        parameters.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(denied, ClientError::Api(ErrorCode::Forbidden, ..)));
+    let pending_view = daemon.store().custom_subject(TREE).unwrap().unwrap();
+    // A stale card fence writes nothing; the accepted answer's exact replay across restarts
+    // returns the same claim without a second write.
+    daemon
+        .exercise(DECIDER, "custom.reply", parameters, fence)
+        .await;
+    let answers = daemon
+        .store()
+        .claims_for(TREE, Some("custom.decision.tree.v1.answered"))
+        .unwrap();
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].actor.as_deref(), Some(DECIDER));
+    assert_eq!(answers[0].body["fields"]["request"], json!(request));
+    assert_eq!(answers[0].body["fields"]["selection"], json!(["keep"]));
+    assert!(
+        daemon
+            .client(DECIDER)
+            .attention_list(None, Some(10), false)
+            .await
+            .unwrap()
+            .value
+            .items
+            .is_empty()
+    );
+    // The answered card's parameters are now stale on the CLI path too.
+    let reply = daemon.root.path().join("reply.json");
+    std::fs::write(&reply, r#"{"selection":["drop"]}"#).unwrap();
+    let stale = daemon
+        .cli(
+            DECIDER,
+            &[
+                "subject",
+                "reply",
+                TREE,
+                "--registration",
+                pending_view["registration"].as_str().unwrap(),
+                "--revision",
+                pending_view["revision"].as_str().unwrap(),
+                "--episode",
+                pending_view["attention"]["episode"].as_str().unwrap(),
+                "--fields-file",
+                reply.to_str().unwrap(),
+                "--idempotency-key",
+                "decision-cli-stale",
+                "--as",
+                DECIDER,
+            ],
+        )
+        .await;
+    let stderr = String::from_utf8_lossy(&stale.stderr);
+    assert!(!stale.status.success() && stderr.contains("stale-fence"), "{stderr}");
+    let show = ["subject".to_owned(), "show".into(), TREE.into()];
+    let shown = run(&daemon, DECIDER, &show).await;
+    assert_eq!(shown["state"], "stale");
+    assert_eq!(shown["fields"]["last_selection"], json!(["keep"]));
+    assert_eq!(shown["provenance"]["answer"]["actor"], DECIDER);
+
+    let raw = document(
+        &daemon,
+        "doc/decision/example/import-raw",
+        b"---\nq: 2\nbroken frontmatter\n",
+    )
+    .await;
+    let damaged = vec![
+        format!("raw={raw}"),
+        "records=3".into(),
+        "imported=2".into(),
+        "malformed=1".into(),
+    ];
+    run(&daemon, PERSON, &claim("damaged", damaged)).await;
+    let clear = vec![
+        "state=clear".to_owned(),
+        "title=No open decisions".into(),
+        "detail=Q1 answered; one record damaged.".into(),
+        "pending=0".into(),
+        format!("_basis={}", basis(&daemon, &raw_kinds).await),
+    ];
+    run(&daemon, PERSON, &claim("status", clear)).await;
+    let before = run(&daemon, DECIDER, &show).await;
+    assert_eq!(before["state"], "ready");
+    assert_eq!(before["fields"]["state"], "clear");
+    assert_eq!(before["fields"]["damage_malformed"], 1);
+    assert_eq!(before["fields"]["damage_raw"], json!(raw));
+    daemon.restart().await;
+    assert_eq!(run(&daemon, DECIDER, &show).await, before);
+    assert!(
+        daemon
+            .client(DECIDER)
+            .attention_list(None, Some(10), false)
+            .await
+            .unwrap()
+            .value
+            .items
+            .is_empty()
+    );
+}

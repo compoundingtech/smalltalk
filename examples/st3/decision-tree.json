@@ -1,0 +1,420 @@
+{
+  "kind": "decision.tree",
+  "namespace": "decision",
+  "version": 1,
+  "language": "custom-projection.v1",
+  "subject_prefix": "custom/decision/tree/v1/",
+  "creation_kind": "custom.decision.tree.v1.opened",
+  "claims": {
+    "custom.decision.tree.v1.opened": {
+      "authority": "creator",
+      "fields": {
+        "seat": {
+          "value_type": "subject-reference",
+          "required": true,
+          "reference_families": [
+            "agent"
+          ]
+        },
+        "recipient": {
+          "value_type": "subject-reference",
+          "required": true,
+          "reference_families": [
+            "person"
+          ]
+        },
+        "legacy_trees": {
+          "value_type": "array",
+          "max_items": 64,
+          "max_bytes": 16384
+        }
+      }
+    },
+    "custom.decision.tree.v1.requested": {
+      "authority": "owner",
+      "fields": {
+        "question": {
+          "value_type": "string",
+          "required": true,
+          "max_bytes": 512
+        },
+        "kind": {
+          "value_type": "string",
+          "required": true,
+          "values": [
+            "blocker",
+            "refinement"
+          ]
+        },
+        "body": {
+          "value_type": "string",
+          "required": true,
+          "document": true
+        },
+        "about": {
+          "value_type": "string",
+          "max_bytes": 1024
+        },
+        "parent": {
+          "value_type": "string",
+          "claim": true
+        },
+        "applies_when": {
+          "value_type": "array",
+          "max_items": 64,
+          "max_bytes": 16384
+        },
+        "q": {
+          "value_type": "integer"
+        },
+        "legacy_id": {
+          "value_type": "string",
+          "max_bytes": 64
+        }
+      }
+    },
+    "custom.decision.tree.v1.answered": {
+      "authority": "recipient",
+      "fields": {
+        "request": {
+          "value_type": "string",
+          "required": true,
+          "claim": true
+        },
+        "selection": {
+          "value_type": "array",
+          "required": true,
+          "min_items": 0,
+          "max_items": 64,
+          "max_bytes": 4096
+        },
+        "text": {
+          "value_type": "string",
+          "max_bytes": 32768
+        },
+        "supersedes": {
+          "value_type": "string",
+          "claim": true
+        },
+        "legacy_id": {
+          "value_type": "string",
+          "max_bytes": 64
+        }
+      }
+    },
+    "custom.decision.tree.v1.assumed": {
+      "authority": "owner",
+      "fields": {
+        "request": {
+          "value_type": "string",
+          "required": true,
+          "claim": true
+        },
+        "text": {
+          "value_type": "string",
+          "required": true,
+          "max_bytes": 32768
+        },
+        "supersedes": {
+          "value_type": "string",
+          "claim": true
+        },
+        "legacy_id": {
+          "value_type": "string",
+          "max_bytes": 64
+        }
+      }
+    },
+    "custom.decision.tree.v1.promoted": {
+      "authority": "owner",
+      "fields": {
+        "request": {
+          "value_type": "string",
+          "required": true,
+          "claim": true
+        },
+        "target": {
+          "value_type": "string",
+          "required": true,
+          "max_bytes": 2048
+        },
+        "text": {
+          "value_type": "string",
+          "max_bytes": 32768
+        },
+        "legacy_id": {
+          "value_type": "string",
+          "max_bytes": 64
+        }
+      }
+    },
+    "custom.decision.tree.v1.status": {
+      "authority": "owner",
+      "fields": {
+        "state": {
+          "value_type": "string",
+          "required": true,
+          "values": [
+            "pending",
+            "clear"
+          ]
+        },
+        "title": {
+          "value_type": "string",
+          "required": true,
+          "max_bytes": 512
+        },
+        "detail": {
+          "value_type": "string",
+          "required": true,
+          "max_bytes": 8192
+        },
+        "request": {
+          "value_type": "string",
+          "claim": true
+        },
+        "q": {
+          "value_type": "integer"
+        },
+        "pending": {
+          "value_type": "integer"
+        }
+      }
+    },
+    "custom.decision.tree.v1.damaged": {
+      "authority": "owner",
+      "fields": {
+        "raw": {
+          "value_type": "string",
+          "required": true,
+          "document": true
+        },
+        "records": {
+          "value_type": "integer",
+          "required": true
+        },
+        "imported": {
+          "value_type": "integer",
+          "required": true
+        },
+        "malformed": {
+          "value_type": "integer",
+          "required": true
+        },
+        "source": {
+          "value_type": "string",
+          "max_bytes": 2048
+        },
+        "detail": {
+          "value_type": "string",
+          "max_bytes": 8192
+        }
+      }
+    }
+  },
+  "slots": {
+    "tree": {
+      "kind": "custom.decision.tree.v1.opened",
+      "select": "first"
+    },
+    "request": {
+      "kind": "custom.decision.tree.v1.requested",
+      "select": "last"
+    },
+    "answer": {
+      "kind": "custom.decision.tree.v1.answered",
+      "select": "last"
+    },
+    "assumption": {
+      "kind": "custom.decision.tree.v1.assumed",
+      "select": "last"
+    },
+    "promotion": {
+      "kind": "custom.decision.tree.v1.promoted",
+      "select": "last"
+    },
+    "status": {
+      "kind": "custom.decision.tree.v1.status",
+      "select": "last"
+    },
+    "damage": {
+      "kind": "custom.decision.tree.v1.damaged",
+      "select": "last"
+    }
+  },
+  "fields": {
+    "seat": {
+      "op": "field",
+      "slot": "tree",
+      "field": "seat"
+    },
+    "recipient": {
+      "op": "field",
+      "slot": "tree",
+      "field": "recipient"
+    },
+    "state": {
+      "op": "field",
+      "slot": "status",
+      "field": "state"
+    },
+    "status": {
+      "op": "claim-id",
+      "slot": "status"
+    },
+    "pending": {
+      "op": "field",
+      "slot": "status",
+      "field": "pending"
+    },
+    "request": {
+      "op": "field",
+      "slot": "status",
+      "field": "request"
+    },
+    "q": {
+      "op": "field",
+      "slot": "status",
+      "field": "q"
+    },
+    "question": {
+      "op": "field",
+      "slot": "status",
+      "field": "title"
+    },
+    "last_request": {
+      "op": "claim-id",
+      "slot": "request"
+    },
+    "last_answer": {
+      "op": "claim-id",
+      "slot": "answer"
+    },
+    "last_answer_request": {
+      "op": "field",
+      "slot": "answer",
+      "field": "request"
+    },
+    "last_selection": {
+      "op": "field",
+      "slot": "answer",
+      "field": "selection"
+    },
+    "last_text": {
+      "op": "field",
+      "slot": "answer",
+      "field": "text"
+    },
+    "last_assumption": {
+      "op": "claim-id",
+      "slot": "assumption"
+    },
+    "last_promotion": {
+      "op": "claim-id",
+      "slot": "promotion"
+    },
+    "promotion_target": {
+      "op": "field",
+      "slot": "promotion",
+      "field": "target"
+    },
+    "damage": {
+      "op": "claim-id",
+      "slot": "damage"
+    },
+    "damage_raw": {
+      "op": "field",
+      "slot": "damage",
+      "field": "raw"
+    },
+    "damage_records": {
+      "op": "field",
+      "slot": "damage",
+      "field": "records"
+    },
+    "damage_imported": {
+      "op": "field",
+      "slot": "damage",
+      "field": "imported"
+    },
+    "damage_malformed": {
+      "op": "field",
+      "slot": "damage",
+      "field": "malformed"
+    }
+  },
+  "attention": {
+    "when": {
+      "op": "all",
+      "args": [
+        {
+          "op": "exists",
+          "slot": "tree"
+        },
+        {
+          "op": "eq",
+          "left": {
+            "op": "field",
+            "slot": "status",
+            "field": "state"
+          },
+          "right": {
+            "op": "constant",
+            "value": "pending"
+          }
+        },
+        {
+          "op": "eq",
+          "left": {
+            "op": "field",
+            "slot": "status",
+            "field": "request"
+          },
+          "right": {
+            "op": "field",
+            "slot": "status",
+            "field": "request"
+          }
+        }
+      ]
+    },
+    "recipient_field": "recipient",
+    "title": {
+      "op": "field",
+      "slot": "status",
+      "field": "title"
+    },
+    "detail": {
+      "op": "field",
+      "slot": "status",
+      "field": "detail"
+    },
+    "episode": {
+      "op": "claim-id",
+      "slot": "status"
+    },
+    "reply": {
+      "kind": "custom.decision.tree.v1.answered",
+      "fields": {
+        "selection": {
+          "value_type": "array",
+          "required": true,
+          "min_items": 0,
+          "max_items": 64,
+          "max_bytes": 4096
+        },
+        "text": {
+          "value_type": "string",
+          "max_bytes": 32768
+        }
+      },
+      "bindings": {
+        "request": {
+          "op": "field",
+          "slot": "status",
+          "field": "request"
+        }
+      }
+    }
+  }
+}

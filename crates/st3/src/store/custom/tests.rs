@@ -635,3 +635,148 @@ fn custom_late_document_recovers_only_its_source_and_cycles_are_invalid() {
         .unwrap();
     assert_eq!(before, projection_digest::oracle(&s.readers.get()).unwrap());
 }
+
+const TREE: &str = "custom/decision/tree/v1/example/decisions";
+const SEAT: &str = "agent/example/decisions";
+const DECIDER: &str = "person/lichen";
+const RAW_KINDS: [&str; 6] = ["opened", "requested", "answered", "assumed", "promoted", "damaged"];
+fn decision_tree() -> Manifest {
+    serde_json::from_str(include_str!(
+        "../../../../../examples/st3/decision-tree.json"
+    ))
+    .unwrap()
+}
+fn tree_claim(
+    s: &Store,
+    tree: &str,
+    kind: &str,
+    actor: &str,
+    fields: Value,
+) -> Result<ClaimRecord, St3Error> {
+    s.append_claim(&ClaimInput {
+        subject: tree.into(),
+        kind: format!("custom.decision.tree.v1.{kind}"),
+        actor: Some(actor.into()),
+        fields: serde_json::from_value(fields).unwrap(),
+        ..empty_input()
+    })
+}
+fn tree_document(s: &Store, name: &str, bytes: &[u8]) -> String {
+    s.put_document_as(name, bytes, &None, name, Some(SEAT)).unwrap();
+    format!("{name}@{}", hex::encode(Sha256::digest(bytes)))
+}
+/// The external tool's derived status, fenced on every raw kind of the same tree subject.
+fn tree_status(s: &Store, fields: Value) -> ClaimRecord {
+    let kinds = RAW_KINDS.map(|k| format!("custom.decision.tree.v1.{k}")).to_vec();
+    let mut fields = fields;
+    fields["_basis"] = json!([{"subject":TREE,"kinds":kinds,"revision":s.custom_basis_revision(TREE,&kinds).unwrap()}]);
+    tree_claim(s, TREE, "status", SEAT, fields).unwrap()
+}
+
+#[test]
+fn decision_tree_manifest_replicates_restarts_and_surfaces_damage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replica.db");
+    let a = Store::open_memory("alder").unwrap();
+    let b = Store::open(&path, "birch").unwrap();
+    let m = decision_tree();
+    assert!(serde_json::to_vec(&m).unwrap().len() <= schema::MAX_BYTES);
+    a.register_custom_kind(&RegistrationRequest {
+        manifest: m,
+        actor: SEAT.into(),
+    })
+    .unwrap();
+    tree_claim(&a, TREE, "opened", SEAT, json!({"seat":SEAT,"recipient":DECIDER})).unwrap();
+    let body = tree_document(&a, "doc/decision/example/q1", b"## Options\n### keep\nKeep it.\n### drop\nDrop it.\n");
+    let ask = json!({"question":"Keep the seed history?","kind":"blocker","body":body,"q":1,"legacy_id":"k3x9qa"});
+    // Only the tree owner asks, assumes, promotes and derives; only the person answers.
+    assert!(tree_claim(&a, TREE, "requested", "agent/example/other", ask.clone()).is_err());
+    let request = tree_claim(&a, TREE, "requested", SEAT, ask).unwrap();
+    let answer = json!({"request":request.id,"selection":["keep"]});
+    assert!(tree_claim(&a, TREE, "answered", SEAT, answer.clone()).is_err());
+    assert!(tree_claim(&a, TREE, "assumed", DECIDER, json!({"request":request.id,"text":"Keep."})).is_err());
+    let bad_kind = json!({"question":"Bad","kind":"urgent","body":body});
+    assert!(tree_claim(&a, TREE, "requested", SEAT, bad_kind).is_err());
+    assert!(a.attention_items(Some(DECIDER)).unwrap().is_empty());
+    let status = tree_status(&a, json!({"state":"pending","title":"Q1: Keep the seed history?","detail":"Options: keep, drop.","request":request.id,"q":1,"pending":1}));
+    legacy_sync(&a, &b);
+    assert_eq!(a.custom_subject(TREE).unwrap(), b.custom_subject(TREE).unwrap());
+    let cards = b.attention_items(Some(DECIDER)).unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].episode, status.id);
+    assert_eq!(cards[0].requester_id.as_deref(), Some(SEAT));
+
+    let v = b.custom_subject(TREE).unwrap().unwrap();
+    let mut r = ReplyRequest {
+        subject: TREE.into(),
+        registration: v["registration"].as_str().unwrap().into(),
+        revision: v["revision"].as_str().unwrap().into(),
+        episode: v["attention"]["episode"].as_str().unwrap().into(),
+        fields: serde_json::from_value(json!({"selection":[],"text":"Reframe: keep only recent history"}))
+            .unwrap(),
+        actor: SEAT.into(),
+        idempotency_key: "decision-q1-answer".into(),
+    };
+    assert_eq!(b.reply_custom_subject(&r).unwrap_err().code, "forbidden");
+    r.actor = DECIDER.into();
+    let mut stale = r.clone();
+    stale.revision = "obsolete".into();
+    assert_eq!(b.reply_custom_subject(&stale).unwrap_err().code, "stale-fence");
+    let human = b.reply_custom_subject(&r).unwrap();
+    assert_eq!(human.actor.as_deref(), Some(DECIDER));
+    assert_eq!(human.body["fields"]["request"], json!(request.id));
+    assert_eq!(human.body["fields"]["selection"], json!([]));
+    assert_eq!(b.reply_custom_subject(&r).unwrap().id, human.id);
+    let mut changed = r.clone();
+    changed.fields.insert("selection".into(), json!(["drop"]));
+    assert_eq!(
+        b.reply_custom_subject(&changed).unwrap_err().code,
+        "idempotency-conflict"
+    );
+    // The raw answer makes the derived status stale; the old card cannot be answered again.
+    assert_eq!(b.custom_subject(TREE).unwrap().unwrap()["state"], "stale");
+    assert!(b.attention_items(Some(DECIDER)).unwrap().is_empty());
+    let mut again = r.clone();
+    again.idempotency_key = "decision-q1-second".into();
+    assert_eq!(b.reply_custom_subject(&again).unwrap_err().code, "stale-fence");
+
+    legacy_sync(&b, &a);
+    assert_eq!(a.reply_custom_subject(&r).unwrap().id, human.id);
+    let assumption = tree_claim(&a, TREE, "assumed", SEAT, json!({"request":request.id,"text":"Assume recent history only."})).unwrap();
+    let raw = tree_document(&a, "doc/decision/example/import-raw", b"---\nq: 2\nbroken frontmatter\n");
+    let damage = tree_claim(&a, TREE, "damaged", SEAT, json!({"raw":raw,"records":3,"imported":2,"malformed":1,"source":"axe/example/decisions"})).unwrap();
+    tree_status(&a, json!({"state":"clear","title":"No open decisions","detail":"Q1 answered.","pending":0}));
+    let view = a.custom_subject(TREE).unwrap().unwrap();
+    assert_eq!(view["state"], "ready");
+    assert_eq!(view["fields"]["last_answer"], json!(human.id));
+    assert_eq!(view["provenance"]["answer"]["actor"], DECIDER);
+    assert_eq!(view["fields"]["last_assumption"], json!(assumption.id));
+    assert_eq!(view["provenance"]["assumption"]["actor"], SEAT);
+    assert_eq!(view["fields"]["damage"], json!(damage.id));
+    assert_eq!(view["fields"]["damage_malformed"], 1);
+    assert!(a.attention_items(Some(DECIDER)).unwrap().is_empty());
+
+    // A tree whose import was entirely malformed still reads as damaged, never as empty.
+    let broken = "custom/decision/tree/v1/example/broken";
+    tree_claim(&a, broken, "opened", SEAT, json!({"seat":SEAT,"recipient":DECIDER})).unwrap();
+    tree_claim(&a, broken, "damaged", SEAT, json!({"raw":raw,"records":4,"imported":0,"malformed":4})).unwrap();
+    legacy_sync(&a, &b);
+    for id in [TREE, broken] {
+        assert_eq!(a.custom_subject(id).unwrap(), b.custom_subject(id).unwrap());
+    }
+    assert_eq!(
+        projection_digest::oracle(&a.readers.get()).unwrap(),
+        projection_digest::oracle(&b.readers.get()).unwrap()
+    );
+    let before = (b.custom_subject(TREE).unwrap(), b.custom_subject(broken).unwrap());
+    drop(b);
+    let b = Store::open(&path, "birch").unwrap();
+    assert_eq!((b.custom_subject(TREE).unwrap(), b.custom_subject(broken).unwrap()), before);
+    let broken = b.custom_subject(broken).unwrap().unwrap();
+    assert_eq!(broken["state"], "ready");
+    assert_eq!(broken["fields"]["damage_malformed"], 4);
+    assert_eq!(broken["fields"]["damage_imported"], 0);
+    assert!(broken["fields"]["last_request"].is_null());
+    assert!(b.attention_items(Some(DECIDER)).unwrap().is_empty());
+    assert_eq!(b.reply_custom_subject(&r).unwrap().id, human.id);
+}

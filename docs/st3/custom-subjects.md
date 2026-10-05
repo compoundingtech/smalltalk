@@ -115,3 +115,42 @@ its episode. Array selections can allow zero or multiple choices, and a text fie
 freeform reframe. Custom claims do not block native work or confer native approval; a tool that
 needs native blocking separately uses authorized work asks. This slice does not replace the
 existing decision-tree bridge.
+
+## Decision trees
+
+[decision-tree.json](../../examples/st3/decision-tree.json) registers `decision.tree` version 1
+for the external decision-tree tool. Register it once per fleet:
+
+```sh
+st schema register examples/st3/decision-tree.json --as agent/example/decisions
+```
+
+Each logical tree is one subject, `custom/decision/tree/v1/<seat>`, named after the durable seat
+ID without its `agent/` family, so a tree has one revision to fence. The tool writes these kinds,
+all `custom.decision.tree.v1.*`:
+
+| Kind | Authority | Fields |
+| --- | --- | --- |
+| `opened` | creator | `seat` (agent reference), `recipient` (person reference), optional `legacy_trees` |
+| `requested` | owner | `question`, `kind` (`blocker`/`refinement`), hash-pinned `body` document; optional `about`, `parent` (claim), `applies_when` (array of `{decision, option}`), `q`, `legacy_id` |
+| `answered` | recipient | `request` (claim), `selection` (array, zero or more option keys); optional `text` reframe, `supersedes` (claim), `legacy_id` |
+| `assumed` | owner | `request` (claim), `text`; optional `supersedes` (claim), `legacy_id` |
+| `promoted` | owner | `request` (claim), `target`; optional `text`, `legacy_id` |
+| `status` | owner | `state` (`pending`/`clear`), card `title` and `detail`; optional `request` (claim), `q`, `pending` |
+| `damaged` | owner | `raw` (hash-pinned document of the unreadable bytes), `records`, `imported`, `malformed`; optional `source`, `detail` |
+
+`opened` fixes the tree's owner and its one addressed person. Only that owner asks, assumes,
+promotes, records damage and derives status; only that person answers. Assumptions are owner
+facts, never person responses.
+
+`status` is the tool's derived view. Write it with one `_basis` entry for the tree subject
+covering every other kind, from `st subject basis custom/decision/tree/v1/<seat> --kind
+custom.decision.tree.v1.opened --kind ...requested --kind ...answered --kind ...assumed
+--kind ...promoted --kind ...damaged`. A `pending` status that names a `request` shows one card.
+The status claim ID is the episode. The card's reply writes `answered` with that request bound.
+Any new raw fact makes the status stale and removes the card until the tool writes a fresh one.
+
+`q` and `legacy_id` are stored but not allocated or checked. Handle allocation, guards,
+supersession forks and option grounding stay in the tool. A `damaged` receipt shows in the
+source's `damage*` fields even when a tree has no readable requests, so a failed import does
+not read as an empty tree. Writes need a running daemon; nothing is spooled offline.
