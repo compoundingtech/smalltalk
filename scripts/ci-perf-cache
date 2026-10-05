@@ -162,6 +162,16 @@ def restore():
         artifacts = api(f"repos/{repo}/actions/runs/{run['id']}/artifacts?per_page=100")
         return {item['name'] for item in artifacts['artifacts'] if not item['expired']}
 
+    # Investigation control only: all after samples use the exact fixture from the
+    # three frozen-main before samples. Keep normal build restoration and gate baselines.
+    pinned = api(f'repos/{repo}/actions/runs/37281901496')
+    if not trusted_snapshot(pinned):
+        raise ValueError('the fixed control fixture must be a completed main workload')
+    with tempfile.TemporaryDirectory(dir=temp) as tmp:
+        snapshots(pinned, {wanted['stores']}, Path(tmp), 'fixed control main fixture')
+    if 'stores' not in found:
+        raise ValueError('the fixed control fixture is unavailable')
+
     # PR snapshots can be reused only by that same PR, never by main or another PR.
     # A rerun changes the current run's status: verify its previous successful attempt directly.
     # GitHub may hide that attempt's artifacts; main remains the durable fallback.
