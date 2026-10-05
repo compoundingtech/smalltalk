@@ -39,7 +39,7 @@ This design replaces each step:
 
 ## What a person types
 
-On any listening member, or on a machine that is not in a fleet yet (which then founds one):
+On any listening member, or on a machine that is not in a fleet yet (which then creates its first fleet):
 
 ```sh
 st fleet invite laptop
@@ -115,7 +115,7 @@ The design review of the first version of this document raised seven findings. E
 - **Writer**: the node name that authored a replicated batch (`origin`). A node's writer name is
   its node name.
 - **Anchor**: the member whose key every member pins as the root of membership: the machine that
-  founded the fleet, or the first machine of an existing fleet to migrate.
+  created the fleet, or the first machine of an existing fleet to migrate.
 
 ## Trust model
 
@@ -257,8 +257,8 @@ Or, if laptop is a Fabric peer of this machine, send the code instead of showing
 A dial-out member cannot sponsor, because nothing can connect to it. `st fleet invite` there
 fails and names the listening members.
 
-On a machine that is not in a fleet yet, `st fleet invite` first founds one; see
-[Founding a fleet](#founding-a-fleet).
+On a machine that is not in a fleet yet, `st fleet invite` first creates a fleet; see
+[Creating your first fleet](#creating-your-first-fleet).
 
 ### What the sponsor stores
 
@@ -515,9 +515,9 @@ Runtime ownership follows the node name. Seats declared on host `laptop` belong 
 machine is currently `laptop`. That is why `st fleet remove` asks what to do with a machine's
 seats first.
 
-### Founding a fleet
+### Creating your first fleet
 
-`st fleet invite` on a machine that is not in a fleet founds one, and says so:
+`st fleet invite` on a machine that is not in a fleet creates one, and says so:
 
 1. Generate a random fleet ID (UUID v4), a 32-byte secret, and the member key.
 2. Write `STATE/fleet/` with `anchor_key` set to this node's own key, bind the store to the fleet
@@ -530,7 +530,7 @@ seats first.
    worker runs.
 5. Continue with the invite.
 
-A local-only store keeps its history when it founds a fleet, and that history replicates to
+A local-only store keeps its history when it creates a fleet, and that history replicates to
 every member that joins.
 
 ## Membership
@@ -651,7 +651,7 @@ signature = Ed25519(member key, "st3-envelope-v1\n" || fleet_id || "\n" || write
 
 The envelope hash already covers the writer, sequence, previous hash, accept time, and payload.
 The main daemon holds the member key and signs when it appends a batch. When a node gets its key
-(founding, joining, migrating), it also signs every envelope it already holds under its own name,
+(creating a fleet, joining, migrating), it also signs every envelope it already holds under its own name,
 so its whole history is signed. At every start it signs any envelope of its own writer that has no
 signature, which covers batches written while it ran an older build. Ed25519 signing and checking take tens of microseconds, and one
 exchange carries at most 512 envelopes.
@@ -754,7 +754,7 @@ st3 replication-worker --node studio --state-dir STATE --socket SOCKET
 ```
 
 The worker unit is installed whenever the node is in a fleet. Changing membership changes
-nothing on disk and needs no restart. `st fleet join`, founding, `st fleet mode`, `st fleet leave`,
+nothing on disk and needs no restart. `st fleet join`, creating a fleet, `st fleet mode`, `st fleet leave`,
 and `st fleet migrate` refresh the units themselves when the daemon runs as a service.
 
 Units installed by an older build keep their baked `--peer` arguments and keep working until
@@ -941,7 +941,7 @@ and any tunnel a person runs themselves, such as `ssh -L`. It has two forms:
 
 - a `[[peers]]` entry with a loopback URL, which is a local override for one name;
 - an advertised `loopback` endpoint, which means "this port on the dialer's own loopback reaches
-  me". A node publishes it only when it founded the fleet or joined with `--via loopback`, or has
+  me". A node publishes it only when it created the fleet or joined with `--via loopback`, or has
   `advertise_loopback = true`.
 
 ### No plain network HTTP
@@ -1348,7 +1348,7 @@ Setup and isolation:
 
 - Download the release bundles for both machines, verify their checksums, and install them under
   a temporary root on each machine (short paths, for `SUN_LEN`). Check `st --version`.
-- Found a new fleet, so the fleet ID and the Fabric protocol are new. Node names are
+- Create a new fleet, so the fleet ID and the Fabric protocol are new. Node names are
   `live-a-RUN` and `live-b-RUN`. Ports are free ports above 40000 that no local `config.toml`
   names.
 - Run every node as a foreground process with a pid file; on the remote machine, start it with
@@ -1362,7 +1362,7 @@ Setup and isolation:
 
 Phases:
 
-1. **Tailscale.** A founds the fleet and invites `--via tailscale`; B joins. Write a document on
+1. **Tailscale.** A creates the fleet and invites `--via tailscale`; B joins. Write a document on
    each; both must see both within 60 seconds.
 2. **Dial-out.** `st fleet mode dial-out` on B. Stop B, write 600 claims on A, start B. B must
    catch up, A must hold no `down` observation for B, and A's status must show no outbound
@@ -1418,7 +1418,7 @@ Small pull requests, in order, each from a branch off `origin/main`:
    the status, doctor, and machines views.
 5. **Transports.** The tailnet listener and discovery, Fabric expose and dial through the CLI,
    advertised loopback endpoints, and route order.
-6. **Invite and join.** The code, the handshake, founding and the anchor, `st fleet invite`,
+6. **Invite and join.** The code, the handshake, fleet creation and the anchor, `st fleet invite`,
    `invites`, and `join`, code delivery through the Fabric inbox, the integration harness,
    `fleet.rs` tests 1, 2, 6, 7, 8, 12, and 13, and `scripts/fleet-e2e` with the `fleet-e2e` job
    (this needs the tag workflow from pull request 585 on `main`).

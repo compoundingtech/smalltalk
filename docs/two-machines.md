@@ -1,26 +1,70 @@
 # Connect two machines
 
-Your machines can share one fleet: each daemon keeps a local replica of the graph and catches up when it reconnects. This connects **your own machines**; each person currently runs their own fleet.
-
-If either machine has a populated v0.3.4 store, preserve its raw state and keys and follow the [founder signing audit](st3/founder-signing-audit.md) before installation, doctor, restart, or fleet creation/join. The v0.3.4 rehearsal found [unsigned grants](https://github.com/compoundingtech/smalltalk/issues/1228) after standalone restart. v0.3.5's source contains the prevention fix; upgrading cannot repair already-sealed unsigned history.
+Each daemon keeps a local replica of the graph and catches up when it reconnects. This connects **your own machines**; each person currently runs their own fleet.
 
 Finish [getting started](getting-started.md) on the first machine. Install Smalltalk, set `person = "person/ada"`, and start its user service on the second machine too. Harnesses and their logins are needed only on machines that will run seats.
 
-## Join over SSH
+The examples call the first machine **studio** and the second **beacon**. Choose one route below. Create your first fleet on studio only once; if it already belongs to your fleet, skip `create` and use the endpoints shown by `st fleet status`. Creating a fleet preserves your existing graph.
 
-This worked example calls the first machine **studio** and the second **beacon**. It uses SSH to encrypt a connection between their loopback listeners. You need SSH access from beacon to studio; use your actual SSH destination when prompted. If you already use Tailscale or Fabric, [fleet join](fleet-join.md#what-a-person-types) gives the shorter route with automatic transport discovery.
+## Tailscale
 
-On **studio**, found a fleet and check its listener:
+Install and connect Tailscale on both machines. Allow TCP port 31313 between them in your tailnet policy. On **studio**:
 
 ```sh
-st fleet create --name studio --port 31313 --advertise-loopback
+tailscale ip -4
+st fleet create --name studio --port 31313 --transports tailscale
+st fleet status
+st service status
+st fleet invite beacon --via tailscale
+```
+
+The replication worker listens on `127.0.0.1:31313` and studio's detected local Tailscale addresses on port 31313. Status shows the advertised tailnet endpoints. The invitation carries those literal IP addresses, so beacon does not need a manual peer URL or MagicDNS name. Tailscale userspace networking without a local tailnet interface cannot provide this listener; see [Tailscale setup](st3/tailscale.md).
+
+On **beacon**, join and paste the code when asked:
+
+```sh
+st fleet join --transports tailscale
+st fleet status
+st replication status
+```
+
+Join restarts the installed services and waits for the first sync. Beacon also listens on loopback and its own Tailscale addresses, using port 31313 or the next free port. Add `--dial-out` to `join` if beacon should accept no inbound replication connections; its outgoing connections still synchronize both directions.
+
+## Fabric
+
+Use this route when the machines are already trusted Fabric peers. Run Fabric as a service on both, and allow the fleet's protocol in the peers' Fabric service grants. See [fleet join](fleet-join.md#fabric) for the exact exposure, dial, and service-grant configuration.
+
+On **studio**:
+
+```sh
+st fleet create --name studio --port 31313 --transports fabric
 st fleet status
 st service status
 ```
 
-Wait until `status` shows studio's loopback endpoint. Creating the fleet preserves your existing graph. If studio already belongs to your fleet, skip `create`; use its existing Tailscale/Fabric route, or its advertised loopback endpoint and listening port for this example.
+The replication worker listens on `127.0.0.1:31313` and exposes that listener through Fabric. Status shows the `fabric://NODE_ID/PROTOCOL` endpoint: the node ID comes from studio's Fabric identity, and the protocol belongs to this fleet. Grant that exact protocol to the other machine in Fabric before joining.
 
-On **beacon**, open a second terminal and keep this SSH tunnel running:
+On **studio**, issue an invitation containing that Fabric endpoint:
+
+```sh
+st fleet invite beacon --via fabric
+```
+
+On **beacon**, paste it at the join prompt:
+
+```sh
+st fleet join --transports fabric
+st fleet status
+st replication status
+```
+
+Beacon listens on its own loopback port and exposes it through Fabric. The invitation sets the sponsor's peer address; the replication worker creates and reacquires the local Fabric tunnel. No manual `fabric dial` or `[[peers]]` entry is needed. Add `--dial-out` to accept no inbound connections on beacon.
+
+With their user services installed, Tailscale, Fabric, and the Smalltalk replication worker restart after reboot and reconnect after network interruptions. A terminal does not need to stay open.
+
+## SSH as a last resort
+
+An SSH tunnel can carry the same protocol between loopback listeners. On studio, create the fleet with `st fleet create --name studio --port 31313 --advertise-loopback`, then issue `st fleet invite beacon --via loopback`. On beacon, keep a separate terminal running:
 
 ```sh
 printf 'SSH destination for studio (for example ada@studio): '
@@ -29,27 +73,7 @@ ssh -N -o ExitOnForwardFailure=yes \
   -L 127.0.0.1:31313:127.0.0.1:31313 "$studio_ssh"
 ```
 
-On **studio**, issue a single-use invitation:
-
-```sh
-st fleet invite beacon --via loopback
-```
-
-Back in beacon's original terminal, join and paste the code when asked:
-
-```sh
-st fleet join --dial-out
-st fleet status
-st replication status
-```
-
-`--dial-out` leaves beacon's loopback port free for the tunnel. Beacon connects to studio, and each connection synchronizes **both directions**. Join installs the replication service and waits for first sync. Keep the tunnel running while using this route; Tailscale and Fabric manage their own connections instead.
-
-If port 31313 is busy on beacon, choose another local tunnel port (such as 31314), and join using that route:
-
-```sh
-st fleet join --dial-out --via http://127.0.0.1:31314
-```
+Join on beacon with `st fleet join --dial-out --via http://127.0.0.1:31313` and paste the invitation. Studio's worker listens on `127.0.0.1:31313`; SSH provides that same address locally on beacon, which has no inbound replication listener in dial-out mode. This foreground tunnel dies when its terminal closes, its network connection fails, or the machine reboots. You must reopen it to resume replication. Prefer the service-managed Tailscale or Fabric routes above for ongoing use.
 
 ## Check what arrived
 
@@ -89,7 +113,7 @@ The graph records a seat's host. Replication does not copy its workspace or move
 
 ## A sleeping machine is normal
 
-Disconnect beacon's tunnel with **Ctrl+C**. On studio, inspect the fleet again after about 90 seconds:
+Put beacon to sleep or disconnect it from the network. On studio, inspect the fleet again after about 90 seconds:
 
 ```sh
 st fleet status
@@ -97,6 +121,6 @@ st replication status
 st doctor
 ```
 
-Beacon becomes `last-seen`, with the time of the last exchange. Its absence does not remove it or make a healthy graph an error; transport diagnostics can retain the last failed connection. Authentication or admission failures are different and need investigation. Reopen the tunnel and beacon catches up automatically, with no new invitation. Retries back off, so reconnection can take a little time.
+Beacon becomes `last-seen`, with the time of the last exchange. Its absence does not remove it or make a healthy graph an error; transport diagnostics can retain the last failed connection. Authentication or admission failures are different and need investigation. Wake beacon or restore its connection and it catches up automatically, with no new invitation. Retries back off, so reconnection can take a little time.
 
 See [replication](st3/replication.md) for digest interpretation and recovery, and [fleet join](fleet-join.md) for Tailscale/Fabric routes, invitations, leaving, and removal.
