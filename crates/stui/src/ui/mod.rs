@@ -3176,6 +3176,10 @@ impl Ui {
         if key.kind != KeyEventKind::Press {
             // Repeats and releases belong to the child, never to stui shortcuts or confirmations.
             if self.terminal_focused()
+                && !self.palette_open()
+                && !self.help
+                && self.popover.is_none()
+                && self.voice.is_none()
                 && !terminal_space_key(key)
                 && !matches!(key.code, KeyCode::Char('\\' | '4') if key.modifiers.contains(KeyModifiers::CONTROL))
                 && !matches!(key.code, KeyCode::Char('s' | 'S' | 'r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT))

@@ -81,6 +81,7 @@ impl Painter {
             return;
         }
         let original = buf.clone();
+        let placeholders = placeholder_ids(frame, &original, area);
         let mut keep = Vec::new();
         let mut remaining_pixels = 16 * 1024 * 1024u64;
         for place in frame.state.visible() {
@@ -192,24 +193,8 @@ impl Painter {
                 .filter(|&pos| {
                     let cell = &original[pos];
                     let placeholder = cell.symbol().contains('\u{10eeee}');
-                    let id = match cell.fg {
-                        ratatui::style::Color::Rgb(r, g, b) => {
-                            Some((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b))
-                        }
-                        ratatui::style::Color::Indexed(id) => Some(u32::from(id)),
-                        _ => None,
-                    };
-                    let placement = match cell.underline_color {
-                        ratatui::style::Color::Rgb(r, g, b) => {
-                            (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
-                        }
-                        ratatui::style::Color::Indexed(id) => u32::from(id),
-                        _ => 0,
-                    };
                     (!virtual_image
-                        || (placeholder
-                            && id == Some(place.image_id & 0xffffff)
-                            && placement == place.placement_id))
+                        || placeholders.get(&pos) == Some(&(place.image_id, place.placement_id)))
                         && (place.z >= 0 || cell.symbol().trim().is_empty() || placeholder)
                 })
                 .collect();
@@ -228,7 +213,7 @@ impl Painter {
                 rendered[first].set_symbol(&symbol[index..]);
                 // Send pixels independently of frame cells: a later palette overlay may
                 // erase the first placeholder before the backend draws it.
-                let _ = std::io::stdout().write_all(symbol[..index].as_bytes());
+                let _ = std::io::stdout().write_all(&symbol.as_bytes()[..index]);
             }
             for position in paint {
                 buf[position] = rendered[position].clone();
@@ -237,6 +222,66 @@ impl Painter {
         }
         self.cache.retain(|key, _| keep.contains(key));
     }
+}
+
+/// Resolve full ids from the engine's known first visible placeholder, without copying
+/// its diacritic table. A third mark carries the high byte; compact cells inherit it
+/// from a preceding placeholder with the same foreground and placement colour.
+fn placeholder_ids(frame: &Frame, buf: &Buffer, area: Rect) -> HashMap<(u16, u16), (u32, u32)> {
+    fn color_id(color: ratatui::style::Color) -> Option<u32> {
+        match color {
+            ratatui::style::Color::Rgb(r, g, b) => {
+                Some((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b))
+            }
+            ratatui::style::Color::Indexed(id) => Some(u32::from(id)),
+            _ => None,
+        }
+    }
+    let mut encoded = HashMap::new();
+    for y in area.y..area.bottom() {
+        let mut previous: Option<(u32, u32, char)> = None;
+        for x in area.x..area.right() {
+            let cell = &buf[(x, y)];
+            if !cell.symbol().starts_with('\u{10eeee}') {
+                previous = None;
+                continue;
+            }
+            let Some(base) = color_id(cell.fg) else {
+                previous = None;
+                continue;
+            };
+            let placement = color_id(cell.underline_color).unwrap_or(0);
+            let high = cell
+                .symbol()
+                .chars()
+                .nth(3)
+                .or_else(|| {
+                    previous
+                        .filter(|p| p.0 == base && p.1 == placement)
+                        .map(|p| p.2)
+                })
+                .unwrap_or('\u{0305}');
+            let key = (base, placement, high);
+            encoded.insert((x, y), key);
+            previous = Some(key);
+        }
+    }
+    let mut ids = HashMap::new();
+    for place in frame.state.visible() {
+        if let PlacementPosition::Placeholder(p) = place.position {
+            let anchor = (area.x + p.col, area.y + p.row);
+            if let Some(&key) = encoded.get(&anchor)
+                && key.0 == place.image_id & 0xffffff
+                && key.1 == place.placement_id
+            {
+                ids.insert(key, (place.image_id, place.placement_id));
+            }
+        }
+    }
+    encoded
+        .into_iter()
+        .filter_map(|(pos, key)| ids.get(&key).copied().map(|id| (pos, id)))
+        .collect()
 }
 
 fn bounded(width: u32, height: u32) -> bool {
@@ -322,6 +367,41 @@ fn clipped(col: i32, row: i32, cols: u32, rows: u32, area: Rect) -> Option<(Rect
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn overlapping_placeholder_regions_keep_the_full_image_id() {
+        use base64::Engine;
+        use ratatui::style::Color;
+        let mut actor = TerminalActor::new(6, 10, 20);
+        actor.enable_graphics(Default::default());
+        for (id, color) in [(23, [220u8, 90, 40, 255]), (0x01000017, [40, 90, 220, 255])] {
+            let pixels = base64::engine::general_purpose::STANDARD.encode(color.repeat(32 * 16));
+            actor.write(format!("\x1b_Ga=t,t=d,f=32,s=32,v=16,i={id};{pixels}\x1b\\\x1b_Ga=p,U=1,i={id},p=1,c=4,r=1\x1b\\").as_bytes());
+        }
+        let marks = ['\u{0305}', '\u{030d}', '\u{030e}', '\u{0310}'];
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
+        let pane = Rect::new(20, 8, 10, 6);
+        actor.write(b"\x1b[38;2;0;0;23m\x1b[58;2;0;0;1m");
+        for col in 0..4 {
+            let text = format!("\u{10eeee}{}{}{}", marks[0], marks[col], marks[col % 2]);
+            actor.write(text.as_bytes());
+            buf[(pane.x + col as u16, pane.y)]
+                .set_symbol(&text)
+                .set_fg(Color::Rgb(0, 0, 23))
+                .set_style(ratatui::style::Style::default().underline_color(Color::Rgb(0, 0, 1)));
+        }
+        let mut frame = Frame::default();
+        frame.update(&actor, 0);
+        assert_eq!(frame.state.visible().len(), 2);
+        Painter::default().draw(&frame, &mut buf, pane, &Picker::halfblocks());
+        for col in 0..4 {
+            let expected = if col % 2 == 0 {
+                Color::Rgb(220, 90, 40)
+            } else {
+                Color::Rgb(40, 90, 220)
+            };
+            assert_eq!(buf[(pane.x + col, pane.y)].bg, expected);
+        }
+    }
     #[test]
     fn inline_pixels_have_a_cell_fallback_inside_the_pane() {
         use base64::Engine;

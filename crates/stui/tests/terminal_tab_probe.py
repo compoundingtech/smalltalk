@@ -538,10 +538,13 @@ def controls_and_images(worker):
             wait_for(tab.status, lambda s: s and not s["image_cells"], "direct image delete")
             rows.append({"case": "images/direct-placement", "clipped": True, "delete": True})
             # The palette stays stui's, and detach is available through its overlay.
-            tab.emit(RESET)
+            tab.emit(RESET + b"\x1b[>27u")
             before = len(tab.input())
             tab.send(b"\x0b")
             wait_for(tab.status, lambda s: s and s["palette"], "Ctrl-K palette")
+            tab.send(b"\x1b[97;1:2u\x1b[97;1:3u")
+            time.sleep(0.07)
+            assert tab.input()[before:] == b"", "palette leaked repeat/release input"
             tab.send(b"\x1c")
             wait_for(tab.status, lambda s: s and s["detached"], "detach through palette")
             assert tab.input()[before:] == b""
