@@ -14,6 +14,9 @@ const PAGE: usize = 64;
 const READ_BYTES: usize = 4 * 1024 * 1024;
 const BUDGET: Duration = Duration::from_millis(50);
 
+mod encoding;
+pub(super) use encoding::encode_claim_spans;
+
 pub(super) fn initialize(connection: &Connection) -> Result<()> {
     let columns = connection
         .prepare("PRAGMA table_info(replica_records)")?

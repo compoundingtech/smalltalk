@@ -2824,15 +2824,11 @@ fn seed_replica_envelopes_signed_tx(
             accepted_at_unix_ms: accepted_at.parse().unwrap_or_default(),
             claims: claims.clone(),
         };
-        let mut payload = Vec::new();
-        ciborium::into_writer(
-            &ReplicaEnvelopePayload {
-                batch,
-                blobs,
-                claim_signatures,
-            },
-            &mut payload,
-        )?;
+        let (payload, spans) = record_offsets::encode_claim_spans(&ReplicaEnvelopePayload {
+            batch,
+            blobs,
+            claim_signatures,
+        })?;
         let envelope_hash = replica_envelope_hash(
             &writer,
             sequence,
@@ -2863,7 +2859,7 @@ fn seed_replica_envelopes_signed_tx(
             &envelope_hash,
             &payload,
         )? {
-            record_offsets::Spans::parse(&payload).ok()
+            Some(spans)
         } else {
             None
         };
