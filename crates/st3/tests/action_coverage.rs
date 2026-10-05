@@ -20,6 +20,9 @@ const WORKER: &str = "agent/example/worker";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_owned_seat_rollout_captures_fences_and_survives_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use st3::store::owned_sets::{Options, Source};
     let mut daemon = Daemon::new().await;
     let seat = "agent/garden/maple";
@@ -472,6 +475,9 @@ async fn dispatch(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn messages_survive_stale_fences_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     let fence = daemon.fence(PERSON).await;
     let sent = daemon
@@ -505,6 +511,9 @@ async fn messages_survive_stale_fences_and_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn creation_and_declaration_actions_survive_stale_fences_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     let workspace = daemon.root.path().display().to_string();
     let fence = daemon.fence(PERSON).await;
@@ -564,6 +573,9 @@ async fn creation_and_declaration_actions_survive_stale_fences_and_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn work_actions_survive_stale_fences_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for end in ["work.complete", "work.fail", "work.release"] {
         let mut daemon = Daemon::new().await;
         daemon.worker();
@@ -665,6 +677,9 @@ impl Daemon {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn human_review_actions_survive_stale_fences_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for (kind, mode, verdict) in [
         ("review.approve", "approve", "pass"),
         ("review.reject", "approve", "fail"),
@@ -747,6 +762,9 @@ mission "example/review" state="ready" {{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lane_actions_survive_stale_fences_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     daemon.apply(
@@ -823,6 +841,9 @@ mission "example/lane" state="ready" {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launch_actions_survive_stale_fences_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for end in ["launch.approve", "launch.revise", "launch.cancel"] {
         let mut daemon = Daemon::new().await;
         let fence = daemon.fence(PERSON).await;
@@ -911,6 +932,9 @@ async fn launch_actions_survive_stale_fences_and_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seat_queue_moves_survive_stale_fences_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     daemon.apply(r#"version 2
@@ -938,6 +962,9 @@ mission "example/queue" state="ready" { concurrent-runs; goal "Order a seat's wo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pairing_revocation_survives_stale_fences_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     let challenge: Value = daemon.transport().post("/v1/client/pairings", &json!({"api_version": "st3.client.v0", "device_name": "Copper phone", "person_id": PERSON, "full_control": true})).await.unwrap();
     let pairing = challenge["pairing_id"]
@@ -972,6 +999,9 @@ async fn pairing_revocation_survives_stale_fences_and_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn person_work_actions_survive_stale_fences_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for kind in ["work.done", "work.cancel-ask"] {
         let mut daemon = Daemon::new().await;
         daemon.worker();
@@ -1006,6 +1036,9 @@ async fn person_work_actions_survive_stale_fences_and_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mission_actions_survive_stale_fences_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.apply(r#"version 2
 mission "example/cancel" state="ready" { concurrent-runs; goal "Exercise a run cancellation."; step "wait" { agentless } }
@@ -1032,6 +1065,9 @@ mission "example/cancel" state="ready" { concurrent-runs; goal "Exercise a run c
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_import_survives_stale_discovery_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     let transcript = daemon
         .root
@@ -1104,6 +1140,9 @@ async fn native_import_survives_stale_discovery_and_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revision_decisions_survive_stale_previews_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for kind in ["mission.approve-revision", "mission.cancel-revision"] {
         let mut daemon = Daemon::new().await;
         let source = |goal: &str| {
@@ -1187,6 +1226,9 @@ async fn revision_decisions_survive_stale_previews_and_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn suspension_requests_survive_stale_incarnations_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     daemon.claim(WORKER, "harness.session-file", json!({"harness": "claude", "session_id": "copper-suspended-native", "agent": WORKER, "incarnation_id": "4242:fixture", "status": "active"}));
@@ -1248,6 +1290,9 @@ async fn suspension_requests_survive_stale_incarnations_and_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_actions_refuse_before_and_after_restart_without_writes() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     for (kind, parameters, code) in [
         (
@@ -1372,6 +1417,9 @@ impl Daemon {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_controls_survive_stale_screens_and_daemon_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     let pty = daemon.pty(WORKER).await;
@@ -1451,6 +1499,9 @@ async fn terminal_controls_survive_stale_screens_and_daemon_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_controls_survive_stale_incarnations_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for kind in [
         "runtime.context-clear",
         "runtime.signal",
@@ -1520,6 +1571,9 @@ async fn runtime_controls_survive_stale_incarnations_and_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_runtime_reset_survives_stale_desired_revision_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.apply(&format!("version 2\nmission \"example/reset\" state=\"ready\" {{ goal \"Reset a runtime.\"; agent \"worker\" {{ workspace {:?}; command \"true\"; restart always }}; step \"hold\" {{ assigned-to \"agent/worker\" }} }}\n", daemon.root.path()), "reset-mission");
     let run = daemon.start("example/reset", "reset-run");
@@ -1563,6 +1617,9 @@ async fn run_runtime_reset_survives_stale_desired_revision_and_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn glasses_save_delete_and_read_survive_stale_bases_and_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     let id = "019a0000-0000-7000-8000-000000000042";
     let body = json!({"name": "Copper workspace", "layout": {"tabs": [{"title": "Home", "pane": "home:"}]}});
@@ -1631,6 +1688,9 @@ async fn glasses_save_delete_and_read_survive_stale_bases_and_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_reads_preserve_operational_views_after_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     daemon.apply("version 2\nmission \"example/inspect\" state=\"ready\" { goal \"Inspect the graph.\"; step \"work\" { assigned-to \"agent/example/worker\" } }\n", "inspect-mission");
@@ -1721,6 +1781,9 @@ async fn cli_reads_preserve_operational_views_after_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_metadata_documents_blobs_and_rules_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     cli_value(
@@ -1845,6 +1908,9 @@ async fn cli_metadata_documents_blobs_and_rules_survive_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     let file = daemon.root.path().join("work.kdl");
@@ -2063,6 +2129,9 @@ async fn cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_rest
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_send_reply_read_archive_search_and_attachments_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     let image = daemon.root.path().join("copper.png");
@@ -2166,6 +2235,9 @@ async fn cli_send_reply_read_archive_search_and_attachments_survive_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_aged_unread_cleanup_preserves_fresh_and_read_mail_across_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2302,6 +2374,9 @@ async fn cli_aged_unread_cleanup_preserves_fresh_and_read_mail_across_restart() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_revision_propose_inspect_approve_and_cancel_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for decision in ["approve", "cancel"] {
         let mut daemon = Daemon::new().await;
         let source = |goal: &str| {
@@ -2387,6 +2462,9 @@ async fn cli_revision_propose_inspect_approve_and_cancel_survive_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     daemon.apply("version 2\nmission \"example/update\" state=\"ready\" { goal \"Report to its requester.\"; step \"report\" { assigned-to \"agent/example/worker\" } }\n", "update-mission");
@@ -2524,6 +2602,9 @@ async fn cli_person_asks_updates_done_cancel_and_retired_attention_survive_resta
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_mission_output_and_manual_wake_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     daemon.apply("version 2\nmission \"example/producer\" state=\"ready\" { goal \"Publish the child mission.\"; step \"produce\" { assigned-to \"agent/example/worker\"; produces-mission \"example/produced\" } }\n", "output-producer");
@@ -2599,6 +2680,9 @@ async fn cli_mission_output_and_manual_wake_survive_restart() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_service_install_status_restart_reset_uninstall_use_isolated_manager() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     for directory in ["bin", "home", "config/st3", "state/st3", "data", "run"] {
@@ -2743,6 +2827,9 @@ PY
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_launch_planning_questions_variants_approval_and_run_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for end in ["approve", "approve-and-launch", "revise", "cancel"] {
         let mut daemon = Daemon::new().await;
         let request = daemon.root.path().join("request.md");
@@ -2963,6 +3050,9 @@ async fn cli_launch_planning_questions_variants_approval_and_run_survive_restart
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_terminal_controls_and_stream_capabilities_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     let pty = daemon.pty(WORKER).await;
@@ -3050,6 +3140,9 @@ async fn cli_terminal_controls_and_stream_capabilities_survive_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_local_skill_completions_holds_and_repairs_use_private_files() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     daemon.apply(&format!("version 2\nagent \"example/worker\" {{ host {NODE:?}; workspace {:?}; harness \"codex\" {{}}; restart always }}\n", daemon.root.path()), "codex-hold-worker");
@@ -3159,6 +3252,9 @@ async fn cli_local_skill_completions_holds_and_repairs_use_private_files() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_subscription_release_and_cancel_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     for (command, held, expected) in [
         ("release", true, "pending"),
@@ -3207,6 +3303,9 @@ async fn cli_subscription_release_and_cancel_survive_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_replication_inspection_and_repair_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     const FLEET: &str = "5e3c1a9b-2d4f-4b6e-8a7c-0f1e2d3c4b5a";
     let mut daemon = Daemon::new().await;
     daemon.store().bind_fleet(FLEET).unwrap();
@@ -3308,6 +3407,9 @@ async fn cli_replication_inspection_and_repair_survive_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_devices_and_native_import_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     let challenge = cli_value(
         daemon
@@ -3449,6 +3551,9 @@ async fn cli_devices_and_native_import_survive_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_launch_proposes_a_named_variant_from_an_exact_run_generation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.apply("version 2\nmission \"example/variants\" state=\"ready\" { goal \"Record the initial proof.\"; step \"proof\" { agentless } }\n", "variants-initial");
     let run = daemon.start("example/variants", "variants-run");
@@ -3559,6 +3664,9 @@ async fn cli_launch_proposes_a_named_variant_from_an_exact_run_generation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_seat_suspension_and_resume_wait_for_durable_owner_acknowledgements() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     daemon.worker();
     daemon.claim(WORKER, "harness.session-file", json!({"harness": "claude", "session_id": "copper-cli-suspended", "agent": WORKER, "incarnation_id": "4242:fixture", "status": "active"}));
@@ -3618,6 +3726,9 @@ async fn cli_seat_suspension_and_resume_wait_for_durable_owner_acknowledgements(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_human_reviews_act_on_the_current_card_after_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for (kind, mode, verdict) in [
         ("approve", "approve", "pass"),
         ("reject", "approve", "fail"),
@@ -3706,6 +3817,9 @@ mission "example/review" state="ready" {{
 
 #[test]
 fn action_inventory_matches_contract_and_has_existing_test_references() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use std::collections::BTreeSet;
     let inventory: Value =
         serde_json::from_str(include_str!("../../../docs/st3/action-coverage.json")).unwrap();
@@ -3814,6 +3928,9 @@ fn action_inventory_matches_contract_and_has_existing_test_references() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_github_gates_pass_wait_and_refuse_over_private_http_across_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     let index = daemon.store().index().unwrap();
     for _ in 0..2 {
@@ -3898,6 +4015,9 @@ async fn cli_github_gates_pass_wait_and_refuse_over_private_http_across_restart(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_agent_and_shell_declarations_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let mut daemon = Daemon::new().await;
     const SEAT: &str = "agent/example/cli-seat";
     let store = daemon.state.store.clone();

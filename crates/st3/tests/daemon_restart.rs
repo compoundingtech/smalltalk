@@ -248,6 +248,9 @@ fn stop(mut child: Child) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/restart-claude";
@@ -373,6 +376,9 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/restart-omp";
@@ -464,6 +470,9 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_after_catchup() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/restart-todo";
@@ -570,6 +579,9 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribution() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use sha2::Digest as _;
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
@@ -636,6 +648,9 @@ async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_omp_ask_clears_without_poisoning_the_next_incarnation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/human-omp";
@@ -721,6 +736,9 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
 
 #[test]
 fn a_cli_command_says_the_daemon_is_unreachable_and_never_to_start_it() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
@@ -746,6 +764,9 @@ fn a_cli_command_says_the_daemon_is_unreachable_and_never_to_start_it() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cli_command_waits_out_a_daemon_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let mut daemon = Daemon::new(root);
@@ -778,6 +799,9 @@ async fn a_cli_command_waits_out_a_daemon_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for driver in ["omp", "pi"] {
         for transport in ["poll", "push"] {
             let root = tempfile::tempdir().unwrap();
@@ -935,6 +959,9 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delivered_unread_mail_stays_in_the_mailbox_after_seat_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for driver in ["omp", "pi"] {
         for transport in ["push", "poll"] {
             let root = tempfile::tempdir().unwrap();
@@ -1146,6 +1173,9 @@ impl ClaudeChannelFixture {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receipt_forms() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for mid_turn in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
@@ -1235,6 +1265,9 @@ async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receip
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_staged_mail_receipted_after_restart_is_not_injected_on_second_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let mut daemon = Daemon::new(root);
@@ -1303,6 +1336,9 @@ async fn claude_staged_mail_receipted_after_restart_is_not_injected_on_second_re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_preboot_mail_is_held_while_live_receipts_survive_outage() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let mut daemon = Daemon::new(root);
@@ -1384,6 +1420,9 @@ async fn claude_preboot_mail_is_held_while_live_receipts_survive_outage() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_delivered_unread_mail_from_an_old_ledger_is_held_in_a_fresh_session() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let mut daemon = Daemon::new(root);

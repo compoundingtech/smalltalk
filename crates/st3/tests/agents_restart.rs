@@ -364,15 +364,24 @@ async fn restarts_preserving_declaration(mission: bool) {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restarts_top_level_seat_on_a_new_incarnation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     restarts_preserving_declaration(false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restarts_mission_seat_without_redeclaring_it() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     restarts_preserving_declaration(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_reports_timeout_and_launch_failure() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::new(false).await;
     let output = cli(
         &fixture.root.path().join("st3.sock"),
@@ -405,6 +414,9 @@ async fn restart_reports_timeout_and_launch_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_is_idempotent_and_cannot_revive_a_later_stop() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::new(false).await;
     let first = fixture.request(&subject, "same").await;
     assert_eq!(first.id, fixture.request(&subject, "same").await.id);
@@ -459,6 +471,9 @@ async fn restart_is_idempotent_and_cannot_revive_a_later_stop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delayed_restart_does_not_stop_a_newer_incarnation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::new(false).await;
     let request = fixture.request(&subject, "delayed").await;
     let member = fixture.runtime.starts.lock().unwrap()[0].clone();
@@ -473,6 +488,9 @@ async fn a_delayed_restart_does_not_stop_a_newer_incarnation() {
 
 #[test]
 fn restart_help_explains_seats_and_the_new_incarnation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         .env_remove("ST_AGENT")
         .args(["agents", "--help"])
@@ -518,6 +536,9 @@ fn restarted_daemon(fixture: &Fixture) -> Reconciler<Runtime> {
 /// database, workspace and runtime all belong to this fixture.
 #[tokio::test]
 async fn one_shot_exit_retires_keeps_history_and_can_start_again() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for (shape, status, exit_code) in [
         (Shape::TopLevel, "exited", Some(0)),
         (Shape::TopLevel, "exited", Some(17)),
@@ -613,6 +634,9 @@ async fn one_shot_exit_retires_keeps_history_and_can_start_again() {
 
 #[tokio::test]
 async fn one_shot_exit_found_after_daemon_restart_retires_without_a_pty_record() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::launching(
         Shape::TopLevel,
         r#"command "sleep 1000"; one-shot"#,
@@ -636,6 +660,9 @@ async fn one_shot_exit_found_after_daemon_restart_retires_without_a_pty_record()
 
 #[tokio::test]
 async fn one_shot_exit_retires_an_owned_set_member_without_changing_its_source() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::launching(
         Shape::TopLevel,
         r#"command "sleep 1000"; one-shot"#,
@@ -716,6 +743,9 @@ async fn one_shot_exit_retires_an_owned_set_member_without_changing_its_source()
 
 #[tokio::test]
 async fn one_shot_unknown_snapshot_keeps_the_seat_live_until_exit_is_known() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::launching(
         Shape::TopLevel,
         r#"command "sleep 1000"; one-shot"#,
@@ -761,6 +791,9 @@ async fn one_shot_unknown_snapshot_keeps_the_seat_live_until_exit_is_known() {
 
 #[tokio::test]
 async fn seats_without_one_shot_keep_their_exit_and_restart_behaviour() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for restart in ["never", "always", "on-failure"] {
         for exit_code in [0, 17] {
             let (fixture, subject) =
@@ -796,6 +829,9 @@ async fn seats_without_one_shot_keep_their_exit_and_restart_behaviour() {
 
 #[tokio::test]
 async fn explicit_restart_of_one_shot_replaces_the_process_without_retiring_the_seat() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::launching(
         Shape::TopLevel,
         r#"command "sleep 1000"; one-shot"#,
@@ -818,6 +854,9 @@ async fn explicit_restart_of_one_shot_replaces_the_process_without_retiring_the_
 
 #[tokio::test]
 async fn one_shot_start_after_retirement_continues_the_same_native_session() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::launching(
         Shape::TopLevel,
         r#"harness "claude" { model "example-model"; }; one-shot"#,
@@ -888,11 +927,17 @@ async fn stopped_mission_seat_stays_stopped(shape: Shape) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_mission_seat_stays_stopped_when_the_daemon_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     stopped_mission_seat_stays_stopped(Shape::Mission).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_step_seat_stays_stopped() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     stopped_mission_seat_stays_stopped(Shape::Step).await;
 }
 
@@ -988,11 +1033,17 @@ async fn starts_a_stopped_mission_seat_on_its_own_declaration(shape: Shape) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn starting_a_stopped_mission_seat_restores_its_declaration_and_creates_nothing_else() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     starts_a_stopped_mission_seat_on_its_own_declaration(Shape::Mission).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn starting_a_stopped_step_seat_restores_its_declaration() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     starts_a_stopped_mission_seat_on_its_own_declaration(Shape::Step).await;
 }
 
@@ -1006,6 +1057,9 @@ fn github_observer_running(store: &Store, thread: &st3::github_watch::ThreadRef)
 /// The native mailbox stream proof lives beside its authenticated API in api/mailbox.rs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_then_start_keeps_a_github_watch_and_its_queued_wake() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     // A mission seat also exercises restoring its original owning declaration.
     let (fixture, subject) = Fixture::new(true).await;
     let thread = st3::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
@@ -1108,6 +1162,9 @@ async fn stop_then_start_keeps_a_github_watch_and_its_queued_wake() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_a_retired_seats_declaration_ends_its_watch_and_stops_the_last_observer() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::new(true).await;
     let thread = st3::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
     fixture
@@ -1163,6 +1220,9 @@ async fn removing_a_retired_seats_declaration_ends_its_watch_and_stops_the_last_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_finished_run_cannot_start_its_seat_again() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::new(true).await;
     let socket = fixture.root.path().join("st3.sock");
     succeeded(
@@ -1255,6 +1315,9 @@ async fn client_action(fixture: &Fixture, kind: &str, agent: &str, key: &str) ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_stops_and_starts_a_mission_seat_on_its_own_declaration() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::new(true).await;
     let before = fixture
         .store
@@ -1349,6 +1412,9 @@ fn hang_up(fixture: &Fixture) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_declared_workspace_change_restarts_a_running_seat() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::new(false).await;
     let socket = fixture.root.path().join("st3.sock");
     let elsewhere = fixture.root.path().join("elsewhere");
@@ -1440,6 +1506,9 @@ async fn a_declared_workspace_change_restarts_a_running_seat() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_restart_continues_the_seats_last_native_session() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::claude(Shape::TopLevel, "always").await;
     let socket = fixture.root.path().join("st3.sock");
     // A first launch has no session to continue.
@@ -1534,6 +1603,9 @@ async fn every_restart_continues_the_seats_last_native_session() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_the_driver_could_not_continue_is_not_tried_again() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let (fixture, subject) = Fixture::claude(Shape::TopLevel, "always").await;
     bind_session(&fixture, &subject, "fixture:1", "session-one").await;
     // The driver started a new session instead, and said so once for that session.

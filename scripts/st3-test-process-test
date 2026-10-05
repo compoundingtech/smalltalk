@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Regression proofs for isolated test process ownership; never uses fleet daemons."""
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+
+
+def canary_module():
+    loader = SourceFileLoader("boot_canary", str(HERE / "st3-boot-canaries/run"))
+    module = module_from_spec(spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def boot_fixture(binary, evidence, mode):
+    """Use the actual boot-canary Node, then deliberately omit its cleanup.
+
+    A detached stand-in covers the PTY server's double-fork/new-session behavior.
+    Normal exit deletes the daemon's binary directory before guardian cleanup,
+    reproducing the observed deleted-/tmp/bc-*/bin/st3 leak.
+    """
+    canary = canary_module()
+    root = canary.private_root()
+    try:
+        node = canary.Node(root, Path(binary).resolve(), "claude")
+        node.start()
+        detached = subprocess.Popen([sys.executable, "-c", """
+import os, time
+if os.fork(): os._exit(0)
+os.setsid()
+if os.fork(): os._exit(0)
+print(os.getpid(), flush=True)
+time.sleep(600)
+"""], stdout=subprocess.PIPE, text=True)
+        escaped = int(detached.stdout.readline())
+        detached.wait()
+        evidence = Path(evidence)
+        evidence.mkdir(parents=True, exist_ok=True)
+        (evidence / "ready.json").write_text(json.dumps({
+            "daemon": node.daemon.pid, "escaped": escaped, "root": str(root),
+            "fixture": os.getpid(), "guardian": int(os.environ["SMALLTALK_TEST_SUPERVISOR"]),
+        }))
+        if mode == "exit":
+            return
+        if mode == "failure":
+            raise AssertionError("injected failure before cleanup")
+        while True:
+            time.sleep(1)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def wait_for(predicate, message, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.02)
+    raise AssertionError(message)
+
+
+class OwnershipTests(unittest.TestCase):
+    def fixture(self, mode, signal_to_test=None, signal_to_fixture=None):
+        with tempfile.TemporaryDirectory(prefix="cleanup-proof-") as directory:
+            evidence = Path(directory)
+            env = {**os.environ, "ST3_CLEANUP_FIXTURE": directory,
+                   "ST3_CLEANUP_FIXTURE_MODE": mode, "PYTHONDONTWRITEBYTECODE": "1"}
+            # This is the real Rust test process, including supervise_test(),
+            # rather than a Python approximation of nextest's kill behavior.
+            with (evidence / "rust.log").open("wb") as log:
+                runner = subprocess.Popen([RUST_TEST, "--exact", "boot_canaries::cleanup_fixture",
+                                           "--ignored", "--nocapture"], env=env, stdout=log, stderr=log)
+                rows = None
+                fixture_fds = []
+                try:
+                    def ready():
+                        path = evidence / "ready.json"
+                        if not path.exists():
+                            self.assertIsNone(runner.poll(), (evidence / "rust.log").read_text())
+                            return None
+                        try:
+                            return json.loads(path.read_text())
+                        except json.JSONDecodeError:
+                            return None
+                    rows = wait_for(ready, "boot-canary daemon did not become ready", timeout=90)
+                    for kind in ("daemon", "escaped", "fixture"):
+                        try:
+                            fixture_fds.append(os.pidfd_open(rows[kind]))
+                        except ProcessLookupError:
+                            pass
+                    if signal_to_test:
+                        os.kill(runner.pid, signal_to_test)
+                    if signal_to_fixture:
+                        os.kill(rows["fixture"], signal_to_fixture)
+                    runner.wait(timeout=10)
+                    if mode == "exit":
+                        self.assertEqual(runner.returncode, 0, (evidence / "rust.log").read_text())
+                    else:
+                        self.assertNotEqual(runner.returncode, 0)
+                    for kind in ("daemon", "escaped"):
+                        wait_for(lambda: not Path(f"/proc/{rows[kind]}").exists(),
+                                 f"{kind} {rows[kind]} outlived its test", timeout=5)
+                finally:
+                    if runner.poll() is None:
+                        runner.kill()
+                        runner.wait()
+                    if rows:
+                        # Only these explicitly recorded private fixture processes.
+                        # Keep regression failures from becoming another leak.
+                        for fd in fixture_fds:
+                            try:
+                                signal.pidfd_send_signal(fd, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            finally:
+                                os.close(fd)
+                        shutil.rmtree(rows["root"], ignore_errors=True)
+
+    def test_success_reaps_daemon_and_detached_descendant(self):
+        self.fixture("exit")
+
+    def test_assertion_failure_reaps_daemon_and_detached_descendant(self):
+        self.fixture("failure")
+
+    def test_rust_panic_reaps_daemon_and_detached_descendant(self):
+        self.fixture("panic")
+
+    def test_sigkill_of_rust_test_reaps_daemon_and_detached_descendant(self):
+        self.fixture("hold", signal_to_test=signal.SIGKILL)
+
+    def test_sigterm_of_rust_test_reaps_daemon_and_detached_descendant(self):
+        self.fixture("hold", signal_to_test=signal.SIGTERM)
+
+    def test_sigkill_of_python_fixture_reaps_daemon_and_detached_descendant(self):
+        self.fixture("hold", signal_to_fixture=signal.SIGKILL)
+
+    def test_evidence_failure_cannot_skip_node_stop(self):
+        canary = canary_module()
+        node = SimpleNamespace(root=Path("/unused-private-canary"), daemon=None)
+        node.start = lambda: canary.fail("injected startup failure")
+        node.pty = lambda *args: (_ for _ in ()).throw(OSError("injected evidence failure"))
+        args = SimpleNamespace(binary=Path(BINARY), harness="claude", scenario="fresh", bound=180)
+        with patch.object(canary, "Node", return_value=node), patch.object(node, "stop", create=True) as stop:
+            with self.assertRaisesRegex(OSError, "evidence failure"):
+                canary.run(args, node.root, Path("/unused-evidence"))
+            stop.assert_called_once()
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--boot-fixture"]:
+        boot_fixture(*sys.argv[2:])
+    else:
+        BINARY, RUST_TEST = sys.argv[1:3]
+        del sys.argv[1:3]
+        unittest.main()
