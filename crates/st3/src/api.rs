@@ -46,7 +46,7 @@ use crate::model::{
     OperationalRepairResult, PlannerSpec, PlanningApprovalRequest, PlanningCancelRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
     PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest, QuickAgentResponse,
-    ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse, ReplicationHealAnswer,
+    ReplicaRecordView, ReplicaRecordsPage, ReplicationExportRequest, ReplicationExportResponse, ReplicationHealAnswer,
     ReplicationHealAnswerRequest, ReplicationHealNextRequest, ReplicationHealStep,
     ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
     ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
@@ -6506,6 +6506,8 @@ async fn replication_status(
 struct ReplicationRecordsQuery {
     #[serde(default = "default_true")]
     unresolved: bool,
+    after: Option<String>,
+    limit: Option<usize>,
 }
 
 fn default_true() -> bool {
@@ -6515,11 +6517,28 @@ fn default_true() -> bool {
 async fn replication_records(
     State(state): State<AppState>,
     Query(query): Query<ReplicationRecordsQuery>,
-) -> Result<Json<Vec<ReplicaRecordView>>, ApiError> {
+) -> Result<Json<ReplicaRecordsPage>, ApiError> {
     let store = state.store.clone();
-    blocking_store(move || store.replica_records(query.unresolved))
-        .await
-        .map(Json)
+    let limit = query.limit.unwrap_or(256).clamp(1, 512);
+    if let Some(cursor) = query.after.as_deref() {
+        smallclaims::store::decode_replica_record_cursor(cursor).map_err(|_| {
+            ApiError::bad(St3Error::new("invalid-cursor", "invalid replica record cursor"))
+        })?;
+    }
+    let records = blocking_store(move || {
+        store.replica_records_page(query.unresolved, query.after.as_deref(), limit)
+    })
+    .await?;
+    let next = if records.len() == limit {
+        records
+            .last()
+            .map(smallclaims::store::replica_record_cursor)
+            .transpose()
+            .map_err(ApiError::internal)?
+    } else {
+        None
+    };
+    Ok(Json(ReplicaRecordsPage { records, next, limit }))
 }
 
 async fn replication_record(
@@ -13761,6 +13780,59 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn replica_record_pages_expose_a_seek_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        {
+            let connection = state.store.connection.lock().unwrap();
+            for (record_ref, sequence) in [("record/one", 1), ("record/two", 2)] {
+                connection.execute(
+                    "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,
+                         position,raw,state,updated_at_unix_ms)
+                     VALUES (?1,'invented-node',?2,'hash',0,X'','invalid','1')",
+                    rusqlite::params![record_ref, sequence],
+                ).unwrap();
+            }
+        }
+        let app = router(state);
+        let first = app.clone().oneshot(Request::builder()
+            .uri("/v1/replication/records?limit=1")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: Value = serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(first["value"]["records"][0]["record_ref"], "record/one");
+        let cursor = first["value"]["next"].as_str().unwrap();
+        let second = app.clone().oneshot(Request::builder()
+            .uri(format!("/v1/replication/records?limit=1&after={cursor}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: Value = serde_json::from_slice(&to_bytes(second.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(second["value"]["records"][0]["record_ref"], "record/two");
+        let cursor = second["value"]["next"].as_str().unwrap();
+        let empty = app.clone().oneshot(Request::builder()
+            .uri(format!("/v1/replication/records?limit=1&after={cursor}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(empty.status(), StatusCode::OK);
+        let empty: Value = serde_json::from_slice(&to_bytes(empty.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(empty["value"]["records"], serde_json::json!([]));
+        assert!(empty["value"]["next"].is_null());
+        let malformed = app.clone().oneshot(Request::builder()
+            .uri("/v1/replication/records?after=invalid!")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(malformed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let clamped = app.clone().oneshot(Request::builder()
+            .uri("/v1/replication/records?limit=9999")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let clamped: Value = serde_json::from_slice(&to_bytes(clamped.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(clamped["value"]["limit"], 512);
+        let minimum = app.clone().oneshot(Request::builder()
+            .uri("/v1/replication/records?limit=0")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let minimum: Value = serde_json::from_slice(&to_bytes(minimum.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(minimum["value"]["limit"], 1);
+    }
 
     #[tokio::test]
     async fn a_seat_reads_its_own_desired_record_for_its_status_line() {

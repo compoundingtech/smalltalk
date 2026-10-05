@@ -535,6 +535,16 @@ st doctor
 ```
 
 The status view reports the authority digest, graph digest, record counts, projection health, and last peer results.
+The records API returns a page object with `records`, `next`, and `limit`; it returns at most 256
+rows by default (512 maximum). Pass `next` as the URL-encoded `after` query parameter until it is
+null. An exact full final page can return a cursor whose next page is empty. The page object makes
+incomplete collections visible to clients that previously expected an
+array. `st replication invalid` prints one page (100 rows by default) and a command for the next
+page; `--all` still includes valid and repaired states. Use `--limit` and `--after` to choose a
+page. Its `--json` output contains the same page object. A record lookup by reference uses the
+primary key and does not read the collection. Pages read current committed rows; if records are
+inserted or change state during a traversal, restart from the first page to inspect the new
+membership. The cursor remains valid if its preceding record is removed.
 
 A Fabric `peer not permitted for service` answer means the member's grants refuse that direct
 route. It shows as `refused`, with the Fabric node and service, in `st replication status`,

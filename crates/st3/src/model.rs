@@ -11,7 +11,7 @@ pub use smallclaims::claim::{
 pub use smallclaims::replication::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 pub use smallclaims::replication::{
     ClaimRange, ClaimRangeDigest, ClaimSubjectDigest, HealClaim, InventoryCheckpoint,
-    ReplicaRecordView, ReplicationExchange, ReplicationExportRequest, ReplicationExportResponse,
+    ReplicaRecordView, ReplicaRecordsPage, ReplicationExchange, ReplicationExportRequest, ReplicationExportResponse,
     ReplicationFirstSync, ReplicationHealAnswer, ReplicationHealAnswerRequest,
     ReplicationHealNextRequest, ReplicationHealQuery, ReplicationHealReport,
     ReplicationHealRequest, ReplicationHealStep, ReplicationInventory, ReplicationInventoryBucket,

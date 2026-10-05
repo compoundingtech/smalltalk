@@ -333,6 +333,14 @@ pub struct ReplicaRecordView {
     pub replacement_claim_id: Option<String>,
 }
 
+/// A bounded diagnostic collection. `next` is an opaque seek cursor for the next page.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicaRecordsPage {
+    pub records: Vec<ReplicaRecordView>,
+    pub next: Option<String>,
+    pub limit: usize,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ReplicationStatus {
     pub configured: bool,
