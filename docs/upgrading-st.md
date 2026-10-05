@@ -1,4 +1,4 @@
-# Upgrade Small Talk safely
+# Upgrade Smalltalk safely
 
 Upgrade each machine in your own fleet to the **same release**. Keep the old archive and read the new release's compatibility notes before starting it against your state. For an initial installation, use [getting started](getting-started.md).
 

@@ -1,6 +1,6 @@
-# Get started with Small Talk
+# Get started with Smalltalk
 
-Small Talk (`st`) keeps coding agents running as durable **seats** and gives them work as **missions**. Its graph remembers work, messages, and decisions across agent and daemon restarts.
+Smalltalk turns your coding agents into a team that doesn't need babysitting. Describe the work once as a mission, with its goals, its constraints and the checks that prove it's done right, not just done. Agents on your own machines carry it through, survive restarts, and bring you only the decisions that are yours to make. You plan and decide; your agents do the rest, all day and overnight.
 
 For now, each person runs their own fleet. Start with one machine; [add your second machine](two-machines.md) when you need it.
 
@@ -83,7 +83,7 @@ cd ~/st/garden
 git init
 ```
 
-Install Small Talk's Claude message channel (it may ask for your administrator password). Finish any workspace trust prompt when you attach to the seat in step 4:
+Install Smalltalk's Claude message channel (it may ask for your administrator password). Finish any workspace trust prompt when you attach to the seat in step 4:
 
 ```sh
 st claude-channel install

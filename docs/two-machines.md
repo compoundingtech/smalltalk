@@ -4,7 +4,7 @@ Your machines can share one fleet: each daemon keeps a local replica of the grap
 
 If either machine has a populated v0.3.4 store, preserve its raw state and keys and follow the [founder signing audit](st3/founder-signing-audit.md) before installation, doctor, restart, or fleet creation/join. The v0.3.4 rehearsal found [unsigned grants](https://github.com/compoundingtech/smalltalk/issues/1228) after standalone restart. v0.3.5's source contains the prevention fix; upgrading cannot repair already-sealed unsigned history.
 
-Finish [getting started](getting-started.md) on the first machine. Install Small Talk, set `person = "person/ada"`, and start its user service on the second machine too. Harnesses and their logins are needed only on machines that will run seats.
+Finish [getting started](getting-started.md) on the first machine. Install Smalltalk, set `person = "person/ada"`, and start its user service on the second machine too. Harnesses and their logins are needed only on machines that will run seats.
 
 ## Join over SSH
 

@@ -1,4 +1,4 @@
-# Developing Small Talk
+# Developing Smalltalk
 
 ## Contributing
 
@@ -30,7 +30,7 @@ Client terminal screens use `pty-terminal` and the same pinned `libghostty-vt` a
 the PTY runtime. Styled runs carry terminal-cell widths (including wide characters), soft-wrap
 continuations, strikethrough and admitted OSC 8 links; keyboard modes include kitty flags.
 The Nix package and developer shell link the shared static library through pkg-config, so
-building Small Talk does not require Zig or a Ghostty source checkout.
+building Smalltalk does not require Zig or a Ghostty source checkout.
 The runtime, screen projector and terminal UI pin their PTY protocol crates to the same
 producer revision, keeping one shared protocol source in the workspace.
 

@@ -1,4 +1,4 @@
-# Small Talk with Home Manager
+# Smalltalk with Home Manager
 
 Import `inputs.smalltalk.homeManagerModules.default` and configure the user service:
 

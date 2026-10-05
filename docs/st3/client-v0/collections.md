@@ -79,7 +79,7 @@ A conversation is one more subscription too. Name an agent or a session:
 {"kind":"subscribe","id":"talk","collection":"conversation","conversation":"agent/ID"}
 ```
 
-An agent's conversation is its current session's timeline with the Small Talk to or from the agent
+An agent's conversation is its current session's timeline with the Smalltalk to or from the agent
 joined in. The first `conversation` frame carries `id`, `collection` (`conversation`),
 `session_id`, `replace: true`, the newest page of timeline `items`, and `has_more`. Later frames
 carry `replace: false` and the entries that changed since; an entry revised in place arrives

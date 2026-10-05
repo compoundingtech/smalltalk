@@ -1,14 +1,12 @@
-# Small Talk
+# Smalltalk
 
-Small Talk (`st`) runs coding agents as durable seats and hands them work as missions. Its graph
-records seats, missions, steps, messages, and decisions, so work survives harness, daemon, and
-machine restarts. One daemon runs on each machine; your machines can join a fleet.
+Smalltalk turns your coding agents into a team that doesn't need babysitting. Describe the work once as a mission, with its goals, its constraints and the checks that prove it's done right, not just done. Agents on your own machines carry it through, survive restarts, and bring you only the decisions that are yours to make. You plan and decide; your agents do the rest, all day and overnight.
 
-Use the terminal UI, CLI, or iOS app to follow work and talk to agents. Small Talk observes each
-harness through its driver; missions carry the goals and constraints for the work. Each person
-currently runs their own fleet.
+`st` runs agents as durable seats and records work, messages, and decisions in a graph.
+One daemon runs on each machine; your machines can join a fleet. Use the terminal UI, CLI,
+or iOS app to follow work and talk to agents. Each person currently runs their own fleet.
 
-**[Get started](docs/getting-started.md)** — install Small Talk and give your first agent a mission.
+**[Get started](docs/getting-started.md)** — install Smalltalk and give your first agent a mission.
 
 Platforms/status: Linux x86_64 and macOS Apple Silicon; fresh-Mac setup is not yet verified, and macOS CI is currently disabled.
 
