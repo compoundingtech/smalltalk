@@ -3505,3 +3505,236 @@ async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart
     assert_eq!(ended["ended"], "unwatched");
     server.abort();
 }
+
+/// Real native drivers on two private fleet daemons: the source never launches after suspend,
+/// and the target launches only after receiving the Git workspace and the same native transcript.
+#[tokio::test(flavor = "multi_thread")]
+async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_conversation() {
+    let root = tempfile::tempdir().unwrap();
+    struct SeatCleanup {
+        pty: PathBuf,
+        roots: Vec<PathBuf>,
+    }
+    impl Drop for SeatCleanup {
+        fn drop(&mut self) {
+            for root in &self.roots {
+                let output = Command::new(&self.pty)
+                    .args(["list", "--json"])
+                    .env("PTY_ROOT", root)
+                    .output();
+                if let Ok(output) = output
+                    && let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&output.stdout)
+                {
+                    for row in rows {
+                        if let Some(name) = row["name"].as_str() {
+                            let _ = Command::new(&self.pty)
+                                .args(["kill", name])
+                                .env("PTY_ROOT", root)
+                                .output();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let pty = st_runtime::resolve_executable("pty", &std::env::vars().collect()).unwrap();
+    let node_program = st_runtime::resolve_executable("node", &std::env::vars().collect()).unwrap();
+    let mut cleanup = SeatCleanup { pty: pty.clone(), roots: Vec::new() };
+    let mut amber = anchor(root.path(), "fixture-move-amber").await;
+    let mut jade = joined(root.path(), &amber, "fixture-move-jade", &[]).await;
+    cleanup.roots = vec![amber.state_dir().join("pty"), jade.state_dir().join("pty")];
+    for node in [&mut amber, &mut jade] {
+        node.stop();
+        fs::write(
+            node.root.join("bin/pty"),
+            format!("#!/bin/sh\nexec '{}' \"$@\"\n", pty.display()),
+        )
+        .unwrap();
+        let stub = node.root.join("bin/omp");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nexec env STUB_HARNESS=omp '{}' '{}' \"$@\"\n",
+                node_program.display(),
+                repo.join("scripts/st3-boot-canaries/stub-pi-family.mjs")
+                    .display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        node.start().await;
+    }
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Canary")
+            .env("GIT_AUTHOR_EMAIL", "canary@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Canary")
+            .env("GIT_COMMITTER_EMAIL", "canary@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    fs::write(workspace.join("tracked"), "original\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "Original"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    fs::write(workspace.join("tracked"), "changed\n").unwrap();
+    fs::write(workspace.join("untracked"), "copper workspace\n").unwrap();
+    let seat = "agent/canary/portable";
+    let declaration = root.path().join("seat.kdl");
+    fs::write(&declaration, format!("version 2\nagent \"canary/portable\" {{ host \"fixture-move-amber\"; workspace \"{}\"; harness \"omp\" {{}} }}", workspace.display())).unwrap();
+    amber.st_ok(&[
+        "agents",
+        "apply",
+        declaration.to_str().unwrap(),
+        "--as",
+        PERSON,
+    ]);
+    let receipts = workspace.join("receipts-agent-canary-portable.jsonl");
+    wait_until("source native session becomes idle", 90, || async {
+        amber.st_json(&["agents", "show", seat])["value"]["harness_state"] == "idle"
+    })
+    .await;
+    amber.st_ok(&[
+        "conversations",
+        "send",
+        seat,
+        "--from",
+        PERSON,
+        "--subject",
+        "copper history",
+        "--body",
+        "Remember the copper orchard.",
+    ]);
+    wait_until("source reads the first message", 60, || async {
+        fs::read_to_string(&receipts)
+            .unwrap_or_default()
+            .contains("Remember the copper orchard")
+    })
+    .await;
+    let suspended = amber.st_json(&[
+        "agents",
+        "suspend",
+        seat,
+        "--as",
+        PERSON,
+        "--timeout",
+        "60s",
+    ]);
+    let native = suspended["suspension"]["native_session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source_sessions =
+        st3::seat_snapshot::sessions(&amber.state_dir().join("drivers"), seat, "omp");
+    let transcript = st3::native_resume::pi_family_transcript(&source_sessions, &native).unwrap();
+    let before = fs::read(&transcript).unwrap();
+    assert!(String::from_utf8_lossy(&before).contains("Remember the copper orchard"));
+    wait_until("suspension replicates to target", 60, || async {
+        jade.st_json(&["agents", "show", seat])["value"]["suspension"]["phase"] == "suspended"
+    })
+    .await;
+    // Both daemons share this test's filesystem. An existing path represents an occupied target,
+    // and must refuse even when it happens to be the source's checkout.
+    let occupied = jade.st(&[
+        "agents",
+        "resume",
+        seat,
+        "--host",
+        "fixture-move-jade",
+        "--as",
+        PERSON,
+        "--timeout",
+        "60s",
+    ]);
+    assert!(!occupied.status.success());
+    assert!(
+        String::from_utf8_lossy(&occupied.stderr).contains("workspace-occupied"),
+        "{}\n{}",
+        String::from_utf8_lossy(&occupied.stderr),
+        jade.logs()
+    );
+    assert_eq!(git(&["rev-parse", "HEAD"]), head);
+    // Preserve the stopped source checkout elsewhere, modelling the target's independent disk
+    // with an unoccupied path at the exact same absolute cwd.
+    fs::rename(&workspace, root.path().join("preserved-source-workspace")).unwrap();
+    let resumed = jade.st_json(&[
+        "agents",
+        "resume",
+        seat,
+        "--host",
+        "fixture-move-jade",
+        "--as",
+        PERSON,
+        "--timeout",
+        "90s",
+    ]);
+    assert_eq!(resumed["id"], seat);
+    assert_eq!(resumed["suspension"]["phase"], "resumed");
+    assert_eq!(resumed["suspension"]["native_session_id"], native);
+    assert_eq!(
+        fs::read_to_string(workspace.join("tracked")).unwrap(),
+        "changed\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("untracked")).unwrap(),
+        "copper workspace\n"
+    );
+    assert_eq!(git(&["rev-parse", "HEAD"]), head);
+    let target_sessions =
+        st3::seat_snapshot::sessions(&jade.state_dir().join("drivers"), seat, "omp");
+    let target_transcript =
+        st3::native_resume::pi_family_transcript(&target_sessions, &native).unwrap();
+    assert!(fs::read(&target_transcript).unwrap().starts_with(&before));
+    jade.st_ok(&[
+        "conversations",
+        "send",
+        seat,
+        "--from",
+        PERSON,
+        "--subject",
+        "after move",
+        "--body",
+        "The copper orchard continued.",
+    ]);
+    wait_until(
+        "target reads mail in the resumed conversation",
+        60,
+        || async {
+            fs::read_to_string(&target_transcript)
+                .unwrap_or_default()
+                .contains("The copper orchard continued")
+        },
+    )
+    .await;
+    assert_eq!(
+        fs::read(&transcript).unwrap(),
+        before,
+        "source transcript changed after the move"
+    );
+    let source_ptys = Command::new(&pty).args(["list", "--json"])
+        .env("PTY_ROOT", amber.state_dir().join("pty")).output().unwrap();
+    let source_ptys: Vec<Value> = serde_json::from_slice(&source_ptys.stdout).unwrap();
+    assert!(source_ptys.iter().all(|row| row["status"] != "running"), "source still has a live PTY: {source_ptys:?}");
+    jade.st_ok(&[
+        "agents",
+        "suspend",
+        seat,
+        "--as",
+        PERSON,
+        "--timeout",
+        "60s",
+    ]);
+}

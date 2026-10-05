@@ -22,6 +22,7 @@ pub struct Extras {
     pub bodies: BTreeMap<String, (String, Option<String>, String)>,
     pub live: bool,
     pub offline: Option<String>,
+    pub mail_backlog: Option<Result<st3_client::MailBacklog, String>>,
 }
 
 fn now() -> String {
@@ -141,6 +142,11 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         host,
         link,
         diverged,
+        mail_backlog: match &extras.mail_backlog {
+            Some(Ok(value)) => Load::Ready(value.clone()),
+            Some(Err(error)) => Load::Failed(error.clone()),
+            None => Load::Loading,
+        },
         attention: loaded(model.now.snapshot.is_some(), attention),
         agents: loaded(model.agents.snapshot.is_some(), agents(model)),
         missions: loaded(model.missions.snapshot.is_some(), missions),
@@ -561,6 +567,15 @@ fn agents(model: &Model) -> Vec<Agent> {
                     AgentState::NeedsYou
                 }
                 ("waiting", Some("blocked")) => AgentState::NeedsYou,
+                // st withdraws an idle claim it has not heard renewed lately: the harness reads
+                // "indeterminate" and the seat "waiting", though it is up and reachable. That is an
+                // idle seat nobody has spoken to, not one starting (Nathan, 2026-10-05).
+                ("waiting", Some("indeterminate"))
+                    if agent.observation.as_deref() == Some("stale")
+                        && matches!(agent.reachability.as_str(), "reachable" | "local") =>
+                {
+                    AgentState::Idle
+                }
                 ("waiting" | "starting" | "desired", _) => AgentState::Starting,
                 ("stopped", _) => AgentState::Stopped,
                 _ => AgentState::Unknown,
@@ -605,6 +620,11 @@ fn agents(model: &Model) -> Vec<Agent> {
                     queued: agent.queued_work_count,
                     harness_state: agent.harness_state.clone(),
                     runtime: None,
+                    model: agent
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.context.as_ref())
+                        .and_then(|context| context.model.clone()),
                     fault: agent.fault.clone(),
                     under: agent.under.first().map(|relation| {
                         model
@@ -1514,6 +1534,32 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_seat_st_has_not_heard_from_lately_reads_idle_not_starting() {
+        let mut model = Model::default();
+        let resource = |state: &str, harness: &str, observation: Option<&str>| {
+            serde_json::json!({
+                "id": "agent/example/quiet", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-10-05T12:00:00Z", "name": "example/quiet",
+                "state": state, "reachability": "reachable", "harness_state": harness,
+                "observation": observation, "blocked_on": "none", "runtime_ids": [], "under": [],
+            })
+        };
+        // Its idle claim went stale: st says waiting/indeterminate; the seat is just idle.
+        model.agents = window(vec![resource("waiting", "indeterminate", Some("stale"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::Idle);
+        // Without that staleness, an indeterminate waiting seat is still starting.
+        model.agents = window(vec![resource("waiting", "indeterminate", Some("current"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+        model.agents = window(vec![resource("waiting", "indeterminate", None)]);
+        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+        // A stale observation on an unreachable seat is no news that it is idle.
+        let mut gone = resource("waiting", "indeterminate", Some("stale"));
+        gone["reachability"] = "unreachable".into();
+        model.agents = window(vec![gone]);
+        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+    }
+
+    #[test]
     fn a_signed_out_harness_needs_login_and_clears_once_signed_in() {
         let mut model = Model::default();
         let resource = |state: &str, harness: &str, reason: Option<&str>| {
@@ -1655,6 +1701,33 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_header_names_the_model_beside_the_harness() {
+        let world = crate::ui::demo::world();
+        let mut agent = world.agents.items()[0].clone();
+        assert_eq!(agent.details.model.as_deref(), Some("claude-sonnet-5-5"));
+        let line = |agent: &Agent| -> String {
+            let doc = crate::ui::screens::agent_header(&world, agent, 100, "⠋");
+            doc.lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let with = line(&agent);
+        assert!(
+            with.contains(&format!("{} · claude-sonnet-5-5 · ", agent.harness.name())),
+            "{with}"
+        );
+        agent.details.model = None;
+        let without = line(&agent);
+        assert!(!without.contains("sonnet"), "{without}");
+        assert!(
+            without.contains(&format!("{} · {} ", agent.harness.name(), agent.host)),
+            "{without}"
+        );
+    }
+
+    #[test]
     fn only_an_older_st_build_is_called_older_than_its_member() {
         assert!(older_than_member("stui 0.0.9+77d0a13", "0.1.0+1ecae71"));
         assert!(older_than_member("st 0.1.0+local.ab12cd3", "0.2.0+1ecae71"));
@@ -1687,11 +1760,41 @@ mod tests {
         assert!(text.contains("CONNECTED CLIENTS"), "{text}");
         assert!(text.contains("stui 0.1.0+1ecae71"), "{text}");
         assert!(text.contains("person/robin · Robin's phone"), "{text}");
+        // The follows list may wrap, so its words are checked apart.
+        assert!(text.contains("follows now,"), "{text}");
         assert!(
-            text.contains("follows now, terminal:terminal/agent/lark/planner"),
+            text.contains("terminal:terminal/agent/lark/planner"),
             "{text}"
         );
         assert!(text.contains("seen 3m ago"), "{text}");
         assert_eq!(text.matches("older than this member").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn the_clients_card_wraps_a_long_client_instead_of_clipping_it() {
+        let world = crate::ui::demo::world();
+        let doc = crate::ui::screens::clients_card(&world, 44);
+        let lines: Vec<String> = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        for line in &lines {
+            assert!(
+                crate::ui::text::width(line) <= 44,
+                "clipped at the card's edge: {line:?}"
+            );
+        }
+        let text = lines.join("\n");
+        assert!(text.contains("smalltalk-ios 1.0 (42)"), "{text}");
+        assert!(
+            text.contains("terminal:terminal/agent/lark/planner"),
+            "{text}"
+        );
     }
 }

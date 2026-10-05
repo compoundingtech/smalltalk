@@ -768,6 +768,73 @@ pub(super) struct AgentDeclarationQuery {
     show_env_values: bool,
 }
 
+/// A workspace belongs to the seat's declaration and host, not this API gateway's filesystem.
+/// Follow the same unambiguous stop predecessors that start uses, including one-shot retirement.
+pub(super) async fn agent_workspace(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    require_scope(&session, "read.projections")?;
+    let subject = client_detail_id("agent", &id);
+    let result = blocking_store(move || {
+        state.store.read_snapshot(|index| {
+            let status = state.store.status_at(Some(&subject), None, Some(index))?;
+            let Some(status) = status
+                .subjects
+                .into_iter()
+                .find(|item| item.subject == subject)
+            else {
+                return Ok(None);
+            };
+            if !status.conflicts.is_empty() {
+                return Err(anyhow::anyhow!(St3Error::new(
+                    "validation-failed",
+                    "agent has conflicting declarations",
+                )));
+            }
+            let Some(token) = status.desired_token else {
+                return Ok(None);
+            };
+            let mut claim = state
+                .store
+                .claim_by_id(&token)?
+                .ok_or_else(|| anyhow::anyhow!("selected declaration is missing"))?;
+            loop {
+                let desired: crate::model::DesiredSubject = serde_json::from_value(claim.body)?;
+                if desired.kind == "agent" {
+                    let Some(member) = desired.member else {
+                        return Ok(None);
+                    };
+                    let value = json!({
+                        "kind": "agent-workspace",
+                        "agent_id": subject,
+                        "host_id": client_host_id(&member.host),
+                        "workspace": member.workspace,
+                        "desired_token": token,
+                        "declaration_token": claim.id,
+                    });
+                    return Ok(Some((client_snapshot_at(&state, index), value)));
+                }
+                if desired.kind != "stop" || claim.predecessors.len() != 1 {
+                    return Err(anyhow::anyhow!(St3Error::new(
+                        "validation-failed",
+                        "agent has no unambiguous prior declaration",
+                    )));
+                }
+                claim = state
+                    .store
+                    .claim_by_id(&claim.predecessors[0])?
+                    .ok_or_else(|| anyhow::anyhow!("prior declaration is missing"))?;
+            }
+        })
+    })
+    .await?;
+    let (snapshot, value) =
+        result.ok_or_else(|| ApiError::not_found("agent workspace not found"))?;
+    Ok((Extension(snapshot), Json(value)))
+}
+
 /// Both redacted and explicit environment-value reads require declaration scope.
 pub(super) async fn agent_declaration(
     State(state): State<AppState>,
@@ -1187,6 +1254,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"device-key-proofs", "version":1, "state":"granted"}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
@@ -1259,7 +1327,9 @@ pub(super) fn authenticate(
         let pairing_completion = request.method() == axum::http::Method::POST
             && request.uri().path().starts_with("/v1/client/pairings/")
             && request.uri().path().ends_with("/complete");
-        return pairing_completion
+        let pairing_capabilities = request.method() == axum::http::Method::GET
+            && request.uri().path() == "/v1/client/capabilities";
+        return (pairing_completion || pairing_capabilities)
             .then(ClientSession::pairing)
             .ok_or_else(|| forbidden("the Fabric-loopback client credential is required"));
     };
@@ -5504,6 +5574,10 @@ pub(super) fn device_signing_key(public_key: &str) -> Option<&str> {
     }
 }
 
+// Proof preparation must not let simultaneous completions enroll a second key after another
+// request has consumed the same code. All checks and store writes follow this serialization.
+static PAIRING_COMPLETIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub(super) async fn pairing_complete(
     State(state): State<AppState>,
     Extension(_session): Extension<ClientSession>,
@@ -5515,6 +5589,7 @@ pub(super) async fn pairing_complete(
             "the pairing completion has an invalid version or public key",
         ));
     }
+    let _completion = PAIRING_COMPLETIONS.lock().await;
     let pairing_id = client_detail_id("pairing", &id);
     let subject = format!("custom/client/pairing-{id}");
     let begun = state
@@ -5580,6 +5655,61 @@ pub(super) async fn pairing_complete(
         None => LIMITED_PAIRING_SCOPES.to_vec(),
         Some(_) => return Err(validation("the pairing has invalid delegated scopes")),
     };
+    // A device with a real key, paired to send messages, is enrolled: the person's root key
+    // grants it as a device key. A device paired only to read gets no key that speaks for the
+    // person, so a wall display can never sign as them.
+    let signs = scopes.contains(&"control.messages");
+    let enrollment = match device_signing_key(&device_public_key).filter(|_| signs) {
+        Some(key) => {
+            let name = begun
+                .body
+                .pointer("/fields/device_name")
+                .and_then(Value::as_str)
+                .unwrap_or("device");
+            let storage = match request.key_storage.as_deref() {
+                Some("secure-enclave") => " (secure enclave)",
+                Some("software") => " (software key)",
+                _ => "",
+            };
+            let chain = state
+                .store
+                .enroll_device_key(&person_id, key, &format!("{name}{storage}"))
+                .map_err(ApiError::bad)?;
+            // All proof-producing work precedes the single-use completion claim. Failure
+            // here can leave an unused key grant, but never spends the code or creates a bearer.
+            state
+                .store
+                .seal_local_batches()
+                .map_err(ApiError::internal)?;
+            let cannot_prove = || {
+                validation(
+                    "the member cannot produce verifiable enrollment grants; the pairing code was not consumed. Inspect the member's signing history",
+                )
+            };
+            let mut proofs = Vec::new();
+            for id in &chain {
+                let grant = state
+                    .store
+                    .claim_by_id(id)
+                    .map_err(ApiError::internal)?
+                    .ok_or_else(cannot_prove)?;
+                let signature = state
+                    .store
+                    .claim_signature(id)
+                    .map_err(ApiError::internal)?
+                    .ok_or_else(cannot_prove)?;
+                proofs.push(json!({
+                    "id": grant.id, "batch_id": grant.batch_id, "subject": grant.subject,
+                    "kind": grant.kind, "origin": grant.origin, "actor": grant.actor,
+                    "body": grant.body, "predecessors": grant.predecessors, "signature": signature,
+                }));
+            }
+            st3_client::device::verify_device_key_proofs(&person_id, &chain, &proofs, key)
+                .map_err(|_| cannot_prove())?;
+            Some((chain, proofs))
+        }
+        None => None,
+    };
     let completed = state.store.append_claim(&ClaimInput {
         subject: begun.subject.clone(),
         kind: "custom.client.pairing-completed".into(),
@@ -5614,48 +5744,9 @@ pub(super) async fn pairing_complete(
         }
         return Err(ApiError::bad(error));
     }
-    // A device with a real key, paired to send messages, is enrolled: the person's root key
-    // grants it as a device key. A device paired only to read gets no key that speaks for the
-    // person, so a wall display can never sign as them.
-    let signs = scopes.contains(&"control.messages");
-    let chain = match device_signing_key(&device_public_key).filter(|_| signs) {
-        Some(key) => {
-            let name = begun
-                .body
-                .pointer("/fields/device_name")
-                .and_then(Value::as_str)
-                .unwrap_or("device");
-            let storage = match request.key_storage.as_deref() {
-                Some("secure-enclave") => " (secure enclave)",
-                Some("software") => " (software key)",
-                _ => "",
-            };
-            Some(
-                state
-                    .store
-                    .enroll_device_key(&person_id, key, &format!("{name}{storage}"))
-                    .map_err(ApiError::bad)?,
-            )
-        }
-        None => None,
-    };
     signal_changed(&state);
     let mut session = json!({ "kind": "paired-session", "device_id": device_id, "person_id": person_id, "session_actor": session_actor, "credential": credential, "scopes": scopes, "expires_at": client_timestamp(expires_at) });
-    if let Some(chain) = chain {
-        // Return public, signed evidence for the exact enrolled key. Opaque IDs alone do not
-        // let a completing client detect a substituted key. Seal before reading signatures;
-        // this never repairs an already sealed unsigned grant.
-        state.store.seal_local_batches().map_err(ApiError::internal)?;
-        let mut proofs = Vec::new();
-        for id in &chain {
-            let grant = state.store.claim_by_id(id).map_err(ApiError::internal)?;
-            let signature = state.store.claim_signature(id).map_err(ApiError::internal)?;
-            proofs.push(grant.map(|grant| json!({
-                "id": grant.id, "batch_id": grant.batch_id, "subject": grant.subject,
-                "kind": grant.kind, "origin": grant.origin, "actor": grant.actor,
-                "body": grant.body, "predecessors": grant.predecessors, "signature": signature,
-            })).unwrap_or(Value::Null));
-        }
+    if let Some((chain, proofs)) = enrollment {
         session["device_key_chain"] = json!(chain);
         session["device_key_proofs"] = json!(proofs);
     }
@@ -8273,6 +8364,7 @@ async fn dispatch_action(
                 actor: authority_actor.clone(),
                 idempotency_key: request.idempotency_key.clone(),
                 reason,
+                host: if action == "agent.resume" { p.get("host").and_then(Value::as_str).map(str::to_owned) } else { None },
             };
             let fence = super::SuspensionFence {
                 incarnation,
@@ -9426,6 +9518,39 @@ mod tests {
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn agent_workspace_requires_projection_scope_only() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let intent = crate::graph::parse_intent(
+            "version 2\nagent \"garden/interactive\" { workspace \"/work/garden\"; harness \"omp\" {} }\n",
+            state.store.origin(),
+        ).unwrap();
+        state
+            .store
+            .apply_internal(&intent, "workspace-scope")
+            .unwrap();
+        let mut session = ClientSession::local(None).unwrap();
+        session.scopes = ["read.projections".to_owned()].into_iter().collect();
+        let (_, Json(value)) = agent_workspace(
+            State(state.clone()),
+            Extension(session.clone()),
+            AxumPath("garden/interactive".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["workspace"], "/work/garden");
+        session.scopes.clear();
+        let error = agent_workspace(
+            State(state),
+            Extension(session),
+            AxumPath("garden/interactive".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

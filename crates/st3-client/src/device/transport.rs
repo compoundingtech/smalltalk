@@ -76,6 +76,21 @@ pub(super) fn client(endpoint: &str, allow_public_http: bool) -> Result<reqwest:
     Ok(client.build()?)
 }
 
+/// Resolve at each connection and connect only to those exact admitted addresses.
+pub(crate) async fn websocket_tcp(url: &reqwest::Url) -> Result<tokio::net::TcpStream> {
+    let host = url
+        .host_str()
+        .context("WebSocket origin needs a host")?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let port = url
+        .port_or_known_default()
+        .context("WebSocket origin needs a port")?;
+    let addresses = tokio::net::lookup_host((host, port)).await?.collect();
+    let addresses = admitted_addresses(addresses)?.collect::<Vec<_>>();
+    Ok(tokio::net::TcpStream::connect(addresses.as_slice()).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

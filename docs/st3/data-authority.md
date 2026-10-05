@@ -1,9 +1,13 @@
 # st data authority
 
-This document classifies each SQLite table in schema version 15.
+This document classifies each SQLite table in schema version 16.
 
-Schema version 15 upgrades schema versions 10 through 14 in place. Document bindings gain a
-shared canonical `binding_key` and an index; existing keys are backfilled once from claims.
+Schema version 16 upgrades schema versions 10 through 15 in place. Envelope payloads are stored
+as their exact decoded bytes. Existing base64 TEXT rows convert to BLOBs after startup in bounded
+writer-queue transactions; each transaction commits its progress cursor with the converted bytes.
+Mixed TEXT/BLOB stores remain readable after interruption. This version changes no indexes, and
+older binaries reject it. Version 15 added the shared canonical document `binding_key` and its
+index, with existing keys backfilled once from claims.
 
 The claim log and immutable blobs are the durable graph authority.
 
@@ -196,7 +200,8 @@ version and rebuilt from admitted claims during graph replay. Updates, out-of-or
 repair, and retained-claim deletion refresh only affected resource subjects. Neither the
 projection nor its pending-subject queue is independent authority.
 
-Replication receipt stores an envelope before admission decodes its payload.
+Replication receipt decodes the wire's base64 representation and stores an envelope before
+admission interprets its CBOR payload. Malformed base64 remains exact TEXT evidence for admission.
 
 Admission validates each claim and blob independently. Invalid or unknown records do not enter graph projections.
 

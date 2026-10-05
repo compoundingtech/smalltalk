@@ -392,7 +392,13 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     let address = listener.local_addr().unwrap();
     let url = format!("http://{address}");
     let route = carrier(listener, gateway.clone());
-    assert!(Client::fabric_pairing(&url).capabilities().await.is_err());
+    let preflight = Client::fabric_pairing(&url);
+    let advertised = preflight.capabilities().await.unwrap();
+    assert!(advertised.value.capabilities.iter().any(|capability| capability.id == "device-key-proofs"));
+    assert!(advertised.value.capabilities.iter().filter(|capability| capability.id != "device-key-proofs")
+        .all(|capability| capability.state != st3_client::CapabilityState::Granted));
+    // Public compatibility discovery grants no authority to read the graph.
+    assert!(preflight.agents_list(None, None, false).await.is_err());
     pair(device.path(), &local, &url).await;
     let online_step = person_ask(&state, "online-proof", "Online proof");
     let mut tui = Tui::start(device.path());

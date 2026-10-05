@@ -1427,7 +1427,14 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
         span(agent.name.clone(), theme::bold()),
         span(format!("  {}", agent_word(agent.state)), theme::fg(color)),
     ];
-    let right = format!("{} · {} ", agent.harness.name(), agent.host);
+    // The model rides beside the harness, as the harness reported it.
+    let model = agent
+        .details
+        .model
+        .as_deref()
+        .map(|model| format!(" · {model}"))
+        .unwrap_or_default();
+    let right = format!("{}{model} · {} ", agent.harness.name(), agent.host);
     let used = first.iter().map(Span::width).sum::<usize>();
     first.push(span(
         " ".repeat(width.saturating_sub(used + text::width(&right))),
@@ -1437,7 +1444,7 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
         agent.harness.name(),
         theme::fg(harness_color(agent.harness)),
     ));
-    first.push(span(format!(" · {} ", agent.host), theme::dim()));
+    first.push(span(format!("{model} · {} ", agent.host), theme::dim()));
     doc.line(Line::from(first));
     let mut second = vec![span(format!("   {}", agent.id), theme::dim())];
     if let Some(tree) = &agent.worktree {
@@ -2175,11 +2182,7 @@ pub fn clients_card(world: &World, width: usize) -> Doc {
                 } else {
                     item.client.as_str()
                 };
-                let who = match &item.device {
-                    Some(device) => format!("{} · {device}", item.who),
-                    None => item.who.clone(),
-                };
-                let mut head = vec![
+                let head = vec![
                     span(
                         if item.connected { "● " } else { "○ " },
                         theme::fg(if item.connected {
@@ -2188,19 +2191,24 @@ pub fn clients_card(world: &World, width: usize) -> Doc {
                             theme::QUIET
                         }),
                     ),
-                    span(format!("{name}  "), theme::text()),
-                    span(who, theme::soft()),
+                    span(name.to_owned(), theme::text()),
                 ];
-                if item.older {
-                    head.push(span("  older than this member", theme::dim()));
-                }
                 inner.line(Line::from(head));
-                let mut about = vec![item.via.clone(), item.member.clone(), item.when.clone()];
+                // Who, how it came in, what it follows and the quiet "older" note wrap under the
+                // name, so nothing clips at the card's edge.
+                let mut about = vec![match &item.device {
+                    Some(device) => format!("{} · {device}", item.who),
+                    None => item.who.clone(),
+                }];
+                about.extend([item.via.clone(), item.member.clone(), item.when.clone()]);
                 if !item.follows.is_empty() {
                     about.push(format!("follows {}", item.follows.join(", ")));
                 }
+                if item.older {
+                    about.push("older than this member".to_owned());
+                }
                 inner.wrap(
-                    &[run(about.join(" · "), theme::dim())],
+                    &[run(format!("  {}", about.join(" · ")), theme::dim())],
                     width.saturating_sub(4),
                 );
             }
@@ -2725,6 +2733,7 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
         doc.line(Line::from(spans));
     };
     field(&mut doc, "harness", Some(agent.harness.name()));
+    field(&mut doc, "model", details.model.as_deref());
     field(&mut doc, "state", details.harness_state.as_deref());
     field(&mut doc, "runtime", details.runtime.as_deref());
     field(&mut doc, "host", Some(&agent.host));

@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Keep same-source build outputs outside the repository's dependency-cache quota."""
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from urllib.parse import quote
+
+sys.dont_write_bytecode = True
+loader = importlib.machinery.SourceFileLoader('ci_perf_cache', str(Path(__file__).with_name('ci-perf-cache')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+source = importlib.util.module_from_spec(spec)
+loader.exec_module(source)
+ALLOWED = {'.github/workflows/fleet.yml', '.github/workflows/main-upkeep.yml',
+           '.github/workflows/macos.yml', '.github/workflows/release-smalltalk.yml',
+           '.github/workflows/release-portable.yml'}
+
+
+def paths():
+    work, temp = Path(os.environ['GITHUB_WORKSPACE']), Path(os.environ['RUNNER_TEMP'])
+    cargo = Path(os.environ.get('CARGO_HOME', str(Path.home() / '.cargo') if os.environ.get('CI_NATIVE_SNAPSHOT') == '1' else str(temp / 'cargo-home')))
+    target = Path(os.environ.get('CARGO_TARGET_DIR', str(work / 'target')))
+    if not target.is_absolute(): target = work / target
+    if target.resolve() in (work.resolve(), Path('/')):
+        raise ValueError('unsafe target directory')
+    return work, temp, cargo, target
+
+
+def fingerprint():
+    work, _, _, _ = paths()
+    head = source.git(work, 'rev-parse', 'HEAD')
+    if not re.fullmatch(r'[a-f0-9]{40}', head): raise ValueError('expected the actual full source SHA')
+    flags = {key: value for key, value in os.environ.items()
+             if key.startswith('CARGO_PROFILE_') or key in ('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_BUILD_TARGET', 'CARGO_INCREMENTAL', 'MACOSX_DEPLOYMENT_TARGET')}
+    # Hash the workflow's content, rather than its whole commit: an unrelated main
+    # update must not invalidate an older accepted source's portable build.
+    controller = os.environ.get('CI_SNAPSHOT_PIPELINE_FILE')
+    if controller:
+        pipeline = Path(controller).read_bytes()
+    else:
+        reference = os.environ.get('GITHUB_WORKFLOW_REF', '')
+        relative = '.github/' + reference.split('.github/', 1)[1].split('@', 1)[0] if '.github/' in reference else ''
+        revision = os.environ.get('CI_SNAPSHOT_PIPELINE', source.git(work, 'rev-parse', 'HEAD'))
+        try:
+            pipeline = source.git(work, 'show', f'{revision}:{relative}').encode() if relative else Path(__file__).read_bytes()
+        except subprocess.CalledProcessError:
+            pipeline = (work / relative).read_bytes()
+    flags['pipeline'] = hashlib.sha256(pipeline).hexdigest()
+    if os.environ.get('CI_NATIVE_SNAPSHOT') == '1':
+        flags['compiler'] = subprocess.check_output(['rustc', '-vV'], text=True)
+        if os.environ['RUNNER_OS'] == 'macOS':
+            flags['swift'] = subprocess.check_output(['xcrun', 'swiftc', '--version'], text=True)
+            flags['sdk'] = subprocess.check_output(['xcrun', '--show-sdk-version'], text=True)
+    recipe = hashlib.sha256(json.dumps(flags, sort_keys=True).encode()).hexdigest()[:16]
+    return f"ci-build-v1-{os.environ['GITHUB_JOB']}-{os.environ['RUNNER_OS']}-{os.environ['RUNNER_ARCH']}-{recipe}-{head}"
+
+
+def trusted(run, event, repo):
+    if run.get('path') not in ALLOWED or run.get('conclusion') not in ('success', 'failure'):
+        return False
+    if event.get('pull_request'):
+        pr = event['pull_request']
+        if run.get('event') != 'pull_request' or run.get('head_branch') != pr['head']['ref']:
+            return False
+        if (run.get('head_repository') or {}).get('full_name') != pr['head']['repo']['full_name']:
+            return False
+        if run.get('pull_requests') and not any(item['number'] == pr['number'] for item in run['pull_requests']):
+            return False
+        return run.get('head_sha') == pr['head']['sha']
+    if event.get('merge_group'):
+        group = event['merge_group']
+        return (run.get('event') == 'merge_group'
+                and run.get('head_sha') == group['head_sha']
+                and run.get('head_branch', '').startswith('gh-readonly-queue/main/')
+                and (run.get('head_repository') or {}).get('full_name') == repo)
+    ref = os.environ.get('GITHUB_REF', '')
+    if ref.startswith('refs/tags/'):
+        return (run.get('event') in ('push', 'workflow_dispatch')
+                and run.get('head_branch') == ref.removeprefix('refs/tags/')
+                and (run.get('head_repository') or {}).get('full_name') == repo)
+    return (run.get('head_branch') == 'main' and run.get('event') in ('push', 'schedule', 'workflow_dispatch')
+            and (run.get('head_repository') or {}).get('full_name') == repo)
+
+
+def summary(message, warning=False):
+    print(('::warning::' if warning else '') + message, flush=True)
+    with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+        stream.write(('⚠️ **' + message + '**' if warning else message) + '\n')
+
+
+def stream(archive, command):
+    process = subprocess.Popen(['zstd', '-dc', str(archive)], stdout=subprocess.PIPE)
+    try:
+        result = subprocess.check_output(command, stdin=process.stdout, text=True)
+        process.stdout.close()
+        if process.wait(): raise ValueError('snapshot decompression failed')
+        return result
+    finally:
+        if process.poll() is None: process.terminate(); process.wait()
+
+
+def unpack(archive, dest):
+    names = stream(archive, ['tar', '-tf', '-']).splitlines()
+    for name in names:
+        parts = Path(name).parts
+        if not parts or name.startswith('/') or '..' in parts or parts[0] not in ('target', 'cargo-home', 'st-ci-cache', 'cost-stores', 'zig-tool'):
+            raise ValueError('unexpected snapshot archive path')
+    stream(archive, ['tar', '-xf', '-', '-C', str(dest)])
+    for name in ('target', 'cargo-home/registry', 'cargo-home/git', 'st-ci-cache'):
+        if not (dest / name).is_dir(): raise ValueError('incomplete build snapshot')
+
+
+def restore():
+    work, temp, cargo, target = paths()
+    if source.git(work, 'status', '--porcelain'):
+        summary('Build snapshot skipped: dirty source; Cargo validates the checkout.')
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as output: output.write('cache-hit=false\n')
+        return
+    if os.environ.get('CI_LOCAL_CACHES') == '1':
+        summary('Build snapshot: persistent runner stores; remote archives skipped.')
+    else:
+        repo = os.environ['GITHUB_REPOSITORY']
+        event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+        name = fingerprint()
+        artifacts = source.api(f'repos/{repo}/actions/artifacts?name={quote(name)}&per_page=100')['artifacts']
+        found = False
+        for artifact in artifacts:
+            if artifact.get('expired') or artifact['name'] != name: continue
+            run_id = artifact['workflow_run']['id']
+            run = source.api(f'repos/{repo}/actions/runs/{run_id}')
+            if str(run_id) == os.environ['GITHUB_RUN_ID'] and int(os.environ['GITHUB_RUN_ATTEMPT']) > 1:
+                run = source.api(f"repos/{repo}/actions/runs/{run_id}/attempts/{int(os.environ['GITHUB_RUN_ATTEMPT']) - 1}")
+            if not trusted(run, event, repo): continue
+            with tempfile.TemporaryDirectory(dir=temp) as tmp:
+                dest = Path(tmp)
+                source.download(repo, run, name, dest / 'download')
+                archives = list((dest / 'download').rglob('build.tar.zst'))
+                if len(archives) != 1: raise ValueError('missing build snapshot archive')
+                unpack(archives[0], dest)
+                checkpoint = dest / 'st-ci-cache/perf-source-state.json'
+                state = json.loads(checkpoint.read_text())
+                if state['head'] != source.git(work, 'rev-parse', 'HEAD'):
+                    raise ValueError('snapshot source identity differs from the checkout')
+                for staged, destination in ((dest / 'target', target), (dest / 'cargo-home/registry', cargo / 'registry'),
+                                            (dest / 'cargo-home/git', cargo / 'git'), (dest / 'st-ci-cache', temp / 'st-ci-cache')):
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if destination.exists(): shutil.rmtree(destination)
+                    shutil.move(staged, destination)
+                if (dest / 'cost-stores').is_dir():
+                    if (temp / 'st-bench').exists(): shutil.rmtree(temp / 'st-bench')
+                    shutil.move(dest / 'cost-stores', temp / 'st-bench')
+                    with open(os.environ['GITHUB_ENV'], 'a') as output: output.write('CI_BUILD_SNAPSHOT_STORES_HIT=1\n')
+                if (dest / 'zig-tool').is_dir():
+                    compiler = Path(os.environ['CI_ZIG_CACHE_DIR'])
+                    compiler.parent.mkdir(parents=True, exist_ok=True)
+                    if compiler.exists(): shutil.rmtree(compiler)
+                    shutil.move(dest / 'zig-tool', compiler)
+                    with open(os.environ['GITHUB_ENV'], 'a') as output: output.write('CI_BUILD_SNAPSHOT_ZIG_HIT=1\n')
+            with open(os.environ['GITHUB_ENV'], 'a') as output: output.write('CI_BUILD_SNAPSHOT_HIT=1\n')
+            with open(os.environ['GITHUB_OUTPUT'], 'a') as output: output.write('cache-hit=true\n')
+            summary('Build snapshot cache HIT: exact source, platform, flags and compiler; dependency archives skipped.')
+            found = True
+            break
+        if not found:
+            with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                output.write('cache-hit=false\n')
+                if int(os.environ['GITHUB_RUN_ATTEMPT']) > 1: output.write('avoidable-miss=true\n')
+            message = ('P0: repeated build snapshot MISS; this unchanged source has no retained build.' if int(os.environ['GITHUB_RUN_ATTEMPT']) > 1 else
+                       'Build snapshot MISS: this source needs a saved build; restoring dependency caches.')
+            summary(message, warning=True)
+    # Persistent runners keep the same checkpoint next to their actual target directory.
+    checkpoint = target / '.ci-source-state.json'
+    if os.environ.get('CI_BUILD_SNAPSHOT_HIT') == '1' or (temp / 'st-ci-cache/perf-source-state.json').exists():
+        source.restore_sources()
+    elif checkpoint.exists():
+        source.restore_sources(checkpoint)
+
+
+def prepare():
+    work, temp, cargo, target = paths()
+    for directory in (cargo / 'registry', cargo / 'git', temp / 'st-ci-cache', target): directory.mkdir(parents=True, exist_ok=True)
+    if os.environ.get('CI_LOCAL_CACHES') == '1' and (target / '.ci-source-state.json').exists():
+        source.restore_sources(target / '.ci-source-state.json')
+    source.remember_sources()
+    if (temp / 'perf-source-state.json').exists():
+        with open(os.environ['GITHUB_ENV'], 'a') as output:
+            output.write(f"AGENT_SPEC_REVISION={source.git(work, 'rev-parse', 'HEAD')}\n")
+
+
+def pack():
+    work, temp, cargo, target = paths()
+    captured = temp / 'perf-source-state.json'
+    if not captured.exists() or source.git(work, 'status', '--porcelain'):
+        summary('Build snapshot skipped: no clean source checkpoint.')
+        return
+    state = json.loads(captured.read_text())
+    if state['head'] != source.git(work, 'rev-parse', 'HEAD'):
+        raise ValueError('source changed while compiling')
+    shutil.copyfile(captured, target / '.ci-source-state.json')
+    if os.environ.get('CI_LOCAL_CACHES') == '1' or os.environ.get('CI_BUILD_SNAPSHOT_HIT') == '1': return
+    shutil.copyfile(captured, temp / 'st-ci-cache/perf-source-state.json')
+    output = temp / 'ci-build-snapshot'
+    output.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=temp) as tmp:
+        staged = Path(tmp)
+        def copy(src, dest):
+            try: return os.link(src, dest)
+            except OSError: return shutil.copy2(src, dest)
+        for src, dest in ((target, staged / 'target'), (cargo / 'registry', staged / 'cargo-home/registry'),
+                          (cargo / 'git', staged / 'cargo-home/git'), (temp / 'st-ci-cache', staged / 'st-ci-cache')):
+            shutil.copytree(src, dest, copy_function=copy, symlinks=True)
+        names = ['target', 'cargo-home', 'st-ci-cache']
+        if os.environ.get('CI_ZIG_CACHE_DIR'):
+            compiler = Path(os.environ['CI_ZIG_CACHE_DIR'])
+            if compiler.is_dir():
+                shutil.copytree(compiler, staged / 'zig-tool', copy_function=copy, symlinks=True)
+                names.append('zig-tool')
+        report = temp / 'perf/cost.json'
+        if (temp / 'st-bench').is_dir() and report.exists() and json.loads(report.read_text()).get('failures') == []:
+            shutil.copytree(temp / 'st-bench', staged / 'cost-stores', copy_function=copy, symlinks=True)
+            names.append('cost-stores')
+        process = subprocess.Popen(['tar', '--format=pax', '-cf', '-', '-C', str(staged), *names], stdout=subprocess.PIPE)
+        try:
+            subprocess.run(['zstd', '-1', '-T2', '-f', '-o', str(output / 'build.tar.zst')], stdin=process.stdout, check=True)
+            process.stdout.close()
+            if process.wait(): raise ValueError('snapshot archive failed')
+        finally:
+            if process.poll() is None: process.terminate(); process.wait()
+    with open(os.environ['GITHUB_OUTPUT'], 'a') as result:
+        result.write(f'publish=true\nname={fingerprint()}\n')
+
+
+if __name__ == '__main__':
+    try: {'restore': restore, 'prepare': prepare, 'pack': pack}[sys.argv[1]]()
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+        summary(f'P0: build snapshot operation failed: {error}', warning=True)
+        raise SystemExit(1)

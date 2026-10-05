@@ -243,6 +243,8 @@ enum Command {
         #[command(subcommand)]
         command: RuleCommand,
     },
+    /// Run any CLI with credentials no seat can read, through the sekrets gateway.
+    Sekrets(st3::sekrets::cli::SekretsArgs),
     /// Discover native harness sessions and move one under durable st ownership.
     Import {
         #[command(subcommand)]
@@ -1699,6 +1701,10 @@ struct MissionShowArgs {
 struct MissionPublishArgs {
     /// KDL file to publish; use `-` to read standard input.
     file: PathBuf,
+    /// Print the resolved publication preview without applying or running exec gates.
+    /// Use `missions check` separately to run the gates.
+    #[arg(long, visible_alias = "preview")]
+    dry_run: bool,
     /// Preview against this exact store index.
     #[arg(long, visible_alias = "at")]
     at_index: Option<u64>,
@@ -2718,6 +2724,8 @@ enum AgentsCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Print one seat's declared workspace directory on its owning host, even when stopped.
+    Workspace { subject: String },
     /// Declare one new agent seat, start its harness, and wait until it is ready.
     ///
     /// The declaration is the one a person writes by hand, with the harness defaults of the
@@ -3237,6 +3245,9 @@ struct AgentSuspendArgs {
 
 #[derive(Args)]
 struct AgentResumeArgs {
+    /// Resume the suspended conversation on this fleet host.
+    #[arg(long)]
+    host: Option<String>,
     /// Exact seat subject or its identity without the `agent/` prefix.
     #[arg(value_parser = parse_agent_start_identity)]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
@@ -3513,6 +3524,13 @@ struct AttentionWithdrawArgs {
 
 #[derive(Subcommand)]
 enum WorkCommand {
+    /// Open a one-step run for this seat without authoring a mission; then use claim.
+    Start(WorkStartArgs),
+    /// Release claimed work to another seat or person with a note they acknowledge.
+    Handoff(WorkHandoffArgs),
+    /// Acknowledge the exact handoff note before claiming or completing its work.
+    Acknowledge(WorkAcknowledgeArgs),
+
     /// Ask a person through a runtime step owned by live work.
     ///
     /// Puts a structured request on the person's home.
@@ -3593,6 +3611,44 @@ enum WorkCommand {
         #[command(subcommand)]
         command: WorkRevisionCommand,
     },
+}
+
+#[derive(Args)]
+struct WorkStartArgs {
+    /// What this spontaneous task is for.
+    title: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    /// Reuse a key after a timeout to recover the same run.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+struct WorkHandoffArgs {
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    #[arg(long, env = "ST3_INCARNATION")]
+    incarnation: Option<String>,
+    #[arg(long)]
+    to: String,
+    #[arg(long)]
+    note: String,
+    #[arg(long)]
+    evidence: Vec<String>,
+    #[arg(long)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+struct WorkAcknowledgeArgs {
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    /// The message ID from the handoff note or work show.
+    #[arg(long)]
+    message: String,
 }
 
 #[derive(Args)]
@@ -3823,6 +3879,18 @@ enum MessageCommand {
     Reply(MessageReplyArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
+    /// Archive unread mail past an age threshold as each recipient.
+    Cleanup {
+        #[arg(long, conflicts_with = "actor", required_unless_present = "actor")]
+        all: bool,
+        #[arg(long = "as", conflicts_with = "all", required_unless_present = "all")]
+        actor: Option<String>,
+        #[arg(long, default_value = "1h")]
+        older_than: String,
+        /// Show the matching message IDs without archiving them.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Render the bounded conversation thread around one message.
     Thread(MessageReferenceArgs),
     /// List normalized harness sessions available for native conversation views.
@@ -4433,6 +4501,13 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Skill(args) = cli.command {
         return run_skill(args);
     }
+    // The gateway runs as the sekrets user, which has no st configuration.
+    if let Command::Sekrets(args) = cli.command {
+        let code = st3::sekrets::cli::run(args, cli.json).await?;
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
     if let Command::ReplicationWorker(args) = cli.command {
         let mut config = Config::load_unvalidated(args.config.as_deref())?;
         if let Some(value) = args.node {
@@ -4478,6 +4553,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Sets { command } => run_owned_sets(&endpoint, command, cli.json).await,
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
+        Command::Sekrets(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
         Command::Usage(args) => run_usage(&immediate, args, cli.json).await,
@@ -4726,6 +4802,9 @@ fn guard_mutating_cli_actor(
             _ => None,
         },
         Command::Work { command } => match command {
+            WorkCommand::Start(args) => Some(args.actor.as_str()),
+            WorkCommand::Handoff(args) => Some(args.actor.as_str()),
+            WorkCommand::Acknowledge(args) => Some(args.actor.as_str()),
             WorkCommand::Claim(args) | WorkCommand::Renew(args) | WorkCommand::Progress(args)
             | WorkCommand::Complete(args) | WorkCommand::Fail(args) | WorkCommand::Release(args) => args.actor.as_deref(),
             WorkCommand::Wake(args) => args.actor.as_deref(),
@@ -5230,6 +5309,16 @@ async fn run_up(args: UpArgs) -> Result<()> {
         None => st_runtime::resolve_executable("pty", &login_environment)?,
     };
     let recorder = install_recorder(&config, &login_environment);
+    if let Some(person) = &config.person {
+        let _ = st3::sekrets::daemon::PERSON.set(person.clone());
+    }
+    // Sekrets is opt-in: this records a gateway's calls once one listens on this host.
+    st3::sekrets::daemon::spawn_importer(
+        store.clone(),
+        config.node.clone(),
+        config.state_dir.clone(),
+        st3::sekrets::client::socket_path(),
+    );
     let state = AppState {
         store: store.clone(),
         notify: notify.clone(),
@@ -5256,7 +5345,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         notify.clone(),
         event_notify.clone(),
         recorder.map(|installation| installation.directory),
-    )?.with_schedule_peers(state.configured_peers.clone()));
+    )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()));
     tokio::spawn(reconciler.supervise());
     // A start no longer rebuilds the operation projection; check it once the API serves.
     tokio::spawn({
@@ -5292,6 +5381,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
             },
         ));
     }
+    tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
@@ -5937,11 +6027,17 @@ async fn publish_mission_file(
             },
         )
         .await?;
+    if args.dry_run {
+        print_value(&mission, json_output)?;
+    }
     anyhow::ensure!(
         mission.blockers.is_empty(),
         "{}",
         mission.blockers.join("; ")
     );
+    if args.dry_run {
+        return Ok(());
+    }
     warn_ignored_authority(&mission);
     if !args.no_gate_check {
         check_before_publish(client, &intent, &args.workspace).await?;
@@ -11126,6 +11222,16 @@ async fn run_agents(
             }
             Ok(())
         }
+        AgentsCommand::Workspace { subject } => {
+            let response = generated_client(endpoint, None)?
+                .agent_workspace_get(&normalize_agent_subject(&subject))
+                .await?;
+            if json_output {
+                return print_value(&response, true);
+            }
+            println!("{}", response.value.workspace);
+            Ok(())
+        }
         AgentsCommand::Apply(args) => {
             let client = cli_client(endpoint);
             let (kdl, source_name) = read_intent(Some(&args.file))?;
@@ -11227,6 +11333,7 @@ async fn run_agents(
                 &subject,
                 &args.actor,
                 args.reason.as_deref(),
+                None,
                 &args.timeout,
             )
             .await?;
@@ -11254,6 +11361,7 @@ async fn run_agents(
                 &subject,
                 &args.actor,
                 None,
+                args.host.as_deref(),
                 &args.timeout,
             )
             .await?;
@@ -12067,6 +12175,7 @@ async fn run_agent_inspection(
             return Ok(());
         }
         AgentsCommand::New(_)
+        | AgentsCommand::Workspace { .. }
         | AgentsCommand::Repos { .. }
         | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
@@ -13699,6 +13808,69 @@ async fn run_work(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        WorkCommand::Start(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let response: StepRunView = client
+                .post(
+                    "/v1/work/start",
+                    &st3::model::WorkStartRequest {
+                        actor: args.actor.clone(),
+                        title: args.title,
+                        idempotency_key: args
+                            .idempotency_key
+                            .unwrap_or_else(|| format!("work-start:{}", uuid::Uuid::now_v7())),
+                    },
+                )
+                .await?;
+            if json_output {
+                print_value(&response, true)
+            } else {
+                println!(
+                    "{}\t{}\nClaim: st work claim {} --as {}",
+                    response.status, response.subject, response.subject, args.actor
+                );
+                Ok(())
+            }
+        }
+        WorkCommand::Handoff(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let incarnation = match args.incarnation {
+                Some(value) => Some(value),
+                None => current_agent_incarnation(client, &args.actor).await?,
+            };
+            let response: StepRunView = client
+                .post(
+                    &format!("/v1/work/handoff/{}", urlencoding::encode(&args.subject)),
+                    &st3::model::WorkHandoffRequest {
+                        actor: args.actor,
+                        incarnation,
+                        to: args.to,
+                        note: args.note,
+                        evidence: args.evidence,
+                        idempotency_key: args
+                            .idempotency_key
+                            .unwrap_or_else(|| format!("work-handoff:{}", uuid::Uuid::now_v7())),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+        WorkCommand::Acknowledge(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let response: StepRunView = client
+                .post(
+                    &format!(
+                        "/v1/work/acknowledge/{}",
+                        urlencoding::encode(&args.subject)
+                    ),
+                    &st3::model::WorkAcknowledgeRequest {
+                        actor: args.actor,
+                        message: args.message,
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
         WorkCommand::Ask(args) => {
             reject_foreign_agent_actor(&args.actor)?;
             let request = args
@@ -14639,6 +14811,31 @@ async fn run_message(
                 return Ok(());
             };
             print_message_receipt(&receipt, json_output)
+        }
+        MessageCommand::Cleanup { all, actor, older_than, dry_run } => {
+            if let Some(actor) = actor.as_deref() {
+                reject_foreign_agent_actor(actor)?;
+            }
+            let older_than_ms = st3::graph::parse_duration(&older_than, true)?;
+            let result: Value = client
+                .post("/v1/messages/cleanup", &json!({
+                    "older_than_ms": older_than_ms, "to": actor, "all": all, "dry_run": dry_run,
+                }))
+                .await?;
+            sync_message_projection(client).await?;
+            if json_output {
+                print_value(&result, true)
+            } else {
+                println!("{} {} unread messages older than {}", if dry_run { "Would archive" } else { "Archived" }, result["count"], older_than);
+                if dry_run {
+                    for id in result["messages"].as_array().into_iter().flatten() {
+                        if let Some(id) = id.as_str() {
+                            println!("{id}");
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
         MessageCommand::Archive(args) => {
             let actor = args
@@ -19613,6 +19810,7 @@ async fn request_suspension(
     subject: &str,
     actor: &str,
     reason: Option<&str>,
+    host: Option<&str>,
     timeout_text: &str,
 ) -> Result<st3_client::Agent> {
     let timeout = st3::graph::parse_duration(timeout_text, false)?;
@@ -19624,6 +19822,7 @@ async fn request_suspension(
                 "subject": subject,
                 "actor": actor,
                 "reason": reason,
+                "host": host,
                 "idempotency_key": uuid::Uuid::now_v7().to_string(),
             }),
         )
@@ -19878,6 +20077,7 @@ struct NativeMailbox {
     messages: Vec<MessageView>,
     queued: BTreeMap<String, st_drivers::message::Message>,
     replayed: bool,
+    last_title_warning: Option<Instant>,
 }
 impl NativeMailbox {
     async fn start(
@@ -19915,6 +20115,7 @@ impl NativeMailbox {
             messages: Vec::new(),
             queued: BTreeMap::new(),
             replayed: false,
+            last_title_warning: None,
         })
     }
     async fn recv(&mut self) -> Option<st3::mailbox::Frame> {
@@ -19933,7 +20134,16 @@ impl NativeMailbox {
             }
             Some(st3::mailbox::Frame::Seat { seat }) => {
                 if let Err(error) = update_native_title(&seat, runtime_id) {
-                    eprintln!("st: could not update seat title: {error:#}");
+                    let now = Instant::now();
+                    if self.last_title_warning.is_none_or(|prior| {
+                        now.duration_since(prior) >= Duration::from_secs(10)
+                    }) {
+                        let _ = write_driver_log(
+                            &self.fence.subject,
+                            &format!("could not update seat title: {error:#}"),
+                        );
+                        self.last_title_warning = Some(now);
+                    }
                 }
                 Ok(())
             }
@@ -20110,8 +20320,13 @@ fn seat_label(seat: &st3::model::DesiredSubject) -> String {
 }
 fn update_native_title(seat: &st3::model::DesiredSubject, runtime_id: &str) -> Result<()> {
     let label = seat_label(seat);
+    // The launcher's registry name can differ from the provider's logical runtime ID.
+    let session = std::env::var("PTY_SESSION")
+        .ok()
+        .filter(|session| !session.is_empty())
+        .unwrap_or_else(|| runtime_id.to_owned());
     let result = std::process::Command::new("pty")
-        .args(["rename", runtime_id, &label])
+        .args(["rename", &session, &label])
         .output()?;
     anyhow::ensure!(
         result.status.success(),
@@ -20622,12 +20837,18 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
         let policy = policy.clone();
         match tokio::task::spawn_blocking(move || {
             st3::profile::task("task enforce-account-limits", || {
-                pass.enforce_account_limits(&policy, now_ms())
+                let now = now_ms();
+                let check = pass.account_limits_check(now, policy.fresh_ms)?;
+                let outcome = pass.enforce_account_limits(&policy, now)?;
+                Ok::<_, anyhow::Error>((outcome, check))
             })
         })
         .await
         {
-            Ok(Ok(outcome)) => {
+            Ok(Ok((outcome, check))) => {
+                if check.status == "warn" {
+                    eprintln!("st3: limits policy: {}", check.message);
+                }
                 for seat in outcome.stopped {
                     eprintln!("st3: limits policy stopped {seat}");
                 }
@@ -20639,6 +20860,23 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
             Err(error) => eprintln!("st3: limits policy stopped: {error}"),
         }
         tokio::time::sleep(LIMITS_INTERVAL).await;
+    }
+}
+
+/// Old payloads convert after startup; each page joins the normal writer queue and commits
+/// its own cursor. A failed page retries, including after a daemon restart.
+async fn convert_envelope_payloads(store: Arc<Store>) {
+    loop {
+        let store = store.clone();
+        let result = tokio::task::spawn_blocking(move || store.convert_envelope_payloads()).await;
+        match result {
+            Ok(Ok(report)) if report.done => return,
+            Ok(Ok(_)) => tokio::time::sleep(Duration::from_millis(50)).await,
+            error => {
+                eprintln!("st3: binary envelope conversion failed: {error:?}");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
     }
 }
 
@@ -21640,6 +21878,7 @@ mod tests {
                 messages: vec![view.clone()],
                 queued: BTreeMap::new(),
                 replayed: true,
+                last_title_warning: None,
             };
             view.subject = "message/pending".into();
             view.status = "staged".into();
@@ -25967,6 +26206,7 @@ mission "review" state="ready" {
             client,
             MissionPublishArgs {
                 file,
+                dry_run: false,
                 at_index: None,
                 actor: "person/test".into(),
                 workspace: root.to_owned(),

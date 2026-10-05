@@ -46,6 +46,8 @@ pub struct World {
     /// Peers this host's graph has diverged from: the same envelopes project a different graph
     /// here, so what stui shows can be wrong until the host is repaired.
     pub diverged: Vec<String>,
+    #[serde(skip)]
+    pub mail_backlog: Load<st3_client::MailBacklog>,
     pub attention: Load<Vec<Attention>>,
     pub agents: Load<Vec<Agent>>,
     pub missions: Load<Vec<Mission>>,
@@ -339,6 +341,8 @@ pub struct AgentDetails {
     pub runtime: Option<String>,
     pub fault: Option<String>,
     pub under: Option<String>,
+    /// The model its harness last reported using, as reported ("claude-sonnet-5-5").
+    pub model: Option<String>,
 }
 
 // ---------------------------------------------------------------- fleet, trees

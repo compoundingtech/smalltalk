@@ -28,7 +28,7 @@ case "$cmd" in
       echo "extra-trusted-public-keys = $(cat "$key.pub")"
       echo "ST_CI_NIX_CONFIG"
     } >> "$GITHUB_ENV"
-    printf 'Nix cache %s: %s store paths\n' "$cache" "$(find "$cache" -maxdepth 1 -name '*.narinfo' | wc -l)"
+    printf 'Nix cache %s: %s store paths\n' "$cache" "$(python3 -c 'import pathlib,sys; print(sum(1 for _ in pathlib.Path(sys.argv[1]).glob("*.narinfo")))' "$cache")"
     ;;
   save)
     start=$SECONDS
@@ -48,8 +48,27 @@ case "$cmd" in
              | .[] | select(endswith(".drv") | not)' > "$cache.paths"
     printf 'Nix cache: %s reference-free downloads and sources to save\n' "$(wc -l < "$cache.paths")"
     to="file://$cache?secret-key=$key.sec&compression=zstd"
-    xargs -a "$cache.paths" -r nix copy --to "$to" --no-check-sigs --no-recursive
+    if [ -s "$cache.paths" ]; then
+      xargs nix copy --to "$to" --no-check-sigs --no-recursive < "$cache.paths"
+    fi
     roots=()
+    # Cache locally built shell tools (PTY, collector, etc.), not the upstream-signed
+    # compiler/Node closure, which cache.nixos.org serves faster than another archive.
+    if [ -n "${CI_CACHE_DEV_SHELL:-}" ]; then
+      system=$(nix eval --impure --raw --expr builtins.currentSystem)
+      nix eval --json ".#devShells.$system.$CI_CACHE_DEV_SHELL" \
+        --apply 'shell: map toString ((shell.buildInputs or []) ++ (shell.nativeBuildInputs or []))' |
+        jq -r '.[]' > "$dir/shell-inputs"
+      shell_inputs=()
+      while IFS= read -r path; do shell_inputs+=("$path"); done < "$dir/shell-inputs"
+      if [ "${#shell_inputs[@]}" -gt 0 ]; then
+        nix path-info --json --json-format 1 "${shell_inputs[@]}" |
+          jq -r 'if type == "object" then to_entries | map(select((.value.signatures // []) == [])) | map(.key)
+                 else map(select((.signatures // []) == [])) | map(.path) end | .[]' > "$dir/shell-roots"
+        while IFS= read -r path; do roots+=("$path"); done < "$dir/shell-roots"
+      fi
+    fi
+    [ -e "$RUNNER_TEMP/vm-driver" ] && roots+=("$RUNNER_TEMP/vm-driver")
     # Performance keeps its small devShell closure as well as downloads, avoiding cold tool setup.
     [ -n "${CI_PERF_SHELL_ROOT:-}" ] && roots+=("$CI_PERF_SHELL_ROOT")
     [ -e "$RUNNER_TEMP/baseline" ] && roots+=("$RUNNER_TEMP/baseline")
@@ -60,7 +79,7 @@ case "$cmd" in
       nix copy --to "$to" --no-check-sigs "${roots[@]}"
     fi
     printf 'Nix cache %s: %s store paths after saving (%ss)\n' "$cache" \
-      "$(find "$cache" -maxdepth 1 -name '*.narinfo' | wc -l)" "$((SECONDS - start))"
+      "$(python3 -c 'import pathlib,sys; print(sum(1 for _ in pathlib.Path(sys.argv[1]).glob("*.narinfo")))' "$cache")" "$((SECONDS - start))"
     ;;
   *) echo "unknown command: $cmd" >&2; exit 2 ;;
 esac

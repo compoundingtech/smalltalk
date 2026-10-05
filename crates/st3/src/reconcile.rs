@@ -707,6 +707,8 @@ pub struct Reconciler<R = NativeRuntime> {
     host: String,
     endpoint: String,
     driver_state_dir: PathBuf,
+    client_relay: Option<crate::peer::ClientRelay>,
+    incoming_resumes: Arc<Mutex<BTreeSet<String>>>,
     /// The `ST3_BIN` members get; see [`st_binary_link`]. Without one they get the executable.
     st_binary: Option<PathBuf>,
     runtime_environment: BTreeMap<String, String>,
@@ -840,6 +842,8 @@ impl Reconciler<NativeRuntime> {
             host,
             endpoint,
             driver_state_dir: state_dir.join("drivers"),
+            client_relay: None,
+            incoming_resumes: Arc::default(),
             st_binary: Some(publish_st_binary(state_dir)?),
             runtime_environment: BTreeMap::from([
                 (
@@ -916,6 +920,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             host,
             endpoint: "unused-test-endpoint".into(),
             driver_state_dir: std::env::temp_dir().join("st3-test-drivers"),
+            client_relay: None,
+            incoming_resumes: Arc::default(),
             st_binary: None,
             runtime_environment: BTreeMap::new(),
             notify,
@@ -969,6 +975,97 @@ impl<R: RuntimeControl> Reconciler<R> {
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
         }
+    }
+
+    pub fn with_client_relay(mut self, relay: Option<crate::peer::ClientRelay>) -> Self {
+        self.client_relay = relay;
+        self
+    }
+
+    fn incoming_resumes(&self, desired: &[DesiredSubject]) -> Result<()> {
+        let targets = self.store.cross_host_resume_targets(&self.host)?;
+        for subject in desired.iter().filter(|subject| targets.contains(&subject.subject)) {
+            let Some(member) = &subject.member else {
+                continue;
+            };
+            if member.host == self.host {
+                continue;
+            }
+            let Some(suspension) = crate::suspension::current(&self.store, &subject.subject)?
+            else {
+                continue;
+            };
+            if suspension.host.as_deref() != Some(&self.host)
+                || !matches!(suspension.phase.as_str(), "fencing-source" | "transferring")
+            {
+                continue;
+            }
+            let Some(relay) = self.client_relay.clone() else {
+                self.fail_suspension(
+                    &subject.subject,
+                    &suspension,
+                    "source-unavailable",
+                    "this host has no peer client-read route".into(),
+                    Vec::new(),
+                )?;
+                continue;
+            };
+            let mut incoming = self
+                .incoming_resumes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !incoming.insert(suspension.operation_id.clone()) {
+                continue;
+            }
+            let store = self.store.clone();
+            let subject = subject.clone();
+            let state = self
+                .driver_state_dir
+                .parent()
+                .context("drivers have no state directory")?
+                .to_path_buf();
+            let notify = self.notify.clone();
+            let events = self.event_notify.clone();
+            let incoming = self.incoming_resumes.clone();
+            tokio::spawn(async move {
+                let result = crate::seat_snapshot::transfer(
+                    store.clone(),
+                    relay,
+                    state.clone(),
+                    subject.clone(),
+                    suspension.clone(),
+                )
+                .await;
+                if let Err(error) = result {
+                    let _ = store.append_claim(&ClaimInput {
+                        subject: subject.subject,
+                        kind: "runtime.action.failed".into(),
+                        actor: suspension.requested_by.clone(),
+                        fields: BTreeMap::from([
+                            ("action".into(), "resume".into()),
+                            ("code".into(), crate::seat_snapshot::code(&error).into()),
+                            ("reason".into(), format!("{error:#}").into()),
+                        ]),
+                        evidence: vec![suspension.operation_id.clone()],
+                        expected_subject: None,
+                        idempotency_key: Some(crate::suspension::resume_failed_key(
+                            &suspension.operation_id,
+                        )),
+                    });
+                }
+                incoming
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&suspension.operation_id);
+                notify.notify_one();
+                events.send_modify(|n| *n = n.saturating_add(1));
+                let _ = std::fs::write(
+                    state.join("replication.wake"),
+                    uuid::Uuid::now_v7().to_string(),
+                );
+            });
+        }
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -1617,19 +1714,21 @@ impl<R: RuntimeControl> Reconciler<R> {
             read("deadline/missions", &|| {
                 self.store.next_active_mission_deadline(&self.host)
             }),
-            // Skipping passes keep each wake's and capacity retry's due time, so these need
-            // no scan of every local agent's work and diagnostics after every pass. The next
-            // full pass bounds what a missing due time could delay.
+            // Every item records its clock dependencies, including times with no separate
+            // timer. Wake for the earliest one across all sections.
+            self.skip_unneeded
+                .then(|| self.incremental.next_due(""))
+                .flatten(),
             read("deadline/work-wakes", &|| {
                 if self.skip_unneeded {
-                    Ok(self.incremental.next_due("wake:"))
+                    Ok(None)
                 } else {
                     self.next_work_wake_deadline()
                 }
             }),
             read("deadline/provider-capacity-retries", &|| {
                 if self.skip_unneeded {
-                    Ok(self.incremental.next_due("capacity:"))
+                    Ok(None)
                 } else {
                     self.next_provider_capacity_retry_deadline()
                 }
@@ -1794,6 +1893,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         drop(_runners_span);
         let desired_span = crate::profile::span("pass/desired");
         let mut desired = self.store.desired_subjects()?;
+        self.incoming_resumes(&desired)?;
         let terminal_owned = self.store.terminal_owned_runtime_subjects()?;
         drop(desired_span);
         for subject in &mut desired {
@@ -2125,6 +2225,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let item = format!("member:{}", subject.subject);
             members.insert(item.clone());
+            let _clock = smallclaims::store::clock_snapshot();
             let needed = member_errors.contains_key(&subject.subject)
                 || self.needs_item(&item, !skip_members);
             if skip_members && !needed {
@@ -3451,6 +3552,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         skip: bool,
         work: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        let _clock = smallclaims::store::clock_snapshot();
         let needed = self.needs_item(item, !skip);
         if skip && !needed {
             return Ok(());
@@ -3891,6 +3993,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         live_workspaces: &BTreeSet<&str>,
         diagnostic_errors: &mut Vec<String>,
     ) {
+        let _clock = smallclaims::store::clock_snapshot();
         let needed = self.needs_item(item, !skip);
         if skip && !needed {
             return;
@@ -4396,6 +4499,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(format!("terminate:{subject}:{incarnation}")),
             })?;
+            // Even a failed terminate leaves a request that must reach its kill deadline.
+            // A short shutdown timeout comes before the usual first observation poll.
+            self.arm_restart(
+                &format!("stop:{subject}"),
+                deadline.min(now_ms().saturating_add(100)),
+            );
             if let Err(error) = self.runtime.stop(runtime_id, terminal, Some(incarnation)) {
                 self.store.append_claim(&ClaimInput {
                     subject: subject.into(),
@@ -4411,7 +4520,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })?;
                 return Err(error);
             }
-            self.arm_restart(&format!("stop:{subject}"), now_ms().saturating_add(100));
             return Ok(false);
         };
         let deadline = request
@@ -4946,6 +5054,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                 else {
                     unreachable!("blockers require a bound native session");
                 };
+                if let Err(error) = crate::seat_snapshot::workspace(self.driver_state_dir.parent().unwrap(), agent, &suspension.operation_id, member) {
+                    return self.fail_suspension(agent, suspension, crate::seat_snapshot::code(&error), format!("{error:#}"), Vec::new());
+                }
+                let blocking = suspended::blockers(&self.store, agent, incarnation)?;
+                if !blocking.is_empty() {
+                    return self.fail_suspension(agent, suspension, "not-quiescent", "the seat became active while its workspace was captured".into(), blocking);
+                }
                 self.record_suspension_phase(
                     agent,
                     suspension,
@@ -4957,6 +5072,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             Value::String("snapshotting".into()),
                         ),
                         ("harness".into(), Value::String(harness)),
+                        ("source_host".into(), Value::String(self.host.clone())),
                         ("native_session_id".into(), Value::String(session)),
                         ("incarnation_id".into(), Value::String(incarnation.into())),
                         (
@@ -4988,6 +5104,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                     member.shutdown_timeout_ms,
                     None,
                 )?;
+                // A missing portable transcript does not discard single-host continuity.
+                // Cross-host fetch will refuse until a complete archive exists.
+                let _ = crate::seat_snapshot::seal(self.driver_state_dir.parent().unwrap(), &self.store, agent, member, suspension);
                 self.record_suspension_phase(
                     agent,
                     suspension,
@@ -5012,7 +5131,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     ]),
                 )
             }
-            "suspended" => {
+            "suspended" | "fencing-source" | "transferring" => {
                 // A resume that failed after its launch leaves a process to end.
                 if let Some(observation) = running {
                     self.record_member(subject, observation, true)?;
@@ -5030,6 +5149,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 Ok(())
             }
             "restoring" => {
+                if suspension.host.as_deref().is_some_and(|host| host != self.host) { return Ok(()); }
+                if suspension.host.is_some()
+                    && let Some(token) = self.store.selected_desired_token(agent)?
+                    && let Some(handoff) = crate::placement::handoff(&self.store, agent, &token, u64::MAX)?
+                    && !handoff.pending_sources.is_empty()
+                { return Ok(()); }
                 if running.is_some() || !ended {
                     // A launch from an earlier pass is already under way; verify it.
                     return self.record_suspension_phase(
@@ -5099,6 +5224,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 )
             }
             "verifying" => {
+                let due = suspension
+                    .updated_at_unix_ms
+                    .saturating_add(suspended::VERIFY_TIMEOUT_MS)
+                    .saturating_add(1);
                 let overdue = now_ms().saturating_sub(suspension.updated_at_unix_ms)
                     > suspended::VERIFY_TIMEOUT_MS;
                 if let Some(observation) = running {
@@ -5138,7 +5267,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                             ),
                             Vec::new(),
                         ),
-                        None => Ok(()),
+                        None => {
+                            self.arm_deadline_at(agent, due, "timer resume-verification");
+                            Ok(())
+                        }
                     }
                 } else if ended {
                     if let Some(observation) = observation {
@@ -5235,6 +5367,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         Vec::new(),
                     )
                 } else {
+                    self.arm_deadline_at(agent, due, "timer resume-verification");
                     Ok(())
                 }
             }
@@ -6027,6 +6160,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let full = !self.skip_unneeded || self.incremental.take_full_pass("mission-run", now_ms());
         for id in &ids {
             let subject = format!("mission-run/{id}");
+            let _clock = smallclaims::store::clock_snapshot();
             let needed = self.needs_item(&subject, full);
             if !full && !needed {
                 // Nothing it read changed and nothing is due. It stays active: keep its caches,
@@ -7702,10 +7836,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             smallclaims::touched::note_read(|| format!("exec:{runtime_id}"));
             match self.runtime.observe_exec(&runtime_id)? {
-                Some(observation) if observation.status == "running" => {
-                    self.arm_gate_poll(&runtime_id);
-                    return Ok(None);
-                }
                 Some(observation) if observation.status == "exited" => {
                     if self.gate_exit_code(&subject, &observation)? != Some(0) {
                         anyhow::bail!("metric `{}` exited unsuccessfully", metric.name);
@@ -7731,6 +7861,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                     return Ok(Some(value));
                 }
                 _ => {
+                    self.arm_deadline_at(
+                        &subject,
+                        request.accepted_at_unix_ms
+                            .saturating_add(u128::from(*time_limit_ms)),
+                        "timer gate-timeout",
+                    );
                     self.arm_gate_poll(&runtime_id);
                     return Ok(None);
                 }
@@ -7745,6 +7881,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("owner".into(), Value::String(view.subject.clone())),
             ]),
         )?;
+        let request = self
+            .store
+            .latest_claim(&subject, Some("gate.requested"))?
+            .context("the metric request disappeared")?;
         let member = MemberSpec {
             kind: MemberKind::Exec,
             host,
@@ -7777,6 +7917,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             &member,
             "the loop metric was requested",
         )?;
+        self.arm_deadline_at(
+            &subject,
+            request.accepted_at_unix_ms
+                .saturating_add(u128::from(*time_limit_ms)),
+            "timer gate-timeout",
+        );
         self.arm_gate_poll(&member.runtime_id);
         Ok(None)
     }
@@ -10188,6 +10334,15 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.arm_deadline(handle, step, remaining, "timer step-timeout");
     }
 
+    /// Record the exact clock dependency even when no runtime can spawn its wake.
+    fn arm_deadline_at(&self, key: &str, deadline: u128, wake: &'static str) {
+        smallclaims::touched::note_due(deadline);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let remaining = deadline.saturating_sub(now_ms()).min(u128::from(u64::MAX)) as u64;
+            self.arm_deadline(&handle, key, remaining, wake);
+        }
+    }
+
     /// Wake the reconciler in `remaining` ms for `key`, unless `key` already armed a wake at or
     /// before then; `wake` names the timer in wake accounting.
     fn arm_deadline(
@@ -12198,14 +12353,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .saturating_add(self.gate_recheck_delay_ms(previous));
                     let now = now_ms();
                     if !started && now < due {
-                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                            self.arm_deadline(
-                                &handle,
-                                &result_subject,
-                                (due - now).min(u128::from(u64::MAX)) as u64,
-                                "timer gate-recheck",
-                            );
-                        }
+                        self.arm_deadline_at(&result_subject, due, "timer gate-recheck");
                         return Ok(GateOutcome::NotYet);
                     }
                     next
@@ -12263,6 +12411,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                     self.record_gate_check(stage, check)
                 }
                 _ => {
+                    self.arm_deadline_at(
+                        &operation,
+                        requested.accepted_at_unix_ms
+                            .saturating_add(u128::from(time_limit_ms)),
+                        "timer gate-timeout",
+                    );
                     self.arm_gate_poll(&runtime_id);
                     Ok(GateOutcome::Pending)
                 }
@@ -12286,6 +12440,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("owner".into(), Value::String(stage.subject.clone())),
             ]),
         )?;
+        let requested = self
+            .store
+            .latest_claim(&operation, Some("gate.requested"))?
+            .context("the mechanical gate request disappeared")?;
         let mut environment = environment.clone();
         environment.insert(
             crate::gate_report::ENV.into(),
@@ -12330,6 +12488,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             );
             return self.record_gate_check(stage, check);
         }
+        self.arm_deadline_at(
+            &operation,
+            requested.accepted_at_unix_ms
+                .saturating_add(u128::from(time_limit_ms)),
+            "timer gate-timeout",
+        );
         self.arm_gate_poll(&member.runtime_id);
         Ok(GateOutcome::Pending)
     }
@@ -12394,15 +12558,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(match answer {
             "pass" => GateOutcome::Pass,
             "not-yet" => {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let delay = self.gate_recheck_delay_ms(check.check);
-                    self.arm_deadline(
-                        &handle,
-                        check.result_subject,
-                        delay.min(u128::from(u64::MAX)) as u64,
-                        "timer gate-recheck",
-                    );
-                }
+                let result = self
+                    .store
+                    .latest_claim(check.result_subject, Some("gate.result"))?
+                    .context("the mechanical gate result disappeared")?;
+                self.arm_deadline_at(
+                    check.result_subject,
+                    result.accepted_at_unix_ms
+                        .saturating_add(self.gate_recheck_delay_ms(check.check)),
+                    "timer gate-recheck",
+                );
                 GateOutcome::NotYet
             }
             _ => {
@@ -14579,6 +14744,7 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     mod differential;
+    mod incremental_deadlines;
     mod rollout_tests;
     mod ref_watch_tests;
     #[test]
@@ -14755,6 +14921,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         starts: Mutex<Vec<String>>,
         failed_starts: Mutex<std::collections::HashSet<String>>,
         failed_observes: Mutex<std::collections::HashSet<String>>,
+        observe_at: Mutex<Option<u128>>,
         failed_stops: Mutex<std::collections::HashSet<String>>,
         started_members: Mutex<Vec<MemberSpec>>,
         stops: Mutex<Vec<String>>,
@@ -14814,6 +14981,9 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             Ok(self.ptys.lock().unwrap().clone())
         }
         fn observe_exec(&self, runtime_id: &str) -> Result<Option<RuntimeObservation>> {
+            if let Some(at) = self.observe_at.lock().unwrap().take() {
+                smallclaims::store::set_thread_clock(Some(at));
+            }
             anyhow::ensure!(
                 !self.failed_observes.lock().unwrap().contains(runtime_id),
                 "fake observe failed"

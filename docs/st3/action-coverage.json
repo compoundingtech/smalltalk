@@ -465,6 +465,14 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st agents workspace",
+      "description": "Print one seat's declared workspace directory on its owning host, even when stopped",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::agent_workspace_cli_and_client_read_the_same_declaration_even_after_retirement"
+      ],
+      "verification": "real CLI and generated Rust client over a private Unix socket; current and stopped declarations"
+    },
+    {
       "command": "st agents start",
       "description": "Start a durable seat, patching only explicitly supplied declaration fields. A stopped mission seat starts again on its run's own declaration",
       "tests": [
@@ -639,6 +647,14 @@
         "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st conversations cleanup",
+      "description": "Archive aged unread mail in one mailbox or all mailboxes, with dry-run preview",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_aged_unread_cleanup_preserves_fresh_and_read_mail_across_restart"
+      ],
+      "verification": "real CLI over private Unix socket; dry run, mailbox scope and repeated cleanup across disk-store restarts"
     },
     {
       "command": "st conversations export",
@@ -1451,6 +1467,166 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st sekrets",
+      "description": "Run any CLI with credentials no seat can read, through the sekrets gateway",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word",
+        "crates/st3/src/sekrets/tests.rs::git_in_a_checkout_runs_none_of_the_checkouts_programs",
+        "crates/st3/src/sekrets/tests.rs::a_terminal_command_gets_a_controlling_terminal_whose_side_the_caller_holds"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets enable",
+      "description": "Register this host's daemon key with the gateway, so seats can be told from their person",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets grant",
+      "description": "Give an agent or another person the use of a profile, narrowed by a policy",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word",
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets grants",
+      "description": "List grants of this person's profiles, and grants to this caller",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets lock",
+      "description": "Stop all use of sekrets, or one person's",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets log",
+      "description": "Show the calls and changes this person may read",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets login",
+      "description": "Run a tool's own login as the sekrets user, so the credential lands in a profile",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in",
+        "crates/st3/src/sekrets/tests.rs::a_terminal_command_gets_a_controlling_terminal_whose_side_the_caller_holds"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets presets",
+      "description": "List policy presets",
+      "tests": [
+        "crates/st3/src/sekrets/policy.rs::deny_follows_allow_and_options_match_long_short_and_bundled_forms"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets profile create",
+      "description": "Create a profile you own, with its command policy",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets profile policy",
+      "description": "Replace a profile's policy",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in",
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets profile rm",
+      "description": "Remove a profile, its home and its values, and end its grants",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets profile show",
+      "description": "Show a profile you own or were granted, with its policy and the names of its values",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets profiles",
+      "description": "List profiles this caller may use",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets put",
+      "description": "Put a value read from standard input into a profile, as an environment variable its commands get",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets revoke",
+      "description": "Remove a grant",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets setup",
+      "description": "Print the root commands that create the sekrets user, its store and the gateway service",
+      "tests": [
+        "crates/st3/src/sekrets/cli.rs::the_setup_script_names_each_person_and_a_root_owned_binary"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets unlock",
+      "description": "Allow use again",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets unset",
+      "description": "Remove a value from a profile",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets whoami",
+      "description": "Show who the gateway takes this caller for",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
       "command": "st service install",
       "description": "Install and start the st user services for this machine",
       "tests": [
@@ -1699,6 +1875,15 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st work acknowledge",
+      "description": "Record the recipient read receipt and acknowledge an exact handoff note",
+      "tests": [
+        "crates/st3/tests/adhoc_work.rs::spontaneous_work_survives_restart_handoff_acknowledgment_and_close",
+        "crates/st3/tests/adhoc_work.rs::person_handoff_is_visible_acknowledged_and_closed_with_evidence"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened and replayed between actions"
+    },
+    {
       "command": "st work ask",
       "description": "Ask a person through a runtime step owned by live work",
       "tests": [
@@ -1753,6 +1938,15 @@
         "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
       ],
       "verification": "shared API restart case"
+    },
+    {
+      "command": "st work handoff",
+      "description": "Release the current lease and assign a leaf step with a durable recipient note",
+      "tests": [
+        "crates/st3/tests/adhoc_work.rs::spontaneous_work_survives_restart_handoff_acknowledgment_and_close",
+        "crates/st3/tests/adhoc_work.rs::person_handoff_is_visible_acknowledged_and_closed_with_evidence"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened and replayed between actions"
     },
     {
       "command": "st work ls",
@@ -1857,6 +2051,15 @@
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work start",
+      "description": "Open a minimal spontaneous work run for the calling seat",
+      "tests": [
+        "crates/st3/tests/adhoc_work.rs::spontaneous_work_survives_restart_handoff_acknowledgment_and_close",
+        "crates/st3/tests/adhoc_work.rs::person_handoff_is_visible_acknowledged_and_closed_with_evidence"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened and replayed between actions"
     },
     {
       "command": "st work update",

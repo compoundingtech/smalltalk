@@ -47,15 +47,15 @@ limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
 Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
 or restoring build archives. When both entries exist it stops after the probes. A miss is flagged
 as P0 and fills the missing entries with builds only: selected test executables, Clippy artifacts,
-or the fleet baseline and integration binary. Workspace tests and the isolation VM are not repeated on main. The TypeScript dependency cache is also kept on main without repeating its tests.
+the fleet baseline and integration binary, the Genie shell, or the isolation archive and VM driver. Workspace tests and the isolation VM are not repeated on main. The TypeScript dependency cache is also kept on main without repeating its tests.
 Merge-group and PR caches have their own ref scope; they cannot replace these main-scope saves,
 which all PRs and Namespace overflow runs can restore. Manual Workspace CI dispatch on main
 remains available for a full run. Release and deployment workflows keep their own push triggers.
 
 Each stage restores a job-keyed `actions/cache` entry (Namespace serves it from its accelerated
 backend) holding Cargo's registry and the workspace `target/` directory, keyed on `Cargo.lock` and
-`flake.lock`. A second keyed entry (`nix4-<job>-...`) holds a signed local Nix binary cache in
-`$RUNNER_TEMP/st-ci-cache`. Its key includes `flake.lock` and both compatibility baseline pins.
+`flake.lock`, workspace manifests and linker configuration. A second keyed entry (`nix5-<job>-...`) holds a signed local Nix binary cache in
+`$RUNNER_TEMP/st-ci-cache`. Its key includes `flake.lock`, the flake, Nix expressions and both compatibility baseline pins.
 `scripts/ci-nix-cache use` makes it a preferred substituter. After a successful stage, `save`
 copies reference-free downloads and sources fetched by the run, plus the closures of the fleet
 baseline, historical messaging channel and provider components. It leaves the installer-managed
@@ -198,8 +198,8 @@ The Claude no-st2 seat eval and all five harness boot canaries inspect fresh sea
 for `ST2_*` exports and st2 program/path references. They also inspect generated state, home
 and PTY paths, text records, SQLite schemas/semantic rows and logs for st2 labels. Fixtures use
 neutral identities and payloads, so authored text cannot hide an owned label. Base64 replication
-payloads/signatures are opaque; their stored semantic claims are checked separately. Historical
-binary-upgrade canaries retain predecessor records and are outside this fresh-generation rule.
+payloads and replication/claim signatures are opaque; stored semantic claims remain checked.
+Historical binary-upgrade canaries retain predecessor records and are outside this fresh-generation rule.
 The mutation suite injects every prohibited category and requires rejection; source/dependency
 mutations also exercise the guard's CLI exit status.
 
@@ -416,14 +416,63 @@ cargo test -p st3 --test integration daemon_cost:: -- --nocapture --test-threads
 ST_LOAD_GATE=1 nix develop .#perf -c cargo test --release -p st3 --features perf-load --test perf_load daemon_load:: -- --nocapture
 ```
 
+### Cache coverage across workflows
+
+Every job declares its cache coverage. Jobs that select runners, collect checks, run
+standard-library guards or consume verified release artifacts have no build cache and say
+why. The other jobs report exact hits, lookup-only hits, fallback restores, misses and
+failed lookups separately. A missing exact key or failed restore emits a P0 warning in
+both the log and the job summary; a skipped archive on ci1 is identified as a persistent
+runner store, rather than called an archive hit.
+
+Cargo keys include the lockfiles, workspace manifests and linker configuration. Nix keys
+include the flake, Nix expressions and compatibility pins. Both cover macOS as well as
+Linux, with isolated Cargo and Nix-cache directories. Genie freshness and isolation have
+job-specific caches seeded on main; portable builds use the same pinned Rust cache action as native
+releases. Native releases keep the pinned Zig compiler under a stable version/platform key instead of
+per-run entries. Matching native snapshots also retain it, so fresh nodes do not fetch it
+again. These Cargo builds do not produce Zig object-cache directories; empty cache declarations
+would miss on every run and are omitted.
+
+Compiled outputs also have three-day artifact snapshots keyed by the actual full source SHA,
+job, platform, architecture, build flags and workflow contents. Native snapshots additionally
+fingerprint the installed Rust compiler and, on macOS, the Swift compiler and SDK. A fresh
+runner restores a compatible completed run's outputs and the original tracked-source
+nanosecond timestamps only for that exact clean SHA. Git metadata is never restamped.
+Cargo still rebuilds dirty or changed source and embeds the genuine source identity.
+The signed Nix cache retains locally built shell tools and their runtime closures, so
+a target hit does not rebuild the immutable PTY and collector before Cargo starts.
+Upstream-signed compilers and Node stay with their faster public binary caches.
+Persistent ci1 runners keep their source checkpoint beside the actual target directory.
+A first build of a new source warns that no snapshot exists and restores dependency caches;
+a repeat reuses its snapshot without consuming the shared dependency-cache quota.
+
+Native releases keep the pinned PTY checkout at a stable Cargo-home path and retain the
+macOS speech app only with a matching native snapshot. Portable releases keep the immutable
+workflow helpers before checking out the accepted source, so earlier accepted sources can
+use the cache policy without weakening source, binary or publishing verification.
+
+Main upkeep removes cache entries belonging to closed PRs and redundant old Zig snapshots.
+It retains open PR entries, current main recipes and one legacy Zig snapshot per platform
+while the new cache is seeded. This maintains the shared cache quota without removing
+active work. Native Nix verification probes real output paths before building and still
+proves its repeat with downloads and builds disabled. Performance retains its separate
+durable snapshots and successful-main-only baselines.
+
+The macOS workflow was manually disabled when this audit ran. Its cache configuration is
+maintained without changing that repository setting. Portable publishing permissions and
+accepted-source verification remain in place.
+
 ## Required mail redelivery canaries
 
-Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires eleven named,
-unignored regressions: boot/reconnect mailbox suppression for Claude, Codex, OpenCode, Pi,
-and OMP; each harness's native suspend/resume canary with old mail held and fresh mail read;
-and delivered-but-unread retention across native channel restart. The mailbox cases seed
-sent, staged, and delivered-but-unread mail and prove zero old offers, live delivery, and
-continued explicit mailbox access. Every selected test runs with zero retries.
+Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires seventeen named,
+unignored regressions: boot/reconnect mailbox suppression and recent unoffered recovery for
+Claude, Codex, OpenCode, Pi, and OMP; each harness's native suspend/resume canary with hour-old
+mail held and recent unoffered mail consumed exactly once; legacy polling recovery through the
+current offer's receipt sequence; and delivered-but-unread retention across native channel
+restart. The mailbox cases seed hour-old sent mail and recent staged and delivered-but-unread
+mail, prove zero historical offers, preserve explicit mailbox access, and recover an in-flight
+send after a daemon restart with exactly one receipt pair. Every selected test runs with zero retries.
 
 The script fails if any required test is missing, ignored, or filtered out. The named
 `mail-redelivery-canaries` check reads that step's actual outcome; a skipped step cannot pass.

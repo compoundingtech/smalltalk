@@ -125,16 +125,26 @@ impl Grant {
 }
 
 pub(super) fn validate(session: &PairedSession, expected_key: &str) -> Result<()> {
+    verify(
+        &session.person_id,
+        &session.device_key_chain,
+        &session.device_key_proofs,
+        expected_key,
+    )
+}
+
+pub(super) fn verify(
+    person: &str,
+    chain: &[String],
+    proofs: &[Value],
+    expected_key: &str,
+) -> Result<()> {
     ensure!(
-        session.device_key_chain.len() == 2 && session.device_key_proofs.len() == 2,
+        chain.len() == 2 && proofs.len() == 2,
         "Member did not return verifiable device and root grants; upgrade the member"
     );
     let mut grants = Vec::new();
-    for (proof, id) in session
-        .device_key_proofs
-        .iter()
-        .zip(&session.device_key_chain)
-    {
+    for (proof, id) in proofs.iter().zip(chain) {
         ensure!(
             serde_json::to_vec(proof)?.len() <= 64 * 1024,
             "Enrollment proof is too large"
@@ -142,19 +152,19 @@ pub(super) fn validate(session: &PairedSession, expected_key: &str) -> Result<()
         // Do not expose an untrusted response value in a deserializer's error text.
         let grant: Grant = serde_json::from_value(proof.clone())
             .map_err(|_| anyhow::anyhow!("Incomplete enrollment grant proof"))?;
-        grant.verify(id, &session.person_id)?;
+        grant.verify(id, person)?;
         grants.push(grant);
     }
     let (device, root) = (&grants[0], &grants[1]);
     ensure!(
         device.field("key") == Some(expected_key)
             && device.field("role") == Some("device")
-            && device.actor.as_deref() == Some(&session.person_id)
-            && device.field("issuer") == Some(&session.person_id)
-            && device.signature.signer == session.person_id
+            && device.actor.as_deref() == Some(person)
+            && device.field("issuer") == Some(person)
+            && device.signature.signer == person
             && device.field("issuer_key") == root.field("key")
             && Some(device.signature.key.as_str()) == root.field("key")
-            && device.signature.chain == session.device_key_chain[1..],
+            && device.signature.chain == chain[1..],
         "Returned device grant does not bind our public key to the paired person's root"
     );
     ensure!(

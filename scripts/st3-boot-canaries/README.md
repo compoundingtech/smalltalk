@@ -9,7 +9,8 @@ message.
 `HARNESS` is `claude`, `codex`, `pi`, `omp` or `opencode`. `SCENARIO` is `fresh`, `restart`,
 `daemon-restart`, `reexec`, `concurrent` or `suspend`; `run --help` says what each does. Each
 stand-in keeps its sessions the way its harness does, so `suspend` proves that a resumed seat comes
-back on the session it suspended on. The Rust wrapper
+back on the session it suspended on, holds hour-old mail, and consumes recent never-offered
+mail exactly once. The Rust wrapper
 `crates/st3/tests/boot_canaries.rs` runs every pair as its own test in the required Linux gate.
 
 The Codex-only `utf8` scenario starts and ends the bounded transcript window inside a euro sign,

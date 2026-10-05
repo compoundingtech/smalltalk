@@ -578,7 +578,13 @@ impl World {
         let Some(input) = input else {
             return;
         };
-        if let Ok(claim) = self.nodes[index].store.append_claim(&input) {
+        // Latest observations derive replicated status timing from the reader's clock as
+        // well as the writer's. Pin both to this node's simulated time so omitted source
+        // timestamps cannot put host wall time into a seeded claim.
+        smallclaims::store::set_thread_clock(Some(self.clock(index) as u128));
+        let appended = self.nodes[index].store.append_claim(&input);
+        smallclaims::store::set_thread_clock(None);
+        if let Ok(claim) = appended {
             *self.written.entry(claim.kind.clone()).or_default() += 1;
             // Observations a node keeps to itself never replicate, whoever wrote them.
             let replicated =

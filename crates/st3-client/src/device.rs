@@ -1,7 +1,7 @@
 //! Software device keys and paired credentials share one atomic, private profile.
 //! This is client state, never a graph replica or a peer configuration.
 mod grant_proof;
-mod transport;
+pub(crate) mod transport;
 use crate::{Client, DeviceSignature, MessageSendParameters, PairedSession, PairingComplete};
 use anyhow::{Context as _, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -172,6 +172,7 @@ impl Device {
     pub fn client(&self) -> Result<Client> {
         let mut client = Client::fabric_loopback(&self.endpoint, &self.session.credential);
         client.http = transport::client(&self.endpoint, self.allow_public_http)?;
+        client.device_http_policy = Some(self.allow_public_http);
         if self.signing_key.is_some() {
             client.signing_device = Some(Arc::new(self.clone()));
         }
@@ -494,6 +495,16 @@ pub async fn complete_with_http_policy(
     let public = key.public_key()?;
     let (parent, _lock) = prepare(path)?;
     let mut profile = Profile::load(path)?.unwrap_or_default();
+    let capabilities = client.capabilities().await
+        .context("Member cannot advertise pairing proof support; upgrade the member before retrying. The pairing code was not submitted")?;
+    ensure!(
+        capabilities.value.capabilities.iter().any(|capability| {
+            capability.id == "device-key-proofs"
+                && capability.version >= 1
+                && capability.state == crate::CapabilityState::Granted
+        }),
+        "Member does not support verifiable device grants; upgrade it before retrying. The pairing code was not submitted"
+    );
     let session = client
         .pairing_complete(
             pairing_id,
@@ -557,6 +568,16 @@ pub async fn complete_with_http_policy(
             "The server consumed the pairing code, but local completion failed and returned an unusable device ID. Inspect `st devices ls --as <your-person-id>` on the trusted member and revoke the new device before starting a new pairing. The previous profile was retained".into()
         }
     })
+}
+
+/// Verify public enrollment receipts without adding authority or trusting a node key independently.
+pub fn verify_device_key_proofs(
+    person: &str,
+    chain: &[String],
+    proofs: &[serde_json::Value],
+    expected_key: &str,
+) -> Result<()> {
+    grant_proof::verify(person, chain, proofs, expected_key)
 }
 
 pub fn read_pairing_code() -> Result<String> {

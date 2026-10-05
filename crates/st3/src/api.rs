@@ -66,6 +66,7 @@ mod delivery_probes;
 mod github_watch;
 mod harness_events;
 mod mailbox;
+mod mail_backlog;
 mod owned_sets;
 mod terminal_view;
 
@@ -333,6 +334,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/documents/content", get(client_v0::document_get))
         .route("/v1/client/usage", get(client_v0::usage_period))
+        .route("/v1/client/mail-backlog", get(mail_backlog::get))
         .route("/v1/client/clients", get(client_v0::clients_list))
         .route(
             "/v1/client/subject-definition",
@@ -377,6 +379,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/agents", get(client_agents))
         .route("/v1/client/resources", get(client_v0::resources::list))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
+        .route(
+            "/v1/client/agent-workspaces/{*id}",
+            get(client_v0::agent_workspace),
+        )
         .route(
             "/v1/client/agent-declarations/{*id}",
             get(client_v0::agent_declaration),
@@ -466,6 +472,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/agents/source-offline", post(override_placement_source))
         .route("/v1/agents/suspend", post(suspend_agent))
         .route("/v1/agents/resume", post(resume_agent))
+        .route("/v1/internal/seat-snapshot", post(seat_snapshot_chunk))
         .route("/v1/agents/native-session", post(report_native_session))
         .route("/v1/missions/{id}", get(get_mission))
         .route("/v1/missions/{id}/retire", post(retire_mission))
@@ -530,6 +537,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/page", get(list_messages_page))
+        .route("/v1/messages/cleanup", post(mail_backlog::cleanup))
         .route("/v1/mailbox", get(mailbox::subscribe))
         .route("/v1/harness-events", post(harness_events::publish))
         .route("/v1/mailbox/bind", post(mailbox::bind))
@@ -646,6 +654,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(cancel_revision_proposal),
         )
         .route("/v1/work/ask", post(ask_person))
+        .route("/v1/work/start", post(start_work))
+        .route("/v1/work/handoff/{*subject}", post(handoff_work))
+        .route("/v1/work/acknowledge/{*subject}", post(acknowledge_work))
         .route("/v1/github/watch", post(github_watch::watch))
         .route("/v1/github/unwatch", post(github_watch::unwatch))
         .route("/v1/github/watches", get(github_watch::watches))
@@ -662,6 +673,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
         .route("/v1/agent-queue-moves", post(move_agent_queue))
+        .route("/v1/sekrets/node", get(sekrets_node))
+        .route("/v1/sekrets/attest", post(sekrets_attest))
         .route("/v1/lanes", get(list_lanes))
         .route("/v1/lanes/{*lane}", get(get_lane))
         .route("/v1/lane-changes", post(change_lane))
@@ -1894,9 +1907,11 @@ fn client_agent_resources(
     at: &str,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut items = store.cached_agent_resources(snapshot_index, history, || {
-        let mut items = client_agent_resources_uncached(store, history, snapshot_index)?;
-        let subjects = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))
+    let mut items = store.cached_agent_resources(snapshot_index, history, |changed| {
+        let mut items = client_agent_resources_selected(store, history, snapshot_index, changed)?;
+        let subjects = items
+            .iter()
+            .filter_map(|item| item["id"].as_str().map(str::to_owned))
             .collect::<Vec<_>>();
         let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
         for item in &mut items {
@@ -1914,15 +1929,24 @@ fn client_agent_resources(
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
         }
-        let source = item.as_object_mut().unwrap().remove("_status_source").unwrap_or(Value::Null);
+        let source = item
+            .as_object_mut()
+            .unwrap()
+            .remove("_status_source")
+            .unwrap_or(Value::Null);
         let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
         let observation = store.seat_observation_at(
-            item["id"].as_str().unwrap_or_default(), harness.as_ref(), snapshot_index, client_now_ms(),
+            item["id"].as_str().unwrap_or_default(),
+            harness.as_ref(),
+            snapshot_index,
+            client_now_ms(),
         )?;
         item["observation"] = json!(observation);
         if observation == "stale" && item["harness_state"] == "idle" {
             item["harness_state"] = json!("indeterminate");
-            if item["state"] == "running" { item["state"] = json!("waiting"); }
+            if item["state"] == "running" {
+                item["state"] = json!("waiting");
+            }
         }
         overlay_delivery_presence(item, &local_host);
     }
@@ -1944,6 +1968,8 @@ fn client_suspension(suspension: &crate::suspension::Suspension) -> Value {
         "code": suspension.code,
         "reason": suspension.reason,
         "blocking": suspension.blocking,
+        "source_host": suspension.source_host,
+        "host": suspension.host,
     })
 }
 
@@ -2006,15 +2032,43 @@ fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
     item["delivery"] = assessment.to_value();
 }
 
+#[cfg(test)]
 fn client_agent_resources_uncached(
     store: &Store,
     history: bool,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
+    client_agent_resources_selected(store, history, snapshot_index, None)
+}
+
+fn client_agent_resources_selected(
+    store: &Store,
+    history: bool,
+    snapshot_index: u64,
+    changed: Option<(&BTreeSet<String>, &[Value])>,
+) -> anyhow::Result<Vec<Value>> {
     // Without history the store reduces only agents that can be current, including unhealthy
     // ones; the filters below keep the current layer either way.
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
-    let work_queues = store.agent_work_queues()?;
+    let status = match changed {
+        Some((subjects, _)) => {
+            store.status_for_subject_names_at(subjects.clone(), snapshot_index, history)?
+        }
+        None => store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?,
+    };
+    // Local harness/runtime observations do not change queues or their labels. Retain those
+    // fields from the previous cards rather than scanning the fleet's work again.
+    let retain_queues = changed.is_some_and(|(subjects, previous)| {
+        subjects.iter().all(|subject| {
+            previous
+                .iter()
+                .any(|item| item["id"].as_str() == Some(subject.as_str()))
+        })
+    });
+    let work_queues = if retain_queues {
+        BTreeMap::new()
+    } else {
+        store.agent_work_queues()?
+    };
     let agent_subjects = status
         .subjects
         .iter()
@@ -2173,7 +2227,7 @@ fn client_agent_resources_uncached(
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
                 Some("suspended") if fault.is_none() => "suspended",
-                Some("snapshotting" | "restoring") if state == "stopped" => "suspended",
+                Some("snapshotting" | "fencing-source" | "transferring" | "restoring") if state == "stopped" => "suspended",
                 _ => state,
             };
             let runtime_id = fields
@@ -2218,7 +2272,7 @@ fn client_agent_resources_uncached(
                 .cloned()
                 .unwrap_or_default();
             let usage = usage_summaries.get(&subject.subject);
-            let value = json!({
+            let mut value = json!({
                 "id": subject.subject,
                 "kind": "agent",
                 "revision": revision,
@@ -2259,6 +2313,13 @@ fn client_agent_resources_uncached(
                 "handoff": handoff,
                 "rollout": crate::rollout::status(store, &subject.subject)?,
             });
+            if let Some((_, previous)) = changed.filter(|_| retain_queues)
+                && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
+                for field in ["current_work_ids", "active_work_count", "next_work_id",
+                    "upcoming_work_ids", "queued_work_count", "current_work", "next_work", "upcoming_work"] {
+                    value[field] = old[field].clone();
+                }
+            }
             Ok((name, value))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -4512,6 +4573,12 @@ async fn serve_unix_with_ancestor(
                 let delivery_peer = delivery_peer.clone();
                 async move {
                     let mut request = request.map(Body::new);
+                    if let Some(pid) = peer_pid {
+                        request.extensions_mut().insert(LocalPeer {
+                            pid,
+                            ancestor: bound_agent.clone(),
+                        });
+                    }
                     if let Some(peer) = delivery_peer {
                         request.extensions_mut().insert(peer);
                     }
@@ -5561,6 +5628,16 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: format!("could not inspect terminal exec gates: {error}"),
         }),
     );
+    checks.push(
+        state
+            .store
+            .account_limits_check(client_now_ms(), 3_600_000)
+            .unwrap_or_else(|error| DoctorCheck {
+                name: "account-limits".into(),
+                status: "warn".into(),
+                message: format!("could not inspect weekly account readings: {error}"),
+            }),
+    );
     match tempfile::Builder::new()
         .prefix(".st3-doctor-")
         .tempfile_in(&state.state_dir)
@@ -6136,6 +6213,14 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             status: "warn".into(),
             message: error.to_string(),
         }),
+    }
+    match mail_backlog::report(&state.store, client_now_ms()) {
+        Ok(backlog) => checks.push(DoctorCheck {
+            name: "mail-backlog".into(),
+            status: if backlog.count == 0 { "pass" } else { "warn" }.into(),
+            message: format!("{} unread messages older than 1h; close them with `{}`", backlog.count, backlog.cleanup_command),
+        }),
+        Err(error) => checks.push(DoctorCheck { name: "mail-backlog".into(), status: "warn".into(), message: error.to_string() }),
     }
     match delivery_probes::check(
         &state.store,
@@ -8884,6 +8969,8 @@ async fn start_mission_seat(
 
 #[derive(Deserialize)]
 pub(crate) struct AgentSuspensionRequest {
+    #[serde(default)]
+    pub host: Option<String>,
     pub subject: String,
     pub actor: String,
     pub idempotency_key: String,
@@ -9094,6 +9181,63 @@ pub(crate) fn request_suspend(
     Ok(claim)
 }
 
+#[derive(Deserialize, Serialize)]
+pub(crate) struct SnapshotReadRequest {
+    pub subject: String,
+    pub suspend_operation: String,
+    pub resume_operation: String,
+    pub actor: String,
+    pub offset: u64,
+}
+
+async fn seat_snapshot_chunk(
+    State(state): State<AppState>,
+    Json(request): Json<SnapshotReadRequest>,
+) -> Result<Json<Value>, ApiError> {
+    person_or_agent_actor(&request.actor, "invalid-resume-actor")?;
+    let suspension = crate::suspension::current(&state.store, &request.subject)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("no suspension"))?;
+    if suspension.operation_id != request.resume_operation
+        || suspension.suspend_operation_id.as_deref() != Some(&request.suspend_operation)
+        || suspension.source_host.as_deref() != Some(&state.node)
+        || suspension.requested_by.as_deref() != Some(&request.actor)
+        || !matches!(suspension.phase.as_str(), "fencing-source" | "transferring")
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-fence",
+            "snapshot read does not name the current move",
+        )));
+    }
+    let completed = state
+        .store
+        .operation_claim(&crate::suspension::suspend_completed_key(
+            &request.suspend_operation,
+        ))
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("source is not suspended"))?;
+    if completed.origin != state.node {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-fence",
+            "snapshot belongs to another source",
+        )));
+    }
+    let sources = crate::placement::latest_by_origin(&state.store, &request.subject, u64::MAX)
+        .map_err(ApiError::internal)?;
+    if !sources
+        .get(&state.node)
+        .is_some_and(|claim| crate::placement::field(claim, "status") == Some("stopped"))
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-fence",
+            "source runtime has not acknowledged its stop",
+        )));
+    }
+    crate::seat_snapshot::chunk(&state.state_dir, &request.suspend_operation, request.offset)
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
 /// Ask the seat's owner to resume a suspended seat on the native session it suspended.
 async fn resume_agent(
     State(state): State<AppState>,
@@ -9128,19 +9272,50 @@ pub(crate) fn request_resume(
     let suspend = suspension.suspend_operation_id.clone().ok_or_else(|| {
         ApiError::internal(anyhow::anyhow!("a suspension without its suspend request"))
     })?;
+    let host = request.host.unwrap_or_else(|| member.host.clone());
+    if host.is_empty() || host.contains('/') {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-host",
+            "resume needs a host name",
+        )));
+    }
+    let mut fields = BTreeMap::from([
+        ("action".into(), Value::String("resume".into())),
+        (
+            "runtime_id".into(),
+            Value::String(member.runtime_id.clone()),
+        ),
+    ]);
+    if host != member.host {
+        let membership = state.store.fleet_membership().map_err(ApiError::internal)?;
+        if host != state.node
+            && !state.configured_peers.contains(&host)
+            && !matches!(
+                membership.state(&host),
+                crate::fleet::MemberState::Current(_)
+            )
+        {
+            return Err(ApiError::bad(St3Error::new(
+                "unknown-host",
+                "the resume target is not a current fleet member",
+            )));
+        }
+        if !matches!(suspension.harness.as_deref(), Some("pi" | "omp")) {
+            return Err(ApiError::bad(St3Error::new(
+                "snapshot-harness-unsupported",
+                "cross-host resume currently supports pi and omp portable transcripts",
+            )));
+        }
+        fields.insert("host".into(), Value::String(host));
+        fields.insert("source_host".into(), Value::String(member.host.clone()));
+    }
     let claim = state
         .store
         .append_claim(&ClaimInput {
             subject,
             kind: "runtime.action.requested".into(),
             actor: Some(actor),
-            fields: BTreeMap::from([
-                ("action".into(), Value::String("resume".into())),
-                (
-                    "runtime_id".into(),
-                    Value::String(member.runtime_id.clone()),
-                ),
-            ]),
+            fields,
             evidence: vec![token, suspend],
             expected_subject: None,
             idempotency_key: Some(key),
@@ -12101,6 +12276,59 @@ struct LaneListQuery {
 }
 
 /// Every open lane, every declared lane with `?all=true`, or the lanes of one `?run=`.
+/// The process at the other end of a local socket connection, as the kernel reports it, and
+/// the agent its ancestry names.
+#[derive(Clone, Debug)]
+struct LocalPeer {
+    pid: u32,
+    ancestor: Option<String>,
+}
+
+/// This node's key for sekrets attestations, for `st sekrets enable` to register.
+async fn sekrets_node(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let (node, key) =
+        crate::sekrets::daemon::node_key(&state.store, &state.node).map_err(ApiError::bad)?;
+    Ok(Json(json!({
+        "node": node,
+        "key": key,
+        "person": crate::sekrets::daemon::PERSON.get(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct SekretsAttestRequest {
+    nonce: String,
+}
+
+/// Sign which seat the calling process is, for the sekrets gateway. Only over the local socket,
+/// where the kernel names the caller.
+async fn sekrets_attest(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<LocalPeer>>,
+    Json(request): Json<SekretsAttestRequest>,
+) -> Result<Json<crate::sekrets::protocol::Attestation>, ApiError> {
+    let Some(axum::Extension(peer)) = peer else {
+        return Err(ApiError::bad(St3Error::new(
+            "sekrets-attestation-refused",
+            "attestations are only given over the local socket",
+        )));
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::sekrets::daemon::attest(
+            &state.store,
+            &state.node,
+            &state.pty_root,
+            peer.pid,
+            peer.ancestor.as_deref(),
+            &request.nonce,
+        )
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map(Json)
+    .map_err(ApiError::bad)
+}
+
 async fn list_lanes(
     State(state): State<AppState>,
     Query(query): Query<LaneListQuery>,
@@ -12165,6 +12393,50 @@ fn normalized_agent_actor(actor: &str) -> Option<String> {
     }
 }
 
+async fn start_work(
+    State(state): State<AppState>,
+    Json(request): Json<crate::model::WorkStartRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let store = state.store.clone();
+    let result = blocking_action(move || store.start_work(&request)).await?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
+async fn handoff_work(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut input): Json<crate::model::WorkHandoffRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        Some(&input.actor),
+        &mut input.incarnation,
+    )?;
+    let request = WorkRequest {
+        actor: Some(input.actor.clone()),
+        incarnation: input.incarnation.clone(),
+        summary: Some(input.note.clone()),
+        reason: None,
+        evidence: input.evidence.clone(),
+        idempotency_key: input.idempotency_key.clone(),
+    };
+    work_action_response(state, "release".into(), subject, request, None, Some(input)).await
+}
+
+async fn acknowledge_work(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<crate::model::WorkAcknowledgeRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let store = state.store.clone();
+    let result = blocking_action(move || store.acknowledge_work(&subject, &request)).await?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
 async fn post_work_action(
     State(state): State<AppState>,
     AxumPath((action, subject)): AxumPath<(String, String)>,
@@ -12177,7 +12449,7 @@ async fn post_work_action(
         request.actor.as_deref(),
         &mut request.incarnation,
     )?;
-    work_action_response(state, action, subject, request, None).await
+    work_action_response(state, action, subject, request, None, None).await
 }
 
 /// Add time to the execution budget of the step attempt this seat holds.
@@ -12202,7 +12474,7 @@ async fn extend_work(
         evidence: Vec::new(),
         idempotency_key: request.idempotency_key,
     };
-    work_action_response(state, "extend".into(), subject, request, Some(extend_ms)).await
+    work_action_response(state, "extend".into(), subject, request, Some(extend_ms), None).await
 }
 
 async fn work_action_response(
@@ -12211,6 +12483,7 @@ async fn work_action_response(
     subject: String,
     request: WorkRequest,
     extend_ms: Option<u64>,
+    handoff: Option<crate::model::WorkHandoffRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
     let actor = request
         .actor
@@ -12236,6 +12509,9 @@ async fn work_action_response(
         .cached_idempotency_response::<StepRunView>(&request.idempotency_key)
         .map_err(ApiError::internal)?
     {
+        if let Some(input) = handoff.as_ref() {
+            state.store.handoff_retry(&subject, input).map_err(ApiError::bad)?;
+        }
         return Ok(Json(response));
     }
     let harness = state
@@ -12257,7 +12533,12 @@ async fn work_action_response(
     let quiet_renewal = action == "renew";
     let store = state.store.clone();
     let (mut response, desired) = blocking_action(move || {
-        let response = store.work_action_extending(&subject, &action, &request, extend_ms)?;
+        let response = if let Some(input) = handoff {
+            store.handoff_work(&subject, &input)?
+        } else {
+            store.work_action_extending(&subject, &action, &request, extend_ms)?
+        };
+
         let desired = store.desired_subjects().map_err(|error| {
             St3Error::new("store-read-failed", format!("read desired agents: {error}"))
         })?;
@@ -15984,6 +16265,22 @@ agent "good" {{ workspace {:?}; command "true" }}
     }
 
     #[test]
+    fn doctor_reports_missing_weekly_evidence_for_a_declared_account() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let intent = parse_intent(
+            "version 2\naccount \"avery/one\" { provider \"anthropic\"; login \"/tmp/example-login\"; }\nagent \"worker\" { workspace \"/tmp\"; harness \"claude\" { account \"avery/one\"; }; }",
+            state.store.origin(),
+        ).unwrap();
+        state.store.apply_internal(&intent, "missing-weekly-doctor").unwrap();
+        let report = doctor_report(&state).unwrap().0;
+        let check = report.checks.iter().find(|check| check.name == "account-limits").unwrap();
+        assert_eq!(check.status, "warn");
+        assert!(check.message.contains("account/avery/one: no weekly reading"));
+        assert!(check.message.contains("not below the limit"));
+    }
+
+    #[test]
     fn doctor_reports_waiting_claims_without_a_replication_fault() {
         let root = tempfile::tempdir().unwrap();
         let mut state = state(root.path());
@@ -19047,6 +19344,126 @@ mission "wake" state="ready" {
         assert_eq!(wake.assignee_state, "idle");
     }
 
+    fn checked_agent_cache(store: &Store, history: bool, index: u64) -> Vec<Value> {
+        let mut cached = store
+            .cached_agent_resources(index, history, |changed| {
+                client_agent_resources_selected(store, history, index, changed)
+            })
+            .unwrap();
+        // Production cards also cache todo; this comparison isolates the core projection.
+        for item in &mut cached {
+            item.as_object_mut().unwrap().remove("todo");
+        }
+        assert_eq!(
+            cached,
+            client_agent_resources_uncached(store, history, index).unwrap()
+        );
+        cached
+    }
+
+    #[test]
+    fn agent_cards_advance_locally_and_keep_historical_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let source = "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "incremental-cards")
+            .unwrap();
+        let append = |subject: &str, kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: None,
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        append(
+            "agent/node.amber",
+            "runtime.observed",
+            json!({
+                "status":"running", "runtime_id":"node.amber", "incarnation_id":"amber-1",
+            }),
+        );
+        let before = store.index().unwrap();
+        let original = checked_agent_cache(store, false, before);
+        checked_agent_cache(store, true, before);
+        for n in 0..12 {
+            append(
+                "agent/node.amber",
+                "harness.observed",
+                json!({
+                    "state":if n % 2 == 0 { "idle" } else { "working" },
+                    "driver":"codex", "incarnation_id":"amber-1",
+                }),
+            );
+            let at = store.index().unwrap();
+            for history in [false, true] {
+                checked_agent_cache(store, history, at);
+            }
+            // The unchanged card survives every local update.
+            let cards = checked_agent_cache(store, false, at);
+            assert_eq!(
+                cards
+                    .iter()
+                    .find(|card| card["id"] == "agent/node.cobalt")
+                    .unwrap(),
+                original
+                    .iter()
+                    .find(|card| card["id"] == "agent/node.cobalt")
+                    .unwrap()
+            );
+        }
+        // Evicted old snapshots rebuild independently of the newest cache.
+        assert_eq!(checked_agent_cache(store, false, before), original);
+        append(
+            "agent/node.cobalt",
+            "runtime.observed",
+            json!({
+                "status":"running", "runtime_id":"node.cobalt", "incarnation_id":"cobalt-1",
+            }),
+        );
+        checked_agent_cache(store, false, store.index().unwrap());
+        // A declaration changes membership and falls back to the complete projection.
+        let source = "version 2\nagent \"birch\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "incremental-new-card")
+            .unwrap();
+        let cards = checked_agent_cache(store, false, store.index().unwrap());
+        assert_eq!(
+            cards
+                .iter()
+                .map(|card| card["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["node.amber", "node.birch", "node.cobalt"]
+        );
+    }
+
     #[test]
     fn agents_name_their_queued_steps_and_missions_carry_open_run_steps() {
         let root = tempfile::tempdir().unwrap();
@@ -19123,6 +19540,17 @@ mission "labelled" state="ready" {
         );
         assert_eq!(steps[0]["goals"], json!(["Greet the fleet."]));
         assert_eq!(steps[0]["assignee"], format!("agent/{}/worker", run.id));
+
+        store.append_claim(&ClaimInput {
+            subject: format!("agent/{}/worker", run.id), kind: "harness.observed".into(),
+            actor: None, fields: serde_json::from_value(json!({
+                "state":"idle", "driver":"codex", "incarnation_id":"labelled-1",
+            })).unwrap(), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let cards = checked_agent_cache(&store, false, store.index().unwrap());
+        assert_eq!(cards[0]["next_work"], *next);
+        store.set_step_state(&first, "working", None).unwrap();
+        checked_agent_cache(&store, false, store.index().unwrap());
     }
 
     #[test]
@@ -19338,8 +19766,7 @@ mission "agent-human" state="ready" {
         };
         // Exercise the canonical graph projection independently of process-local delivery health.
         let agent = || {
-            client_agent_resources_uncached(&store, true, store.index().unwrap())
-                .unwrap()
+            checked_agent_cache(&store, true, store.index().unwrap())
                 .into_iter()
                 .find(|agent| agent["id"] == subject.as_str())
                 .unwrap()

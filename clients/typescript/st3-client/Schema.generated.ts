@@ -202,7 +202,8 @@ export type AgentCreateParameters = typeof AgentCreateParameters.Type
 export type AgentCreateParametersEncoded = typeof AgentCreateParameters.Encoded
 
 export const AgentResumeParameters = /*#__PURE__*/ (() => Schema.Struct({
-  "agent": Id
+  "agent": Id,
+  "host": optionalKey(Schema.String.check(Schema.isMinLength(1)))
 }).annotate({ identifier: "AgentResumeParameters" }))()
 export type AgentResumeParameters = typeof AgentResumeParameters.Type
 export type AgentResumeParametersEncoded = typeof AgentResumeParameters.Encoded
@@ -499,6 +500,7 @@ export const AgentSuspension = /*#__PURE__*/ (() => Schema.Struct({
   /** Stable reason the last suspend or resume failed, such as not-quiescent, native-session-mismatch or native-resume-unavailable. */
   "code": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Stable reason the last suspend or resume failed, such as not-quiescent, native-session-mismatch or native-resume-unavailable." }),
   "harness": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "host": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   /** The suspended incarnation, or the one a completed resume launched. */
   "incarnation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "The suspended incarnation, or the one a completed resume launched." }),
   /** The harness's own session the seat suspended on and resumes. */
@@ -506,8 +508,9 @@ export const AgentSuspension = /*#__PURE__*/ (() => Schema.Struct({
   /** The request claim; each phase change is a change of this agent. */
   "operation_id": Schema.String.annotate({ description: "The request claim; each phase change is a change of this agent." }),
   /** suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason. */
-  "phase": Schema.Literals(["quiescing","snapshotting","suspended","failed","restoring","verifying","resumed"]).annotate({ description: "suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason." }),
+  "phase": Schema.Literals(["quiescing","snapshotting","suspended","failed","fencing-source","transferring","restoring","verifying","resumed"]).annotate({ description: "suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason." }),
   "reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "source_host": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "suspended_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "updated_at": Timestamp
 }).annotate({ identifier: "AgentSuspension" }))()
@@ -750,6 +753,20 @@ export const AgentRepository = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "AgentRepository" }))()
 export type AgentRepository = typeof AgentRepository.Type
 export type AgentRepositoryEncoded = typeof AgentRepository.Encoded
+
+export const AgentWorkspace = /*#__PURE__*/ (() => Schema.Struct({
+  "agent_id": AgentId,
+  /** Agent declaration supplying the workspace; reached through unambiguous stop predecessors. */
+  "declaration_token": Schema.String.annotate({ description: "Agent declaration supplying the workspace; reached through unambiguous stop predecessors." }),
+  /** Selected desired claim, including a stop when the seat is retired. */
+  "desired_token": Schema.String.annotate({ description: "Selected desired claim, including a stop when the seat is retired." }),
+  "host_id": HostId,
+  "kind": Schema.Literal("agent-workspace"),
+  /** Declared workspace directory on host_id, not the API gateway's filesystem or the harness's internal state directory. */
+  "workspace": Schema.String.annotate({ description: "Declared workspace directory on host_id, not the API gateway's filesystem or the harness's internal state directory." })
+}).annotate({ identifier: "AgentWorkspace" }))()
+export type AgentWorkspace = typeof AgentWorkspace.Type
+export type AgentWorkspaceEncoded = typeof AgentWorkspace.Encoded
 
 export const Attachment = /*#__PURE__*/ (() => Schema.Struct({
   "blob": Schema.String.check(Schema.isPattern(new RegExp("^blob/[0-9a-f]{64}$", "u"))),
@@ -1896,6 +1913,14 @@ export const EventPage = /*#__PURE__*/ (() => Schema.Struct({
 export type EventPage = typeof EventPage.Type
 export type EventPageEncoded = typeof EventPage.Encoded
 
+export const MailBacklog = /*#__PURE__*/ (() => Schema.Struct({
+  "cleanup_command": Schema.String,
+  "count": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "threshold_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
+}).annotate({ identifier: "MailBacklog" }))()
+export type MailBacklog = typeof MailBacklog.Type
+export type MailBacklogEncoded = typeof MailBacklog.Encoded
+
 export const ReplicatedNotice = /*#__PURE__*/ (() => Schema.Struct({
   "complete": Schema.Boolean,
   "owner_host_id": Id,
@@ -2078,7 +2103,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded

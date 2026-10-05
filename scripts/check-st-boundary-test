@@ -140,6 +140,19 @@ class BoundaryCheck(unittest.TestCase):
             connection.commit()
             self.assertTrue(list(fresh_seat_findings(self.root, self.processes)))
 
+    def test_opaque_claim_signature_does_not_mask_semantic_claims(self):
+        database = self.root / "state/claims.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE claim_signatures(signature TEXT)")
+            connection.execute("INSERT INTO claim_signatures VALUES ('Abc+st2/Def')")
+            connection.execute("CREATE TABLE claims(body TEXT)")
+            connection.execute("INSERT INTO claims VALUES (?)", ('{"schema":"st.harness-state.v1"}',))
+            connection.commit()
+            self.assertEqual(list(fresh_seat_findings(self.root, self.processes)), [])
+            connection.execute("UPDATE claims SET body=?", ('{"schema":"st2.harness-state.v1"}',))
+            connection.commit()
+            self.assertTrue(list(fresh_seat_findings(self.root, self.processes)))
+
     def test_random_key_material_with_the_letters_st2_passes(self):
         database = self.root / "state/claims.sqlite3"
         with sqlite3.connect(database) as connection:

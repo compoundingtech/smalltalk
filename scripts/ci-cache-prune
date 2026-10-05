@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Free repository cache space without evicting open-PR or current main recipes."""
+import json
+import os
+import re
+import subprocess
+
+
+def api(path, method='GET'):
+    result = subprocess.check_output(['gh', 'api', '--method', method, path], text=True)
+    return json.loads(result) if result.strip() else None
+
+
+def obsolete(caches, closed):
+    selected, kept_zig = [], set()
+    # Newest access first: retain one old Zig snapshot per platform during migration.
+    ordered = sorted(caches, key=lambda cache: cache.get('last_accessed_at', ''), reverse=True)
+    for cache in ordered:
+        match = re.fullmatch(r'refs/pull/(\d+)/merge', cache['ref'])
+        if match and closed(int(match[1])):
+            selected.append(cache)
+            continue
+        zig = re.fullmatch(r'(setup-zig-cache-v2-build-zig-.*)--\d+-\d+', cache['key'])
+        if cache['ref'] == 'refs/heads/main' and zig:
+            if zig[1] in kept_zig:
+                selected.append(cache)
+            else:
+                kept_zig.add(zig[1])
+    return selected
+
+
+def main():
+    if os.environ.get('GITHUB_REF') != 'refs/heads/main' or os.environ.get('GITHUB_EVENT_NAME') not in ('push', 'workflow_dispatch'):
+        raise SystemExit('cache pruning requires a protected main push or manual main run')
+    repo = os.environ['GITHUB_REPOSITORY']
+    caches, page = [], 1
+    while True:
+        batch = api(f'repos/{repo}/actions/caches?per_page=100&page={page}')['actions_caches']
+        caches.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    states = {}
+    def closed(number):
+        if number not in states:
+            states[number] = api(f'repos/{repo}/pulls/{number}')['state'] == 'closed'
+        return states[number]
+    selected = obsolete(caches, closed)
+    for cache in selected:
+        api(f"repos/{repo}/actions/caches/{cache['id']}", 'DELETE')
+    freed = sum(cache['size_in_bytes'] for cache in selected)
+    message = f'Removed {len(selected)} closed-PR or redundant Zig caches ({freed / 1_000_000:.0f} MB). Open PRs and current main recipes retained.'
+    print(message)
+    with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+        summary.write(message + '\n')
+
+
+if __name__ == '__main__':
+    main()

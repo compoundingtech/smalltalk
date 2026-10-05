@@ -2165,6 +2165,142 @@ async fn cli_send_reply_read_archive_search_and_attachments_survive_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_aged_unread_cleanup_preserves_fresh_and_read_mail_across_restart() {
+    let mut daemon = Daemon::new().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let mut messages = BTreeMap::new();
+    for (name, recipient, phase, fresh) in [
+        ("old-sent", PERSON, "sent", false),
+        ("old-delivered", PERSON, "delivered", false),
+        ("old-read", PERSON, "read", false),
+        ("old-closed", PERSON, "closed", false),
+        ("old-other", "person/blair", "sent", false),
+        ("fresh-sent", PERSON, "sent", true),
+        ("fresh-delivered", PERSON, "delivered", true),
+    ] {
+        daemon
+            .store()
+            .set_write_clock_at(if fresh { now } else { now - 7_200_000 })
+            .unwrap();
+        let sent = cli_value(
+            daemon
+                .cli(
+                    PERSON,
+                    &[
+                        "conversations",
+                        "send",
+                        recipient,
+                        "--from",
+                        PERSON,
+                        "--body",
+                        name,
+                        "--idempotency-key",
+                        name,
+                    ],
+                )
+                .await,
+        );
+        let subject = sent["subject"].as_str().unwrap().to_owned();
+        if phase != "sent" {
+            let _: Value = daemon.transport().post(
+                &format!("/v1/messages/{}/claims", subject.trim_start_matches("message/")),
+                &json!({"lifecycle": "delivered", "actor": recipient, "idempotency_key": format!("{name}:delivered")}),
+            ).await.unwrap();
+        }
+        if matches!(phase, "read" | "closed") {
+            cli_value(
+                daemon
+                    .cli(
+                        recipient,
+                        &["conversations", "read", &subject, "--as", recipient],
+                    )
+                    .await,
+            );
+        }
+        if phase == "closed" {
+            cli_value(
+                daemon
+                    .cli(
+                        recipient,
+                        &["conversations", "archive", &subject, "--as", recipient],
+                    )
+                    .await,
+            );
+        }
+        messages.insert(name, subject);
+    }
+    daemon.store().set_write_clock_at(now).unwrap();
+    daemon.restart().await;
+    let all = ["conversations", "cleanup", "--all", "--older-than", "1h"];
+    let before = daemon.store().index().unwrap();
+    let preview = cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &[
+                    "conversations",
+                    "cleanup",
+                    "--all",
+                    "--older-than",
+                    "1h",
+                    "--dry-run",
+                ],
+            )
+            .await,
+    );
+    assert_eq!(preview["count"], 3);
+    assert_eq!(daemon.store().index().unwrap(), before);
+    let scoped = [
+        "conversations",
+        "cleanup",
+        "--as",
+        PERSON,
+        "--older-than",
+        "1h",
+    ];
+    assert_eq!(cli_value(daemon.cli(PERSON, &scoped).await)["count"], 2);
+    daemon.restart().await;
+    assert_eq!(cli_value(daemon.cli(PERSON, &scoped).await)["count"], 0);
+    for (name, expected) in [
+        ("old-sent", "closed"),
+        ("old-delivered", "closed"),
+        ("old-other", "sent"),
+        ("old-read", "read"),
+        ("old-closed", "closed"),
+        ("fresh-sent", "sent"),
+        ("fresh-delivered", "delivered"),
+    ] {
+        assert_eq!(
+            daemon
+                .store()
+                .message(&messages[name])
+                .unwrap()
+                .unwrap()
+                .status,
+            expected,
+            "{name}"
+        );
+    }
+    assert_eq!(cli_value(daemon.cli(PERSON, &all).await)["count"], 1);
+    daemon.restart().await;
+    let before = daemon.store().index().unwrap();
+    assert_eq!(cli_value(daemon.cli(PERSON, &all).await)["count"], 0);
+    assert_eq!(daemon.store().index().unwrap(), before);
+    assert_eq!(
+        daemon
+            .store()
+            .message(&messages["old-other"])
+            .unwrap()
+            .unwrap()
+            .status,
+        "closed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_revision_propose_inspect_approve_and_cancel_survive_restart() {
     for decision in ["approve", "cancel"] {
         let mut daemon = Daemon::new().await;
@@ -3071,7 +3207,6 @@ async fn cli_subscription_release_and_cancel_survive_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_replication_inspection_and_repair_survive_restart() {
-    use base64::Engine;
     const FLEET: &str = "5e3c1a9b-2d4f-4b6e-8a7c-0f1e2d3c4b5a";
     let mut daemon = Daemon::new().await;
     daemon.store().bind_fleet(FLEET).unwrap();
@@ -3092,11 +3227,9 @@ async fn cli_replication_inspection_and_repair_survive_restart() {
         .export_replication_exchange(FLEET, &daemon.store().replication_inventory().unwrap())
         .unwrap();
     let original = exchange.envelopes[0].clone();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&original.payload)
-        .unwrap();
+    let bytes = original.payload.bytes().unwrap();
     let mut payload: smallclaims::claim::ReplicaEnvelopePayload =
-        ciborium::from_reader(bytes.as_slice()).unwrap();
+        ciborium::from_reader(bytes).unwrap();
     let claim = &mut payload.batch.claims[0];
     claim.body["fields"]["unexpected"] = json!(true);
     claim.id = smallclaims::hash::claim_hash(
@@ -3119,7 +3252,7 @@ async fn cli_replication_inspection_and_repair_survive_restart() {
             original.accepted_at_unix_ms,
             &bytes,
         ),
-        payload: base64::engine::general_purpose::STANDARD.encode(bytes),
+        payload: bytes.into(),
         ..original.clone()
     };
     exchange.envelopes = vec![original, broken];

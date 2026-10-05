@@ -38,7 +38,9 @@ Every client's tests check against that file.
      subject, kind, origin, actor, body, predecessors and existing claim signature. These public
      receipts let a completing client check content hashes, signatures and issuer/role links,
      including that the device grant binds the public key it submitted. They provide no new
-     authority and do not authenticate the gateway's node key independently of transport trust.
+     authority. Without independently pinning a trusted node or person-root key, an active
+     attacker can return an entirely forged, self-consistent chain and defeat this check.
+     Use a trusted encrypted path; returned proofs alone do not authenticate the gateway.
    - A `device_public_key` that is not a signing key pairs the device as before. That device has
      no grant and cannot sign.
 4. Revoking the pairing (`pairing.revoke`) also writes `principal.key-revoked` for the key.
@@ -67,7 +69,9 @@ tunnel: the pairing code and bearer credentials cross it. Both commands print th
 using HTTP. Other HTTP addresses are refused by default. On an already encrypted path, use
 `--allow-public-http` with `st devices complete` or `stui pair` to override that restriction.
 The override is saved as `allow_public_http: true` on that device in the private profile;
-existing profiles can set that field explicitly. HTTPS requires no override.
+existing profiles can set that field explicitly. The override also permits ambient HTTP proxies;
+ensure that the proxy path is encrypted and trusted too. HTTPS requires no override.
+The same address restriction applies to every plain WebSocket stream connection and reconnect.
 
 The default generates a P-256 software key. Use `--algorithm ed25519` for Ed25519. To import
 an existing private key, add `--key-file /absolute/path/device.der` and select its algorithm;
@@ -97,7 +101,14 @@ enrolls no signing key and persists no private signing material.
 
 Completion checks the private key with a local signing self-test before sending the existing
 pairing request. It does not add a server proof-of-possession requirement or send a message.
-Before committing a messaging profile it verifies the returned device and person-root grant
+Before sending the single-use code, it reads the member's capability advertisement and requires
+`device-key-proofs` version 1. Older members are refused without submitting or consuming the code.
+The member prepares and checks both proofs before recording completion or creating the bearer.
+If a historical root has no usable signature or content hash, completion refuses without consuming
+its code; inspect signing history on the trusted member. Proof preparation can leave an unused key
+grant: that principal claim is signing authority even without a bearer, and is not rolled back.
+Inspect principal grant history on the trusted member if proof preparation fails; there is no
+completed device record for that grant in `st devices ls`. Immutable history is not rewritten. Before committing a messaging profile it verifies the returned device and person-root grant
 proofs, their content hashes and signatures, the device-to-root-to-node issuer/role links, and
 the first grant's binding to its submitted public key. A member that does not return those
 proofs must be upgraded; the client refuses to save its response and reports the possible

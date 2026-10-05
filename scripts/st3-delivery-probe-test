@@ -11,6 +11,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import uuid
@@ -323,6 +324,12 @@ agent "probe/{node.name}" {{
             self.assertTrue(any(item["subject"] == blocked["attention"] for item in attention), attention)
             doctor = json.loads(await nodes[0].cli("doctor", "--json"))
             self.assertTrue(any(check["name"] == "delivery-probes" and check["status"] == "warn" for check in doctor["checks"]))
+            # This probe is seconds old and was never offered while its recipient was
+            # stopped. Restart must recover it once, as well as reading new live probes.
+            before = await nodes[1].api("/v1/claims?" + probe.urlencode({"subject": blocked["message"]}))
+            self.assertFalse(any(claim["kind"] in ("message.staged", "message.delivered", "message.read")
+                                 for claim in before["claims"]))
+            restarted_at = time.time_ns() // 1_000_000
             await nodes[1].cli("agents", "apply", str(nodes[1].root / "seat.kdl"), "--as", "person/eval")
 
             async def recovered():
@@ -332,8 +339,16 @@ agent "probe/{node.name}" {{
             recovered_row = await faults.until(recovered, 30)
             self.assertFalse(recovered_row["late"])
             self.assertLess(recovered_row["latency_ms"], deadline_ms)
-            claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": blocked["message"]}))
-            self.assertEqual(sum(claim["kind"] == "message.read" for claim in claims["claims"]), 0)
+            async def recovered_outage_probe():
+                claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": blocked["message"]}))
+                return claims if any(claim["kind"] == "message.read" for claim in claims["claims"]) else None
+
+            claims = await faults.until(recovered_outage_probe, 30)
+            self.assertEqual(sum(claim["kind"] == "message.read" for claim in claims["claims"]), 1)
+            events = [json.loads(line) for line in (nodes[1].root / "probe/events.jsonl").read_text().splitlines()]
+            consumed = [event for event in events if event["event"] == "consumed" and event["message"] == blocked["message"]]
+            self.assertEqual(len(consumed), 1)
+            self.assertGreaterEqual(consumed[0]["at_unix_ms"], restarted_at)
             claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": recovered_row["message"]}))
             self.assertEqual(sum(claim["kind"] == "message.read" for claim in claims["claims"]), 1)
             # No provider binary was launched: only Python and the real native channel.
