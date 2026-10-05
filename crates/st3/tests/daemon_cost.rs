@@ -104,6 +104,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "requires an authenticated native driver; the load test models seat waits with event long-polls",
     ),
     (
+        "GET /v1/mailbox/attachment",
+        "requires an authenticated native driver; uses indexed mailbox fence validation and an in-memory channel report",
+    ),
+    (
         "GET /v1/client/conversations/{id}/stream",
         "a WebSocket stream",
     ),

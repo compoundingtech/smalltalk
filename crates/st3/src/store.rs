@@ -19163,9 +19163,10 @@ fn claude_attachment_fence(
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
     let claim = connection.prepare_cached(&format!(
         "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
-         FROM claims JOIN batches ON batches.id=claims.batch_id
+         FROM claims INDEXED BY claims_incarnation_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1 AND claims.kind='harness.diagnostic' AND claims.store_index<=?2
-           AND json_extract(claims.body, '$.fields.incarnation_id')=?3
+           AND {INCARNATION_OF_CLAIM}=?3
            AND json_extract(claims.body, '$.fields.code') IN ('claude-channel-unattached','claude-channel-attached')
          ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
     ))?.query_row(params![subject, at_index, incarnation], |row| {
