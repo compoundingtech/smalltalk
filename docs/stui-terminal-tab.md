@@ -113,6 +113,9 @@ owns. Both direct and Unicode-placeholder placements render as outer kitty virtu
 placements. Text-cell frame diffs move and clear the visible placeholders on
 scroll, pane movement, resize, overlays and tab switches. Hidden/dropped panes and
 replaced placements delete only the compositor's own stored image ids.
+Child placeholders whose images have been deleted are blanked, even if their text
+remains in history or reflows back into the pane; child image ids never reach the
+outer terminal.
 
 Transmission is independent of the first placeholder cell, so an overlay or a hole
 cannot swallow it. Original placeholder colors mask holes and other images.

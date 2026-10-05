@@ -69,6 +69,17 @@ pub(super) struct Painter {
 }
 impl Painter {
     pub(super) fn draw(&mut self, frame: &Frame, buf: &mut Buffer, area: Rect, picker: &Picker) {
+        let original = buf.clone();
+        // Placeholder text can outlive its image (including after history reflow).
+        // It is an inner placement reference, never ordinary outer terminal text.
+        // Only active placements below may replace it with our owned image ids.
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                if buf[(x, y)].symbol().starts_with('\u{10eeee}') {
+                    buf[(x, y)].set_symbol(" ");
+                }
+            }
+        }
         let font = if picker.protocol_type() == ProtocolType::Kitty {
             picker.font_size()
         } else {
@@ -80,7 +91,6 @@ impl Painter {
         if font.width == 0 || font.height == 0 {
             return;
         }
-        let original = buf.clone();
         let placeholders = placeholder_ids(frame, &original, area);
         let mut keep = Vec::new();
         let mut remaining_pixels = 16 * 1024 * 1024u64;
@@ -367,6 +377,54 @@ fn clipped(col: i32, row: i32, cols: u32, rows: u32, area: Rect) -> Option<(Rect
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deleted_images_leave_no_child_placeholders_in_the_pane() {
+        use base64::Engine;
+        use ratatui::style::Color;
+        let mut actor = TerminalActor::new(6, 10, 20);
+        actor.enable_graphics(Default::default());
+        let pixels =
+            base64::engine::general_purpose::STANDARD.encode([220u8, 90, 40, 255].repeat(16 * 32));
+        actor.write(format!("\x1b_Ga=t,t=d,f=32,s=16,v=32,i=23;{pixels}\x1b\\\x1b_Ga=p,U=1,i=23,p=1,c=2,r=2\x1b\\\x1b[38;2;0;0;23m\x1b[58;2;0;0;1m").as_bytes());
+        let pane = Rect::new(20, 8, 10, 6);
+        let mut original = Buffer::empty(Rect::new(0, 0, 40, 20));
+        original[(0, 0)].set_symbol("neighbor");
+        let marks = ['\u{0305}', '\u{030d}'];
+        for row in 0..2 {
+            actor.write(format!("\x1b[{};1H", row + 1).as_bytes());
+            for col in 0..2 {
+                let text = format!("\u{10eeee}{}{}", marks[row], marks[col]);
+                actor.write(text.as_bytes());
+                original[(pane.x + col as u16, pane.y + row as u16)]
+                    .set_symbol(&text)
+                    .set_fg(Color::Rgb(0, 0, 23))
+                    .set_style(
+                        ratatui::style::Style::default().underline_color(Color::Rgb(0, 0, 1)),
+                    );
+            }
+        }
+        let mut frame = Frame::default();
+        frame.update(&actor, 0);
+        let mut painter = Painter::default();
+        let mut active = original.clone();
+        painter.draw(&frame, &mut active, pane, &Picker::halfblocks());
+        assert_eq!(active[(pane.x, pane.y)].bg, Color::Rgb(220, 90, 40));
+        assert_eq!(painter.cache.len(), 1);
+
+        // Kitty deletion removes the image, without erasing the placeholder text.
+        actor.write(b"\x1b_Ga=d,d=I,i=23,q=2\x1b\\");
+        frame.update(&actor, 0);
+        assert!(frame.state.images.is_empty());
+        painter.draw(&frame, &mut original, pane, &Picker::halfblocks());
+        assert!(
+            original
+                .content
+                .iter()
+                .all(|cell| !cell.symbol().contains('\u{10eeee}'))
+        );
+        assert_eq!(original[(0, 0)].symbol(), "neighbor");
+        assert!(painter.cache.is_empty());
+    }
     #[test]
     fn overlapping_placeholder_regions_keep_the_full_image_id() {
         use base64::Engine;

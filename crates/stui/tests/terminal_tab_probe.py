@@ -523,7 +523,9 @@ def controls_and_images(worker):
                 assert bx <= x < bx+bw and by <= y < by+bh
             tab.resize(44,132)
             wait_for(tab.status, lambda s: s and s["body"][2] != moved["body"][2] and len(s["image_cells"]) == 2, "image resize")
-            tab.emit(b"\x1b_Ga=d,d=I,i=23,q=2\x1b\\\x1b[2J")
+            # Deletion must clear the rendered image even while its text placeholders
+            # remain in the grid (or return from history during a resize).
+            tab.emit(b"\x1b_Ga=d,d=I,i=23,q=2\x1b\\")
             wait_for(tab.status, lambda s: s and not s["image_cells"], "image delete")
             rows.append({"case": "images/unicode-lifecycle", "clipped": True, "scroll": True, "move": True, "hide": True, "resize": True, "delete": True})
             # Direct placements use the same pane-safe outer virtual image path.
