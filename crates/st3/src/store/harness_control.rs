@@ -393,8 +393,14 @@ mod tests {
         second.idempotency_key = "key:0123456789abcdef".into();
         let accepted_second = store.mutate_harness_queue(&second).unwrap();
         assert_ne!(accepted_first.operation_id, accepted_second.operation_id);
-        assert_eq!(store.mutate_harness_queue(&first).unwrap(), accepted_first);
-        assert_eq!(store.mutate_harness_queue(&second).unwrap(), accepted_second);
+        let recovered_first = store.mutate_harness_queue(&first).unwrap();
+        assert_eq!(recovered_first.operation_id, accepted_first.operation_id);
+        assert_eq!(recovered_first.entry_id, accepted_first.entry_id);
+        assert_eq!(recovered_first, store.harness_control_receipt(&accepted_first.operation_id).unwrap().unwrap());
+        let recovered_second = store.mutate_harness_queue(&second).unwrap();
+        assert_eq!(recovered_second.operation_id, accepted_second.operation_id);
+        assert_eq!(recovered_second.entry_id, accepted_second.entry_id);
+        assert_eq!(recovered_second, store.harness_control_receipt(&accepted_second.operation_id).unwrap().unwrap());
         let queue = store.harness_control_queue(SUBJECT).unwrap();
         assert_eq!((queue.entries[0].actor.as_str(), queue.entries[0].content.as_str()), (first.actor.as_str(), "first person"));
         assert_eq!((queue.entries[1].actor.as_str(), queue.entries[1].content.as_str()), (second.actor.as_str(), "second person"));
