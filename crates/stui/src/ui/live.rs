@@ -138,7 +138,6 @@ fn usage_error(error: &st3_client::ClientError) -> String {
 }
 
 enum Fetched {
-    MailBacklog(Result<st3_client::MailBacklog, String>),
     Read(String, Result<(), String>),
     /// A page before the oldest entry of a conversation's session: its entries, whether st
     /// holds more before them, and the cursor for that next page; or why it could not be read.
@@ -323,8 +322,6 @@ pub fn run(context: Context) -> Result<()> {
     let mut clients_read: Option<Instant> = None;
     let mut clients_reading = false;
     let mut usage_reading = false;
-    let mut backlog_read: Option<Instant> = None;
-    let mut backlog_reading = false;
     // The palette's conversation search: what st was last asked, and what is typed since when.
     let mut said_asked: Option<String> = None;
     let mut said_typed: Option<(String, Instant)> = None;
@@ -348,8 +345,6 @@ pub fn run(context: Context) -> Result<()> {
                 feed::Update::GlassesVersion(version) => super::set_glasses_version(version),
                 feed::Update::Connected(member) => {
                     client = member;
-                    backlog_read = None;
-                    extras.mail_backlog = None;
                     extras.live = false;
                     attached = None;
                     shown_tab = usize::MAX;
@@ -504,10 +499,6 @@ pub fn run(context: Context) -> Result<()> {
         }
         while let Ok(result) = fetched.try_recv() {
             match result {
-                Fetched::MailBacklog(result) => {
-                    backlog_reading = false;
-                    extras.mail_backlog = Some(result);
-                }
                 Fetched::Read(id, result) => {
                     read_receipts.completed(id, result.is_ok(), Instant::now());
                 }
@@ -793,19 +784,6 @@ pub fn run(context: Context) -> Result<()> {
                     let _ = tx.send(Fetched::Usage(hours, outcome));
                 });
             }
-        }
-        if !backlog_reading && backlog_read.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
-            backlog_reading = true;
-            backlog_read = Some(Instant::now());
-            let client = client.clone();
-            let tx = fetched_tx.clone();
-            runtime.spawn(async move {
-                let result = client.mail_backlog_summary()
-                    .await
-                    .map(|envelope| envelope.value)
-                    .map_err(|error| format!("Could not read mail backlog: {}", error.plain()));
-                let _ = tx.send(Fetched::MailBacklog(result));
-            });
         }
         // Every conversation on screen rides the feed's socket (the focused one first): st
         // pushes each change, so nothing here reads one again on a timer.
