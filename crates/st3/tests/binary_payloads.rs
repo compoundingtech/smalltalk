@@ -72,6 +72,18 @@ fn upgrade_preserves_signed_backups_retries_and_stream_cursors() {
         .replication_status(true, Some("sample-fleet"), &[])
         .unwrap()
         .authority_digest;
+    let raw_records = store
+        .replica_records(false)
+        .unwrap()
+        .into_iter()
+        .map(|record| {
+            let raw = store
+                .replica_record_raw(&record.record_ref)
+                .unwrap()
+                .unwrap();
+            (record.record_ref, raw)
+        })
+        .collect::<Vec<_>>();
     {
         let connection = store.connection.write();
         let payloads: Vec<(i64, Vec<u8>)> = connection
@@ -89,12 +101,20 @@ fn upgrade_preserves_signed_backups_retries_and_stream_cursors() {
                 )
                 .unwrap();
         }
+        for (record_ref, raw) in &raw_records {
+            connection.execute("UPDATE replica_records SET raw=?2,raw_offset=NULL,raw_length=NULL,raw_mode=NULL WHERE record_ref=?1",
+                rusqlite::params![record_ref,raw]).unwrap();
+        }
         connection.execute_batch("PRAGMA user_version=15").unwrap();
     }
     drop(store);
     let store = Store::open(&path, "alder").unwrap();
     store.set_member_key(Some(key)).unwrap();
     while !store.convert_envelope_payloads().unwrap().done {}
+    while !store.convert_record_offsets().unwrap().done {}
+    for (record_ref, raw) in raw_records {
+        assert_eq!(store.replica_record_raw(&record_ref).unwrap(), Some(raw));
+    }
     assert_eq!(
         store
             .replication_status(true, Some("sample-fleet"), &[])

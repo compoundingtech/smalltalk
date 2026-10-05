@@ -49,6 +49,64 @@ fn main() -> anyhow::Result<()> {
         "open_cpu_ms={:.3}",
         (process_time() - cpu_started).as_secs_f64() * 1000.0
     );
+    if args.get(2).is_some_and(|arg| arg == "convert-records") {
+        let started = Instant::now();
+        let mut converted = 0;
+        let mut scanned = 0;
+        let mut retained = 0;
+        let mut max_page_ms = 0.0_f64;
+        let mut max_queue_ms = 0.0_f64;
+        loop {
+            let page_started = Instant::now();
+            let page = source.convert_record_offsets()?;
+            max_page_ms = max_page_ms.max(page_started.elapsed().as_secs_f64() * 1000.0);
+            max_queue_ms = max_queue_ms.max(page.queue_ms);
+            converted += page.converted;
+            scanned += page.scanned;
+            retained += page.retained;
+            if page.done {
+                break;
+            }
+        }
+        println!(
+            "record_conversion_ms={:.3} scanned={scanned} converted={converted} retained={retained} max_page_ms={max_page_ms:.3} max_queue_ms={max_queue_ms:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        return Ok(());
+    }
+    if args.get(2).is_some_and(|arg| arg == "raw-proof") {
+        use sha2::{Digest, Sha256};
+        let ids = source
+            .connection
+            .write()
+            .prepare("SELECT record_ref FROM replica_records ORDER BY rowid")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut digest = Sha256::new();
+        let mut bytes = 0;
+        for id in &ids {
+            let value = source
+                .replica_record_raw(id)?
+                .ok_or_else(|| anyhow::anyhow!("missing record"))?;
+            digest.update((id.len() as u64).to_be_bytes());
+            digest.update(id.as_bytes());
+            let (kind, raw) = match value {
+                rusqlite::types::Value::Blob(raw) => (b'b', raw),
+                rusqlite::types::Value::Text(text) => (b't', text.into_bytes()),
+                _ => anyhow::bail!("unexpected raw SQLite type"),
+            };
+            bytes += raw.len();
+            digest.update([kind]);
+            digest.update((raw.len() as u64).to_be_bytes());
+            digest.update(raw);
+        }
+        println!(
+            "raw_records={} raw_bytes={bytes} raw_digest={}",
+            ids.len(),
+            hex::encode(digest.finalize())
+        );
+        return Ok(());
+    }
     if args.get(2).is_some_and(|arg| arg == "convert") {
         let started = Instant::now();
         let mut converted = 0;

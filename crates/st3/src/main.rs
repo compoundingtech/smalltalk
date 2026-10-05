@@ -5416,6 +5416,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         ));
     }
     tokio::spawn(convert_envelope_payloads(store.clone()));
+    tokio::spawn(convert_record_offsets(store.clone()));
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
@@ -21139,6 +21140,23 @@ async fn convert_envelope_payloads(store: Arc<Store>) {
             Ok(Ok(_)) => tokio::time::sleep(Duration::from_millis(50)).await,
             error => {
                 eprintln!("st3: binary envelope conversion failed: {error:?}");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    }
+}
+
+/// Legacy record representations are checked on a reader before bounded pointer updates
+/// join the normal writer queue. The cursor commits with those updates after each page.
+async fn convert_record_offsets(store: Arc<Store>) {
+    loop {
+        let store = store.clone();
+        let result = tokio::task::spawn_blocking(move || store.convert_record_offsets()).await;
+        match result {
+            Ok(Ok(report)) if report.done => return,
+            Ok(Ok(_)) => tokio::time::sleep(Duration::from_millis(50)).await,
+            error => {
+                eprintln!("st3: record offset conversion failed: {error:?}");
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         }
