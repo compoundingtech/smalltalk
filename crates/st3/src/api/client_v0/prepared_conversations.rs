@@ -380,7 +380,15 @@ impl Owner {
                         Ok(remote) => remote,
                         Err(_) => continue,
                     };
-                    let _ = background(&state, &session, &session_id, remote.as_deref()).await;
+                    tokio::select! {
+                        _ = background(&state, &session, &session_id, remote.as_deref()) => {},
+                        result = wanted.changed() => {
+                            if result.is_err() { return; }
+                            // Removing/replacing a window cancels queued work immediately.
+                            // An already-started blocking read still owns its budget.
+                            break;
+                        }
+                    }
                 }
             }
         });

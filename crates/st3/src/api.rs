@@ -3836,6 +3836,10 @@ async fn client_sessions_detail(
                         "remote session detail requires a concrete person or agent",
                     )));
                 }
+                let limit = query.limit.map(Ok).unwrap_or_else(|| {
+                    query.cursor.as_deref().map(decode_client_cursor).transpose()
+                        .map(|cursor| cursor.map_or(CLIENT_DEFAULT_PAGE_ITEMS, |cursor| cursor.limit))
+                })?.clamp(1, CLIENT_MAX_PAGE_ITEMS);
                 let value = relay
                     .read(
                         &remote_host,
@@ -3844,7 +3848,7 @@ async fn client_sessions_detail(
                             relay: None,
                             request: crate::peer::ClientReadOperation::Timeline {
                                 session_id,
-                                limit: query.limit.unwrap_or(50).clamp(1, 200),
+                                limit,
                                 cursor: query.cursor.clone(),
                             },
                         },
