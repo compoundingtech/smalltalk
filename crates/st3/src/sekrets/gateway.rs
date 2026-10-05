@@ -1236,7 +1236,8 @@ fn open_pty(size: protocol::Winsize) -> Result<(OwnedFd, OwnedFd)> {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut winsize,
+            // Linux takes a const pointer, macOS a mutable one; a raw pointer suits both.
+            std::ptr::addr_of_mut!(winsize),
         )
     };
     if result != 0 {
