@@ -45,6 +45,13 @@ def telemetry():
             data[name] = Path(name).read_text()
     return data
 
+def restore_checkpoint(source):
+    # The main helper reads its checkpoint at the established cache path.
+    destination = TEMP / 'st-ci-cache/perf-source-state.json'
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    cache.restore_sources()
+
 def initialize():
     ROOT.mkdir()
     (ROOT / 'results').mkdir()
@@ -114,7 +121,7 @@ def measure(label, requested):
     saved.mkdir(parents=True, exist_ok=True)
     if (saved / 'target').exists():
         shutil.move(saved / 'target', WORK / 'target')
-        cache.restore_sources(saved / 'source-state.json')
+        restore_checkpoint(saved / 'source-state.json')
         origin = 'same-runner exact-SHA previous measurement'
     else:
         source = ROOT / 'seeds' / build_seed
@@ -122,7 +129,7 @@ def measure(label, requested):
         if head in dict(SEEDS):
             source = ROOT / 'seeds' / head
         subprocess.run(['cp', '-a', str(source / 'target'), str(WORK / 'target')], check=True)
-        cache.restore_sources(source / 'st-ci-cache/perf-source-state.json')
+        restore_checkpoint(source / 'st-ci-cache/perf-source-state.json')
         origin = f'trusted main {source.name}'
     shutil.rmtree(TEMP / 'st-ci-cache', ignore_errors=True)
     shutil.copytree(ROOT / 'seeds' / build_seed / 'st-ci-cache', TEMP / 'st-ci-cache')
