@@ -782,3 +782,32 @@ fn attachment_only_mail_and_non_image_refs_remain_visible() {
     let paired = adapt::conversation(&[message, content], &Default::default());
     assert!(matches!(&paired[0].body, Body::Mail { body, .. } if body.contains("safe-hash")));
 }
+
+#[test]
+fn pending_binding_preserves_authorized_activity_without_claiming_an_empty_harness() {
+    let activity = item("activity", 1, 1, "Captured activity");
+    let mail = serde_json::from_value(serde_json::json!({
+        "id":"mail","sequence":2,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+        "role":"user","final":true,"type":"message",
+        "body":{"message_id":"message/status","from":"person/ada","to":"agent/a","title":"Status?"}
+    }))
+    .unwrap();
+    let text = item("mail-content", 3, 1, "How is the audit going?");
+    let notice = serde_json::from_value(serde_json::json!({
+        "id":"notice","sequence":4,"revision":1,"timestamp":"2026-10-05T10:00:01Z",
+        "role":"system","final":true,"type":"error",
+        "body":{"code":"transcript-not-bound","message":"transcript not bound: path unknown",
+            "retryable":true,"details":{"not_yet":true}}
+    }))
+    .unwrap();
+    let timeline = [activity, mail, text, notice];
+    assert!(adapt::unreadable_transcript(&timeline).is_none());
+    let rendered = adapt::conversation(&timeline, &Default::default());
+    assert!(matches!(&rendered[0].body, Body::Assistant(text) if text == "Captured activity"));
+    assert!(matches!(&rendered[1].body, Body::Mail { body, .. } if body == "How is the audit going?"));
+    let Body::Event(availability) = &rendered[2].body else {
+        panic!("{rendered:?}");
+    };
+    assert!(availability.contains("unavailable"));
+    assert!(!availability.contains("nothing"));
+}
