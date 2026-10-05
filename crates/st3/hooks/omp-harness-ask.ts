@@ -43,6 +43,7 @@ const answersEqual = (a: Answer[], b: Answer[]) => a.length === b.length && a.ev
 
 export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, unknown>) => void, current: () => ControlBinding | undefined, observe: () => void) => {
   let ask: Ask | undefined;
+  let askUi: ExtensionContext["ui"] | undefined;
   let unsafe: string | undefined;
   let unsubscribe: (() => void) | undefined;
   let guarded: Command | undefined;
@@ -96,6 +97,11 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
         // The reserved protocol prefix is consumed even after settlement, session reset,
         // or process replacement. A late/foreign token can never become chat input.
         if (!command || !step || token !== stepToken || !live || !sameBinding(command.binding, live) || ask?.tool_call_id !== command.tool_call_id) return { consume: true };
+        if (askUi?.getEditorText().length) {
+          unsafe = "native-ask-blocked-by-editor-draft";
+          settle(command, "indeterminate", unsafe); observe();
+          return { consume: true };
+        }
         stepToken = undefined; stepIndex += 1;
         // Microtask runs after the native focused component handles this transformed
         // event; the owner then checks the next actual screen before another token.
@@ -110,7 +116,7 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
     unsubscribe?.(); unsubscribe = undefined;
     rawProtocol = "";
     if (guarded) settle(guarded, "indeterminate", reason);
-    ask = undefined; unsafe = undefined; activeCalls.clear(); observe();
+    ask = undefined; askUi = undefined; unsafe = undefined; activeCalls.clear(); observe();
   };
   pi.on("tool_execution_start", (event, ctx) => {
     if (event.toolName !== "ask" || (ctx as ExtensionContext & { agent?: { kind?: string } }).agent?.kind === "sub") return;
@@ -123,8 +129,10 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
     const questions = parseQuestions(event.args);
     if (!questions) return;
     ask = { tool_call_id: event.toolCallId, questions };
+    askUi = ctx.ui;
     const terminal = process.stdin.isTTY === true && process.stdout.isTTY === true && !process.argv.some((argument, index) => argument.startsWith("--mode=rpc") || (argument === "--mode" && process.argv[index + 1]?.startsWith("rpc")));
     unsafe = terminal && typeof ctx.ui.askDialog === "function" && ctx.hasUI ? undefined : "native-rich-ask-terminal-unavailable";
+    if (ctx.ui.getEditorText().length) unsafe = "native-ask-blocked-by-editor-draft";
     if (questions.some(q => new Set(q.options.map(option => option.label)).size !== q.options.length)) unsafe = "ambiguous-native-ask-options";
     try { install(ctx); } catch { unsafe = "native-terminal-input-guard-unavailable"; }
     observe();
@@ -174,7 +182,9 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
       const answers = parseAnswers(wire.answers);
       const command: Command = { type: "answer_ask", operation_id: wire.operation_id, binding, tool_call_id: typeof wire.tool_call_id === "string" ? wire.tool_call_id : "", answers: answers ?? [] };
       const reject = (reason: string) => { const receipt = { type: "harness_control_receipt", operation_id: command.operation_id, binding, status: "rejected", reason }; receipts.set(command.operation_id, receipt); send(receipt); };
-      if (!ask || ask.tool_call_id !== command.tool_call_id || unsafe || guarded || activeCalls.size !== 1) { reject(unsafe ?? "stale-or-busy-native-ask"); return true; }
+      if (!ask || ask.tool_call_id !== command.tool_call_id || guarded || activeCalls.size !== 1) { reject("stale-or-busy-native-ask"); return true; }
+      if (unsafe === "terminal-input-conflict") { settle(command, "indeterminate", "terminal-input-conflict"); observe(); return true; }
+      if (unsafe) { reject(unsafe); return true; }
       if (!answers || answers.length !== ask.questions.length || answers.some((answer, index) => { const q = ask?.questions[index]; return !q || answer.id !== q.id || new Set(answer.selected_options).size !== answer.selected_options.length || answer.selected_options.some(label => !q.options.some(option => option.label === label)) || (!q.multi && answer.selected_options.length + Number(answer.custom_input !== undefined) !== 1) || (answer.custom_input !== undefined && (!answer.custom_input.trim() || /[\x00-\x09\x0b-\x1f\x7f-\x9f]/.test(answer.custom_input))); })) { reject("invalid-native-ask-answers"); return true; }
       steps = [];
       for (let index = 0; index < ask.questions.length; index += 1) {

@@ -28,6 +28,7 @@ const scenarios = [
   { id: 'native-ask-literal-image-path', questions: [{ id: 'literal', question: 'Supply a literal file path', options: [{ label: 'Preset' }] }], text: root + '/literal-answer.png' },
   { id: 'native-ask-after-new', switchSession: true, questions: [{ id: 'after-new', question: 'Answer in the new native session', options: [{ label: 'Continue' }] }], answers: [{ questionId: 'after-new', options: ['Continue'] }] },
   { id: 'native-ask-conflict', conflict: true, questions: [{ id: 'conflict', question: 'Conflict must hand off to the terminal', options: Array.from({ length: 8 }, (_, index) => ({ label: 'Preset ' + index })) }], text: 'This browser answer must never submit' },
+  { id: 'native-ask-existing-draft', draft: 'Operator existing draft must not become browser chat', questions: [{ id: 'draft', question: 'Please select a color', options: [{ label: 'Red' }, { label: 'Blue' }] }], answers: [{ questionId: 'draft', options: ['Blue'] }] },
   { id: 'native-ask-edited', questions: [{ id: 'edited', question: 'Edit this in the terminal', options: [{ label: 'First' }, { label: 'Second' }] }], answers: [{ questionId: 'edited', options: ['First'] }] },
 ];
 let scenarioIndex = 0;
@@ -36,6 +37,10 @@ const server = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: async req => {
   const last = body.messages?.at(-1);
   const isContinuation = last?.role === 'tool';
   const scenario = scenarios[scenarioIndex];
+  if (!isContinuation && scenario.draft) {
+    await Bun.write(root + '/draft-provider-waiting', 'waiting');
+    await poll(async () => await Bun.file(root + '/draft-provider-release').exists(), 'operator draft before native ask');
+  }
   const delta = isContinuation ? { role: 'assistant', content: 'Native ask continuation observed.' } : { role: 'assistant', tool_calls: [{ index: 0, id: scenario.id, type: 'function', function: { name: 'ask', arguments: JSON.stringify({ questions: scenario.questions }) } }] };
   const chunk = { id: 'ask-smoke', object: 'chat.completion.chunk', created: 1, model: 'native-smoke', choices: [{ index: 0, delta, finish_reason: null }] };
   const end = { ...chunk, choices: [{ index: 0, delta: {}, finish_reason: isContinuation ? 'stop' : 'tool_calls' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } };
@@ -94,6 +99,12 @@ try {
       await poll(async () => { const native = (await read()).native; return native.idle && native.binding.session_id !== previousSession; }, 'actual native session switch');
     }
     await pty('send', 'native-smoke', '--seq', 'Start isolated ask ' + scenario.id, '--seq', 'key:return');
+    if (scenario.draft) {
+      await poll(async () => await Bun.file(root + '/draft-provider-waiting').exists(), 'real provider waiting');
+      await pty('send', 'native-smoke', '--seq', scenario.draft);
+      await poll(async () => (await pty('peek', '--plain', 'native-smoke')).includes(scenario.draft), 'actual operator editor draft');
+      await Bun.write(root + '/draft-provider-release', 'release');
+    }
     const queued = await poll(async () => { const q = await read(); return q.native?.pending_ask?.tool_call_id === scenario.id ? q : false; }, 'native pending ' + scenario.id);
     const pending = queued.native.pending_ask;
     if (process.env.SMOKE_BROWSER_HOLD && scenarioIndex === 0) {
@@ -110,6 +121,20 @@ try {
       const stale = await answer('stale-' + scenarioIndex, { _tag: 'Selection', askRef: oldRef, answers: scenarios[0].answers });
       if (stale.status < 400 || stale.envelope.code !== 'ask-no-longer-pending') throw Error('Stale askRef admitted ' + JSON.stringify(stale));
       if ((await read()).native.pending_ask.tool_call_id !== scenario.id) throw Error('Stale response changed the new ask');
+    }
+    if (scenario.draft) {
+      if (queued.native.ask_supported || queued.native.ask_reason !== 'native-ask-blocked-by-editor-draft') throw Error('Blocking operator draft was advertised safe');
+      const requestsBefore = providerRequests.length;
+      const refused = await answer('existing-draft', { _tag: 'Selection', askRef: pending.ask_ref, answers: scenario.answers });
+      if (refused.status < 400 || refused.envelope.code !== 'unsupported-harness-ask') throw Error('Blocking draft was not refused');
+      const screen = await pty('peek', '--plain', 'native-smoke');
+      if (!screen.includes(scenario.draft) || providerRequests.length !== requestsBefore || await Bun.file(root + '/native-result-' + scenario.id + '.json').exists()) throw Error('Browser answer submitted or changed the operator draft');
+      await pty('send', 'native-smoke', '--seq', '\x15', '--seq', 'key:return');
+      await poll(async () => !(await read()).native.pending_ask, 'terminal clears draft and answers native ask');
+      await poll(async () => (await read()).native.idle, 'draft native continuation idle');
+      proof.push({ scenario: scenario.id, refusal: refused.envelope.code, draft: 'unchanged-until-terminal-handoff' });
+      oldRef = pending.ask_ref;
+      continue;
     }
     if (scenario.id === 'native-ask-edited') {
       await pty('send', 'native-smoke', '--seq', 'key:down');

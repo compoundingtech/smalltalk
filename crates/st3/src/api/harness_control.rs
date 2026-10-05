@@ -92,6 +92,9 @@ pub(super) async fn ask_terminal_input(State(state): State<AppState>, peer: Opti
             return Err(ApiError::bad(St3Error::new("unsupported-harness-ask", "native guarded ask input requires the OMP TUI")));
         }
         let screen = daemon_pty(&state).and_then(|runtime| runtime.screen(&session.runtime_id)).map_err(ApiError::internal)?;
+        if screen.contains("Finish or clear the current prompt to answer") {
+            return Err(ApiError::bad(St3Error::new("unsupported-harness-ask", "the native ask is blocked by an existing editor draft")));
+        }
         // Conservative presentation fence: wrapped/ambiguous dialogs hand off to the terminal.
         // The native public input guard additionally checks every token at consumption time.
         let presented = match request.input.surface {
