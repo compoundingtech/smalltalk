@@ -39,6 +39,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `peer_replica_cursors` | Local | Local per-peer/per-writer transport progress. |
 | `replica_envelopes` | Shared storage, with stated local fields | Shared authenticated writer/sequence/hash/payload identity; relay, receipt_state/errors and received_at are local. Inventory hashes immutable envelope identity, not physical rows. |
 | `replica_records` | Shared storage, with stated local fields | Shared raw record/position/claim identity and replicated repair meaning; admission status/errors/updated_at are local. Normalize from retained records plus tombstones; never compare physical receipt rows. |
+| `replica_state_counts` | Local cache | Exact totals by local replica-record admission state, seeded once on upgrade and maintained in the same transaction as record inserts, deletes and state changes. These diagnostic totals are not replicated projection identities. |
 | `projection_health` | Local | Local admission/projection/quarantine status, frontier, errors and observation timestamps. Deterministic shared degraded-state summaries must be separate from receipt health. |
 | `replication_peers` | Local | Local connectivity, peer digest observations, receive timings and errors. |
 | `replication_refusals` | Local | Added after this audit: direct outbound Fabric grant refusals and observation timestamps. Route policy cache, never a replicated outcome. |
