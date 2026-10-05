@@ -101,7 +101,8 @@ mod tests {
         state.private_notes = Arc::new(crate::private_notes::Authority {
             person: Some("person/operator".into()), catalogs: vec![catalog],
         });
-        let app = crate::api::router(state.clone());
+        let unclassified = crate::api::router(state.clone());
+        let app = unclassified.clone().layer(Extension(private_notes_login::Identity::VerifiedNonAgent));
         let path = "/v1/client/private-notes/dev.schickling.agent-private-notes%3A%2F%2Fnode%2Fworker";
         let issuer = app.clone().layer(Extension(VerifiedNotesPairingPrincipal));
         for local in [app.clone(), issuer.clone()] {
@@ -132,7 +133,7 @@ mod tests {
             assert_eq!(denied["code"], "claim-write-forbidden");
         }
         let pairing = json!({"api_version":"st3.client.v0", "person_id":"person/operator", "device_name":"notes editor", "scopes":["notes.read", "notes.write"]});
-        let native_issuer = issuer.clone().layer(Extension(BoundAgent("agent/foreign".into())));
+        let native_issuer = unclassified.clone().layer(Extension(private_notes_login::Identity::Agent));
         for denied_issuer in [app.clone(), native_issuer.clone()] {
             let (status, denied) = request(denied_issuer, "POST", "/v1/client/pairings", pairing.clone()).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
@@ -145,11 +146,24 @@ mod tests {
             "api_version":"st3.client.v0", "code":offered["value"]["code"],
             "device_public_key":"legacy-notes-device-public-key-fixture",
         });
-        let (status, denied) = request(native_issuer, "POST", &complete_path, completion.clone()).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        for denied_peer in [native_issuer, unclassified.clone(),
+            unclassified.clone().layer(Extension(private_notes_login::Identity::Unavailable))] {
+            let (status, denied) = request(denied_peer, "POST", &complete_path, completion.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        }
         let (status, completed) = request(app.clone(), "POST", &complete_path, completion).await;
         assert_eq!(status, StatusCode::OK, "{completed}");
         let credential = completed["value"]["credential"].as_str().unwrap();
+        for denied_peer in [unclassified.clone(),
+            unclassified.clone().layer(Extension(private_notes_login::Identity::Unavailable))] {
+            let (status, denied) = bearer(denied_peer, "GET", path, Value::Null, credential).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        }
+        let trusted = unclassified.clone().layer(Extension(private_notes_login::Identity::TrustedPairedTransport));
+        let (status, denied) = request(trusted.clone(), "GET", path, Value::Null).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, notes) = bearer(trusted, "GET", path, Value::Null, credential).await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
         let (status, notes) = bearer(app.clone(), "GET", path, Value::Null, credential).await;
         assert_eq!(status, StatusCode::OK, "{notes}");
         assert_eq!(notes["value"]["data"]["markdown"], "");
@@ -158,7 +172,7 @@ mod tests {
             "idempotency_key":"notes-first-key-0001", "fence":notes["value"]["actions"][0]["fence"],
             "parameters":{"uri":uri,"markdown":"owner private bytes\n"},
         });
-        let native = app.clone().layer(Extension(BoundAgent("agent/foreign".into())));
+        let native = unclassified.layer(Extension(private_notes_login::Identity::Agent));
         let (status, denied) = bearer(native.clone(), "GET", path, Value::Null, credential).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
         assert_eq!(denied["code"], "unsupported-capability");
@@ -180,7 +194,8 @@ mod tests {
             person: Some("person/operator".into()), catalogs: vec![],
         });
         peer.store.import_replication("node", &replica).unwrap();
-        let (status, denied) = bearer(crate::api::router(peer), "GET", path, Value::Null, credential).await;
+        let peer_app = crate::api::router(peer).layer(Extension(private_notes_login::Identity::VerifiedNonAgent));
+        let (status, denied) = bearer(peer_app, "GET", path, Value::Null, credential).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
         let mut stale = action;
         stale["id"] = "action/notes-concurrent".into();

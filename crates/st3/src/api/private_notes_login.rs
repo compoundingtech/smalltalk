@@ -1,5 +1,14 @@
 //! Notes pairing bootstrap trusts a root-issued PAM login, never ambient person
 //! headers, user-service cgroups, mutable native identity, or an orphaned process.
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Identity { Agent, VerifiedNonAgent, Unavailable, TrustedPairedTransport }
+
+impl Identity {
+    pub(super) fn allows_paired_notes(self) -> bool {
+        matches!(self, Self::VerifiedNonAgent | Self::TrustedPairedTransport)
+    }
+}
 #[cfg(target_os = "linux")]
 pub(super) use linux::Peer;
 
@@ -8,6 +17,7 @@ pub(super) struct Peer;
 #[cfg(not(target_os = "linux"))]
 impl Peer {
     pub(super) fn capture(_stream: &tokio::net::UnixStream) -> Option<Self> { None }
+    pub(super) async fn classify(self: std::sync::Arc<Self>) -> Identity { Identity::Unavailable }
     pub(super) async fn admitted(self: std::sync::Arc<Self>) -> bool { false }
 }
 
@@ -23,16 +33,15 @@ mod linux {
     use serde_json::Value;
     use tokio::io::AsyncReadExt as _;
 
+    use super::Identity;
     const BUS: &str = "/run/dbus/system_bus_socket";
     const MAX_OUTPUT: u64 = 262_144;
 
-    pub(crate) struct Peer { pid: u32, uid: u32, lifetime: File }
+    pub(in crate::api) struct Peer { pid: u32, uid: u32, lifetime: File }
 
     impl Peer {
-        pub(crate) fn capture(stream: &tokio::net::UnixStream) -> Option<Self> {
+        pub(in crate::api) fn capture(stream: &tokio::net::UnixStream) -> Option<Self> {
             let credentials = stream.peer_cred().ok()?;
-            // SAFETY: getuid takes no arguments and accesses no caller memory.
-            if credentials.uid() != unsafe { libc::getuid() } { return None; }
             let pid = u32::try_from(credentials.pid()?).ok()?;
             let mut descriptor: libc::c_int = -1;
             let mut size = std::mem::size_of_val(&descriptor) as libc::socklen_t;
@@ -47,14 +56,35 @@ mod linux {
             Some(Self { pid, uid: credentials.uid(), lifetime })
         }
 
-        pub(crate) async fn admitted(self: Arc<Self>) -> bool {
+        pub(in crate::api) async fn classify(self: Arc<Self>) -> Identity {
+            tokio::task::spawn_blocking(move || {
+                if !live(&self.lifetime) { return Identity::Unavailable; }
+                // SAFETY: getuid takes no arguments and accesses no caller memory.
+                let owner = unsafe { libc::getuid() };
+                // This is a privileged paired transport, never a person or
+                // bootstrap grant. Its caller still needs an attested bearer.
+                if self.uid == 0 && owner != 0 { return Identity::TrustedPairedTransport; }
+                if self.uid != owner { return Identity::Unavailable; }
+                let Some(chain) = chain(self.pid) else { return Identity::Unavailable; };
+                if chain.first().and_then(|process| process.lifetime.metadata().ok()).map(|metadata| metadata.ino())
+                    != self.lifetime.metadata().ok().map(|metadata| metadata.ino()) {
+                    return Identity::Unavailable;
+                }
+                let identity = classify_chain(&chain, owner);
+                if live(&self.lifetime) && chain.iter().all(Process::unchanged) { identity }
+                else { Identity::Unavailable }
+            }).await.unwrap_or(Identity::Unavailable)
+        }
+
+        pub(in crate::api) async fn admitted(self: Arc<Self>) -> bool {
             tokio::time::timeout(Duration::from_secs(3), self.admit()).await.unwrap_or(false)
         }
 
         async fn admit(self: Arc<Self>) -> bool {
             let peer = self.clone();
             let Some((chain, executable)) = tokio::task::spawn_blocking(move || {
-                if !live(&peer.lifetime) || super::super::ancestor(peer.pid).is_some() { return None; }
+                // SAFETY: getuid takes no arguments and accesses no caller memory.
+                if !live(&peer.lifetime) || peer.uid != unsafe { libc::getuid() } { return None; }
                 let chain = chain(peer.pid)?;
                 if chain.first()?.lifetime.metadata().ok()?.ino() != peer.lifetime.metadata().ok()?.ino() {
                     return None;
@@ -87,12 +117,14 @@ mod linux {
                     issuer, path, "org.freedesktop.DBus.Properties",
                     "GetAll", "s", "org.freedesktop.login1.Session",
                 ]).await else { return false; };
-                let Some(leader) = chain.iter().find(|process| session_matches(&properties, self.uid,
+                let Some(leader_index) = chain.iter().position(|process| session_matches(&properties, self.uid,
                     process.pid, process.lifetime.metadata().map(|metadata| metadata.ino()).unwrap_or_default())) else { continue; };
-                if !live(&leader.lifetime) { return false; }
+                if !live(&chain[leader_index].lifetime) { return false; }
                 let peer = self.clone();
                 return tokio::task::spawn_blocking(move || {
-                    live(&peer.lifetime) && super::super::ancestor(peer.pid).is_none()
+                    // The exact root-issued PAM leader is the boundary; its
+                    // protected environment is neither needed nor readable.
+                    live(&peer.lifetime) && classify_chain(&chain[..leader_index], peer.uid) == Identity::VerifiedNonAgent
                         && chain.iter().all(Process::unchanged)
                 }).await.unwrap_or(false);
             }
@@ -100,11 +132,11 @@ mod linux {
         }
     }
 
-    struct Process { pid: u32, parent: u32, start: u64, lifetime: File }
+    struct Process { pid: u32, parent: u32, start: u64, uids: [u32; 4], lifetime: File }
     impl Process {
         fn unchanged(&self) -> bool {
             live(&self.lifetime) && process_stat(self.pid) == Some((self.parent, self.start))
-                && live(&self.lifetime)
+                && process_uids(self.pid) == Some(self.uids) && live(&self.lifetime)
         }
     }
 
@@ -123,6 +155,30 @@ mod linux {
         Some((parent, start))
     }
 
+    fn process_uids(pid: u32) -> Option<[u32; 4]> {
+        let value = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let mut values = value.lines().find_map(|line| line.strip_prefix("Uid:"))?.split_whitespace();
+        let uids = [values.next()?.parse().ok()?, values.next()?.parse().ok()?,
+            values.next()?.parse().ok()?, values.next()?.parse().ok()?];
+        values.next().is_none().then_some(uids)
+    }
+
+    fn classify_chain(chain: &[Process], owner: u32) -> Identity {
+        for process in chain {
+            if process.uids == [owner; 4] {
+                let Ok(environment) = std::fs::read(format!("/proc/{}/environ", process.pid)) else {
+                    return Identity::Unavailable;
+                };
+                if environment.split(|byte| *byte == 0).any(|entry| entry.starts_with(b"ST_AGENT=agent/")) {
+                    return Identity::Agent;
+                }
+            } else if process.uids != [0; 4] {
+                return Identity::Unavailable;
+            }
+        }
+        Identity::VerifiedNonAgent
+    }
+
     fn chain(mut pid: u32) -> Option<Vec<Process>> {
         let mut processes = Vec::new();
         while pid > 1 && processes.len() < 64 {
@@ -134,7 +190,7 @@ mod linux {
             // SAFETY: the successful syscall transferred this descriptor to us.
             let lifetime = unsafe { File::from_raw_fd(descriptor as libc::c_int) };
             let (parent, start) = process_stat(pid)?;
-            let process = Process { pid, parent, start, lifetime };
+            let process = Process { pid, parent, start, uids: process_uids(pid)?, lifetime };
             if !process.unchanged() { return None; }
             processes.push(process);
             pid = parent;

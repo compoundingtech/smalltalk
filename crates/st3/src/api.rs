@@ -761,6 +761,9 @@ async fn response_envelope(
             .body(Body::empty())
             .expect("the incoming request has a valid method and URI");
         *auth_request.headers_mut() = request.headers().clone();
+        if let Some(identity) = request.extensions().get::<private_notes_login::Identity>().copied() {
+            auth_request.extensions_mut().insert(identity);
+        }
         let auth_state = state.clone();
         let transport = transport.as_str();
         let auth_profile = profile.clone();
@@ -4499,7 +4502,7 @@ async fn serve_unix_with_ancestor(
         };
         // Every local connection names its caller, so request counts by client are always on.
         let peer_pid = local_peer_pid(&stream);
-        let notes_peer = bind_ancestry.then(|| private_notes_login::Peer::capture(&stream)).flatten();
+        let notes_peer = private_notes_login::Peer::capture(&stream);
         let app = app.clone();
         tokio::spawn(async move {
             // /proc ancestry may fault in pages on a loaded host. Keep that work
@@ -4527,11 +4530,23 @@ async fn serve_unix_with_ancestor(
                 let notes_peer = notes_peer.clone();
                 async move {
                     let mut request = request.map(Body::new);
-                    if bound_agent.is_none() && request.method() == axum::http::Method::POST
-                        && request.uri().path() == "/v1/client/pairings"
-                        && let Some(peer) = notes_peer
-                        && peer.admitted().await {
-                        request.extensions_mut().insert(VerifiedNotesPairingPrincipal);
+                    if request.uri().path().starts_with("/v1/client/") {
+                        let mut identity = if bound_agent.is_some() {
+                            private_notes_login::Identity::Agent
+                        } else if let Some(peer) = &notes_peer {
+                            peer.clone().classify().await
+                        } else {
+                            private_notes_login::Identity::Unavailable
+                        };
+                        if bind_ancestry && identity != private_notes_login::Identity::Agent
+                            && request.method() == axum::http::Method::POST
+                            && request.uri().path() == "/v1/client/pairings"
+                            && let Some(peer) = notes_peer
+                            && peer.admitted().await {
+                            identity = private_notes_login::Identity::VerifiedNonAgent;
+                            request.extensions_mut().insert(VerifiedNotesPairingPrincipal);
+                        }
+                        request.extensions_mut().insert(identity);
                     }
                     if let Some(peer) = delivery_peer {
                         request.extensions_mut().insert(peer);
