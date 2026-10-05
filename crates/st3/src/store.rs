@@ -405,6 +405,52 @@ BEGIN
     SELECT subject, MIN(store_index), MAX(kind = 'message.closed')
     FROM claims WHERE subject = OLD.subject GROUP BY subject;
 END;
+-- Candidate reply edges are local, rebuildable lookup data. The message view remains the
+-- authority: a subject can have several historical send claims or a selected declaration.
+CREATE TABLE IF NOT EXISTS message_reply_edges (
+    source TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    parent TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS message_reply_edges_parent ON message_reply_edges(parent, subject);
+CREATE TRIGGER IF NOT EXISTS message_reply_claim_insert AFTER INSERT ON claims
+WHEN NEW.kind='message.sent' AND json_extract(NEW.body, '$.fields.in_reply_to') IS NOT NULL
+BEGIN
+    INSERT OR REPLACE INTO message_reply_edges(source, subject, parent)
+    VALUES (NEW.id, NEW.subject, json_extract(NEW.body, '$.fields.in_reply_to'));
+END;
+CREATE TRIGGER IF NOT EXISTS message_reply_claim_delete AFTER DELETE ON claims
+WHEN OLD.kind='message.sent'
+BEGIN
+    DELETE FROM message_reply_edges WHERE source=OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS message_reply_desired_insert AFTER INSERT ON desired
+WHEN NEW.kind='message'
+BEGIN
+    INSERT OR REPLACE INTO message_reply_edges(source, subject, parent)
+    SELECT 'desired:' || NEW.subject, NEW.subject,
+           json_extract(child.value, '$.arguments[0]')
+    FROM json_each(NEW.body, '$.children') AS child
+    WHERE json_extract(child.value, '$.name')='in-reply-to'
+      AND json_type(child.value, '$.arguments[0]')='text';
+END;
+CREATE TRIGGER IF NOT EXISTS message_reply_desired_update AFTER UPDATE ON desired
+WHEN OLD.kind='message' OR NEW.kind='message'
+BEGIN
+    DELETE FROM message_reply_edges WHERE source='desired:' || OLD.subject;
+    INSERT OR REPLACE INTO message_reply_edges(source, subject, parent)
+    SELECT 'desired:' || NEW.subject, NEW.subject,
+           json_extract(child.value, '$.arguments[0]')
+    FROM json_each(NEW.body, '$.children') AS child
+    WHERE NEW.kind='message' AND json_extract(child.value, '$.name')='in-reply-to'
+      AND json_type(child.value, '$.arguments[0]')='text';
+END;
+CREATE TRIGGER IF NOT EXISTS message_reply_desired_delete AFTER DELETE ON desired
+WHEN OLD.kind='message'
+BEGIN
+    DELETE FROM message_reply_edges WHERE source='desired:' || OLD.subject;
+END;
+
 
 CREATE TABLE IF NOT EXISTS capabilities (
     secret_hash TEXT PRIMARY KEY,
@@ -451,6 +497,7 @@ CREATE TABLE IF NOT EXISTS mission_runs (
     created_at_unix_ms TEXT NOT NULL,
     updated_at_unix_ms TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS mission_runs_root_order_index ON mission_runs(root_run_id, created_at_unix_ms, id);
 CREATE INDEX IF NOT EXISTS mission_runs_mission_index ON mission_runs(mission_id, created_at_unix_ms);
 -- The runs that have not finished, a few of every run a fleet has made. The predicate is
 -- OPEN_MISSION_RUN, which queries repeat so the planner uses this index.
@@ -2335,6 +2382,36 @@ fn backfill_message_index(connection: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+/// Existing stores predate the reply-edge triggers. Fill their immutable send edges and
+/// selected declarations once; later writes, rollback, and replay use the triggers above.
+fn backfill_message_reply_edges(connection: &Connection) -> Result<()> {
+    let filled: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key='message_reply_edges_v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if filled {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         INSERT OR REPLACE INTO message_reply_edges(source, subject, parent)
+         SELECT id, subject, json_extract(body, '$.fields.in_reply_to')
+         FROM claims INDEXED BY claims_message_to_index WHERE kind='message.sent'
+           AND json_type(body, '$.fields.in_reply_to')='text';
+         INSERT OR REPLACE INTO message_reply_edges(source, subject, parent)
+         SELECT 'desired:' || desired.subject, desired.subject,
+                json_extract(child.value, '$.arguments[0]')
+         FROM desired, json_each(desired.body, '$.children') AS child
+         WHERE desired.kind='message'
+           AND json_extract(child.value, '$.name')='in-reply-to'
+           AND json_type(child.value, '$.arguments[0]')='text';
+         INSERT INTO meta(key, value) VALUES ('message_reply_edges_v1', '1');
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 
 /// The runtime smalltalk opens the graph with, for code that opens the graph store itself.
 pub fn runtime() -> Arc<dyn smallclaims::Runtime> {
@@ -5910,6 +5987,71 @@ impl Store {
             })
             .collect()
     }
+    /// A bounded display page for `missions show`. Only the exact detail endpoint needs step
+    /// wake and execution history; this page reads the fields the tree renderer displays.
+    pub fn mission_run_tree_page(
+        &self,
+        selected: &str,
+        limit: usize,
+    ) -> Result<(Vec<MissionRunView>, bool)> {
+        let selected = selected.strip_prefix("mission-run/").unwrap_or(selected);
+        let connection = self.readers.get();
+        let root: Option<String> = connection
+            .query_row(
+                "SELECT root_run_id FROM mission_runs WHERE id=?1",
+                [selected],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(root) = root else {
+            return Ok((Vec::new(), false));
+        };
+        let mut statement = connection.prepare_cached(
+            "SELECT id FROM mission_runs INDEXED BY mission_runs_root_order_index
+             WHERE root_run_id=?1 ORDER BY created_at_unix_ms, id LIMIT ?2",
+        )?;
+        let mut ids = statement
+            .query_map(params![root, limit.saturating_add(1) as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+        if !ids.iter().any(|id| id == selected) {
+            // A selected descendant can be later than the page. Include it so the caller can
+            // still render its own work and explicitly report the hidden rest of the tree.
+            if ids.len() == limit {
+                ids.pop();
+            }
+            ids.push(selected.to_owned());
+        }
+        let mut runs = Vec::with_capacity(ids.len());
+        for id in ids {
+            let mut view = mission_run_steps_view_tx(&connection, &id, true)?;
+            let body: Option<String> = connection
+                .query_row(
+                    "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+                    params![view.mission.trim_start_matches("mission/"), view.revision],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(spec) =
+                body.and_then(|body| serde_json::from_str::<MissionSpec>(&body).ok())
+            {
+                for step in &mut view.steps {
+                    if let Some(definition) = crate::mission::find_step(&spec, &step.step) {
+                        step.queue.clone_from(&definition.queue);
+                        step.queue_position = definition.queue_position;
+                    }
+                }
+            }
+            view.loops = loop_run_views_tx(&connection, &view)?;
+            note_run_view_reads(&view);
+            runs.push(view);
+        }
+        Ok((runs, has_more))
+    }
+
 
     /// When a loop first executed: a worker's first claim, or the creation of a round
     /// with no claimable steps. Presentation details and other loops' rounds do not
@@ -10190,6 +10332,43 @@ impl Store {
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
     }
+    /// Scan at most `limit` durable events. `next_after` advances past inspected rows even if
+    /// an owner filter accepts none of them, so a sparse owner cannot force a whole-log read.
+    pub fn events_page(
+        &self,
+        after: u64,
+        subject: Option<&str>,
+        owner_run: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<EventRecord>, Option<u64>)> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT store_index, kind, subject, body FROM events
+             WHERE store_index>?1 AND (?2 IS NULL OR subject=?2)
+             ORDER BY store_index LIMIT ?3",
+        )?;
+        let raw = statement
+            .query_map(params![after, subject, limit.saturating_add(1) as i64], |row| {
+                let body = row.get::<_, String>(3)?;
+                Ok(EventRecord {
+                    store_index: row.get(0)?,
+                    kind: row.get(1)?,
+                    subject: row.get(2)?,
+                    body: serde_json::from_str(&body).unwrap_or(Value::Null),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let scanned = raw.iter().take(limit).last().map(|event| event.store_index);
+        let items = raw
+            .into_iter()
+            .take(limit)
+            .filter(|event| {
+                owner_run.is_none_or(|run| subject_owned_by(&connection, &event.subject, run))
+            })
+            .collect();
+        Ok((items, scanned))
+    }
+
 
     pub fn desired_subjects(&self) -> Result<Vec<DesiredSubject>> {
         smallclaims::touched::note_read(|| "kind:intent.desired".to_owned());
@@ -11111,6 +11290,114 @@ impl Store {
             .map(|index| self.message_view_cached(&connection, subject, index))
             .transpose()
     }
+    /// One bounded conversation, using reply edges rather than replaying the mailbox. The
+    /// edge table is a candidate index: compare each candidate with its current message view
+    /// so canonical selection and declaration changes determine membership.
+    pub fn message_thread(&self, subject: &str) -> Result<Vec<MessageView>, St3Error> {
+        const LIMIT: usize = 200;
+        let connection = self.readers.get();
+        let lookup = |subject: &str| -> Result<Option<MessageView>, St3Error> {
+            let created = connection
+                .query_row(
+                    "SELECT created_index FROM message_index WHERE subject=?1",
+                    [subject],
+                    |row| row.get::<_, u64>(0),
+                )
+                .optional()
+                .map_err(internal)?;
+            created
+                .map(|index| {
+                    self.message_view_cached(&connection, subject, index)
+                        .map_err(internal)
+                })
+                .transpose()
+        };
+        let mut current = subject.to_owned();
+        let mut ancestors = BTreeSet::new();
+        let mut root = None;
+        while let Some(view) = lookup(&current)? {
+            if !ancestors.insert(current.clone()) || ancestors.len() > LIMIT {
+                return Err(St3Error::new(
+                    "message-thread-too-large",
+                    "message thread exceeds 200 messages",
+                ));
+            }
+            root = Some(current.clone());
+            let Some(parent) = view.in_reply_to.as_deref() else {
+                break;
+            };
+            let parent = if parent.starts_with("message/") {
+                parent.to_owned()
+            } else {
+                format!("message/{parent}")
+            };
+            if ancestors.contains(&parent) || lookup(&parent)?.is_none() {
+                break;
+            }
+            current = parent;
+        }
+        let Some(root) = root else {
+            return Ok(Vec::new());
+        };
+        let mut queue = VecDeque::from([root.clone()]);
+        let mut visited = BTreeSet::from([root]);
+        let mut output = Vec::new();
+        while let Some(parent) = queue.pop_front() {
+            let Some(view) = lookup(&parent)? else {
+                continue;
+            };
+            output.push(view);
+            let bare = parent.strip_prefix("message/").unwrap_or(&parent);
+            let mut statement = connection
+                .prepare_cached(
+                    "SELECT DISTINCT message_index.subject FROM message_reply_edges AS edge
+                 JOIN message_index ON message_index.subject=edge.subject
+                 WHERE edge.parent IN (?1, ?2)
+                 ORDER BY message_index.created_index, message_index.subject LIMIT 201",
+                )
+                .map_err(internal)?;
+            let candidates = statement
+                .query_map(params![parent, bare], |row| row.get::<_, String>(0))
+                .map_err(internal)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(internal)?;
+            if candidates.len() > LIMIT {
+                return Err(St3Error::new(
+                    "message-thread-too-large",
+                    "message thread exceeds 200 messages",
+                ));
+            }
+            for child in candidates {
+                if visited.contains(&child) {
+                    continue;
+                }
+                let Some(view) = lookup(&child)? else {
+                    continue;
+                };
+                let actual_parent = view.in_reply_to.as_deref().map(|value| {
+                    if value.starts_with("message/") {
+                        value.to_owned()
+                    } else {
+                        format!("message/{value}")
+                    }
+                });
+                if actual_parent.as_deref() != Some(parent.as_str()) {
+                    continue;
+                }
+                if visited.len() >= LIMIT {
+                    return Err(St3Error::new(
+                        "message-thread-too-large",
+                        "message thread exceeds 200 messages",
+                    ));
+                }
+                visited.insert(child.clone());
+                queue.push_back(child);
+            }
+        }
+        output.sort_by_key(|message| message.created_index);
+        Ok(output)
+    }
+
 
     fn message_view_cached(
         &self,
@@ -29528,6 +29815,37 @@ mod tests {
     use crate::graph::parse_test_intent as parse_intent;
     use crate::model::{ReplicationHealAnswer, ReplicationHealQuery, ReplicationHealStep};
     use proptest::prelude::*;
+    #[test]
+    fn sparse_event_page_advances_the_scanned_cursor() {
+        let store = Store::open_memory("garden-events").unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "message/garden-event".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/garden".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("person/garden")),
+                    ("to".into(), json!("agent/garden")),
+                    ("content".into(), json!("hello")),
+                    ("status".into(), json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let (items, scanned) = store
+            .events_page(0, None, Some("mission-run/unrelated"), 1)
+            .unwrap();
+        assert!(items.is_empty());
+        let scanned = scanned.expect("the scanned event must advance the cursor");
+        let (items, next) = store
+            .events_page(scanned, None, Some("mission-run/unrelated"), 1)
+            .unwrap();
+        assert!(items.is_empty());
+        assert_eq!(next, None);
+    }
+
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
 

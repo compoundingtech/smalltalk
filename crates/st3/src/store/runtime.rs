@@ -42,6 +42,7 @@ impl Runtime for SmalltalkRuntime {
         connection.execute_batch(SCHEMA)?;
         migrate_local_usage_seen(connection)?;
         backfill_message_index(connection)?;
+        backfill_message_reply_edges(connection)?;
         unread_mail::create_schema(connection)?;
         resources::create_schema(connection)?;
         custom::create_schema(connection)?;
