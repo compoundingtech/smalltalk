@@ -88,3 +88,7 @@ assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observa
 assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: 'current', reachability: 'reachable', fault: null, delivery: null }), 'starting');
 assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: null, reachability: 'reachable', fault: null, delivery: null }), 'starting');
 assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: 'stale', reachability: 'unreachable', fault: null, delivery: null }), 'starting');
+
+// st's additive harness_error_state names a login outright, even when the harness state is stale.
+assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: 'stale', reachability: 'reachable', harness_error_state: 'needs-login', fault: null, delivery: null }), 'needs-login');
+assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: 'stale', reachability: 'reachable', harness_error_state: null, fault: null, delivery: null }), 'idle');
