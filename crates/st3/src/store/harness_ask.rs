@@ -1,7 +1,7 @@
 //! Atomic native ask answers use the existing owner dispatch interlock, never the chat queue.
 use super::*;
 use super::harness_control::{check_binding, check_runtime, release_dispatch_tx, reserve_dispatch_tx, state_tx};
-use st3_schema::harness_control::{AskCommand, AskParameters, AskReceipt, AskRequest, AskTerminalInput, NativeReceipt, NativeResult, Outcome};
+use st3_schema::harness_control::{AskCommand, AskIndeterminateReason, AskOutcome, AskParameters, AskReceipt, AskRequest, AskTerminalInput, NativeReceipt, NativeResult, Outcome};
 
 pub(super) fn create_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch("CREATE TABLE IF NOT EXISTS local_harness_ask_operations(id TEXT PRIMARY KEY,subject TEXT NOT NULL,digest TEXT NOT NULL,parameters TEXT NOT NULL,receipt TEXT NOT NULL);
@@ -30,11 +30,12 @@ pub(super) fn invalidate_binding_tx(tx: &Connection, subject: &str, reason: &str
     }
     Ok(())
 }
-fn validate(tx: &Connection, parameters: &AskParameters) -> Result<(), St3Error> {
+fn validate(tx: &Connection, parameters: &AskParameters) -> Result<bool, St3Error> {
     let state = check_binding(tx, &parameters.subject, &parameters.binding)?;
     let ask = state.pending_ask.ok_or_else(|| St3Error::new("already-settled", "there is no live native ask"))?;
     if ask.tool_call_id != parameters.tool_call_id { return Err(St3Error::new("stale-harness-ask", "the native ask changed")); }
-    if !state.ask_supported { return Err(St3Error::new("unsupported-harness-ask", state.ask_reason.unwrap_or_else(|| "native ask answer route is unavailable".into()))); }
+    let conflicted = state.ask_reason.as_deref() == Some("terminal-input-conflict");
+    if !state.ask_supported && !conflicted { return Err(St3Error::new("unsupported-harness-ask", state.ask_reason.unwrap_or_else(|| "native ask answer route is unavailable".into()))); }
     if parameters.answers.len() != ask.questions.len() { return Err(St3Error::new("invalid-harness-answers", "all questions must be answered together in original order")); }
     for (question, answer) in ask.questions.iter().zip(&parameters.answers) {
         let custom = answer.custom_input.as_deref();
@@ -45,7 +46,7 @@ fn validate(tx: &Connection, parameters: &AskParameters) -> Result<(), St3Error>
             return Err(St3Error::new("invalid-harness-answers", "answers must match question IDs, choices, cardinality, and safe nonempty custom text"));
         }
     }
-    Ok(())
+    Ok(conflicted)
 }
 impl Store {
     /// Replays recover original answers and return frozen proof, never another terminal write.
@@ -67,12 +68,17 @@ impl Store {
                 if stored != digest { return Err(St3Error::new("idempotency-conflict", "this operation key identifies different answers")); }
                 return serde_json::from_str(&value).map_err(internal);
             }
-            validate(tx, p)?;
+            let conflicted = validate(tx, p)?;
             let settled: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM local_harness_ask_operations WHERE subject=?1 AND json_extract(parameters,'$.tool_call_id')=?2 AND json_extract(parameters,'$.binding')=json(?3) AND json_extract(receipt,'$.status') IN ('accepted','dispatched','applied','indeterminate'))", params![p.subject, p.tool_call_id, serde_json::to_string(&p.binding).map_err(internal)?], |row| row.get(0)).map_err(internal)?;
             if settled { return Err(St3Error::new("already-settled", "this ask already has an admitted answer")); }
             // Native answer input shares the native mutation lane but is not a queued chat entry.
-            if !reserve_dispatch_tx(tx, &p.subject, &operation, "input", &p.binding)? { return Err(St3Error::new("harness-control-busy", "another native mutation owns the control lane")); }
-            let receipt = AskReceipt { operation_id: operation.clone(), subject: p.subject.clone(), binding: p.binding.clone(), tool_call_id: p.tool_call_id.clone(), status: Outcome::Accepted, reason: None, result: None };
+            if !conflicted && !reserve_dispatch_tx(tx, &p.subject, &operation, "input", &p.binding)? { return Err(St3Error::new("harness-control-busy", "another native mutation owns the control lane")); }
+            let receipt = AskReceipt {
+                operation_id: operation.clone(), subject: p.subject.clone(), binding: p.binding.clone(), tool_call_id: p.tool_call_id.clone(),
+                status: if conflicted { Outcome::Indeterminate } else { Outcome::Accepted },
+                reason: conflicted.then(|| "terminal-input-conflict".into()), result: None,
+                outcome: conflicted.then_some(AskOutcome::Indeterminate { reason: AskIndeterminateReason::TerminalInputConflict }),
+            };
             tx.execute("INSERT INTO local_harness_ask_operations(id,subject,digest,parameters,receipt) VALUES(?1,?2,?3,?4,?5)", params![operation, p.subject, digest, serde_json::to_string(p).map_err(internal)?, serde_json::to_string(&receipt).map_err(internal)?]).map_err(internal)?;
             Ok(receipt)
         }).map_err(|error| St3Error::new("internal", error))?
@@ -85,8 +91,16 @@ impl Store {
             let mut receipt = receipt_tx(tx, &operation)?.ok_or_else(|| St3Error::new("missing-harness-operation", "ask operation disappeared"))?;
             let stored: String = tx.query_row("SELECT parameters FROM local_harness_ask_operations WHERE id=?1", [&operation], |row| row.get(0)).map_err(internal)?;
             let p: AskParameters = serde_json::from_str(&stored).map_err(internal)?;
-            if let Err(error) = validate(tx, &p) {
-                receipt.status = Outcome::Rejected; receipt.reason = Some(error.code.into()); save(tx, &receipt)?; release_dispatch_tx(tx, &fence.subject, &operation)?; return Ok(None);
+            match validate(tx, &p) {
+                Ok(false) => {}
+                Ok(true) => {
+                    receipt.status = Outcome::Indeterminate; receipt.reason = Some("terminal-input-conflict".into());
+                    receipt.outcome = Some(AskOutcome::Indeterminate { reason: AskIndeterminateReason::TerminalInputConflict });
+                    save(tx, &receipt)?; release_dispatch_tx(tx, &fence.subject, &operation)?; return Ok(None);
+                }
+                Err(error) => {
+                    receipt.status = Outcome::Rejected; receipt.reason = Some(error.code.into()); save(tx, &receipt)?; release_dispatch_tx(tx, &fence.subject, &operation)?; return Ok(None);
+                }
             }
             receipt.status = Outcome::Dispatched; save(tx, &receipt)?;
             Ok(Some(AskCommand { operation_id: operation, binding: p.binding, tool_call_id: p.tool_call_id, answers: p.answers }))
@@ -126,7 +140,11 @@ impl Store {
                 let p: AskParameters = serde_json::from_str(&stored).map_err(internal)?;
                 if !matches!(result, Some(result) if result.native_event == "tool_result" && result.tool_call_id == p.tool_call_id && result.answers == p.answers) { return Err(St3Error::new("invalid-native-receipt", "applied ask requires the exact matching actual native answers")); }
             }
-            receipt.status = native.status; receipt.reason.clone_from(&native.reason); receipt.result = result.cloned(); save(tx, &receipt)?; release_dispatch_tx(tx, &native.subject, &native.operation_id)?;
+            receipt.status = native.status; receipt.reason.clone_from(&native.reason); receipt.result = result.cloned();
+            receipt.outcome = if native.status == Outcome::Indeterminate && native.reason.as_deref() == Some("terminal-input-conflict") {
+                Some(AskOutcome::Indeterminate { reason: AskIndeterminateReason::TerminalInputConflict })
+            } else { None };
+            save(tx, &receipt)?; release_dispatch_tx(tx, &native.subject, &native.operation_id)?;
             Ok(receipt)
         }).map_err(|error| St3Error::new("internal", error))?
     }
@@ -208,6 +226,34 @@ mod tests {
         input.token = "st-ask-00000000-0000-0000-0000-000000000002".into();
         assert_eq!(store.send_harness_ask_token(&input, &fence, || panic!("replaced delivery must never write")).unwrap_err().code, "stale-mailbox-session");
         assert!(store.send_harness_ask_token(&input, &replacement, || Ok(())).unwrap().is_ok());
+    }
+    #[test]
+    fn terminal_conflict_never_dispatches_or_fabricates_native_answers() {
+        let (store, mut state, fence) = baseline();
+        state.ask_supported = false; state.ask_reason = Some("terminal-input-conflict".into());
+        store.observe_harness_control(&state, &fence).unwrap();
+        let receipt = store.reserve_harness_ask(&request(&state, "before-admission")).unwrap();
+        assert_eq!(receipt.status, Outcome::Indeterminate);
+        assert_eq!(receipt.outcome, Some(AskOutcome::Indeterminate { reason: AskIndeterminateReason::TerminalInputConflict }));
+        assert!(store.take_harness_ask(&fence).unwrap().is_none());
+        assert!(receipt.result.is_none());
+        assert_eq!(store.harness_control_state(SUBJECT).unwrap().unwrap().pending_ask.unwrap().tool_call_id, "call-one");
+    }
+    #[test]
+    fn dispatched_terminal_conflict_is_indeterminate_and_keeps_native_ask_pending() {
+        let (store, state, fence) = baseline();
+        let accepted = store.reserve_harness_ask(&request(&state, "conflict")).unwrap();
+        let command = store.take_harness_ask(&fence).unwrap().unwrap();
+        let native = NativeReceipt {
+            subject: SUBJECT.into(), operation_id: accepted.operation_id.clone(), binding: command.binding,
+            status: Outcome::Indeterminate, reason: Some("terminal-input-conflict".into()), result: None,
+        };
+        let receipt = store.settle_harness_ask(&native, &fence).unwrap();
+        assert_eq!(receipt.status, Outcome::Indeterminate);
+        assert_eq!(receipt.outcome, Some(AskOutcome::Indeterminate { reason: AskIndeterminateReason::TerminalInputConflict }));
+        assert!(receipt.result.is_none());
+        assert_eq!(store.reserve_harness_ask(&request(&state, "retry-conflict")).unwrap_err().code, "already-settled");
+        assert_eq!(store.harness_control_state(SUBJECT).unwrap().unwrap().pending_ask.unwrap().tool_call_id, "call-one");
     }
     #[test]
     fn only_matching_native_result_settles_and_stale_answer_cannot_touch_new_ask() {

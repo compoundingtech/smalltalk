@@ -49,6 +49,7 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
   let stepToken: string | undefined;
   let steps: Step[] = [];
   let stepIndex = 0;
+  let rawProtocol = "";
   const activeCalls = new Set<string>();
   const receipts = new Map<string, Record<string, unknown>>();
   const settle = (command: Command, status: "applied" | "rejected" | "indeterminate", reason?: string, answers?: Answer[]) => {
@@ -56,6 +57,28 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
     guarded = undefined; stepToken = undefined; steps = [];
     receipts.set(command.operation_id, receipt); send(receipt);
   };
+  const conflict = () => {
+    if (!ask) return;
+    rawProtocol = ""; unsafe = "terminal-input-conflict";
+    if (guarded) settle(guarded, "indeterminate", "terminal-input-conflict");
+    observe();
+  };
+  // Public Node listener ordering observes input before OMP's clipboard/enhanced
+  // paste listeners. Human input is not suppressed: competing bytes revoke
+  // automation before those listeners can mutate or submit the native prompt.
+  const observeRawInput = (data: Buffer | string) => {
+    if (!ask) { rawProtocol = ""; return; }
+    const candidate = rawProtocol + data.toString();
+    const expected = guarded && stepToken ? `\x1b[200~${stepToken}\x1b[201~` : undefined;
+    if (expected && expected.startsWith(candidate)) {
+      rawProtocol = candidate === expected ? "" : candidate;
+      return;
+    }
+    // A coalesced suffix is competing input too. Revoking the token here makes
+    // the later TUI listener consume the whole framed event, suffix included.
+    conflict();
+  };
+  process.stdin.prependListener("data", observeRawInput);
   const requestStep = () => {
     const command = guarded; const step = steps[stepIndex]; const live = current();
     if (!command || !step || !ask || ask.tool_call_id !== command.tool_call_id) return;
@@ -79,13 +102,13 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
         queueMicrotask(requestStep);
         return { data: step.data };
       }
-      if (guarded) return { consume: true };
-      if (ask) { unsafe = "native-ask-edited-in-terminal"; observe(); }
+      if (ask) conflict();
       return undefined;
     });
   };
   const reset = (reason: string) => {
     unsubscribe?.(); unsubscribe = undefined;
+    rawProtocol = "";
     if (guarded) settle(guarded, "indeterminate", reason);
     ask = undefined; unsafe = undefined; activeCalls.clear(); observe();
   };
@@ -101,9 +124,7 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
     if (!questions) return;
     ask = { tool_call_id: event.toolCallId, questions };
     const terminal = process.stdin.isTTY === true && process.stdout.isTTY === true && !process.argv.some((argument, index) => argument.startsWith("--mode=rpc") || (argument === "--mode" && process.argv[index + 1]?.startsWith("rpc")));
-    // Public onTerminalInput runs after native clipboard/enhanced-paste handlers.
-    // Without a pre-native exclusive input fence, do not advertise safe automation.
-    unsafe = terminal && typeof ctx.ui.askDialog === "function" && ctx.hasUI ? "native-exclusive-input-guard-unavailable" : "native-rich-ask-terminal-unavailable";
+    unsafe = terminal && typeof ctx.ui.askDialog === "function" && ctx.hasUI ? undefined : "native-rich-ask-terminal-unavailable";
     if (questions.some(q => new Set(q.options.map(option => option.label)).size !== q.options.length)) unsafe = "ambiguous-native-ask-options";
     try { install(ctx); } catch { unsafe = "native-terminal-input-guard-unavailable"; }
     observe();
@@ -134,7 +155,10 @@ export const createHarnessAsk = (pi: ExtensionAPI, send: (frame: Record<string, 
     reset("native-session-replaced");
     try { install(ctx); } catch { unsafe = "native-terminal-input-guard-unavailable"; }
   });
-  pi.on("session_shutdown", () => reset("native-process-shutdown"));
+  pi.on("session_shutdown", () => {
+    process.stdin.removeListener("data", observeRawInput);
+    reset("native-process-shutdown");
+  });
   return {
     state: () => ({ pending_ask: ask ?? null, ask_supported: !!ask && !unsafe && !guarded, ask_reason: unsafe ?? (guarded ? "native-ask-answer-in-flight" : ask ? null : "no-pending-native-ask") }),
     busy: () => !!guarded,

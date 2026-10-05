@@ -27,6 +27,7 @@ const scenarios = [
   { id: 'native-ask-optionless-multi', questions: [{ id: 'optionless', question: 'Confirm no listed extras', options: [], multi: true }], answers: [{ questionId: 'optionless', options: [] }] },
   { id: 'native-ask-literal-image-path', questions: [{ id: 'literal', question: 'Supply a literal file path', options: [{ label: 'Preset' }] }], text: root + '/literal-answer.png' },
   { id: 'native-ask-after-new', switchSession: true, questions: [{ id: 'after-new', question: 'Answer in the new native session', options: [{ label: 'Continue' }] }], answers: [{ questionId: 'after-new', options: ['Continue'] }] },
+  { id: 'native-ask-conflict', conflict: true, questions: [{ id: 'conflict', question: 'Conflict must hand off to the terminal', options: Array.from({ length: 8 }, (_, index) => ({ label: 'Preset ' + index })) }], text: 'This browser answer must never submit' },
   { id: 'native-ask-edited', questions: [{ id: 'edited', question: 'Edit this in the terminal', options: [{ label: 'First' }, { label: 'Second' }] }], answers: [{ questionId: 'edited', options: ['First'] }] },
 ];
 let scenarioIndex = 0;
@@ -112,12 +113,12 @@ try {
     }
     if (scenario.id === 'native-ask-edited') {
       await pty('send', 'native-smoke', '--seq', 'key:down');
-      await poll(async () => (await read()).native.ask_reason === 'native-ask-edited-in-terminal', 'terminal edit revocation');
+      await poll(async () => (await read()).native.ask_reason === 'terminal-input-conflict', 'terminal edit revocation');
       const refused = await answer('edited', { _tag: 'Selection', askRef: pending.ask_ref, answers: scenario.answers });
-      if (refused.status < 400 || refused.envelope.code !== 'unsupported-harness-ask') throw Error('Edited ask was not honestly refused');
+      if (refused.status !== 200 || refused.value.harness_ask.outcome?._tag !== 'Indeterminate' || refused.value.harness_ask.outcome.reason !== 'terminal-input-conflict') throw Error('Edited ask lacked typed terminal handoff');
       await pty('send', 'native-smoke', '--seq', 'key:return');
       await poll(async () => !(await read()).native.pending_ask, 'real terminal completion clears pending');
-      proof.push({ scenario: scenario.id, refusal: refused.envelope.code });
+      proof.push({ scenario: scenario.id, receipt: refused.value.harness_ask });
       break;
     }
     if (!queued.native.ask_supported) throw Error('Native guarded answer unsupported ' + JSON.stringify(queued.native));
@@ -131,6 +132,25 @@ try {
     const accepted = await answer('valid-' + scenarioIndex, parameters);
     if (accepted.status !== 200 || accepted.value.status !== 'accepted') throw Error('Owner did not accept pending answer ' + JSON.stringify(accepted));
     const operation = accepted.value.operation_id;
+    if (scenario.conflict) {
+      await poll(async () => (await read()).native.ask_reason === 'native-ask-answer-in-flight', 'admitted native automation');
+      // Native clipboard listeners precede extension TUI listeners. The public
+      // raw observer revokes automation before this real Ctrl+V reaches them.
+      await pty('send', 'native-smoke', '--seq', '\x16');
+      const conflicted = await poll(async () => {
+        const response = await request('/v1/client/harness-control-receipts/' + encodeURIComponent(operation) + '?subject=' + encodeURIComponent(subject));
+        return response.value?.status === 'indeterminate' ? response.value : false;
+      }, 'typed native input conflict');
+      if (conflicted.outcome?._tag !== 'Indeterminate' || conflicted.outcome.reason !== 'terminal-input-conflict' || conflicted.result) throw Error('Conflict fabricated native answer proof ' + JSON.stringify(conflicted));
+      if ((await read()).native.pending_ask?.tool_call_id !== scenario.id) throw Error('Conflict incorrectly cleared the native ask');
+      if (await Bun.file(root + '/native-result-' + scenario.id + '.json').exists()) throw Error('Browser automation submitted after human input');
+      await pty('send', 'native-smoke', '--seq', 'key:escape', '--seq', 'key:escape');
+      await poll(async () => !(await read()).native.pending_ask, 'terminal-only cancellation');
+      await poll(async () => (await read()).native.idle, 'conflict native continuation idle');
+      proof.push({ scenario: scenario.id, accepted: accepted.value.status, receipt: conflicted, completion: 'manual-terminal-only' });
+      oldRef = pending.ask_ref;
+      continue;
+    }
     const settled = await poll(async () => { const result = await request('/v1/client/harness-control-receipts/' + encodeURIComponent(operation) + '?subject=' + encodeURIComponent(subject)); if (result.status !== 200) throw Error(JSON.stringify(result)); if (['rejected', 'indeterminate'].includes(result.value.status)) throw Error('Native answer failed ' + JSON.stringify(result.value)); return result.value.status === 'applied' ? result.value : false; }, 'actual native result ' + scenario.id);
     if (settled.result.native_event !== 'tool_result' || settled.result.tool_call_id !== scenario.id) throw Error('Receipt lacked exact native tool_result');
     await poll(async () => !(await read()).native.pending_ask, 'matching native result clears pending');

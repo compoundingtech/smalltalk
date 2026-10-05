@@ -413,6 +413,16 @@ pub struct AskResult {
     pub tool_call_id: String,
     pub answers: Vec<AskAnswer>,
 }
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum AskIndeterminateReason {
+    #[serde(rename = "terminal-input-conflict")]
+    TerminalInputConflict,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "_tag", deny_unknown_fields)]
+pub enum AskOutcome {
+    Indeterminate { reason: AskIndeterminateReason },
+}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AskReceipt {
@@ -423,6 +433,8 @@ pub struct AskReceipt {
     pub status: Outcome,
     pub reason: Option<String>,
     pub result: Option<AskResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<AskOutcome>,
 }
 /// A one-use opaque terminal input token. The native public input hook translates
 /// it into a single key only while the exact ask operation owns its input guard.
