@@ -16,9 +16,6 @@ let
     [[bin]]
     name = "unselected"
     path = "src/unselected.rs"
-    [[test]]
-    name = "smoke"
-    path = "tests/smoke.rs"
   '';
   lockContents = ''
     version = 4

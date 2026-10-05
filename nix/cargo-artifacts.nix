@@ -17,9 +17,46 @@ let
       [ ]
     else
       [ (builtins.head flags) ] ++ cargoFlags (builtins.tail flags);
+  # Crane stubs explicitly declared tests; Cargo also discovers tests/foo.rs
+  # and tests/foo/main.rs. Preserve those target names without depending on
+  # their contents, so explicit --test selectors also work in the dummy build.
+  originalSource = if self._isLibCleanSourceWith or false then self.origSrc else self;
+  sourcePrefix = builtins.unsafeDiscardStringContext (toString originalSource + "/");
+  autoTests = lib.concatMapStrings (
+    cargoToml:
+    let
+      manifest = builtins.fromTOML (builtins.readFile cargoToml);
+      testDir = builtins.dirOf cargoToml + "/tests";
+      relativeDir = builtins.dirOf (lib.removePrefix sourcePrefix cargoToml);
+      entries =
+        if manifest ? package && (manifest.package.autotests or true) && builtins.pathExists testDir then
+          builtins.readDir testDir
+        else
+          { };
+    in
+    lib.concatMapStrings (
+      name:
+      let
+        testPath =
+          if entries.${name} == "regular" && lib.hasSuffix ".rs" name then
+            "tests/${name}"
+          else if entries.${name} == "directory" && builtins.pathExists (testDir + "/${name}/main.rs") then
+            "tests/${name}/main.rs"
+          else
+            null;
+        destination = "${relativeDir}/${testPath}";
+      in
+      lib.optionalString (testPath != null) ''
+        mkdir -p "$out"/${lib.escapeShellArg (builtins.dirOf destination)}
+        if [ ! -f "$out"/${lib.escapeShellArg destination} ]; then
+          printf 'fn main() {}\n' > "$out"/${lib.escapeShellArg destination}
+        fi
+      ''
+    ) (builtins.attrNames entries)
+  ) (craneLib.findCargoFiles self).cargoTomls;
   dummySource = craneLib.mkDummySrc {
     src = self;
-    inherit extraDummyScript;
+    extraDummyScript = autoTests + extraDummyScript;
   };
   dependencies = package.overrideAttrs (old: {
     pname = "${old.pname}-dependencies";
