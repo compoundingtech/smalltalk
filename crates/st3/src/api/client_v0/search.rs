@@ -492,7 +492,7 @@ fn search_page(
     let Some(indexed_at) = &index.indexed_at else {
         return Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            code: if index.refreshing {
+            code: if index.refreshing || index.error.is_none() {
                 "index-building"
             } else {
                 "remote-unavailable"
