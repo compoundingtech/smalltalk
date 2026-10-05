@@ -678,13 +678,6 @@ name = "{other.name}"
 url = "http://127.0.0.1:{ports[1 - index]}"
 ''')
                 await node.start()
-                # Retain the real channel's refusal without changing its argv, fences or
-                # deadlines. The probe intentionally keeps channel stderr off its own pipe.
-                channel = node.root / "bin/probe-channel-st3"
-                channel_stderr = node.root / "probe-channel.stderr"
-                channel.write_text("#!/bin/sh\nexec " + shlex.quote(str(node.binary))
-                                   + ' "$@" 2>>' + shlex.quote(str(channel_stderr)) + "\n")
-                channel.chmod(0o700)
                 if index == 0 and expect_agent_alert:
                     # A live operations harness, using the existing token-free omp stand-in.
                     wrapper = node.root / "bin/omp"
@@ -706,7 +699,7 @@ agent "operations/amber" {{
                         return card if card and card.get("driver") and card.get("state") == "running" else None
                     await faults.until(operations_ready, 30)
                 config = {"host": node.name, "agent": f"agent/probe/{node.name}",
-                          "binary": str(channel), "socket": str(node.endpoint),
+                          "binary": str(node.binary), "socket": str(node.endpoint),
                           "state_dir": str(node.root / "probe"), "reviewer": "person/eval",
                           "interval_ms": 12_000, "deadline_ms": deadline_ms,
                           "peers": [{"host": other.name, "agent": f"agent/probe/{other.name}"}]}
@@ -809,6 +802,16 @@ agent "probe/{node.name}" {{
             for node in nodes:
                 events = [json.loads(line) for line in (node.root / "probe/events.jsonl").read_text().splitlines()]
                 self.assertTrue(any(event["event"] == "consumed" for event in events))
+                starts = {event["channel_id"]: event for event in events if event["event"] == "channel-started"}
+                for event in events:
+                    if event["event"] == "channel-exited":
+                        self.assertEqual(starts[event["channel_id"]]["pid"], event["pid"])
+                        self.assertIn("observed_owner_at_exit", event)
+                        self.assertIn("diagnostic", event["stderr"])
+                        if event["exit"] == 2:
+                            # A fixture wrapper must not redirect away the real CLI refusal.
+                            self.assertGreater(event["stderr"]["bytes"], 0)
+                self.assertEqual((node.root / "probe/events.jsonl").stat().st_mode & 0o777, 0o600)
                 await node.cli("agents", "stop", f"agent/probe/{node.name}", "--as", "person/eval")
             if expect_agent_alert:
                 await nodes[0].cli("agents", "stop", "agent/operations/amber", "--as", "person/eval")
@@ -826,7 +829,7 @@ agent "probe/{node.name}" {{
                     print(f"{node.name} follow-up failed doctor checks: {json.dumps(failed)[-8000:]}", file=sys.stderr)
                 except Exception as error:
                     print(f"{node.name} follow-up doctor unavailable: {type(error).__name__}", file=sys.stderr)
-                for name in ("probe/latest.json", "probe/events.jsonl", "probe-channel.stderr"):
+                for name in ("probe/latest.json", "probe/events.jsonl"):
                     path = node.root / name
                     if path.exists():
                         print(f"{node.name} {name}: {path.read_text()[-8000:]}", file=sys.stderr)
