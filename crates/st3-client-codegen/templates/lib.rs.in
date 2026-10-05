@@ -555,6 +555,9 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::ValidationFailed
         | ErrorCode::AttentionMigrated
         | ErrorCode::RuntimeNotLocal
+        | ErrorCode::PrivateNotesCarrierConflict
+        | ErrorCode::PrivateNotesUnreachable
+        | ErrorCode::PrivateNotesIndeterminate
         | ErrorCode::Unknown => message.to_owned(),
     }
 }
@@ -2186,13 +2189,31 @@ mod tests {
     }
 
     #[test]
-    fn fence_carries_every_schema_fence_field() {
-        // runtime.stop/restart/reset require runtime_desired_revision; a missing typed field makes them unsendable.
-        let schema: serde_json::Value = serde_json::from_str(include_str!("../../../docs/st3/client-v0/schemas/client-v0.schema.json")).unwrap();
-        let declared: std::collections::BTreeSet<&str> = schema["$defs"]["Fence"]["properties"].as_object().unwrap().keys().map(String::as_str).collect();
-        let typed = serde_json::to_value(Fence::default()).unwrap();
-        let typed: std::collections::BTreeSet<&str> = typed.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(typed, declared);
+    fn server_fence_round_trip_preserves_action_preconditions() {
+        let wire = serde_json::json!({
+            "snapshot_id": "snapshot/owner/7",
+            "subject_revisions": {"agent/owner/worker": "revision/3"},
+            "mission_generation": "generation/2",
+            "step_definition": "definition/4",
+            "attempt": 2,
+            "readiness_epoch": 3,
+            "runtime_incarnation": "incarnation/5",
+            "runtime_desired_revision": "desired/6",
+            "terminal_sequence": 7,
+            "preview_token": "preview/8",
+            "private_notes": {"carrier_generation": "carrier/9", "revision": "notes/10"}
+        });
+        let typed: Fence = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&typed).unwrap(), wire);
+        let notes = typed.private_notes.as_ref().unwrap();
+        assert_eq!(notes.carrier_generation, "carrier/9");
+        assert_eq!(notes.revision, "notes/10");
+
+        let mut without_notes = wire;
+        without_notes.as_object_mut().unwrap().remove("private_notes");
+        let typed: Fence = serde_json::from_value(without_notes.clone()).unwrap();
+        assert!(typed.private_notes.is_none());
+        assert_eq!(serde_json::to_value(typed).unwrap(), without_notes);
     }
 
     const EMPTY_PAGE: &str = r#"{

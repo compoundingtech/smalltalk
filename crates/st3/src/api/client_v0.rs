@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 pub(super) mod raw_terminal;
 pub(super) mod resources;
 pub(super) mod search;
+pub(super) mod private_notes;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -1096,7 +1097,9 @@ const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "control.attention",
     "control.launches",
 ];
+
 const ACTIONS: &[&str] = &[
+    "private-notes.write",
     "attention.resolve",
     "review.approve",
     "review.reject",
@@ -1153,6 +1156,7 @@ const ACTIONS: &[&str] = &[
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
     "custom.reply",
+    "private-notes.write",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -1208,7 +1212,7 @@ const AVAILABLE_ACTIONS: &[&str] = &[
 pub(super) struct ClientSession {
     /// The credential/session identity used for audit and idempotency isolation.
     pub(super) actor: String,
-    /// The concrete graph person whose explicitly delegated authority is exercised.
+    /// The concrete graph person or local agent whose authority is exercised.
     pub(super) authority_actor: String,
     pub(super) transport: &'static str,
     pub(super) custom_forms: bool,
@@ -5725,9 +5729,7 @@ pub(super) async fn pairing_begin(
                 .collect()
         }
     };
-    state
-        .store
-        .append_claim(&ClaimInput {
+    state.store.append_claim(&ClaimInput {
             subject,
             kind: "custom.client.pairing-begun".into(),
             actor: Some(person_id.clone()),
@@ -7217,6 +7219,7 @@ pub(super) struct Fence {
     runtime_desired_revision: Option<String>,
     terminal_sequence: Option<u64>,
     preview_token: Option<String>,
+    private_notes: Option<crate::private_notes::NotesFence>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -7232,6 +7235,7 @@ pub(super) struct ActionRequest {
 }
 
 fn action_scope(action: &str) -> Option<&'static str> {
+    if action == "private-notes.write" { return Some("control.work"); }
     if matches!(
         action,
         "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume"
@@ -8935,6 +8939,9 @@ pub(super) async fn action(
             "client mutations require a concrete person or a local agent",
         ));
     }
+    if request.action_type == "private-notes.write" {
+        return private_notes::write(&state, &session, request).await.map(Json);
+    }
     let gate = action_gate(&state, &session, &request.idempotency_key);
     let _guard = gate.lock().await;
     let request_digest = action_request_digest(&request)?;
@@ -10175,6 +10182,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         }
     }
 
@@ -12417,6 +12425,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: None,
                 preview_token: None,
+                private_notes: None,
             },
             parameters: json!({"target_id": external.id}),
         };
@@ -13248,6 +13257,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: None,
                 preview_token: None,
+                private_notes: None,
             },
             parameters,
         };
@@ -14945,6 +14955,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: Some(1),
                 preview_token: None,
+                private_notes: None,
             },
             parameters: json!({ "target_id": "terminal/agent/terminal-owner" }),
         };
@@ -15020,6 +15031,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: None,
                 preview_token: None,
+                private_notes: None,
             },
             parameters: json!({ "target_id": attachment_id }),
         };
@@ -15317,6 +15329,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: Some(snapshot.store_index),
                 preview_token: None,
+                private_notes: None,
             },
             parameters: json!({ "target_id": "terminal/agent/concurrent-terminal-owner" }),
         };
@@ -15501,6 +15514,7 @@ mission "example/zero-run" state="ready" {
                 runtime_desired_revision: None,
                 terminal_sequence: Some(owner.store.index().unwrap()),
                 preview_token: None,
+                private_notes: None,
             },
             parameters: json!({ "target_id": "terminal/agent/fleet-terminal" }),
         };

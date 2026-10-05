@@ -47,6 +47,8 @@ pub mod peer;
 pub mod placement;
 pub mod person_request;
 pub mod pricing;
+pub mod private_notes;
+mod private_notes_fs;
 pub use smallclaims::{performance, profile};
 pub mod projection;
 pub mod reconcile;

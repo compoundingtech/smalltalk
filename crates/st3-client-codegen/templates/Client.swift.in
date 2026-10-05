@@ -173,6 +173,10 @@ public actor St3Client {
         return try JSONDecoder().decode(T.self, from: data)
     }
 
+    static func pathSegment(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"))!
+    }
+
     static func routedSessionID(_ value: String) -> String {
         let innerID = value.hasPrefix("session/") ? String(value.dropFirst("session/".count)) : value
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~"))

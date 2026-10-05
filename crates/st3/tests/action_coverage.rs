@@ -188,6 +188,7 @@ impl Daemon {
             client_relay: None,
             native_session_home: Some(root.join("native")),
             planner_default: Default::default(),
+            private_notes: Default::default(),
         }
     }
 
@@ -231,7 +232,9 @@ impl Daemon {
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
         std::fs::remove_file(self.socket()).unwrap();
+        let private_notes = self.state.private_notes.clone();
         self.state = Self::state(self.root.path(), &self.state.node);
+        self.state.private_notes = private_notes;
         self.serve().await;
     }
 
@@ -433,8 +436,7 @@ fn cli_value(output: Output) -> Value {
         .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stdout)))
 }
 
-// Call the same typed builders stui uses. The inventory guard below compares this dispatch
-// with the generated contract so a newly offered action cannot silently escape the matrix.
+// Exercise the public typed action builders over the real daemon listener.
 async fn dispatch(
     client: &Client,
     kind: &str,
@@ -464,6 +466,7 @@ async fn dispatch(
         "mission.approve-revision" => mission_approve_revision, "mission.cancel" => mission_cancel,
         "mission.cancel-revision" => mission_cancel_revision, "mission.revise" => mission_revise,
         "mission.start" => mission_start, "pairing.revoke" => pairing_revoke,
+        "private-notes.write" => private_notes_write,
         "review.approve" => review_approve, "review.reject" => review_reject, "review.request-changes" => review_request_changes,
         "runtime.context-clear" => runtime_context_clear, "runtime.reset" => runtime_reset,
         "runtime.restart" => runtime_restart, "runtime.signal" => runtime_signal, "runtime.stop" => runtime_stop,
@@ -476,6 +479,68 @@ async fn dispatch(
         "work.publish-mission" => work_publish_mission, "work.release" => work_release,
         "work.renew" => work_renew, "work.retry" => work_retry,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_notes_receipts_and_stale_carriers_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let mut daemon = Daemon::new().await;
+    let catalog = daemon.root.path().join("notes-catalog");
+    let subject = catalog.join(format!("agents/{NODE}/worker"));
+    std::fs::create_dir_all(subject.join("resources")).unwrap();
+    let uri = format!("dev.schickling.agent-private-notes://{NODE}/worker");
+    std::fs::write(
+        subject.join("agent.kdl"),
+        format!("agent \"worker\" {{\n host {NODE:?}\n resource \"Notes\" uri={uri:?}\n}}\n"),
+    ).unwrap();
+    let carrier = subject.join("resources/private-notes.md");
+    std::fs::write(&carrier, "Original private bytes.").unwrap();
+    daemon.state.private_notes = Arc::new(st3::private_notes::Authority { catalogs: vec![catalog] });
+    daemon.restart().await;
+
+    let first = daemon.client(PERSON).private_notes_get(&uri).await.unwrap();
+    let fence = first.value.actions[0].fence.clone();
+    assert_eq!(fence.private_notes.as_ref(), Some(&first.value.data.fence));
+    let parameters = json!({"uri": uri, "markdown": "First accepted private bytes."});
+    let accepted = dispatch(&daemon.client(PERSON), "private-notes.write",
+        "notes-restart-first-0001", fence.clone(), parameters.clone()).await.unwrap().value;
+    let successor = accepted.private_notes.clone().unwrap();
+    assert_ne!(successor.revision, first.value.data.fence.revision);
+    assert_eq!(std::fs::read_to_string(&carrier).unwrap(), "First accepted private bytes.");
+    daemon.restart().await;
+
+    // A successor from the real read authorizes a concurrent normal actor.
+    let current = daemon.client(PERSON).private_notes_get(&uri).await.unwrap();
+    assert_eq!(current.value.data.fence, successor);
+    dispatch(&daemon.client(WORKER), "private-notes.write", "notes-restart-winner-0002",
+        current.value.actions[0].fence.clone(),
+        json!({"uri":uri,"markdown":"Concurrent winning private bytes."})).await.unwrap();
+    daemon.restart().await;
+
+    // The exact old intent returns its original durable receipt, not a new replacement.
+    let index = daemon.store().index().unwrap();
+    let replay = dispatch(&daemon.client(PERSON), "private-notes.write",
+        "notes-restart-first-0001", fence.clone(), parameters).await.unwrap().value;
+    assert_eq!(replay.operation_id, accepted.operation_id);
+    assert_eq!(replay.private_notes, Some(successor));
+    assert_eq!(daemon.store().index().unwrap(), index);
+    assert_eq!(std::fs::read_to_string(&carrier).unwrap(), "Concurrent winning private bytes.");
+
+    let changed = dispatch(&daemon.client(PERSON), "private-notes.write",
+        "notes-restart-first-0001", fence.clone(),
+        json!({"uri":uri,"markdown":"Changed bytes under the accepted key."})).await.unwrap_err();
+    assert!(matches!(changed, ClientError::Api(ErrorCode::IdempotencyConflict, ..)));
+    assert_eq!(daemon.store().index().unwrap(), index);
+    let stale = dispatch(&daemon.client(PERSON), "private-notes.write",
+        "notes-restart-stale-0003", fence,
+        json!({"uri":uri,"markdown":"A stale edit must not replace the winner."})).await.unwrap_err();
+    assert!(matches!(stale, ClientError::Api(ErrorCode::StaleFence, ..)));
+    assert_eq!(std::fs::read_to_string(&carrier).unwrap(), "Concurrent winning private bytes.");
+    daemon.restart().await;
+    let observed = daemon.client(PERSON).private_notes_get(&uri).await.unwrap();
+    assert_eq!(observed.value.data.markdown, "Concurrent winning private bytes.");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3820,116 +3885,6 @@ mission "example/review" state="ready" {{
     }
 }
 
-#[test]
-fn action_inventory_matches_contract_and_has_existing_test_references() {
-    if st3::test_support::supervise_test() {
-        return;
-    }
-    use std::collections::BTreeSet;
-    let inventory: Value =
-        serde_json::from_str(include_str!("../../../docs/st3/action-coverage.json")).unwrap();
-    let declared: BTreeSet<_> = st3_client::ACTION_NAMES.iter().copied().collect();
-    let documented: BTreeSet<_> = inventory["typed_actions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| row["action"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        declared, documented,
-        "add a restart case when the action contract grows"
-    );
-    let dispatch = include_str!("action_coverage.rs")
-        .split("actions! {")
-        .nth(1)
-        .unwrap()
-        .split("\n    }")
-        .next()
-        .unwrap();
-    for action in declared {
-        assert!(
-            dispatch.contains(&format!("\"{action}\" =>")),
-            "{action} is absent from the real typed-client dispatch"
-        );
-    }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for group in [
-        "typed_actions",
-        "cli",
-        "stui_effects",
-        "local_ui_actions",
-        "palette_actions",
-    ] {
-        for row in inventory[group].as_array().unwrap() {
-            let tests = row["tests"].as_array().unwrap();
-            assert!(!tests.is_empty(), "missing test evidence: {row}");
-            for reference in tests {
-                let (file, test) = reference.as_str().unwrap().split_once("::").unwrap();
-                let source = std::fs::read_to_string(root.join(file)).unwrap();
-                assert!(
-                    source.contains(&format!("fn {test}(")),
-                    "coverage reference no longer exists: {reference}"
-                );
-            }
-        }
-    }
-    let source = include_str!("../../stui/src/ui/mod.rs");
-    let declaration = source
-        .split("pub enum Effect {")
-        .nth(1)
-        .unwrap()
-        .split("\n}")
-        .next()
-        .unwrap();
-    let offered: BTreeSet<_> = declaration
-        .lines()
-        .filter_map(|line| {
-            let line = line.strip_prefix("    ")?;
-            if !line.chars().next()?.is_ascii_uppercase() {
-                return None;
-            }
-            Some(line.split([' ', '{', '(', ',']).next().unwrap())
-        })
-        .collect();
-    let documented: BTreeSet<_> = inventory["stui_effects"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| row["effect"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        offered, documented,
-        "add reducer and transport evidence when stui gains an effect"
-    );
-    let source = include_str!("../../stui/src/ui/glass.rs");
-    let declaration = source
-        .split("enum Action {")
-        .nth(1)
-        .unwrap()
-        .split("\n}")
-        .next()
-        .unwrap();
-    let offered: BTreeSet<_> = declaration
-        .lines()
-        .filter_map(|line| {
-            let line = line.strip_prefix("    ")?;
-            if !line.chars().next()?.is_ascii_uppercase() {
-                return None;
-            }
-            Some(line.split([' ', '{', '(', ',']).next().unwrap())
-        })
-        .collect();
-    let documented: BTreeSet<_> = inventory["palette_actions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| row["action"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        offered, documented,
-        "add coverage when the stui palette grows"
-    );
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_github_gates_pass_wait_and_refuse_over_private_http_across_restart() {

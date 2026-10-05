@@ -1022,6 +1022,7 @@ mod tests {
         let config = Config {
             node: "node-a".into(),
             person: None,
+            private_notes_catalogs: Vec::new(),
             fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
             shared_secret_file: Some("/var/lib/st3/fleet.secret".into()),
             state_dir: "/var/lib/st3".into(),

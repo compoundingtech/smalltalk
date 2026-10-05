@@ -17,6 +17,8 @@ pub struct Config {
     pub node: String,
     /// The concrete person represented by trusted local product commands.
     pub person: Option<String>,
+    /// Owner-local catalog roots supplying declared private-notes carrier provenance.
+    pub private_notes_catalogs: Vec<PathBuf>,
     pub fleet_id: Option<String>,
     pub shared_secret_file: Option<PathBuf>,
     pub state_dir: PathBuf,
@@ -173,6 +175,7 @@ impl Default for Config {
         Self {
             node: host_name(),
             person: None,
+            private_notes_catalogs: Vec::new(),
             fleet_id: None,
             shared_secret_file: None,
             state_dir,
@@ -317,6 +320,11 @@ impl Config {
             "the OpenCode planner does not accept an effort override"
         );
         anyhow::ensure!(!self.node.trim().is_empty(), "the st node label is empty");
+        anyhow::ensure!(
+            self.private_notes_catalogs.iter().all(|path| path.is_absolute()
+                && path.components().all(|part| matches!(part, std::path::Component::RootDir | std::path::Component::Normal(_)))),
+            "private_notes_catalogs must contain absolute paths without parent components"
+        );
         anyhow::ensure!(
             self.observations.retention_ms()? >= ObservationsConfig::MINIMUM_RETENTION_MS,
             "observations.retention must be at least 1h"

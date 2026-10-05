@@ -819,7 +819,7 @@ pub(crate) fn parse_declared_resource(
     ))
 }
 
-fn uri_reference_name(uri: &str) -> String {
+pub(crate) fn uri_reference_name(uri: &str) -> String {
     format!("uri/{}", hex::encode(Sha256::digest(uri.as_bytes())))
 }
 

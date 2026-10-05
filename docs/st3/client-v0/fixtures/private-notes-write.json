@@ -1,0 +1,15 @@
+{
+  "api_version": "st3.client.v0",
+  "id": "action/private-notes-write",
+  "type": "private-notes.write",
+  "idempotency_key": "private-notes-write-0001",
+  "fence": {
+    "snapshot_id": "snapshot/alder:1",
+    "subject_revisions": {},
+    "private_notes": { "carrier_generation": "generation-a", "revision": "revision-a" }
+  },
+  "parameters": {
+    "uri": "dev.schickling.agent-private-notes://alder/worker",
+    "markdown": "Owner-authored context.\n"
+  }
+}

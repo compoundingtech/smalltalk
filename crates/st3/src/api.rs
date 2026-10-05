@@ -93,6 +93,7 @@ pub struct AppState {
     pub client_relay: Option<crate::peer::ClientRelay>,
     pub native_session_home: Option<std::path::PathBuf>,
     pub planner_default: PlannerSpec,
+    pub private_notes: Arc<crate::private_notes::Authority>,
 }
 
 const CLIENT_API_VERSION: &str = "st3.client.v0";
@@ -252,12 +253,17 @@ impl ApiError {
             | "stale-launch-preview"
             | "fleet-leaving"
             | "glass-deleted"
+            | "stale-fence"
+            | "idempotency-conflict"
+            | "private-notes-carrier-conflict"
             | "glass-limit" => StatusCode::CONFLICT,
             "launch-review-not-authorized"
             | "wrong-message-recipient"
             | "lane-approval-denied"
+            | "forbidden"
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
+            "private-notes-unreachable" | "private-notes-indeterminate" => StatusCode::SERVICE_UNAVAILABLE,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -385,6 +391,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/work/{*id}", get(client_work_detail))
         .route("/v1/client/agents", get(client_agents))
         .route("/v1/client/resources", get(client_v0::resources::list))
+        .route("/v1/client/private-notes/{*uri}", get(client_v0::private_notes::detail))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
         .route(
             "/v1/client/agent-workspaces/{*id}",
@@ -1142,6 +1149,9 @@ fn client_error_code(code: Option<&str>) -> String {
         | "validation-failed"
         | "idempotency-conflict"
         | "stale-fence"
+        | "private-notes-unreachable"
+        | "private-notes-carrier-conflict"
+        | "private-notes-indeterminate"
         | "timeline-history-incomplete"
         | "cursor-gap"
         | "page-cursor-expired"
@@ -14776,6 +14786,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             client_relay: None,
             native_session_home: None,
             planner_default: PlannerSpec::default(),
+            private_notes: Default::default(),
         }
     }
 
@@ -22117,6 +22128,7 @@ agent "seat" { workspace "/tmp"; command "true" }
         let (status, body) = json_request(app, "/v1/harness-events", stale).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
+
 }
 
 #[cfg(test)]

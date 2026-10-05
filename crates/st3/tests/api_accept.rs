@@ -75,6 +75,7 @@ async fn descriptor_exhaustion_child() {
         client_relay: None,
         native_session_home: None,
         planner_default: st3::model::PlannerSpec::default(),
+        private_notes: Default::default(),
     };
     let server_socket = socket.clone();
     let server =

@@ -192,6 +192,13 @@
       "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
     },
     {
+      "action": "private-notes.write",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::private_notes_receipts_and_stale_carriers_survive_restart"
+      ],
+      "behavior": "typed Notes fence survives reads and restart; exact retry preserves its durable receipt and concurrent winning bytes; changed content under an accepted key and stale carrier edits refuse across restart"
+    },
+    {
       "action": "review.approve",
       "tests": [
         "crates/st3/tests/action_coverage.rs::human_review_actions_survive_stale_fences_and_restarts"

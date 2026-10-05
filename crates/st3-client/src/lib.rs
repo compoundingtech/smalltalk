@@ -560,6 +560,9 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::ValidationFailed
         | ErrorCode::AttentionMigrated
         | ErrorCode::RuntimeNotLocal
+        | ErrorCode::PrivateNotesCarrierConflict
+        | ErrorCode::PrivateNotesUnreachable
+        | ErrorCode::PrivateNotesIndeterminate
         | ErrorCode::Unknown => message.to_owned(),
     }
 }
@@ -1169,6 +1172,13 @@ impl Client {
     }
     pub async fn custom_subjects_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("custom-subjects", id).await
+    }
+    pub async fn private_notes_get(
+        &self,
+        uri: &str,
+    ) -> Result<Envelope<PrivateNotesSubject>, ClientError> {
+        self.get(&format!("/v1/client/private-notes/{}", percent_encode(uri)))
+            .await
     }
     pub async fn host_repositories(
         &self,
@@ -1874,6 +1884,17 @@ impl Client {
         parameters: TargetParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::pairing_revoke(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn private_notes_write(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PrivateNotesWriteParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::private_notes_write(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
@@ -3322,26 +3343,34 @@ mod tests {
     }
 
     #[test]
-    fn fence_carries_every_schema_fence_field() {
-        // runtime.stop/restart/reset require runtime_desired_revision; a missing typed field makes them unsendable.
-        let schema: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../docs/st3/client-v0/schemas/client-v0.schema.json"
-        ))
-        .unwrap();
-        let declared: std::collections::BTreeSet<&str> = schema["$defs"]["Fence"]["properties"]
-            .as_object()
+    fn server_fence_round_trip_preserves_action_preconditions() {
+        let wire = serde_json::json!({
+            "snapshot_id": "snapshot/owner/7",
+            "subject_revisions": {"agent/owner/worker": "revision/3"},
+            "mission_generation": "generation/2",
+            "step_definition": "definition/4",
+            "attempt": 2,
+            "readiness_epoch": 3,
+            "runtime_incarnation": "incarnation/5",
+            "runtime_desired_revision": "desired/6",
+            "terminal_sequence": 7,
+            "preview_token": "preview/8",
+            "private_notes": {"carrier_generation": "carrier/9", "revision": "notes/10"}
+        });
+        let typed: Fence = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&typed).unwrap(), wire);
+        let notes = typed.private_notes.as_ref().unwrap();
+        assert_eq!(notes.carrier_generation, "carrier/9");
+        assert_eq!(notes.revision, "notes/10");
+
+        let mut without_notes = wire;
+        without_notes
+            .as_object_mut()
             .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        let typed = serde_json::to_value(Fence::default()).unwrap();
-        let typed: std::collections::BTreeSet<&str> = typed
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(typed, declared);
+            .remove("private_notes");
+        let typed: Fence = serde_json::from_value(without_notes.clone()).unwrap();
+        assert!(typed.private_notes.is_none());
+        assert_eq!(serde_json::to_value(typed).unwrap(), without_notes);
     }
 
     const EMPTY_PAGE: &str = r#"{

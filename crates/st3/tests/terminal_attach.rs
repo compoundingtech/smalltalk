@@ -39,6 +39,7 @@ pub(crate) fn state(root: &Path) -> AppState {
         client_relay: None,
         native_session_home: None,
         planner_default: st3::model::PlannerSpec::default(),
+        private_notes: Default::default(),
     }
 }
 

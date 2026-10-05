@@ -233,6 +233,7 @@ impl Fixture {
             client_relay: None,
             native_session_home: None,
             planner_default: Default::default(),
+            private_notes: Default::default(),
         };
         let socket = root.path().join("st3.sock");
         let router = st3::api::router(state.clone());

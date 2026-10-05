@@ -56,6 +56,64 @@ Loop and wake enrichment is detail-only and bounded to open runs plus the latest
 null timing fields on lists or older finished runs are not proof of no loop or wake.
 Clients can render `round N/M · wakes in …` without reading claim envelopes.
 
+### Owner-local private notes
+
+`GET /v1/client/private-notes/{uri}` accepts one fully percent-encoded canonical
+`dev.schickling.agent-private-notes://HOST/IDENTITY` URI. The pure canonical URI
+contract lives in `st3-schema::private_notes`; clients never send a filesystem path or UID.
+The response is a `PrivateNotesSubject` envelope value with `ref`, `family`,
+`schema`, `data`, `actions`, and `live`. Its data contains the current Markdown and
+the carrier-generation/revision fence; `live` is null. Missing bytes are empty
+only when the declaration and owned resource directory already exist.
+
+The daemon's `private_notes_catalogs` configuration lists absolute owner-local
+catalog roots. Each source must declare the exact self URI in
+`agents/HOST/IDENTITY/agent.kdl`; its filesystem byte authority remains
+`resources/private-notes.md`. Resolution refuses divergent carriers, symlink
+traversal, foreign ownership, and group/world-writable sources or destinations.
+No Markdown, notes revision, content digest, or local recovery receipt enters
+fleet claims, collections, or replication.
+
+Private notes are ordinary subjects: reads require `read.projections`, and writes
+require `control.work` plus a concrete person or local agent acting party.
+The same ordinary Unix actor admission and paired-session authentication used by
+other subjects apply. Pairing keeps its normal limited default, optional narrowing
+to ordinary limited scopes, and explicit `full_control` grant; notes add no
+credentials, scopes, or bootstrap endpoints.
+Public claim writes cannot create, complete, or revoke pairings, and paired
+sessions retain their stored-scope, expiry, and revocation checks.
+
+Agents are instructed by policy not to write private notes. This is not a
+person-only credential boundary: a permitted agent request is attributed as an
+agent, never as the configured person. Write observations identify the exact
+URI, action, operation, stage, authority actor, session actor, and transport
+without publishing Markdown or content-derived metadata.
+
+The ordinary URI resource receives an idempotent `resource.observed` requested
+observation before bytes can change, and a completed observation only after its
+durable local receipt. Audit-publication failure is not completed success:
+exact-key retry reconciles the same outcome without another replacement.
+Cross-listener retries of a paired session preserve the original intent's
+transport and actor metadata. URI facts contain only the URI; attribution is
+observation metadata, not a second authority for private bytes.
+
+
+`private-notes.write` requires `control.work`, an acting party, the returned
+action fence, a stable idempotency key, the canonical URI, and complete Markdown.
+Supported writers must use this API: writes serialize across daemon processes,
+compare carrier generation and revision, then durably record intent before an
+atomic owned sibling replacement.
+Exact retries recover the private outcome without overwriting a newer edit.
+The local-only result carries its successor fence as `ActionResult.private_notes`.
+Its `affected_ids` is empty because a canonical notes URI is not a generic graph ID;
+unrelated collection projections do not receive notes invalidations.
+Changed key reuse conflicts; stale editors and replaced carriers are refused.
+An interrupted replacement remains `private-notes-indeterminate` until its exact
+key is reconciled. External filesystem editors are not coordinated writers;
+changes between operations invalidate the next revision fence.
+Markdown must fit the existing 1 MiB encoded response bound, with room reserved
+for URI/fence and snapshot metadata; writes cannot create an unreadable oversized response.
+
 ### Agent activity and human blocking
 
 An agent's `harness_state` describes activity independently of its optional `blocked_on`, `ask`,

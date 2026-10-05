@@ -30,6 +30,7 @@ public enum ActionType: String, Codable, CaseIterable, Sendable {
     case missionRevise = "mission.revise"
     case missionStart = "mission.start"
     case pairingRevoke = "pairing.revoke"
+    case privateNotesWrite = "private-notes.write"
     case reviewApprove = "review.approve"
     case reviewReject = "review.reject"
     case reviewRequestChanges = "review.request-changes"
@@ -61,6 +62,7 @@ public enum ActionType: String, Codable, CaseIterable, Sendable {
 public enum ReadOperation: String, CaseIterable, Sendable {
     case customSubjectsList = "custom-subjects.list"
     case customSubjectsGet = "custom-subjects.get"
+    case privateNotesGet = "private-notes.get"
     case hostRepositories = "host.repositories"
     case setsList = "sets.list"
     case setsGet = "sets.get"
@@ -120,6 +122,7 @@ public enum ReadOperation: String, CaseIterable, Sendable {
 public let st3ClientReadPaths: [ReadOperation: String] = [
     .customSubjectsList: "/v1/client/custom-subjects",
     .customSubjectsGet: "/v1/client/custom-subjects/{id}",
+    .privateNotesGet: "/v1/client/private-notes/{uri}",
     .hostRepositories: "/v1/client/hosts/{id}/repositories",
     .setsList: "/v1/client/sets",
     .setsGet: "/v1/client/sets/{id}",

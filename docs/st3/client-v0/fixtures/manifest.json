@@ -8,6 +8,8 @@
     { "file": "timeline.json", "definition": "Envelope" },
     { "file": "events.json", "definition": "Envelope" },
     { "file": "action.json", "definition": "ActionRequest" },
+    { "file": "private-notes.json", "definition": "PrivateNotesSubject" },
+    { "file": "private-notes-write.json", "definition": "ActionRequest" },
     { "file": "agent-create.json", "definition": "ActionRequest" },
     { "file": "terminal-create.json", "definition": "ActionRequest" },
     { "file": "terminal-end.json", "definition": "ActionRequest" },

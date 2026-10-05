@@ -302,6 +302,7 @@ async fn an_idle_daemon_stays_under_its_cpu_and_request_budget() {
         client_relay: None,
         native_session_home: None,
         planner_default: st3::model::PlannerSpec::default(),
+        private_notes: Default::default(),
     };
     std::fs::create_dir_all(root.join("daemon")).unwrap();
     // The receipt consumer is part of the daemon's idle cost. Its own scans must

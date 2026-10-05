@@ -1103,6 +1103,7 @@ async fn receive_client_read(
                     runtime_desired_revision: None,
                     terminal_sequence: Some(expected_sequence),
                     preview_token: None,
+                    private_notes: None,
                 };
                 let result = match action_type.as_str() {
                     "terminal.input" => {
@@ -1577,6 +1578,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let owner = app_state(owner_root.path(), "owner-node");
         let mut gateway = app_state(gateway_root.path(), "gateway-node");
@@ -1748,6 +1750,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let owner = app_state(owner_root.path(), "owner-node");
         let mut gateway = app_state(gateway_root.path(), "gateway-node");
@@ -1962,6 +1965,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let owner = app_state(owner_root.path(), "owner-node");
         let mut gateway = app_state(gateway_root.path(), "gateway-node");
@@ -2054,6 +2058,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let owner = app_state(owner_root.path(), "owner-node");
         let mut gateway = app_state(gateway_root.path(), "gateway-node");
@@ -2240,6 +2245,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let mut gateway = make_state(roots[0].path(), "chain-gateway");
         let mut relay = make_state(roots[1].path(), "chain-relay");
@@ -2488,6 +2494,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let mut gateway = make_state(roots[0].path(), "lag-gateway");
         let owner = make_state(roots[1].path(), "lag-owner");
@@ -2641,6 +2648,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let secret = root.path().join("fleet-secret");
         fs::write(&secret, [5_u8; 32]).unwrap();
@@ -2842,6 +2850,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let owner = make_state(owner_root.path(), "conversation-owner");
         let mut gateway = make_state(gateway_root.path(), "conversation-gateway");
@@ -2949,6 +2958,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let owner = make_state(owner_root.path(), "conversation-owner");
         let mut gateway = make_state(gateway_root.path(), "conversation-gateway");
@@ -3163,6 +3173,7 @@ mod tests {
             client_relay: None,
             native_session_home: Some(home),
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         };
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {
@@ -3561,6 +3572,7 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+            private_notes: Default::default(),
         });
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {
@@ -3678,6 +3690,7 @@ mod tests {
                 client_relay: None,
                 native_session_home: None,
                 planner_default: crate::model::PlannerSpec::default(),
+                private_notes: Default::default(),
             });
             let served = socket.clone();
             servers.push(tokio::spawn(async move {
