@@ -243,6 +243,10 @@
     }
   },
   "fields": {
+    "owner": {
+      "op": "actor",
+      "slot": "tree"
+    },
     "seat": {
       "op": "field",
       "slot": "tree",
@@ -350,6 +354,18 @@
         {
           "op": "exists",
           "slot": "tree"
+        },
+        {
+          "op": "eq",
+          "left": {
+            "op": "actor",
+            "slot": "tree"
+          },
+          "right": {
+            "op": "field",
+            "slot": "tree",
+            "field": "seat"
+          }
         },
         {
           "op": "eq",

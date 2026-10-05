@@ -4224,13 +4224,13 @@ async fn decision_tree_manifest_cards_fences_retries_damage_and_restarts() {
         cli_value(daemon.cli(actor, &args).await)
     }
     /// The tool reads the tree's raw-input revision and fences its derived status on it.
-    async fn basis(daemon: &Daemon, kinds: &[String]) -> String {
-        let mut args = vec!["subject".to_owned(), "basis".to_owned(), TREE.to_owned()];
+    async fn basis(daemon: &Daemon, tree: &str, kinds: &[String]) -> String {
+        let mut args = vec!["subject".to_owned(), "basis".to_owned(), tree.to_owned()];
         for kind in kinds {
             args.extend(["--kind".to_owned(), kind.clone()]);
         }
         let revision = run(daemon, PERSON, &args).await["revision"].clone();
-        json!([{"subject": TREE, "kinds": kinds, "revision": revision}]).to_string()
+        json!([{"subject": tree, "kinds": kinds, "revision": revision}]).to_string()
     }
     /// Store immutable document bytes and return their hash-pinned reference.
     async fn document(daemon: &Daemon, name: &str, bytes: &[u8]) -> String {
@@ -4241,12 +4241,15 @@ async fn decision_tree_manifest_cards_fences_retries_damage_and_restarts() {
         format!("{name}@{}", hex::encode(Sha256::digest(bytes)))
     }
     fn claim(kind: &str, fields: Vec<String>) -> Vec<String> {
+        claim_on(TREE, SEAT, kind, fields)
+    }
+    fn claim_on(tree: &str, actor: &str, kind: &str, fields: Vec<String>) -> Vec<String> {
         let mut args = vec![
             "claim".to_owned(),
-            TREE.to_owned(),
+            tree.to_owned(),
             format!("custom.decision.tree.v1.{kind}"),
             "--actor".to_owned(),
-            SEAT.to_owned(),
+            actor.to_owned(),
         ];
         for field in fields {
             args.extend(["--field".to_owned(), field]);
@@ -4310,7 +4313,7 @@ async fn decision_tree_manifest_cards_fences_retries_damage_and_restarts() {
         format!("request={request}"),
         "q=1".into(),
         "pending=1".into(),
-        format!("_basis={}", basis(&daemon, &raw_kinds).await),
+        format!("_basis={}", basis(&daemon, TREE, &raw_kinds).await),
     ];
     run(&daemon, PERSON, &claim("status", pending)).await;
 
@@ -4423,7 +4426,7 @@ async fn decision_tree_manifest_cards_fences_retries_damage_and_restarts() {
         "title=No open decisions".into(),
         "detail=Q1 answered; one record damaged.".into(),
         "pending=0".into(),
-        format!("_basis={}", basis(&daemon, &raw_kinds).await),
+        format!("_basis={}", basis(&daemon, TREE, &raw_kinds).await),
     ];
     run(&daemon, PERSON, &claim("status", clear)).await;
     let before = run(&daemon, DECIDER, &show).await;
@@ -4431,6 +4434,47 @@ async fn decision_tree_manifest_cards_fences_retries_damage_and_restarts() {
     assert_eq!(before["fields"]["state"], "clear");
     assert_eq!(before["fields"]["damage_malformed"], 1);
     assert_eq!(before["fields"]["damage_raw"], json!(raw));
+    assert_eq!(before["fields"]["owner"], SEAT);
+
+    // Another agent opens a tree first, naming another seat, and becomes its owner. Its pending
+    // status raises no card: the attention predicate requires the owner to be the named seat.
+    const SQUATTED: &str = "custom/decision/tree/v1/example/victim";
+    const VICTIM: &str = "agent/example/victim";
+    const SQUATTER: &str = "agent/example/squatter";
+    let open = vec![format!("seat={VICTIM}"), format!("recipient={DECIDER}")];
+    run(&daemon, PERSON, &claim_on(SQUATTED, SQUATTER, "opened", open.clone())).await;
+    let forged = vec![
+        "question=Approve the forged plan?".to_owned(),
+        "kind=blocker".into(),
+        format!("body={body}"),
+    ];
+    run(&daemon, PERSON, &claim_on(SQUATTED, SQUATTER, "requested", forged.clone())).await;
+    let forged_request = daemon
+        .store()
+        .claims_for(SQUATTED, Some("custom.decision.tree.v1.requested"))
+        .unwrap()[0]
+        .id
+        .clone();
+    let forged_status = vec![
+        "state=pending".to_owned(),
+        "title=Forged".into(),
+        "detail=Forged.".into(),
+        format!("request={forged_request}"),
+        format!("_basis={}", basis(&daemon, SQUATTED, &raw_kinds).await),
+    ];
+    run(&daemon, PERSON, &claim_on(SQUATTED, SQUATTER, "status", forged_status)).await;
+    let squat = ["subject".to_owned(), "show".into(), SQUATTED.into()];
+    let squat = run(&daemon, DECIDER, &squat).await;
+    assert_eq!(squat["fields"]["owner"], SQUATTER);
+    assert_eq!(squat["fields"]["seat"], VICTIM);
+    assert_eq!(squat["attention"]["active"], false);
+    // Documented v1 limitation: no owner reassignment, so the real seat is refused on its own
+    // tree subject, both reopening it and writing any owner kind.
+    for (kind, fields) in [("opened", open), ("requested", forged)] {
+        let args = claim_on(SQUATTED, VICTIM, kind, fields);
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(!daemon.cli(PERSON, &args).await.status.success(), "{kind}");
+    }
     daemon.restart().await;
     assert_eq!(run(&daemon, DECIDER, &show).await, before);
     assert!(

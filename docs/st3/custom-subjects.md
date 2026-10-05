@@ -107,15 +107,6 @@ input-set token with `st subject basis SUBJECT --kind custom.domain.input` (or t
 and removes its card. The tool recomputes and appends a fresh derived claim. Filters exclude
 the output kind, dependency cycles are invalid, and bounds are enforced.
 
-For a decision tree, register request, answer, assumption, promotion and derived-status kinds.
-Keep raw human answers and supersession references immutable. The external tool owns guards,
-option grounding, handle allocation and fork detection. Only fresh `pending` derived states
-should satisfy the attention predicate. A revived question uses a fresh derived claim ID as
-its episode. Array selections can allow zero or multiple choices, and a text field preserves a
-freeform reframe. Custom claims do not block native work or confer native approval; a tool that
-needs native blocking separately uses authorized work asks. This slice does not replace the
-existing decision-tree bridge.
-
 ## Decision trees
 
 [decision-tree.json](../../examples/st3/decision-tree.json) registers `decision.tree` version 1
@@ -139,18 +130,37 @@ all `custom.decision.tree.v1.*`:
 | `status` | owner | `state` (`pending`/`clear`), card `title` and `detail`; optional `request` (claim), `q`, `pending` |
 | `damaged` | owner | `raw` (hash-pinned document of the unreadable bytes), `records`, `imported`, `malformed`; optional `source`, `detail` |
 
-`opened` fixes the tree's owner and its one addressed person. Only that owner asks, assumes,
-promotes, records damage and derives status; only that person answers. Assumptions are owner
-facts, never person responses.
+`opened` fixes the tree's owner (its actor) and its one addressed person. Only that owner asks,
+assumes, promotes, records damage and derives status; only that person answers. Assumptions are
+owner facts, never person responses.
+
+Registration cannot tie `seat` to the writer or to the subject, so any agent can write the first
+`opened` on a tree and name any seat and person. The source's `owner` output is that writer.
+A card shows only when `owner` equals `seat`, so a forged tree raises no card. The tool must
+reject a tree whose `owner` differs from `seat`, or whose subject is not
+`custom/decision/tree/v1/` plus `seat` without `agent/`, and must read nothing from it.
+Version 1 cannot reassign an owner: if another agent opened the seat's tree first, every owner
+write by the real seat is refused. A retired or renamed seat likewise strands its tree, which
+keeps its history but takes no new owner writes.
 
 `status` is the tool's derived view. Write it with one `_basis` entry for the tree subject
 covering every other kind, from `st subject basis custom/decision/tree/v1/<seat> --kind
 custom.decision.tree.v1.opened --kind ...requested --kind ...answered --kind ...assumed
---kind ...promoted --kind ...damaged`. A `pending` status that names a `request` shows one card.
-The status claim ID is the episode. The card's reply writes `answered` with that request bound.
-Any new raw fact makes the status stale and removes the card until the tool writes a fresh one.
+--kind ...promoted --kind ...damaged`. A `pending` status that names a `request` shows one card:
+the attention predicate compares `status.request` with itself because `eq` is false when either
+side is missing, which makes it a "field is present" test. The status claim ID is the episode,
+so a revived question gets a fresh episode. The card's reply writes `answered` with that request
+bound. Any new raw fact makes the status stale and removes the card until the tool writes a
+fresh one.
+
+Claim-reference fields (`request`, `parent`, `supersedes`) are checked only to name an existing
+claim. The daemon does not check that it is a `requested` claim, an answer or assumption, or on
+the same tree. The tool must check those, and must ignore any fact that fails them.
 
 `q` and `legacy_id` are stored but not allocated or checked. Handle allocation, guards,
 supersession forks and option grounding stay in the tool. A `damaged` receipt shows in the
 source's `damage*` fields even when a tree has no readable requests, so a failed import does
-not read as an empty tree. Writes need a running daemon; nothing is spooled offline.
+not read as an empty tree. Writes need a running daemon; nothing is spooled offline. Custom
+claims do not block native work or confer native approval; a tool that needs native blocking
+separately uses authorized work asks. This manifest does not replace the existing decision-tree
+bridge.
