@@ -1155,9 +1155,13 @@
             ln -sfn ${effect-utils} repos/effect-utils
           '';
         };
-        # The isolation-vm CI job's NixOS VM; see the file for how it runs.
+        # The isolation-vm CI job's NixOS VMs; see each file for how it runs.
         legacyPackages = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           transport-isolation-vm = import ./nix/transport-isolation-vm.nix {
+            inherit pkgs;
+            pty = ptyPackage;
+          };
+          sekrets-vm = import ./nix/sekrets-vm.nix {
             inherit pkgs;
             pty = ptyPackage;
           };

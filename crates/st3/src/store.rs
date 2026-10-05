@@ -14724,6 +14724,10 @@ impl Store {
                 | "subagent.appeared"
                 | "subagent.renewed"
                 | "subagent.ended"
+                | "sekret.called"
+                | "sekret.exited"
+                | "sekret.refused"
+                | "sekret.changed"
         )
     }
 
@@ -14735,7 +14739,9 @@ impl Store {
         let connection = self.readers.get();
         let (total, other): (u64, u64) = connection.query_row(
             "SELECT COUNT(*), COUNT(*) FILTER (
-                 WHERE kind NOT IN ('harness.usage', 'work.renewed', 'subagent.renewed')
+                 WHERE kind NOT IN ('harness.usage', 'work.renewed', 'subagent.renewed',
+                                    'sekret.called', 'sekret.exited', 'sekret.refused',
+                                    'sekret.changed')
                    AND NOT (
                      kind IN ('message.sent', 'message.staged', 'message.delivered',
                               'message.read', 'message.closed')
