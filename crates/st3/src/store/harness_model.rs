@@ -229,7 +229,7 @@ mod tests {
     use super::*;
     use st3_schema::harness_control::{Approval, Binding, InputResult, Lane, ModelChoice, ModelResult, Models, NativeState, QueueMutation, QueueRequest, SelectedModel};
 
-    const SUBJECT: &str = "agent/model-control";
+    const SUBJECT: &str = "agent/model-owner.model-control";
     fn baseline(store: &Store) -> (NativeState, crate::mailbox::Fence) {
         let intent = crate::graph::parse_intent("version 2\nagent \"model-control\" { workspace \".\"; harness \"omp\" { model \"provider/reasoner\"; } }", "model-owner").unwrap();
         let planned = store.mission(&intent, crate::model::IntentInput { kdl: String::new(), source_name: None }).unwrap();

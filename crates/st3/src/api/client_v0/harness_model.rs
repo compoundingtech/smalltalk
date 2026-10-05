@@ -443,9 +443,9 @@ mod tests {
         assert!(planned.blockers.is_empty(), "{:?}", planned.blockers);
         state.store.apply(&intent, &planned.subject_tokens, source).unwrap();
         state.store.append_claim(&ClaimInput {
-            subject: "agent/model-worker".into(),
+            subject: "agent/model-catalogue.model-worker".into(),
             kind: "runtime.observed".into(),
-            actor: Some("agent/model-worker".into()),
+            actor: Some("agent/model-catalogue.model-worker".into()),
             fields: BTreeMap::from([
                 ("runtime_id".into(), json!("native-runtime")),
                 ("incarnation_id".into(), json!("incarnation-one")),
@@ -454,7 +454,7 @@ mod tests {
             evidence: Vec::new(), expected_subject: None, idempotency_key: None,
         }).unwrap();
         let fence = state.store.bind_mailbox(&crate::mailbox::Fence::new(
-            "agent/model-worker", "incarnation-one", "delivery",
+            "agent/model-catalogue.model-worker", "incarnation-one", "delivery",
         )).unwrap();
         let choices = (0..3).map(|index| ModelChoice {
             provider: "native".into(),
@@ -464,7 +464,7 @@ mod tests {
         }).collect::<Vec<_>>();
         let expected_ids = choices.iter().map(|choice| choice.id.clone()).collect::<Vec<_>>();
         let mut native = NativeState {
-            subject: "agent/model-worker".into(),
+            subject: "agent/model-catalogue.model-worker".into(),
             binding: Binding {
                 desired_revision: state.store.harness_control_desired_revision(&fence).unwrap(),
                 incarnation_id: "incarnation-one".into(),
@@ -495,7 +495,7 @@ mod tests {
                 (status, serde_json::from_slice::<Value>(&bytes).unwrap())
             }
         };
-        let path = "/v1/client/harness-models/agent/model-worker";
+        let path = "/v1/client/harness-models/agent/model-catalogue.model-worker";
         let (status, first) = read(format!("{path}?limit=100")).await;
         assert_eq!(status, StatusCode::OK, "{first}");
         let first = &first["value"];
@@ -533,9 +533,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{current}");
         let current_cursor = current["value"]["cursor"].as_str().unwrap();
         state.store.append_claim(&ClaimInput {
-            subject: "agent/model-worker".into(),
+            subject: "agent/model-catalogue.model-worker".into(),
             kind: "runtime.observed".into(),
-            actor: Some("agent/model-worker".into()),
+            actor: Some("agent/model-catalogue.model-worker".into()),
             fields: BTreeMap::from([
                 ("runtime_id".into(), json!("native-runtime")),
                 ("incarnation_id".into(), json!("incarnation-one")),

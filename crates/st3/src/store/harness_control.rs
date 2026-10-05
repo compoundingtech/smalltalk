@@ -311,7 +311,7 @@ impl Store {
 mod tests {
     use super::*;
     use st3_schema::harness_control::{Approval, InputResult, Models, NativeResult};
-    const SUBJECT: &str = "agent/control-smoke";
+    const SUBJECT: &str = "agent/queue-owner.control-smoke";
     fn baseline(store: &Store) -> (NativeState, crate::mailbox::Fence) {
         let intent = crate::graph::parse_intent("version 2\nagent \"control-smoke\" { workspace \".\"; harness \"omp\" { model \"control-smoke/native-smoke\"; } }", "queue-owner").unwrap();
         let planned = store.mission(&intent, crate::model::IntentInput { kdl: String::new(), source_name: None }).unwrap();
