@@ -24766,6 +24766,10 @@ mod tests {
                 read_contract_inventory_request(&args(&["st", "driver", "run", "--", "codex", literal])),
                 None
             );
+            assert!(Cli::try_parse_from([
+                "st", "documents", "put", "--as", "doc/example", "--", literal,
+            ])
+            .is_ok());
         }
         assert_eq!(read_contract_inventory_request(&args(&["st", "documents", "put"])), None);
     }
