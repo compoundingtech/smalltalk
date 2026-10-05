@@ -12,6 +12,8 @@ pub const ACTION_NAMES: &[&str] = &[
     "agent.suspend",
     "attention.resolve",
     "custom.reply",
+    "harness.model.set",
+    "harness.queue.mutate",
     "lane.approve",
     "lane.join",
     "lane.leave",
@@ -62,6 +64,9 @@ pub const ACTION_NAMES: &[&str] = &[
 pub const READ_OPERATIONS: &[(&str, &str)] = &[
     ("custom-subjects.list", "/v1/client/custom-subjects"),
     ("custom-subjects.get", "/v1/client/custom-subjects/{id}"),
+    ("harness-queue.get", "/v1/client/harness-queue/{id}"),
+    ("harness-models.get", "/v1/client/harness-models/{id}"),
+    ("harness-control-receipt.get", "/v1/client/harness-control-receipts/{id}"),
     ("host.repositories", "/v1/client/hosts/{id}/repositories"),
     ("sets.list", "/v1/client/sets"),
     ("sets.get", "/v1/client/sets/{id}"),
