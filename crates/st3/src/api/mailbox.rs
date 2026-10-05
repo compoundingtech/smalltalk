@@ -1730,6 +1730,14 @@ mod tests {
                     },
                 ),
             )
+            .route(
+                "/v1/internal/replication/receive",
+                post(super::super::replication_receive),
+            )
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                response_envelope,
+            ))
             .with_state(state);
         let server_path = path.to_owned();
         let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
@@ -1747,6 +1755,90 @@ mod tests {
             reads,
             server,
         }
+    }
+
+    #[tokio::test]
+    async fn replication_worker_receive_delivers_and_fences_without_safety_ticks() {
+        const FLEET: &str = "18ba3167-11fb-472c-8ff8-e46e0fefb1e4";
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "target").unwrap());
+        state.store.bind_fleet(FLEET).unwrap();
+        let source = Store::open_memory("source").unwrap();
+        source.bind_fleet(FLEET).unwrap();
+        crate::mailbox::tests::ready(&source, "session-1");
+        let request = || ReplicationReceiveRequest {
+            peer: "source".into(),
+            fleet_id: FLEET.into(),
+            exchange: source
+                .export_replication_exchange(FLEET, &state.store.replication_inventory().unwrap())
+                .unwrap(),
+            // The native replication worker supplies this; it enables the worker's heal path.
+            round_trip_ms: Some(1),
+        };
+        // Establish the remote incarnation before binding the live stream.
+        let Json(initial) = super::super::replication_receive(State(state.clone()), Json(request()))
+            .await
+            .unwrap();
+        assert!(initial.changed);
+        let fence = state
+            .store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        let path = root.path().join("daemon.sock");
+        let mut stream = controlled_stream(state.clone(), &fence, &path).await;
+        let client = Client::unix(&path);
+        source
+            .append_claim(&ClaimInput {
+                subject: "message/worker-arrival".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/fixture".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("person/fixture")),
+                    ("to".into(), json!("agent/eval.worker")),
+                    ("content".into(), json!("An arriving fixture note.")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        // Use the same Unix endpoint/request as peer::Daemon::receive, not a local claim API
+        // or a manually signaled event. Its receive/admit/project/notify path must route this.
+        let arrival: ReplicationReceiveResponse = client
+            .post("/v1/internal/replication/receive", &request())
+            .await
+            .unwrap();
+        assert!(arrival.changed);
+        assert!(matches!(
+            next(&mut stream.socket).await,
+            Frame::Mailbox { messages }
+                if messages.len() == 1 && messages[0].subject == "message/worker-arrival"
+        ));
+        assert_eq!(stream.reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Binding epochs/tokens are daemon-local and never replicated. A replicated live
+        // incarnation replacement must instead wake the seat dependency and fence this boot.
+        crate::mailbox::tests::ready(&source, "session-2");
+        let replacement: ReplicationReceiveResponse = client
+            .post("/v1/internal/replication/receive", &request())
+            .await
+            .unwrap();
+        assert!(replacement.changed);
+        assert!(matches!(
+            next(&mut stream.socket).await,
+            Frame::Fenced { .. }
+        ));
+        assert_eq!(
+            stream.reads.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "fencing must come from the dispatched snapshot, not a heartbeat check"
+        );
+        assert_eq!(
+            state.store.check_mailbox(&fence).unwrap_err().code,
+            "stale-mailbox-session"
+        );
+        // No stream.recheck.send() occurred: neither assertion can pass via the safety timer.
     }
 
     #[tokio::test(start_paused = true)]
