@@ -34,6 +34,7 @@ pub mod hooks;
 pub mod incremental;
 pub mod lane;
 pub mod mailbox;
+pub(crate) mod memory;
 pub mod mission;
 pub mod model;
 /// A driver relaunches its harness on the native session a suspended seat resumes.

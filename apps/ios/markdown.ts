@@ -2,7 +2,7 @@
 // and inline): headings, bullets with a hanging marker, fenced code, quotes, rules, and tables
 // kept as monospace rows. Anything else is a plain line.
 
-export type Run = { text: string; style: 'plain' | 'bold' | 'code' | 'link' };
+export type Run = { text: string; style: 'plain' | 'bold' | 'code' | 'link'; url?: string };
 export type Block =
   | { kind: 'blank' }
   | { kind: 'text'; runs: Run[] }
@@ -13,6 +13,22 @@ export type Block =
   | { kind: 'fence'; text: string }
   | { kind: 'code'; text: string }
   | { kind: 'table'; text: string };
+
+// A written-out web address: it runs to whitespace, then gives back the punctuation that ended the
+// sentence around it (and a closing bracket nothing opened).
+function address(rest: string): string | null {
+  const found = /^https?:\/\/[^\s<>]+/.exec(rest);
+  if (!found) return null;
+  let url = found[0];
+  for (;;) {
+    const last = url[url.length - 1];
+    const open = { ')': '(', ']': '[' }[last];
+    const unmatched = open !== undefined && (url.split(last).length - 1) > (url.split(open).length - 1);
+    if (/[.,;:!?'"*>]/.test(last) || unmatched) url = url.slice(0, -1);
+    else break;
+  }
+  return url.length > 'https://'.length - 1 ? url : null;
+}
 
 export function inline(text: string): Run[] {
   const runs: Run[] = [];
@@ -28,7 +44,10 @@ export function inline(text: string): Run[] {
       const end = rest.indexOf('`', 1);
       flush(); runs.push({ text: rest.slice(1, end), style: 'code' }); rest = rest.slice(end + 1);
     } else if ((match = /^\[([^\]]*)\]\(([^)]*)\)/.exec(rest))) {
-      flush(); runs.push({ text: match[1], style: 'link' }); rest = rest.slice(match[0].length);
+      flush(); runs.push({ text: match[1], style: 'link', url: /^https?:\/\//.test(match[2]) ? match[2] : undefined }); rest = rest.slice(match[0].length);
+    } else if ((match = /^https?:\/\//.exec(rest)) && (plain === '' || /[\s(\["'*]$/.test(plain)) && address(rest)) {
+      const url = address(rest)!;
+      flush(); runs.push({ text: url, style: 'link', url }); rest = rest.slice(url.length);
     } else {
       const character = String.fromCodePoint(rest.codePointAt(0)!);
       plain += character; rest = rest.slice(character.length);

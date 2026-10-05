@@ -237,6 +237,7 @@
             "mission_id": { "$ref": "#/$defs/Id" },
             "mission_run_id": { "$ref": "#/$defs/Id" },
             "step_run_id": { "$ref": "#/$defs/Id" },
+            "blocked": { "$ref": "#/$defs/AttentionBlocked", "description": "The mission step waiting on this ask, on an ask a mission step made; absent on a standalone ask." },
             "title": { "type": "string" },
             "detail": { "type": "string" },
             "priority": { "enum": ["critical", "high", "normal", "low"] },
@@ -248,6 +249,17 @@
           }
         }
       ]
+    },
+    "AttentionBlocked": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step_run_id", "step", "goal", "attempt"],
+      "properties": {
+        "step_run_id": { "$ref": "#/$defs/Id", "description": "The step run that asked and waits for the answer." },
+        "step": { "type": "string", "description": "That step's name within its mission." },
+        "goal": { "type": "string", "description": "What that step is for." },
+        "attempt": { "type": "integer", "minimum": 0 }
+      }
     },
     "AttentionTargetState": {
       "type": "object",

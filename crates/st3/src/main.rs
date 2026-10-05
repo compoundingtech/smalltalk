@@ -15937,6 +15937,18 @@ async fn run_st2_native_driver(
         reject_noninteractive_claude_argv(&argv)?;
     }
     let paths = NativePaths::prepare(subject, driver)?;
+    #[cfg(unix)]
+    if matches!(driver, "pi" | "omp")
+        && let Err(skip) = st3::native_resume::pi_family_link_transcript(
+            &argv,
+            &paths.session_dir.join("provider-sessions"),
+        )
+    {
+        let _ = write_driver_log(
+            subject,
+            &json!({"type":"authored_resume_link_skipped","driver":driver,"code":skip.code,"reason":skip.reason}).to_string(),
+        );
+    }
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
     // A driver launched while the daemon restarts waits for it; exiting here would end the seat.
     retry_while_daemon_unreachable(subject, || {

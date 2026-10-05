@@ -241,6 +241,7 @@ export type Attention = ResourceHeader & {
   actions: Array<"custom.reply" | "work.done" | "review.approve" | "review.reject" | "review.request-changes" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
   attention_kind: ("human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault" | string);
   because?: string;
+  blocked?: AttentionBlocked;
   custom_form?: {
 
 };
@@ -272,6 +273,13 @@ export type Attention = ResourceHeader & {
   update?: PersonUpdate;
   variant_id?: Id;
   what?: string;
+};
+
+export type AttentionBlocked = {
+  attempt: number;
+  goal: string;
+  step: string;
+  step_run_id: Id;
 };
 
 export type AttentionTargetState = {

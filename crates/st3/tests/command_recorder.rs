@@ -141,6 +141,9 @@ fn read_line(reader: &mut impl std::io::Read) -> String {
 
 #[test]
 fn a_recorded_call_is_byte_for_byte_the_real_call() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let fixture = fixture(ECHO);
     let workspace = fixture.root.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
@@ -177,6 +180,9 @@ fn a_recorded_call_is_byte_for_byte_the_real_call() {
 
 #[test]
 fn each_call_appends_one_record_with_its_context() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let fixture = fixture(ECHO);
     let workspace = fixture.root.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
@@ -249,6 +255,9 @@ fn each_call_appends_one_record_with_its_context() {
 
 #[test]
 fn the_recorder_leaves_unread_input_for_the_next_command() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let fixture = fixture("#!/bin/sh\nexit 0\n");
     let output = run_with_input(
         {
@@ -264,6 +273,9 @@ fn the_recorder_leaves_unread_input_for_the_next_command() {
 
 #[test]
 fn a_real_program_ended_by_a_signal_ends_the_recorder_by_that_signal() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let fixture = fixture("#!/bin/sh\nkill -TERM $$\nsleep 5\n");
     let recorded = fixture.recorded("git").status().unwrap();
     let direct = fixture.direct("git").status().unwrap();
@@ -276,6 +288,9 @@ fn a_real_program_ended_by_a_signal_ends_the_recorder_by_that_signal() {
 
 #[test]
 fn a_signal_sent_to_the_recorder_reaches_the_real_program() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let fixture = fixture(
         "#!/bin/sh\ntrap 'echo stopped; exit 7' TERM\necho ready\nwhile :; do sleep 0.05; done\n",
     );
@@ -298,6 +313,9 @@ fn a_signal_sent_to_the_recorder_reaches_the_real_program() {
 
 #[test]
 fn a_closed_output_pipe_ends_the_recorder_as_it_ends_the_real_program() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let fixture = fixture("#!/bin/sh\nwhile :; do echo line; done\n");
     let mut statuses = Vec::new();
     for mut command in [fixture.recorded("git"), fixture.direct("git")] {
@@ -319,6 +337,9 @@ fn a_closed_output_pipe_ends_the_recorder_as_it_ends_the_real_program() {
 
 #[test]
 fn a_log_that_cannot_be_written_changes_nothing() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let fixture = fixture(ECHO);
     let state = fixture.root.path().join("state");
     assert!(st3::recorder::health(&state).0);
@@ -341,6 +362,9 @@ fn a_log_that_cannot_be_written_changes_nothing() {
 
 #[test]
 fn a_log_fifo_without_a_reader_does_not_hold_the_command() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let fixture = fixture("#!/bin/sh\necho done\n");
     fs::remove_file(&fixture.log).unwrap();
     let fifo = std::ffi::CString::new(fixture.log.to_str().unwrap()).unwrap();
@@ -359,6 +383,9 @@ fn a_log_fifo_without_a_reader_does_not_hold_the_command() {
 
 #[test]
 fn a_recorder_never_runs_itself_or_another_recorder() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let fixture = fixture("#!/bin/sh\necho real\n");
     let second = install(&fixture.root.path().join("second-state"), &fixture.real);
     let unmarked = fixture.root.path().join("unmarked");
@@ -410,6 +437,9 @@ fn a_recorder_never_runs_itself_or_another_recorder() {
 
 #[test]
 fn concurrent_calls_append_whole_lines() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let fixture = fixture("#!/bin/sh\nexit 0\n");
     let children = (0..16)
         .map(|index| {
@@ -439,6 +469,9 @@ fn concurrent_calls_append_whole_lines() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_terminal_interrupt_ends_the_call_and_is_still_recorded() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use std::os::fd::FromRawFd as _;
     use std::os::unix::process::CommandExt as _;
 
@@ -511,6 +544,9 @@ fn a_terminal_interrupt_ends_the_call_and_is_still_recorded() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_real_program_keeps_the_callers_ignored_and_blocked_signals() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use std::os::unix::process::CommandExt as _;
 
     // GNU grep reads its own status without changing its signals first, as a shell would, and
@@ -572,6 +608,9 @@ fn the_real_program_keeps_the_callers_ignored_and_blocked_signals() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_killed_recorder_takes_the_real_program_with_it() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let fixture = fixture("#!/bin/sh\necho $$\nexec sleep 30\n");
     let mut child = fixture
         .recorded("git")

@@ -711,33 +711,35 @@ def run(args, root, evidence):
         return {"verdict": "fail", "harness": args.harness, "scenario": args.scenario,
                 "failure": str(error), "seconds_to_boot": seats.timings}
     finally:
-        for letter in letters:
-            terminal = node.pty("peek", "--plain", "--full", f"c1.seat-{letter}")
-            (evidence / f"terminal-{letter}.txt").write_text(terminal.stdout + terminal.stderr)
-            if node.daemon is not None and node.daemon.poll() is None:
-                (evidence / f"trace-{letter}.jsonl").write_text(
-                    node.cli("trace", "show", seat_subject(letter), "--json", "--limit", "500", check=False))
-        for index, record in enumerate(sorted((root / "state").rglob("harness-state"))):
-            (evidence / f"harness-state-{index}.json").write_text(record.read_text(errors="replace"))
-        # The outbox and driver warnings explain a stalled observation without depending on
-        # the temporary runtime surviving cleanup. Keep fixture evidence, never native content.
-        import sqlite3
-        summaries = []
-        for database in (root / "state/drivers").rglob("st-harness-events.sqlite"):
-            try:
-                with sqlite3.connect(database) as connection:
-                    pending = connection.execute("SELECT sequence,kind FROM events ORDER BY sequence").fetchall()
-                    metadata = connection.execute("SELECT key,value FROM metadata WHERE key='runtime' OR key LIKE 'provider-runtime:%'").fetchall()
-                    snapshots = connection.execute("SELECT kind,body FROM snapshots WHERE kind='harness-state'").fetchall()
-                    states = [{"kind": kind, "state": json.loads(body).get("state"), "incarnation": json.loads(body).get("incarnation")} for kind, body in snapshots]
-                summaries.append({"pending": pending, "metadata": metadata, "states": states})
-            except sqlite3.Error as error:
-                summaries.append({"error": str(error)})
-        (evidence / "observation-outboxes.json").write_text(json.dumps(summaries, indent=2) + "\n")
-        for index, log in enumerate([*(root / "home/.local/state/st3").rglob("*.log"),
-                                    *(root / "state/drivers").rglob("driver.log")]):
-            (evidence / f"driver-{index}.log").write_text(log.read_text(errors="replace"))
-        node.stop()
+        try:
+            for letter in letters:
+                terminal = node.pty("peek", "--plain", "--full", f"c1.seat-{letter}")
+                (evidence / f"terminal-{letter}.txt").write_text(terminal.stdout + terminal.stderr)
+                if node.daemon is not None and node.daemon.poll() is None:
+                    (evidence / f"trace-{letter}.jsonl").write_text(
+                        node.cli("trace", "show", seat_subject(letter), "--json", "--limit", "500", check=False))
+            for index, record in enumerate(sorted((root / "state").rglob("harness-state"))):
+                (evidence / f"harness-state-{index}.json").write_text(record.read_text(errors="replace"))
+            # The outbox and driver warnings explain a stalled observation without depending on
+            # the temporary runtime surviving cleanup. Keep fixture evidence, never native content.
+            import sqlite3
+            summaries = []
+            for database in (root / "state/drivers").rglob("st-harness-events.sqlite"):
+                try:
+                    with sqlite3.connect(database) as connection:
+                        pending = connection.execute("SELECT sequence,kind FROM events ORDER BY sequence").fetchall()
+                        metadata = connection.execute("SELECT key,value FROM metadata WHERE key='runtime' OR key LIKE 'provider-runtime:%'").fetchall()
+                        snapshots = connection.execute("SELECT kind,body FROM snapshots WHERE kind='harness-state'").fetchall()
+                        states = [{"kind": kind, "state": json.loads(body).get("state"), "incarnation": json.loads(body).get("incarnation")} for kind, body in snapshots]
+                    summaries.append({"pending": pending, "metadata": metadata, "states": states})
+                except sqlite3.Error as error:
+                    summaries.append({"error": str(error)})
+            (evidence / "observation-outboxes.json").write_text(json.dumps(summaries, indent=2) + "\n")
+            for index, log in enumerate([*(root / "home/.local/state/st3").rglob("*.log"),
+                                        *(root / "state/drivers").rglob("driver.log")]):
+                (evidence / f"driver-{index}.log").write_text(log.read_text(errors="replace"))
+        finally:
+            node.stop()
         for path in [root / "daemon.log", *sorted((root / "ws").glob("receipts-*.jsonl"))]:
             if path.exists():
                 (evidence / path.name).write_text(path.read_text(errors="replace"))
@@ -807,4 +809,6 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from st3_test_process import supervised_main
+    raise SystemExit(supervised_main(main))

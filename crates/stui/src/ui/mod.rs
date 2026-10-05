@@ -386,6 +386,11 @@ pub struct Ui {
     stalled: HashMap<String, String>,
 }
 
+/// Whether `c` can be part of a written-out web address.
+fn is_address_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
+}
+
 impl Ui {
     /// Call only after the terminal successfully presented this frame.
     pub(crate) fn visible_messages(&self) -> HashSet<String> {
@@ -616,8 +621,14 @@ impl Ui {
     }
 
     /// Make the links drawn in `area` clickable: addresses written out, and markdown links by
-    /// the text they were drawn with.
+    /// the text they were drawn with. An address the renderer wrapped at the edge is one link on
+    /// every row it covers, so a click on any part of it opens or copies all of it.
     fn links(&self, buf: &Buffer, area: Rect) {
+        let chars = |y: u16| -> Vec<(u16, char)> {
+            (area.x..area.x + area.width)
+                .map(|x| (x, buf[(x, y)].symbol().chars().next().unwrap_or(' ')))
+                .collect()
+        };
         for y in area.y..area.y + area.height {
             let cells = (area.x..area.x + area.width)
                 .map(|x| (x, &buf[(x, y)]))
@@ -636,25 +647,59 @@ impl Ui {
                     from = start + 4;
                     continue;
                 }
-                let url = tail
-                    .split(char::is_whitespace)
-                    .next()
-                    .unwrap_or("")
-                    .trim_end_matches(['.', ',', ')', ']', ';', ':', '"', '\'', '>']);
+                let token = tail.split(char::is_whitespace).next().unwrap_or("");
                 let column = text[..start].chars().count();
-                let width = url.chars().count();
+                // Each part of the address: where it sits on its row, and how wide it is.
+                let mut parts = Vec::new();
+                let mut url = token.to_owned();
                 if let Some((x, _)) = cells.get(column) {
-                    self.hit(
-                        Rect {
-                            x: *x,
-                            y,
-                            width: width as u16,
-                            height: 1,
-                        },
-                        Hit::Link(url.to_owned()),
-                    );
+                    parts.push((*x, y, token.chars().count()));
                 }
-                from = start + url.len().max(1);
+                // An address that runs to the right edge goes on at the start of the next row.
+                let mut reaches_edge = token.len() == tail.trim_end().len()
+                    && column + token.chars().count() >= usize::from(area.width).saturating_sub(3);
+                let mut next = y + 1;
+                while reaches_edge && next < area.y + area.height {
+                    let below = chars(next);
+                    let indent = below.iter().take_while(|(_, c)| *c == ' ').count();
+                    let more = below[indent..]
+                        .iter()
+                        .take_while(|(_, c)| !c.is_whitespace())
+                        .collect::<Vec<_>>();
+                    if indent > 4
+                        || more.is_empty()
+                        || more.iter().any(|(_, c)| !is_address_char(*c))
+                    {
+                        break;
+                    }
+                    url.extend(more.iter().map(|(_, c)| *c));
+                    parts.push((below[indent].0, next, more.len()));
+                    reaches_edge = indent + more.len() >= below.len().saturating_sub(3)
+                        && below[indent + more.len()..].iter().all(|(_, c)| *c == ' ');
+                    next += 1;
+                }
+                let trimmed = url
+                    .trim_end_matches(['.', ',', ')', ']', ';', ':', '"', '\'', '>'])
+                    .to_owned();
+                // The last part loses whatever trailing punctuation the address lost.
+                let cut = url.chars().count() - trimmed.chars().count();
+                if let Some(last) = parts.last_mut() {
+                    last.2 = last.2.saturating_sub(cut);
+                }
+                for (x, row_y, width) in parts {
+                    if width > 0 {
+                        self.hit(
+                            Rect {
+                                x,
+                                y: row_y,
+                                width: width as u16,
+                                height: 1,
+                            },
+                            Hit::Link(trimmed.clone()),
+                        );
+                    }
+                }
+                from = start + token.len().max(1);
             }
             // Markdown links: underlined runs whose text names a link.
             let mut index = 0;
@@ -3332,6 +3377,10 @@ impl Ui {
         let Some(id) = self.attention_focus() else {
             return;
         };
+        self.read_update_id(id);
+    }
+
+    fn read_update_id(&mut self, id: String) {
         if !self.updates_read.insert(id.clone()) {
             return;
         }
@@ -3347,20 +3396,26 @@ impl Ui {
         }
     }
 
-    /// An update left open on Home for a moment has been read (docs: it clears when the person
-    /// opens it). Passing over it with the arrows does not count.
+    /// An update opened on Home is read once the person leaves it, after it was open for a
+    /// moment: marking it read closes it, and it must stay put while it is being read (Nathan,
+    /// 2026-10-05: updates vanished mid-read). Passing over it with the arrows does not count,
+    /// and `x` still reads it at once.
     pub(crate) fn read_open_update(&mut self) {
         let open = self
             .attention_focus()
             .filter(|_| !self.help && self.popover.is_none())
             .filter(|_| self.current_kind() == Some("update"));
+        if let Some((shown, since)) = &self.update_open
+            && open.as_ref() != Some(shown)
+            && since.elapsed() >= UPDATE_READ_AFTER
+        {
+            let shown = shown.clone();
+            self.update_open = None;
+            self.read_update_id(shown);
+        }
         match (open, &self.update_open) {
             (None, _) => self.update_open = None,
-            (Some(id), Some((shown, since))) if *shown == id => {
-                if since.elapsed() >= UPDATE_READ_AFTER {
-                    self.read_update();
-                }
-            }
+            (Some(id), Some((shown, _))) if *shown == id => {}
             (Some(id), _) => self.update_open = Some((id, Instant::now())),
         }
     }
@@ -5297,6 +5352,7 @@ mod tests {
             actions: vec!["custom.reply".into()],
             related: vec![],
             raised_by: None,
+            blocked: None,
         }]);
         let mut ui = Ui::new(world);
         ui.live = true;
@@ -5446,6 +5502,7 @@ mod tests {
             actions: vec!["work.done".into()],
             related: Vec::new(),
             raised_by: None,
+            blocked: None,
         };
         if let Load::Ready(items) = &mut world.attention {
             items.insert(0, asks("attention/request-one"));
@@ -5582,6 +5639,7 @@ mod tests {
             actions: vec!["work.done".into()],
             related: Vec::new(),
             raised_by: None,
+            blocked: None,
         };
         if let Load::Ready(items) = &mut world.attention {
             items.insert(0, item);
@@ -5622,6 +5680,57 @@ mod tests {
     }
 
     #[test]
+    fn a_mission_backed_ask_names_its_mission_and_the_step_that_waits() {
+        // Nathan, 2026-10-05: a request a mission step made lost its mission link.
+        let mut world = demo::world();
+        let mission = "mission/release-proof";
+        let item = Attention {
+            id: "attention/capacity".into(),
+            tier: Tier::Stopped,
+            title: "Allocate capacity?".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: Some(mission.into()),
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Request {
+                from: "Chief of Staff".into(),
+                from_id: "agent/example/cos".into(),
+                question: "The proof needs a runner.".into(),
+                structured: None,
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+            blocked: Some(Blocked {
+                step: "tag-proof".into(),
+                goal: "Prove the published tag builds.".into(),
+            }),
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let at = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/capacity")
+            .unwrap();
+        ui.select(at);
+        let screen = frame(&ui, 140, 50).join("\n");
+        for shown in [
+            "release-proof",
+            "waits    tag-proof · Prove the published tag builds.",
+            "it continues once you answer",
+            "Go to the mission",
+        ] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+    }
+
+    #[test]
     fn an_update_shows_what_was_asked_for_and_clears_once_read() {
         let mut world = demo::world();
         let item = Attention {
@@ -5641,6 +5750,7 @@ mod tests {
             actions: vec!["work.done".into()],
             related: Vec::new(),
             raised_by: None,
+            blocked: None,
         };
         if let Load::Ready(items) = &mut world.attention {
             items.insert(0, item);
@@ -5676,15 +5786,26 @@ mod tests {
             "{:?}",
             ui.effects
         );
-        // Left open a moment, it counts as read without a key.
+        // Left open a good while, it stays: it is read only once the person moves off it.
         ui.effects.clear();
         ui.updates_read.clear();
         ui.update_open = Some((
             "attention/update".into(),
-            Instant::now() - UPDATE_READ_AFTER,
+            Instant::now() - UPDATE_READ_AFTER * 10,
         ));
         ui.read_open_update();
-        assert_eq!(ui.effects.len(), 1);
+        assert!(ui.effects.is_empty(), "still being read: {:?}", ui.effects);
+        assert!(ui.updates_read.is_empty());
+        // Moving off it (here, to nothing) after it was open a moment reads it.
+        ui.select(0);
+        ui.read_open_update();
+        assert_eq!(ui.effects.len(), 1, "{:?}", ui.effects);
+        // Moving off one that was only passed over does not.
+        ui.effects.clear();
+        ui.updates_read.clear();
+        ui.update_open = Some(("attention/update".into(), Instant::now()));
+        ui.read_open_update();
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
     }
 
     #[test]
@@ -5715,6 +5836,7 @@ mod tests {
                     actions: vec!["work.done".into()],
                     related: Vec::new(),
                     raised_by: None,
+                    blocked: None,
                 },
             );
         }

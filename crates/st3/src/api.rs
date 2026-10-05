@@ -2756,6 +2756,13 @@ fn client_attention_resources(
         if item.kind == "person-step" {
             resource["action_parameters"] =
                 json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
+            // An ask a mission step made carries its mission and the step that waits on it.
+            if let Some(context) = store.person_ask_context(&item.subject)? {
+                if let Some(mission) = context["mission_id"].as_str() {
+                    resource["mission_id"] = json!(mission);
+                }
+                resource["blocked"] = context["blocked"].clone();
+            }
             match item.request {
                 // An update asks nothing, so it is not a `request`: a client that predates
                 // updates shows a free-text card, and any response to it reads it.
@@ -5079,6 +5086,7 @@ fn isolation_name(mode: st_runtime::Isolation) -> &'static str {
 }
 
 async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, ApiError> {
+    let reader_store = state.store.clone();
     let environment = tokio::task::spawn_blocking(crate::environment::snapshot)
         .await
         .map_err(ApiError::internal)?;
@@ -5160,6 +5168,12 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         client_now_ms(),
     ));
     report.checks.push(descriptor_check());
+    report.checks.push(reader_memory_check(
+        reader_store.readers.usage(),
+        smallclaims::sqlite::read_cache_kib(),
+        smallclaims::sqlite::max_idle_read_connections(),
+        crate::memory::service_memory(),
+    ));
     report.status = if report.checks.iter().any(|check| check.status == "fail") {
         "fail"
     } else if report.checks.iter().any(|check| check.status == "warn") {
@@ -5195,6 +5209,71 @@ fn descriptor_check() -> DoctorCheck {
         .ok()
         .map(|entries| entries.count().saturating_sub(1) as u64);
     descriptor_usage_check(limit.rlim_cur, limit.rlim_max, usage)
+}
+
+/// A planning reserve for schema/statements, projections, tasks and allocator overhead, not
+/// an enforced or measured limit. Active bursts can exceed idle retention and this envelope.
+const DAEMON_MEMORY_HEADROOM_KIB: u128 = 512 * 1024;
+
+fn reader_memory_check(
+    readers: smallclaims::sqlite::ReaderUsage,
+    cache_kib: usize,
+    retained: usize,
+    groups: anyhow::Result<Option<Vec<crate::memory::GroupMemory>>>,
+) -> DoctorCheck {
+    let targets = readers.open as u128 * cache_kib as u128;
+    let envelope_kib = readers.open.max(retained) as u128 * cache_kib as u128
+        + smallclaims::sqlite::WRITE_CACHE_KIB as u128
+        + DAEMON_MEMORY_HEADROOM_KIB;
+    let mut message = format!(
+        "{} open readers ({} idle, {} active), peak {}, {} opened since startup; per-reader cache target {} KiB; current reader targets {} MiB; idle retention {}; planning envelope {} MiB (reader targets + 32 MiB writer + 512 MiB reserve). Warning: concurrent reader bursts are unbounded; cache targets exclude schema, prepared statements and query results, and this envelope is not a process memory limit",
+        readers.open,
+        readers.idle,
+        readers.open.saturating_sub(readers.idle),
+        readers.peak,
+        readers.opened,
+        cache_kib,
+        targets / 1024,
+        retained,
+        envelope_kib / 1024,
+    );
+    let mut warned = false;
+    match groups {
+        Ok(Some(groups)) => {
+            if let Some(group) = groups
+                .iter()
+                .filter(|group| group.max_bytes.is_some())
+                .min_by_key(|group| group.max_bytes.unwrap())
+            {
+                let max = group.max_bytes.unwrap();
+                message.push_str(&format!(
+                    "; cgroup memory.max {} MiB at {}",
+                    max / (1024 * 1024),
+                    group.path.display()
+                ));
+                if u128::from(max) < envelope_kib * 1024 {
+                    warned = true;
+                    message.push_str(" is below the planning envelope; review the service cap and reader cache/retention settings");
+                }
+            } else {
+                message.push_str("; cgroup memory.max is unlimited in the visible hierarchy");
+            }
+            for group in groups.iter().filter(|group| group.max_events > 0) {
+                warned = true;
+                message.push_str(&format!("; memory.events:max {} at {} (historical pressure in this cgroup, including descendants; not proof of a current OOM)", group.max_events, group.path.display()));
+            }
+        }
+        Ok(None) => message.push_str("; cgroup memory diagnostics are Linux-only"),
+        Err(error) => {
+            warned = true;
+            message.push_str(&format!("; cannot inspect daemon cgroup memory: {error:#}"));
+        }
+    }
+    DoctorCheck {
+        name: "reader-memory".into(),
+        status: if warned { "warn" } else { "pass" }.into(),
+        message,
+    }
 }
 
 fn descriptor_usage_check(soft: u64, hard: u64, usage: Option<u64>) -> DoctorCheck {
@@ -14054,6 +14133,58 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         );
         assert_eq!(descriptor_usage_check(8192, 8192, Some(92)).status, "pass");
         assert_eq!(descriptor_usage_check(8192, 8192, None).status, "warn");
+    }
+
+    #[test]
+    fn doctor_reader_memory_reports_targets_and_warns_on_limits_and_pressure() {
+        let usage = smallclaims::sqlite::ReaderUsage {
+            open: 97,
+            idle: 90,
+            peak: 100,
+            opened: 100,
+        };
+        let groups = |max_bytes, max_events| {
+            Ok(Some(vec![crate::memory::GroupMemory {
+                path: "/invented/service".into(),
+                max_bytes,
+                max_events,
+            }]))
+        };
+        let normal = reader_memory_check(usage, 2048, 128, groups(Some(1 << 30), 0));
+        assert_eq!(normal.status, "pass");
+        assert!(
+            normal
+                .message
+                .contains("97 open readers (90 idle, 7 active)")
+        );
+        assert!(normal.message.contains("current reader targets 194 MiB"));
+        assert!(normal.message.contains("planning envelope 800 MiB"));
+        assert!(normal.message.contains("bursts are unbounded"));
+        assert_eq!(
+            reader_memory_check(usage, 8192, 128, groups(Some(1 << 30), 0)).status,
+            "warn"
+        );
+        let pressure = reader_memory_check(usage, 2048, 128, groups(Some(1 << 30), 1225));
+        assert_eq!(pressure.status, "warn");
+        assert!(pressure.message.contains("memory.events:max 1225"));
+        assert_eq!(
+            reader_memory_check(usage, 2048, 128, groups(None, 0)).status,
+            "pass"
+        );
+        assert_eq!(
+            reader_memory_check(usage, 2048, 128, Err(anyhow::anyhow!("unavailable"))).status,
+            "warn"
+        );
+        let burst = smallclaims::sqlite::ReaderUsage {
+            open: 300,
+            idle: 0,
+            peak: 300,
+            opened: 300,
+        };
+        assert_eq!(
+            reader_memory_check(burst, 2048, 128, groups(Some(1 << 30), 0)).status,
+            "warn"
+        );
     }
 
     #[test]

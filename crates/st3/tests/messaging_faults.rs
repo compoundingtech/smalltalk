@@ -106,55 +106,88 @@ fn run_case(case: &str) {
 
 #[test]
 fn baseline() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("baseline");
 }
 
 #[test]
 fn daemon_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("daemon-restart");
 }
 
 #[test]
 fn binary_swap() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("binary-swap");
 }
 
 #[test]
 fn path_deploy() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("path-deploy");
 }
 
 #[test]
 fn link_seconds() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("link-seconds");
 }
 
 #[test]
 fn link_minutes() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("link-minutes");
 }
 
 #[test]
 fn receiver_down() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("receiver-down");
 }
 
 #[test]
 fn harness_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("harness-restart");
 }
 
 #[test]
 fn channel_killed() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("channel-killed");
 }
 
 #[test]
 fn old_channel() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("old-channel");
 }
 
 #[test]
 fn handoff_failed() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     run_case("handoff-failed");
 }
