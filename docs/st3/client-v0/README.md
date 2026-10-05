@@ -790,7 +790,9 @@ session), or a st message ID with a session peer. A cursor remains tied to the
 resolved session, so a new agent incarnation needs a fresh stream.
 The first envelope has a `ConversationChanges` value with an empty `items`
 array, a `next_cursor`, and an `initial_page` containing up to 200 newest
-authoritative timeline entries when opening at the live edge. Its `preparation` is
+authoritative timeline entries when opening at the live edge. Oversized initial
+windows are byte-bounded to fit the stream and relay envelopes; their history
+cursor includes every omitted older entry. Its `preparation` is
 `ready` when the owner reused a current prepared page, or `miss` when this read
 built it. Reads with `after=CURSOR` omit both initial-only fields. Later envelopes
 contain new chronological `TimelineEntry` values, including st messages, and a

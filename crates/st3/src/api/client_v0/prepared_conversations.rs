@@ -224,7 +224,9 @@ fn build(
     let verdict = source_verdict(state, binding.as_ref(), session_id)?;
     let stamp = verdict.path().and_then(native_stamp);
     let local_position = local_latest_position(state)?;
-    let value = Arc::new(conversation_read_now(state, session, session_id, None)?);
+    let value = Arc::new(conversation_read_snapshot(
+        state, session, session_id, None, &client_snapshot_at(state, index),
+    )?);
     if verdict.path().and_then(native_stamp) != stamp
         || source_verdict(state, binding.as_ref(), session_id)? != verdict
     {
@@ -275,6 +277,8 @@ fn build(
     Ok(Some(InitialRead { value, prepared, seen }))
 }
 
+// Outbound dispatch only. Owner-local reads hold their own budget, never these
+// permits, so reciprocal preparation cannot deadlock the two hosts.
 pub(super) async fn slot() -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
     static SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
         LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
@@ -311,10 +315,8 @@ async fn prepare_with_budget(
     mut budget: BackgroundBudget,
 ) -> Result<bool, ApiError> {
     require_scope(session, "read.projections")?;
-    let permit = slot().await?;
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
     tokio::task::spawn_blocking(move || {
-        let _permit = permit;
         let started = std::time::Instant::now();
         let result = warm(&state, &session, &session_id);
         // The blocking read keeps the budget even if its socket owner is cancelled.
@@ -338,7 +340,7 @@ async fn background(
 }
 
 /// Preparation belongs to a held agents window, never to hover or a guessed selection.
-/// Closing the socket cancels this owner; in-flight blocking reads retain their slot.
+/// Closing the socket cancels this owner; in-flight blocking reads retain their budget.
 pub(super) struct Owner {
     targets: watch::Sender<Vec<String>>,
     task: tokio::task::JoinHandle<()>,

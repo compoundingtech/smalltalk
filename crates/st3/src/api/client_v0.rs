@@ -4599,14 +4599,23 @@ fn conversation_read_now(
     session_id: &str,
     after: Option<&str>,
 ) -> Result<Value, ApiError> {
+    conversation_read_snapshot(state, session, session_id, after, &new_client_snapshot(state))
+}
+
+fn conversation_read_snapshot(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+    snapshot: &ClientSnapshot,
+) -> Result<Value, ApiError> {
     #[cfg(test)]
     if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
         *rebuilds.entry(session_id.to_owned()).or_default() += 1;
     }
-    let snapshot = new_client_snapshot(state);
     let page = timeline_value(
         state,
-        &snapshot,
+        snapshot,
         session,
         session_id,
         &ClientListQuery {
@@ -4804,9 +4813,54 @@ fn conversation_read_now(
     }
     let mut value = json!({"kind":"conversation-changes", "session_id":session_id, "items":items, "next_cursor":conversation_cursor(state, session_id, snapshot.store_index, local_latest, native_latest)});
     if after.is_none() {
-        value["initial_page"] = page;
+        value["initial_page"] = bounded_conversation_initial_page(state, snapshot, session_id, page)?;
     }
     Ok(value)
+}
+
+fn bounded_conversation_initial_page(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session_id: &str,
+    mut page: Value,
+) -> Result<Value, ApiError> {
+    // Leave room for the conversation, API, and signed relay envelopes. Most pages
+    // retain all 200 entries; only oversized payloads need a smaller initial window.
+    const ITEMS_BUDGET: usize = CLIENT_MAX_RESPONSE_BYTES - 8_192;
+    if frame_bytes(&page) <= ITEMS_BUDGET { return Ok(page); }
+    let cursor = page["page"]["next_cursor"].as_str().map(decode_client_cursor).transpose()?;
+    let Value::Array(mut items) = page["items"].take() else {
+        return Err(ApiError::internal("the initial timeline page has no items"));
+    };
+    let mut limit = items.len();
+    let mut serialized = Vec::new();
+    loop {
+        serialized.clear();
+        serde_json::to_writer(&mut serialized, &items[items.len() - limit..])
+            .map_err(ApiError::internal)?;
+        if serialized.len() <= ITEMS_BUDGET || limit <= 1 { break; }
+        limit -= limit.div_ceil(4);
+    }
+    let query = ClientListQuery {
+        limit: Some(limit),
+        cursor: cursor.map(|mut cursor| {
+            // The backing is newest-first. Start there with the smaller window,
+            // so its continuation includes every entry omitted from first delivery.
+            cursor.offset = 0;
+            cursor.limit = limit;
+            encode_client_cursor(&cursor)
+        }).transpose()?,
+        ..Default::default()
+    };
+    let mut bounded = if query.cursor.is_some() {
+        client_page(state, snapshot, &format!("timeline/{session_id}"), Vec::new(), &query)?
+    } else {
+        items.reverse();
+        client_page(state, snapshot, &format!("timeline/{session_id}"), items, &query)?
+    };
+    bounded.items.reverse();
+    Ok(json!({"kind":"timeline-page", "session_id":session_id,
+        "items":bounded.items, "page":bounded.page}))
 }
 
 /// What a conversation read last saw, so a wake-up can tell cheaply whether anything that
@@ -12755,6 +12809,82 @@ mission "example/zero-run" state="ready" {
             .unwrap()
             .0;
         assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_initial_cursor_does_not_skip_a_commit_after_its_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "prepared-pinned");
+        let agent = "agent/prepared-pinned";
+        let incarnation = "prepared-pinned:i1";
+        state.store.append_claim(&ClaimInput {
+            subject: agent.into(), kind: "runtime.observed".into(), actor: Some(agent.into()),
+            fields: serde_json::from_value(json!({
+                "status":"running", "runtime_id":"prepared-pinned", "incarnation_id":incarnation
+            })).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let session_id = managed_session_id(agent, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let initial = state.store.read_snapshot(|index| {
+            let writer = state.store.clone();
+            let message_session = session_id.clone();
+            std::thread::spawn(move || {
+                writer.append_claim(&ClaimInput {
+                    subject:"message/prepared-pinned".into(), kind:"message.sent".into(),
+                    actor:Some("person/example".into()),
+                    fields: serde_json::from_value(json!({
+                        "from":"person/example", "to":agent, "session_id":message_session,
+                        "content":"committed after the pinned snapshot", "status":"sent"
+                    })).unwrap(),
+                    evidence:Vec::new(), expected_subject:None, idempotency_key:None,
+                }).unwrap();
+            }).join().unwrap();
+            let initial = prepared_conversations::initial(&state, &session, &session_id).unwrap();
+            let cursor = initial["next_cursor"].as_str().unwrap();
+            assert_eq!(conversation_position(&state, &session_id, cursor).unwrap().0, index);
+            assert!(!initial["initial_page"]["items"].as_array().unwrap().iter()
+                .any(|entry| entry["body"]["text"] == "committed after the pinned snapshot"));
+            Ok(initial)
+        }).unwrap();
+        let changes = conversation_changes_local(&state, &session, &session_id,
+            initial["next_cursor"].as_str(), 0).await.unwrap();
+        assert!(changes["items"].as_array().unwrap().iter()
+            .any(|entry| entry["body"]["text"] == "committed after the pinned snapshot"));
+    }
+
+    #[test]
+    fn oversized_initial_pages_fit_the_stream_and_keep_complete_history() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "prepared-large");
+        let snapshot = new_client_snapshot(&state);
+        let session_id = "session/prepared-large";
+        let entries = (0..250).map(|entry| json!({
+            "id":format!("timeline-entry/native-large-{entry}"), "sequence":entry,
+            "revision":1, "timestamp":"2026-10-05T15:00:00Z", "role":"assistant",
+            "type":"content", "final":true, "body":{"text":"x".repeat(8_192)}
+        })).collect();
+        let page = native_timeline_page(&state, &snapshot, session_id,
+            &ClientListQuery { limit:Some(200), ..Default::default() }, entries).unwrap().0;
+        let bounded = bounded_conversation_initial_page(&state, &snapshot, session_id, page).unwrap();
+        let frame = terminal_stream_envelope(&state, json!({
+            "kind":"conversation-changes", "session_id":session_id, "items":[],
+            "next_cursor":conversation_cursor(&state, session_id, snapshot.store_index, 0, 249),
+            "initial_page":bounded
+        }));
+        assert!(frame_bytes(&frame) <= CLIENT_MAX_RESPONSE_BYTES);
+        let page = &frame["value"]["initial_page"];
+        let mut seen = page["items"].as_array().unwrap().iter().rev()
+            .map(|entry| entry["sequence"].as_u64().unwrap()).collect::<Vec<_>>();
+        let mut cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+        while let Some(next) = cursor {
+            let decoded = decode_client_cursor(&next).unwrap();
+            let page = client_page(&state, &decoded.snapshot, &decoded.collection, Vec::new(),
+                &ClientListQuery { cursor:Some(next), ..Default::default() }).unwrap();
+            seen.extend(page.items.iter().map(|entry| entry["sequence"].as_u64().unwrap()));
+            cursor = page.page.next_cursor;
+        }
+        assert_eq!(seen, (0..250).rev().collect::<Vec<u64>>());
     }
 
     #[test]
