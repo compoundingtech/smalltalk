@@ -2844,6 +2844,7 @@ pub(super) async fn missions(
                 items_digest: "sql-page".into(),
                 before_index: None,
                 after_key: after_key.clone(),
+                last_name_key: None,
                 expires_at_unix_ms,
             })
         })
