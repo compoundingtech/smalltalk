@@ -1428,12 +1428,31 @@ async fn invented_client_read_owner(
     assert_eq!(sender.name, NODE);
     let request: ClientReadRequest = serde_json::from_slice(&body).unwrap();
     assert_eq!(request.authority_actor, "person/bench-operator");
-    assert!(request.relay.is_none(), "direct owner delivery has no relay fence");
-    assert!(matches!(request.request, ClientReadOperation::Messages { actor, history: false, limit: Some(20), cursor: None } if actor == "agent/bench/cost/reader"));
-    let envelope = PeerResponse::new("cost-owner", 1, json!({
-        "items": [{"id": "message/cost-forward", "content": "invented owner answer"}],
-        "page": {"has_more": false}
-    }));
+    assert!(
+        request.relay.is_none(),
+        "direct owner delivery has no relay fence"
+    );
+    assert!(
+        matches!(request.request, ClientReadOperation::Messages { actor, history: false, limit: Some(20), cursor: None } if actor == "agent/bench/cost/reader")
+    );
+    let envelope = PeerResponse::new(
+        "cost-owner",
+        1,
+        json!({
+            "kind": "collection",
+            "collection": "messages",
+            "filters": {},
+            "items": [{
+                "id": "message/cost-forward",
+                "kind": "message",
+                "from": "agent/bench/cost/reader",
+                "to": "person/bench-operator",
+                "state": "sent",
+                "content": "invented owner answer"
+            }],
+            "page": {"limit": 20, "has_more": false}
+        }),
+    );
     let bytes = serde_json::to_vec(&envelope).unwrap();
     let signed = auth
         .response_headers_for(
@@ -1668,7 +1687,11 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                     answer
                         .and_then(|value| {
                             if probe.route == "POST /v1/internal/client-read/forward"
-                                && (value["items"][0]["id"] != "message/cost-forward"
+                                && (serde_json::from_value::<st3::model::ClientResourcePage>(
+                                    value.clone(),
+                                )
+                                .is_err()
+                                    || value["items"][0]["id"] != "message/cost-forward"
                                     || value["items"][0]["content"] != "invented owner answer"
                                     || value["page"]["has_more"] != false)
                             {
