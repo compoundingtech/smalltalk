@@ -88,13 +88,13 @@ pub fn manual(desired: &DesiredSubject) -> bool {
 
 /// Pending manual publication is informational: it holds neither messages nor work intake.
 pub fn status(store: &Store, subject: &str) -> Result<Option<serde_json::Value>> {
-    let operation = store.rollout(subject)?;
+    let (operation, selection) = store.rollout_and_selection(subject)?;
     if let Some(operation) = &operation
         && operation.phase != "superseded"
     {
         return Ok(Some(serde_json::to_value(operation)?));
     }
-    let Some(selection) = store.rollout_selection(subject)? else {
+    let Some(selection) = selection else {
         return Ok(None);
     };
     if selection.manual && hold_render(store, &selection.desired)? {
