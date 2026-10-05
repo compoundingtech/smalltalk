@@ -40551,9 +40551,20 @@ version 2
             )
             .unwrap_err();
         assert_eq!(error.code, "work-not-claimed");
-        store
+        let claimed = store
             .work_action(subject, "claim", &request("one", "claim-one"))
             .unwrap();
+        let direct = store.step_run(subject).unwrap().unwrap();
+        let client = store
+            .client_work_item_at_snapshot(subject, Some("agent/node.worker"), now_ms())
+            .unwrap()
+            .unwrap();
+        for observed in [&direct, &client] {
+            assert_eq!(observed.status, claimed.status);
+            assert_eq!(observed.claimant, claimed.claimant);
+            assert_eq!(observed.claim_incarnation, claimed.claim_incarnation);
+            assert_eq!(observed.readiness_epoch, claimed.readiness_epoch);
+        }
         let queue = store
             .agent_work_queues()
             .unwrap()
@@ -40571,9 +40582,18 @@ version 2
             .work_action(subject, "progress", &request("two", "progress-two"))
             .unwrap_err();
         assert_eq!(error.code, "wrong-work-incarnation");
-        store
+        let progressed = store
             .work_action(subject, "progress", &request("one", "progress-one"))
             .unwrap();
+        let direct = store.step_run(subject).unwrap().unwrap();
+        let client = store
+            .client_work_item_at_snapshot(subject, Some("agent/node.worker"), now_ms())
+            .unwrap()
+            .unwrap();
+        assert_eq!(progressed.status, "working");
+        assert_eq!(direct.status, progressed.status);
+        assert_eq!(client.status, progressed.status);
+        assert_eq!(client.claim_incarnation, progressed.claim_incarnation);
         // Lease expiry changes the read projection before any repair commits.
         store
             .connection
