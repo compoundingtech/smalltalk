@@ -915,6 +915,34 @@ pub struct MissionStep {
     pub goals: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<String>,
+    #[serde(default)]
+    pub loop_round: Option<u32>,
+    #[serde(default)]
+    pub loop_max_rounds: Option<u32>,
+    #[serde(default)]
+    pub loop_reason: Option<String>,
+    /// Earliest work eligibility, not a promise of wake dispatch.
+    #[serde(default)]
+    pub next_wake_at: Option<String>,
+    #[serde(default)]
+    pub wake_reason: Option<String>,
+    #[serde(default)]
+    pub wake: Option<MissionWake>,
+    #[serde(default)]
+    pub claim_expires_at: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MissionWake {
+    pub assignee: String,
+    pub assignee_state: String,
+    pub incarnation_id: String,
+    pub attempts: u32,
+    #[serde(default)]
+    pub last_attempt_at: Option<String>,
+    #[serde(default)]
+    pub acknowledged_by: Option<String>,
+    #[serde(default)]
+    pub failure: Option<String>,
 }
 /// A step named for display: its mission, run, path, title and first goal.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
