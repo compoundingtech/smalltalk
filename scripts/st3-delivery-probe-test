@@ -39,6 +39,22 @@ if "--scratch" in sys.argv:
     del sys.argv[index:index + 2]
 
 
+async def wait_for_healthy_probe_reports(node, timeout=10):
+    async def healthy():
+        doctor = json.loads(await node.cli("doctor", "--json", check=False))
+        node.last_probe_doctor = doctor
+        if doctor["status"] == "fail":
+            # Retain the first failed report even if the next observation recovers.
+            path = node.root / "probe-doctor-failed.json"
+            if not path.exists():
+                probe.save(path, doctor)
+                path.chmod(0o600)
+            return None
+        return doctor if any(check["name"] == "delivery-probes" and check["status"] == "pass"
+                             for check in doctor["checks"]) else None
+    return await faults.until(healthy, timeout)
+
+
 class FakeApi:
     def __init__(self):
         self.posts = []
@@ -250,6 +266,29 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["event"] for event in events], ["channel-started", "channel-exited"])
         self.assertEqual(events[0]["pid"], events[1]["pid"])
         self.assertEqual(events[1]["exit"], self.monitor.child.returncode)
+
+    async def test_native_doctor_wait_requires_recovery_and_keeps_its_deadline(self):
+        class Node:
+            root = Path(self.directory.name)
+            reports = [
+                {"status": "fail", "checks": [{"name": "delivery-probes", "status": "pass"}]},
+                {"status": "pass", "checks": [{"name": "delivery-probes", "status": "warn"}]},
+                {"status": "pass", "checks": [{"name": "delivery-probes", "status": "pass"}]},
+            ]
+            async def cli(node, *args, check=True):
+                self.assertFalse(check)
+                return json.dumps(node.reports.pop(0) if len(node.reports) > 1 else node.reports[0])
+        node = Node()
+        result = await wait_for_healthy_probe_reports(node, 1)
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["checks"][0]["status"], "pass")
+        failed = node.root / "probe-doctor-failed.json"
+        self.assertEqual(json.loads(failed.read_text())["status"], "fail")
+        self.assertEqual(failed.stat().st_mode & 0o777, 0o600)
+        node.reports = [{"status": "fail", "checks": [{"name": "delivery-probes", "status": "pass"}]}]
+        with self.assertRaises(TimeoutError):
+            await wait_for_healthy_probe_reports(node, 0.15)
+        self.assertEqual(node.last_probe_doctor["status"], "fail")
 
     async def test_timeout_replays_exact_send_and_alerts_even_if_send_is_unaccepted(self):
         self.monitor.api.fail_send = True
@@ -699,12 +738,7 @@ agent "probe/{node.name}" {{
             # latest.json is written locally after publishing its report. The other
             # node's doctor can still have the preceding report until replication
             # carries the new success, especially after a late startup probe.
-            async def healthy_reports():
-                doctor = json.loads(await nodes[0].cli("doctor", "--json"))
-                return doctor if any(check["name"] == "delivery-probes" and check["status"] == "pass"
-                                     for check in doctor["checks"]) else None
-
-            doctor = await faults.until(healthy_reports, 10)
+            doctor = await wait_for_healthy_probe_reports(nodes[0], 10)
             self.assertTrue(any(check["name"] == "delivery-probes" and check["status"] == "pass" for check in doctor["checks"]), doctor)
             # Kill only this test's declared recipient, never a shared seat.
             await nodes[1].cli("agents", "stop", "agent/probe/cobalt", "--as", "person/eval")
@@ -773,6 +807,9 @@ agent "probe/{node.name}" {{
             # Probe recipients use Python and the native channel; the operations fixture
             # alone uses a token-free provider stand-in, never a real model.
             for node in nodes:
+                if getattr(node, "last_probe_doctor", None):
+                    failed = [check for check in node.last_probe_doctor["checks"] if check["status"] == "fail"]
+                    print(f"{node.name} last observed failed doctor checks: {json.dumps(failed)[-8000:]}", file=sys.stderr)
                 events = [json.loads(line) for line in (node.root / "probe/events.jsonl").read_text().splitlines()]
                 self.assertTrue(any(event["event"] == "consumed" for event in events))
                 await node.cli("agents", "stop", f"agent/probe/{node.name}", "--as", "person/eval")
