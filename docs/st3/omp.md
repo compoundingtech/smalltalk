@@ -92,6 +92,8 @@ stale session and turn refusal, real branch/switch cancellation during admission
 and replay, stale bindings after a completed branch, and a pending model's native shutdown result.
 Before injecting each follow-up, the smoke positively observes `ctx.isIdle()`; native turn
 completion or `waitForIdle()` alone does not establish the admission precondition.
+The owner-HTTP smoke uses the declaration's scoped identity `agent/queue-smoke.control-smoke`
+consistently for desired state, runtime claims, channel binding, and control requests.
 This proof was exercised with OMP 18.4.10. It does not use the managed-seat launcher or a remote
 provider account.
 

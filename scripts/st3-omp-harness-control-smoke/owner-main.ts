@@ -12,7 +12,7 @@ let native;let log='';let driverErrors='';
 const deadline=setTimeout(()=>{native?.kill();d.kill();},45000);
 const request=async(path,body,person=true)=>{const r=await fetch('http://localhost'+path,{unix:socket,method:body?'POST':'GET',headers:{'content-type':'application/json',...(person?{'x-st3-person':'person/operator'}:{})},...(body?{body:JSON.stringify(body)}:{})});const v=await r.json();return {status:r.status,value:v.value,error:v};};
 const poll=async(fn,label)=>{for(let i=0;i<250;i++){const value=await fn();if(value)return value;await Bun.sleep(40);}throw Error('Timed out '+label);};
-const subject='agent/control-smoke';
+const subject='agent/queue-smoke.control-smoke';
 const read=async()=>{const r=await request('/v1/client/harness-queue/'+encodeURIComponent(subject));if(r.status!==200)throw Error(JSON.stringify(r));return r.value;};
 const receipt=async(operation)=>{const r=await request('/v1/client/harness-control-receipts/'+encodeURIComponent(operation)+'?subject='+encodeURIComponent(subject));if(r.status!==200)throw Error(JSON.stringify(r));return r.value;};
 const action=async(key,mutation,bindingOverride,revisionOverride,person=true)=>{const q=await read();const cap=await request('/v1/client/capabilities');const binding=bindingOverride??q.native.binding;const body={api_version:'st3.client.v0',id:'action/'+key,type:'harness.queue.mutate',idempotency_key:'owner-smoke-operation-'+key,fence:{snapshot_id:cap.error.snapshot.id,runtime_incarnation:binding.incarnation_id,runtime_desired_revision:binding.desired_revision},parameters:{subject,binding,queue_revision:revisionOverride??q.queue.revision,mutation}};return {...await request('/v1/client/actions',body,person),body};};
