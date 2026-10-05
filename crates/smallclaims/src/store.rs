@@ -1475,7 +1475,8 @@ impl Store {
     /// The fleet as its sealed envelopes show it, without taking the writer, for reads. A local
     /// membership claim shows once the next exchange seals its batch.
     pub fn fleet_view_sealed(&self) -> Result<crate::fleet::FleetView> {
-        self.sealed_replication_snapshot()?;
+        // Membership reads the sealed envelope rows directly; no inventory or graph digest
+        // is needed for this view.
         let connection = self.readers.get();
         Ok(crate::fleet::FleetView::from_membership(
             &fleet_membership_tx(&connection)?,
