@@ -357,6 +357,13 @@ Cargo builds use the host's four-job limit. Workspace test shards explicitly use
 threads, with the host's 14 GiB per-job memory limit. The repository variable `CI1_MIN_IDLE`
 can override admission; keep it at four when preserving CPU capacity for reserved lanes.
 
+The local test stage sets `TMPDIR`, `TMP` and `TEMP` to the short `RUNNER_TEMP/t` path on
+the runner's memory filesystem. Otherwise `nix develop` chooses disk-backed `/tmp`, making
+every test-store commit wait for a disk sync. Stores survive fixture process restarts and are
+removed with the ephemeral job; fixture executables retain their target scratch directories.
+The stage logs the scratch filesystem. Namespace and the performance jobs retain their existing
+temporary storage, and the host's per-job memory limit also covers this test scratch.
+
 `CI_RUN_ID` keeps the messaging-fault evidence under `target/messaging-faults/`, which is
 uploaded with the stage logs.
 
