@@ -94,13 +94,15 @@ import re
 blocks = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow.split("\njobs:\n", 1)[1]))
 for job in ("linux-tests-shard-2", "linux-clippy", "linux-fleet-compat", "genie-freshness", "typescript-client", "isolation-vm", "perf-cost"):
     assert "outputs.ci1" not in blocks[job], (job, "supporting job consumes reserved cores")
-    if job != "perf-cost":
-        assert ";job.priority=" in blocks[job], (job, "required work must precede optional Namespace jobs")
-        assert "namespace-features:github.run-id=" in blocks[job], (job, "prevent cross-run assignment")
-        assert "github.event_name == 'merge_group'" in blocks[job] and "'ci-priority'" in blocks[job], job
-assert ";job.priority=" not in blocks["perf-cost"], "optional benchmarks must not claim required-job priority"
+    assert ";job.priority=1" in blocks[job], (job, "one class prevents perpetual benchmark starvation")
+    assert "namespace-features:github.run-id=" in blocks[job], (job, "prevent cross-run assignment")
 assert "outputs.ci1" in blocks["linux-tests"], "primary shard must retain reserved routing"
-assert "job.priority={0}" in blocks["linux-tests"] and "github.run-id={1}" in blocks["linux-tests"], "prioritize Namespace fallback without embedding unevaluated expressions"
+assert "job.priority=1" in blocks["linux-tests"] and "github.run-id={0}" in blocks["linux-tests"], "same class for Namespace fallback with an evaluated run id"
+for path in ("perf.yml", "main-upkeep.yml", "public-repo.yml", "release-daily.yml", "release-portable.yml", "release-smalltalk.yml"):
+    generated = (ROOT / ".github/workflows" / path).read_text()
+    assert ";job.priority=1" in generated, (path, "Linux optional work must share the class")
+    assert "namespace-features:github.run-id=" in generated, (path, "avoid nondeterministic runner pickup")
+    assert ";job.priority=10" not in generated, path
 assert "linux-tests-shard-2" in blocks["linux-gate"], "both shards must be required"
 assert 'CI_TEST_PARTITION: "hash:1/2"' in blocks["linux-tests"]
 assert 'CI_TEST_PARTITION: "hash:2/2"' in blocks["linux-tests-shard-2"]
