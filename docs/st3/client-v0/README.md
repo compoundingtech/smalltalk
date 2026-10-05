@@ -62,7 +62,9 @@ The pairing grant and sealed challenge must originate on that owner node;
 replicated pairings do not acquire another node's notes authority, even for the same person.
 Native agents never write or delegate notes authority. The existing authenticated
 native harness producer binds only its declared self notes source to the current
-runtime incarnation; source failure does not block unrelated observation delivery.
+runtime incarnation. Optional admission skips a busy private writer and retries
+on a later native event; it does not wait on the private mutation lock before
+acknowledging unrelated observation delivery.
 
 `private-notes.write` requires `notes.write`, the returned action fence, a stable
 idempotency key, the canonical URI, and complete Markdown. Supported writers must

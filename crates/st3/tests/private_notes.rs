@@ -113,3 +113,48 @@ fn encoded_response_limit_refuses_unreadable_writes_without_changing_the_carrier
     assert_eq!(fixture.write("over-boundary", &oversized).unwrap_err().code, "validation-failed");
     assert_eq!(fs::read_to_string(fixture.carrier()).unwrap(), oversized.markdown[..oversized.markdown.len() - 1]);
 }
+
+#[test]
+fn completed_receipt_remains_recoverable_while_a_later_replacement_is_pending() {
+    let fixture = Fixture::new();
+    let initial = fixture.authority.read("node", &fixture.uri).unwrap();
+    let first = NotesWrite { uri: fixture.uri.clone(), markdown: "completed first\n".into(), fence: initial.fence };
+    let receipt = fixture.write("first", &first).unwrap();
+    let later = NotesWrite { uri: fixture.uri.clone(), markdown: "later replacement\n".into(), fence: fixture.authority.read("node", &fixture.uri).unwrap().fence };
+    let ledger = rusqlite::Connection::open(fixture.root.path().join("private-notes.sqlite")).unwrap();
+    ledger.execute_batch("CREATE TRIGGER fail_completion BEFORE UPDATE OF result ON notes_operations BEGIN SELECT RAISE(FAIL, 'injected completion failure'); END;").unwrap();
+    assert_eq!(fixture.write("later", &later).unwrap_err().code, "private-notes-unreachable");
+    assert_eq!(fixture.write("first", &first).unwrap(), receipt);
+    assert_eq!(fs::read_to_string(fixture.carrier()).unwrap(), later.markdown);
+    let before_recovery = fs::metadata(fixture.carrier()).unwrap();
+    ledger.execute_batch("DROP TRIGGER fail_completion;").unwrap();
+    fixture.write("later", &later).unwrap();
+    use std::os::unix::fs::MetadataExt as _;
+    assert_eq!(fs::metadata(fixture.carrier()).unwrap().ino(), before_recovery.ino());
+}
+
+#[test]
+fn optional_native_admission_skips_a_busy_writer_and_retries_without_rebinding_other_incarnations() {
+    let fixture = Fixture::new();
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600)
+        .open(fixture.root.path().join("private-notes.lock")).unwrap();
+    lock.lock().unwrap();
+    let skipped = std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fixture = &fixture;
+        let worker = scope.spawn(move || {
+            let result = fixture.authority.bind_source("node", fixture.root.path(), &fixture.uri, "agent/worker", "incarnation-one");
+            tx.send(result).unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(lock);
+        worker.join().unwrap();
+        result.expect("native admission must not wait for a private writer")
+    });
+    assert_eq!(skipped.unwrap(), None);
+    assert_eq!(fixture.authority.check_source("node", fixture.root.path(), &fixture.uri, "agent/worker", "incarnation-one").unwrap_err().code, "stale-fence");
+    assert!(fixture.authority.bind_source("node", fixture.root.path(), &fixture.uri, "agent/worker", "incarnation-one").unwrap().is_some());
+    fixture.authority.check_source("node", fixture.root.path(), &fixture.uri, "agent/worker", "incarnation-one").unwrap();
+    assert_eq!(fixture.authority.check_source("node", fixture.root.path(), &fixture.uri, "agent/worker", "incarnation-two").unwrap_err().code, "stale-fence");
+}
