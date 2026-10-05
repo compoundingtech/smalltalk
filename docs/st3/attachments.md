@@ -21,9 +21,9 @@ image adds a few hundred bytes to sync, not megabytes. The reference field is `s
 
 ## Native OMP image availability
 
-Native `blob:sha256:<64 hex>` references belong to OMP's blob store, not automatically to
-st's authorized message attachment service. Replay preserves their exact safe identity,
-supported MIME type and supplied numeric dimensions, but does not manufacture an st
+Native `blob:sha256:<64 lowercase hex>` references belong to OMP's blob store, not automatically
+to st's authorized message attachment service. Replay preserves their exact safe identity,
+supported MIME type and supplied integer dimensions up to 65,535, but does not manufacture an st
 `attachment_id`, origin, upload authority or successful fetch.
 
 Standalone image blocks become typed `native_image_unavailable` timeline diagnostics.
@@ -34,8 +34,11 @@ other result content and call correlation remain unchanged.
 
 Inline pixels, remote URLs and malformed references are never copied into these descriptors.
 They report `availability: withheld` and `reason: image_payload_not_authorized`. Unsupported
-MIME values report `mime_availability: unknown` rather than leaking free text. No image is
-fetched or uploaded by native normalization, and no image bytes enter timeline claims.
+MIME values report `mime_availability: unknown` rather than leaking free text.
+Unrecognized image-bearing blocks, including `input_image`, `image_url` and single-object message
+content, also produce typed placeholders instead of JSON excerpts. Tool-result blocks containing
+data URIs are replaced with the same withheld descriptor, regardless of their block type.
+No image is fetched or uploaded by native normalization, and no image bytes enter timeline claims.
 
 ## Limits
 

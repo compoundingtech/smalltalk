@@ -2199,6 +2199,10 @@ fn push_unrecognized(
     kind: Option<&str>,
     value: &Value,
 ) {
+    if driver == "omp" && omp_has_image_payload(value) {
+        push_omp_image_unavailable(items, sequence, timestamp, value);
+        return;
+    }
     let label = match kind {
         Some(kind) => format!("[unrecognized {driver} {what} `{kind}`]"),
         None => format!("[unrecognized {driver} {what} without a type]"),
@@ -2615,12 +2619,7 @@ fn push_omp_content(
                     ),
                     Some(kind) if HIDDEN_REASONING_BLOCKS.contains(&kind) => {}
                     Some("image") if driver == ExternalDriver::Omp => {
-                        items.push(timeline_item(item_sequence, &timestamp, "system", "error", json!({
-                            "code":"native_image_unavailable",
-                            "message":"Native image is unavailable through the conversation attachment service.",
-                            "retryable":false,
-                            "details":omp_image_availability(part),
-                        })));
+                        push_omp_image_unavailable(items, item_sequence, &timestamp, part);
                     }
                     Some("image") => {
                         push_content(items, item_sequence, &timestamp, role, "[image]")
@@ -2653,7 +2652,8 @@ fn push_omp_content(
 fn omp_image_availability(image: &Value) -> Value {
     let reference = image.get("data").and_then(Value::as_str).filter(|reference| {
         reference.strip_prefix("blob:sha256:").is_some_and(|digest| {
-            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
     });
     let mut details = json!({
@@ -2673,27 +2673,53 @@ fn omp_image_availability(image: &Value) -> Value {
         details["mime_availability"] = json!("unknown");
     }
     for key in ["width", "height"] {
-        if let Some(value) = image.get(key).filter(|value| value.is_u64()) {
-            details[key] = value.clone();
+        if let Some(value) = image.get(key).and_then(Value::as_u64).filter(|value| *value <= 65_535) {
+            details[key] = json!(value);
         }
     }
     details
 }
 
-fn omp_result_images(driver: ExternalDriver, mut content: Value) -> Value {
+fn push_omp_image_unavailable(
+    items: &mut Vec<Value>,
+    sequence: u64,
+    timestamp: &str,
+    image: &Value,
+) {
+    items.push(timeline_item(sequence, timestamp, "system", "error", json!({
+        "code":"native_image_unavailable",
+        "message":"Native image is unavailable through the conversation attachment service.",
+        "retryable":false,
+        "details":omp_image_availability(image),
+    })));
+}
+
+/// Unknown native shapes must not turn an image or a data URI into visible JSON text.
+fn omp_has_image_payload(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.trim_start().starts_with("data:"),
+        Value::Array(values) => values.iter().any(omp_has_image_payload),
+        Value::Object(fields) => {
+            fields.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                matches!(kind, "image" | "input_image" | "image_url")
+            }) || fields.contains_key("image_url")
+                || fields.values().any(omp_has_image_payload)
+        }
+        _ => false,
+    }
+}
+
+fn omp_result_images(driver: ExternalDriver, content: Value) -> Value {
     if driver != ExternalDriver::Omp {
         return content;
     }
-    if let Some(parts) = content.as_array_mut() {
-        for part in parts {
-            if part.get("type").and_then(Value::as_str) == Some("image") {
-                *part = omp_image_availability(part);
-            }
-        }
-    } else if content.get("type").and_then(Value::as_str) == Some("image") {
-        content = omp_image_availability(&content);
+    match content {
+        Value::Array(parts) => Value::Array(
+            parts.into_iter().map(|part| omp_result_images(driver, part)).collect(),
+        ),
+        other if omp_has_image_payload(&other) => omp_image_availability(&other),
+        other => other,
     }
-    content
 }
 
 fn normalized_role(role: Option<&str>) -> &'static str {
@@ -3445,6 +3471,91 @@ mod tests {
         assert_eq!(result["body"]["content"][0]["mime_availability"], "unknown");
         assert_eq!(result["body"]["content"][0]["reason"], "image_payload_not_authorized");
         assert!(!serde_json::to_string(&items).unwrap().contains("planted-"));
+    }
+
+    #[test]
+    fn omp_images_reject_malformed_direct_refs_and_oversized_dimensions() {
+        let canonical = format!("blob:sha256:{}", "a".repeat(64));
+        for reference in [
+            format!("blob:sha256:{}", "A".repeat(64)),
+            format!("blob:sha256:{}", "a".repeat(63)),
+            format!("blob:sha256:{}", "a".repeat(65)),
+            format!("{canonical}trailing-data"),
+            format!("blob:sha256:{}", "é".repeat(32)),
+            "data:image/png;base64,planted-pixels".into(),
+        ] {
+            let mut items = Vec::new();
+            normalize_omp(ExternalDriver::Omp, &json!({
+                "type":"message","id":"malformed-image","message":{"role":"user","content":[{
+                    "type":"image","data":reference,"mimeType":"planted-mime",
+                    "width":9_007_199_254_740_992_u64,"height":65_536
+                }]}
+            }), 0, "", &mut items);
+            let details = &items.iter().find(|item| item["type"] == "error").unwrap()["body"]["details"];
+            assert_eq!(details["availability"], "withheld");
+            assert_eq!(details["reason"], "image_payload_not_authorized");
+            assert!(details.get("native_ref").is_none());
+            assert!(details.get("width").is_none());
+            assert!(details.get("height").is_none());
+            assert!(!serde_json::to_string(&items).unwrap().contains(&reference));
+        }
+        let details = omp_image_availability(&json!({
+            "type":"image","data":canonical,"width":65_535,"height":480
+        }));
+        assert_eq!(details["width"], 65_535);
+        assert_eq!(details["height"], 480);
+    }
+
+    #[test]
+    fn omp_images_withhold_unrecognized_and_single_object_payloads() {
+        let payload = "data:image/png;base64,planted-pixels";
+        for block in [
+            json!({"type":"input_image","image_url":payload}),
+            json!({"type":"image_url","image_url":{"url":payload}}),
+            json!({"type":"future_block","source":{"data":payload}}),
+        ] {
+            for content in [json!([block.clone()]), block.clone()] {
+                let mut items = Vec::new();
+                normalize_omp(ExternalDriver::Omp, &json!({
+                    "type":"message","id":"unknown-image","message":{"role":"user","content":content}
+                }), 0, "", &mut items);
+                let details = &items.iter().find(|item| item["type"] == "error").unwrap()["body"]["details"];
+                assert_eq!(details["_tag"], "OmpImage");
+                assert_eq!(details["availability"], "withheld");
+                assert!(!serde_json::to_string(&items).unwrap().contains(payload));
+            }
+            for content in [json!([{"type":"text","text":"kept"},block.clone()]), block.clone()] {
+                let mut items = Vec::new();
+                normalize_omp(ExternalDriver::Omp, &json!({
+                    "type":"message","id":"unknown-tool-image","message":{
+                        "role":"toolResult","toolCallId":"image-call","content":content
+                    }
+                }), 0, "", &mut items);
+                let result = &items.iter().find(|item| item["type"] == "tool_result").unwrap()["body"]["content"];
+                let placeholder = if result.is_array() {
+                    assert_eq!(result[0]["text"], "kept");
+                    &result[1]
+                } else {
+                    result
+                };
+                assert_eq!(placeholder["_tag"], "OmpImage");
+                assert_eq!(placeholder["availability"], "withheld");
+                assert!(!serde_json::to_string(&items).unwrap().contains(payload));
+            }
+        }
+    }
+
+    #[test]
+    fn pi_images_remain_plain_image_placeholders() {
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Pi, &json!({
+            "type":"message","id":"pi-image","message":{"role":"user","content":[{
+                "type":"image","data":"planted-pixels","mimeType":"image/png"
+            }]}
+        }), 0, "", &mut items);
+        let content = items.iter().find(|item| item["type"] == "content").unwrap();
+        assert_eq!(content["body"]["text"], "[image]");
+        assert!(!serde_json::to_string(&items).unwrap().contains("planted-pixels"));
     }
 
     #[test]
