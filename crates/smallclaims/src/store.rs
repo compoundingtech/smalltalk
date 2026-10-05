@@ -2735,6 +2735,7 @@ fn seed_replica_envelopes_signed_tx(
     through_rowid: Option<i64>,
     sign: Option<&dyn Fn(&principals::Unsealed<'_>) -> Option<crate::principal::ClaimSignature>>,
 ) -> Result<()> {
+    let _seal = crate::profile::span("replication/seal-envelopes");
     let order = if after_rowid.is_some() {
         "batches.rowid"
     } else {
@@ -2843,6 +2844,7 @@ fn seed_replica_envelopes_signed_tx(
                 relay
             ],
         )?;
+        let _records = crate::profile::span("replication/seal-records");
         for (position, claim) in claims.iter().enumerate() {
             let mut raw = Vec::new();
             ciborium::into_writer(claim, &mut raw)?;
@@ -3921,6 +3923,7 @@ pub fn validate_and_admit_envelope_tx(
     }
     verify_replica_batch_header(batch)?;
     outcome.verify += started.elapsed();
+    let _records = crate::profile::span("replication/admit-records");
     let now = now_ms().to_string();
     let mut degraded = false;
     for (offset, (hash, bytes)) in payload.blobs.iter().enumerate() {
