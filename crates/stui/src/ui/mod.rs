@@ -386,6 +386,11 @@ pub struct Ui {
     stalled: HashMap<String, String>,
 }
 
+/// Whether `c` can be part of a written-out web address.
+fn is_address_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
+}
+
 impl Ui {
     /// Call only after the terminal successfully presented this frame.
     pub(crate) fn visible_messages(&self) -> HashSet<String> {
@@ -616,8 +621,14 @@ impl Ui {
     }
 
     /// Make the links drawn in `area` clickable: addresses written out, and markdown links by
-    /// the text they were drawn with.
+    /// the text they were drawn with. An address the renderer wrapped at the edge is one link on
+    /// every row it covers, so a click on any part of it opens or copies all of it.
     fn links(&self, buf: &Buffer, area: Rect) {
+        let chars = |y: u16| -> Vec<(u16, char)> {
+            (area.x..area.x + area.width)
+                .map(|x| (x, buf[(x, y)].symbol().chars().next().unwrap_or(' ')))
+                .collect()
+        };
         for y in area.y..area.y + area.height {
             let cells = (area.x..area.x + area.width)
                 .map(|x| (x, &buf[(x, y)]))
@@ -636,25 +647,59 @@ impl Ui {
                     from = start + 4;
                     continue;
                 }
-                let url = tail
-                    .split(char::is_whitespace)
-                    .next()
-                    .unwrap_or("")
-                    .trim_end_matches(['.', ',', ')', ']', ';', ':', '"', '\'', '>']);
+                let token = tail.split(char::is_whitespace).next().unwrap_or("");
                 let column = text[..start].chars().count();
-                let width = url.chars().count();
+                // Each part of the address: where it sits on its row, and how wide it is.
+                let mut parts = Vec::new();
+                let mut url = token.to_owned();
                 if let Some((x, _)) = cells.get(column) {
-                    self.hit(
-                        Rect {
-                            x: *x,
-                            y,
-                            width: width as u16,
-                            height: 1,
-                        },
-                        Hit::Link(url.to_owned()),
-                    );
+                    parts.push((*x, y, token.chars().count()));
                 }
-                from = start + url.len().max(1);
+                // An address that runs to the right edge goes on at the start of the next row.
+                let mut reaches_edge = token.len() == tail.trim_end().len()
+                    && column + token.chars().count() >= usize::from(area.width).saturating_sub(3);
+                let mut next = y + 1;
+                while reaches_edge && next < area.y + area.height {
+                    let below = chars(next);
+                    let indent = below.iter().take_while(|(_, c)| *c == ' ').count();
+                    let more = below[indent..]
+                        .iter()
+                        .take_while(|(_, c)| !c.is_whitespace())
+                        .collect::<Vec<_>>();
+                    if indent > 4
+                        || more.is_empty()
+                        || more.iter().any(|(_, c)| !is_address_char(*c))
+                    {
+                        break;
+                    }
+                    url.extend(more.iter().map(|(_, c)| *c));
+                    parts.push((below[indent].0, next, more.len()));
+                    reaches_edge = indent + more.len() >= below.len().saturating_sub(3)
+                        && below[indent + more.len()..].iter().all(|(_, c)| *c == ' ');
+                    next += 1;
+                }
+                let trimmed = url
+                    .trim_end_matches(['.', ',', ')', ']', ';', ':', '"', '\'', '>'])
+                    .to_owned();
+                // The last part loses whatever trailing punctuation the address lost.
+                let cut = url.chars().count() - trimmed.chars().count();
+                if let Some(last) = parts.last_mut() {
+                    last.2 = last.2.saturating_sub(cut);
+                }
+                for (x, row_y, width) in parts {
+                    if width > 0 {
+                        self.hit(
+                            Rect {
+                                x,
+                                y: row_y,
+                                width: width as u16,
+                                height: 1,
+                            },
+                            Hit::Link(trimmed.clone()),
+                        );
+                    }
+                }
+                from = start + token.len().max(1);
             }
             // Markdown links: underlined runs whose text names a link.
             let mut index = 0;
