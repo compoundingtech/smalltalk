@@ -8210,6 +8210,8 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                     "  action{reads}: st attention show {} --as {}",
                     item.source_id, item.person_id
                 );
+                // What `st attention approve` and its siblings take: a person copies it from here.
+                let _ = writeln!(output, "  id: {}", item.header.id);
                 if item.header.operational.as_ref().is_some_and(|operational| {
                     operational
                         .reasons
@@ -23146,6 +23148,7 @@ mod tests {
             rest,
             concat!(
                 " launch/release --as person/alex\n",
+                "  id: attention/release-review\n",
                 "work/release/1/build  work  claimed  build  attempt 1\n",
                 "  assigned: agent/release\n",
                 "  action: st work show work/release/1/build\n",
