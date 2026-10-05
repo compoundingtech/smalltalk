@@ -72,20 +72,25 @@ there is no bridge; it never chooses a transcript or session itself.
 OMP 18.4.10 needs a temporary, token-free recovery bridge for an open `ask` picker:
 `arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge`
 ([migration registry](https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf)).
-When the selected transcript has an unresolved last ask, st first runs a bounded RPC heal pass
-with closed stdin, then launches the interactive session with `ST3_OMP_PENDING_ASK` naming its
-pending toolCall id. `--no-extensions` disables discovery, but a fleet launcher can still prepend
-explicit `-e` extensions. The heal clears `PTY_SESSION`, `PTY_ROOT`, `PTY_SESSION_DIR`, and inherited
+When the selected transcript has an unresolved last ask, st checks the installed OMP version
+against the driver's admitted minors before running a bounded RPC heal pass with closed stdin.
+The interactive launch checks the version again before its own fork, then receives
+`ST3_OMP_PENDING_ASK` naming the pending toolCall id. `--no-extensions` disables discovery, but a
+fleet launcher can still prepend explicit `-e` extensions. The heal clears `PTY_SESSION`,
+`PTY_ROOT`, `PTY_SESSION_DIR`, and inherited
 `ST3_*`, `ST2_*`, and `ST_*` environment variables (except the launcher's required `ST_AGENT`
 identity) so those extensions cannot reach the seat's PTY or st channel. The bridge's transcript
-read logs I/O failures, fails open, and decodes bytes lossily; read, heal, retry, or diagnostic
-failures do not stop native continuation.
+read logs I/O failures, fails open, decodes bytes lossily, and skips malformed JSONL lines while
+continuing to inspect later valid entries. Read, heal, retry, or diagnostic failures do not stop
+native continuation; an unadmitted OMP version still prevents launch through the driver's gate.
 The extension holds mailbox delivery, waits for its ready frame and first idle, and requests one
 raw F5 from the Rust channel. For OMP's native interrupted result, the same toolCall id, questions,
 and options reopen without a model turn or human action. Delivery resumes when that ask starts
 again, or after a 120-second timeout with a diagnostic. Both exits send `delivery_ready` to release
 the Rust channel's first-idle delivery gate independently of activity; a reopened picker remains
-blocked on the person, not falsely idle. Shared native continuation does not depend on the bridge.
+blocked on the person, not falsely idle. Its existing state-frame `reason` names the reopened
+toolCall id (`reopened interrupted ask <toolCallId>`), alongside `ask: "question"`, so clients can
+explain what the seat is waiting on. Shared native continuation does not depend on the bridge.
 
 The contraction criterion is behavioral, not a version equality assertion. The standalone
 `crates/st3/fixtures/omp-resume/native-reopen-probe.py` copies its adjacent public canary fixture into

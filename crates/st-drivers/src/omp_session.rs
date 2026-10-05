@@ -491,6 +491,14 @@ fn run_with_required_resume(
     )
 }
 
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+/// Gate the transcript-mutating RPC heal before it opens the selected session.
+/// Interactive launch still gates its own fork after the asynchronous heal.
+pub fn verify_version_for_heal(binary: &str) -> Result<()> {
+    verify_supported_version(binary)
+}
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+
 /// Refuse any provider whose MINOR this binary was not verified against. Failing loudly at launch
 /// is the point (OMP-R05): a silently degraded observed state or delivery path would read as
 /// healthy. Patches inside an admitted minor pass, because the admission unit is the minor.
