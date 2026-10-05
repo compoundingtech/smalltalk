@@ -1220,7 +1220,13 @@ fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == 0 || version == 13 || version == 14 || version == 15 || version == 16 {
+    if version == 0
+        || version == 13
+        || version == 14
+        || version == 15
+        || version == 16
+        || version == 17
+    {
         return Ok(());
     }
     if version == 12 {
@@ -37910,7 +37916,7 @@ version 2
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
         assert_eq!(planner_column, 1);
     }
 
