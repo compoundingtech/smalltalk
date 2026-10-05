@@ -3428,6 +3428,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("kind", string()),
             ("state", any()),
             ("observed_at", integer()),
+            ("attribution_only", boolean()),
         ],
         _ => &[],
     };

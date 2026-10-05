@@ -1629,9 +1629,11 @@ fn discovered_collection_items(
             if resource.as_ref() == Some(&facts) {
                 return None;
             }
+            // Creation receipts establish identity and attribution, not observer state.
+            let observed_prior = prior.filter(|prior| prior.get("state").is_some());
             let new_item =
-                prior.is_none() && !baseline && item.get("new") != Some(&Value::Bool(false));
-            let deliver = match (field, prior) {
+                observed_prior.is_none() && !baseline && item.get("new") != Some(&Value::Bool(false));
+            let deliver = match (field, observed_prior) {
                 ("pull_requests", Some(prior)) => pull_request_needs_review(Some(prior), &facts),
                 (_, Some(_)) => false,
                 ("pull_requests", None) => new_item && pull_request_needs_review(None, &facts),
@@ -12359,7 +12361,7 @@ impl Store {
                                 &canonical_sql(
                                     "SELECT accepted_at_unix_ms FROM claims
                                      WHERE subject=?1 AND kind='resource.observed'
-                                     ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                                     ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1",
                                 ),
                                 [&subject],
                                 |row| row.get::<_, String>(0),
@@ -16418,7 +16420,7 @@ fn resolve_mission_run_inputs(
                 } else {
                     transaction
                         .query_row(
-                            &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                            &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1"),
                             [subject],
                             |row| row.get(0),
                         )
@@ -16970,7 +16972,7 @@ fn normalize_resource_observation(
         // Issue and pull request attribution belongs to its publisher, not to the latest
         // observer or fixer. Keep each named field, including a mission-run-only opener, across
         // observations, so a partial snapshot such as a merge never erases it.
-        if carries_opener(&kind) {
+        if carries_opener(&kind) && input.fields.get("attribution_only") != Some(&Value::Bool(true)) {
             for name in ["opened_by", "opened_by_run"] {
                 if let Some(value) = previous.get(name) {
                     facts.insert(name.into(), value.clone());
@@ -17033,6 +17035,7 @@ fn resource_facts(fields: &BTreeMap<String, Value>) -> Result<BTreeMap<String, V
         "observer",
         "baseline",
         "changed_fields",
+        "attribution_only",
     ];
     Ok(fields
         .iter()
@@ -18878,6 +18881,10 @@ fn latest_actual_at(
         let value: Value = serde_json::from_str(&body)?;
         let source = value.get("fields").unwrap_or(&value);
         if let Some(fields) = source.as_object() {
+            if kind == "resource.observed" {
+                resources::merge_observation(&mut merged, fields);
+                continue;
+            }
             if registry
                 .claim(&kind)
                 .is_some_and(|spec| spec.cardinality == st3_schema::Cardinality::StateTransition)
@@ -20364,7 +20371,7 @@ fn pull_request_state_tx(connection: &Connection, target: &str) -> Result<Option
             &canonical_sql(
                 "SELECT json_extract(body, '$.fields'), accepted_at_unix_ms FROM claims
              WHERE subject=?1 AND kind='resource.observed'
-             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+             ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1",
             ),
             [subject],
             |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
@@ -44780,6 +44787,121 @@ mission "review-guardrail" state="ready" {
     }
 
     #[test]
+    fn late_receipt_preserves_observation_and_next_head_push_delivers() {
+        let store = Store::open_memory("node").unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        let repository = "resource/github/acme/demo";
+        let subject = format!("{repository}/pull-request/9");
+        let observed = json!({
+            "number": 9, "state": "open", "title": "Ready", "draft": false,
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "checks": [{"name": "build", "conclusion": "success"}]
+        });
+        store.append_claim(&ClaimInput {
+            subject: subject.clone(), kind: "resource.observed".into(), actor: None,
+            fields: BTreeMap::from([
+                ("kind".into(), json!("vcs.pull-request")),
+                ("facts".into(), observed.clone()),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        std::fs::write(spool.path().join("1.json"), serde_json::to_vec(&crate::recorder::Receipt {
+            schema: "st3.recorder.receipt.v1".into(),
+            url: "https://github.com/acme/demo/pull/9".into(),
+            actor: "agent/node.builder".into(), mission_run: Some("created".into()),
+            exit_code: Some(0), at: "2026-10-03T12:00:00Z".into(),
+        }).unwrap()).unwrap();
+        assert_eq!(crate::recorder_receipts::ingest_once(&store, spool.path()).unwrap(), 1);
+        let recorded = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
+        let previous = json!({"pull_requests": [{
+            "number": 9, "state": "open", "draft": false
+        }]});
+        let current = json!({"pull_requests": [{
+            "number": 9, "new": false, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }]});
+        let items = discovered_collection_items(
+            repository, "pull_requests", Some(&previous), &current,
+            &mut |_| Some(recorded.clone()),
+        );
+        assert!(items[0].deliver, "a late receipt must not lose the next head's review");
+        for field in ["state", "title", "head_sha", "checks"] {
+            assert_eq!(recorded[field], observed[field], "{field}");
+        }
+        assert_eq!(recorded["opened_by"], "agent/node.builder");
+        let projected = store.resource_collection_page(None, None, Some(&subject), None, 10).unwrap();
+        assert_eq!(projected[0]["facts"], recorded);
+    }
+
+    #[test]
+    fn receipt_born_resources_receive_first_observer_issue_and_review_delivery() {
+        let store = Store::open_memory("node").unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        let repository = "resource/github/acme/demo";
+        for (field, path, segment) in [
+            ("issues", "issues", "issue"),
+            ("pull_requests", "pull", "pull-request"),
+        ] {
+            let receipt = crate::recorder::Receipt {
+                schema: "st3.recorder.receipt.v1".into(),
+                url: format!("https://github.com/acme/demo/{path}/8"),
+                actor: "agent/node.builder".into(),
+                mission_run: Some("created".into()),
+                exit_code: Some(0),
+                at: "2026-10-03T12:00:00Z".into(),
+            };
+            std::fs::write(
+                spool.path().join(format!("{field}.json")),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::recorder_receipts::ingest_once(&store, spool.path()).unwrap(),
+                1
+            );
+            let subject = format!("{repository}/{segment}/8");
+            let recorded = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
+            assert!(recorded.get("state").is_none());
+            let previous = json!({"repository_id": 1, field: []});
+            let current = json!({"repository_id": 1, field: [{
+                "number": 8, "state": "open", "draft": false,
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }]});
+            let items = discovered_collection_items(
+                repository, field, Some(&previous), &current,
+                &mut |_| Some(recorded.clone()),
+            );
+            assert_eq!(items.len(), 1);
+            assert!(items[0].deliver, "{field} must deliver its first observed state");
+            assert_eq!(items[0].facts["opened_by"], "agent/node.builder");
+            assert_eq!(items[0].facts["opened_by_run"], "mission-run/created");
+            let observed = items[0].facts.clone();
+            assert!(
+                discovered_collection_items(
+                    repository, field, Some(&current), &current,
+                    &mut |_| Some(observed.clone()),
+                )
+                .is_empty(),
+                "the same sighting must not deliver twice"
+            );
+            assert!(
+                !discovered_collection_items(
+                    repository, field, None, &current,
+                    &mut |_| Some(recorded.clone()),
+                )[0].deliver,
+                "a repository baseline must not deliver receipt-born items"
+            );
+            let mut old_item = current.clone();
+            old_item[field][0]["new"] = Value::Bool(false);
+            assert!(
+                !discovered_collection_items(
+                    repository, field, Some(&previous), &old_item,
+                    &mut |_| Some(recorded.clone()),
+                )[0].deliver,
+                "an explicitly historical item must not deliver"
+            );
+        }
+    }
+
+    #[test]
     fn repository_collections_create_one_typed_resource_for_each_new_item() {
         let previous = json!({"pull_requests": [], "issues": []});
         let current = json!({
@@ -47391,6 +47513,18 @@ fn append_claim_with_fences(
                     return Err(St3Error::new("stale-placement",
                         "placement changed; read the current handoff before overriding its sources"));
                 }
+            }
+            // Check under the writer lock: concurrent captures must not append a second opener
+            // or replace an existing observation with another attribution-only claim.
+            if input.kind == "resource.observed"
+                && input.fields.get("attribution_only") == Some(&Value::Bool(true))
+                && let Some(previous) = latest_actual(transaction, &input.subject).map_err(internal)?
+                && previous.get("facts").unwrap_or(&previous).as_object().is_some_and(|facts| {
+                    facts.contains_key("opened_by") || facts.contains_key("opened_by_run")
+                })
+                && let Some(existing) = latest_claim_of_kind_tx(transaction, &input.subject, "resource.observed")?
+            {
+                return Ok((existing, false));
             }
             let mut stored_fields = custom::prepare(transaction, input)?;
             if let Some(fields) = normalize_resource_observation(transaction, input)? {
