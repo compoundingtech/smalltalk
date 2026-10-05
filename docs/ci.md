@@ -40,6 +40,13 @@ requests. Run affinity ensures that a runner started for a request is assigned t
 so GitHub cannot hand it to a newer run with the same shape. Local `ci1-priority` and `ci1-merge`
 reservations continue to select only the primary test shard.
 
+Profile labels carry affinity inline, for example
+`namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}`.
+Shape labels retain `-with-features` and a separate
+`namespace-features:github.run-id=${{ github.run_id }}` label. Namespace does not support a
+separate `namespace-features:` label with profiles; see the
+[Runner Controls syntax](https://namespace.so/docs/solutions/github-actions/runner-controls).
+
 The queue still shares the existing Linux limit of 320 vCPUs / 640 GiB and must drain its older
 backlog. Queue time is measured separately from execution time; the shared class removes
 indefinite overtaking, rather than promising a fixed start time under arbitrary overload.

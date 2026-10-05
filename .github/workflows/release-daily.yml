@@ -23,11 +23,7 @@ concurrency:
 jobs:
   release:
     name: daily-release
-    runs-on:
-      [
-        namespace-profile-linux-x86-64;job.priority=1,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 20
     permissions:
       contents: write

@@ -2,12 +2,14 @@ import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from '.
 import {
   defaultActionlintConfig,
   effectUtilsBinaryCaches,
-  namespaceRunner,
   nixDevelopStep,
   plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
 
-export const linuxRunner = namespaceRunner({ profile: 'namespace-profile-linux-x86-64;job.priority=1', runId: '${{ github.run_id }}' })
+// Profiles require controls inline; namespace-features labels apply only to shape labels.
+export const linuxRunnerProfile = 'namespace-profile-linux-x86-64;job.priority=1'
+export const macosRunnerProfile = 'namespace-profile-macos-arm64'
+export const linuxRunner = [`${linuxRunnerProfile};github.run-id=\${{ github.run_id }}`] as const
 /**
  * The Linux gate's stage jobs. On 2026-10-03 the shape label `nscloud-ubuntu-24.04-amd64-16x32`
  * stopped getting runners at about 12:10Z, and the profile allows only about five runners at
@@ -20,7 +22,7 @@ export const linuxStageRunner = [
   `${linuxStageShape};job.priority=1`,
   'namespace-features:github.run-id=${{ github.run_id }}',
 ] as const
-export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-arm64', runId: '${{ github.run_id }}' })
+export const macosRunner = [`${macosRunnerProfile};github.run-id=\${{ github.run_id }}`] as const
 export const linuxActionlintConfig = {
   ...defaultActionlintConfig,
   selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],

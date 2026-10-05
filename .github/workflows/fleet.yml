@@ -91,7 +91,7 @@ jobs:
   namespace-capacity:
     name: namespace-capacity
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["namespace-profile-linux-x86-64;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["namespace-profile-linux-x86-64;job.priority=1;github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 120
     permissions:
       contents: read
@@ -222,11 +222,7 @@ jobs:
       CI_CACHE_DEV_SHELL: genie
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on:
-      [
-        namespace-profile-linux-x86-64;job.priority=1,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -311,11 +307,7 @@ jobs:
     name: typescript-client
     needs: [pick-runner, genie-freshness]
     if: ${{ !cancelled() && needs.genie-freshness.result == 'success' }}
-    runs-on:
-      [
-        namespace-profile-linux-x86-64;job.priority=1,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 10
     defaults:
       run:
@@ -1083,11 +1075,7 @@ jobs:
     name: isolation-vm
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on:
-      [
-        namespace-profile-linux-x86-64;job.priority=1,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 60
     defaults:
       run:

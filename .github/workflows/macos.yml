@@ -21,8 +21,7 @@ jobs:
   macos-ci:
     name: macos-ci
     if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'macos-ci')
-    runs-on:
-      [namespace-profile-macos-arm64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    runs-on: ["namespace-profile-macos-arm64;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 120
     defaults:
       run:
