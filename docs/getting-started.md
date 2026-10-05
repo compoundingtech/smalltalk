@@ -254,6 +254,7 @@ at either socket path is never replaced; choose a different path instead.
 
 ## Next
 
+- [Using stui and the iOS app](stui-and-ios.md): follow work, talk to agents, and install the phone app.
 - [Two machines](two-machines.md): connect your machines and check graph replication.
 - [Missions in practice](missions-in-practice.md): revise work, queue runs, and ask for human decisions.
 - [Talking to agents](talking-to-agents.md): UI, phone, CLI, attachments, and structured requests.
