@@ -3662,6 +3662,9 @@
               "$ref": "#/$defs/SubjectDefinition"
             },
             {
+              "$ref": "#/$defs/PublicationDefinition"
+            },
+            {
               "$ref": "#/$defs/AgentWorkspace"
             },
             {
@@ -69895,6 +69898,38 @@
         "resource_ids",
         "snapshot_id",
         "body"
+      ],
+      "type": "object"
+    },
+    "PublicationDefinition": {
+      "additionalProperties": false,
+      "description": "Canonical publication values with resolved compiler defaults; requires read.declarations.",
+      "properties": {
+        "declaration": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "kind": {
+          "const": "publication-definition"
+        },
+        "revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "subject": {
+          "pattern": "^(agent|mission|schedule)/[^\\s]+$",
+          "type": "string"
+        },
+        "token": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "subject",
+        "declaration",
+        "revision",
+        "token"
       ],
       "type": "object"
     },

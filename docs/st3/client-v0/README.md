@@ -390,6 +390,17 @@ copy of the definition: re-publishing it would replace the environment values wi
 Unknown agents and agents with observations but no applied desired declaration return typed
 `not-found`. Other subject kinds return `validation-failed`: a mission is published as a compiled
 revision (read it through `/missions/{id}`) and keeps no canonical declaration AST to render.
+
+For canonical structured publication values, use
+`GET /v1/client/publication-definition?subject=mission%2Fexample%2Fdaily` (also accepts
+`agent/` and `schedule/` subjects). Rust `publication_definition(subject)`, Swift
+`publicationDefinition(subject:)`, and TypeScript `publicationDefinition(subject)` return
+`PublicationDefinition` in the same snapshot envelope. Its `declaration` is the compiled
+`MissionSpec` for missions, or normalized `DesiredSubject` for seats and schedules, with
+`revision` and immutable claim `token`. This read requires `read.projections` and
+`read.declarations`; environment values and embedded declarations are retained. Missing
+subjects return 404 and oversized definitions are rejected without truncation.
+These are the same values used by the [owned-set declaration diff](../owned-sets.md#declaration-diffs-and-readback).
 A definition is never truncated:
 when its serialized value exceeds `max_response_bytes - 4096` (reserving room for the envelope),
 the server returns `validation-failed` rather than an incomplete AST or KDL document.

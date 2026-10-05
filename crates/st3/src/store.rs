@@ -1,4 +1,5 @@
 pub mod custom;
+pub mod declarations;
 mod glass_heads;
 mod glasses;
 pub mod owned_sets;
@@ -8021,7 +8022,14 @@ impl Store {
         warnings.sort();
         warnings.dedup();
 
+        let declaration_diffs = declarations::diffs(
+            &connection,
+            intent,
+            changes.iter().map(|change| change.subject.as_str()),
+            Some(store_index),
+        )?;
         Ok(MissionResponse {
+            declaration_diffs,
             store_index,
             source_hash: intent.source_hash.clone(),
             normalized: intent.normalized.clone(),
@@ -19988,12 +19996,47 @@ fn current_harness_fold_at(
     let runtime_key = canonical::claim_key(connection, &runtime_claim)?;
     let runtime_body: Value = serde_json::from_str(&runtime_body)?;
     let runtime_fields = runtime_body.get("fields").unwrap_or(&runtime_body);
-    if runtime_fields.get("status").and_then(Value::as_str) != Some("running") {
-        return Ok(None);
-    }
     let Some(incarnation_id) = runtime_fields.get("incarnation_id").and_then(Value::as_str) else {
         return Ok(None);
     };
+
+    // An admission refusal remains visible even after omp exits, and OpenCode's ready
+    // observations cannot claim healthy delivery while its exact build failed the probe.
+    let admission = connection
+        .prepare_cached(&canonical_sql(
+            "SELECT id, accepted_at_unix_ms, json_extract(body, '$.fields.reason') FROM claims
+         WHERE subject=?1 AND kind='harness.diagnostic' AND store_index<=?2
+           AND json_extract(body, '$.fields.code')='harness-admission-failed'
+           AND json_extract(body, '$.fields.incarnation_id')=?3
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+        ))?
+        .query_row(params![subject, at_index, incarnation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .optional()?;
+    if let Some((claim, observed_at, reason)) = admission {
+        return Ok(Some(crate::model::CurrentHarnessView {
+            state: "indeterminate".into(),
+            driver: None,
+            incarnation_id: incarnation_id.into(),
+            transport: None,
+            reason: Some(reason),
+            blocked_on: None,
+            ask: None,
+            input_buffer: None,
+            exit: None,
+            claim,
+            since_unix_ms: observed_at.parse()?,
+            observed_at_unix_ms: observed_at.parse()?,
+        }));
+    }
+    if runtime_fields.get("status").and_then(Value::as_str) != Some("running") {
+        return Ok(None);
+    }
 
     // A terminal modal holds even if a parallel native channel reports idle or work progress.
     // Only a successful subsequent screen observation or a new runtime lifts this fence.
@@ -48090,6 +48133,91 @@ message "human-attention" {
                 .total_tokens,
             150
         );
+    }
+
+    #[test]
+    fn admission_failure_fences_ready_work_and_exit_until_a_new_incarnation() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.fixture";
+        let append = |kind: &str, fields: BTreeMap<String, Value>| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        append(
+            "runtime.observed",
+            BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("fixture")),
+                ("incarnation_id".into(), json!("first")),
+            ]),
+        );
+        append(
+            "harness.observed",
+            BTreeMap::from([
+                ("state".into(), json!("ready")),
+                ("incarnation_id".into(), json!("first")),
+            ]),
+        );
+        assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
+        let refusal = append(
+            "harness.diagnostic",
+            BTreeMap::from([
+                ("code".into(), json!("harness-admission-failed")),
+                ("status".into(), json!("degraded")),
+                (
+                    "reason".into(),
+                    json!("opencode 99.42.7 admission failed at admissionLifecycle"),
+                ),
+                ("incarnation_id".into(), json!("first")),
+            ]),
+        );
+        append(
+            "harness.observed",
+            BTreeMap::from([
+                ("state".into(), json!("working")),
+                ("incarnation_id".into(), json!("first")),
+            ]),
+        );
+        let refused = store.current_harness(subject).unwrap().unwrap();
+        assert!(!refused.is_ready());
+        assert_eq!(refused.state, "indeterminate");
+        assert_eq!(refused.since_unix_ms, refusal.accepted_at_unix_ms);
+        assert!(refused.reason.unwrap().contains("admissionLifecycle"));
+        append(
+            "runtime.observed",
+            BTreeMap::from([
+                ("status".into(), json!("exited")),
+                ("incarnation_id".into(), json!("first")),
+            ]),
+        );
+        let exited = store.current_harness(subject).unwrap().unwrap();
+        assert!(exited.reason.unwrap().contains("admissionLifecycle"));
+        assert_eq!(exited.since_unix_ms, refusal.accepted_at_unix_ms);
+        append(
+            "runtime.observed",
+            BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("fixture")),
+                ("incarnation_id".into(), json!("second")),
+            ]),
+        );
+        append(
+            "harness.observed",
+            BTreeMap::from([
+                ("state".into(), json!("ready")),
+                ("incarnation_id".into(), json!("second")),
+            ]),
+        );
+        assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
     }
 
     #[test]

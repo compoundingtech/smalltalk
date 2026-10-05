@@ -256,6 +256,8 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn host_repositories(&self, host: &str) -> Result<Envelope<HostRepositories>, ClientError> {{ self.get(&format!(\"/v1/client/hosts/{{}}/repositories\", percent_encode(host))).await }}"
             )?;
+        } else if id == "publication.definition" {
+            writeln!(out, "    pub async fn publication_definition(&self, subject: &str) -> Result<Envelope<PublicationDefinition>, ClientError> {{ self.get(&format!(\"/v1/client/publication-definition?subject={{}}\", percent_encode(subject))).await }}")?;
         } else if id == "subject.definition" {
             writeln!(
                 out,
@@ -451,6 +453,8 @@ fn swift_operation_methods(
                 out,
                 "    public func hostRepositories(id: String) async throws -> Envelope<HostRepositories> {{ try await get(\"v1/client/hosts/\\(id)/repositories\") }}"
             )?;
+        } else if id == "publication.definition" {
+            writeln!(out, "    public func publicationDefinition(subject: String) async throws -> Envelope<PublicationDefinition> {{ try await get(\"v1/client/publication-definition\", query: [.init(name: \"subject\", value: subject)]) }}")?;
         } else if id == "subject.definition" {
             writeln!(
                 out,
@@ -680,6 +684,7 @@ fn validate_surfaces(
         "HostRepositories",
         "CanonicalNode",
         "SubjectDefinition",
+        "PublicationDefinition",
         "UsagePeriod",
         "AgentMessageEstimate",
         "AgentMessageDay",
@@ -1267,6 +1272,8 @@ fn typescript_operation_methods(
                 out,
                 "    async hostRepositories(id: string): Promise<EnvelopeOf<HostRepositories>> {{ return this.get(`{route}`); }}"
             )?;
+        } else if id == "publication.definition" {
+            writeln!(out, "    async publicationDefinition(subject: string): Promise<EnvelopeOf<PublicationDefinition>> {{ return this.get('{route}' + query({{ subject }})); }}")?;
         } else if id == "subject.definition" {
             writeln!(
                 out,

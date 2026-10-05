@@ -113,6 +113,13 @@ pub enum Reason {
     LaunchConfigurationRejected,
     VersionProbeFailed,
     UnsupportedVersion,
+    AdmissionExtensionLoad,
+    AdmissionApiContract,
+    AdmissionLifecycle,
+    AdmissionIdleEdge,
+    AdmissionApprovalCorrelation,
+    AdmissionNativeConsumption,
+    AdmissionIndeterminate,
     ApiUnavailable,
     IncompatibleApi,
     SseConnectFailed,
@@ -145,10 +152,17 @@ pub enum Reason {
 }
 
 impl Reason {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 37] = [
         Self::LaunchConfigurationRejected,
         Self::VersionProbeFailed,
         Self::UnsupportedVersion,
+        Self::AdmissionExtensionLoad,
+        Self::AdmissionApiContract,
+        Self::AdmissionLifecycle,
+        Self::AdmissionIdleEdge,
+        Self::AdmissionApprovalCorrelation,
+        Self::AdmissionNativeConsumption,
+        Self::AdmissionIndeterminate,
         Self::ApiUnavailable,
         Self::IncompatibleApi,
         Self::SseConnectFailed,
@@ -183,6 +197,13 @@ impl Reason {
             Self::LaunchConfigurationRejected => "launchConfigurationRejected",
             Self::VersionProbeFailed => "versionProbeFailed",
             Self::UnsupportedVersion => "unsupportedVersion",
+            Self::AdmissionExtensionLoad => "admissionExtensionLoad",
+            Self::AdmissionApiContract => "admissionApiContract",
+            Self::AdmissionLifecycle => "admissionLifecycle",
+            Self::AdmissionIdleEdge => "admissionIdleEdge",
+            Self::AdmissionApprovalCorrelation => "admissionApprovalCorrelation",
+            Self::AdmissionNativeConsumption => "admissionNativeConsumption",
+            Self::AdmissionIndeterminate => "admissionIndeterminate",
             Self::ApiUnavailable => "apiUnavailable",
             Self::IncompatibleApi => "incompatibleApi",
             Self::SseConnectFailed => "sseConnectFailed",
@@ -221,6 +242,13 @@ impl Reason {
         match self {
             Self::LaunchConfigurationRejected => Stage::Launch,
             Self::VersionProbeFailed | Self::UnsupportedVersion => Stage::VersionGate,
+            Self::AdmissionExtensionLoad
+            | Self::AdmissionApiContract
+            | Self::AdmissionLifecycle
+            | Self::AdmissionIdleEdge
+            | Self::AdmissionApprovalCorrelation
+            | Self::AdmissionNativeConsumption
+            | Self::AdmissionIndeterminate => Stage::VersionGate,
             Self::ApiUnavailable | Self::IncompatibleApi => Stage::ApiGate,
             Self::SseConnectFailed | Self::SseDisconnected | Self::UnknownEvent => Stage::Sse,
             Self::StatusUnavailable
@@ -253,6 +281,13 @@ impl Reason {
             Self::VersionProbeFailed | Self::UnsupportedVersion => {
                 matches!(source, Source::VersionProbe)
             }
+            Self::AdmissionExtensionLoad
+            | Self::AdmissionApiContract
+            | Self::AdmissionLifecycle
+            | Self::AdmissionIdleEdge
+            | Self::AdmissionApprovalCorrelation
+            | Self::AdmissionNativeConsumption
+            | Self::AdmissionIndeterminate => matches!(source, Source::AdmissionProbe),
             Self::ApiUnavailable | Self::IncompatibleApi => {
                 matches!(source, Source::OpenApiDocument)
             }
@@ -300,6 +335,7 @@ impl Reason {
 pub enum Source {
     ProcessExit,
     VersionProbe,
+    AdmissionProbe,
     OpenApiDocument,
     EventStream,
     StatusSnapshot,
@@ -314,9 +350,10 @@ pub enum Source {
 }
 
 impl Source {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::ProcessExit,
         Self::VersionProbe,
+        Self::AdmissionProbe,
         Self::OpenApiDocument,
         Self::EventStream,
         Self::StatusSnapshot,
@@ -332,6 +369,7 @@ impl Source {
         match self {
             Self::ProcessExit => "processExit",
             Self::VersionProbe => "versionProbe",
+            Self::AdmissionProbe => "admissionProbe",
             Self::OpenApiDocument => "openApiDocument",
             Self::EventStream => "eventStream",
             Self::StatusSnapshot => "statusSnapshot",
@@ -455,7 +493,17 @@ pub fn repair_text(observed: &Observed) -> &'static str {
             Stage::Launch => {
                 "repair the rejected declared launch arguments; the seat is running with a known-safe fallback"
             }
-            Stage::VersionGate => "install a supported producer version and restart the seat",
+            Stage::VersionGate => match failure.driver {
+                Driver::Omp => {
+                    "repair the named producer admission check and remove its cache record to remeasure, or explicitly allow this build from a person's terminal with `st admission override omp --binary <installed-executable> --reason <reason>`; then restart the affected seat"
+                }
+                Driver::OpenCode => {
+                    "repair the named producer admission check and remove its cache record to remeasure, or explicitly allow this build from a person's terminal with `st admission override opencode --binary <installed-executable> --reason <reason>`; then restart the affected seat"
+                }
+                _ => {
+                    "repair the named producer admission check, remove its harness-admission cache record to repeat the isolated probe, and restart the seat"
+                }
+            },
             Stage::ApiGate => "restore the producer API contract, then restart the seat",
             Stage::Sse => "restore the producer event stream; recovery clears this advisory",
             Stage::Seed => {

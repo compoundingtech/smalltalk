@@ -1269,6 +1269,16 @@ impl Client {
         ))
         .await
     }
+    pub async fn publication_definition(
+        &self,
+        subject: &str,
+    ) -> Result<Envelope<PublicationDefinition>, ClientError> {
+        self.get(&format!(
+            "/v1/client/publication-definition?subject={}",
+            percent_encode(subject)
+        ))
+        .await
+    }
     pub async fn subject_definition(
         &self,
         subject: &str,

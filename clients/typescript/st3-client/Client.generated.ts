@@ -3,7 +3,7 @@ import { API_VERSION } from './Models.generated.ts';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
-    SubjectDefinition, SubjectSchemas, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
+    PublicationDefinition, SubjectDefinition, SubjectSchemas, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated.ts';
@@ -365,6 +365,7 @@ export class St3Client {
     async setsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/sets' + query(options)); }
     async setsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/sets/${encodeURIComponent(routedId(id))}`); }
     async documentGet(name: string): Promise<EnvelopeOf<DocumentContent>> { return this.get('/v1/client/documents/content' + query({ name })); }
+    async publicationDefinition(subject: string): Promise<EnvelopeOf<PublicationDefinition>> { return this.get('/v1/client/publication-definition' + query({ subject })); }
     async subjectDefinition(subject: string, showEnvValues = false): Promise<EnvelopeOf<SubjectDefinition>> { return this.get('/v1/client/subject-definition' + query({ subject, show_env_values: showEnvValues })); }
     async mailBacklogSummary(): Promise<EnvelopeOf<MailBacklog>> { return this.get('/v1/client/mail-backlog'); }
     async subjectsList(family: string, options: PageOptions & { ref_prefix?: string } = {}): Promise<EnvelopeOf<SubjectsPageResult>> { const envelope = await this.get<unknown>('/v1/client/subjects' + query({ family, ...options })); return { ...envelope, value: decodeSubjectsPage(envelope.value) }; }

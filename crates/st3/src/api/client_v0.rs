@@ -1099,6 +1099,57 @@ pub(super) async fn subject_definition(
     Ok((Extension(snapshot), Json(value)))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PublicationDefinitionQuery {
+    subject: String,
+}
+
+/// Full canonical publication values can contain environment values or embedded declarations.
+pub(super) async fn publication_definition(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<PublicationDefinitionQuery>,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    require_scope(&session, "read.projections")?;
+    require_scope(&session, "read.declarations")?;
+    if !["agent/", "mission/", "schedule/"]
+        .iter()
+        .any(|prefix| query.subject.starts_with(prefix))
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "validation-failed",
+            "a publication definition subject must start with agent/, mission/, or schedule/",
+        )));
+    }
+    let subject = query.subject.clone();
+    let result = blocking_store(move || {
+        state.store.read_snapshot(|index| {
+            let definition = state.store.publication_definition(&subject, index)?;
+            Ok((client_snapshot_at(&state, index), definition))
+        })
+    })
+    .await?;
+    let value = serde_json::to_value(result.1.ok_or_else(|| {
+        ApiError::not_found(format!(
+            "subject `{}` has no published definition",
+            query.subject
+        ))
+    })?)
+    .map_err(ApiError::internal)?;
+    if serde_json::to_vec(&value)
+        .map_err(ApiError::internal)?
+        .len()
+        > CLIENT_MAX_RESPONSE_BYTES - 4096
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "validation-failed",
+            "the published definition exceeds the client response limit",
+        )));
+    }
+    Ok((Extension(result.0), Json(value)))
+}
+
 const ALL_SCOPES: &[&str] = &[
     "read.projections",
     "read.declarations",

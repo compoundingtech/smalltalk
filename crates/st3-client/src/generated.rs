@@ -528,6 +528,16 @@ pub struct CanonicalNode {
     pub children: Vec<CanonicalNode>,
 }
 
+/// Canonical compiler values of an applied seat, mission, or schedule publication.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PublicationDefinition {
+    pub kind: String,
+    pub subject: String,
+    pub declaration: BTreeMap<String, Value>,
+    pub revision: String,
+    pub token: String,
+}
+
 /// Applied desired state, not the original declaration file or a proposed mission revision.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SubjectDefinition {
