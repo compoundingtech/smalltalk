@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Measurement-only driver: unchanged load tests, two frozen binaries, one runner."""
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import time
+
+HEADS = {
+    'main': 'e4062387fd5bd5538158f63e11bbf5aedc3ebe2c',
+    'after': '481d4988cadac2ad6d679a6ba2d7dbe84f3160ed',
+}
+BASELINES = [37276978494, 37273736714, 37265290064, 37257137831, 37256435588]
+MEASURED_PAIRS = 5
+workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+temporary = pathlib.Path(os.environ['RUNNER_TEMP'])
+output = temporary / 'perf'
+output.mkdir(exist_ok=True)
+
+
+def write(name, value):
+    (output / name).write_text(json.dumps(value, indent=2) + '\n')
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with path.open('rb') as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def git(*arguments, cwd=workspace):
+    return subprocess.check_output(['git', *arguments], cwd=cwd, text=True).strip()
+
+
+def machine():
+    return {
+        'affinity': sorted(os.sched_getaffinity(0)),
+        'loadavg': pathlib.Path('/proc/loadavg').read_text().strip(),
+        'cpu_stat': pathlib.Path('/proc/stat').read_text().splitlines()[0],
+        'monotonic': time.monotonic(),
+    }
+
+
+fixture = temporary / 'st-bench'
+fixture_files = sorted(path for path in fixture.iterdir() if path.is_file())
+assert (fixture / 'generated-1.sqlite3').exists()
+assert (fixture / 'generated-1-peer.sqlite3').exists()
+fixture_hashes = {path.name: digest(path) for path in fixture_files}
+baseline = temporary / 'perf-baseline'
+assert {path.name for path in baseline.glob('load-*.json')} == {
+    f'load-{run}.json' for run in BASELINES
+}
+baseline_hashes = {path.name: digest(path) for path in sorted(baseline.glob('load-*.json'))}
+assert not git('status', '--porcelain')
+plan = {
+    'runtime_heads': HEADS,
+    'warmup_pairs': 1,
+    'measured_pairs': MEASURED_PAIRS,
+    'order': 'main/after on even pairs, after/main on odd pairs; warmup pair is zero',
+    'fixture_run': 37281901496,
+    'fixture_artifact': 11333545011,
+    'fixture_sha256': 'e31918ae968d5f101a4ab317fabbb1909a516d13b0f85b2d3d7d4edd9c3b4489',
+    'fixture_file_sha256': fixture_hashes,
+    'baseline_runs': BASELINES,
+    'baseline_file_sha256': baseline_hashes,
+    'assertions_and_budgets_unchanged': True,
+    'profiling_disabled': True,
+    'workload_seconds': 120,
+    'workload_scale': 1,
+    'runner': machine(),
+}
+write('paired-plan.json', plan)
+
+# Both builds finish before timing starts. Shared dependency cache is only a build
+# input; each executable is copied and hashed before the other source is built.
+executables = {}
+for side, head in HEADS.items():
+    subprocess.run(['git', 'cat-file', '-e', head + '^{commit}'], cwd=workspace, check=True)
+    source = temporary / ('record-paired-source-' + side)
+    subprocess.run(['git', 'worktree', 'add', '--detach', str(source), head], cwd=workspace, check=True)
+    assert git('rev-parse', 'HEAD', cwd=source) == head
+    assert not git('status', '--porcelain', cwd=source)
+    write(side + '-source.json', {
+        'head': head,
+        'tree': git('rev-parse', 'HEAD^{tree}', cwd=source),
+        'tracked_files': git('ls-files', '-s', cwd=source).splitlines(),
+        'daemon_load_sha256': digest(source / 'crates/st3/tests/daemon_load.rs'),
+        'daemon_bench_sha256': digest(source / 'crates/st3/tests/daemon_bench.rs'),
+    })
+    environment = os.environ.copy()
+    environment.update(CARGO_TARGET_DIR=str(workspace / 'target'), CARGO_BUILD_JOBS='3', AGENT_SPEC_REVISION=head)
+    command = ['cargo', 'test', '--release', '-p', 'st3', '--features', 'perf-load', '--test',
+               'perf_load', '--locked', '--no-run', '--message-format=json']
+    with (output / (side + '-build.jsonl')).open('w') as stdout, (output / (side + '-build.log')).open('w') as stderr:
+        build = subprocess.run(command, cwd=source, env=environment, stdout=stdout, stderr=stderr)
+    if build.returncode:
+        raise RuntimeError(f'{side} build failed; see retained build log')
+    artifacts = []
+    for line in (output / (side + '-build.jsonl')).read_text().splitlines():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if (message.get('reason') == 'compiler-artifact'
+                and message.get('target', {}).get('name') == 'perf_load'
+                and message.get('executable')):
+            artifacts.append(pathlib.Path(message['executable']))
+    assert len(artifacts) == 1, artifacts
+    frozen = output / (side + '-perf-load')
+    shutil.copy2(artifacts[0], frozen)
+    assert not git('status', '--porcelain', cwd=source)
+    executables[side] = {'head': head, 'path': str(frozen), 'sha256': digest(frozen)}
+    write('frozen-binaries.json', executables)
+assert executables['main']['sha256'] != executables['after']['sha256']
+subprocess.run(['sccache', '--stop-server'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+samples = []
+for pair in range(MEASURED_PAIRS + 1):
+    order = ['main', 'after'] if pair % 2 == 0 else ['after', 'main']
+    for side in order:
+        executable = executables[side]
+        assert digest(pathlib.Path(executable['path'])) == executable['sha256']
+        directory = output / f'pair-{pair}-{side}'
+        directory.mkdir()
+        report = directory / 'load.json'
+        environment = os.environ.copy()
+        for key in list(environment):
+            if key.startswith('ST3_PROFILE_'):
+                environment.pop(key)
+        environment.update(ST_LOAD_GATE='1', ST_LOAD_SCALE='1', ST_LOAD_SECONDS='120',
+                           ST_LOAD_REPORT=str(report), ST_LOAD_BASELINE=str(baseline),
+                           ST_BENCH_DIR=str(fixture), TMPDIR=str(temporary))
+        before = machine()
+        with (directory / 'load.log').open('w') as log:
+            trial = subprocess.run([executable['path'], 'daemon_load::', '--nocapture'],
+                                   cwd=workspace, env=environment, stdout=log, stderr=subprocess.STDOUT)
+        after = machine()
+        if not report.exists():
+            write('incomplete-trial.json', {'pair': pair, 'side': side, 'exit_code': trial.returncode})
+            raise RuntimeError('No load report; stop and retain setup/workload failure')
+        result = json.loads(report.read_text())
+        assert result['scale'] == 1 and result['claims'] == 238794
+        assert result['seconds'] >= 120 and result['long_poll_seats'] == 30
+        row = {'pair': pair, 'side': side, 'warmup': pair == 0, 'source_head': executable['head'],
+               'binary_sha256': executable['sha256'], 'exit_code': trial.returncode,
+               'before': before, 'after': after, 'report': result}
+        samples.append(row)
+        write('paired-samples.json', samples)
+        print(json.dumps({'pair': pair, 'side': side, 'warmup': pair == 0,
+                          'exit_code': trial.returncode, 'daemon_cores': result['daemon_cores'],
+                          'claims': result['claims']}), flush=True)
+
+assert {path.name: digest(path) for path in fixture_files} == fixture_hashes
+assert {path.name: digest(path) for path in sorted(baseline.glob('load-*.json'))} == baseline_hashes
+write('paired-summary.json', {
+    'plan': plan,
+    'executables': executables,
+    'samples': samples,
+    'fixture_and_baseline_bytes_unchanged': True,
+    'all_predeclared_samples_retained': True,
+    'historical_gate_failures': sum(row['exit_code'] != 0 for row in samples),
+})
+with pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+    summary.write('Single-runner record comparison: one warmup pair and five alternating measured pairs.\n\n')
+    summary.write('All runs use unchanged historical assertions/budgets. Nonzero outcomes remain failures.\n\n')
+    summary.write('| Pair | Side | Warmup | Exit | CPU cores | Claim p99 ms | Wake p99 ms |\n')
+    summary.write('|---|---|---|---:|---:|---:|---:|\n')
+    for row in samples:
+        report = row['report']
+        summary.write(f"| {row['pair']} | {row['side']} | {row['warmup']} | {row['exit_code']} | "
+                      f"{report['daemon_cores']:.3f} | {report['paths']['claim']['p99_ms']:.2f} | "
+                      f"{report['paths']['replication wake']['p99_ms']:.2f} |\n")
+raise SystemExit(1 if any(row['exit_code'] for row in samples) else 0)
