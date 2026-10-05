@@ -611,6 +611,8 @@ fn validate_surfaces(
         "UsagePeriod",
         "MailBacklog",
         "UsageRow",
+        "UsagePricing",
+        "UsagePricingRates",
         "ClientConnections",
         "ClientConnection",
         "UsageLimit",

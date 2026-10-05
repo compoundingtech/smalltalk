@@ -577,6 +577,13 @@ CREATE TABLE IF NOT EXISTS local_usage_spend (
     observed_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY(subject, incarnation_id, model, account, owner_run, owner_step, host)
 );
+-- Provenance shares the existing cumulative spend slot; individual responses remain local.
+CREATE TABLE IF NOT EXISTS local_usage_provenance (
+    subject TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    pricing TEXT NOT NULL,
+    PRIMARY KEY(subject, slot)
+);
 -- The seats this node's limits policy stopped, once per account and weekly window, so a seat a
 -- person starts again stays up until the window resets.
 CREATE TABLE IF NOT EXISTS local_limit_stops (
@@ -9141,6 +9148,23 @@ impl Store {
         {
             fields.insert(name.into(), Value::from(value));
         }
+        let provenance: Option<String> = connection
+            .query_row(
+                "SELECT pricing FROM local_usage_provenance WHERE subject=?1 AND slot=?2",
+                params![observation.subject, usage_slot(&fields)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(provenance) = provenance {
+            fields.insert(
+                "pricing_provenance".into(),
+                serde_json::from_str(&provenance)?,
+            );
+        }
+        // Never use the seat's current binding for a response from an older incarnation.
+        if let Some(binding) = usage_native_session(&connection, &observation.subject, &fields)? {
+            fields.insert("native_session_id".into(), Value::String(binding));
+        }
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
         Ok(Some(ClaimInput {
             subject: observation.subject.clone(),
@@ -13853,21 +13877,13 @@ impl Store {
     /// and step on one host, with its API-equivalent cost in millionths of a dollar. Tokens no
     /// price covers are counted in `unpriced_tokens`, never as free.
     pub fn usage_period_rows(&self, since_ms: u64, until_ms: u64) -> Result<Vec<Value>> {
-        const BUCKETS: [&str; 9] = [
-            "total_tokens",
-            "input_tokens",
-            "output_tokens",
-            "cache_write_tokens",
-            "cache_write_1h_tokens",
-            "cached_tokens",
-            "cost_microusd",
-            "reported_cost_microusd",
-            "unpriced_tokens",
-        ];
-        #[derive(Clone, Copy, Default)]
+        #[derive(Clone, Default)]
         struct Snapshot {
             at: u64,
-            buckets: [u64; BUCKETS.len()],
+            buckets: [u64; USAGE_BUCKETS.len()],
+            pricing: String,
+            native_session_id: Option<String>,
+            provenance: Option<Vec<Value>>,
         }
         let connection = self.readers.get();
         let mut statement = connection.prepare(&canonical_sql(
@@ -13883,7 +13899,7 @@ impl Store {
             ))
         })?;
         type Key = (String, String, String, String, String, String, String);
-        let mut groups = BTreeMap::<Key, (Option<Snapshot>, Option<Snapshot>, String)>::new();
+        let mut groups = BTreeMap::<Key, (Option<Snapshot>, Option<Snapshot>)>::new();
         for row in rows {
             let (subject, _index, body) = row?;
             let body: Value = serde_json::from_str(&body)?;
@@ -13894,9 +13910,12 @@ impl Store {
             }
             let mut snapshot = Snapshot {
                 at,
+                pricing: fields["pricing"].as_str().unwrap_or("").to_owned(),
+                native_session_id: fields["native_session_id"].as_str().map(str::to_owned),
+                provenance: fields["pricing_provenance"].as_array().cloned(),
                 ..Snapshot::default()
             };
-            for (bucket, name) in snapshot.buckets.iter_mut().zip(BUCKETS) {
+            for (bucket, name) in snapshot.buckets.iter_mut().zip(USAGE_BUCKETS) {
                 *bucket = fields[name].as_u64().unwrap_or(0);
             }
             // A rollup from before costs were recorded priced nothing: its tokens are unpriced.
@@ -13913,20 +13932,15 @@ impl Store {
                 text("owner_step"),
                 text("host"),
             );
-            let (baseline, latest, pricing) = groups.entry(key).or_default();
+            let (baseline, latest) = groups.entry(key).or_default();
             let target = if at <= since_ms { baseline } else { latest };
-            if target.is_none_or(|previous| at >= previous.at) {
+            if target.as_ref().is_none_or(|previous| at >= previous.at) {
                 *target = Some(snapshot);
-                if at > since_ms {
-                    *pricing = text("pricing");
-                }
             }
         }
         let mut result = Vec::new();
-        for (
-            (agent, _incarnation, model, account, mission_run, step, host),
-            (baseline, latest, pricing),
-        ) in groups
+        for ((agent, _incarnation, model, account, mission_run, step, host), (baseline, latest)) in
+            groups
         {
             let Some(latest) = latest else {
                 continue;
@@ -13939,9 +13953,18 @@ impl Store {
             let mut row = json!({
                 "agent": agent, "mission_run": mission_run, "step": step,
                 "model": model, "account": account, "host": host,
-                "pricing": pricing,
+                "pricing": latest.pricing,
             });
-            for (index, name) in BUCKETS.iter().enumerate() {
+            if let Some(session) = latest.native_session_id {
+                row["native_session_id"] = json!(session);
+            }
+            if let Some(provenance) = latest.provenance {
+                row["pricing_provenance"] = json!(pricing_period_delta(
+                    provenance,
+                    baseline.provenance.as_deref().unwrap_or(&[]),
+                ));
+            }
+            for (index, name) in USAGE_BUCKETS.iter().enumerate() {
                 row[*name] =
                     Value::from(latest.buckets[index].saturating_sub(baseline.buckets[index]));
             }
@@ -17372,6 +17395,87 @@ fn insert_local_observation_tx(
                     total_tokens, cost_microusd, reported_cost.unwrap_or(0), unpriced_tokens,
                     observed_at as i64],
             ).map_err(internal)?;
+            // Keep each distinct price/source/effective-rate combination cumulative. A later
+            // table revision or long-context response must not relabel earlier spend.
+            let mut key_fields = BTreeMap::from([
+                ("semantics".into(), json!("response_rollup")),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("model".into(), json!(model)),
+                ("owner_run".into(), json!(owner_run)),
+                ("owner_step".into(), json!(owner_step)),
+                ("host".into(), json!(origin)),
+            ]);
+            if !account.is_empty() {
+                key_fields.insert("account".into(), json!(account));
+            }
+            let slot = usage_slot(&key_fields);
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT pricing FROM local_usage_provenance WHERE subject=?1 AND slot=?2",
+                    params![input.subject, slot],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(internal)?;
+            let mut provenance: Vec<Value> = previous
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(internal)?
+                .unwrap_or_default();
+            let tokens = crate::pricing::Tokens {
+                input: input_tokens,
+                output: output_tokens,
+                cache_read: cached_tokens,
+                cache_write: cache_write_tokens,
+                cache_write_1h: cache_write_1h_tokens,
+            };
+            let mut entry = json!({
+                "cost_source": if reported_cost.is_some() { "provider_reported" }
+                    else if estimated_cost.is_some() { "computed" } else { "unpriced" },
+            });
+            // A provider figure does not reveal the provider's own price table or rates.
+            if reported_cost.is_none() {
+                entry["price_table_id"] = json!(crate::pricing::PRICE_TABLE_ID);
+                entry["price_table_version"] = json!(crate::pricing::price_table_version());
+                if let Some(rates) = crate::pricing::applied_rates(model, tokens) {
+                    let mut rates = serde_json::to_value(rates).map_err(internal)?;
+                    rates.as_object_mut().unwrap().remove("long_context");
+                    entry["rates_usd_per_million_tokens"] = rates;
+                }
+            }
+            let index = provenance
+                .iter()
+                .position(|previous| pricing_identity(previous) == pricing_identity(&entry));
+            if let Some(index) = index {
+                entry = provenance.remove(index);
+            }
+            for (name, value) in USAGE_BUCKETS.into_iter().zip([
+                total_tokens,
+                input_tokens,
+                output_tokens,
+                cache_write_tokens,
+                cache_write_1h_tokens,
+                cached_tokens,
+                cost_microusd,
+                reported_cost.unwrap_or(0),
+                unpriced_tokens,
+            ]) {
+                entry[name] = json!(entry[name].as_u64().unwrap_or(0).saturating_add(value));
+            }
+            provenance.push(entry);
+            provenance.sort_by_key(pricing_identity);
+            transaction
+                .execute(
+                    "INSERT INTO local_usage_provenance(subject, slot, pricing) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(subject, slot) DO UPDATE SET pricing=excluded.pricing",
+                    params![
+                        input.subject,
+                        slot,
+                        serde_json::to_string(&provenance).map_err(internal)?
+                    ],
+                )
+                .map_err(internal)?;
         }
     }
     smallclaims::touched::note_wrote(|| format!("{} {}", input.kind, input.subject));
@@ -17556,6 +17660,86 @@ fn publish_changed_harness_state_tx(
     Ok(Some(claim))
 }
 
+fn usage_native_session(
+    connection: &Connection,
+    subject: &str,
+    fields: &BTreeMap<String, Value>,
+) -> Result<Option<String>> {
+    if fields.get("semantics").and_then(Value::as_str) != Some("response_rollup") {
+        return Ok(None);
+    }
+    let text = |key| fields.get(key).and_then(Value::as_str).unwrap_or("");
+    let binding: Option<String> = connection
+        .query_row(
+            &canonical_sql(
+                "SELECT json_extract(body, '$.fields.session_id') FROM claims
+         WHERE subject=?1 AND kind='harness.session-file'
+           AND json_extract(body, '$.fields.incarnation_id')=?2
+           AND json_extract(body, '$.fields.harness')=?3
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ),
+            params![subject, text("incarnation_id"), text("driver")],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(binding) = binding.filter(|id| !id.trim().is_empty()) {
+        return Ok(Some(binding));
+    }
+    // The native claim may have been trimmed after this slot first published. Its own
+    // published snapshot is still an exact-incarnation carrier, never a current-seat guess.
+    let previous: Option<Option<String>> = connection.query_row(
+        "SELECT json_extract(published_fields, '$.native_session_id') FROM local_latest_slots
+         WHERE subject=?1 AND kind='harness.usage' AND slot=?2",
+        params![subject, usage_slot(fields)], |row| row.get(0),
+    ).optional()?;
+    Ok(previous.flatten().filter(|id| !id.trim().is_empty()))
+}
+
+const USAGE_BUCKETS: [&str; 9] = [
+    "total_tokens",
+    "input_tokens",
+    "output_tokens",
+    "cache_write_tokens",
+    "cache_write_1h_tokens",
+    "cached_tokens",
+    "cost_microusd",
+    "reported_cost_microusd",
+    "unpriced_tokens",
+];
+
+fn pricing_identity(entry: &Value) -> String {
+    json!([
+        entry.get("price_table_id"),
+        entry.get("price_table_version"),
+        entry.get("cost_source"),
+        entry.get("rates_usd_per_million_tokens")
+    ])
+    .to_string()
+}
+
+fn pricing_period_delta(latest: Vec<Value>, baseline: &[Value]) -> Vec<Value> {
+    latest
+        .into_iter()
+        .filter_map(|mut entry| {
+            if let Some(before) = baseline
+                .iter()
+                .find(|before| pricing_identity(before) == pricing_identity(&entry))
+            {
+                for name in USAGE_BUCKETS {
+                    entry[name] = json!(
+                        entry[name]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .saturating_sub(before[name].as_u64().unwrap_or(0))
+                    );
+                }
+            }
+            // A zero-token response may still have a reported cost.
+            (entry["total_tokens"] != 0 || entry["cost_microusd"] != 0).then_some(entry)
+        })
+        .collect()
+}
+
 fn usage_slot(fields: &BTreeMap<String, Value>) -> String {
     if fields.get("semantics").and_then(Value::as_str) == Some("response_rollup") {
         // Each rollup key is its own cumulative series. Sharing one slot per incarnation would
@@ -17643,6 +17827,15 @@ fn publish_usage_slot_tx(
     fields: &BTreeMap<String, Value>,
     now: u128,
 ) -> Result<ClaimRecord, St3Error> {
+    let mut fields = fields.clone();
+    // Native binding can arrive after the response was captured. Enrich at the scheduled
+    // publication (including stop), without adding a publication or changing the slot.
+    if !fields.contains_key("native_session_id")
+        && let Some(binding) =
+            usage_native_session(transaction, subject, &fields).map_err(internal)?
+    {
+        fields.insert("native_session_id".into(), json!(binding));
+    }
     let fields_text = canonical_json_text(&json!(fields)).map_err(internal)?;
     transaction
         .execute(
@@ -17655,7 +17848,7 @@ fn publish_usage_slot_tx(
                 pending_local_id=NULL",
             params![
                 subject,
-                usage_slot(fields),
+                usage_slot(&fields),
                 now.min(i64::MAX as u128) as i64,
                 fields_text
             ],
@@ -41218,6 +41411,178 @@ mission "nested-work" state="ready" {
                 .total_tokens,
             65
         );
+    }
+
+    #[test]
+    fn usage_provenance_survives_resume_replay_periods_and_reopen() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("usage.sqlite3");
+        let local = Store::open(&path, "host-one").unwrap();
+        let subject = "agent/example.provenance";
+        let binding = |incarnation: &str, session: &str| {
+            local
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.session-file".into(),
+                    actor: Some(subject.into()),
+                    fields: BTreeMap::from([
+                        ("harness".into(), json!("codex")),
+                        ("session_id".into(), json!(session)),
+                        ("incarnation_id".into(), json!(incarnation)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("binding-{incarnation}")),
+                })
+                .unwrap();
+        };
+        let respond = |incarnation: &str, entry: &str, input: u64, reported: bool| {
+            let mut claim = timeline_observation(subject, incarnation, entry);
+            claim.fields.insert("driver".into(), json!("codex"));
+            claim.fields.insert("entry_type".into(), json!("usage"));
+            let mut body = json!({"semantics":"response", "model":"gpt-6.1-sol",
+                "input_tokens":input,"output_tokens":100,"total_tokens":input+100});
+            if reported {
+                body["cost"] = json!(0.001);
+            }
+            claim.fields.insert("body".into(), body);
+            let observation = local.append_claim(&claim).unwrap();
+            let rollup = local
+                .usage_rollup_for_timeline(&observation)
+                .unwrap()
+                .unwrap();
+            local.append_client_claim(&rollup).unwrap();
+            (claim, observation, rollup)
+        };
+        binding("inc-one", "native-example");
+        let (first, observation, baseline) = respond("inc-one", "price-short", 1000, false);
+        let provenance = &baseline.fields["pricing_provenance"][0];
+        assert_eq!(provenance["price_table_id"], crate::pricing::PRICE_TABLE_ID);
+        assert_eq!(
+            provenance["price_table_version"],
+            crate::pricing::price_table_version()
+        );
+        assert_eq!(provenance["cost_source"], "computed");
+        assert_eq!(provenance["rates_usd_per_million_tokens"]["input"], 2.0);
+        assert_eq!(baseline.fields["native_session_id"], "native-example");
+        let since = baseline.fields["observed_at_unix_ms"].as_u64().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        respond("inc-one", "price-long", 300000, false);
+        let (_, _, mixed) = respond("inc-one", "price-reported", 10, true);
+        assert_eq!(
+            mixed.fields["pricing_provenance"].as_array().unwrap().len(),
+            3
+        );
+        let computed = mixed.fields["pricing_provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["cost_source"] == "computed")
+            .collect::<Vec<_>>();
+        assert!(
+            computed
+                .iter()
+                .any(|p| p["rates_usd_per_million_tokens"]["input"] == 4.0
+                    && p["rates_usd_per_million_tokens"]["output"] == 15.0)
+        );
+        let reported = mixed.fields["pricing_provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["cost_source"] == "provider_reported")
+            .unwrap();
+        assert!(reported.get("rates_usd_per_million_tokens").is_none());
+        assert!(reported.get("price_table_id").is_none());
+        // Replaying the response never adds another provenance contribution.
+        local.append_claim(&first).unwrap();
+        assert_eq!(
+            local
+                .usage_rollup_for_timeline(&observation)
+                .unwrap()
+                .unwrap()
+                .fields,
+            mixed.fields
+        );
+        let period = local.usage_period_rows(since, u64::MAX).unwrap();
+        assert_eq!(period[0]["pricing_provenance"].as_array().unwrap().len(), 2);
+        assert_eq!(period[0]["total_tokens"], 300210);
+        assert_eq!(
+            period[0]["pricing_provenance"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["total_tokens"].as_u64().unwrap())
+                .sum::<u64>(),
+            300210
+        );
+        let typed: st3_client::UsageRow = serde_json::from_value(period[0].clone()).unwrap();
+        assert_eq!(typed.native_session_id.as_deref(), Some("native-example"));
+        assert_eq!(typed.pricing_provenance.unwrap().len(), 2);
+        // Resume binds a new incarnation to the same conversation. A newer conversation on
+        // this seat must not steal the old incarnation's spend.
+        binding("inc-two", "native-example");
+        let (_, _, resumed) = respond("inc-two", "after-resume", 20, false);
+        assert_eq!(resumed.fields["native_session_id"], "native-example");
+        binding("inc-three", "native-other");
+        assert_eq!(
+            local
+                .usage_rollup_for_timeline(&observation)
+                .unwrap()
+                .unwrap()
+                .fields["native_session_id"],
+            "native-example"
+        );
+        let all = local.usage_period_rows(0, u64::MAX).unwrap();
+        let peer = Store::open_memory("host-two").unwrap();
+        receive_and_project(
+            &peer,
+            "host-one",
+            &exchange_from(&local, &ReplicationInventory::default()),
+        );
+        assert_eq!(peer.usage_period_rows(0, u64::MAX).unwrap(), all);
+        drop(local);
+        let reopened = Store::open(&path, "host-one").unwrap();
+        assert_eq!(reopened.usage_period_rows(0, u64::MAX).unwrap(), all);
+        assert_eq!(
+            reopened
+                .usage_rollup_for_timeline(&observation)
+                .unwrap()
+                .unwrap()
+                .fields,
+            mixed.fields
+        );
+    }
+
+    #[test]
+    fn historical_usage_claims_leave_provenance_unknown() {
+        let local = Store::open_memory("host-one").unwrap();
+        let subject = "agent/example.legacy";
+        local
+            .append_client_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.usage".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("semantics".into(), json!("response_rollup")),
+                    ("driver".into(), json!("claude")),
+                    ("incarnation_id".into(), json!("legacy-inc")),
+                    ("total_tokens".into(), json!(99)),
+                    ("observed_at_unix_ms".into(), json!(10)),
+                    ("pricing".into(), json!("old-label")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let rows = local.usage_period_rows(0, 100).unwrap();
+        assert_eq!(rows[0]["unpriced_tokens"], 99);
+        assert_eq!(rows[0]["pricing"], "old-label");
+        assert!(rows[0].get("pricing_provenance").is_none());
+        assert!(rows[0].get("native_session_id").is_none());
+        let typed: st3_client::UsageRow = serde_json::from_value(rows[0].clone()).unwrap();
+        assert!(typed.native_session_id.is_none());
+        assert!(typed.pricing_provenance.is_none());
     }
 
     #[test]

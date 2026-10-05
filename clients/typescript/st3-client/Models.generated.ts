@@ -1555,6 +1555,30 @@ export type UsagePeriod = {
   until_ms: number;
 };
 
+export type UsagePricing = {
+  cache_write_1h_tokens: number;
+  cache_write_tokens: number;
+  cached_tokens: number;
+  cost_microusd: number;
+  cost_source: "provider_reported" | "computed" | "unpriced";
+  input_tokens: number;
+  output_tokens: number;
+  price_table_id?: string;
+  price_table_version?: string;
+  rates_usd_per_million_tokens?: UsagePricingRates;
+  reported_cost_microusd: number;
+  total_tokens: number;
+  unpriced_tokens: number;
+};
+
+export type UsagePricingRates = {
+  cache_read: number;
+  cache_write_1h: number;
+  cache_write_5m: number;
+  input: number;
+  output: number;
+};
+
 export type UsageRow = {
   account?: string;
   agent: Id;
@@ -1566,8 +1590,10 @@ export type UsageRow = {
   input_tokens: number;
   mission_run?: Id;
   model?: string;
+  native_session_id?: string;
   output_tokens: number;
   pricing?: string;
+  pricing_provenance?: Array<UsagePricing>;
   reported_cost_microusd: number;
   step?: Id;
   total_tokens: number;

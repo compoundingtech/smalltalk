@@ -644,6 +644,8 @@
         "account": { "type": "string" },
         "host": { "type": "string" },
         "pricing": { "type": "string" },
+        "native_session_id": { "type": "string" },
+        "pricing_provenance": { "type": "array", "items": { "$ref": "#/$defs/UsagePricing" } },
         "total_tokens": { "type": "integer", "minimum": 0 },
         "input_tokens": { "type": "integer", "minimum": 0 },
         "output_tokens": { "type": "integer", "minimum": 0 },
@@ -653,6 +655,111 @@
         "cost_microusd": { "type": "integer", "minimum": 0 },
         "reported_cost_microusd": { "type": "integer", "minimum": 0 },
         "unpriced_tokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "UsagePricingRates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "output",
+        "cache_read",
+        "cache_write_5m",
+        "cache_write_1h"
+      ],
+      "properties": {
+        "input": {
+          "type": "number",
+          "minimum": 0
+        },
+        "output": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cache_read": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cache_write_5m": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cache_write_1h": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "UsagePricing": {
+      "description": "Cumulative contribution on claims; period contribution on usage reads. Provider-reported costs have no disclosed price table or rates. Missing provenance on historical claims is unknown.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cost_source",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_write_tokens",
+        "cache_write_1h_tokens",
+        "cached_tokens",
+        "cost_microusd",
+        "reported_cost_microusd",
+        "unpriced_tokens"
+      ],
+      "properties": {
+        "price_table_id": {
+          "type": "string"
+        },
+        "price_table_version": {
+          "type": "string"
+        },
+        "cost_source": {
+          "type": "string",
+          "enum": [
+            "provider_reported",
+            "computed",
+            "unpriced"
+          ]
+        },
+        "rates_usd_per_million_tokens": {
+          "$ref": "#/$defs/UsagePricingRates"
+        },
+        "total_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_write_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_write_1h_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cached_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_microusd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reported_cost_microusd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unpriced_tokens": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "Mission": {
