@@ -26,8 +26,10 @@ jobs:
       pull-requests: read
     outputs:
       ci1: ${{ steps.pick.outputs.ci1 }}
+      ci1_secondary: ${{ steps.pick.outputs.ci1_secondary }}
+      ci1_mail: ${{ steps.pick.outputs.ci1_mail }}
     steps:
-      - name: Use reserved ci1 for priority PRs and the queue; available ci1 for PRs
+      - name: Keep reserved primary lanes and use idle general runners for tests and canaries
         id: pick
         env:
           GH_TOKEN: ${{ secrets.CI1_RUNNERS_READ_TOKEN }}
@@ -40,19 +42,24 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           NEED: ${{ vars.CI1_MIN_IDLE || '4' }}
         run: |
+          primary_label=
           namespace() {
             echo "$1: Namespace"
-            printf 'Runner: **Namespace** (%s)\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+            printf 'Unpicked runners: **Namespace** (%s)\n' "$1" >> "$GITHUB_STEP_SUMMARY"
             exit 0
+          }
+          primary() {
+            primary_label=$1
+            printf 'ci1=["%s"]\n' "$primary_label" >> "$GITHUB_OUTPUT"
+            printf 'Primary runner: **ci1** (%s)\n' "$primary_label" >> "$GITHUB_STEP_SUMMARY"
           }
           if [ "$EVENT" = pull_request ] && [ "$HEAD_REPOSITORY" != "$REPOSITORY" ]; then
             namespace "a pull request from a fork never runs on ci1"
           fi
           if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_LABELS" >/dev/null 2>&1; then
-            printf 'ci1=["ci1-priority"]\n' >> "$GITHUB_OUTPUT"
+            primary ci1-priority
             echo "priority PR: reserved ci1-priority capacity"
             printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\n' >> "$GITHUB_STEP_SUMMARY"
-            exit 0
           fi
           if [ "$EVENT" = merge_group ]; then
             label=ci1-merge
@@ -63,25 +70,42 @@ jobs:
                 label=ci1-priority
               fi
             fi
-            printf 'ci1=["%s"]\n' "$label" >> "$GITHUB_OUTPUT"
+            primary "$label"
             echo "merge queue: reserved $label runners"
             printf 'Runner: **ci1** (%s, reserved merge-queue capacity)\n' "$label" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
           fi
-          label=ci1
           [ -n "$GH_TOKEN" ] || namespace "no runner status token"
           [[ "$NEED" =~ ^[1-9][0-9]*$ ]] || namespace "invalid minimum idle runner count"
           if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>&1); then
             echo "::warning::could not list ci1's runners: $runners"
             namespace "the runner list is unavailable"
           fi
-          if ! idle=$(jq -e --arg label "$label" '[.[].runners[] | select(.status == "online" and .busy == false and any(.labels[]; .name == $label))] | length' <<< "$runners"); then
+          if ! idle=$(jq -e '[.[].runners[] | select(.status == "online" and .busy == false and any(.labels[]; .name == "ci1"))] | length' <<< "$runners"); then
             namespace "the runner list is invalid"
           fi
-          [ "$idle" -ge "$NEED" ] || namespace "$idle $label runners idle, $NEED needed"
-          printf 'ci1=["%s"]\n' "$label" >> "$GITHUB_OUTPUT"
-          echo "$idle $label runners idle: ci1"
-          printf 'Runner: **ci1** (%s, %s idle)\n' "$label" "$idle" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$primary_label" ]; then
+            if [ "$idle" -ge "$NEED" ]; then
+              primary ci1
+            else
+              printf 'Primary runner: **Namespace** (%s general runners idle, %s needed)\n' "$idle" "$NEED" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          # A primary on ci1 or ci1-merge may take a general worker. Account for that worker
+          # before offering separate slots to the second shard and canaries. A priority
+          # primary has its own reserved label; general workers temporarily lent to priority
+          # work no longer carry ci1 and therefore were excluded from the idle count above.
+          available=$idle
+          case "$primary_label" in ci1|ci1-merge) available=$((available - 1));; esac
+          echo "$idle general runners idle; primary minimum $NEED; extra slots $available"
+          for output in ci1_secondary ci1_mail; do
+            if [ "$available" -gt 0 ]; then
+              printf '%s=["ci1"]\n' "$output" >> "$GITHUB_OUTPUT"
+              printf '%s runner: **ci1** (idle general slot)\n' "$output" >> "$GITHUB_STEP_SUMMARY"
+              available=$((available - 1))
+            else
+              printf '%s runner: **Namespace** (no idle general slot)\n' "$output" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
       - name: Report job cache coverage
         if: always()
         shell: bash
@@ -503,11 +527,7 @@ jobs:
     name: linux-tests-shard-2
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on:
-      [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1_secondary || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -882,11 +902,7 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   mail-redelivery-canaries:
     name: mail-redelivery-canaries
-    runs-on:
-      [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1_mail || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 120
     defaults:
       run:

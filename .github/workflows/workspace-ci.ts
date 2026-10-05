@@ -29,8 +29,9 @@ export const linuxActionlintConfig = {
 } as const
 
 /**
- * ci1 takes the primary Workspace CI test partition when enough general runners are idle;
- * Namespace takes the second partition and supporting jobs on independent CPUs. GitHub has no
+ * ci1 takes the primary Workspace CI test partition when enough general runners are idle.
+ * The second partition and mail canaries may each take an idle general runner; other supporting
+ * jobs stay on Namespace. GitHub has no
  * overflow between runner labels, so the `pick-runner` job asks the
  * GitHub API how many ci1 runners are idle before the other jobs start, and their `runs-on` reads its
  * output. Trusted PRs labelled `ci-priority` use the reserved `ci1-priority` lane.
@@ -43,7 +44,7 @@ export const linuxActionlintConfig = {
  */
 export const pickRunnerJobId = 'pick-runner'
 
-/** Leave CPU capacity for the priority and merge lanes; only one shard uses ci1 per run. */
+/** Preserve the primary shard's admission threshold; extra jobs use only observed free slots. */
 const ci1MinIdle = 4
 
 export const pickRunnerJob = {
@@ -53,10 +54,14 @@ export const pickRunnerJob = {
   'runs-on': 'ubuntu-latest',
   'timeout-minutes': 3,
   permissions: { 'pull-requests': 'read' },
-  outputs: { ci1: '${{ steps.pick.outputs.ci1 }}' },
+  outputs: {
+    ci1: '${{ steps.pick.outputs.ci1 }}',
+    ci1_secondary: '${{ steps.pick.outputs.ci1_secondary }}',
+    ci1_mail: '${{ steps.pick.outputs.ci1_mail }}',
+  },
   steps: [
     {
-      name: 'Use reserved ci1 for priority PRs and the queue; available ci1 for PRs',
+      name: 'Keep reserved primary lanes and use idle general runners for tests and canaries',
       id: 'pick',
       env: {
         // A token that may only read the organization's self-hosted runners. Forks never receive it.
@@ -70,19 +75,24 @@ export const pickRunnerJob = {
         OWNER: '${{ github.repository_owner }}',
         NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1MinIdle}' }}`,
       },
-      run: `namespace() {
+      run: `primary_label=
+namespace() {
   echo "$1: Namespace"
-  printf 'Runner: **Namespace** (%s)\\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+  printf 'Unpicked runners: **Namespace** (%s)\\n' "$1" >> "$GITHUB_STEP_SUMMARY"
   exit 0
+}
+primary() {
+  primary_label=$1
+  printf 'ci1=["%s"]\\n' "$primary_label" >> "$GITHUB_OUTPUT"
+  printf 'Primary runner: **ci1** (%s)\\n' "$primary_label" >> "$GITHUB_STEP_SUMMARY"
 }
 if [ "$EVENT" = pull_request ] && [ "$HEAD_REPOSITORY" != "$REPOSITORY" ]; then
   namespace "a pull request from a fork never runs on ci1"
 fi
 if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_LABELS" >/dev/null 2>&1; then
-  printf 'ci1=["ci1-priority"]\\n' >> "$GITHUB_OUTPUT"
+  primary ci1-priority
   echo "priority PR: reserved ci1-priority capacity"
   printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\\n' >> "$GITHUB_STEP_SUMMARY"
-  exit 0
 fi
 if [ "$EVENT" = merge_group ]; then
   label=ci1-merge
@@ -93,31 +103,48 @@ if [ "$EVENT" = merge_group ]; then
       label=ci1-priority
     fi
   fi
-  printf 'ci1=["%s"]\\n' "$label" >> "$GITHUB_OUTPUT"
+  primary "$label"
   echo "merge queue: reserved $label runners"
   printf 'Runner: **ci1** (%s, reserved merge-queue capacity)\\n' "$label" >> "$GITHUB_STEP_SUMMARY"
-  exit 0
 fi
-label=ci1
 [ -n "$GH_TOKEN" ] || namespace "no runner status token"
 [[ "$NEED" =~ ^[1-9][0-9]*$ ]] || namespace "invalid minimum idle runner count"
 if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>&1); then
   echo "::warning::could not list ci1's runners: $runners"
   namespace "the runner list is unavailable"
 fi
-if ! idle=$(jq -e --arg label "$label" '[.[].runners[] | select(.status == "online" and .busy == false and any(.labels[]; .name == $label))] | length' <<< "$runners"); then
+if ! idle=$(jq -e '[.[].runners[] | select(.status == "online" and .busy == false and any(.labels[]; .name == "ci1"))] | length' <<< "$runners"); then
   namespace "the runner list is invalid"
 fi
-[ "$idle" -ge "$NEED" ] || namespace "$idle $label runners idle, $NEED needed"
-printf 'ci1=["%s"]\\n' "$label" >> "$GITHUB_OUTPUT"
-echo "$idle $label runners idle: ci1"
-printf 'Runner: **ci1** (%s, %s idle)\\n' "$label" "$idle" >> "$GITHUB_STEP_SUMMARY"`,
+if [ -z "$primary_label" ]; then
+  if [ "$idle" -ge "$NEED" ]; then
+    primary ci1
+  else
+    printf 'Primary runner: **Namespace** (%s general runners idle, %s needed)\\n' "$idle" "$NEED" >> "$GITHUB_STEP_SUMMARY"
+  fi
+fi
+# A primary on ci1 or ci1-merge may take a general worker. Account for that worker
+# before offering separate slots to the second shard and canaries. A priority
+# primary has its own reserved label; general workers temporarily lent to priority
+# work no longer carry ci1 and therefore were excluded from the idle count above.
+available=$idle
+case "$primary_label" in ci1|ci1-merge) available=$((available - 1));; esac
+echo "$idle general runners idle; primary minimum $NEED; extra slots $available"
+for output in ci1_secondary ci1_mail; do
+  if [ "$available" -gt 0 ]; then
+    printf '%s=["ci1"]\\n' "$output" >> "$GITHUB_OUTPUT"
+    printf '%s runner: **ci1** (idle general slot)\\n' "$output" >> "$GITHUB_STEP_SUMMARY"
+    available=$((available - 1))
+  else
+    printf '%s runner: **Namespace** (no idle general slot)\\n' "$output" >> "$GITHUB_STEP_SUMMARY"
+  fi
+done`,
     },
   ],
 } as const
 
-const pickedOr = (namespaceLabels: string) =>
-  `\${{ fromJSON(needs.${pickRunnerJobId}.outputs.ci1 || ${namespaceLabels}) }}`
+const pickedOr = (namespaceLabels: string, output = 'ci1') =>
+  `\${{ fromJSON(needs.${pickRunnerJobId}.outputs.${output} || ${namespaceLabels}) }}`
 
 // Same priority for required, optional and manual jobs. Run affinity makes Namespace's
 // scheduled order deterministic; a newer required run cannot steal an older benchmark's runner.
@@ -126,12 +153,22 @@ export const linuxStageRunsOn = pickedOr(
   `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
 )
 
+/** Extra test jobs can consume only general ci1 slots, never the primary's reserved label. */
+export const secondaryStageRunsOn = pickedOr(
+  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  'ci1_secondary',
+)
+export const mailStageRunsOn = pickedOr(
+  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  'ci1_mail',
+)
+
 /** `runs-on` for a Linux profile job: picked ci1, else the shared Namespace queue class. */
 export const linuxRunsOn = pickedOr(
   `format('${JSON.stringify(linuxRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
 )
 
-/** Supporting jobs use independent CPUs; only the primary test shard takes the picked lane. */
+/** Other supporting jobs stay on Namespace rather than spending the test runners. */
 export const supportingLinuxRunsOn = linuxRunner
 export const supportingStageRunsOn = linuxStageRunner
 
