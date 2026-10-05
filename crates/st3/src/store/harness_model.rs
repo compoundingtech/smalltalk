@@ -406,7 +406,7 @@ mod tests {
         let command = store.take_harness_model(&fence).unwrap().unwrap();
         store.settle_harness_model(&model_proof(&command, Outcome::Rejected, None), &fence).unwrap();
         let mut other_actor = original;
-        other_actor.actor = "person/another".into();
+        other_actor.actor = "person/operator-two".into();
         assert_ne!(store.reserve_harness_model(&other_actor).unwrap().operation_id, accepted.operation_id);
     }
 
