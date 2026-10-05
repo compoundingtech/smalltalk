@@ -21766,6 +21766,44 @@ mod tests {
     }
 
     #[test]
+    fn cli_timeline_folds_claude_skill_and_raw_preserves_the_expansion() {
+        let items: Vec<ClientTimelineEntry> = serde_json::from_str(include_str!(
+            "../../../fixtures/clients/transcripts/claude-skill.json"
+        ))
+        .unwrap();
+        for density in [
+            st3_conversation_ui::Density::Full,
+            st3_conversation_ui::Density::Simple,
+        ] {
+            let pretty = conversation_text("session/example", &items, 100, false, density);
+            assert!(pretty.contains("Skill st"), "{pretty}");
+            assert!(!pretty.contains("## Messages"), "{pretty}");
+            assert!(pretty.contains("I have loaded the st skill."), "{pretty}");
+        }
+        let raw = timeline_entries_text("session/example", &items);
+        assert!(raw.contains("# st\n\nThis applies only"), "{raw}");
+        assert!(raw.contains("When\nit prints nothing"), "{raw}");
+        assert!(
+            raw.contains("`<smalltalk-message>`, followed by a bounded preview."),
+            "{raw}"
+        );
+        // Paging can start after Skill: the expansion remains one block, with intact rows.
+        let orphan = conversation_text(
+            "session/example",
+            &items[2..3],
+            100,
+            false,
+            st3_conversation_ui::Density::Full,
+        );
+        assert!(orphan.lines().any(|line| line.trim() == "## Messages"), "{orphan}");
+        assert!(
+            orphan.contains("<smalltalk-message>, followed by a bounded preview."),
+            "{orphan}"
+        );
+        assert!(!orphan.contains("Whenit"), "{orphan}");
+    }
+
+    #[test]
     fn usage_report_ranks_each_group_by_cost_and_marks_unpriced_tokens() {
         let report = json!({"rows": [
             {"agent":"agent/cheap","mission_run":"mission-run/one","step":"step-run/one/build","model":"model-a","account":"claude/aaaa","host":"host/a","cost_microusd":250000,"total_tokens":900,"input_tokens":200,"output_tokens":100,"cache_write_tokens":0,"cached_tokens":600,"unpriced_tokens":0},

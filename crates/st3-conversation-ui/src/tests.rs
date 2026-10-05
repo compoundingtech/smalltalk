@@ -504,3 +504,185 @@ fn shared_style_rules_are_available_without_a_renderer() {
         .unwrap()
     );
 }
+
+#[test]
+fn claude_skill_expansion_belongs_to_its_call_and_keeps_the_actual_body() {
+    let timeline: Vec<st3_client::TimelineEntry> = serde_json::from_str(include_str!(
+        "../../../fixtures/clients/transcripts/claude-skill.json"
+    ))
+    .unwrap();
+    let raw = match &timeline[2].body {
+        st3_client::TimelineBody::Content(content) => content.text.as_deref().unwrap(),
+        other => panic!("unexpected {other:?}"),
+    };
+    // A window starting after the call still preserves the entire skill as ordinary text.
+    let orphan = adapt::from_harness(true, raw, &Default::default());
+    assert!(
+        matches!(&orphan[..], [Body::User(body)] if body == raw.trim()),
+        "{orphan:?}"
+    );
+    let entries = adapt::conversation(&timeline, &Default::default());
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(entries[0].id, "skill-call");
+    assert!(
+        matches!(&entries[0].body, Body::Tool { title, state: ToolState::Ok, output }
+        if title == "Skill st" && output.join("\n") == raw.trim()),
+        "{entries:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "ratatui")]
+fn claude_skill_renders_folded_and_opens_with_its_newlines_and_quoted_tag() {
+    let timeline = serde_json::from_str::<Vec<st3_client::TimelineEntry>>(include_str!(
+        "../../../fixtures/clients/transcripts/claude-skill.json"
+    ))
+    .unwrap();
+    let entries = adapt::conversation(&timeline, &Default::default());
+    let cache = Cache::default();
+    let folded = cache.render(&entries, 100, &HashSet::new(), "", &theme());
+    assert!(
+        !folded
+            .lines
+            .iter()
+            .any(|line| text::plain(line).contains("## Messages"))
+    );
+    let opened = cache.render(
+        &entries,
+        100,
+        &HashSet::from(["skill-call".into()]),
+        "",
+        &theme(),
+    );
+    assert!(
+        opened
+            .lines
+            .iter()
+            .all(|line| !text::plain(line).contains('\n'))
+    );
+    let rendered = opened
+        .lines
+        .iter()
+        .map(text::plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for kept in [
+        "# st",
+        "## Messages",
+        "`<smalltalk-message>`, followed by a bounded preview.",
+        "it prints nothing, st did not start the session and nothing here applies.",
+    ] {
+        assert!(rendered.contains(kept), "lost {kept:?}: {rendered}");
+    }
+}
+
+#[test]
+fn only_structural_delivery_envelopes_split_harness_content() {
+    let envelope = "<smalltalk-message id=\"a1\" from=\"person/example\" to=\"agent/example/quay\" subject=\"Keys &amp; locks\" sha256=\"00\" graph=\"message/a1\">\nRotate &lt;all&gt; keys.\n</smalltalk-message>";
+    for raw in [
+        "A quoted `<smalltalk-message>` stays here.".to_owned(),
+        "<smalltalk-message>\nordinary text\n</smalltalk-message>".to_owned(),
+        envelope.replace("graph=\"message/a1\"", "graph=\"message/other\""),
+        envelope.replace(" sha256=\"00\"", ""),
+        format!("An example: `{envelope}`"),
+        format!("```xml\n{envelope}\n```"),
+        format!("~~~xml\n{envelope}\n~~~"),
+        envelope
+            .lines()
+            .map(|line| format!("    {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "Mention `<channel>` in prose.".to_owned(),
+    ] {
+        let bodies = adapt::from_harness(true, &raw, &Default::default());
+        assert!(
+            matches!(&bodies[..], [Body::User(text)] if text == raw.trim()),
+            "{bodies:?}"
+        );
+    }
+    // An invalid quoted head must not steal the attributes of a later real delivery.
+    let raw = format!("Mention `<smalltalk-message>` here.\n{envelope}");
+    let bodies = adapt::from_harness(true, &raw, &Default::default());
+    assert!(
+        matches!(&bodies[..], [Body::User(_), Body::Mail { from, subject, body, .. }]
+        if from == "person/example" && subject == "Keys & locks" && body == "Rotate <all> keys."),
+        "{bodies:?}"
+    );
+    let shown = std::collections::BTreeSet::from(["message/a1".into()]);
+    assert!(adapt::from_harness(true, envelope, &shown).is_empty());
+}
+
+#[test]
+fn skill_expansions_match_the_pending_name_in_this_turn() {
+    let timeline: Vec<st3_client::TimelineEntry> = serde_json::from_str(include_str!(
+        "../../../fixtures/clients/transcripts/claude-skill.json"
+    ))
+    .unwrap();
+    let mut other = timeline.clone();
+    if let st3_client::TimelineBody::ToolCall(call) = &mut other[0].body {
+        call.arguments = serde_json::json!({"skill": "another"});
+    }
+    let entries = adapt::conversation(&other, &Default::default());
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(&entry.body, Body::User(_)))
+    );
+    // A later turn's content must not attach to a stale call.
+    let mut later = timeline.clone();
+    later.insert(2, timeline[3].clone());
+    let entries = adapt::conversation(&later, &Default::default());
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(&entry.body, Body::User(_)))
+    );
+    // A later tool result must not overwrite the loaded body.
+    let mut reordered = timeline.clone();
+    reordered.swap(1, 2);
+    let entries = adapt::conversation(&reordered, &Default::default());
+    assert!(matches!(&entries[0].body, Body::Tool { output, .. }
+        if output.iter().any(|line| line == "## Messages")));
+    // Plugin names carry a namespace while the base directory uses the skill basename.
+    let mut plugin = timeline.clone();
+    if let st3_client::TimelineBody::ToolCall(call) = &mut plugin[0].body {
+        call.arguments = serde_json::json!({"skill": "example:st"});
+    }
+    let entries = adapt::conversation(&plugin, &Default::default());
+    assert_eq!(entries.len(), 2);
+}
+
+#[test]
+#[cfg(feature = "ratatui")]
+fn wrapping_multiline_runs_preserves_blank_rows_styles_and_copy_boundaries() {
+    let rows = text::wrap(
+        &[
+            text::run(
+                "When\nit prints nothing\n\n",
+                ratatui::style::Style::default(),
+            ),
+            text::run(
+                "## Messages\nlast",
+                ratatui::style::Style::default().fg(Color::Blue),
+            ),
+        ],
+        14,
+        &[],
+        &[],
+        None,
+    );
+    assert!(rows.iter().all(|line| !text::plain(line).contains('\n')));
+    let selection = Selection {
+        pane: "example".into(),
+        anchor: (0, 0),
+        head: (rows.len() - 1, 100),
+    };
+    assert_eq!(
+        selection.text(&rows),
+        "When\nit prints nothing\n\n## Messages\nlast"
+    );
+    assert!(
+        rows.iter().any(|line| text::plain(line) == "## Messages"
+            && line.spans[0].style.fg == Some(Color::Blue))
+    );
+}
