@@ -73,6 +73,12 @@ mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
 
+/// Recheck the initialized live delivery owner before replacing an unattached seat.
+pub(crate) fn claude_channel_attached(store: &Store, subject: &str, incarnation: &str) -> bool {
+    delivery_presence::attachment(subject, incarnation)
+        .is_some_and(|fence| store.check_mailbox(&fence).is_ok())
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,

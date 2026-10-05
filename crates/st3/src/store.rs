@@ -14904,6 +14904,20 @@ impl Store {
         current_harness_at(&connection, subject, None)
     }
 
+    /// Positive attachment proof under the indexed current-incarnation diagnostic fence.
+    pub(crate) fn claude_channel_attached(&self, subject: &str, incarnation: &str) -> Result<bool> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        let body: Option<String> = connection
+            .prepare_cached(&claude_attachment_query())?
+            .query_row(params![subject, i64::MAX, incarnation], |row| row.get(1))
+            .optional()?;
+        Ok(body
+            .map(|body| serde_json::from_str::<Value>(&body))
+            .transpose()?
+            .is_some_and(|body| body["fields"]["code"] == "claude-channel-attached"))
+    }
+
     pub fn harness_was_ready(&self, subject: &str, incarnation: &str) -> Result<bool> {
         let connection = self.readers.get();
         let found: i64 = connection.query_row(
