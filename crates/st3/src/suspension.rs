@@ -1,5 +1,5 @@
 //! Suspended seats: a running seat stops at a quiet boundary and later resumes its own native
-//! session on the same host.
+//! session on the same host or, for portable drivers, another fleet host.
 //!
 //! A suspension is a pair of fenced runtime actions on the seat, like a restart. A person or
 //! agent asks with `runtime.action.requested {action: suspend | resume}`; the seat's owner records
@@ -11,7 +11,8 @@
 //! resume:  restoring -> verifying   -> resumed           (failed: the seat stays suspended)
 //! ```
 //!
-//! The snapshot is the native session the seat's driver bound for the suspended incarnation, read
+//! The snapshot includes a host-local workspace bundle and, for portable drivers, native files.
+//! The native session is the one the driver bound for the suspended incarnation, read
 //! from its `harness.session-file` claim. Resume launches the driver with that session named in
 //! [`RESUME_ENV`]; the driver relaunches the harness on exactly that session or exits with a typed
 //! reason, and the resume completes only when the driver binds the same session again.
@@ -63,6 +64,10 @@ pub fn resume_completed_key(request: &str) -> String {
 pub struct Suspension {
     /// `suspend` or `resume`: the request this phase belongs to.
     pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_host: Option<String>,
     /// `quiescing`, `snapshotting`, `suspended`, `failed` (a refused suspend), `restoring`,
     /// `verifying` or `resumed`.
     pub phase: String,
@@ -102,7 +107,7 @@ impl Suspension {
     pub fn holds_seat(&self) -> bool {
         matches!(
             self.phase.as_str(),
-            "quiescing" | "snapshotting" | "suspended" | "restoring" | "verifying"
+            "quiescing" | "snapshotting" | "suspended" | "fencing-source" | "transferring" | "restoring" | "verifying"
         )
     }
 }
@@ -178,6 +183,7 @@ fn suspend_state(store: &Store, request: &ClaimRecord) -> Result<Suspension> {
         state.phase = "snapshotting".into();
         state.harness = field(snapshot, "harness").map(str::to_owned);
         state.native_session_id = field(snapshot, "native_session_id").map(str::to_owned);
+        state.source_host = field(snapshot, "source_host").map(str::to_owned);
         state.updated_at_unix_ms = snapshot.accepted_at_unix_ms;
     }
     if let Some(completed) = store.operation_claim(&suspend_completed_key(&request.id))? {
@@ -200,7 +206,16 @@ pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
         return Ok(None);
     }
     let lineage = store.launch_lineage(subject)?;
-    if !evidence(request, 0).is_some_and(|token| lineage.iter().any(|item| item == token)) {
+    let mut moved = false;
+    if action(request) == Some("resume") && field(request, "host").is_some() {
+        for token in &lineage {
+            if store.claim_by_id(token)?.is_some_and(|selected| {
+                selected.body.get("evidence").and_then(Value::as_array)
+                    .is_some_and(|items| items.iter().any(|id| id.as_str() == Some(&request.id)))
+            }) { moved = true; break; }
+        }
+    }
+    if !moved && !evidence(request, 0).is_some_and(|token| lineage.iter().any(|item| item == token)) {
         return Ok(None);
     }
     if action(request) == Some("suspend") {
@@ -221,7 +236,20 @@ pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
     state.requested_by = request.actor.clone();
     state.updated_at_unix_ms = request.accepted_at_unix_ms;
     state.requested_at_unix_ms = request.accepted_at_unix_ms;
-    state.phase = "restoring".into();
+    state.host = field(request, "host").map(str::to_owned);
+    state.source_host = field(request, "source_host").map(str::to_owned).or(state.source_host);
+    state.phase = if state.host.is_some() { "fencing-source" } else { "restoring" }.into();
+    for (suffix, phase) in [("transfer", "transferring"), ("restored", "restoring")] {
+        if let Some(claim) = store.operation_claim(&format!("agent-resume-{suffix}:{}", request.id))? {
+            state.phase = phase.into();
+            state.updated_at_unix_ms = claim.accepted_at_unix_ms;
+        }
+    }
+    // Placement is published only after full restoration. A crash before the separate phase
+    // receipt must still let the destination continue the strict resume, without another fetch.
+    if moved && matches!(state.phase.as_str(), "fencing-source" | "transferring") {
+        state.phase = "restoring".into();
+    }
     if let Some(failed) = store.operation_claim(&resume_failed_key(&request.id))? {
         // A resume that fails leaves the seat suspended on the same snapshot, with the reason.
         state.phase = "suspended".into();
@@ -433,6 +461,103 @@ pub fn annotate_quiescence(fields: &mut std::collections::BTreeMap<String, Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_move_survives_a_crash_after_placement_and_a_later_label_change() {
+        use crate::model::ClaimInput;
+        use serde_json::json;
+        let store = Store::open_memory("amber").unwrap();
+        let intent = crate::parse_intent("version 2\nagent \"sample\" { host \"amber\"; workspace \"/sample\"; harness \"omp\" { model \"canary\" } }", "amber").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "declare",
+                Some("person/test"),
+            )
+            .unwrap();
+        let subject = "agent/amber.sample";
+        let token = store.selected_desired_token(subject).unwrap().unwrap();
+        let append = |kind: &str, fields: Value, evidence: Vec<String>, key: Option<String>| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some("person/test".into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence,
+                    expected_subject: None,
+                    idempotency_key: key,
+                })
+                .unwrap()
+        };
+        let suspend = append(
+            "runtime.action.requested",
+            json!({"action": "suspend", "incarnation_id": "source-one"}),
+            vec![token.clone()],
+            None,
+        );
+        append(
+            "runtime.action.succeeded",
+            json!({"action": "suspend", "operation_status": "snapshotting", "harness": "omp", "native_session_id": "native", "source_host": "amber"}),
+            vec![suspend.id.clone()],
+            Some(suspend_snapshot_key(&suspend.id)),
+        );
+        append(
+            "runtime.action.succeeded",
+            json!({"action": "suspend", "operation_status": "suspended"}),
+            vec![suspend.id.clone()],
+            Some(suspend_completed_key(&suspend.id)),
+        );
+        let resume = append(
+            "runtime.action.requested",
+            json!({"action": "resume", "host": "jade", "source_host": "amber"}),
+            vec![token.clone(), suspend.id],
+            None,
+        );
+        let transferring = current(&store, subject).unwrap().unwrap();
+        crate::seat_snapshot::phase(&store, subject, &transferring, "transfer", "transferring")
+            .unwrap();
+        assert_eq!(
+            current(&store, subject).unwrap().unwrap().phase,
+            "transferring"
+        );
+        store
+            .place_resumed_seat(subject, &token, &resume.id, "jade", "person/test")
+            .unwrap();
+        // No restored receipt exists: this models a crash immediately after placement publication.
+        let restored = current(&store, subject).unwrap().unwrap();
+        assert_eq!(restored.phase, "restoring");
+        assert_eq!(restored.native_session_id.as_deref(), Some("native"));
+        let desired = store
+            .desired_subject_with_writer(subject)
+            .unwrap()
+            .unwrap()
+            .0;
+        let kdl = crate::graph::render_agent_desired_kdl(&desired.desired).unwrap();
+        assert!(
+            crate::parse_intent(&kdl, "jade")
+                .unwrap()
+                .subjects
+                .contains_key(subject)
+        );
+        store
+            .rename_agent(subject, Some("Renamed sample"), "rename")
+            .unwrap();
+        assert_eq!(
+            current(&store, subject).unwrap().unwrap().phase,
+            "restoring"
+        );
+    }
 
     #[test]
     fn only_an_idle_harness_with_nothing_pending_is_quiescent() {

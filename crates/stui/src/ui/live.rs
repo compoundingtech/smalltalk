@@ -1648,6 +1648,7 @@ async fn agent_control(client: &Client, agent: &str, control: AgentControl) -> R
                         fence,
                         st3_client::AgentResumeParameters {
                             agent: agent.to_owned(),
+                            host: None,
                         },
                     )
                     .await?;

@@ -3227,6 +3227,9 @@ struct AgentSuspendArgs {
 
 #[derive(Args)]
 struct AgentResumeArgs {
+    /// Resume the suspended conversation on this fleet host.
+    #[arg(long)]
+    host: Option<String>,
     /// Exact seat subject or its identity without the `agent/` prefix.
     #[arg(value_parser = parse_agent_start_identity)]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
@@ -5299,7 +5302,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         notify.clone(),
         event_notify.clone(),
         recorder.map(|installation| installation.directory),
-    )?.with_schedule_peers(state.configured_peers.clone()));
+    )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()));
     tokio::spawn(reconciler.supervise());
     // A start no longer rebuilds the operation projection; check it once the API serves.
     tokio::spawn({
@@ -11230,6 +11233,7 @@ async fn run_agents(
                 &subject,
                 &args.actor,
                 args.reason.as_deref(),
+                None,
                 &args.timeout,
             )
             .await?;
@@ -11257,6 +11261,7 @@ async fn run_agents(
                 &subject,
                 &args.actor,
                 None,
+                args.host.as_deref(),
                 &args.timeout,
             )
             .await?;
@@ -19716,6 +19721,7 @@ async fn request_suspension(
     subject: &str,
     actor: &str,
     reason: Option<&str>,
+    host: Option<&str>,
     timeout_text: &str,
 ) -> Result<st3_client::Agent> {
     let timeout = st3::graph::parse_duration(timeout_text, false)?;
@@ -19727,6 +19733,7 @@ async fn request_suspension(
                 "subject": subject,
                 "actor": actor,
                 "reason": reason,
+                "host": host,
                 "idempotency_key": uuid::Uuid::now_v7().to_string(),
             }),
         )

@@ -103,6 +103,8 @@ pub enum ClientReadOperation {
         expected_sequence: u64,
         parameters: serde_json::Value,
     },
+    /// A portable suspended seat payload, read only for the exact fenced resume request.
+    SeatSnapshot { subject: String, suspend_operation: String, resume_operation: String, offset: u64 },
     /// The directory this host gives a new agent that names no workspace.
     AgentWorkspace {
         identity: String,
@@ -1144,6 +1146,16 @@ async fn receive_client_read(
                     .await?
                     .value;
                 Ok(serde_json::to_value(page)?)
+            }
+            ClientReadOperation::SeatSnapshot { subject, suspend_operation, resume_operation, offset } => {
+                let local = crate::client::Client::unix(state.backend().socket());
+                local.post::<_, serde_json::Value>("/v1/internal/seat-snapshot", &serde_json::json!({
+                    "subject": subject, "suspend_operation": suspend_operation,
+                    "resume_operation": resume_operation, "offset": offset, "actor": request.authority_actor
+                })).await.map_err(|error| ClientReadRejected::new(
+                    crate::client::api_error_code(&error).unwrap_or("remote-unavailable"),
+                    StatusCode::CONFLICT, format!("{error:#}")
+                ).into())
             }
             ClientReadOperation::AgentWorkspace { identity } => {
                 let workspace =
