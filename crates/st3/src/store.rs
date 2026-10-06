@@ -14277,17 +14277,12 @@ impl Store {
         let mut has_cost = false;
         for group in spend.into_values() {
             summary.incarnation_count += 1;
-            if !group.rollups.is_empty() {
-                for (total, input, output, writes, reads) in group.rollups.into_values() {
-                    summary.total_tokens = summary.total_tokens.saturating_add(total);
-                    summary.input_tokens = summary.input_tokens.saturating_add(input);
-                    summary.output_tokens = summary.output_tokens.saturating_add(output);
-                    summary.cache_write_tokens = summary.cache_write_tokens.saturating_add(writes);
-                    summary.cached_tokens = summary.cached_tokens.saturating_add(reads);
-                }
-            } else if let Some((total, input, output, cached, group_cost, currency)) =
-                group.cumulative
-            {
+            let rollup_total = group.rollups.values().fold(0_u64, |total, row| total.saturating_add(row.0));
+            // These are two cumulative views of the same incarnation, never additive.
+            // Incomplete attributed rollups cannot lower a larger provider total; newer
+            // complete rollups may exceed a still-old provider reading.
+            let cumulative = group.cumulative.filter(|value| group.rollups.is_empty() || value.0 > rollup_total);
+            if let Some((total, input, output, cached, group_cost, currency)) = cumulative {
                 summary.total_tokens = summary.total_tokens.saturating_add(total);
                 summary.input_tokens = summary.input_tokens.saturating_add(input);
                 summary.output_tokens = summary.output_tokens.saturating_add(output);
@@ -14297,6 +14292,14 @@ impl Store {
                     has_cost = true;
                 }
                 summary.currency = summary.currency.or(currency);
+            } else if !group.rollups.is_empty() {
+                for (total, input, output, writes, reads) in group.rollups.into_values() {
+                    summary.total_tokens = summary.total_tokens.saturating_add(total);
+                    summary.input_tokens = summary.input_tokens.saturating_add(input);
+                    summary.output_tokens = summary.output_tokens.saturating_add(output);
+                    summary.cache_write_tokens = summary.cache_write_tokens.saturating_add(writes);
+                    summary.cached_tokens = summary.cached_tokens.saturating_add(reads);
+                }
             } else {
                 summary.total_tokens = summary.total_tokens.saturating_add(group.response_total);
                 summary.input_tokens = summary.input_tokens.saturating_add(group.response_input);
