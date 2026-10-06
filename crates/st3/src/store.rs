@@ -9020,6 +9020,30 @@ impl Store {
         )
     }
 
+    /// A categorical snapshot has no position in the ordered native event stream.
+    /// Its live-runtime fence is checked in the same transaction as dedupe and publication.
+    pub fn append_harness_current(
+        &self,
+        publication: &crate::harness_events::CurrentPublication,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        let mut input = publication.claim.clone();
+        if input.kind != "harness.current"
+            || input.actor.as_deref() != Some(input.subject.as_str())
+            || input.fields.get("incarnation_id").and_then(Value::as_str) != Some(publication.runtime_incarnation.as_str())
+            || publication.runtime_incarnation.is_empty()
+            || !input.evidence.is_empty()
+            || input.expected_subject.is_some()
+        {
+            return Err(St3Error::new("invalid-harness-event", "invalid current harness envelope"));
+        }
+        st3_schema::registry()
+            .validate_public_claim(&input.subject, &input.kind, &input.fields, input.actor.as_deref())
+            .map_err(|error| St3Error::new(error.code, error.message))?;
+        let digest = opaque_cache_key(&canonical_json_text(&json!(input.fields)).map_err(internal)?);
+        input.idempotency_key = Some(format!("harness-current:{}:{}:{digest}", input.subject, publication.runtime_incarnation));
+        append_claim_with_fences(&self.graph, &input, None, Some(&publication.runtime_incarnation))
+    }
+
     pub fn append_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
         self.append_claim_outcome(input).map(|(claim, _)| claim)
     }
@@ -49330,7 +49354,7 @@ fn append_latest_observation_fenced(
                 "harness.usage" => {
                     publish_due_usage_tx(transaction, &graph.origin, input, &local, now)?
                 }
-                "harness.todo.observed" | "workspace.observed" => Some(publish_latest_claim_tx(
+                "harness.current" | "harness.todo.observed" | "workspace.observed" => Some(publish_latest_claim_tx(
                     transaction,
                     &graph.origin,
                     &input.subject,

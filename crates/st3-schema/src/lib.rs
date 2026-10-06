@@ -433,6 +433,9 @@ impl Registry {
                 self.validate_reference(kind, name, value, field)?;
             }
         }
+        if kind == "harness.current" {
+            validate_harness_current(fields)?;
+        }
         if kind == "harness.todo.observed" {
             validate_harness_todo(fields)?;
         }
@@ -626,6 +629,46 @@ fn valid_identifier_part(part: &str) -> bool {
         && part
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn validate_harness_current(fields: &BTreeMap<String, Value>) -> Result<(), ValidationError> {
+    for name in ["incarnation_id", "evidence_incarnation", "active_ask"] {
+        if let Some(value) = fields.get(name).filter(|value| !value.is_null())
+            && !value.as_str().is_some_and(|value| {
+                !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+            })
+        {
+            return Err(error("invalid-claim-field", format!("harness.current `{name}` must be an identity of 1..256 bytes")));
+        }
+    }
+    for name in ["observed_at_ms", "observed_since_ms", "ownership_sequence", "transition_sequence", "provider_auth_sequence", "background_jobs", "running_subagents"] {
+        if let Some(value) = fields.get(name).filter(|value| !value.is_null())
+            && value.as_u64().is_none()
+        {
+            return Err(error("invalid-claim-field", format!("harness.current `{name}` must be an unsigned integer")));
+        }
+    }
+    for name in ["observed_at_ms", "observed_since_ms"] {
+        if fields.get(name).and_then(Value::as_u64).is_some_and(|value| value > i64::MAX as u64) {
+            return Err(error("invalid-claim-field", format!("harness.current `{name}` exceeds the supported timestamp range")));
+        }
+    }
+    if let Some(value) = fields.get("blocking").filter(|value| !value.is_null()) {
+        let allowed = ["turn-in-flight", "starting", "harness-indeterminate", "pending-ask", "unsent-input", "background-jobs-running", "background-jobs-unreported"];
+        if !value.as_array().is_some_and(|items| items.len() <= allowed.len()
+            && items.iter().all(|item| item.as_str().is_some_and(|item| allowed.contains(&item))))
+        {
+            return Err(error("invalid-claim-field", "harness.current blocking contains an unsupported category"));
+        }
+    }
+    if fields.get("active_ask").is_some_and(|value| !value.is_null())
+        && !(fields.get("state").and_then(Value::as_str) == Some("working")
+            && fields.get("blocked_on").and_then(Value::as_str) == Some("human")
+            && fields.get("ask").and_then(Value::as_str) == Some("question"))
+    {
+        return Err(error("invalid-claim-field", "harness.current active_ask requires a working human question"));
+    }
+    Ok(())
 }
 
 fn validate_value(
@@ -1716,6 +1759,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "harness.current",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            Some("harnesses"),
+            true,
+            &[],
+        ),
+        (
             "harness.session-file",
             &["agent"],
             WritePolicy::AuthorizedRequester,
@@ -2436,7 +2488,7 @@ fn claim_retention(kind: &str) -> Retention {
         | "runtime.action.deadline-reached" => Retention::SystemLocal,
         // Other nodes read the current harness state and usage: step readiness is judged on
         // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
-        "harness.observed" | "harness.usage" | "harness.todo.observed" | "workspace.observed" => {
+        "harness.observed" | "harness.current" | "harness.usage" | "harness.todo.observed" | "workspace.observed" => {
             Retention::Latest
         }
         _ => Retention::Durable,
@@ -3000,6 +3052,27 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("until_unix_ms", required_integer()),
             ("reason", required_string()),
             ("legacy_adoption", boolean()),
+        ],
+        "harness.current" => &[
+            ("state", required_enum(&["starting", "ready", "idle", "working", "blocked", "ended", "indeterminate"])),
+            ("incarnation_id", required_string()),
+            ("observed_at_ms", required_integer()),
+            ("observed_since_ms", integer()),
+            ("driver", enumeration(&["claude", "codex", "pi", "omp", "opencode"])),
+            ("transport", enumeration(&["claude-channel", "app-server", "pi-channel", "omp-channel", "native", "opencode-server"])),
+            ("blocked_on", enumeration(&["none", "human", "unknown", "channel"])),
+            ("ask", enumeration(&["none", "permission", "question", "review", "unknown"])),
+            ("active_ask", string()),
+            ("input_buffer", enumeration(&["empty", "nonempty", "unknown"])),
+            ("provider_auth", boolean()),
+            ("provider_auth_sequence", integer()),
+            ("ownership_sequence", integer()),
+            ("transition_sequence", integer()),
+            ("evidence_incarnation", string()),
+            ("background_jobs", integer()),
+            ("running_subagents", integer()),
+            ("quiescent", boolean()),
+            ("blocking", array()),
         ],
         "harness.observed" => &[
             (
