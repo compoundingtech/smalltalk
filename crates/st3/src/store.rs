@@ -840,6 +840,8 @@ struct StatusEntry {
     owners: Vec<String>,
     status: SubjectStatus,
     action: Option<PlannedAction>,
+    /// Raw observed harness from the same full reduction; None means uncaptured.
+    raw_observed: Option<Option<crate::model::CurrentHarnessView>>,
 }
 
 /// One runtime's answer. It depends on the runtime's own claims and, for a declared runtime,
@@ -953,6 +955,16 @@ fn subject_status_at(
     at_index: Option<u64>,
     owner_filter: Option<&str>,
 ) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
+    subject_status_at_with_raw_observed(connection, subject, at_index, owner_filter, None)
+}
+
+fn subject_status_at_with_raw_observed(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    owner_filter: Option<&str>,
+    raw_observed: Option<&mut Option<Option<crate::model::CurrentHarnessView>>>,
+) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
     #[cfg(test)]
     SUBJECT_REDUCTIONS.with(|reductions| reductions.set(reductions.get() + 1));
     if subject.starts_with("arrangement/") {
@@ -983,7 +995,15 @@ fn subject_status_at(
         at_index,
         member.as_ref().map(|member| member.host.as_str()),
     )?;
-    let harness = current_harness_at(connection, subject, at_index)?;
+    let harness = match raw_observed {
+        Some(captured) => {
+            let (current, observed) =
+                current_harness_at_with_raw_observed(connection, subject, at_index)?;
+            *captured = Some(observed);
+            current
+        }
+        None => current_harness_at(connection, subject, at_index)?,
+    };
     let claims = claim_ids_at(connection, subject, at_index)?;
     let conflicts = desired_conflicts_at(
         connection,
@@ -9794,6 +9814,29 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        self.status_for_subject_prefix_with_raw_observed(prefix, at_index, include_history, false)
+    }
+
+    pub(crate) fn agent_card_status_for_prefix_at(
+        &self,
+        at_index: u64,
+        include_history: bool,
+    ) -> Result<StatusResponse> {
+        self.status_for_subject_prefix_with_raw_observed(
+            "agent/",
+            Some(at_index),
+            include_history,
+            true,
+        )
+    }
+
+    fn status_for_subject_prefix_with_raw_observed(
+        &self,
+        prefix: &str,
+        at_index: Option<u64>,
+        include_history: bool,
+        capture_raw_observed: bool,
+    ) -> Result<StatusResponse> {
         // Agent listings are expensive on large graphs. Hold this lock while building the
         // snapshot so concurrent callers share one reduction, then serve clones at the same
         // store index. A later index always rebuilds, preserving snapshot semantics.
@@ -9825,8 +9868,12 @@ impl Store {
                 result.store_index = index;
                 return Ok(result);
             }
-            let status =
-                self.status_for_subject_prefix_uncached(prefix, Some(index), include_history)?;
+            let status = self.status_for_subject_prefix_uncached(
+                prefix,
+                Some(index),
+                include_history,
+                capture_raw_observed,
+            )?;
             cache.push_back((
                 index,
                 projection_index,
@@ -9838,7 +9885,12 @@ impl Store {
             }
             return Ok(status);
         }
-        self.status_for_subject_prefix_uncached(prefix, at_index, include_history)
+        self.status_for_subject_prefix_uncached(
+            prefix,
+            at_index,
+            include_history,
+            capture_raw_observed,
+        )
     }
 
     fn status_for_subject_prefix_uncached(
@@ -9846,6 +9898,7 @@ impl Store {
         prefix: &str,
         at_index: Option<u64>,
         include_history: bool,
+        capture_raw_observed: bool,
     ) -> Result<StatusResponse> {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
@@ -9873,7 +9926,12 @@ impl Store {
                 .collect::<Result<BTreeSet<_>, _>>()?,
         }};
         drop(connection);
-        self.status_for_subject_names_at(subjects, store_index, include_history)
+        self.status_for_subject_names_with_raw_observed(
+            subjects,
+            store_index,
+            include_history,
+            capture_raw_observed,
+        )
     }
 
     /// Reduce only subjects that have emitted one claim kind at the selected snapshot.
@@ -9967,6 +10025,7 @@ impl Store {
         subject: &str,
         store_index: u64,
         newest: bool,
+        capture_raw_observed: bool,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
         {
             let cache = self
@@ -9982,8 +10041,16 @@ impl Store {
                 return Ok((entry.status.clone(), entry.action.clone()));
             }
         }
-        let (status, action) = subject_status_at(connection, subject, Some(store_index), None)?
-            .expect("a reduction without an owner filter always has a status");
+        let mut raw_observed = None;
+        let capture = (capture_raw_observed && newest).then_some(&mut raw_observed);
+        let (status, action) = subject_status_at_with_raw_observed(
+            connection,
+            subject,
+            Some(store_index),
+            None,
+            capture,
+        )?
+        .expect("a reduction without an owner filter always has a status");
         if newest {
             let mut cache = self
                 .smalltalk
@@ -10005,6 +10072,7 @@ impl Store {
                         owners,
                         status: status.clone(),
                         action: action.clone(),
+                        raw_observed,
                     },
                 );
             }
@@ -10080,18 +10148,48 @@ impl Store {
         store_index: u64,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        self.status_for_subject_names_with_raw_observed(
+            subjects,
+            store_index,
+            include_history,
+            false,
+        )
+    }
+
+    pub(crate) fn agent_card_status_for_names_at(
+        &self,
+        subjects: BTreeSet<String>,
+        store_index: u64,
+        include_history: bool,
+    ) -> Result<StatusResponse> {
+        self.status_for_subject_names_with_raw_observed(
+            subjects,
+            store_index,
+            include_history,
+            true,
+        )
+    }
+
+    fn status_for_subject_names_with_raw_observed(
+        &self,
+        subjects: BTreeSet<String>,
+        store_index: u64,
+        include_history: bool,
+        capture_raw_observed: bool,
+    ) -> Result<StatusResponse> {
         let subjects = if include_history {
             subjects
         } else {
             self.current_view_candidates(&self.readers.get(), subjects, store_index, true)?
         };
         if subjects.len() <= 64 {
-            return self.status_at_view_for_names(
+            return self.status_at_view_for_names_with_raw_observed(
                 None,
                 None,
                 Some(store_index),
                 include_history,
                 Some(subjects),
+                capture_raw_observed,
             );
         }
         // Divide a large bounded projection across a few threads, each reading its slice on its
@@ -10107,12 +10205,13 @@ impl Store {
                     let profile = profile.clone();
                     scope.spawn(move || {
                         let _entered = crate::profile::enter(profile.as_ref());
-                        self.status_at_view_for_names(
+                        self.status_at_view_for_names_with_raw_observed(
                             None,
                             None,
                             Some(store_index),
                             include_history,
                             Some(names),
+                            capture_raw_observed,
                         )
                     })
                 })
@@ -10158,6 +10257,25 @@ impl Store {
         include_history: bool,
         selected_names: Option<BTreeSet<String>>,
     ) -> Result<StatusResponse> {
+        self.status_at_view_for_names_with_raw_observed(
+            selected,
+            selected_owner_run,
+            at_index,
+            include_history,
+            selected_names,
+            false,
+        )
+    }
+
+    fn status_at_view_for_names_with_raw_observed(
+        &self,
+        selected: Option<&str>,
+        selected_owner_run: Option<&str>,
+        at_index: Option<u64>,
+        include_history: bool,
+        selected_names: Option<BTreeSet<String>>,
+        capture_raw_observed: bool,
+    ) -> Result<StatusResponse> {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
@@ -10197,9 +10315,13 @@ impl Store {
                 continue;
             }
             let reduced = match newest {
-                Some(newest) => {
-                    Some(self.cached_subject_status(&connection, &subject, store_index, newest)?)
-                }
+                Some(newest) => Some(self.cached_subject_status(
+                    &connection,
+                    &subject,
+                    store_index,
+                    newest,
+                    capture_raw_observed,
+                )?),
                 None => subject_status_at(&connection, &subject, at_index, selected_owner_run)?,
             };
             let Some((status, action)) = reduced else {
@@ -10216,6 +10338,33 @@ impl Store {
             subjects,
             pending_actions,
         })
+    }
+
+    pub(crate) fn observed_harness_for_card_at(
+        &self,
+        subject: &str,
+        index: u64,
+    ) -> Result<Option<crate::model::CurrentHarnessView>> {
+        let captured = {
+            let cache = self
+                .smalltalk
+                .subject_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            cache
+                .statuses
+                .get(subject)
+                .filter(|entry| entry.read_at <= index && index <= cache.through)
+                .and_then(|entry| entry.raw_observed.clone())
+        };
+        let Some(mut observed) = captured else {
+            // An existing full-status or prefix-cache hit need not contain the optional pair.
+            return self.observed_harness_at(subject, index);
+        };
+        if let Some(view) = observed.as_mut() {
+            seat_status::enrich_harness(&self.readers.get(), subject, Some(index), view)?;
+        }
+        Ok(observed)
     }
 
     pub fn events_after(&self, after: u64, subject: Option<&str>) -> Result<Vec<EventRecord>> {
@@ -20150,6 +20299,47 @@ fn current_harness_fold_at(
     at_index: Option<u64>,
     include_work_activity: bool,
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
+    current_harness_fold_at_with_observed(
+        connection,
+        subject,
+        at_index,
+        include_work_activity,
+        None,
+    )
+}
+
+// The observed copy remains raw: enrich it at the existing card-consumption
+// position, after complete status and claim-vector validation.
+fn current_harness_at_with_raw_observed(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+) -> Result<(
+    Option<crate::model::CurrentHarnessView>,
+    Option<crate::model::CurrentHarnessView>,
+)> {
+    let mut captured = None;
+    let mut current = current_harness_fold_at_with_observed(
+        connection,
+        subject,
+        at_index,
+        true,
+        Some(&mut captured),
+    )?;
+    let observed = captured.unwrap_or_else(|| current.clone());
+    if let Some(view) = current.as_mut() {
+        seat_status::enrich_harness(connection, subject, at_index, view)?;
+    }
+    Ok((current, observed))
+}
+
+fn current_harness_fold_at_with_observed(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    include_work_activity: bool,
+    observed: Option<&mut Option<Option<crate::model::CurrentHarnessView>>>,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let runtime = connection
         .prepare_cached(&format!(
@@ -20419,6 +20609,16 @@ fn current_harness_fold_at(
             .as_ref()
             .is_none_or(|(_, _, _, harness_key)| key > *harness_key)
     {
+        // Capture before the work branch removes optional fields. Some(None)
+        // records that work exists without an observed harness state.
+        if let Some(observed) = observed {
+            *observed = Some(observed_harness_from_fold_fields(
+                current.clone(),
+                optional.clone(),
+                auth_restored,
+                incarnation_id,
+            ));
+        }
         return Ok(Some(crate::model::CurrentHarnessView {
             state: "working".into(),
             driver: optional.remove("driver").flatten(),
@@ -20434,9 +20634,21 @@ fn current_harness_fold_at(
             observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
         }));
     }
-    let Some((mut state, claim, observed_at_unix_ms, _)) = current else {
-        return Ok(None);
-    };
+    Ok(observed_harness_from_fold_fields(
+        current,
+        optional,
+        auth_restored,
+        incarnation_id,
+    ))
+}
+
+fn observed_harness_from_fold_fields(
+    current: Option<(String, String, u128, canonical::ClaimKey)>,
+    mut optional: BTreeMap<&'static str, Option<String>>,
+    auth_restored: bool,
+    incarnation_id: &str,
+) -> Option<crate::model::CurrentHarnessView> {
+    let (mut state, claim, observed_at_unix_ms, _) = current?;
     if optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
         if auth_restored {
             // Sparse successful reports must not inherit an older credential-refusal reason.
@@ -20445,7 +20657,7 @@ fn current_harness_fold_at(
             state = "needs-login".into();
         }
     }
-    Ok(Some(crate::model::CurrentHarnessView {
+    Some(crate::model::CurrentHarnessView {
         state,
         driver: optional.remove("driver").flatten(),
         incarnation_id: incarnation_id.to_owned(),
@@ -20458,7 +20670,7 @@ fn current_harness_fold_at(
         claim,
         since_unix_ms: observed_at_unix_ms,
         observed_at_unix_ms,
-    }))
+    })
 }
 
 fn working_episode_query() -> String {
@@ -49384,6 +49596,278 @@ message "human-attention" {
         }
     }
 
+    fn checked_raw_harness_pair(store: &Store, subject: &str, index: u64) {
+        store
+            .read_snapshot(|_| {
+                let connection = store.readers.get();
+                let (current, mut observed) =
+                    current_harness_at_with_raw_observed(&connection, subject, Some(index))?;
+                assert_eq!(
+                    serde_json::to_value(&current)?,
+                    serde_json::to_value(current_harness_at(&connection, subject, Some(index))?)?
+                );
+                assert_eq!(
+                    serde_json::to_value(&observed)?,
+                    serde_json::to_value(current_harness_fold_at(
+                        &connection,
+                        subject,
+                        Some(index),
+                        false
+                    )?)?
+                );
+                if let Some(view) = observed.as_mut() {
+                    seat_status::enrich_harness(&connection, subject, Some(index), view)?;
+                }
+                assert_eq!(
+                    serde_json::to_value(observed)?,
+                    serde_json::to_value(store.observed_harness_at(subject, index)?)?
+                );
+                store.forget_current_views();
+                let full = subject_status_at(&connection, subject, Some(index), None)?.unwrap();
+                let cached = store.agent_card_status_for_names_at(
+                    BTreeSet::from([subject.into()]),
+                    index,
+                    true,
+                )?;
+                assert_eq!(
+                    serde_json::to_value(&cached.subjects[0])?,
+                    serde_json::to_value(&full.0)?
+                );
+                assert_eq!(
+                    serde_json::to_value(&cached.pending_actions)?,
+                    serde_json::to_value(full.1.into_iter().collect::<Vec<_>>())?
+                );
+                assert_eq!(
+                    serde_json::to_value(store.observed_harness_for_card_at(subject, index)?)?,
+                    serde_json::to_value(store.observed_harness_at(subject, index)?)?
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn raw_harness_card_cache_preserves_full_status_and_historical_fallback() {
+        let store = Store::open_memory("node").unwrap();
+        let subjects = (0..65)
+            .map(|n| format!("agent/node.card{n}"))
+            .collect::<BTreeSet<_>>();
+        for subject in &subjects {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: serde_json::from_value(
+                        json!({"status":"running", "runtime_id":subject,
+                    "incarnation_id":"one"}),
+                    )
+                    .unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let old = store.index().unwrap();
+        let full = store
+            .status_for_subject_names_at(subjects.clone(), old, true)
+            .unwrap();
+        assert_eq!(full.subjects.len(), 65);
+        let cards = store
+            .agent_card_status_for_names_at(subjects.clone(), old, true)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&cards).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+        {
+            let cache = store.smalltalk.subject_cache.lock().unwrap();
+            assert_eq!(cache.statuses.len(), 65);
+            assert!(
+                cache
+                    .statuses
+                    .values()
+                    .all(|entry| entry.raw_observed.is_none())
+            );
+        }
+        // A warm full-status entry is retained, without a forced pair/status rebuild.
+        for subject in &subjects {
+            assert!(
+                store
+                    .observed_harness_for_card_at(subject, old)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        store.forget_current_views();
+        let paired = store
+            .agent_card_status_for_names_at(subjects.clone(), old, true)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&paired).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+        {
+            let cache = store.smalltalk.subject_cache.lock().unwrap();
+            assert_eq!(cache.statuses.len(), 65);
+            assert!(
+                cache
+                    .statuses
+                    .values()
+                    .all(|entry| matches!(entry.raw_observed, Some(None)))
+            );
+        }
+        let subject = subjects.first().unwrap();
+        let observed = store
+            .append_claim(&ClaimInput {
+                subject: subject.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.clone()),
+                fields: serde_json::from_value(json!({"state":"idle", "driver":"codex",
+                "incarnation_id":"one", "reason":null, "blocked_on":null}))
+                .unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let now = store.index().unwrap();
+        store
+            .agent_card_status_for_names_at(subjects.clone(), now, true)
+            .unwrap();
+        let actual = store
+            .observed_harness_for_card_at(subject, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.claim, observed.id);
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(store.observed_harness_at(subject, now).unwrap().unwrap())
+                .unwrap()
+        );
+        // Older cuts cannot use the newer sidecar or replace it while rebuilding.
+        store
+            .agent_card_status_for_names_at(subjects.clone(), old, true)
+            .unwrap();
+        assert!(
+            store
+                .observed_harness_for_card_at(subject, old)
+                .unwrap()
+                .is_none()
+        );
+        let cache = store.smalltalk.subject_cache.lock().unwrap();
+        let entry = cache.statuses.get(subject).unwrap();
+        assert_eq!(entry.read_at, now);
+        assert_eq!(
+            entry.raw_observed.as_ref().unwrap().as_ref().unwrap().claim,
+            observed.id
+        );
+        drop(cache);
+        // General deletion/repair/replay invalidation removes the raw copy with the full entry.
+        store.forget_current_views();
+        assert!(
+            store
+                .smalltalk
+                .subject_cache
+                .lock()
+                .unwrap()
+                .statuses
+                .is_empty()
+        );
+        assert_eq!(
+            serde_json::to_value(store.observed_harness_for_card_at(subject, now).unwrap())
+                .unwrap(),
+            serde_json::to_value(store.observed_harness_at(subject, now).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn raw_harness_pair_keeps_work_and_observed_branches_separate() {
+        for with_observation in [false, true] {
+            let store = Store::open_memory("node").unwrap();
+            let subject = "agent/node.paired";
+            let append = |kind: &str, fields: Value| {
+                let claim = store
+                    .append_claim(&ClaimInput {
+                        subject: subject.into(),
+                        kind: kind.into(),
+                        actor: Some(subject.into()),
+                        fields: serde_json::from_value(fields).unwrap(),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+                assert!(store.claim_by_id(&claim.id).unwrap().is_some());
+                claim
+            };
+            checked_raw_harness_pair(&store, subject, store.index().unwrap());
+            append(
+                "runtime.observed",
+                json!({"status":"running", "runtime_id":"node.paired", "incarnation_id":"one"}),
+            );
+            checked_raw_harness_pair(&store, subject, store.index().unwrap());
+            if with_observation {
+                append(
+                    "harness.observed",
+                    json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "transport":null, "reason":null, "blocked_on":null, "ask":null, "input_buffer":null, "exit":null}),
+                );
+            }
+            let before_work = store.index().unwrap();
+            checked_raw_harness_pair(&store, subject, before_work);
+            let work = {
+                let mut connection = store.connection.lock().unwrap();
+                let tx = connection.transaction().unwrap();
+                let claim = append_claim_tx(&tx, "node", "step-run/paired/work", "work.progress", Some(subject),
+                    &json!({"fields":{"status":"working", "attempt":1, "readiness_epoch":1, "claimant":subject, "claim_incarnation":"one", "claim_expires_at_unix_ms":now_ms().saturating_add(60_000), "worker_reported":false, "summary":"paired work", "reason":null}}), &[], None).unwrap();
+                tx.commit().unwrap();
+                claim
+            };
+            // The synthetic direct transaction does not publish the process atomic.
+            let after_work = store.read_snapshot(Ok).unwrap();
+            assert!(after_work >= work.store_index);
+            checked_raw_harness_pair(&store, subject, after_work);
+            store
+                .read_snapshot(|_| {
+                    let connection = store.readers.get();
+                    let (current, observed) = current_harness_at_with_raw_observed(
+                        &connection,
+                        subject,
+                        Some(after_work),
+                    )?;
+                    assert_eq!(current.unwrap().claim, work.id);
+                    assert_eq!(observed.is_some(), with_observation);
+                    if let Some(observed) = observed {
+                        assert_eq!(observed.state, "idle");
+                        assert_eq!(observed.driver.as_deref(), Some("codex"));
+                        assert_eq!(observed.transport, None);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            checked_raw_harness_pair(&store, subject, before_work);
+            if with_observation {
+                append(
+                    "harness.observed",
+                    json!({"state":"working", "driver":"codex", "incarnation_id":"one", "provider_auth":false}),
+                );
+                checked_raw_harness_pair(&store, subject, store.index().unwrap());
+                append(
+                    "harness.observed",
+                    json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "provider_auth":true}),
+                );
+                checked_raw_harness_pair(&store, subject, store.index().unwrap());
+            }
+            append(
+                "runtime.observed",
+                json!({"status":"running", "runtime_id":"node.paired", "incarnation_id":"two"}),
+            );
+            checked_raw_harness_pair(&store, subject, store.index().unwrap());
+            checked_raw_harness_pair(&store, subject, after_work);
+        }
+    }
+
     #[test]
     fn admission_failure_fences_ready_work_and_exit_until_a_new_incarnation() {
         let store = Store::open_memory("node").unwrap();
@@ -49416,6 +49900,7 @@ message "human-attention" {
                 ("incarnation_id".into(), json!("first")),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
         let refusal = append(
             "harness.diagnostic",
@@ -49436,6 +49921,7 @@ message "human-attention" {
                 ("incarnation_id".into(), json!("first")),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         let refused = store.current_harness(subject).unwrap().unwrap();
         assert!(!refused.is_ready());
         assert_eq!(refused.state, "indeterminate");
@@ -49448,6 +49934,7 @@ message "human-attention" {
                 ("incarnation_id".into(), json!("first")),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         let exited = store.current_harness(subject).unwrap().unwrap();
         assert!(exited.reason.unwrap().contains("admissionLifecycle"));
         assert_eq!(exited.since_unix_ms, refusal.accepted_at_unix_ms);
@@ -49466,6 +49953,7 @@ message "human-attention" {
                 ("incarnation_id".into(), json!("second")),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
     }
 
@@ -49503,6 +49991,7 @@ message "human-attention" {
                 ("incarnation_id".into(), Value::String("first".into())),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
         append(
             "harness.diagnostic",
@@ -49521,6 +50010,7 @@ message "human-attention" {
                 ("incarnation_id".into(), Value::String("first".into())),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         let blocked = store.current_harness(subject).unwrap().unwrap();
         assert_eq!(blocked.state, "needs-login");
         assert_eq!(blocked.reason.as_deref(), Some("providerAuth"));
@@ -49542,6 +50032,7 @@ message "human-attention" {
                 ("incarnation_id".into(), Value::String("second".into())),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
     }
 
@@ -49587,6 +50078,7 @@ message "human-attention" {
         );
         // A channel that initializes behind the prompt must not make the seat look ready.
         append("harness.observed", Some(subject), ready("first"));
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         let blocked = store.current_harness(subject).unwrap().unwrap();
         assert_eq!(blocked.state, "blocked");
         assert_eq!(blocked.reason.as_deref(), Some("providerTrustPrompt"));
@@ -49594,6 +50086,7 @@ message "human-attention" {
 
         append("runtime.observed", None, running("second"));
         append("harness.observed", Some(subject), ready("second"));
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
     }
 }
