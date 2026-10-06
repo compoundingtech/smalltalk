@@ -98,7 +98,9 @@ class Node:
         # binary. A link, because a debug st3 is hundreds of megabytes and /tmp is a small tmpfs.
         self.binary = root / "bin/st3"
         self.binary.symlink_to(binary)
-        for tool in ("pty", "git"):
+        # Login capture/wrappers need env, Claude runs Bash hooks, and OMP admission needs sh.
+        # Nix checks cannot fall back to host tools in /usr/bin or /bin.
+        for tool in ("pty", "git", "env", "bash", "sh"):
             executable = shutil.which(tool)
             if not executable:
                 raise SystemExit(f"{tool} must be on PATH")
