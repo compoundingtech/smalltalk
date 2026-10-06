@@ -156,3 +156,43 @@ it('cannot tunnel dot-segment escapes or malformed encoded paths past the client
     expect(clientRoute(path)).toBe(false)
   expect(clientRoute('/v1/client/agents/agent%2Fexample?cursor=opaque')).toBe(true)
 })
+it('handles upgrade socket errors while asynchronous admission is pending', async () => {
+  let release!: (allowed: boolean) => void
+  const setup = await fixture(() => new Promise<boolean>((resolve) => { release = resolve }))
+  const accepted = new Promise<Duplex>((resolve) => setup.app.server.once('upgrade', (_req, socket) => resolve(socket)))
+  const client = connect(setup.port, '127.0.0.1')
+  client.on('error', () => undefined)
+  cleanups.push(async () => { client.destroy() })
+  await once(client, 'connect')
+  client.write('GET /v1/client/collections/stream HTTP/1.1\r\nHost: fixture\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n')
+  const socket = await accepted
+  expect(socket.listenerCount('error')).toBeGreaterThan(0)
+  const closed = new Promise<void>((resolve) => socket.once('close', () => resolve()))
+  expect(() => socket.emit('error', Object.assign(new Error('synthetic reset'), { code: 'ECONNRESET' }))).not.toThrow()
+  client.resetAndDestroy()
+  await closed
+  release(false)
+  expect(socket.listenerCount('error')).toBe(0)
+  expect(setup.received).toHaveLength(0)
+  expect(setup.spans).toHaveLength(0)
+})
+it('retains upgrade error coverage through rejected socket shutdown', async () => {
+  const setup = await fixture(() => false)
+  const accepted = new Promise<Duplex>((resolve) => setup.app.server.once('upgrade', (_req, socket) => resolve(socket)))
+  const client = connect({ port: setup.port, host: '127.0.0.1', allowHalfOpen: true })
+  client.on('error', () => undefined)
+  cleanups.push(async () => { client.destroy() })
+  await once(client, 'connect')
+  const reply = once(client, 'data')
+  client.write('GET /v1/client/collections/stream HTTP/1.1\r\nHost: fixture\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n')
+  const socket = await accepted
+  expect(String((await reply)[0])).toContain('403 Forbidden')
+  expect(socket.destroyed).toBe(false)
+  expect(socket.listenerCount('error')).toBeGreaterThan(0)
+  const closed = new Promise<void>((resolve) => socket.once('close', () => resolve()))
+  expect(() => socket.emit('error', Object.assign(new Error('synthetic reset'), { code: 'ECONNRESET' }))).not.toThrow()
+  client.resetAndDestroy()
+  await closed
+  expect(socket.listenerCount('error')).toBe(0)
+  expect(setup.received).toHaveLength(0)
+})

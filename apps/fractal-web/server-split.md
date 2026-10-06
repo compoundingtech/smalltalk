@@ -38,7 +38,7 @@ One arrangement edit admits at most 1,024 operations. Import cost is `1 + folder
 
 Run `pnpm --dir apps/fractal-web test` and `pnpm --dir apps/fractal-web typecheck` using the repository's installed workspace. Tests cover:
 
-- Real local Unix-gateway HTTP and raw upgrade transport, credential/header isolation, streamed request data, W3C traces, auth refusal/error, static negotiation/HEAD/ETag/SPA, traversal/symlink rejection, cancellation, deadline and tunnel shutdown.
+- Real local Unix-gateway HTTP and raw upgrade transport, credential/header isolation, streamed request data, W3C traces, auth refusal/error, static negotiation/HEAD/ETag/SPA, traversal/symlink rejection, cancellation, deadline, tunnel shutdown, and socket resets during pending admission/rejected upgrade shutdown.
 - Real generated SDK over local HTTP fixtures; exact arrangements routes/action shape, grants/owner checks, selected-subject subscription and authoritative snapshots/upserts/retirement.
 - Property-based register join commutativity/associativity/idempotence, remove-wins deletion, Unicode ordering, stable-ID deterministic canonical rekeying and preservation of parent/placement semantics.
 - Full pagination past unchanged pages, cursor-cycle refusal and source fence revocation.

@@ -95,12 +95,18 @@ const makeBoundary = (options: MiddlewareOptions, assets?: { root: string; ident
       await run(dispatch, res)
     }
     const upgrade = (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
+      // Node relinquishes HTTP error handling as soon as it emits upgrade.
+      // Cover pending admission and rejected shutdown, not only admitted tunnels.
+      const onError = () => socket.destroy()
+      socket.on('error', onError)
+      socket.once('close', () => socket.off('error', onError))
       void (async () => {
-        if (!await admitted(req) || !clientRoute(req.url ?? '') || req.method !== 'GET' || req.headers.upgrade?.toLowerCase() !== 'websocket') {
+        const allowed = await admitted(req)
+        if (socket.destroyed) return
+        if (!allowed || !clientRoute(req.url ?? '') || req.method !== 'GET' || req.headers.upgrade?.toLowerCase() !== 'websocket') {
           socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
           return
         }
-        if (socket.destroyed) return
         await run(Effect.gen(function* () {
           const parent = yield* Effect.currentSpan.pipe(Effect.orDie)
           const status = yield* gateway.upgrade(req, socket, head, parent)
