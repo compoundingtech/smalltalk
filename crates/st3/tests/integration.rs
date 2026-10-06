@@ -39,7 +39,7 @@ fn cli_inventory_capture_helper() {
         Ok("hold") => {
             let marker = std::env::var_os("ST3_CLI_INVENTORY_CAPTURE_MARKER").unwrap();
             std::fs::write(marker, b"started").unwrap();
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_secs(60));
         }
         _ => {}
     }
