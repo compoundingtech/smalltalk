@@ -545,6 +545,12 @@ pub async fn run<B: Backend>(
         std::future::pending::<()>().await;
         return Ok(());
     };
+    use axum::serve::ListenerExt as _;
+    let listener = listener.tap_io(|tcp| {
+        if let Err(error) = tcp.set_nodelay(true) {
+            tracing::warn!(%error, "could not disable Nagle on peer socket");
+        }
+    });
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -637,6 +643,12 @@ async fn keep_tailnet_current(
                     bound.insert(address);
                     let app = app.clone();
                     tokio::spawn(async move {
+                        use axum::serve::ListenerExt as _;
+                        let listener = listener.tap_io(|tcp| {
+                            if let Err(error) = tcp.set_nodelay(true) {
+                                tracing::warn!(%error, "could not disable Nagle on peer socket");
+                            }
+                        });
                         let _ = axum::serve(listener, app).await;
                     });
                 }
