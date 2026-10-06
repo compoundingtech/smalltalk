@@ -95,7 +95,7 @@ fn transcript_unavailable(reason: &str) -> ApiError {
     }
 }
 
-fn basis(source: &ExternalSession) -> Result<String, ApiError> {
+pub(super) fn basis(source: &ExternalSession) -> Result<String, ApiError> {
     let metadata = std::fs::metadata(&source.transcript)
         .map_err(|_| transcript_unavailable("the owner cannot inspect its transcript"))?;
     #[cfg(unix)]
@@ -409,6 +409,37 @@ pub(super) fn read(
     Ok(items)
 }
 
+pub(super) struct PreparedSlice {
+    pub(super) items: Vec<Value>,
+    pub(super) has_more: bool,
+    pub(super) basis: String,
+}
+
+pub(super) fn read_slice(
+    source: &ExternalSession,
+    session: &ClientSession,
+    session_id: &str,
+    order: crate::external_sessions::TimelineOrder,
+    before: Option<&crate::external_sessions::TimelineKey>,
+    limit: usize,
+) -> Result<PreparedSlice, ApiError> {
+    let _slot = read_slot(&READ_SLOTS)?;
+    let basis = basis(source)?;
+    let mut slice = crate::external_sessions::timeline_slice(source, order, before, limit)
+        .map_err(ApiError::internal)?;
+    for item in &mut slice.items {
+        prepare_one(source, session, session_id, &basis, item)?;
+    }
+    if basis != self::basis(source)? {
+        return Err(invalidated());
+    }
+    Ok(PreparedSlice {
+        items: slice.items,
+        has_more: slice.has_more,
+        basis,
+    })
+}
+
 /// Called before pagination: its held vectors contain only bounded display values and refs.
 pub(super) fn prepare(
     source: &ExternalSession,
@@ -418,202 +449,213 @@ pub(super) fn prepare(
 ) -> Result<Vec<Value>, ApiError> {
     let basis = basis(source)?;
     for item in &mut items {
-        let original = item.clone();
-        let body = item["body"]
-            .as_object_mut()
-            .ok_or_else(|| ApiError::internal("native body is not an object"))?;
-        if let Some(blocks) = body.get_mut("blocks").and_then(Value::as_array_mut) {
-            for (index, block) in blocks.iter_mut().enumerate() {
-                let body_ref = block["payload"] == json!({"body_ref":true});
-                let pointer = if body_ref {
-                    "/body".to_owned()
-                } else {
-                    format!("/body/blocks/{index}/payload")
-                };
-                if body_ref {
-                    block["payload"] = original["body"].clone();
-                    block["payload"]
-                        .as_object_mut()
-                        .expect("native body")
-                        .remove("blocks");
-                }
-                if block["kind"] == "image" && external_image(&block["payload"]) {
-                    block["kind"] = json!("image_link");
-                } else if block["kind"] == "image" {
-                    block["continuation"] = continuation(
-                        reference(source, &basis, session_id, &original, &pointer),
-                        image_media(&block["payload"]),
-                        None,
-                        "on-demand",
-                    );
-                    block["payload"] = json!({});
-                } else {
-                    image_refs(
-                        &mut block["payload"],
-                        &pointer,
-                        source,
-                        &basis,
-                        session_id,
-                        &original,
-                    );
-                    let encoded =
-                        serde_json::to_vec(&block["payload"]).map_err(ApiError::internal)?;
-                    if encoded.len() > VALUE_BYTES || original["_oversized_bytes"].is_number() {
-                        block["continuation"] = continuation(
-                            reference(source, &basis, session_id, &original, &pointer),
-                            "application/json",
-                            Some(
-                                original["_oversized_payload_bytes"][index]
-                                    .as_u64()
-                                    .map_or(encoded.len(), |size| size as usize),
-                            ),
-                            "size-limit",
-                        );
-                        bound(&mut block["payload"]);
-                    }
-                }
-                if let Some(metadata) = block.get_mut("metadata")
-                    && bound_open_value(metadata)
-                    && block.get("continuation").is_none()
-                {
-                    let pointer = format!("/body/blocks/{index}/metadata");
-                    block["continuation"] = continuation(
-                        reference(source, &basis, session_id, &original, &pointer),
-                        "application/json",
-                        Some(
-                            serde_json::to_vec(
-                                original.pointer(&pointer).expect("native metadata"),
-                            )
-                            .map_err(ApiError::internal)?
-                            .len(),
-                        ),
-                        "size-limit",
-                    );
-                }
-            }
-        }
-        if let Some(block) = body
-            .get("blocks")
-            .and_then(Value::as_array)
-            .and_then(|blocks| blocks.first())
-            && block["kind"] == "unknown"
-        {
-            let label = body
-                .get("text")
-                .and_then(Value::as_str)
-                .and_then(|text| text.lines().next())
-                .unwrap_or("[unknown]");
-            body["text"] = json!(format!("{label}\n{}", block["payload"]));
-        }
-        if let Some(block) = body
-            .get("blocks")
-            .and_then(Value::as_array)
-            .and_then(|blocks| blocks.first())
-            && block["kind"] == "image_link"
-        {
-            body["text"] = json!(format!(
-                "[external image link · open explicitly]\n{}",
-                block["payload"]
-            ));
-        }
-        // Fallback bodies use known v0 types and also move native pixels to owner fetch refs.
-        for key in ["text", "arguments", "content"] {
-            if let Some(value) = body.get_mut(key) {
-                image_refs(
-                    value,
-                    &format!("/body/{key}"),
-                    source,
-                    &basis,
-                    session_id,
-                    &original,
-                );
-                if let Value::String(text) = value {
-                    *text = clipped(text);
-                } else {
-                    bound(value);
-                }
-            }
-        }
-        // Error/status fallback fields use the same clipped display convention as
-        // text/arguments/content. A negotiated body_ref continuation fetches the
-        // complete original body; legacy clients receive the visible marker only.
-        for key in ["message", "details", "detail"] {
-            if let Some(value) = body.get_mut(key) {
-                bound_open_value(value);
-            }
-        }
-        let mut fallback = original["body"].clone();
-        fallback
-            .as_object_mut()
-            .expect("native body")
-            .remove("blocks");
-        if let Some(blocks) = body.get_mut("blocks").and_then(Value::as_array_mut) {
-            for (index, block) in blocks.iter_mut().enumerate() {
-                if original["body"]["blocks"][index]["payload"] == fallback
-                    || original["body"]["blocks"][index]["payload"] == json!({"body_ref":true})
-                {
-                    block["payload"] = json!({"body_ref": true});
-                }
-            }
-        }
-        item.as_object_mut().expect("native item").remove("_source");
-        item.as_object_mut()
-            .expect("native item")
-            .remove("_oversized_bytes");
-        item.as_object_mut()
-            .expect("native item")
-            .remove("_oversized_payload_bytes");
-        if serde_json::to_vec(item).map_err(ApiError::internal)?.len()
-            > CLIENT_MAX_RESPONSE_BYTES - 128_000
-        {
-            let body = item["body"].as_object_mut().expect("native body");
-            for (key, value) in body.iter_mut() {
-                if key != "blocks" {
-                    bound_open_value(value);
-                    if !value.is_string() {
-                        bound(value);
-                    }
-                }
-            }
-            // Retained open-object keys can still exceed the transport budget.
-            // Replace only this entry, preserving its identity and ordering.
-            let size = serde_json::to_vec(item).map_err(ApiError::internal)?.len();
-            if size > CLIENT_MAX_RESPONSE_BYTES - 128_000 {
-                if item["type"] != "error" {
-                    item["type"] = json!("error");
-                    item["role"] = json!("system");
-                }
-                item["body"] = json!({
-                    "code":"native-entry-too-large",
-                    "message":format!("[st truncated this native timeline value: size limit; {size} bytes]"),
-                    "retryable":false,
-                    "details":{"size":size},
-                    "blocks":[{
-                        "id":"native-entry-too-large",
-                        "kind":"error",
-                        "source_type":"native-entry-too-large",
-                        "payload":{"body_ref":true},
-                        "continuation":continuation(
-                            reference(source, &basis, session_id, &original, "/body"),
-                            "application/json",
-                            Some(serde_json::to_vec(&original["body"]).map_err(ApiError::internal)?.len()),
-                            "size-limit",
-                        )
-                    }]
-                });
-            }
-        }
-        if !session.conversation_blocks {
-            item["body"]
-                .as_object_mut()
-                .expect("native body")
-                .remove("blocks");
-        }
+        prepare_one(source, session, session_id, &basis, item)?;
     }
     if basis != self::basis(source)? {
         return Err(invalidated());
     }
     Ok(items)
+}
+
+pub(super) fn prepare_one(
+    source: &ExternalSession,
+    session: &ClientSession,
+    session_id: &str,
+    basis: &str,
+    item: &mut Value,
+) -> Result<(), ApiError> {
+    let original = item.clone();
+    let body = item["body"]
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("native body is not an object"))?;
+    if let Some(blocks) = body.get_mut("blocks").and_then(Value::as_array_mut) {
+        for (index, block) in blocks.iter_mut().enumerate() {
+            let body_ref = block["payload"] == json!({"body_ref":true});
+            let pointer = if body_ref {
+                "/body".to_owned()
+            } else {
+                format!("/body/blocks/{index}/payload")
+            };
+            if body_ref {
+                block["payload"] = original["body"].clone();
+                block["payload"]
+                    .as_object_mut()
+                    .expect("native body")
+                    .remove("blocks");
+            }
+            if block["kind"] == "image" && external_image(&block["payload"]) {
+                block["kind"] = json!("image_link");
+            } else if block["kind"] == "image" {
+                block["continuation"] = continuation(
+                    reference(source, basis, session_id, &original, &pointer),
+                    image_media(&block["payload"]),
+                    None,
+                    "on-demand",
+                );
+                block["payload"] = json!({});
+            } else {
+                image_refs(
+                    &mut block["payload"],
+                    &pointer,
+                    source,
+                    basis,
+                    session_id,
+                    &original,
+                );
+                let encoded =
+                    serde_json::to_vec(&block["payload"]).map_err(ApiError::internal)?;
+                if encoded.len() > VALUE_BYTES || original["_oversized_bytes"].is_number() {
+                    block["continuation"] = continuation(
+                        reference(source, basis, session_id, &original, &pointer),
+                        "application/json",
+                        Some(
+                            original["_oversized_payload_bytes"][index]
+                                .as_u64()
+                                .map_or(encoded.len(), |size| size as usize),
+                        ),
+                        "size-limit",
+                    );
+                    bound(&mut block["payload"]);
+                }
+            }
+            if let Some(metadata) = block.get_mut("metadata")
+                && bound_open_value(metadata)
+                && block.get("continuation").is_none()
+            {
+                let pointer = format!("/body/blocks/{index}/metadata");
+                block["continuation"] = continuation(
+                    reference(source, basis, session_id, &original, &pointer),
+                    "application/json",
+                    Some(
+                        serde_json::to_vec(
+                            original.pointer(&pointer).expect("native metadata"),
+                        )
+                        .map_err(ApiError::internal)?
+                        .len(),
+                    ),
+                    "size-limit",
+                );
+            }
+        }
+    }
+    if let Some(block) = body
+        .get("blocks")
+        .and_then(Value::as_array)
+        .and_then(|blocks| blocks.first())
+        && block["kind"] == "unknown"
+    {
+        let label = body
+            .get("text")
+            .and_then(Value::as_str)
+            .and_then(|text| text.lines().next())
+            .unwrap_or("[unknown]");
+        body["text"] = json!(format!("{label}\n{}", block["payload"]));
+    }
+    if let Some(block) = body
+        .get("blocks")
+        .and_then(Value::as_array)
+        .and_then(|blocks| blocks.first())
+        && block["kind"] == "image_link"
+    {
+        body["text"] = json!(format!(
+            "[external image link · open explicitly]\n{}",
+            block["payload"]
+        ));
+    }
+    // Fallback bodies use known v0 types and also move native pixels to owner fetch refs.
+    for key in ["text", "arguments", "content"] {
+        if let Some(value) = body.get_mut(key) {
+            image_refs(
+                value,
+                &format!("/body/{key}"),
+                source,
+                basis,
+                session_id,
+                &original,
+            );
+            if let Value::String(text) = value {
+                *text = clipped(text);
+            } else {
+                bound(value);
+            }
+        }
+    }
+    // Error/status fallback fields use the same clipped display convention as
+    // text/arguments/content. A negotiated body_ref continuation fetches the
+    // complete original body; legacy clients receive the visible marker only.
+    for key in ["message", "details", "detail"] {
+        if let Some(value) = body.get_mut(key) {
+            bound_open_value(value);
+        }
+    }
+    let mut fallback = original["body"].clone();
+    fallback
+        .as_object_mut()
+        .expect("native body")
+        .remove("blocks");
+    if let Some(blocks) = body.get_mut("blocks").and_then(Value::as_array_mut) {
+        for (index, block) in blocks.iter_mut().enumerate() {
+            if original["body"]["blocks"][index]["payload"] == fallback
+                || original["body"]["blocks"][index]["payload"] == json!({"body_ref":true})
+            {
+                block["payload"] = json!({"body_ref": true});
+            }
+        }
+    }
+    item.as_object_mut().expect("native item").remove("_source");
+    item.as_object_mut()
+        .expect("native item")
+        .remove("_oversized_bytes");
+    item.as_object_mut()
+        .expect("native item")
+        .remove("_oversized_payload_bytes");
+    if serde_json::to_vec(item).map_err(ApiError::internal)?.len()
+        > CLIENT_MAX_RESPONSE_BYTES - 128_000
+    {
+        let body = item["body"].as_object_mut().expect("native body");
+        for (key, value) in body.iter_mut() {
+            if key != "blocks" {
+                bound_open_value(value);
+                if !value.is_string() {
+                    bound(value);
+                }
+            }
+        }
+        // Retained open-object keys can still exceed the transport budget.
+        // Replace only this entry, preserving its identity and ordering.
+        let size = serde_json::to_vec(item).map_err(ApiError::internal)?.len();
+        if size > CLIENT_MAX_RESPONSE_BYTES - 128_000 {
+            if item["type"] != "error" {
+                item["type"] = json!("error");
+                item["role"] = json!("system");
+            }
+            item["body"] = json!({
+                "code":"native-entry-too-large",
+                "message":format!("[st truncated this native timeline value: size limit; {size} bytes]"),
+                "retryable":false,
+                "details":{"size":size},
+                "blocks":[{
+                    "id":"native-entry-too-large",
+                    "kind":"error",
+                    "source_type":"native-entry-too-large",
+                    "payload":{"body_ref":true},
+                    "continuation":continuation(
+                        reference(source, basis, session_id, &original, "/body"),
+                        "application/json",
+                        Some(serde_json::to_vec(&original["body"]).map_err(ApiError::internal)?.len()),
+                        "size-limit",
+                    )
+                }]
+            });
+        }
+    }
+    if !session.conversation_blocks {
+        item["body"]
+            .as_object_mut()
+            .expect("native body")
+            .remove("blocks");
+    }
+    Ok(())
 }
 
 /// Keep negotiated data out of legacy relayed clients without changing their known enum.
