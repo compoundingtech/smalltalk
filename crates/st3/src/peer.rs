@@ -70,6 +70,11 @@ pub const CLIENT_READ_FORWARD_PATH: &str = "/v1/internal/client-read/forward";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ClientReadOperation {
+    ConversationContent {
+        session_id: String,
+        reference: String,
+        offset: u64,
+    },
     ConversationChanges {
         session_id: String,
         after: Option<String>,
@@ -1072,6 +1077,13 @@ async fn receive_client_read(
         }
         let client = st3_client::Client::unix_as(state.backend().socket(), &request.authority_actor);
         match request.request {
+            ClientReadOperation::ConversationContent {
+                session_id,
+                reference,
+                offset,
+            } => Ok(serde_json::to_value(
+                client.conversation_content_chunk(&session_id, &reference, offset).await?.value,
+            )?),
             ClientReadOperation::ConversationChanges {
                 session_id,
                 after,
@@ -1270,6 +1282,7 @@ async fn receive_client_read(
                         Some(st3_client::ClientError::Api(code, message, details)) => {
                             let status = match code {
                                 st3_client::ErrorCode::PageCursorExpired
+                                | st3_client::ErrorCode::ConversationContentInvalidated
                                 | st3_client::ErrorCode::CursorGap
                                 | st3_client::ErrorCode::BlobExpired => StatusCode::GONE,
                                 st3_client::ErrorCode::NotFound

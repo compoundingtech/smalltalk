@@ -22,9 +22,7 @@ pub(crate) const MAX_EXPOSED_HISTORY: usize = 2_000;
 const MAX_METADATA_LINES: usize = 64;
 const MAX_TIMELINE_LINES: usize = 4_096;
 const MAX_TIMELINE_BYTES: u64 = 32 * 1024 * 1024;
-// A maximum-size page must remain below the client gateway's one-megabyte response ceiling even
-// when every native entry contains a large tool payload.
-const MAX_TIMELINE_VALUE_BYTES: usize = 8 * 1024;
+// Wire size limits and owner references are applied by api/client_v0/conversation_blocks.
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
 /// How long a saved-history request waits for a background transcript read before it answers
 /// with the last complete inventory.
@@ -1984,6 +1982,38 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
                         );
                     }
                 }
+                Some("image" | "input_image" | "image_url" | "output_image") => {
+                    push_image(
+                        &mut additions,
+                        next_opencode_sequence(&mut sequence)?,
+                        &at,
+                        role,
+                        &part,
+                    );
+                }
+                Some(kind) if REASONING_BLOCKS.contains(&kind) => {
+                    push_reasoning(
+                        &mut additions,
+                        next_opencode_sequence(&mut sequence)?,
+                        &at,
+                        role,
+                        &part,
+                    );
+                }
+                Some("file")
+                    if part
+                        .get("mime")
+                        .and_then(Value::as_str)
+                        .is_some_and(|mime| mime.starts_with("image/")) =>
+                {
+                    push_image(
+                        &mut additions,
+                        next_opencode_sequence(&mut sequence)?,
+                        &at,
+                        role,
+                        &part,
+                    );
+                }
                 Some("file") => {
                     let name = part
                         .get("filename")
@@ -2148,13 +2178,11 @@ const CODEX_BOOKKEEPING: &[&str] = &[
     "session_meta",
     "event_msg",
     "turn_context",
-    "compacted",
     "token_usage_record",
     "world_state",
 ];
-/// Codex response items that are known and deliberately not shown (private reasoning and
-/// workspace snapshots).
-const CODEX_HIDDEN_ITEMS: &[&str] = &["reasoning", "ghost_snapshot"];
+/// Native workspace snapshots are bookkeeping, rather than harness-shown content.
+const CODEX_HIDDEN_ITEMS: &[&str] = &["ghost_snapshot"];
 /// Claude records that are known and are not conversation: UI and session bookkeeping.
 const CLAUDE_BOOKKEEPING: &[&str] = &[
     "file-history-snapshot",
@@ -2166,7 +2194,6 @@ const CLAUDE_BOOKKEEPING: &[&str] = &[
     "last-prompt",
     "ai-title",
     "custom-title",
-    "summary",
     "cost-state",
     "progress",
     "agent-name",
@@ -2175,13 +2202,11 @@ const CLAUDE_BOOKKEEPING: &[&str] = &[
     "bridge-session",
     "fork-context-ref",
 ];
-/// Content blocks that are known and deliberately not shown: the model's private reasoning.
-const HIDDEN_REASONING_BLOCKS: &[&str] = &["thinking", "redacted_thinking"];
+/// Reasoning blocks explicitly exposed in the native transcript.
+const REASONING_BLOCKS: &[&str] = &["thinking", "redacted_thinking", "reasoning"];
 /// Pi and OMP records that are known and are not conversation.
 const OMP_BOOKKEEPING: &[&str] = &[
     "session",
-    "model_change",
-    "thinking_level_change",
     "label",
     "session_info",
     "custom",
@@ -2190,17 +2215,8 @@ const OMP_BOOKKEEPING: &[&str] = &[
 ];
 /// OpenCode parts that are known and deliberately not shown.
 const OPENCODE_HIDDEN_PARTS: &[&str] = &[
-    "reasoning",
-    "step-start",
-    "step-finish",
     "snapshot",
-    "patch",
-    "agent",
-    "retry",
-    "compaction",
 ];
-/// The most JSON an unrecognized record contributes to its generic entry.
-const MAX_UNRECOGNIZED_BYTES: usize = 512;
 
 /// A native timestamp as the timeline carries it. RFC 3339 text is kept as written; a number is
 /// Unix milliseconds (or seconds, when too small to be milliseconds). Anything else is absent,
@@ -2223,9 +2239,8 @@ fn native_timestamp(value: Option<&Value>) -> Option<String> {
     }
 }
 
-/// Show a record this reader does not understand as a generic, clearly-labelled system entry
-/// with a bounded excerpt, instead of dropping it. The role is always `system`: an unknown
-/// record is never attributed to the user or the agent.
+/// Preserve unknown native JSON and label its origin. Transport bounds are applied on reads.
+/// Records without an explicit native attribution use the system role.
 fn push_unrecognized(
     items: &mut Vec<Value>,
     sequence: u64,
@@ -2235,28 +2250,124 @@ fn push_unrecognized(
     kind: Option<&str>,
     value: &Value,
 ) {
-    if driver == "omp" && omp_has_image_payload(value) {
-        push_omp_image_unavailable(items, sequence, timestamp, value);
-        return;
-    }
+    let block_kind = match kind {
+        Some("thinking" | "redacted_thinking" | "reasoning") => {
+            push_reasoning(items, sequence, timestamp, "system", value);
+            return;
+        }
+        Some("job" | "job_start" | "job_update" | "job_end") => "job",
+        Some("subagent" | "subagent_start" | "subagent_update" | "subagent_end" | "agent") => {
+            "subagent"
+        }
+        Some("ask" | "ask_start" | "ask_update" | "ask_end") => "ask",
+        Some(
+            "status"
+            | "model_change"
+            | "thinking_level_change"
+            | "step-start"
+            | "step-finish"
+            | "retry"
+            | "compaction"
+            | "compacted"
+            | "summary",
+        ) => "status",
+        _ => "unknown",
+    };
     let label = match kind {
         Some(kind) => format!("[unrecognized {driver} {what} `{kind}`]"),
         None => format!("[unrecognized {driver} {what} without a type]"),
     };
-    let encoded = serde_json::to_string(value).unwrap_or_default();
-    let excerpt = truncate_at_char_boundary(&encoded, MAX_UNRECOGNIZED_BYTES);
-    let ellipsis = if excerpt.len() < encoded.len() {
-        "…"
-    } else {
-        ""
-    };
-    items.push(timeline_item(
+    let role = value
+        .get("role")
+        .or_else(|| value.pointer("/message/role"))
+        .and_then(Value::as_str)
+        .map(|role| normalized_role(Some(role)))
+        .unwrap_or("system");
+    push_native_block(
+        items,
         sequence,
         timestamp,
-        "system",
+        role,
+        block_kind,
+        kind.unwrap_or(what),
+        json!({"raw": value}),
+        &label,
+    );
+}
+
+/// Native bodies stay owner-local. HTTP negotiation adds size bounds and owner fetch refs;
+/// the text is a legacy-client fallback, not a separate capture or storage policy.
+fn push_native_block(
+    items: &mut Vec<Value>,
+    sequence: u64,
+    timestamp: &str,
+    role: &str,
+    kind: &str,
+    source_type: &str,
+    payload: Value,
+    label: &str,
+) {
+    let fallback = match kind {
+        "image" => "[image · load from owner]".to_owned(),
+        "reasoning" => payload
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| format!("[reasoning]\n{text}"))
+            .unwrap_or_else(|| format!("[reasoning]\n{payload}")),
+        _ => format!("{label}\n{payload}"),
+    };
+    let mut item = timeline_item(
+        sequence,
+        timestamp,
+        role,
         "content",
-        json!({"media_type":"text/plain", "text":format!("{label}\n{excerpt}{ellipsis}")}),
-    ));
+        json!({"media_type":"text/plain", "text":fallback}),
+    );
+    item["body"]["blocks"] = json!([{
+        "id": format!("native-{sequence}/0"), "kind":kind,
+        "source_type":source_type, "payload":payload
+    }]);
+    items.push(item);
+}
+
+fn push_reasoning(
+    items: &mut Vec<Value>,
+    sequence: u64,
+    timestamp: &str,
+    role: &str,
+    part: &Value,
+) {
+    let text = part
+        .get("thinking")
+        .or_else(|| part.get("text"))
+        .or_else(|| part.get("summary"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    push_native_block(
+        items,
+        sequence,
+        timestamp,
+        role,
+        "reasoning",
+        part.get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("reasoning"),
+        json!({"text":text,"raw":part}),
+        "[reasoning]",
+    );
+}
+
+fn push_image(items: &mut Vec<Value>, sequence: u64, timestamp: &str, role: &str, part: &Value) {
+    push_native_block(
+        items,
+        sequence,
+        timestamp,
+        role,
+        "image",
+        part.get("type").and_then(Value::as_str).unwrap_or("image"),
+        part.clone(),
+        "[image]",
+    );
 }
 
 fn json_kind(value: &Value) -> &'static str {
@@ -2310,7 +2421,7 @@ fn normalize_codex(value: &Value, sequence: u64, fallback_timestamp: &str, items
                         }
                         match part.get("type").and_then(Value::as_str) {
                             Some("input_image" | "output_image" | "image") => {
-                                push_content(items, part_sequence, &timestamp, role, "[image]")
+                                push_image(items, part_sequence, &timestamp, role, part)
                             }
                             kind => push_unrecognized(
                                 items,
@@ -2356,6 +2467,7 @@ fn normalize_codex(value: &Value, sequence: u64, fallback_timestamp: &str, items
             payload["call_id"].as_str().unwrap_or("native-call"),
             payload.get("output").cloned().unwrap_or(Value::Null),
         ),
+        Some("reasoning") => push_reasoning(items, sequence, &timestamp, "assistant", payload),
         Some(kind) if CODEX_HIDDEN_ITEMS.contains(&kind) => {}
         kind => push_unrecognized(
             items,
@@ -2471,8 +2583,11 @@ fn push_claude_content(
                         part.get("content").cloned().unwrap_or(Value::Null),
                         part.get("is_error") == Some(&Value::Bool(true)),
                     ),
-                    Some(kind) if HIDDEN_REASONING_BLOCKS.contains(&kind) => {}
-                    Some(kind @ ("image" | "document")) => {
+                    Some(kind) if REASONING_BLOCKS.contains(&kind) => {
+                        push_reasoning(items, item_sequence, timestamp, role, part);
+                    }
+                    Some("image") => push_image(items, item_sequence, timestamp, role, part),
+                    Some(kind @ "document") => {
                         push_content(items, item_sequence, timestamp, role, &format!("[{kind}]"))
                     }
                     kind => push_unrecognized(
@@ -2562,7 +2677,7 @@ fn normalize_omp(
                 sequence + 1,
                 &timestamp,
                 message["toolCallId"].as_str().unwrap_or_default(),
-                omp_result_images(driver, message.get("content").cloned().unwrap_or(Value::Null)),
+                message.get("content").cloned().unwrap_or(Value::Null),
                 message.get("isError").and_then(Value::as_bool).unwrap_or(false),
             );
             return;
@@ -2651,14 +2766,13 @@ fn push_omp_content(
                             .or_else(|| part.get("call_id"))
                             .and_then(Value::as_str)
                             .unwrap_or("native-call"),
-                        omp_result_images(driver, part.get("content").cloned().unwrap_or(Value::Null)),
+                        part.get("content").cloned().unwrap_or(Value::Null),
                     ),
-                    Some(kind) if HIDDEN_REASONING_BLOCKS.contains(&kind) => {}
-                    Some("image") if driver == ExternalDriver::Omp => {
-                        push_omp_image_unavailable(items, item_sequence, &timestamp, part);
+                    Some(kind) if REASONING_BLOCKS.contains(&kind) => {
+                        push_reasoning(items, item_sequence, &timestamp, role, part);
                     }
-                    Some("image") => {
-                        push_content(items, item_sequence, &timestamp, role, "[image]")
+                    Some("image" | "input_image" | "image_url") => {
+                        push_image(items, item_sequence, &timestamp, role, part);
                     }
                     kind => push_unrecognized(
                         items,
@@ -2682,79 +2796,6 @@ fn push_omp_content(
             Some(json_kind(other)),
             other,
         ),
-    }
-}
-
-fn omp_image_availability(image: &Value) -> Value {
-    let reference = image.get("data").and_then(Value::as_str).filter(|reference| {
-        reference.strip_prefix("blob:sha256:").is_some_and(|digest| {
-            digest.len() == 64
-                && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-    });
-    let mut details = json!({
-        "_tag":"OmpImage","version":1,
-        "availability":if reference.is_some() { "unavailable" } else { "withheld" },
-        "reason":if reference.is_some() { "native_blob_not_fetchable" } else { "image_payload_not_authorized" },
-    });
-    if let Some(reference) = reference {
-        // This is not a st attachment ID: no origin/authorization evidence exists to fetch it.
-        details["native_ref"] = json!(reference);
-    }
-    if let Some(mime) = image.get("mimeType").and_then(Value::as_str)
-        .filter(|mime| matches!(*mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp"))
-    {
-        details["mime_type"] = json!(mime);
-    } else {
-        details["mime_availability"] = json!("unknown");
-    }
-    for key in ["width", "height"] {
-        if let Some(value) = image.get(key).and_then(Value::as_u64).filter(|value| *value <= 65_535) {
-            details[key] = json!(value);
-        }
-    }
-    details
-}
-
-fn push_omp_image_unavailable(
-    items: &mut Vec<Value>,
-    sequence: u64,
-    timestamp: &str,
-    image: &Value,
-) {
-    items.push(timeline_item(sequence, timestamp, "system", "error", json!({
-        "code":"native_image_unavailable",
-        "message":"Native image is unavailable through the conversation attachment service.",
-        "retryable":false,
-        "details":omp_image_availability(image),
-    })));
-}
-
-/// Unknown native shapes must not turn an image or a data URI into visible JSON text.
-fn omp_has_image_payload(value: &Value) -> bool {
-    match value {
-        Value::String(text) => text.trim_start().starts_with("data:"),
-        Value::Array(values) => values.iter().any(omp_has_image_payload),
-        Value::Object(fields) => {
-            fields.get("type").and_then(Value::as_str).is_some_and(|kind| {
-                matches!(kind, "image" | "input_image" | "image_url")
-            }) || fields.contains_key("image_url")
-                || fields.values().any(omp_has_image_payload)
-        }
-        _ => false,
-    }
-}
-
-fn omp_result_images(driver: ExternalDriver, content: Value) -> Value {
-    if driver != ExternalDriver::Omp {
-        return content;
-    }
-    match content {
-        Value::Array(parts) => Value::Array(
-            parts.into_iter().map(|part| omp_result_images(driver, part)).collect(),
-        ),
-        other if omp_has_image_payload(&other) => omp_image_availability(&other),
-        other => other,
     }
 }
 
@@ -2784,7 +2825,6 @@ fn push_message(
 }
 
 fn push_content(items: &mut Vec<Value>, sequence: u64, timestamp: &str, role: &str, text: &str) {
-    let text = bounded_text(text);
     items.push(timeline_item(
         sequence,
         timestamp,
@@ -2806,7 +2846,6 @@ fn push_tool_call(
         .as_str()
         .and_then(|value| serde_json::from_str(value).ok())
         .unwrap_or(arguments);
-    let arguments = bounded_value(arguments);
     items.push(timeline_item(
         sequence,
         timestamp,
@@ -2834,39 +2873,8 @@ fn push_tool_result_with_status(
     content: Value,
     failed: bool,
 ) {
-    let content = bounded_value(content);
     let status = if failed { "error" } else { "success" };
     items.push(timeline_item(sequence, timestamp, "tool", "tool_result", json!({"call_id":call_id, "status":status, "media_type":"application/json", "content":content})));
-}
-
-fn truncate_at_char_boundary(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
-fn bounded_text(value: &str) -> String {
-    if value.len() <= MAX_TIMELINE_VALUE_BYTES {
-        return value.to_owned();
-    }
-    // The bound is in bytes: it keeps a page under the gateway's response ceiling.
-    let mut output = truncate_at_char_boundary(value, MAX_TIMELINE_VALUE_BYTES).to_owned();
-    output.push_str("\n[st truncated this native timeline value]");
-    output
-}
-
-fn bounded_value(value: Value) -> Value {
-    match serde_json::to_string(&value) {
-        Ok(encoded) if encoded.len() > MAX_TIMELINE_VALUE_BYTES => {
-            Value::String(bounded_text(&encoded))
-        }
-        _ => value,
-    }
 }
 
 fn timeline_item(
@@ -2874,8 +2882,21 @@ fn timeline_item(
     timestamp: &str,
     role: &str,
     entry_type: &str,
-    body: Value,
+    mut body: Value,
 ) -> Value {
+    let kind = match entry_type {
+        "content" => Some("text"),
+        "tool_call" => Some("tool_call"),
+        "tool_result" => Some("tool_output"),
+        "status" => Some("status"),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        body["blocks"] = json!([{
+            "id":format!("native-{sequence}/0"), "kind":kind,
+            "source_type":entry_type, "payload":body.clone()
+        }]);
+    }
     json!({
         "id": format!("timeline-entry/native-{sequence}"),
         "sequence": sequence,
@@ -3461,139 +3482,22 @@ mod tests {
     }
 
     #[test]
-    fn omp_images_keep_safe_identity_and_typed_unavailability_without_pixels() {
-        let reference = format!("blob:sha256:{}", "a".repeat(64));
-        let image = json!({"type":"image","data":reference,"mimeType":"image/webp","width":640,"height":480});
-        let mut items = Vec::new();
-        normalize_omp(ExternalDriver::Omp, &json!({
-            "type":"message","id":"image-message","message":{"role":"user","content":[image.clone()]}
-        }), 0, "", &mut items);
-        let notice = items.iter().find(|item| item["type"] == "error").unwrap();
-        assert_eq!(notice["body"]["code"], "native_image_unavailable");
-        assert_eq!(notice["body"]["details"]["native_ref"], reference);
-        assert_eq!(notice["body"]["details"]["mime_type"], "image/webp");
-        assert_eq!(notice["body"]["details"]["availability"], "unavailable");
-        assert_eq!(notice["body"]["details"]["reason"], "native_blob_not_fetchable");
-        assert_eq!(notice["body"]["details"]["width"], 640);
-        assert_eq!(notice["body"]["details"]["height"], 480);
-
-        for data in ["planted-image-bytes", "https://user:secret@example.invalid/image", "blob:sha256:secret"] {
-            items.clear();
-            normalize_omp(ExternalDriver::Omp, &json!({
-                "type":"message","id":"image-tool","message":{
-                    "role":"toolResult","toolCallId":"image-call","isError":false,
-                    "content":[{"type":"text","text":"kept"},{"type":"image","data":data,"mimeType":"image/png"}]
-                }
-            }), 0, "", &mut items);
-            let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
-            assert_eq!(result["body"]["call_id"], "image-call");
-            assert_eq!(result["body"]["content"][0]["text"], "kept");
-            assert_eq!(result["body"]["content"][1]["_tag"], "OmpImage");
-            assert_eq!(result["body"]["content"][1]["availability"], "withheld");
-            assert_eq!(result["body"]["content"][1]["mime_type"], "image/png");
-            assert!(!serde_json::to_string(&items).unwrap().contains(data));
-        }
-    }
-
-    #[test]
-    fn omp_nested_result_images_withhold_bytes_and_unknown_mime() {
-        let mut items = Vec::new();
-        normalize_omp(ExternalDriver::Omp, &json!({
-            "type":"message","id":"nested-image","message":{"role":"tool","content":[{
-                "type":"toolResult","toolCallId":"nested-call","content":[{
-                    "type":"image","data":"planted-image-bytes","mimeType":"planted-mime-secret"
-                }]
-            }]}
-        }), 0, "", &mut items);
-        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
-        assert_eq!(result["body"]["content"][0]["mime_availability"], "unknown");
-        assert_eq!(result["body"]["content"][0]["reason"], "image_payload_not_authorized");
-        assert!(!serde_json::to_string(&items).unwrap().contains("planted-"));
-    }
-
-    #[test]
-    fn omp_images_reject_malformed_direct_refs_and_oversized_dimensions() {
-        let canonical = format!("blob:sha256:{}", "a".repeat(64));
-        for reference in [
-            format!("blob:sha256:{}", "A".repeat(64)),
-            format!("blob:sha256:{}", "a".repeat(63)),
-            format!("blob:sha256:{}", "a".repeat(65)),
-            format!("{canonical}trailing-data"),
-            format!("blob:sha256:{}", "é".repeat(32)),
-            "data:image/png;base64,planted-pixels".into(),
-        ] {
+    fn native_images_keep_original_sources_for_owner_fetch() {
+        let part = json!({"type":"image","data":"data:image/png;base64,AAAA","mimeType":"image/png","width":70000});
+        for driver in [ExternalDriver::Omp, ExternalDriver::Pi] {
             let mut items = Vec::new();
-            normalize_omp(ExternalDriver::Omp, &json!({
-                "type":"message","id":"malformed-image","message":{"role":"user","content":[{
-                    "type":"image","data":reference,"mimeType":"planted-mime",
-                    "width":9_007_199_254_740_992_u64,"height":65_536
-                }]}
-            }), 0, "", &mut items);
-            let details = &items.iter().find(|item| item["type"] == "error").unwrap()["body"]["details"];
-            assert_eq!(details["availability"], "withheld");
-            assert_eq!(details["reason"], "image_payload_not_authorized");
-            assert!(details.get("native_ref").is_none());
-            assert!(details.get("width").is_none());
-            assert!(details.get("height").is_none());
-            assert!(!serde_json::to_string(&items).unwrap().contains(&reference));
+            normalize_omp(
+                driver,
+                &json!({"type":"message","id":"image","message":{"role":"user","content":[part.clone()]}}),
+                0,
+                "",
+                &mut items,
+            );
+            let block = &items[1]["body"]["blocks"][0];
+            assert_eq!(block["kind"], "image");
+            assert_eq!(block["payload"], part);
+            assert_eq!(items[1]["body"]["text"], "[image · load from owner]");
         }
-        let details = omp_image_availability(&json!({
-            "type":"image","data":canonical,"width":65_535,"height":480
-        }));
-        assert_eq!(details["width"], 65_535);
-        assert_eq!(details["height"], 480);
-    }
-
-    #[test]
-    fn omp_images_withhold_unrecognized_and_single_object_payloads() {
-        let payload = "data:image/png;base64,planted-pixels";
-        for block in [
-            json!({"type":"input_image","image_url":payload}),
-            json!({"type":"image_url","image_url":{"url":payload}}),
-            json!({"type":"future_block","source":{"data":payload}}),
-        ] {
-            for content in [json!([block.clone()]), block.clone()] {
-                let mut items = Vec::new();
-                normalize_omp(ExternalDriver::Omp, &json!({
-                    "type":"message","id":"unknown-image","message":{"role":"user","content":content}
-                }), 0, "", &mut items);
-                let details = &items.iter().find(|item| item["type"] == "error").unwrap()["body"]["details"];
-                assert_eq!(details["_tag"], "OmpImage");
-                assert_eq!(details["availability"], "withheld");
-                assert!(!serde_json::to_string(&items).unwrap().contains(payload));
-            }
-            for content in [json!([{"type":"text","text":"kept"},block.clone()]), block.clone()] {
-                let mut items = Vec::new();
-                normalize_omp(ExternalDriver::Omp, &json!({
-                    "type":"message","id":"unknown-tool-image","message":{
-                        "role":"toolResult","toolCallId":"image-call","content":content
-                    }
-                }), 0, "", &mut items);
-                let result = &items.iter().find(|item| item["type"] == "tool_result").unwrap()["body"]["content"];
-                let placeholder = if result.is_array() {
-                    assert_eq!(result[0]["text"], "kept");
-                    &result[1]
-                } else {
-                    result
-                };
-                assert_eq!(placeholder["_tag"], "OmpImage");
-                assert_eq!(placeholder["availability"], "withheld");
-                assert!(!serde_json::to_string(&items).unwrap().contains(payload));
-            }
-        }
-    }
-
-    #[test]
-    fn pi_images_remain_plain_image_placeholders() {
-        let mut items = Vec::new();
-        normalize_omp(ExternalDriver::Pi, &json!({
-            "type":"message","id":"pi-image","message":{"role":"user","content":[{
-                "type":"image","data":"planted-pixels","mimeType":"image/png"
-            }]}
-        }), 0, "", &mut items);
-        let content = items.iter().find(|item| item["type"] == "content").unwrap();
-        assert_eq!(content["body"]["text"], "[image]");
-        assert!(!serde_json::to_string(&items).unwrap().contains("planted-pixels"));
     }
 
     #[test]
@@ -4271,11 +4175,12 @@ mod tests {
         let labels = texts(&items);
         assert!(labels[0].starts_with("[unrecognized claude entry `brand-new-kind`]"));
         assert!(labels[1].starts_with("[unrecognized claude entry without a type]"));
-        assert!(labels[2].starts_with("[unrecognized claude content block `hologram`]"));
-        assert_eq!(labels[3], "[image]");
-        assert_eq!(labels[4], "visible");
-        assert_eq!(labels.len(), 5);
-        assert!(!labels.iter().any(|text| text.contains("private")));
+        assert_eq!(labels[2], "[reasoning]\nprivate");
+        assert!(labels[3].starts_with("[unrecognized claude content block `hologram`]"));
+        assert_eq!(labels[4], "[image · load from owner]");
+        assert_eq!(labels[5], "visible");
+        assert_eq!(labels.len(), 6);
+        assert!(labels.iter().any(|text| text.contains("private")));
         for item in &items {
             if item["body"]["text"]
                 .as_str()
@@ -4293,17 +4198,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognized_record_excerpt_is_bounded() {
+    fn unknown_json_is_lossless_before_transport_bounding() {
+        let value = json!({"type":"brand-new-kind","blob":"é".repeat(8192),"nested":{"token":"invented-token"}});
         let mut items = Vec::new();
-        normalize_claude(
-            &json!({"type":"brand-new-kind","blob":"é".repeat(MAX_TIMELINE_VALUE_BYTES)}),
-            16,
-            &timestamp(0),
-            &mut items,
-        );
-        let text = items[0]["body"]["text"].as_str().unwrap();
-        assert!(text.len() < MAX_UNRECOGNIZED_BYTES + 128, "{}", text.len());
-        assert!(text.ends_with('…'));
+        normalize_claude(&value, 16, &timestamp(0), &mut items);
+        assert_eq!(items[0]["body"]["blocks"][0]["kind"], "unknown");
+        assert_eq!(items[0]["body"]["blocks"][0]["payload"]["raw"], value);
     }
 
     #[test]
@@ -4428,12 +4328,13 @@ mod tests {
             normalize_codex(&value, sequence, &fallback, &mut items);
         }
         let labels = texts(&items);
-        assert!(labels[0].starts_with("[unrecognized codex record `new_record_kind`]"));
-        assert!(labels[1].starts_with("[unrecognized codex response item `web_search_call`]"));
-        assert_eq!(labels[2], "[image]");
-        assert!(labels[3].starts_with("[unrecognized codex message part `input_hologram`]"));
-        assert_eq!(labels[4], "typed");
-        assert_eq!(labels.len(), 5);
+        assert!(labels[0].starts_with("[reasoning]"));
+        assert!(labels[1].starts_with("[unrecognized codex record `new_record_kind`]"));
+        assert!(labels[2].starts_with("[unrecognized codex response item `web_search_call`]"));
+        assert_eq!(labels[3], "[image · load from owner]");
+        assert!(labels[4].starts_with("[unrecognized codex message part `input_hologram`]"));
+        assert_eq!(labels[5], "typed");
+        assert_eq!(labels.len(), 6);
         assert_unique_ids(&items);
     }
 
@@ -4467,12 +4368,14 @@ mod tests {
             normalize_omp(ExternalDriver::Omp, &value, sequence, &fallback, &mut items);
         }
         let labels = texts(&items);
-        assert_eq!(labels[0], "[omp compaction]\nearlier work");
-        assert_eq!(labels[1], "$ ls\nfile");
-        assert!(labels[2].starts_with("[unrecognized omp entry `future_kind`]"));
-        assert!(labels[3].starts_with("[unrecognized omp content block `sparkle`]"));
-        assert_eq!(labels[4], "answer");
-        assert_eq!(labels.len(), 5);
+        assert!(labels[0].contains("model_change"));
+        assert_eq!(labels[1], "[omp compaction]\nearlier work");
+        assert_eq!(labels[2], "$ ls\nfile");
+        assert!(labels[3].starts_with("[unrecognized omp entry `future_kind`]"));
+        assert_eq!(labels[4], "[reasoning]\nprivate");
+        assert!(labels[5].starts_with("[unrecognized omp content block `sparkle`]"));
+        assert_eq!(labels[6], "answer");
+        assert_eq!(labels.len(), 7);
         let shell = items
             .iter()
             .find(|item| item["body"]["text"] == "$ ls\nfile")

@@ -671,7 +671,7 @@ fn the_note_that_earlier_history_is_not_shown_is_at_the_start_not_the_bottom() {
 }
 
 #[test]
-fn exposed_timeline_variants_and_media_are_visible_without_unknown_payloads() {
+fn exposed_timeline_variants_media_and_unknown_payloads_are_visible() {
     let bodies = [
         (
             "status",
@@ -732,7 +732,7 @@ fn exposed_timeline_variants_and_media_are_visible_without_unknown_payloads() {
     ] {
         assert!(display.contains(visible), "missing {visible}: {display}");
     }
-    assert!(!display.contains("must-not-render"));
+    assert!(display.contains("must-not-render"));
     assert!(!display.contains("bounded read window"), "{display}");
     assert!(!display.contains("nothing in the harness"));
     assert_eq!(rendered.len(), timeline.len());
@@ -938,7 +938,7 @@ fn review_usage_is_compact_and_preserves_supplied_tokens_cost_and_semantics() {
 }
 
 #[test]
-fn review_unknown_role_content_has_no_blank_event_or_unrecognized_payload() {
+fn unknown_role_content_preserves_payload_and_skips_blank_events() {
     for text in [None, Some(""), Some(" \n\t")] {
         let entry = review_entry("content", "future-role", serde_json::json!({
             "media_type":"text/plain","text":text
@@ -951,14 +951,14 @@ fn review_unknown_role_content_has_no_blank_event_or_unrecognized_payload() {
     let rendered = adapt::conversation(&[entry], &Default::default());
     let display = serde_json::to_string(&rendered).unwrap();
     assert!(display.contains("attachment/safe"));
-    assert!(!display.contains("UNRECOGNIZED_PAYLOAD"));
+    assert!(display.contains("UNRECOGNIZED_PAYLOAD"));
     let entry = review_entry("content", "future-role", serde_json::json!({
         "media_type":"text/plain","text":"UNRECOGNIZED_PAYLOAD"
     }));
     let rendered = adapt::conversation(&[entry], &Default::default());
     let display = serde_json::to_string(&rendered).unwrap();
-    assert!(display.contains("content not displayed"));
-    assert!(!display.contains("UNRECOGNIZED_PAYLOAD"));
+    assert!(display.contains("unknown role"));
+    assert!(display.contains("UNRECOGNIZED_PAYLOAD"));
 }
 
 #[test]

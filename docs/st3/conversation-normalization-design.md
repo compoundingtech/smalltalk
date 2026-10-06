@@ -3,8 +3,8 @@
 Nathan decided on 2026-10-06: no outbox/queue and no stored agent history; status
 is a best-effort latest-wins value with a very short timeout. Conversations are
 read from their owner machine at request time, including managed seats. cos owns
-a separate mission to remove the outbox and stored transcript operations. This
-normalization design changes no runtime behavior; its wire contract still goes
+a separate mission to remove the outbox and stored transcript operations. The
+first implementation includes this design; its wire contract still goes
 to Nathan via the curator for exact-head approval before implementation is queued.
 If a harness shows content in its terminal, st shows it in the conversation. Normalize
 for stui, web and phone without token filtering, secret scrubbing, allow-lists or
@@ -14,7 +14,7 @@ never invent or obtain provider-hidden reasoning.
 ## One display contract
 
 Keep the timeline envelope (`id`, source `sequence`, `revision`, `timestamp`, `role`,
-`type`, `final`, `body`) and propose a negotiated `body.blocks` array. Each block has
+`type`, `final`, `body`) and use a negotiated `body.blocks` array. Each block has
 `id`, `kind`, `source_type` and `payload`; optional `continuation` describes an
 owner-fetched remainder. Kinds are text, reasoning, tool_call, tool_output, image,
 job, subagent, ask, status and unknown. Preserve native identities, call/result
@@ -38,7 +38,7 @@ conversation reports **owner unavailable** when unreachable; a reachable owner w
 a missing transcript reports **transcript unavailable**, rather than an empty session.
 Neither state substitutes stored transcript operations or an old prepared page.
 
-Propose `GET /v1/client/conversations/{session}/content/{ref}/chunk?offset=N` for
+Use `GET /v1/client/conversations/{session}/content/{ref}/chunk?offset=N` for
 image bytes and oversized block bodies. The opaque ref is scoped to the authorized
 session, entry/revision and owner source identity, not an arbitrary path or URL.
 Return bounded bytes with media type, total size and next offset; check authorization
@@ -48,6 +48,9 @@ authority: a native image need not have a graph message ID. Source changes inval
 refs visibly. Native absence or fetch failure is availability, not content withholding.
 
 The present 8 KiB/value and 1 MB/page bounds protect memory and transport only.
+The initial chunk contract returns up to 256 KiB decoded bytes; image reads have
+a visible 32 MiB limit and a five-second URL timeout. Appends also invalidate
+issued references in this first slice; clients reload rather than join revisions.
 Count encoded response bytes, preserve valid JSON/UTF-8, and mark every clipped
 value with its reason, original size when known and continuation. Fetching the
 remainder recovers full arguments/output/unknown JSON; do not cut JSON into an
@@ -102,7 +105,9 @@ Categorical status is one small replace-in-place value per seat, fenced to the a
 runtime and ordered by original source time. Publication is best effort with a very
 short timeout, no retry backlog: a failed send is superseded by the next current
 observation. Stale evidence becomes unknown; the removal mission specifies the timeout
-and freshness bound. No prose, arguments, output or ask prompt belongs in that value.
+and freshness bound. The no-agent-history builder confirmed 100 ms one-shot local/fleet attempts and
+source-age freshness on 2026-10-06. Numeric usage/limits and st messages remain
+durable independently. No prose, arguments, output or ask prompt belongs in that value.
 A latest-shaped append claim alone does not meet the replace-in-place requirement.
 Coordinate #1546 with its author and cos; do not build a competing lane or assume its
 earlier FIFO/history guarantee survives this decision.
@@ -110,7 +115,10 @@ earlier FIFO/history guarantee survives this decision.
 ## Interface with the removal mission
 
 `st missions ls` was checked before editing this design; cos's new removal mission
-was still being drafted. Check the mission list and its published ownership before
+was still being drafted then. It is now published as
+`mission-run/fleet/smalltalk/no-agent-history/2026-10-06`; its builder confirmed
+that it will sequence reader cutover against this normalizer/chunk contract.
+Check the mission list and its published ownership before
 any implementation touching managed storage, admission, status or the outbox.
 
 Normalization needs these outcomes from cos's mission:
@@ -185,3 +193,15 @@ unknown nested JSON, images, oversized chunks, paging, owner failure and mixed b
 Prove no new content writes, preserved accounting/retries, and checkpoint convergence
 before cleanup. Required checks run on each implementation head; no self-enqueue
 before contract approval, no manual merge or deployment from this document.
+
+## First implementation boundary
+
+The first PR establishes negotiation, raw native blocks, legacy fallbacks and
+on-demand owner chunk reads with revision invalidation. It removes the #1453/#1482
+withholding policy without changing producers, admission, current-status storage
+or the managed stored fallback. It exposes the normalizer/preparation interface
+for #1487's native side-input fold. This checkout contains targeted reconcile
+wakes but no conversation IVM engine; the first slice still uses the existing
+bounded native read path. It claims no cold-read or incremental-append performance
+proof. Integrate with #1487's owner before the subsequent read-model slice; do not
+add an independent cache or persist conversation bytes to meet that dependency.

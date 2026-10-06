@@ -293,6 +293,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "image bytes, outside the graph",
     ),
     (
+        "GET /v1/client/conversations/{id}/content/{reference}/chunk",
+        "requires owner-native transcript content; scope, bounded chunk and revision invalidation are covered by conversation_blocks tests",
+    ),
+    (
         "GET /v1/client/blobs/{id}/chunk",
         "image bytes, outside the graph",
     ),

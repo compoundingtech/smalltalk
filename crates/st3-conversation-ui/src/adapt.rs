@@ -374,27 +374,14 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     ""
                 }
             )),
-            (_, TimelineBody::Unknown { entry_type, .. }) => Body::Event(format!(
-                "unsupported timeline entry: {} (content not displayed)",
-                bounded_preview(entry_type, 64)
+            (_, TimelineBody::Unknown { entry_type, body }) => Body::Event(format!(
+                "[unknown {}]\n{body}", bounded_preview(entry_type,64)
             )),
             (_, TimelineBody::Content(content)) => {
-                // Unknown roles do not authorize interpreting their payload as conversation text.
-                if content.attachment_id.is_some() || content.media_type != "text/plain" {
-                    Body::Event(format!(
-                        "[media: {} · {}]",
-                        content.media_type,
-                        content.attachment_id.as_deref().unwrap_or("reference unavailable")
-                    ))
-                } else if content
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| !text.trim().is_empty())
-                {
-                    Body::Event("content not displayed (unknown role)".into())
-                } else {
-                    continue;
-                }
+                // Attribution may be unknown; authorized conversation content is still visible.
+                let text=content_text(content);
+                if text.trim().is_empty() {continue;}
+                Body::Event(format!("[unknown role]\n{text}"))
             }
             (_, TimelineBody::Message(_)) => unreachable!("messages are handled above"),
         };
@@ -500,7 +487,7 @@ fn bounded_preview(text: &str, max: usize) -> Cow<'_, str> {
 
 /// Preserve authorized attachment references without fetching payloads or decoding unknown bodies.
 fn content_text(content: &st3_client::TimelineContentBody) -> String {
-    let mut text = clean_message_text(content.text.as_deref().unwrap_or(""));
+    let mut text = content.text.as_deref().unwrap_or("").to_owned();
     if let Some(reference) = &content.attachment_id {
         if !text.is_empty() {
             text.push('\n');

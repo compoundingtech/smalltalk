@@ -609,7 +609,9 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::NotFound => format!("it is gone: {message}"),
         ErrorCode::Forbidden => format!("not allowed: {message}"),
         ErrorCode::Internal => format!("st hit a problem: {message}"),
-        ErrorCode::TimelineHistoryIncomplete => message.to_owned(),
+        ErrorCode::TimelineHistoryIncomplete
+        | ErrorCode::ConversationContentInvalidated
+        | ErrorCode::TranscriptUnavailable => message.to_owned(),
         ErrorCode::TerminalEnded => "the terminal ended: its process exited".into(),
         ErrorCode::TerminalUnavailable => "the terminal cannot be reached right now".into(),
         ErrorCode::BlobTooLarge => "the image is too large; the limit is 10 MiB".into(),
@@ -1652,6 +1654,19 @@ impl Client {
         limit: Option<usize>,
     ) -> Result<Envelope<TimelinePage>, ClientError> {
         self.timeline_page_internal(session_id, cursor, limit).await
+    }
+    pub async fn conversation_content_chunk(
+        &self,
+        id: &str,
+        reference: &str,
+        offset: u64,
+    ) -> Result<Envelope<ConversationContentChunk>, ClientError> {
+        self.get(&format!(
+            "/v1/client/conversations/{}/content/{}/chunk?offset={offset}",
+            percent_encode(id),
+            percent_encode(reference)
+        ))
+        .await
     }
     pub async fn conversation_changes(
         &self,
@@ -2885,10 +2900,10 @@ impl Client {
                     .await
                 }
                 Endpoint::FabricLoopback(base) => {
-                    let mut request = self
-                        .http
-                        .request(method, format!("{base}{path}"))
-                        .header("x-st3-features", "custom-subjects.v1");
+                    let mut request = self.http.request(method, format!("{base}{path}")).header(
+                        "x-st3-features",
+                        "custom-subjects.v1, conversation-blocks.v1",
+                    );
                     if let Some(key) = key {
                         request = request.header("idempotency-key", key);
                     }
@@ -3010,7 +3025,10 @@ async fn unix_request(
         .method(method)
         .uri(path)
         .header("host", "localhost")
-        .header("x-st3-features", "custom-subjects.v1");
+        .header(
+            "x-st3-features",
+            "custom-subjects.v1, conversation-blocks.v1",
+        );
     if let Some(credential) = credential {
         builder = builder.header("authorization", format!("Bearer {credential}"));
     }
@@ -3084,7 +3102,7 @@ fn websocket_request(
         .map_err(|error| ClientError::Protocol(error.to_string()))?;
     request.headers_mut().insert(
         hyper::header::HeaderName::from_static("x-st3-features"),
-        hyper::header::HeaderValue::from_static("custom-subjects.v1"),
+        hyper::header::HeaderValue::from_static("custom-subjects.v1, conversation-blocks.v1"),
     );
     request.headers_mut().insert(
         hyper::header::SEC_WEBSOCKET_PROTOCOL,

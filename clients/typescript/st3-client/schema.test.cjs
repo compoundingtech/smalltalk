@@ -272,3 +272,15 @@ test('arrangement resources keep deleted folder positions and missing-seat place
     assert.equal(encoded.body.placements['agent/ada/offline'].value.key, 'a1');
     assert.equal(encoded.body.folders[deletedID].tombstone.value, true);
 });
+
+test('normalized conversation fallbacks and open block payloads survive schema round trips', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const fixture = require('../../../docs/st3/client-v0/fixtures/normalized-conversation-legacy.json');
+    for (const entry of fixture) {
+        const decoded = Rich.decodeUnknownSync(Rich.TimelineEntry, 'strict')(entry);
+        assert.deepEqual(Schema.encodeSync(Rich.TimelineEntry)(decoded), { ...entry, timestamp: new Date(entry.timestamp).toISOString() });
+    }
+    const block = { id: 'native-1/0', kind: 'future-kind', source_type: 'native-future', payload: { raw: { token: 'invented-token', nested: { arguments: ['all', 'values'] } } } };
+    const decoded = Rich.decodeUnknownSync(Rich.TimelineBlock, 'strict')(block);
+    assert.deepEqual(Schema.encodeSync(Rich.TimelineBlock)(decoded), block);
+});

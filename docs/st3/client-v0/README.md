@@ -1483,3 +1483,40 @@ ST3_TERMINALS_COMPAT_BIN=/path/to/older/st3 cargo test -p st3 --test integration
 
 Choose a binary built before these terminal filters. The fake legacy-server refusal
 and escaping test, server filter/paging tests, and TypeScript client checks run in CI.
+
+### Owner-native conversation blocks
+
+With `X-St3-Features: conversation-blocks.v1`, native timeline entries include
+optional `body.blocks`. Top-level timeline types stay unchanged for old Swift/iOS
+and stui decoders. Block kinds are open strings; an unrecognized native block keeps
+its complete JSON in `payload.raw` before transport bounding. Reasoning explicitly
+present in the harness transcript and full structured tool arguments are shown
+without secret or token filtering. Without the feature, the server returns known
+text/tool/status bodies with visible size-limit notices. Old clients can read those
+fallbacks but do not fetch images or expand a chunked remainder.
+
+`read.projections` authorizes **raw native conversation content**, including full
+arguments, output, reasoning shown by the harness, unknown JSON and images. It is
+the existing scope for pages, deltas and owner forwarding, and also governs
+`GET /v1/client/conversations/{id}/content/{reference}/chunk?offset=N`. Terminal
+write or message-attachment scopes are not required. A local read-only Unix client
+already has this scope; a paired client needs it in its active delegated grant.
+
+Image pixels stay off timeline pages. Blocks and nested native images carry opaque
+owner references. Every fetch rebinds the authorized session, entry/revision and
+native source identity; no client-supplied file path or image URL is accepted. A
+chunk contains base64 `data`, `media_type`, `offset`, total `size` and nullable
+`next_offset`. Chunks hold at most 256 KiB of decoded bytes; native image reads are
+limited to 32 MiB and five seconds for URLs, with explicit errors. Oversized JSON
+payloads show an 8 KiB UTF-8 prefix labelled as truncated JSON text, and a reference
+recovers the full valid JSON. The existing 1 MB page bound still applies.
+
+A changed/replaced source (including an append) invalidates earlier references:
+HTTP 410 `conversation-content-invalidated`, `retryable: true`, and
+`details.full_resync: true` tell the client to reload before fetching again. A
+reachable owner with unreadable/missing bytes returns `transcript-unavailable`;
+unreachable owner reads retain `remote-unavailable` and carry
+`details.availability: owner-unavailable`. The managed transcript notice similarly
+labels `transcript-unavailable`; retiring its stored-history fallback is owned by
+the separate no-agent-history mission. This contract adds no durable content class,
+claim kind, retention rule, spool, or image blob copy.
