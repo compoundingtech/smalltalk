@@ -571,13 +571,15 @@ accepted-source verification remain in place.
 
 ## Required mail redelivery canaries
 
-Alongside the two Linux test shards, `scripts/ci-mail-redelivery-canaries` requires twenty named,
+Alongside the two Linux test shards, `scripts/ci-mail-redelivery-canaries` requires twenty-two named,
 unignored regressions: boot/reconnect mailbox suppression and recent unoffered recovery for
 Claude, Codex, OpenCode, Pi, and OMP; each harness's native suspend/resume canary with hour-old
 mail held and recent unoffered mail consumed exactly once; legacy polling recovery through the
 current offer's receipt sequence; and delivered-but-unread retention across native channel
 restart. Claude's missing-channel cases also require automatic recovery, attachment during
 recheck without replacing the seat, and durable parking after three failed replacements.
+Its MCP bootstrap cases answer initialization with the daemon offline or binding pending,
+attach and reconnect in the same child, preserve native receipts, and cancel attachment on EOF.
 The mailbox cases seed hour-old sent mail and recent staged and delivered-but-unread
 mail, prove zero historical offers, preserve explicit mailbox access, and recover an in-flight
 send after a daemon restart with exactly one receipt pair. Every selected test runs with zero retries.

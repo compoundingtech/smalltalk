@@ -4556,6 +4556,11 @@ fn driver_environment_incarnation(cli: &Cli) -> Result<Option<String>> {
     let Command::Driver(args) = &cli.command else {
         return Ok(None);
     };
+    // Claude bounds MCP startup. Its child serves initialization before waiting for the
+    // daemon, then verifies incarnation and ownership in the channel's async bootstrap.
+    if args.driver == "claude-mcp" {
+        return Ok(None);
+    }
     let subject = args
         .subject
         .clone()
@@ -16605,11 +16610,10 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             None => NativePaths::legacy(subject, "claude")?,
         };
         if push_mailbox_enabled() {
-            let incarnation = wait_for_agent_incarnation(client, subject).await?;
             return st3::claude_channel::run(
                 client,
                 subject,
-                &incarnation,
+                wait_for_agent_incarnation(client, subject),
                 &paths.resolved(),
                 &paths.identity,
                 &paths.runtime_id,

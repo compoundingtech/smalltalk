@@ -16,6 +16,8 @@ REQUIRED = {
     "boot_canaries::claude_missing_channel_blocks_and_recovers_early_mail_without_replay",
     "boot_canaries::claude_uninitialized_channel_blocks_until_native_attachment",
     "boot_canaries::claude_permanent_channel_failure_parks_after_three_attempts_without_a_restart_loop",
+    "daemon_restart::claude_mcp_initializes_offline_then_attaches_and_reconnects_without_restarting",
+    "daemon_restart::claude_mcp_answers_during_binding_retries_and_eof_cancels_attachment",
 }
 
 

@@ -115,6 +115,25 @@ another epoch after replacement. Reexec carries the returned epoch and token. On
 `stale-mailbox-session` ends a subscription as fenced. Store/read worker failures close its socket
 and the current owner reconnects after one second without creating a receipt or replaying old mail.
 
+Claude's MCP handshake is local to its stdio child and does not wait for the daemon. Previously,
+the child discovered the runtime incarnation and bound its mailbox before answering `initialize`.
+A daemon outage or delayed runtime observation could consume Claude's
+[30-second MCP startup timeout](https://code.claude.com/docs/en/env-vars#environment-variables).
+Once Claude closes that child's stdin, reconnecting to the daemon cannot restore the stdio
+connection. Healthy provider hooks could then coexist with a missing channel. The isolated
+offline-start regression reproduces the blocked handshake; historical incidents without Claude
+loader logs cannot be attributed conclusively to that timeout.
+
+The channel now answers initialization and metadata requests while incarnation discovery and
+binding retry. A fresh binding also keeps waiting when its own nonterminal hook activity precedes
+`runtime.running`; those hooks allocate no ownership and cannot revive an exited incarnation.
+It reports no readiness and reads no mailbox until binding succeeds. When the
+daemon returns, the same initialized child attaches; a later transport outage reconnects using
+its existing fence. Native handoff tracking and receipts prevent replay. EOF cancels a pending
+attachment immediately, leaving no detached reconnect worker. An omitted plugin, an uninitialized
+MCP client, or a child Claude has already closed still needs the bounded seat-restart recovery;
+st does not type into the provider to recreate its channel.
+
 OMP todo observation does not own delivery's lifetime. If the local PTY incarnation is ahead of
 the graph, the channel retains the latest validated todo snapshot while delivery continues. Its
 minute check activates the todo spool and publishes that snapshot once the graph catches up.
