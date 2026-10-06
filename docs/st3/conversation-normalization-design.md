@@ -1,6 +1,11 @@
-# Conversation normalization proposal (#1561)
+# Conversation normalization design (#1561)
 
-Proposed for Nathan's exact-head approval; this document changes no runtime behavior.
+Nathan decided on 2026-10-06: no outbox/queue and no stored agent history; status
+is a best-effort latest-wins value with a very short timeout. Conversations are
+read from their owner machine at request time, including managed seats. cos owns
+a separate mission to remove the outbox and stored transcript operations. This
+normalization design changes no runtime behavior; its wire contract still goes
+to Nathan via the curator for exact-head approval before implementation is queued.
 If a harness shows content in its terminal, st shows it in the conversation. Normalize
 for stui, web and phone without token filtering, secret scrubbing, allow-lists or
 fail-closed sanitizers. Access checks remain. Show only reasoning the harness exposes;
@@ -77,47 +82,52 @@ Today's dependencies that must move before removal:
   cut, subject to witnesses and whole-envelope/evidence guards. UI limits do not
   delete rows. Status-transition readers also depend on historical observations.
 
-The target is **no managed conversation content in local observation databases,
-replicated claims, durable event spools or payload stores**. Keep categorical current
-status as one small replace-in-place value per seat, fenced to the active runtime and
-ordered by original source time; repeated observations replace that value. No prose,
-arguments, output or ask prompt belongs in it. Reuse #1546's `harness.current` work
-rather than introduce a competing lane. A Latest claim alone is still append-only:
-bounded physical storage needs its reviewed replacement witness/checkpoint protocol,
-not merely a latest-shaped API. Source-time winners must survive delayed replay.
+The decided target is **no stored agent history and no outbox/queue**, including
+local observation databases, replicated transcript claims and durable event spools.
+The harness's own native transcript on its owner remains the conversation source.
+Categorical status is one small replace-in-place value per seat, fenced to the active
+runtime and ordered by original source time. Publication is best effort with a very
+short timeout, no retry backlog: a failed send is superseded by the next current
+observation. Stale evidence becomes unknown; the removal mission specifies the timeout
+and freshness bound. No prose, arguments, output or ask prompt belongs in that value.
+A latest-shaped append claim alone does not meet the replace-in-place requirement.
+Coordinate #1546 with its author and cos; do not build a competing lane or assume its
+earlier FIFO/history guarantee survives this decision.
 
-## Removal order and compatibility
+## Interface with the removal mission
 
-1. Post this design and open the contract PR for Nathan via the curator at its exact
-   head. No storage, reader, outbox or retention removal before approval. Coordinate
-   the contract and outbox boundary with Johannes's assistant through #1546.
-2. Add normalization, chunk fetch and renderer support with capability negotiation;
-   prove owner-native reads for managed seats and move accounting/OTLP dependencies.
-   Keep #1546's approved independent current lane and interim FIFO/gap guarantees
-   intact while this replacement is prepared; do not duplicate its cap repair.
-3. Roll out readers and owner routing, then switch managed conversations/search/follow
-   to owner sources. Flush held legacy pages/cursors with visible resync. Prove owner
-   outages, restart/rebind and old-client fallback before removing content publication.
-4. Upgrade producers/drivers and admission together to stop queuing/publishing content,
-   including the legacy polled path. Account for every pending event: preserve prepared
-   retry identities, acknowledgment order and numeric usage. An approved migration may
-   retire content events with an explicit cutover record; never silently clear the
-   shared spool or label discarded events delivered. Old writers must be fenced from
-   reintroducing content. Coordinate provider restarts/rollback; old drivers cannot
-   adopt event-producing providers merely because a daemon upgraded.
-5. Only after consumer migration, retire conversation operation reducers/indexes and
-   their admission/schema paths. Latest-only status also needs an explicit decision
-   about existing status-history/coverage guarantees: retain required control history
-   during transition, then deprecate dependent APIs before deleting it. This design
-   does not silently revoke #1546's ordered-history contract.
-6. Inventory existing local rows, spools, legacy files, replicated envelopes and backups.
-   Clean content through a separately reviewed migration/checkpoint rule; preserve
-   accounting, durable Small Talk messages and unrelated mission evidence. Signed
-   envelopes delete whole, and pinned/evidence/shared claims may block cleanup: report
-   remaining bytes. Backups retain historical content until their agreed disposal;
-   do not claim past copies are erased. Coordinate the rules bump (baseline 11; #1473
-   reserves 12), mixed-member checkpoint agreement and late old-writer replay. No
-   automatic live-store purge, fleet restart or backup deletion follows this proposal.
+`st missions ls` was checked before editing this design; cos's new removal mission
+was still being drafted. Check the mission list and its published ownership before
+any implementation touching managed storage, admission, status or the outbox.
+
+Normalization needs these outcomes from cos's mission:
+
+1. An exact owner/session/incarnation/native-source binding for managed reads, with
+   authorized forwarding and a source revision usable by paging, follow and chunk
+   fetches. No dependence on stored timeline operations or an outbox sequence.
+2. Explicit owner-unavailable and transcript-unavailable results; stale prepared pages
+   cannot masquerade as current owner reads. Source replacement invalidates refs and
+   cursors visibly. Search uses the same owner availability and volatile-only content.
+3. A current-status read containing categorical value, source time, incarnation and
+   freshness/unknown state. Conversations read it without historical status replay.
+   Historical harness-shown status comes from the native source when present.
+4. A cutover signal for flushing old pages/search stamps/replay cursors. Numeric usage
+   accounting/OTLP consumers must be handled independently, without retaining agent
+   conversation history or exporting its bodies to preserve the old carrier.
+
+cos owns the removal order: establish owner-read/current-status replacements and
+dependent-reader compatibility, stop all old/new producer and admission paths,
+then retire operation reducers/indexes and clean existing data. Its mission must
+account for pending prepared events and numeric usage, legacy polled providers,
+status-history API retirement, mixed builds, rollback and old writers that would
+reintroduce storage. Do not silently report discarded pending events as delivered.
+It also owns inventory/cleanup of local rows, spools, legacy files, replicated
+envelopes and backups. Checkpoint guards, whole signed envelopes, pinned/evidence
+references and shared operations can block deletion; report residual data. A rules
+change needs coordinated version/digest agreement (baseline 11; #1473 reserves 12).
+The normalization mission performs none of this removal or live-store cleanup.
+
+## Client compatibility
 
 Existing stui/iOS clients must stay usable. Swift currently decodes a closed
 `TimelineType` enum, so sending new top-level kinds to old clients is breaking.
@@ -145,12 +155,14 @@ These are dependencies/coordination points, not approval or reasons to duplicate
 unknown bodies contradict #1561. Merged #1482 deliberately withholds image bytes/URLs;
 replace that policy with authorized owner fetch. Closed #1507/#1560's unknown-block
 allow-list and argument withholding, and #1449's sanitizer/capture slice 1, are
-superseded and must not enter this stack. Coordinate #1546 separately: it remains
-the authorized interim status repair, not permission to remove historical content.
+superseded and must not enter this stack. Coordinate #1546 separately: Nathan's
+no-outbox/latest-status decision supersedes the earlier history lane plan; cos and
+Johannes's assistant own reconciliation and removal, not this normalization builder.
 
-Small PRs: contract/normalizer and withholding removal; owner chunk/image fetch;
-shared/generated clients and renderers; managed reader/writer cutover; existing-data
-cleanup. Each contract, claim or checkpoint change returns for exact-head approval.
+Normalization PRs: contract/normalizer and withholding removal; owner chunk/image
+fetch; shared/generated clients and renderers. Managed reader/writer cutover and
+existing-data cleanup belong to cos's separate mission. Each contract, claim or
+checkpoint change returns for exact-head approval through its owning mission.
 Use isolated daemons and invented fixtures to compare harness-shown content through
 HTTP, follow/reconnect and all renderers, including full arguments, exposed reasoning,
 unknown nested JSON, images, oversized chunks, paging, owner failure and mixed builds.
