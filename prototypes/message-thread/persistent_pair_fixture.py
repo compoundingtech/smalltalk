@@ -55,6 +55,7 @@ def main() -> None:
         assert tree.gap_at(3) == 2 - 100_000
         # The next call and all selected-edge refreshes share the claim/rank
         # mutation transaction. The ten far-head children are pruned.
+        db.execute('BEGIN')
         with db:
             candidates = tree.shift_after(1, -1)
             assert candidates == children[10:]
@@ -82,6 +83,7 @@ def main() -> None:
         db.rollback()
         assert tree.gap_at(3) == 1 - 100_000
         full_fold(db, children)
+        db.execute('BEGIN')
         with db:
             db.execute("UPDATE replica_records SET position=0 "
                        "WHERE claim_id='z-00000'")
@@ -89,6 +91,27 @@ def main() -> None:
             refresh_child_leaf(db, children[0])
             refresh(db, children[0])
         full_fold(db, children)
+        # A record identity then moves to a claim in another batch/subject.
+        # The OLD and NEW child keys both need leaf and selected-edge refresh.
+        cross = 'message/cross-batch'
+        add(db, 'cross-claim', 1000, 'batch/persist-pair/2', cross,
+            'message/cross-parent')
+        refresh_child_leaf(db, cross)
+        db.commit()
+        db.execute('BEGIN')
+        with db:
+            db.execute("UPDATE replica_records SET claim_id='cross-claim' "
+                       "WHERE claim_id='z-00000'")
+            sync_assignment(db, 'z-00000')
+            sync_assignment(db, 'cross-claim')
+            for child in (children[0], cross):
+                refresh_child_leaf(db, child)
+                refresh(db, child)
+        full_fold(db, children + [cross])
+        db.close()
+        db = sqlite3.connect(path)
+        full_fold(db, children + [cross])
+        assert PersistentGapTree(db, batch).gap_at(3) is None
         db.close()
     print('persistent selected lane parity, rollback and reopen passed')
 

@@ -132,6 +132,22 @@ rank-index changes, persisted tree SQL, selected-parent writes, SQL VM steps,
 statements, row changes and page allocation for far unchanged, all changed,
 and fixed two-child output under unrelated 1k/10k history growth. Neither
 fixture has executed, so none of those correctness or cost rows are green.
+The follow-up source revision validates a NEW leaf and key collision before
+removing OLD state, requires an active caller transaction, and uses savepoints
+to roll back a failed replacement or rank shift. An adversarial same-parent
+near-zero case now omits every leaf even though claim winners may switch; the
+lazy-subtree fixture inserts/removes a leaf after a shift, then rolls back and
+commits a cross-batch move against independent per-leaf arithmetic. A direct
+record-head replacement case is also queued. Its cost driver reports only
+connection-level SQL VM/statement/row/page counters, which include temporary
+OLD and NEW trees and direct leaf writes; per-object Python node counters
+would omit some of that maintenance. All new cases remain unexecuted.
+The queued lifecycle fixtures also check that an invalid/colliding NEW leaf
+cannot remove OLD state, that a lazy-shifted subtree accepts a later insert
+and deletion, and that a replica-record identity moved to another batch and
+child after a shift still agrees with the independent full fold after reopen.
+These are invented SQL model cases; real Store admission, proof-copy, trim,
+repair and publication-cut behavior remain open.
 
 Before production integration, use current-main `store.rs` schema near
 `message_reply_edges`, its open/backfill path and runtime projection hook;

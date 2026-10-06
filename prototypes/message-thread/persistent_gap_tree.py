@@ -138,24 +138,42 @@ class PersistentGapTree:
         prefix and supplies gap only then. A missing NEW index removes the
         old leaf. A caller must refresh this direct child after the operation.
         """
+        assert self.db.in_transaction, 'gap replacement requires the writer transaction'
+        assert child
+        if store_index is None:
+            assert gap is None
+        else:
+            assert self.batch and isinstance(gap, int)
+            assert legacy_claim_id and recorded_claim_id
+            assert 0 < store_index < WIDTH
+            collision = self.db.execute(
+                "SELECT child FROM reply_gap_leaves "
+                "WHERE batch_id=? AND store_index=? AND child<>?",
+                (self.batch, store_index, child),
+            ).fetchone()
+            assert collision is None, (child, collision)
         old = self.db.execute(
             "SELECT batch_id,store_index FROM reply_gap_leaves WHERE child=?",
             (child,),
         ).fetchone()
-        if old is not None:
-            old_batch, old_index = old
-            PersistentGapTree(self.db, old_batch)._set(0, 0, old_index, None)
-            self.db.execute("DELETE FROM reply_gap_leaves WHERE child=?", (child,))
-        if store_index is None:
-            assert gap is None
-            return
-        assert gap is not None and 0 < store_index < WIDTH
-        self.db.execute(
-            "INSERT INTO reply_gap_leaves VALUES(?,?,?,?,?,?,?)",
-            (child, self.batch, store_index, legacy_claim_id,
-             recorded_claim_id, legacy_parent, recorded_parent),
-        )
-        self._set(0, 0, store_index, gap)
+        self.db.execute('SAVEPOINT replace_reply_gap_head')
+        try:
+            if old is not None:
+                old_batch, old_index = old
+                PersistentGapTree(self.db, old_batch)._set(0, 0, old_index, None)
+                self.db.execute("DELETE FROM reply_gap_leaves WHERE child=?", (child,))
+            if store_index is not None:
+                self.db.execute(
+                    "INSERT INTO reply_gap_leaves VALUES(?,?,?,?,?,?,?)",
+                    (child, self.batch, store_index, legacy_claim_id,
+                     recorded_claim_id, legacy_parent, recorded_parent),
+                )
+                self._set(0, 0, store_index, gap)
+        except BaseException:
+            self.db.execute('ROLLBACK TO replace_reply_gap_head')
+            self.db.execute('RELEASE replace_reply_gap_head')
+            raise
+        self.db.execute('RELEASE replace_reply_gap_head')
 
     def shift_after(self, index: int, delta: int) -> list[str]:
         """Persist one COUNT-rank shift, returning potential changed children.
@@ -163,6 +181,7 @@ class PersistentGapTree:
         Only unit shifts are valid. The caller applies this and rank-index
         mutation together, then refreshes returned children before commit.
         """
+        assert self.db.in_transaction, 'gap rank shift requires the writer transaction'
         assert 0 <= index < WIDTH and delta in (-1, 1)
         keys: list[int] = []
 
@@ -185,11 +204,19 @@ class PersistentGapTree:
             visit(level + 1, prefix * 2 + 1, middle, high)
             self._pull(level, prefix)
 
-        visit(0, 0, 0, WIDTH)
-        return [self.db.execute(
-            "SELECT child FROM reply_gap_leaves WHERE batch_id=? AND store_index=?",
-            (self.batch, key),
-        ).fetchone()[0] for key in keys]
+        self.db.execute('SAVEPOINT shift_reply_gap_rank')
+        try:
+            visit(0, 0, 0, WIDTH)
+            children = [self.db.execute(
+                "SELECT child FROM reply_gap_leaves WHERE batch_id=? AND store_index=?",
+                (self.batch, key),
+            ).fetchone()[0] for key in keys]
+        except BaseException:
+            self.db.execute('ROLLBACK TO shift_reply_gap_rank')
+            self.db.execute('RELEASE shift_reply_gap_rank')
+            raise
+        self.db.execute('RELEASE shift_reply_gap_rank')
+        return children
 
     def gap_at(self, index: int) -> int | None:
         """Read through lazy ancestors without mutating persisted rows."""
