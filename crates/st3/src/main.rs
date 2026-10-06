@@ -113,6 +113,10 @@ enum Command {
     /// Show token spend over a period, with the largest spenders first.
     Usage(UsageArgs),
     /// Inspect and control missions.
+    ///
+    /// A mission records an authorized goal, its plan, owners, verification and result.
+    /// Use work start for a small independent job; use a finite mission for dependencies,
+    /// distinct owners, gates or review. st skill explains the agent workflow.
     Missions {
         #[command(subcommand)]
         command: MissionViewCommand,
@@ -150,6 +154,10 @@ enum Command {
     /// stui, the phone and st itself, with their builds as they report them.
     Clients,
     /// Claim and update durable mission work.
+    ///
+    /// Claim existing work first. work start records a small independent authorized job;
+    /// missions record a plan with dependencies and review. Complete work with evidence,
+    /// then turn review feedback into the next authorized iteration. See st skill.
     Work {
         #[command(subcommand)]
         command: WorkCommand,
@@ -1658,6 +1666,9 @@ enum MissionViewCommand {
     /// `depends-on` orders steps; `missions start --after` orders runs without reports.
     /// A final step assigned to the author, depending on the last real step, reaches the
     /// author once when work is done. Review gates mark decisions only a person can make.
+    /// Preview with --dry-run before publication; it runs no exec gates unless --check is set.
+    /// Actual publication normally runs gates once and refuses broken answers, allowing valid
+    /// "not yet" answers. See st skill for goals, evidence, review and feedback loops.
     Publish(MissionPublishArgs),
     /// Run each exec gate in a mission file once, now, the way a run would, and report its
     /// answer: pass (exit 0), not yet (exit 1), broken (anything else), or unchecked.
@@ -1668,6 +1679,8 @@ enum MissionViewCommand {
     /// `depends-on` orders steps; `--after` orders runs without reports.
     /// A final step assigned to the author, depending on the last real step, reaches the
     /// author once when work is done. Review gates mark decisions only a person can make.
+    /// Publication and preview do not start a run. Claim its ready steps, verify the result
+    /// and record evidence before review. Recording work does not widen its authorization.
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
     Cancel(MissionCancelArgs),
@@ -3673,6 +3686,10 @@ struct AttentionWithdrawArgs {
 #[derive(Subcommand)]
 enum WorkCommand {
     /// Open a one-step run for this seat without authoring a mission; then use claim.
+    ///
+    /// For a small independent authorized job: describe the result, use the returned claim
+    /// command, perform the work and complete it with durable evidence. Finish or release
+    /// other independent claimed work first. See st skill for the full workflow.
     Start(WorkStartArgs),
     /// Release claimed work to another seat or person with a note they acknowledge.
     Handoff(WorkHandoffArgs),
@@ -3727,12 +3744,16 @@ enum WorkCommand {
     Renew(WorkActionArgs),
     /// Record a material progress update without changing ownership.
     ///
-    /// Records progress in the graph at no cost to anyone; people read it in stui.
+    /// Records progress in the graph without messaging another agent; people read it in stui.
     #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Progress(WorkActionArgs),
     /// Add time to the execution budget of claimed work that ran out of it.
     Extend(WorkExtendArgs),
     /// Finish claimed work and attach its durable evidence.
+    ///
+    /// Include the result, exact revision, verification and material limits. Gates can keep
+    /// the step verifying after submission. A dependent review step becomes ready when it
+    /// completes; review feedback can become the next authorized step or run. See st skill.
     #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Complete(WorkActionArgs),
     /// Fail claimed work with an actionable reason and evidence.
