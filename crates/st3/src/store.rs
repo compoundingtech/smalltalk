@@ -754,7 +754,7 @@ const RUNTIME_SUBJECTS: &str = "WITH RECURSIVE runtime_subjects(subject) AS (
 
 /// The subjects from `?2` up to but not including `?3` with a claim at or before store index
 /// `?1`, in subject order, by one seek per subject in `claims_subject_index`.
-const RANGE_SUBJECTS: &str = "WITH RECURSIVE range_subjects(subject) AS (
+pub(crate) const RANGE_SUBJECTS: &str = "WITH RECURSIVE range_subjects(subject) AS (
          SELECT (SELECT subject FROM claims INDEXED BY claims_subject_index
                  WHERE subject>=?2 AND subject<?3 AND store_index<=?1 ORDER BY subject LIMIT 1)
          UNION ALL
@@ -10078,7 +10078,7 @@ impl Store {
     /// Each runtime's answer is kept until a claim it depends on arrives, so a view costs what
     /// it shows and what changed, not every runtime the store has ever held. `owners` says
     /// whether the reduction reads owners at the snapshot, as the answers here do.
-    fn current_view_candidates(
+    pub(crate) fn current_view_candidates(
         &self,
         connection: &Connection,
         subjects: BTreeSet<String>,
@@ -24112,7 +24112,7 @@ mod fleet_admission_tests {
 
 #[cfg(test)]
 thread_local! {
-    static SUBJECT_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static SUBJECT_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Steps whose queue, timing and wake a read enriched, so a test can see a read's work.
     pub(crate) static STEPS_ENRICHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

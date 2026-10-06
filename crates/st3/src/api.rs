@@ -2031,6 +2031,110 @@ fn client_agent_resources_cached(
     })
 }
 
+// Freeze membership, ordering and the inexpensive declaration/queue metadata. The expensive
+// status, usage, fault and activity reductions are needed only for the returned page.
+fn client_agent_page_refs(store: &Store, history: bool, index: u64) -> anyhow::Result<Vec<Value>> {
+    let connection = store.readers.get();
+    let mut subjects = connection
+        .prepare_cached(crate::store::RANGE_SUBJECTS)?
+        .query_map(rusqlite::params![index, "agent/", "agent0"], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if !history {
+        subjects = store.current_view_candidates(&connection, subjects, index, true)?;
+    }
+    let names = subjects.iter().cloned().collect::<Vec<_>>();
+    let desired = store
+        .desired_subjects_named(&names)?
+        .into_iter()
+        .map(|desired| (desired.subject.clone(), desired))
+        .collect::<BTreeMap<_, _>>();
+    let queues = store.agent_work_queues()?;
+    let steps = queues
+        .values()
+        .flat_map(|queue| {
+            queue
+                .current_work_ids
+                .iter()
+                .chain(queue.next_work_id.iter())
+                .chain(queue.upcoming_work_ids.iter())
+                .cloned()
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let labels = store.step_labels(&steps)?;
+    let label = |id: &String| {
+        labels.get(id).map(|step| json!({
+        "id":id, "mission_id":step.mission, "mission_run_id":step.run,
+        "path":step.path, "title":step.title, "goal":step.goal,
+        "state":client_work_state(&step.status), "since":client_timestamp(step.updated_at_unix_ms),
+    }))
+    };
+    let mut refs = subjects.into_iter().map(|id| {
+        let declaration = desired.get(&id);
+        let name = crate::model::effective_agent_name(&id, declaration.map(|d| &d.desired));
+        let queue = queues.get(&id).cloned().unwrap_or_default();
+        json!({
+            "id":id, "name":name,
+            "host_id":declaration.and_then(|d| d.member.as_ref()).map(|m| client_host_id(&m.host)),
+            "current_work_ids":queue.current_work_ids, "active_work_count":queue.active_work_count,
+            "next_work_id":queue.next_work_id, "upcoming_work_ids":queue.upcoming_work_ids,
+            "queued_work_count":queue.queued_work_count,
+            "current_work":queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
+            "next_work":queue.next_work_id.as_ref().and_then(label),
+            "upcoming_work":queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
+        })
+    }).collect::<Vec<_>>();
+    refs.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .cmp(&b["name"].as_str())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
+    Ok(refs)
+}
+
+fn client_agent_cards_for_page(
+    store: &Store,
+    history: bool,
+    index: u64,
+    refs: &[Value],
+    at: &str,
+) -> Result<Vec<Value>, ApiError> {
+    let selected = refs
+        .iter()
+        .filter_map(|r| r["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let mut cards = client_agent_resources_selected(store, history, index, Some((&selected, refs)))
+        .map_err(ApiError::internal)?;
+    if cards.len() != refs.len() {
+        return Err(client_page_expired(
+            "agent page membership is no longer available; restart pagination",
+        ));
+    }
+    let mut ordered = Vec::with_capacity(refs.len());
+    for reference in refs {
+        let position = cards
+            .iter()
+            .position(|card| card["id"] == reference["id"])
+            .ok_or_else(|| {
+                client_page_expired(
+                    "agent page membership is no longer available; restart pagination",
+                )
+            })?;
+        let mut card = cards.swap_remove(position);
+        // The original cut's ordering and host metadata must survive later declaration changes.
+        card["name"] = reference["name"].clone();
+        card["host_id"] = reference["host_id"].clone();
+        ordered.push(card);
+    }
+    add_agent_todos(store, &mut ordered, index).map_err(ApiError::internal)?;
+    overlay_agent_resources(store, &mut ordered, at).map_err(ApiError::internal)?;
+    Ok(ordered)
+}
+
 fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Result<()> {
     let subjects = items
         .iter()
@@ -3897,7 +4001,7 @@ async fn client_agents(
                     snapshot.store_index,
                 )?
             } else {
-                client_agent_resources_cached(&state.store, history, snapshot.store_index)?
+                client_agent_page_refs(&state.store, history, snapshot.store_index)?
             };
             if let Some(status) = status.as_deref() {
                 items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
@@ -3913,10 +4017,23 @@ async fn client_agents(
     let store = state.store.clone();
     blocking_store(move || {
         let (Extension(snapshot), Json(mut page)) = page;
-        overlay_agent_resources(&store, &mut page.items, &snapshot.created_at)?;
-        Ok((Extension(snapshot), Json(page)))
+        let items = store.read_snapshot(|_| {
+            Ok(store.with_owned_set_snapshot_reads(|| {
+                client_agent_cards_for_page(
+                    &store,
+                    history,
+                    snapshot.store_index,
+                    &page.items,
+                    &snapshot.created_at,
+                )
+            }))
+        })?;
+        Ok(items.map(|items| {
+            page.items = items;
+            (Extension(snapshot), Json(page))
+        }))
     })
-    .await
+    .await?
 }
 
 async fn client_agents_detail(
@@ -15021,15 +15138,30 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
     async fn agent_page_overlays_only_returned_cards_and_retains_continuation() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
+        let source = "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\nagent \"indigo\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &plan.subject_tokens, "page-cards")
+            .unwrap();
         let snapshot = new_client_snapshot(&state);
-        state.store.cached_agent_resources(snapshot.store_index, false, |_| {
-            Ok(vec![
-                json!({"id":"agent/amber", "name":"amber", "updated_at":"", "_status_source":null}),
-                json!({"id":"agent/cobalt", "name":"cobalt", "updated_at":"", "_status_source":null}),
-                // This third card is deliberately undecodable and must remain off the first pages.
-                json!({"id":"agent/indigo", "name":"indigo", "_status_source":true}),
-            ])
-        }).unwrap();
+        let oracle = client_agent_resources(
+            &state.store,
+            false,
+            &snapshot.created_at,
+            snapshot.store_index,
+        )
+        .unwrap();
         let (_, Json(first)) = client_agents(
             State(state.clone()),
             Extension(snapshot.clone()),
@@ -15040,11 +15172,25 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         )
         .await
         .unwrap();
-        assert_eq!(first.items.len(), 1);
-        assert_eq!(first.items[0]["id"], "agent/amber");
-        assert_eq!(first.items[0]["observation"], "missing");
-        assert!(first.items[0].get("_status_source").is_none());
+        assert_eq!(first.items, oracle[..1]);
         assert!(first.page.has_more);
+        // A later runtime observation must not enter the second card's original cut.
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.cobalt".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("runtime_id".into(), json!("node.cobalt")),
+                    ("incarnation_id".into(), json!("cobalt-new")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         let (_, Json(second)) = client_agents(
             State(state),
             Extension(snapshot),
@@ -15056,9 +15202,52 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         )
         .await
         .unwrap();
-        assert_eq!(second.items.len(), 1);
-        assert_eq!(second.items[0]["id"], "agent/cobalt");
+        assert_eq!(second.items, oracle[1..2]);
         assert!(second.page.has_more);
+    }
+
+    #[test]
+    fn agent_page_constructs_only_its_selected_subject_and_matches_full_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = format!(
+            "version 2\n{}",
+            (0..16)
+                .map(|n| format!("agent \"card-{n:02}\" {{ command \"true\" }}\n"))
+                .collect::<String>()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let plan = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.clone(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &plan.subject_tokens, "page-reduction-work")
+            .unwrap();
+        let index = state.store.index().unwrap();
+        let oracle = client_agent_resources(&state.store, false, "cut", index).unwrap();
+        state.store.forget_current_views();
+        crate::store::SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        let refs = client_agent_page_refs(&state.store, false, index).unwrap();
+        assert_eq!(refs.len(), 16);
+        assert_eq!(
+            crate::store::SUBJECT_REDUCTIONS.with(std::cell::Cell::get),
+            0
+        );
+        let cards =
+            client_agent_cards_for_page(&state.store, false, index, &refs[..1], "cut").unwrap();
+        assert_eq!(
+            crate::store::SUBJECT_REDUCTIONS.with(std::cell::Cell::get),
+            1
+        );
+        assert_eq!(cards, oracle[..1]);
     }
 
     #[test]
