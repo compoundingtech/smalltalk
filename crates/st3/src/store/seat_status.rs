@@ -6,6 +6,10 @@ pub(crate) const WINDOW_MS: u128 = 7 * 24 * 60 * 60 * 1000;
 pub(crate) const MAX_TRANSITIONS: usize = 200;
 pub(crate) const STALE_MS: u128 = 90_000;
 
+pub(super) fn permission_blocked(blocked_on: Option<&str>, ask: Option<&str>) -> bool {
+    blocked_on == Some("human") && ask == Some("permission")
+}
+
 pub(super) fn observation_time(claim: &ClaimRecord) -> u128 {
     claim
         .body
@@ -31,6 +35,8 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
         prompt: Option<&'a str>,
         update_prompt: bool,
         provider_auth: Option<bool>,
+        blocked_on: Option<&'a str>,
+        ask: Option<&'a str>,
         state: Option<&'a str>,
     }
     let mut runtime = None;
@@ -58,7 +64,17 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
                     continue;
                 };
                 let status = statuses.entry(incarnation).or_default();
-                status.harness = Some(state);
+                if let Some(blocked_on) = fields.get("blocked_on") {
+                    status.blocked_on = blocked_on.as_str();
+                }
+                if let Some(ask) = fields.get("ask") {
+                    status.ask = ask.as_str();
+                }
+                status.harness = Some(if permission_blocked(status.blocked_on, status.ask) {
+                    "blocked"
+                } else {
+                    state
+                });
                 if let Some(auth) = fields.get("provider_auth").and_then(Value::as_bool) {
                     status.provider_auth = Some(auth);
                 }
@@ -507,6 +523,24 @@ mod tests {
             store.current_harness("agent/cedar").unwrap().unwrap().state,
             "working"
         );
+        let history = store.seat_status_history("agent/cedar", at + 4).unwrap();
+        let states = history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["state"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["working", "blocked", "working"]);
+
+        runtime(&store, "two");
+        observe(&store, "two", "working", at + 4, "working");
+        let current = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(current.incarnation_id, "two");
+        assert_eq!(current.state, "working");
+        let history = store.seat_status_history("agent/cedar", at + 5).unwrap();
+        let last = history["items"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["state"], "working");
+        assert_eq!(last["runtime_incarnation"], "two");
     }
 
     #[test]
