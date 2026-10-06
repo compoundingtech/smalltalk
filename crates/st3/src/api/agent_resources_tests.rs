@@ -13,6 +13,8 @@ fn append(store: &Store, subject: &str, kind: &str, fields: Value) {
             idempotency_key: None,
         })
         .unwrap();
+    // Raw graph appends do not eagerly refresh the work projection used by card queues.
+    store.project_replication_backlog().unwrap();
 }
 
 fn declare(store: &Store, names: &[&str]) {
@@ -64,6 +66,7 @@ fn project(
 }
 
 fn checked_cards(store: &Store, history: bool) -> Vec<Value> {
+    store.project_replication_backlog().unwrap();
     let index = store.index().unwrap();
     let cached = store
         .cached_agent_resources(index, history, |changed| {
