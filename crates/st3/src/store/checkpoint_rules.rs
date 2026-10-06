@@ -65,6 +65,8 @@ pub(crate) const REQUEST_CLOSERS: [&str; 3] = [
 pub(crate) const RULES_DESCRIPTION: &str = "\
 harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start,newest-source,newest-native-auth-source
 seat.status-history slot=subject keep=last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,current-state-run-start
+harness.current slot=none keep=all
+harness.history.gap slot=none keep=all unique-prepared-segments
 harness.timeline slot=subject,incarnation_id keep=newest min-age-before-cut=5d
 loop.state slot=subject keep=first-and-last-of-each-run-of-status-and-round,first-with-items
 subscription.mission-deferred slot=subject,request keep=all-while-open,newest
@@ -779,9 +781,9 @@ pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128)
     if subject.starts_with("agent/") {
         // Completeness metadata may change deliberately when old claims are tombstoned;
         // every transition still inside the published retention bound must stay identical.
-        answers.insert("status_history".into(), seat_status::history_at(
-            connection, subject, cut, i64::MAX as u64,
-        )?["items"].clone());
+        let mut history = seat_status::history_at(connection, subject, cut, i64::MAX as u64)?;
+        answers.insert("status_history".into(), history["items"].take());
+        answers.insert("history_gaps".into(), history["history_gaps"].take());
     }
     // Which claim a status shows, its origin, and whether its runtime observations conflict.
     answers.insert(

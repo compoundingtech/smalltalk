@@ -102,17 +102,56 @@ fn history_gaps_at(
            AND json_type(body,'$.fields.history_gap_count')='integer'
            AND json_extract(body,'$.fields.history_gap_count')>0
          GROUP BY {INCARNATION_OF_CLAIM}
-         HAVING MAX(json_extract(body,'$.fields.history_gap_to_ms'))>=?3
-            AND MIN(json_extract(body,'$.fields.history_gap_from_ms'))<=?4
          ORDER BY MIN(json_extract(body,'$.fields.history_gap_from_ms')), {INCARNATION_OF_CLAIM}"
     );
     let mut statement = connection.prepare_cached(&query)?;
-    Ok(statement.query_map(params![subject, index, from.min(i64::MAX as u128) as i64, to.min(i64::MAX as u128) as i64], |row| {
+    let current = statement.query_map(params![subject, index], |row| {
         Ok(crate::model::HarnessHistoryGap {
             runtime_incarnation: row.get(0)?, count: row.get(1)?,
             from_ms: row.get(2)?, to_ms: row.get(3)?, reason: "cap-full".into(),
         })
-    })?.collect::<rusqlite::Result<Vec<_>>>()?)
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut gaps = current.into_iter().map(|gap| (gap.runtime_incarnation.clone(), gap))
+        .collect::<BTreeMap<_, _>>();
+    // Each durable row is a unique prepared segment; retries reuse its claim ID.
+    // Current snapshots are cumulative, so adding them to segment totals would double count.
+    let mut durable = BTreeMap::<String, crate::model::HarnessHistoryGap>::new();
+    let mut statement = connection.prepare_cached(
+        "SELECT body FROM claims INDEXED BY claims_harness_durable_gap_index
+         WHERE subject=?1 AND +store_index<=?2 AND kind='harness.history.gap'"
+    )?;
+    let mut rows = statement.query(params![subject, index])?;
+    while let Some(row) = rows.next()? {
+        let body: Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        let fields = &body["fields"];
+        let incarnation = fields["runtime_incarnation"].as_str().context("gap runtime is missing")?;
+        let count = fields["history_gap_count"].as_u64().context("gap count is missing")?;
+        let from_ms = fields["history_gap_from_ms"].as_u64().context("gap interval start is missing")?;
+        let to_ms = fields["history_gap_to_ms"].as_u64().context("gap interval end is missing")?;
+        if let Some(gap) = durable.get_mut(incarnation) {
+            gap.count = gap.count.checked_add(count).context("history gap count exceeds u64")?;
+            gap.from_ms = gap.from_ms.min(from_ms);
+            gap.to_ms = gap.to_ms.max(to_ms);
+        } else {
+            durable.insert(incarnation.to_owned(), crate::model::HarnessHistoryGap {
+                runtime_incarnation: incarnation.to_owned(), count, from_ms, to_ms, reason: "cap-full".into(),
+            });
+        }
+    }
+    for (incarnation, durable) in durable {
+        if let Some(gap) = gaps.get_mut(&incarnation) {
+            gap.count = gap.count.max(durable.count);
+            gap.from_ms = gap.from_ms.min(durable.from_ms);
+            gap.to_ms = gap.to_ms.max(durable.to_ms);
+        } else {
+            gaps.insert(incarnation, durable);
+        }
+    }
+    let mut gaps = gaps.into_values()
+        .filter(|gap| u128::from(gap.to_ms) >= from && u128::from(gap.from_ms) <= to)
+        .collect::<Vec<_>>();
+    gaps.sort_by(|left, right| (left.from_ms, &left.runtime_incarnation).cmp(&(right.from_ms, &right.runtime_incarnation)));
+    Ok(gaps)
 }
 
 /// Canonical source positions of transitions and incarnation resets. Heartbeats and changes
@@ -241,6 +280,14 @@ pub(super) fn enrich_harness(
         .as_ref()
         .is_some_and(|claim| matches!(claim.kind.as_str(), "work.claimed" | "work.progress"))
     {
+        return Ok(());
+    }
+    if view.state == "needs-login" && claim.as_ref().is_some_and(|claim| {
+        matches!(claim.kind.as_str(), "harness.current" | "harness.observed")
+            && claim.body.pointer("/fields/provider_auth").and_then(Value::as_bool) != Some(false)
+    }) {
+        // A fresh unknown-auth capture refreshes activity/counts but cannot restart or lift
+        // the source-newest explicit refusal's episode.
         return Ok(());
     }
     if let Some(claim) = claim.as_ref()
@@ -982,6 +1029,8 @@ mod tests {
         let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(blocked.state, "needs-login");
         assert_eq!(blocked.background_jobs, Some(2));
+        assert_eq!(blocked.since_unix_ms, u128::from(at));
+        assert_eq!(store.seat_observation_at("agent/cedar", Some(&blocked), store.index().unwrap(), u128::from(at) + STALE_MS + 1).unwrap(), "current");
         let recovered = publication(json!(true), at + 2);
         let (claim, first) = store.append_harness_current(&recovered).unwrap();
         assert!(first);
@@ -995,5 +1044,78 @@ mod tests {
         assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().state, "idle");
         runtime(&store, "two");
         assert!(store.append_harness_current(&recovered).is_err());
+    }
+
+    #[test]
+    fn categorical_current_history_gaps_are_visible_independently_and_survive_runtime_reset() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms() as u64 - 1_000;
+        let before = store.seat_status_history("agent/cedar", now_ms()).unwrap();
+        assert_eq!(before["complete"], true);
+        store.append_harness_current(&crate::harness_events::CurrentPublication {
+            runtime_incarnation: "one".into(),
+            claim: input("harness.current", json!({
+                "incarnation_id":"one", "state":"working", "observed_at_ms":at,
+                "observed_since_ms":at - 10, "running_subagents":2,
+                "history_gap_count":3, "history_gap_from_ms":at - 5,
+                "history_gap_to_ms":at, "history_gap_reason":"cap-full"
+            })),
+        }).unwrap();
+        let gap = store.harness_history_gap_at("agent/cedar", "one", store.index().unwrap()).unwrap().unwrap();
+        assert_eq!((gap.count, gap.from_ms, gap.to_ms, gap.reason.as_str()), (3, at - 5, at, "cap-full"));
+        let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
+        assert_eq!(history["complete"], false);
+        assert_eq!(history["items"], before["items"], "loss markers never invent missing transitions");
+        assert_eq!(history["history_gaps"], json!([gap]));
+        store.append_claim(&input("harness.observed", json!({
+            "incarnation_id":"one", "state":"idle", "observed_at_ms":at + 1
+        }))).unwrap();
+        assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().state, "idle");
+        assert_eq!(store.harness_history_gap_at("agent/cedar", "one", store.index().unwrap()).unwrap().unwrap().count, 3);
+        runtime(&store, "two");
+        assert!(store.harness_history_gap_at("agent/cedar", "two", store.index().unwrap()).unwrap().is_none());
+        let reset = store.seat_status_history("agent/cedar", now_ms()).unwrap();
+        assert_eq!(reset["complete"], false);
+        assert_eq!(reset["history_gaps"], history["history_gaps"]);
+        let expired = store.seat_status_history("agent/cedar", u128::from(at) + WINDOW_MS + 1).unwrap();
+        assert_eq!(expired["history_gaps"], json!([]));
+    }
+
+    #[test]
+    fn categorical_current_durable_gap_segments_survive_lost_fastlane_and_dedupe_with_aggregates() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms() as u64 - 1_000;
+        let gap = |sequence: u64, count: u64, from: u64, to: u64| {
+            let mut claim = input("harness.history.gap", json!({
+                "runtime_incarnation":"one", "history_gap_count":count,
+                "history_gap_from_ms":from, "history_gap_to_ms":to, "history_gap_reason":"cap-full"
+            }));
+            claim.idempotency_key = Some(format!("harness-gap:agent/cedar:one:{sequence}"));
+            claim
+        };
+        let segment = gap(1, 2, at - 5, at);
+        let first = store.append_claim(&segment).unwrap();
+        assert_eq!(store.append_claim(&segment).unwrap().id, first.id);
+        runtime(&store, "two");
+        store.append_claim(&gap(2, 3, at + 1, at + 2)).unwrap();
+        let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
+        assert_eq!(history["complete"], false);
+        assert_eq!(history["history_gaps"], json!([{
+            "runtime_incarnation":"one", "count":5, "from_ms":at - 5,
+            "to_ms":at + 2, "reason":"cap-full"
+        }]));
+        assert!(history["items"].as_array().unwrap().iter().all(|item| item["state"].is_null()));
+        // A retained cumulative current claim is the same loss, not five more events.
+        store.append_claim(&input("harness.current", json!({
+            "incarnation_id":"one", "state":"working", "observed_at_ms":at + 3,
+            "history_gap_count":5, "history_gap_from_ms":at - 5,
+            "history_gap_to_ms":at + 2, "history_gap_reason":"cap-full"
+        }))).unwrap();
+        let merged = store.seat_status_history("agent/cedar", now_ms()).unwrap();
+        assert_eq!(merged["history_gaps"], history["history_gaps"]);
+        assert_eq!(merged["items"], history["items"]);
+        assert!(store.current_harness("agent/cedar").unwrap().is_none());
     }
 }
