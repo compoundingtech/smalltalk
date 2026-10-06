@@ -1,4 +1,5 @@
 //! The machine CLI inventory is a real process contract, independent of a daemon.
+use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -20,7 +21,6 @@ fn stop_tree(child: &mut Child) {
 }
 
 fn bounded_output(mut command: Command, limit: Duration) -> Result<Output, String> {
-    use std::io::Read as _;
     use std::sync::mpsc;
 
     command
