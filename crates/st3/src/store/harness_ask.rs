@@ -151,11 +151,10 @@ impl Store {
     pub fn harness_ask_receipt(&self, operation: &str) -> Result<Option<AskReceipt>, St3Error> {
         self.connection.batched(|tx| -> Result<Option<AskReceipt>, St3Error> {
             let Some(receipt) = receipt_tx(tx, operation)? else { return Ok(None); };
-            if matches!(receipt.status, Outcome::Accepted | Outcome::Dispatched) {
-                if let Err(error) = check_runtime(tx, &receipt.subject, &receipt.binding) {
-                    if !matches!(error.code, "stale-harness-control" | "stale-mailbox-session") { return Err(error); }
-                    invalidate_binding_tx(tx, &receipt.subject, "native-runtime-ended-or-replaced")?;
-                }
+            if matches!(receipt.status, Outcome::Accepted | Outcome::Dispatched)
+                && let Err(error) = check_runtime(tx, &receipt.subject, &receipt.binding) {
+                if !matches!(error.code, "stale-harness-control" | "stale-mailbox-session") { return Err(error); }
+                invalidate_binding_tx(tx, &receipt.subject, "native-runtime-ended-or-replaced")?;
             }
             receipt_tx(tx, operation)
         }).map_err(|error| St3Error::new("internal", error))?

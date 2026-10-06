@@ -282,6 +282,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "closes a live native binding and settles uncertain dispatches",
     ),
     (
+        "POST /v1/harness-control/ask-terminal-input",
+        "revokes native ask automation through the exact live source-fenced binding; unrelated claim history is not read",
+    ),
+    (
         "POST /v1/repair/apply",
         "applies an operational repair plan",
     ),

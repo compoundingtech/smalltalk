@@ -55,6 +55,8 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_harness_control_operations",
         "local_harness_control_dispatch",
         "local_harness_model_operations",
+        "local_harness_ask_operations",
+        "local_harness_ask_tokens",
         "unread_mail",
         "unread_mail_prefixes",
         "unread_mail_pending",
