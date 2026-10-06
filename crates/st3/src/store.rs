@@ -9877,6 +9877,38 @@ impl Store {
         self.status_at_view(selected, selected_owner_run, at_index, false)
     }
 
+    /// Only a seat's current harness, as `status_at` reports it, for the one caller that reads
+    /// nothing else of it: a driver renewing its seat's work leases each minute. The full status
+    /// also returns every claim id of the subject, 18,000 ids (1.2 MB) for the busiest seat.
+    pub fn status_harness_only(&self, subject: &str) -> Result<StatusResponse> {
+        let connection = self.readers.get();
+        let store_index = current_index(&connection)?;
+        let harness = current_harness_at(&connection, subject, None)?;
+        Ok(StatusResponse {
+            store_index,
+            subjects: vec![SubjectStatus {
+                subject: subject.to_owned(),
+                kind: None,
+                desired_token: None,
+                desired_revision: None,
+                desired: None,
+                actual: None,
+                actual_claim: None,
+                actual_origin: None,
+                harness,
+                conflicts: Vec::new(),
+                claims: Vec::new(),
+                owner_run: None,
+                gap: None,
+                reachability: "unknown".into(),
+                reason: None,
+                under: Vec::new(),
+                projection: OperationalAnnotation::default(),
+            }],
+            pending_actions: Vec::new(),
+        })
+    }
+
     pub fn status_history(
         &self,
         selected: Option<&str>,

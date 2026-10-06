@@ -7764,12 +7764,12 @@ fn validate_fence(state: &AppState, fence: &Fence) -> Result<(), ApiError> {
                 .map_err(import_lookup_error)?
                 .map(|session| session.revision)
         } else {
+            // The newest claim's id, by a seek: reading and sorting every claim of the subject
+            // was 0.4 s for a busy seat (4.4 s cold) on every fenced action.
             state
                 .store
-                .claims_for(subject, None)
+                .latest_claim_id(subject)
                 .map_err(ApiError::internal)?
-                .last()
-                .map(|claim| claim.id.clone())
         };
         if current.as_deref() != Some(revision) {
             return Err(stale(format!(
