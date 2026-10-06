@@ -57,6 +57,14 @@ A control batched write commits on its own, so its acknowledgement cannot wait f
 ordinary work in the transaction. Already-running writes and writer loans are not preempted.
 This protects readiness, cleanup, and seat launch commits from ordinary write backlog; it
 does not make SQLite, filesystem I/O, or an individual long writer loan time-bounded.
+Launch-needing members also reserve admission for workspace/checkouts and render receipts
+before their lifecycle evaluation; routine workspace/render observations remain ordinary.
+The mission-first stage is intentionally serial and has no total pass deadline. This change
+addresses the observed writer-acknowledgement starvation without abandoning partially
+evaluated mission gates or introducing a second evaluator. Large gate workloads or a slow
+filesystem can still delay host work; the three-second regression is an admission bound
+for this controlled backlog, not an end-to-end production latency guarantee.
+
 
 The saturation regression drives the production mission evaluator, native exec launcher,
 and durable mailbox changed-since query with eight reader threads and a deterministic

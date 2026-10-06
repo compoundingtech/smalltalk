@@ -55,6 +55,8 @@ mission "promotion-proof" state="ready" {{
         })
         .unwrap();
     assert_eq!(run.steps[0].status, "pending");
+    assert!(store.latest_actual_value("agent/node.promotion-seat").unwrap().is_none());
+    assert!(store.claims_for("agent/node.promotion-seat", Some("workspace.observed")).unwrap().is_empty());
     let stop = AtomicBool::new(false);
     let checks = AtomicU64::new(0);
     let (held, is_held) = std::sync::mpsc::sync_channel(1);

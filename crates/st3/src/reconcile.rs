@@ -1980,6 +1980,32 @@ impl<R: RuntimeControl> Reconciler<R> {
         }));
 
         let active = desired.iter().collect::<Vec<_>>();
+        // Only launch-needing members reserve admission for their prerequisite
+        // receipts. Routine workspace/render observations remain ordinary writes.
+        let mut launch_members = BTreeSet::new();
+        for subject in &active {
+            if subject.kind == "stop" || self.store.owned_desired_guard(subject).is_err() {
+                continue;
+            }
+            let Some(member) = subject.member.as_ref().filter(|member| member.host == self.host)
+            else {
+                continue;
+            };
+            let observation = if member.terminal {
+                let Some(ptys) = &ptys else { continue };
+                ptys.get(&member.runtime_id).cloned()
+            } else {
+                self.runtime.observe_exec(&member.runtime_id).ok().flatten()
+            };
+            if observation.as_ref().is_none_or(|observed| observed.status != "running")
+                || observation.as_ref().is_some_and(|observed| {
+                    self.declared_launch_changes(subject, member, observed)
+                        .map_or(true, |changes| changes.is_some())
+                })
+            {
+                launch_members.insert(subject.subject.as_str());
+            }
+        }
         let mut member_errors = BTreeMap::new();
         for subject in &active {
             if self.store.owned_desired_guard(subject).is_err() {
@@ -1995,40 +2021,14 @@ impl<R: RuntimeControl> Reconciler<R> {
             else {
                 continue;
             };
-            let workspace = Path::new(&member.workspace);
-            let checkout = (subject.kind == "agent")
-                .then(|| Checkout::from_desired(&subject.desired))
-                .flatten();
-            if workspace.is_dir() {
-                if let Some(checkout) = &checkout
-                    && let Err(error) = checkout.validate_workspace(workspace)
-                {
-                    member_errors.insert(subject.subject.clone(), error);
-                    continue;
-                }
-                if subject.kind == "agent" {
-                    self.observe_agent_workspace(&subject.subject, member)?;
-                }
-                continue;
-            }
-            let result = if let Some(checkout) = checkout {
-                self.create_checkout(&subject.subject, &checkout, workspace)
-                    .and_then(|failure| match failure {
-                        Some(reason) => Err(anyhow::anyhow!(reason)),
-                        None => Ok(()),
-                    })
-            } else if member.workspace_create {
-                fs::create_dir_all(workspace).map_err(anyhow::Error::from)
+            let prepare = || self.prepare_member_workspace(subject, member);
+            let result = if launch_members.contains(subject.subject.as_str()) {
+                smallclaims::sqlite::with_control_writes(prepare)
             } else {
-                Err(anyhow::anyhow!(
-                    "the workspace does not exist and create was not requested"
-                ))
+                prepare()
             };
-            if let Err(error) = result.with_context(|| format!("workspace {}", workspace.display()))
-            {
+            if let Err(error) = result {
                 member_errors.insert(subject.subject.clone(), error);
-            } else if subject.kind == "agent" {
-                self.observe_agent_workspace(&subject.subject, member)?;
             }
         }
         let renderable = active
@@ -2117,7 +2117,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .collect::<BTreeSet<_>>();
         let mut render_failed = BTreeMap::new();
         for (subject, result) in rendered {
-            let result = result.and_then(|result| {
+            let record = || result.and_then(|result| {
                 let mut applied = BTreeMap::new();
                 // Only an agent has a harness to report a diagnostic on. Another member keeps its
                 // warnings on its render receipt, so a warning never faults it.
@@ -2143,6 +2143,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
                 Ok(())
             });
+            let result = if launch_members.contains(subject.as_str()) {
+                smallclaims::sqlite::with_control_writes(record)
+            } else {
+                record()
+            };
             if let Err(error) = result {
                 render_failed.insert(subject.clone(), format!("{error:#}"));
                 member_errors.insert(subject, error);
@@ -4375,6 +4380,37 @@ impl<R: RuntimeControl> Reconciler<R> {
             timeout,
             observation.as_ref(),
         )?;
+        Ok(())
+    }
+
+    fn prepare_member_workspace(&self, subject: &DesiredSubject, member: &MemberSpec) -> Result<()> {
+        let workspace = Path::new(&member.workspace);
+        let checkout = (subject.kind == "agent")
+            .then(|| Checkout::from_desired(&subject.desired))
+            .flatten();
+        if workspace.is_dir() {
+            if let Some(checkout) = &checkout {
+                checkout.validate_workspace(workspace)?;
+            }
+        } else {
+            let result = if let Some(checkout) = checkout {
+                self.create_checkout(&subject.subject, &checkout, workspace)
+                    .and_then(|failure| match failure {
+                        Some(reason) => Err(anyhow::anyhow!(reason)),
+                        None => Ok(()),
+                    })
+            } else if member.workspace_create {
+                fs::create_dir_all(workspace).map_err(anyhow::Error::from)
+            } else {
+                Err(anyhow::anyhow!(
+                    "the workspace does not exist and create was not requested"
+                ))
+            };
+            result.with_context(|| format!("workspace {}", workspace.display()))?;
+        }
+        if subject.kind == "agent" {
+            self.observe_agent_workspace(&subject.subject, member)?;
+        }
         Ok(())
     }
 
