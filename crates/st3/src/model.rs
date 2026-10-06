@@ -1498,6 +1498,17 @@ pub struct ClientSyncPeer {
     pub host_id: String,
     pub peer_only_envelopes: u64,
     pub local_only_envelopes: u64,
+    pub lag_seconds: Option<u64>,
+    #[serde(default)]
+    pub measurement_age_seconds: u64,
+    #[serde(default)]
+    pub stale: bool,
+    #[serde(default)]
+    pub lag_alert: bool,
+    #[serde(default)]
+    pub lag_alert_envelopes: u64,
+    #[serde(default)]
+    pub lag_alert_seconds: u64,
     pub last_exchange_at: Option<String>,
     /// Whole seconds up to `smallclaims::replication::MAX_SAFE_DURATION_SECONDS`;
     /// null when no finite, representable forecast is available.

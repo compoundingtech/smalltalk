@@ -1631,6 +1631,12 @@
         "host_id": { "$ref": "#/$defs/Id" },
         "peer_only_envelopes": { "type": "integer", "minimum": 0 },
         "local_only_envelopes": { "type": "integer", "minimum": 0 },
+        "lag_seconds": { "description": "Seconds since first observed nonzero inbound backlog, not oldest event age.", "x-st-codec": "duration-s", "type": ["integer", "null"], "minimum": 0 },
+        "measurement_age_seconds": { "x-st-codec": "duration-s", "type": "integer", "minimum": 0 },
+        "stale": { "type": "boolean" },
+        "lag_alert": { "type": "boolean" },
+        "lag_alert_envelopes": { "type": "integer", "minimum": 0 },
+        "lag_alert_seconds": { "x-st-codec": "duration-s", "type": "integer", "minimum": 0 },
         "last_exchange_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
         "estimated_catch_up_seconds": { "x-st-codec": "duration-s", "type": ["integer", "null"], "minimum": 0 },
         "diverged_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }

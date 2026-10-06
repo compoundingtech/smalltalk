@@ -679,6 +679,8 @@ pub struct PeerSyncProgress {
     pub heal: Option<ReplicationHealReport>,
     /// How many envelopes this node held when it took the last measurement.
     pub measured_inventory_envelopes: u64,
+    /// Beginning of the currently observed inbound backlog; only a measured zero clears it.
+    pub lag_since_unix_ms: Option<u128>,
 }
 
 impl PeerSyncProgress {
@@ -702,6 +704,11 @@ impl PeerSyncProgress {
         let Some((peer_only, local_only)) = difference else {
             return;
         };
+        if peer_only == 0 {
+            self.lag_since_unix_ms = None;
+        } else {
+            self.lag_since_unix_ms.get_or_insert(now);
+        }
         let mut sync = self.measured.take().unwrap_or_default();
         sync.peer_only_envelopes = peer_only;
         sync.local_only_envelopes = local_only;
@@ -746,7 +753,7 @@ impl PeerSyncProgress {
     /// than one exchange of envelopes this node lacks.
     pub fn view(&self, now: u128) -> Option<ReplicationPeerSync> {
         let mut sync = self.measured.clone()?;
-        sync.stale = now.saturating_sub(sync.measured_at_unix_ms) >= PEER_QUIET_EXCHANGE_MS;
+        sync.refresh_visibility(now, self.lag_since_unix_ms);
         sync.catching_up = sync.peer_only_envelopes > REPLICATION_EXCHANGE_ENVELOPE_LIMIT as u64
             && now.saturating_sub(sync.measured_at_unix_ms) <= REPLICATION_SYNC_STALE_MS;
         sync.graph_compared_at_unix_ms = self.graph_compared_at_unix_ms;
@@ -3716,6 +3723,47 @@ pub fn replication_difference_counts_what_each_side_lacks() {
 
 #[cfg(test)]
 #[test]
+pub fn sync_lag_visibility_boundaries_preserve_unknown_stale_and_recovery() {
+    let mut progress = PeerSyncProgress::default();
+    assert!(progress.view(1_000).is_none());
+    progress.observe(0, Some((999, 3)), 1_000);
+    let first = progress.view(1_000).unwrap();
+    assert_eq!(first.lag_seconds, Some(0));
+    assert!(!first.lag_alert);
+    progress.observe(0, Some((1_000, 3)), 2_000);
+    assert!(progress.view(2_000).unwrap().lag_alert);
+    progress.observe(0, Some((1, 3)), 60_999);
+    let below = progress.view(60_999).unwrap();
+    assert_eq!(below.lag_seconds, Some(59));
+    assert!(!below.lag_alert);
+    let boundary = progress.view(61_000).unwrap();
+    assert_eq!(boundary.lag_seconds, Some(60));
+    assert!(boundary.lag_alert);
+    assert!(!boundary.stale);
+    progress.observe(0, None, 90_000);
+    assert_eq!(progress.view(90_000).unwrap().lag_seconds, Some(89));
+    let at = 60_999 + PEER_QUIET_EXCHANGE_MS;
+    assert!(!progress.view(at - 1).unwrap().stale);
+    let stale = progress.view(at).unwrap();
+    assert!(stale.stale);
+    assert!(stale.visibility_notice());
+    assert_eq!(stale.measurement_age_seconds, 35);
+    assert_eq!(stale.estimated_catch_up_seconds, None);
+    assert_eq!(stale.peer_only_envelopes, 1);
+    progress.observe(0, Some((0, 3)), at + 1);
+    let recovered = progress.view(at + 1).unwrap();
+    assert_eq!(recovered.lag_seconds, None);
+    assert!(!recovered.stale);
+    assert!(!recovered.lag_alert);
+    assert!(!recovered.visibility_notice());
+    assert!(progress.view(at + 1 + PEER_QUIET_EXCHANGE_MS).unwrap().visibility_notice());
+    progress.observe(0, Some((2, 0)), at + 2);
+    assert_eq!(progress.view(at + 2).unwrap().lag_seconds, Some(0));
+    assert_eq!(progress.view(at).unwrap().measurement_age_seconds, 0);
+}
+
+#[cfg(test)]
+#[test]
 pub fn sync_progress_infinite_rate_does_not_claim_caught_up() {
     let mut progress = PeerSyncProgress {
         measured: Some(ReplicationPeerSync {
@@ -6264,6 +6312,23 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner)
             .values()
             .any(|progress| progress.view(now).is_some_and(|sync| sync.diverged))
+    }
+
+    /// Cheap page guard: no inventory scan or fleet/schema read on a fresh, aligned node.
+    pub fn replication_visibility_notice(&self) -> bool {
+        let now = now_ms();
+        self.replication_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|progress| {
+                progress.measured.as_ref().is_some_and(|sync| {
+                    sync.peer_only_envelopes != 0
+                        || now.saturating_sub(sync.measured_at_unix_ms) >= PEER_QUIET_EXCHANGE_MS
+                }) || progress.graph_differs_since_unix_ms
+                    .zip(progress.graph_compared_at_unix_ms)
+                    .is_some_and(|(since, compared)| compared.saturating_sub(since) >= REPLICATION_DIVERGED_AFTER_MS)
+            })
     }
 
     /// The latest sync measurement for each configured peer that has one.

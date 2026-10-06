@@ -282,8 +282,10 @@ to reach it has failed and it has missed a 35-second quiet exchange interval, as
 does; a failure within that interval can be a one-way route while the peer still dials in. The
 last failed attempt stays as the peer's `last_error`, with its time, until the next exchange. A
 sync measurement older than the quiet interval is marked `stale`, with the envelopes this node
-gained since. Doctor names every absent peer and how much this node has not sent it, and warns
-only for an absent listening member; a dial-out member or a config peer can be away for hours.
+gained since. Doctor names every absent peer and how much this node has not sent it. Its
+reachability check warns only for an absent listening member; a dial-out member or a config
+peer can be away for hours. The separate per-peer lag check still warns when its inventory
+measurement is stale, without classifying that intentional absence as a transport outage.
 Delivery probes and their attention streaks wait for the member to exchange again.
 A config-peer node can omit `peer_listen` and initiate every exchange itself; it still pushes
 and pulls the full graph.
@@ -568,6 +570,32 @@ bound. The estimate divides the remaining envelopes by how fast that number shra
 10-second windows, so a peer that keeps writing lengthens it. The measurements live in memory; the
 first exchange after a restart rebuilds them.
 
+`st fleet status`, its JSON peer `sync` objects, and `st doctor`'s `replication-lag/PEER`
+checks expose the same lag policy: warn at **>= 1,000 inbound envelopes OR >= 60 seconds of
+observed nonzero inbound backlog**. `lag_alert_envelopes` and `lag_alert_seconds` accompany
+`lag_alert` in the view. Freshness is independent: an absent inventory measurement is unknown,
+never zero, and a measurement at least 35 seconds old warns even if its last backlog was zero.
+
+`lag_seconds` is elapsed since this daemon first measured a nonzero inbound backlog, cleared
+only by a measured zero. It is not the age of the oldest missing event, which the inventory
+does not provide, and includes intervals without an exchange. `measurement_age_seconds`
+describes how old the comparison is; stale envelope counts remain the last measured counts.
+`estimated_catch_up_seconds` is a forecast at the measured net drain rate, not either age.
+Stale measurements suppress that forecast rather than displaying a historical rate as current.
+
+With `[observations.otlp]` enabled, the existing OTLP exporter emits live per-peer gauges even
+when there are no local observations to export (normally every five seconds when idle):
+`st_replication_peer_only_envelopes`, `st_replication_local_only_envelopes`,
+`st_replication_lag_seconds`, `st_replication_measurement_age_seconds`,
+`st_replication_measurement_stale`, `st_replication_lag_alert`,
+`st_replication_estimated_catch_up_seconds`, `st_replication_lag_alert_envelopes` and
+`st_replication_lag_alert_seconds`. The bounded `st.peer` label identifies the configured or
+current fleet peer; the resource identifies this node. `st_replication_measurement_available`
+is zero for an unmeasured peer; that peer emits no fabricated zero count or duration.
+Unavailable durations and forecasts have no point. The exporter uses its existing failure
+backoff, and does not write replication metrics into the graph.
+
+
 The `timings` line shows where this daemon has spent replication time since it started:
 
 ```text
@@ -580,11 +608,12 @@ peer's work to answer them. SQLite time is every statement the daemon ran; each 
 a disk flush. `/v1/replication/status` carries the same numbers as `timings`.
 `crates/st3/tests/first_sync.rs` uses them to profile an empty node syncing from a peer; `cargo test --release -p st3 --test integration first_sync:: -- --nocapture` runs it.
 
-A node is catching up while a peer measured in the last five minutes holds more envelopes than one
-exchange carries. During that time its projections can show early history as current: a request
-that a later envelope resolves still looks open. Every client page then carries a `sync` notice,
-`st now` and the other product commands print a `SYNCING` line before their items, and stui shows
-`⟳ Syncing` with the same line.
+A node batches catch-up projection while a peer measured in the last five minutes holds more
+envelopes than one exchange carries. This batching policy is separate from visibility: every
+client page carries a `sync` notice for any measured nonzero inbound backlog or stale
+measurement, including a small backlog that fits in one exchange. `st now` and other product
+commands print it before their items; stui shows `⟳ Syncing`. Counts, observed backlog duration,
+measurement age/staleness, forecast and alert thresholds remain distinct in that notice.
 
 Two nodes are in sync only when they hold the same envelopes and project the same graph from
 them. Each exchange at which both nodes hold the same envelopes compares their graph digests; an

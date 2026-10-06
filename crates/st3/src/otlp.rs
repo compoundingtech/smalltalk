@@ -161,10 +161,23 @@ impl OtlpExporter {
 }
 
 /// Export until the process stops. A failure backs off up to five minutes.
-pub async fn run(store: Arc<Store>, exporter: OtlpExporter) {
+pub async fn run(state: crate::api::AppState, exporter: OtlpExporter) {
+    let state = Arc::new(state);
     let mut backoff = Duration::from_secs(1);
     loop {
-        match exporter.export_once(&store).await {
+        let outcome = async {
+            let reader = state.clone();
+            let metrics = tokio::task::spawn_blocking(move || {
+                let peers = crate::api::replication_peer_names(&reader);
+                let sync = reader.store.replication_peer_sync(&peers);
+                otlp_replication_metrics(&reader.node, &peers, &sync, crate::store::now_ms())
+            }).await?;
+            if let Some(metrics) = metrics {
+                exporter.send(&exporter.metrics_url, &metrics).await?;
+            }
+            exporter.export_once(&state.store).await
+        }.await;
+        match outcome {
             Ok(outcome) => {
                 backoff = Duration::from_secs(1);
                 if outcome.skipped > 0 {
@@ -529,6 +542,65 @@ fn otlp_hook_traces(node: &str, batch: &[ClaimRecord]) -> Option<Value> {
     }]}))
 }
 
+/// Live gauges share the API's per-peer view, and are exported even with no observation batch.
+/// Missing measurements emit availability=0, never a fabricated zero backlog or duration.
+pub fn otlp_replication_metrics(
+    node: &str,
+    peers: &[String],
+    sync: &BTreeMap<String, crate::model::ReplicationPeerSync>,
+    now: u128,
+) -> Option<Value> {
+    if peers.is_empty() {
+        return None;
+    }
+    let point = |peer: &str, value: f64| json!({
+        "attributes": [attribute("st.peer", json!({"stringValue": peer}))],
+        "timeUnixNano": now.saturating_mul(1_000_000).to_string(),
+        "asDouble": value,
+    });
+    let mut metrics = vec![json!({
+        "name": "st_replication_measurement_available", "unit": "1",
+        "gauge": {"dataPoints": peers.iter().map(|peer| point(peer, u8::from(sync.contains_key(peer)) as f64)).collect::<Vec<_>>()},
+    })];
+    for (name, unit, field) in [
+        ("st_replication_peer_only_envelopes", "{envelope}", 0),
+        ("st_replication_local_only_envelopes", "{envelope}", 1),
+        ("st_replication_lag_seconds", "s", 2),
+        ("st_replication_measurement_age_seconds", "s", 3),
+        ("st_replication_measurement_stale", "1", 4),
+        ("st_replication_lag_alert", "1", 5),
+        ("st_replication_estimated_catch_up_seconds", "s", 6),
+        ("st_replication_lag_alert_envelopes", "{envelope}", 7),
+        ("st_replication_lag_alert_seconds", "s", 8),
+    ] {
+        let points = peers.iter().filter_map(|peer| {
+            let sync = sync.get(peer)?;
+            let value = match field {
+                0 => Some(sync.peer_only_envelopes as f64),
+                1 => Some(sync.local_only_envelopes as f64),
+                2 => sync.lag_seconds.map(|seconds| seconds as f64),
+                3 => Some(sync.measurement_age_seconds as f64),
+                4 => Some(u8::from(sync.stale) as f64),
+                5 => Some(u8::from(sync.lag_alert) as f64),
+                6 => sync.estimated_catch_up_seconds.map(|seconds| seconds as f64),
+                7 => Some(sync.lag_alert_envelopes as f64),
+                _ => Some(sync.lag_alert_seconds as f64),
+            }?;
+            Some(point(peer, value))
+        }).collect::<Vec<_>>();
+        let description = match field {
+            2 => "Elapsed since first observed nonzero inbound backlog; not oldest missing event age",
+            3 => "Elapsed since inventory measurement; old counts are not current inventory",
+            6 => "Forecast to drain inbound backlog at measured net catch-up rate; not event age",
+            _ => "Per-peer replication inventory visibility",
+        };
+        metrics.push(json!({"name": name, "unit": unit, "description": description, "gauge": {"dataPoints": points}}));
+    }
+    Some(json!({"resourceMetrics": [{"resource": resource(node), "scopeMetrics": [{
+        "scope": {"name": "st.replication"}, "metrics": metrics,
+    }]}]}))
+}
+
 fn attribute(key: &str, value: Value) -> Value {
     json!({ "key": key, "value": value })
 }
@@ -567,6 +639,30 @@ mod tests {
     use axum::routing::post;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU16, Ordering};
+
+    #[test]
+    fn replication_metrics_distinguish_unknown_stale_backlog_and_forecast() {
+        let mut progress = smallclaims::store::PeerSyncProgress::default();
+        progress.observe(0, Some((1_000, 3)), 1_000);
+        progress.observe(0, Some((1_000, 3)), 30_000);
+        let peers = vec!["birch".into(), "unknown".into()];
+        let sync = BTreeMap::from([("birch".into(), progress.view(65_000).unwrap())]);
+        let body = otlp_replication_metrics("amber", &peers, &sync, 65_000).unwrap();
+        let metrics = body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"].as_array().unwrap();
+        let points = |name: &str| {
+            metrics.iter().find(|metric| metric["name"] == name).unwrap()["gauge"]["dataPoints"].as_array().unwrap()
+        };
+        assert_eq!(points("st_replication_measurement_available")[1]["asDouble"], 0.0);
+        assert_eq!(points("st_replication_peer_only_envelopes").len(), 1);
+        assert_eq!(points("st_replication_peer_only_envelopes")[0]["asDouble"], 1_000.0);
+        assert_eq!(points("st_replication_lag_seconds")[0]["asDouble"], 64.0);
+        assert_eq!(points("st_replication_measurement_age_seconds")[0]["asDouble"], 35.0);
+        assert_eq!(points("st_replication_measurement_stale")[0]["asDouble"], 1.0);
+        assert_eq!(points("st_replication_lag_alert")[0]["asDouble"], 1.0);
+        assert!(points("st_replication_estimated_catch_up_seconds").is_empty());
+        assert_eq!(points("st_replication_lag_alert_envelopes")[0]["asDouble"], 1_000.0);
+        assert_eq!(points("st_replication_lag_alert_seconds")[0]["asDouble"], 60.0);
+    }
 
     #[derive(Clone, Default)]
     struct Collector {

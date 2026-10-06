@@ -455,6 +455,10 @@ pub struct ReplicationPeerStatus {
 /// Larger forecasts are unavailable, rather than clamped to a fabricated duration.
 pub const MAX_SAFE_DURATION_SECONDS: u64 = (1_u64 << 53) - 1;
 
+/// A measured inbound backlog warns at either boundary; freshness warns independently.
+pub const REPLICATION_LAG_ALERT_ENVELOPES: u64 = 1_000;
+pub const REPLICATION_LAG_ALERT_SECONDS: u64 = 60;
+
 /// The difference between this node's envelopes and one peer's, measured from the inventory the
 /// peer sent in its last exchange.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -464,6 +468,18 @@ pub struct ReplicationPeerSync {
     /// Envelopes this node holds that the peer lacks.
     pub local_only_envelopes: u64,
     pub measured_at_unix_ms: u128,
+    /// Seconds since this node first observed a nonzero inbound backlog, not oldest event age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag_seconds: Option<u64>,
+    /// Age of the inventory measurement, distinct from lag duration and catch-up forecast.
+    #[serde(default)]
+    pub measurement_age_seconds: u64,
+    #[serde(default)]
+    pub lag_alert: bool,
+    #[serde(default)]
+    pub lag_alert_envelopes: u64,
+    #[serde(default)]
+    pub lag_alert_seconds: u64,
     /// The peer has not exchanged since a quiet interval passed, so the measurement may no
     /// longer hold: it says what the two nodes held then, not now.
     #[serde(default)]
@@ -503,6 +519,51 @@ pub struct ReplicationPeerSync {
     /// The last heal with this peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heal: Option<ReplicationHealReport>,
+}
+
+impl ReplicationPeerSync {
+    /// Refresh visibility without treating an old inventory as current or a forecast as age.
+    pub fn refresh_visibility(&mut self, now: u128, lag_since: Option<u128>) {
+        let seconds = |ms: u128| (ms / 1_000).min(MAX_SAFE_DURATION_SECONDS as u128) as u64;
+        self.measurement_age_seconds = seconds(now.saturating_sub(self.measured_at_unix_ms));
+        self.stale = now.saturating_sub(self.measured_at_unix_ms)
+            >= crate::store::PEER_QUIET_EXCHANGE_MS;
+        self.lag_seconds = (self.peer_only_envelopes != 0)
+            .then(|| lag_since.map(|since| seconds(now.saturating_sub(since))))
+            .flatten();
+        self.lag_alert_envelopes = REPLICATION_LAG_ALERT_ENVELOPES;
+        self.lag_alert_seconds = REPLICATION_LAG_ALERT_SECONDS;
+        self.lag_alert = self.peer_only_envelopes >= REPLICATION_LAG_ALERT_ENVELOPES
+            || self.lag_seconds.is_some_and(|seconds| seconds >= REPLICATION_LAG_ALERT_SECONDS);
+        if self.stale {
+            self.estimated_catch_up_seconds = None;
+        }
+    }
+
+    pub fn visibility_notice(&self) -> bool {
+        self.peer_only_envelopes != 0 || self.stale || self.diverged
+    }
+
+    /// One description shared by doctor and fleet CLI. Counts remain the last measured counts.
+    pub fn lag_summary(&self) -> String {
+        use std::fmt::Write as _;
+        let mut output = String::with_capacity(320);
+        let _ = write!(output, "{} inbound / {} outbound envelopes; observed behind ",
+            self.peer_only_envelopes, self.local_only_envelopes);
+        match self.lag_seconds {
+            Some(seconds) => { let _ = write!(output, "{seconds}s"); }
+            None => output.push_str("unknown"),
+        }
+        let _ = write!(output, "; measurement age {}s{}; catch-up forecast ",
+            self.measurement_age_seconds, if self.stale { " STALE" } else { "" });
+        match self.estimated_catch_up_seconds {
+            Some(seconds) => { let _ = write!(output, "{seconds}s"); }
+            None => output.push_str("unknown"),
+        }
+        let _ = write!(output, "; lag alert {} (>= {} envelopes or >= {}s observed behind)",
+            self.lag_alert, self.lag_alert_envelopes, self.lag_alert_seconds);
+        output
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

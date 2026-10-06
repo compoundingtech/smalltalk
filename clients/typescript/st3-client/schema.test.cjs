@@ -84,6 +84,36 @@ test('second durations preserve safe wire units without millisecond precision lo
     assert.throws(() => Schema.encodeSync(Rich.SyncPeer)({ ...decoded, estimated_catch_up_seconds: Option.some(Duration.nanos((BigInt(Number.MAX_SAFE_INTEGER) + 1n) * 1_000_000_000n)) }));
 });
 
+test('lag duration, measurement age and forecast remain distinct with unavailable evidence', async () => {
+    const [{ Duration, Option, Schema }, Rich] = await modules;
+    const wire = {
+        host_id: 'host/test', peer_only_envelopes: 1, local_only_envelopes: 3,
+        lag_seconds: 65, measurement_age_seconds: 36, estimated_catch_up_seconds: null,
+        stale: true, lag_alert: true, lag_alert_envelopes: 1000, lag_alert_seconds: 60,
+    };
+    const decode = Rich.decodeUnknownSync(Rich.SyncPeer, 'strict');
+    const decoded = decode(wire);
+    assert.equal(Duration.toSeconds(decoded.lag_seconds.value), 65);
+    assert.equal(Duration.toSeconds(decoded.measurement_age_seconds), 36);
+    assert.equal(Duration.toSeconds(decoded.lag_alert_seconds), 60);
+    assert(Option.isNone(decoded.estimated_catch_up_seconds));
+    assert.equal(decoded.stale, true);
+    assert.equal(decoded.lag_alert, true);
+    const encoded = Schema.encodeSync(Rich.SyncPeer)(decoded);
+    assert.equal(encoded.lag_seconds, 65);
+    assert.equal(encoded.measurement_age_seconds, 36);
+    assert.equal(encoded.lag_alert_seconds, 60);
+    for (const field of ['lag_seconds', 'measurement_age_seconds', 'lag_alert_seconds']) {
+        for (const invalid of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+            assert.throws(() => decode({ ...wire, [field]: invalid }));
+        }
+    }
+    const unknown = decode({ host_id: 'host/test', peer_only_envelopes: 0, local_only_envelopes: 0 });
+    assert(Option.isNone(unknown.lag_seconds));
+    assert.equal(unknown.measurement_age_seconds, undefined);
+    assert.equal(unknown.lag_alert, undefined);
+});
+
 test('strict mode distinguishes real unknown enums from arbitrary same-shaped JSON bags', async () => {
     const [{ Schema }, Rich] = await modules;
     const payload = Schema.Struct({

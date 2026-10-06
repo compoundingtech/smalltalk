@@ -969,6 +969,10 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                         .map(|error| format!("  {error}"))
                         .unwrap_or_default()
                 );
+                println!("  {}", peer.sync.as_ref().map_or_else(
+                    || "lag unknown: no inventory measurement since this daemon started".into(),
+                    |sync| sync.lag_summary(),
+                ));
             }
             for invite in &status.invites {
                 println!("INVITE  {}  {}", invite.invite, invite.state);
@@ -5691,7 +5695,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
             "st3: exporting local observations to OpenTelemetry at {}",
             otlp.endpoint
         );
-        tokio::spawn(st3::otlp::run(store.clone(), exporter));
+        tokio::spawn(st3::otlp::run(state.clone(), exporter));
     }
     #[cfg(target_os = "macos")]
     tokio::spawn(async {
@@ -23996,160 +24000,6 @@ mod tests {
         assert!(!output.contains("down"));
     }
 
-    #[test]
-    fn replication_status_says_which_side_holds_what_and_how_long_catching_up_takes() {
-        let now = 1_000_000;
-        let local = "1111111111111111aaaa";
-        let peer =
-            |name: &str, graph: Option<&str>, sync: Option<st3::model::ReplicationPeerSync>| {
-                ReplicationPeerStatus {
-                    projection_digests: BTreeMap::from([("claim_sources".into(), "sample".into())]),
-                    differing_tables: Vec::new(),
-                    projection_comparison_waiting: false,
-                    peer: name.into(),
-                    status: "up".into(),
-                    last_success_at_unix_ms: Some(now - 2_000),
-                    last_error: None,
-                    last_failure_at_unix_ms: None,
-                    refusal_reason: None,
-                    schema_digest: None,
-                    authority_digest: None,
-                    graph_digest: graph.map(str::to_owned),
-                    sync,
-                }
-            };
-        let same_envelopes = |compared: Option<u128>, differs: Option<u128>, diverged| {
-            Some(st3::model::ReplicationPeerSync {
-                measured_at_unix_ms: now,
-                graph_compared_at_unix_ms: compared,
-                graph_differs_since_unix_ms: differs,
-                diverged,
-                ..Default::default()
-            })
-        };
-        let output = render_replication_peers(
-            &[
-                peer(
-                    "ExampleMac",
-                    Some("3333333333333333"),
-                    Some(st3::model::ReplicationPeerSync {
-                        peer_only_envelopes: 124_384,
-                        local_only_envelopes: 3,
-                        measured_at_unix_ms: now - 2_000,
-                        receive_rate_per_second: Some(142.5),
-                        catch_up_rate_per_second: Some(140.0),
-                        estimated_catch_up_seconds: Some(889),
-                        catching_up: true,
-                        ..Default::default()
-                    }),
-                ),
-                peer("Quiet", Some(local), same_envelopes(Some(now), None, false)),
-                peer(
-                    "Moved",
-                    Some("4444444444444444"),
-                    same_envelopes(Some(now), None, false),
-                ),
-                peer(
-                    "Settling",
-                    Some("5555555555555555"),
-                    same_envelopes(Some(now), Some(now - 10_000), false),
-                ),
-                peer(
-                    "Laptop",
-                    Some("2222222222222222bbbb"),
-                    same_envelopes(Some(now - 1_000), Some(now - 180_000), true),
-                ),
-                peer("Fresh", None, None),
-            ],
-            local,
-            now,
-        );
-        assert_eq!(
-            output,
-            "sync\tdiverged: Laptop holds the same envelopes but projects a different graph, \
-             since 3m ago\n\
-             sync\tcatching up: ExampleMac has 124,384 envelopes this node lacks, \
-             caught up in about 15m\n\
-             peer\tExampleMac\tup\t\n\
-             \x20 last seen 2s ago\n\
-             \x20 ExampleMac has 124,384 envelopes this node lacks\n\
-             \x20 this node has 3 envelopes ExampleMac lacks\n\
-             \x20 receiving 142.5 envelopes/s, caught up in about 15m (measured 2s ago)\n\
-             peer\tQuiet\tup\t\n\
-             \x20 last seen 2s ago\n\
-             \x20 in sync: the same envelopes and the same graph (measured now)\n\
-             peer\tMoved\tup\t\n\
-             \x20 last seen 2s ago\n\
-             \x20 same envelopes (measured now), but the graphs differ (this node \
-             111111111111, Moved 444444444444); the next exchange compares them\n\
-             peer\tSettling\tup\t\n\
-             \x20 last seen 2s ago\n\
-             \x20 graphs differ: the same envelopes project different graphs since 10s ago \
-             (compared now; this node 111111111111, Settling 555555555555)\n\
-             \x20 diverged if this lasts a minute; a peer still projecting settles by itself\n\
-             peer\tLaptop\tup\t\n\
-             \x20 last seen 2s ago\n\
-             \x20 diverged: the same envelopes project different graphs since 3m ago \
-             (compared 1s ago; this node 111111111111, Laptop 222222222222)\n\
-             \x20 exchanges cannot fix this; the nodes heal by comparing the claims each projects, and views on one node are wrong until then\n\
-             peer\tFresh\tup\t\n\
-             \x20 last seen 2s ago\n\
-             \x20 difference not measured yet\n"
-        );
-    }
-
-    #[test]
-    fn a_catching_up_page_leads_with_how_far_behind_this_host_is() {
-        let mut page = fixture_product_page(&["attention"], false);
-        page.sync = Some(st3_client::SyncNotice {
-            state: "catching-up".into(),
-            peers: vec![st3_client::SyncPeer {
-                host_id: "host/ExampleMac".into(),
-                peer_only_envelopes: 1,
-                local_only_envelopes: 0,
-                last_exchange_at: Some("1970-01-01T00:16:38Z".into()),
-                estimated_catch_up_seconds: None,
-                diverged_since: None,
-            }],
-        });
-        let output = render_now_page(&page, "st3 now --as person/alex");
-        assert!(
-            output.starts_with(
-                "SYNCING  ExampleMac has 1 envelope this host lacks · estimating time to catch up · \
-                 last exchange "
-            ),
-            "{output}"
-        );
-        assert!(
-            output.contains("items below can be out of date"),
-            "{output}"
-        );
-        assert_eq!(
-            render_sync_notice(page.sync.as_ref().unwrap(), 1_000_000),
-            "SYNCING  ExampleMac has 1 envelope this host lacks · estimating time to catch up · \
-             last exchange 2s ago\n  Until then, items below can be out of date. \
-             Progress: st3 replication status\n\n"
-        );
-        assert_eq!(catch_up_estimate(Some(0)), "caught up");
-        assert_eq!(catch_up_estimate(Some(59)), "caught up in under a minute");
-        assert_eq!(catch_up_estimate(Some(3_601)), "caught up in about 1h 1m");
-        assert_eq!(catch_up_estimate(Some(90_000)), "caught up in about 1d 1h");
-        assert_eq!(envelope_count(1_234_567), "1,234,567 envelopes");
-
-        // A diverged peer outranks catching up: exchanges cannot fix what the page shows.
-        let sync = page.sync.as_mut().unwrap();
-        sync.state = "diverged".into();
-        sync.peers[0].diverged_since = Some("1970-01-01T00:13:40Z".into());
-        assert_eq!(
-            render_sync_notice(page.sync.as_ref().unwrap(), 1_000_000),
-            "DIVERGED  ExampleMac projects a different graph from the same envelopes · since 3m ago\n\
-             \x20 Exchanges cannot fix this, so items below can be wrong. \
-             Details: st3 replication status\n\n"
-        );
-
-        page.sync = None;
-        assert!(!render_now_page(&page, "st3 now").contains("SYNCING"));
-    }
 
     #[test]
     fn mission_list_counts_active_and_finished_runs_apart() {

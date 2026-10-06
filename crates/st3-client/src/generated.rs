@@ -207,6 +207,19 @@ pub struct SyncPeer {
     pub peer_only_envelopes: u64,
     /// Envelopes this host holds that the peer lacks.
     pub local_only_envelopes: u64,
+    /// Duration of observed backlog, never oldest missing event age.
+    #[serde(default)]
+    pub lag_seconds: Option<u64>,
+    #[serde(default)]
+    pub measurement_age_seconds: u64,
+    #[serde(default)]
+    pub stale: bool,
+    #[serde(default)]
+    pub lag_alert: bool,
+    #[serde(default)]
+    pub lag_alert_envelopes: u64,
+    #[serde(default)]
+    pub lag_alert_seconds: u64,
     #[serde(default)]
     pub last_exchange_at: Option<String>,
     #[serde(default)]
@@ -226,9 +239,20 @@ impl SyncPeer {
             return format!("{host} projects a different graph from the same envelopes");
         }
         format!(
-            "{host} has {} this host lacks · {}",
+            "{host} has {} this host lacks · {} · observed behind {} · measurement age {}s{} · {} (>= {} envelopes or >= {}s observed behind)",
             envelope_count(self.peer_only_envelopes),
-            catch_up_estimate(self.estimated_catch_up_seconds)
+            catch_up_estimate(self.estimated_catch_up_seconds),
+            self.lag_seconds
+                .map_or_else(|| "unknown".into(), |seconds| format!("{seconds}s")),
+            self.measurement_age_seconds,
+            if self.stale { " STALE" } else { "" },
+            if self.lag_alert {
+                "LAG ALERT"
+            } else {
+                "alert threshold"
+            },
+            self.lag_alert_envelopes,
+            self.lag_alert_seconds,
         )
     }
 }

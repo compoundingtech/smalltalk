@@ -1526,18 +1526,24 @@ where
 /// diverged from a peer's can show it wrong, so each page it serves says so and with whom.
 fn client_sync_notice(state: &AppState) -> Option<ClientSyncNotice> {
     // Naming the peers reads the fleet view, so skip it on the usual page read.
-    if !state.store.replication_catching_up() && !state.store.replication_diverged() {
+    if !state.store.replication_visibility_notice() {
         return None;
     }
     let peers = state
         .store
         .replication_peer_sync(&replication_peer_names(state))
         .into_iter()
-        .filter(|(_, sync)| sync.catching_up || sync.diverged)
+        .filter(|(_, sync)| sync.visibility_notice())
         .map(|(peer, sync)| ClientSyncPeer {
             host_id: client_host_id(&peer),
             peer_only_envelopes: sync.peer_only_envelopes,
             local_only_envelopes: sync.local_only_envelopes,
+            lag_seconds: sync.lag_seconds,
+            measurement_age_seconds: sync.measurement_age_seconds,
+            stale: sync.stale,
+            lag_alert: sync.lag_alert,
+            lag_alert_envelopes: sync.lag_alert_envelopes,
+            lag_alert_seconds: sync.lag_alert_seconds,
             last_exchange_at: state
                 .store
                 .replication_peer_last_success(&peer)
@@ -5799,6 +5805,21 @@ fn terminal_exec_gates_check(store: &Store) -> anyhow::Result<DoctorCheck> {
     })
 }
 
+fn replication_lag_checks(peers: &[crate::model::ReplicationPeerStatus]) -> impl Iterator<Item = DoctorCheck> + '_ {
+    peers.iter().filter(|peer| peer.status != "refused").map(|peer| DoctorCheck {
+        name: format!("replication-lag/{}", peer.peer),
+        status: if peer.sync.as_ref().is_none_or(|sync| sync.stale || sync.lag_alert) {
+            "warn"
+        } else {
+            "pass"
+        }.into(),
+        message: peer.sync.as_ref().map_or_else(
+            || "lag unknown: no inventory measurement since this daemon started".into(),
+            |sync| sync.lag_summary(),
+        ),
+    })
+}
+
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
     match state.store.index() {
@@ -6151,6 +6172,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             },
         }),
         Ok(replication) => {
+            checks.extend(replication_lag_checks(&replication.peers));
             let unavailable = replication
                 .peers
                 .iter()
@@ -6967,7 +6989,7 @@ async fn fleet_publish_endpoints(
 
 /// The peers a node reports on: its config peers and the current listening members it dials.
 /// A dial-out member is never dialed, and an ended name is history, so neither is reported.
-fn replication_peer_names(state: &AppState) -> Vec<String> {
+pub(crate) fn replication_peer_names(state: &AppState) -> Vec<String> {
     let view = state.store.fleet_view_sealed().unwrap_or_default();
     let mut names = state
         .configured_peers
@@ -13835,6 +13857,63 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn replication_lag_visibility_survives_small_backlogs_staleness_and_recovers() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.configured_peers = vec!["birch".into()];
+        state.fleet_id = Some("fleet/lag".into());
+        let now = client_now_ms();
+        let mut progress = smallclaims::store::PeerSyncProgress::default();
+        for (backlog, since, age, alert, stale) in [
+            (999, 0, 0, false, false),
+            (1_000, 0, 0, true, false),
+            (1, 61_000, 0, true, false),
+            (1, 61_000, 36_000, true, true),
+            (0, 0, 36_000, false, true),
+            (0, 0, 0, false, false),
+        ] {
+            progress.observe(0, Some((backlog, 3)), now - age);
+            progress.lag_since_unix_ms = (backlog != 0).then_some(now - since);
+            state.store.replication_sync.lock().unwrap().insert("birch".into(), progress.clone());
+            let app = router(state.clone());
+            let (_, fleet) = get_request(app.clone(), "/v1/internal/fleet/status").await;
+            let sync = &fleet["peers"][0]["sync"];
+            assert_eq!(sync["peer_only_envelopes"], backlog);
+            assert_eq!(sync["local_only_envelopes"], 3);
+            assert_eq!(sync["lag_alert"], alert);
+            assert_eq!(sync["stale"], stale);
+            assert_eq!(sync["lag_alert_envelopes"], 1_000);
+            assert_eq!(sync["lag_alert_seconds"], 60);
+            let (_, resources) = get_request(app, "/v1/client/resources").await;
+            let notice = &resources["value"]["sync"];
+            if backlog == 0 && !stale {
+                assert!(notice.is_null());
+            } else {
+                let peer = &notice["peers"][0];
+                assert_eq!(peer["peer_only_envelopes"], backlog);
+                assert_eq!(peer["lag_alert"], alert);
+                assert_eq!(peer["stale"], stale);
+                if backlog == 0 {
+                    assert!(peer["lag_seconds"].is_null());
+                } else {
+                    assert!(peer["lag_seconds"].as_u64().unwrap() >= (since / 1_000) as u64);
+                }
+                assert!(peer["measurement_age_seconds"].as_u64().unwrap() >= (age / 1_000) as u64);
+                if stale {
+                    assert!(peer["estimated_catch_up_seconds"].is_null());
+                }
+            }
+            let report = doctor_report(&state).unwrap().0;
+            let check = report.checks.iter().find(|check| check.name == "replication-lag/birch").unwrap();
+            assert_eq!(check.status, if alert || stale { "warn" } else { "pass" });
+        }
+        state.store.replication_sync.lock().unwrap().clear();
+        let report = doctor_report(&state).unwrap().0;
+        let check = report.checks.iter().find(|check| check.name == "replication-lag/birch").unwrap();
+        assert_eq!(check.status, "warn");
+    }
 
     #[tokio::test]
     async fn resources_page_keeps_rows_when_sync_forecast_is_unrepresentable() {

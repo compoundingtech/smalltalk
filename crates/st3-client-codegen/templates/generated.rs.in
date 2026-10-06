@@ -207,6 +207,19 @@ pub struct SyncPeer {
     pub peer_only_envelopes: u64,
     /// Envelopes this host holds that the peer lacks.
     pub local_only_envelopes: u64,
+    /// Duration of observed backlog, never oldest missing event age.
+    #[serde(default)]
+    pub lag_seconds: Option<u64>,
+    #[serde(default)]
+    pub measurement_age_seconds: Option<u64>,
+    #[serde(default)]
+    pub stale: Option<bool>,
+    #[serde(default)]
+    pub lag_alert: Option<bool>,
+    #[serde(default)]
+    pub lag_alert_envelopes: Option<u64>,
+    #[serde(default)]
+    pub lag_alert_seconds: Option<u64>,
     #[serde(default)]
     pub last_exchange_at: Option<String>,
     #[serde(default)]
@@ -226,9 +239,15 @@ impl SyncPeer {
             return format!("{host} projects a different graph from the same envelopes");
         }
         format!(
-            "{host} has {} this host lacks · {}",
+            "{host} has {} this host lacks · {} · observed behind {} · measurement age {}{} · {} (>= {} envelopes or >= {} observed behind)",
             envelope_count(self.peer_only_envelopes),
-            catch_up_estimate(self.estimated_catch_up_seconds)
+            catch_up_estimate(self.estimated_catch_up_seconds),
+            self.lag_seconds.map_or_else(|| "unknown".into(), |seconds| format!("{seconds}s")),
+            self.measurement_age_seconds.map_or_else(|| "unknown".into(), |seconds| format!("{seconds}s")),
+            match self.stale { Some(true) => " STALE", Some(false) => "", None => " (freshness unknown)" },
+            match self.lag_alert { Some(true) => "LAG ALERT", Some(false) => "alert threshold", None => "alert unknown" },
+            self.lag_alert_envelopes.map_or_else(|| "unknown".into(), |count| count.to_string()),
+            self.lag_alert_seconds.map_or_else(|| "unknown".into(), |seconds| format!("{seconds}s")),
         )
     }
 }

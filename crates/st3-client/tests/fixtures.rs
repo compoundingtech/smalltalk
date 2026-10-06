@@ -13,6 +13,27 @@ fn decode<T: serde::de::DeserializeOwned>(name: &str) -> T {
 }
 
 #[test]
+fn absent_lag_metadata_is_unknown_not_fresh_zero_or_no_alert() {
+    let wire = serde_json::json!({
+        "host_id": "host/birch", "peer_only_envelopes": 0, "local_only_envelopes": 0,
+    });
+    let unknown: SyncPeer = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(unknown.measurement_age_seconds, None);
+    assert_eq!(unknown.stale, None);
+    assert_eq!(unknown.lag_alert, None);
+    assert_eq!(unknown.lag_alert_envelopes, None);
+    assert_eq!(unknown.lag_alert_seconds, None);
+    let mut fresh = wire;
+    fresh["measurement_age_seconds"] = serde_json::json!(0);
+    fresh["stale"] = serde_json::json!(false);
+    fresh["lag_alert"] = serde_json::json!(false);
+    let fresh: SyncPeer = serde_json::from_value(fresh).unwrap();
+    assert_eq!(fresh.measurement_age_seconds, Some(0));
+    assert_eq!(fresh.stale, Some(false));
+    assert_eq!(fresh.lag_alert, Some(false));
+}
+
+#[test]
 fn search_fixture_preserves_result_targets_and_incomplete_history() {
     let search: Envelope<ConversationSearch> = decode("conversation-search.json");
     assert_eq!(search.value.items[0].entry_id, "timeline-entry/note");

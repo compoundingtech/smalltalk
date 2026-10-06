@@ -961,9 +961,16 @@ export const SyncPeer = /*#__PURE__*/ (() => Schema.Struct({
   "diverged_since": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "estimated_catch_up_seconds": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.Duration.check(durationSecondsRange), wholeUnits(1000))), NULL_NONE),
   "host_id": Id,
+  "lag_alert": optionalKey(Schema.Boolean),
+  "lag_alert_envelopes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "lag_alert_seconds": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.Duration.check(durationSecondsRange), wholeUnits(1000)))),
+  /** Seconds since first observed nonzero inbound backlog, not oldest event age. */
+  "lag_seconds": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.Duration.check(durationSecondsRange), wholeUnits(1000))), NULL_NONE).annotate({ description: "Seconds since first observed nonzero inbound backlog, not oldest event age." }),
   "last_exchange_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "local_only_envelopes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  "peer_only_envelopes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+  "measurement_age_seconds": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.Duration.check(durationSecondsRange), wholeUnits(1000)))),
+  "peer_only_envelopes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "stale": optionalKey(Schema.Boolean)
 }).annotate({ identifier: "SyncPeer" }))()
 export type SyncPeer = typeof SyncPeer.Type
 export type SyncPeerEncoded = typeof SyncPeer.Encoded

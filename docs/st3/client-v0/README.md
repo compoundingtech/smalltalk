@@ -231,16 +231,28 @@ Work resources, mission steps (including `current_steps`), and agent work labels
 `claimed` in every projection. Clients treat held or verifying work as active even when its
 successors are waiting.
 
-A page carries an optional `sync` notice while its host is catching up with a fleet peer. Its
-projections can then show early history as current, such as a person step that a
-not-yet-received envelope completes. The notice lists each peer that holds more envelopes than one
-replication exchange carries, with `peer_only_envelopes` (held by the peer, missing here),
-`local_only_envelopes`, `last_exchange_at`, and `estimated_catch_up_seconds` (null until a rate is
-measured or no finite forecast fits the safe-integer duration bound of 9,007,199,254,740,991
-whole seconds, `2^53 - 1`). Unavailable forecasts are null or absent; they are never clamped.
-The producer and API projection share `MAX_SAFE_DURATION_SECONDS`. A stalled peer keeps its
-sync notice even when its forecast is unavailable. Clients show the notice above the page.
-The page omits it once the host has caught up.
+A page carries an optional `sync` notice when any peer's last measured inbound backlog is
+nonzero, even if it fits in one exchange, or its measurement is stale. Its projections can show
+early history as current, such as a person step that a not-yet-received envelope completes.
+Each measured peer includes `peer_only_envelopes` (held by the peer, missing here),
+`local_only_envelopes`, `last_exchange_at`, and these distinct time signals:
+
+- `lag_seconds`: elapsed since this daemon first observed a nonzero inbound backlog. Only a
+  measured zero resets it. It is **not the age of the oldest missing event**; intervals without
+  an exchange remain part of this observed backlog episode. Zero backlog has a null duration.
+- `measurement_age_seconds` and `stale`: age of the inventory comparison, with `stale` set at
+  35 seconds. Stale counts describe the last comparison, not the current peer inventory.
+- `estimated_catch_up_seconds`: a forecast from the measured net catch-up rate, not event age
+  or time already spent behind. It is null when stale, stalled, not yet sampled, or outside
+  the safe-integer bound of 9,007,199,254,740,991 whole seconds (`2^53 - 1`).
+
+`lag_alert` is true at **>= 1,000 inbound envelopes OR >= 60 seconds of observed nonzero
+backlog**. The exact thresholds accompany each peer as `lag_alert_envelopes` and
+`lag_alert_seconds`; st doctor, fleet status and telemetry use the same decision. Staleness
+warns independently, including when the last measurement found zero inbound envelopes.
+Unavailable forecasts are never clamped. A stalled or stale peer keeps its notice; the page
+omits it only once all measured peers are fresh and inbound-aligned. Measurements and observed
+durations are in-memory and restart at the first exchange after daemon startup.
 
 The notice's `state` is `diverged` instead while the host's graph has diverged from a peer's: both
 hold the same envelopes but project different graphs from them, so the page can be wrong, not just

@@ -1492,9 +1492,15 @@ export type SyncPeer = {
   diverged_since?: (Timestamp | null);
   estimated_catch_up_seconds?: number | null;
   host_id: Id;
+  lag_alert?: boolean;
+  lag_alert_envelopes?: number;
+  lag_alert_seconds?: number;
+  lag_seconds?: number | null;
   last_exchange_at?: (Timestamp | null);
   local_only_envelopes: number;
+  measurement_age_seconds?: number;
   peer_only_envelopes: number;
+  stale?: boolean;
 };
 
 export type TargetParameters = {
