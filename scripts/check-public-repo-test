@@ -24,6 +24,10 @@ class PublicRepositoryCheck(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(self.findings(text))
 
+    def test_legacy_provider_templates_allow_only_invented_accounts(self):
+        self.assertEqual(self.findings('person/discord-{id} person/discord-404 person/discord-606'), [])
+        self.assertTrue(self.findings('person' + '/discord-123456789012345678'))
+
     def test_internal_namespace(self):
         for separator in ['/', '%2F', '%2f']:
             self.assertTrue(self.findings(separator.join(['agent', 'fleet', 'fixture'])))
