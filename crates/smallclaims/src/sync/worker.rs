@@ -548,7 +548,7 @@ pub async fn run<B: Backend>(
     use axum::serve::ListenerExt as _;
     let listener = listener.tap_io(|tcp| {
         if let Err(error) = tcp.set_nodelay(true) {
-            tracing::warn!(%error, "could not disable Nagle on peer socket");
+            eprintln!("st: could not disable Nagle on peer socket: {error}");
         }
     });
     axum::serve(listener, app).await?;
@@ -646,7 +646,7 @@ async fn keep_tailnet_current(
                         use axum::serve::ListenerExt as _;
                         let listener = listener.tap_io(|tcp| {
                             if let Err(error) = tcp.set_nodelay(true) {
-                                tracing::warn!(%error, "could not disable Nagle on peer socket");
+                                eprintln!("st: could not disable Nagle on peer socket: {error}");
                             }
                         });
                         let _ = axum::serve(listener, app).await;
