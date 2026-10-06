@@ -254,6 +254,8 @@ impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
 
 /// The remote span context from `traceparent`/`tracestate`, or an empty context when the
 /// caller sent none: the request span is then a local root.
+/// Server roots record a valid parent's sampled flag as `st.parent.sampled` for the
+/// collector policy; AlwaysOn exports requests even when that flag is false.
 pub fn extract_remote_context(headers: &axum::http::HeaderMap) -> opentelemetry::Context {
     opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&HeaderExtractor(headers))

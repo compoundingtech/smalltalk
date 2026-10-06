@@ -1311,6 +1311,7 @@ fn request_trace(
     if !crate::otel::export_enabled() {
         return None;
     }
+    use opentelemetry::trace::TraceContextExt as _;
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
     let span_name = format!("{} {route}", method.as_str());
     let span = tracing::info_span!(
@@ -1323,8 +1324,15 @@ fn request_trace(
         "http.route" = route,
         "st3.client.class" = client_class.as_str(),
         "http.response.status_code" = tracing::field::Empty,
+        "st.parent.sampled" = tracing::field::Empty,
     );
-    span.set_parent(crate::otel::extract_remote_context(headers));
+    let remote = crate::otel::extract_remote_context(headers);
+    let parent = remote.span();
+    let context = parent.span_context();
+    if context.is_valid() {
+        span.record("st.parent.sampled", context.is_sampled());
+    }
+    span.set_parent(remote);
     Some(span)
 }
 

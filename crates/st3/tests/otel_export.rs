@@ -481,29 +481,41 @@ fn daemon_request_span_continues_caller_trace() {
     const PARENT_ID: &str = "1234567890abcdef";
     let root = tempfile::tempdir().unwrap();
     let mut daemon = ExportDaemon::start(&collector, root.path());
-    daemon.health(Some(&format!("00-{TRACE_ID}-{PARENT_ID}-01")));
-    daemon.await_export(&root.path().join("capture/traces.ndjson"), |request| {
-        request["resourceSpans"].as_array().is_some_and(|batches| {
-            batches.iter().any(|batch| {
-                string_attribute(&batch["resource"], "service.name") == Some("st3-daemon")
-                    && batch["scopeSpans"].as_array().is_some_and(|scopes| {
-                        scopes.iter().any(|scope| {
-                            scope["spans"].as_array().is_some_and(|spans| {
-                                spans.iter().any(|span| {
-                                    span["traceId"].as_str() == Some(TRACE_ID)
-                                        && span["parentSpanId"].as_str() == Some(PARENT_ID)
-                                        && span["name"].as_str() == Some("GET /v1/health")
-                                        && string_attribute(span, "http.route")
-                                            == Some("/v1/health")
-                                        && string_attribute(span, "st3.client.class")
-                                            == Some("fractal")
+    for sampled in [true, false] {
+        let flags = if sampled { "01" } else { "00" };
+        daemon.health(Some(&format!("00-{TRACE_ID}-{PARENT_ID}-{flags}")));
+        daemon.await_export(&root.path().join("capture/traces.ndjson"), |request| {
+            request["resourceSpans"].as_array().is_some_and(|batches| {
+                batches.iter().any(|batch| {
+                    string_attribute(&batch["resource"], "service.name") == Some("st-daemon")
+                        && batch["scopeSpans"].as_array().is_some_and(|scopes| {
+                            scopes.iter().any(|scope| {
+                                scope["spans"].as_array().is_some_and(|spans| {
+                                    spans.iter().any(|span| {
+                                        span["traceId"].as_str() == Some(TRACE_ID)
+                                            && span["parentSpanId"].as_str() == Some(PARENT_ID)
+                                            && span["name"].as_str() == Some("GET /v1/health")
+                                            && string_attribute(span, "http.route")
+                                                == Some("/v1/health")
+                                            && string_attribute(span, "st3.client.class")
+                                                == Some("fractal")
+                                            && span["attributes"].as_array().is_some_and(
+                                                |attributes| {
+                                                    attributes.iter().any(|attribute| {
+                                                        attribute["key"] == "st.parent.sampled"
+                                                            && attribute["value"]["boolValue"]
+                                                                == sampled
+                                                    })
+                                                },
+                                            )
+                                    })
                                 })
                             })
                         })
-                    })
+                })
             })
-        })
-    });
+        });
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -523,7 +535,7 @@ fn daemon_request_metric_recorded_without_trace_sampling() {
             .as_array()
             .is_some_and(|batches| {
                 batches.iter().any(|batch| {
-                    string_attribute(&batch["resource"], "service.name") == Some("st3-daemon")
+                    string_attribute(&batch["resource"], "service.name") == Some("st-daemon")
                         && batch["scopeMetrics"].as_array().is_some_and(|scopes| {
                             scopes.iter().any(|scope| {
                                 scope["metrics"].as_array().is_some_and(|metrics| {

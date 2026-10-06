@@ -43,6 +43,7 @@ and link to the [st3 design questions](spec.md#design-questions).
   exported and no in-process sampler or span buffer beyond the SDK batch queue, by Nathan on
   [#1607](https://github.com/compoundingtech/smalltalk/pull/1607) (2026-10-06).
   Johannes approved the O11Y-R16 amendment in q2.
+  Server roots expose a remote parent's sampled flag as `st.parent.sampled` for that policy.
 - **ST3-O11Y-DQ05 Profiler ownership:** Open: does `ST3_PROFILE_DIR` remain a separate
   artifact, or export the same spans? Resolve by comparing profiler coverage, overhead,
   and span vocabulary with the SDK path. The curator's working assumption is that the
