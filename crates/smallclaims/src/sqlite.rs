@@ -5,8 +5,8 @@ use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OpenFlags, Transaction};
@@ -56,6 +56,151 @@ pub fn max_idle_read_connections() -> usize {
 /// for every subject.
 pub const STATEMENT_CACHE_CAPACITY: usize = 128;
 
+/// Owns one synchronous committed-write callback. Dropping it unregisters the callback and
+/// waits for an invocation already running on another thread to finish. Dropping it from its
+/// own callback disables future invocations without waiting for itself. It holds only weak
+/// references, so keeping it after the store closes neither keeps the writer alive nor retains
+/// the callback's captures.
+#[must_use = "dropping the handle unregisters the committed-write observer"]
+pub struct CommitObserver {
+    observers: Weak<CommitObservers>,
+    callback: Weak<CommitObserverCallback>,
+}
+
+struct CommitObserverCallback {
+    state: Mutex<CommitObserverState>,
+    completed: Condvar,
+}
+
+struct CommitObserverState {
+    run: Option<Arc<dyn Fn(&Connection) + Send + Sync>>,
+    running: Option<std::thread::ThreadId>,
+}
+
+/// Always release waiters, including when a callback panics. The writer serializes invocations,
+/// but an observer can be dropped concurrently or by the callback's final upgraded weak owner.
+struct CommitObserverInvocation<'a> {
+    callback: &'a CommitObserverCallback,
+}
+
+impl Drop for CommitObserverInvocation<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .callback
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.running = None;
+        if state.run.is_none() {
+            self.callback.completed.notify_all();
+        }
+    }
+}
+
+#[derive(Default)]
+struct CommitObservers {
+    active: AtomicBool,
+    /// Commits clone this Arc, not the vector. Registration/removal copy the vector only while
+    /// a commit is using its previous snapshot, and never hold this lock while invoking callbacks.
+    callbacks: Mutex<Arc<Vec<Arc<CommitObserverCallback>>>>,
+}
+
+impl CommitObservers {
+    fn register(
+        self: &Arc<Self>,
+        callback: impl Fn(&Connection) + Send + Sync + 'static,
+    ) -> CommitObserver {
+        let callback = Arc::new(CommitObserverCallback {
+            state: Mutex::new(CommitObserverState {
+                run: Some(Arc::new(callback)),
+                running: None,
+            }),
+            completed: Condvar::new(),
+        });
+        let mut callbacks = self
+            .callbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Arc::make_mut(&mut callbacks).push(callback.clone());
+        self.active.store(true, Ordering::Release);
+        CommitObserver {
+            observers: Arc::downgrade(self),
+            callback: Arc::downgrade(&callback),
+        }
+    }
+
+    fn notify(&self, connection: &Connection) {
+        // The common case takes no lock and allocates nothing.
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        let callbacks = self
+            .callbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let current = std::thread::current().id();
+        for callback in callbacks.iter() {
+            let run = {
+                let mut state = callback
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let Some(run) = state.run.clone() else {
+                    continue;
+                };
+                debug_assert!(state.running.is_none(), "the writer serializes observers");
+                state.running = Some(current);
+                run
+            };
+            let _invocation = CommitObserverInvocation { callback };
+            run(connection);
+        }
+    }
+}
+
+impl Drop for CommitObserver {
+    fn drop(&mut self) {
+        let Some(callback) = self.callback.upgrade() else {
+            return;
+        };
+        // Deactivate before removing it from future snapshots; an in-flight snapshot must not
+        // start it after drop returns. Wait for another thread, but not for ourselves: dropping
+        // the callback's last upgraded weak owner can implicitly drop this handle.
+        let removed = {
+            let mut state = callback
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let removed = state.run.take();
+            if state
+                .running
+                .is_some_and(|running| running != std::thread::current().id())
+            {
+                while state.running.is_some() {
+                    state = callback
+                        .completed
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+            removed
+        };
+        // Release captures outside the state and registry locks.
+        drop(removed);
+        if let Some(observers) = self.observers.upgrade() {
+            let mut callbacks = observers
+                .callbacks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Arc::make_mut(&mut callbacks).retain(|entry| !Arc::ptr_eq(entry, &callback));
+            observers
+                .active
+                .store(!callbacks.is_empty(), Ordering::Release);
+        }
+    }
+}
+
 /// The store's only write connection, owned by one writer thread. Writes queue in front of it in
 /// arrival order: a batched write runs on the writer thread with the others queued behind it, each
 /// in a savepoint of one transaction that commits once for all of them, and its caller hears back
@@ -65,6 +210,7 @@ pub struct WriterConnection {
     pub jobs: Mutex<Option<std::sync::mpsc::Sender<WriterJob>>>,
     pub thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub committed_index: Arc<AtomicU64>,
+    observers: Arc<CommitObservers>,
     /// Transactions the writer committed for batched writes, and the batched writes in them.
     /// Tests read them; `st replication status` counts every commit.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -99,6 +245,7 @@ pub struct WriterGuard<'a> {
     pub connection: Option<Connection>,
     pub give_back: std::sync::mpsc::SyncSender<Connection>,
     pub committed_index: &'a AtomicU64,
+    observers: &'a CommitObservers,
     /// When profiling, when this thread took the writer.
     pub acquired: Option<std::time::Instant>,
     /// The connection's changed-row count when it was lent, so the rows this thread changed are
@@ -112,16 +259,40 @@ impl WriterConnection {
         let index = committed_index.clone();
         let batches = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
         let counted = batches.clone();
+        let observers = Arc::new(CommitObservers::default());
+        let observed = observers.clone();
         let thread = std::thread::Builder::new()
             .name("st3-writer".into())
-            .spawn(move || write_queue(connection, queue, &index, &counted))
+            .spawn(move || write_queue(connection, queue, &index, &counted, &observed))
             .expect("the writer thread starts");
         Self {
             jobs: Mutex::new(Some(jobs)),
             thread: Mutex::new(Some(thread)),
             committed_index,
+            observers,
             batches,
         }
+    }
+
+    /// Observe every successfully committed batch and every returned lent writer, synchronously
+    /// after its committed index is updated and before its write can acknowledge success.
+    /// A callback may read authority from this same connection, but must not write or acquire the
+    /// writer. Dropping its own observer handle is safe and disables future invocations.
+    /// Batched callbacks run on the writer thread; lent callbacks run on the returning thread.
+    /// Lent callers must finish their transactions and drop the guard before acknowledging a
+    /// write, since observers run on guard return rather than on each explicit SQL commit.
+    /// Callbacks must fail closed on read errors themselves and must not panic: a panic is not
+    /// swallowed, prevents success acknowledgement, and stops the writer.
+    ///
+    /// Registration does not acquire the writer or invoke the callback. A commit already taking
+    /// its callback snapshot may miss a concurrent registration, so register first, then recheck
+    /// current authority outside any pinned read snapshot before exposing an authorization.
+    /// Capture weak references to the store or other owners to avoid ownership cycles.
+    pub fn observe_commits(
+        &self,
+        callback: impl Fn(&Connection) + Send + Sync + 'static,
+    ) -> CommitObserver {
+        self.observers.register(callback)
     }
 
     pub fn send(&self, job: WriterJob) {
@@ -151,6 +322,7 @@ impl WriterConnection {
             connection: Some(connection),
             give_back,
             committed_index: &self.committed_index,
+            observers: &self.observers,
             acquired: crate::profile::writer_acquired(wait),
         }
     }
@@ -246,18 +418,23 @@ impl Drop for WriterConnection {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
         {
-            let _ = thread.join();
+            // An observer may temporarily upgrade a weak store reference and release its last
+            // owner on the writer thread. Closing its queue is enough there; never join itself.
+            if thread.thread().id() != std::thread::current().id() {
+                let _ = thread.join();
+            }
         }
     }
 }
 
 /// The writer thread: run each batched write with the others queued behind it in one
 /// transaction, and lend the connection to each lending write in its turn.
-pub fn write_queue(
+fn write_queue(
     mut connection: Connection,
     queue: std::sync::mpsc::Receiver<WriterJob>,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
+    observers: &CommitObservers,
 ) {
     let mut next = None;
     loop {
@@ -281,7 +458,14 @@ pub fn write_queue(
                 }
             }
             batched => {
-                next = run_write_batch(&mut connection, batched, &queue, committed_index, batches);
+                next = run_write_batch(
+                    &mut connection,
+                    batched,
+                    &queue,
+                    committed_index,
+                    batches,
+                    observers,
+                );
             }
         }
     }
@@ -291,12 +475,13 @@ pub fn write_queue(
 /// savepoint, then commit once and answer every caller. The batch stops taking writes when it
 /// reaches `WRITE_BATCH_LIMIT`, has run for `WRITE_BATCH_WINDOW`, fails, or meets a lending write,
 /// which it returns to run next.
-pub fn run_write_batch(
+fn run_write_batch(
     connection: &mut Connection,
     first: WriterJob,
     queue: &std::sync::mpsc::Receiver<WriterJob>,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
+    observers: &CommitObservers,
 ) -> Option<WriterJob> {
     let started = std::time::Instant::now();
     let mut answers = Vec::new();
@@ -358,6 +543,9 @@ pub fn run_write_batch(
     if let Ok(index) = current_index(connection) {
         committed_index.store(index, Ordering::Release);
     }
+    if committed.is_ok() {
+        observers.notify(connection);
+    }
     let committed = committed.map_err(|error| error.to_string());
     for done in answers {
         let _ = done.send(committed.clone());
@@ -391,6 +579,7 @@ impl Drop for WriterGuard<'_> {
         if let Ok(index) = current_index(&connection) {
             self.committed_index.store(index, Ordering::Release);
         }
+        self.observers.notify(&connection);
         crate::touched::note_writes(
             connection
                 .total_changes()
@@ -871,5 +1060,267 @@ mod tests {
             (pool.usage().open, pool.usage().idle, pool.usage().peak),
             (retained, retained, burst)
         );
+    }
+}
+
+#[cfg(test)]
+mod commit_observer_tests {
+    use super::*;
+    use std::sync::mpsc::{self, TryRecvError};
+
+    fn writer() -> WriterConnection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE allowed(authority INTEGER PRIMARY KEY);
+                 INSERT INTO allowed VALUES (1), (2);
+                 CREATE TABLE claims(
+                     store_index INTEGER PRIMARY KEY AUTOINCREMENT,
+                     authority INTEGER NOT NULL REFERENCES allowed(authority)
+                         DEFERRABLE INITIALLY DEFERRED
+                 );",
+            )
+            .unwrap();
+        WriterConnection::new(connection, Arc::new(AtomicU64::new(0)))
+    }
+
+    fn queued_claim(writer: &WriterConnection) -> mpsc::Receiver<Result<(), String>> {
+        let (done, answer) = mpsc::sync_channel(1);
+        writer.send(WriterJob::Batched {
+            run: Box::new(|transaction| {
+                transaction
+                    .execute("INSERT INTO claims(authority) VALUES (1)", [])
+                    .unwrap();
+                true
+            }),
+            profile: None,
+            wait: None,
+            done,
+        });
+        answer
+    }
+
+    #[test]
+    fn batched_commit_observer_reads_committed_authority_before_acknowledgement() {
+        let writer = writer();
+        let index = writer.committed_index.clone();
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let released = Mutex::new(released);
+        let _observer = writer.observe_commits(move |connection| {
+            let authority: i64 = connection
+                .query_row("SELECT authority FROM claims", [], |row| row.get(0))
+                .unwrap();
+            entered
+                .send((
+                    connection.is_autocommit(),
+                    index.load(Ordering::Acquire),
+                    authority,
+                ))
+                .unwrap();
+            // Disconnecting this gate also releases the callback if the test unwinds.
+            let _ = released
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv();
+        });
+        // Drop the gate before the observer if this test unwinds while a callback is waiting.
+        let unblock = release;
+        let answer = queued_claim(&writer);
+        let committed = observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let premature = answer.try_recv();
+        unblock.send(()).unwrap();
+        assert_eq!(committed, (true, 1, 1));
+        assert!(matches!(premature, Err(TryRecvError::Empty)));
+        answer.recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn lent_writes_notify_before_guard_drop_returns_and_stop_after_observer_drop() {
+        let writer = writer();
+        let (recorded, observations) = mpsc::channel();
+        let index = writer.committed_index.clone();
+        let observer = writer.observe_commits(move |connection| {
+            let authority: i64 = connection
+                .query_row("SELECT authority FROM claims", [], |row| row.get(0))
+                .unwrap();
+            recorded
+                .send((
+                    connection.is_autocommit(),
+                    index.load(Ordering::Acquire),
+                    authority,
+                ))
+                .unwrap();
+        });
+        {
+            let mut connection = writer.write();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute("INSERT INTO claims(authority) VALUES (1)", [])
+                .unwrap();
+            transaction.commit().unwrap();
+            assert!(matches!(observations.try_recv(), Err(TryRecvError::Empty)));
+        }
+        assert_eq!(observations.recv().unwrap(), (true, 1, 1));
+        drop(observer);
+        writer
+            .batched(|transaction| transaction.execute("UPDATE claims SET authority=2", []))
+            .unwrap()
+            .unwrap();
+        assert!(observations.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_failed_commit_does_not_notify_observers() {
+        let writer = writer();
+        let calls = Arc::new(AtomicU64::new(0));
+        let called = calls.clone();
+        let _observer = writer.observe_commits(move |_| {
+            called.fetch_add(1, Ordering::Relaxed);
+        });
+        // The insert succeeds, but its deferred foreign key rejects the outer commit.
+        assert!(
+            writer
+                .batched(|transaction| {
+                    transaction.execute("INSERT INTO claims(authority) VALUES (99)", [])
+                })
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        writer
+            .batched(|transaction| {
+                transaction.execute("INSERT INTO claims(authority) VALUES (1)", [])
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(writer.committed_index.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn dropping_an_observer_deactivates_an_in_flight_commit_snapshot() {
+        let writer = writer();
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let released = Mutex::new(released);
+        let _first = writer.observe_commits(move |_| {
+            entered.send(()).unwrap();
+            let _ = released
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv();
+        });
+        let calls = Arc::new(AtomicU64::new(0));
+        let called = calls.clone();
+        let second = writer.observe_commits(move |_| {
+            called.fetch_add(1, Ordering::Relaxed);
+        });
+        let unblock = release;
+        let answer = queued_claim(&writer);
+        observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(second);
+        unblock.send(()).unwrap();
+        answer.recv().unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn observer_handles_can_outlive_writer_shutdown_without_retaining_callbacks() {
+        let writer = writer();
+        let calls = Arc::new(AtomicU64::new(0));
+        let retained = Arc::downgrade(&calls);
+        let observer = writer.observe_commits(move |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(retained.upgrade().is_some());
+        drop(writer);
+        assert!(retained.upgrade().is_none());
+        drop(observer);
+    }
+
+    #[test]
+    fn the_last_writer_owner_can_be_released_from_a_commit_observer() {
+        let writer = Arc::new(writer());
+        let owner = Arc::downgrade(&writer);
+        let retained = owner.clone();
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let released = Mutex::new(released);
+        let observer = writer.observe_commits(move |_| {
+            let owner = owner.upgrade().unwrap();
+            entered.send(()).unwrap();
+            let _ = released
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv();
+            drop(owner);
+        });
+        let unblock = release;
+        let answer = queued_claim(&writer);
+        observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(writer);
+        unblock.send(()).unwrap();
+        answer
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(retained.upgrade().is_none());
+        drop(observer);
+    }
+
+    #[test]
+    fn a_callback_can_release_the_last_owner_of_its_observer_handle() {
+        let writer = writer();
+        let lease = Arc::new(Mutex::new(None::<CommitObserver>));
+        let owner = Arc::downgrade(&lease);
+        let retained = owner.clone();
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let released = Mutex::new(released);
+        let observer = writer.observe_commits(move |_| {
+            let lease = owner.upgrade().unwrap();
+            entered.send(()).unwrap();
+            let _ = released
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv();
+            drop(lease);
+        });
+        *lease.lock().unwrap_or_else(PoisonError::into_inner) = Some(observer);
+        let unblock = release;
+        let answer = queued_claim(&writer);
+        observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(lease);
+        unblock.send(()).unwrap();
+        answer
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(retained.upgrade().is_none());
+        writer
+            .batched(|transaction| transaction.execute("UPDATE claims SET authority=2", []))
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn an_observer_panic_never_acknowledges_a_committed_batch() {
+        let writer = writer();
+        let _observer = writer.observe_commits(|_| panic!("commit observer failed"));
+        let result = writer.batched(|transaction| {
+            transaction.execute("INSERT INTO claims(authority) VALUES (1)", [])
+        });
+        assert!(result.is_err());
+        // The commit happened before the observer panicked; it must not be reported as success.
+        assert_eq!(writer.committed_index.load(Ordering::Acquire), 1);
     }
 }
