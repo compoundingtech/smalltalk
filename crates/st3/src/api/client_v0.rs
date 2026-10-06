@@ -7767,6 +7767,16 @@ fn validate_launch_fence(state: &AppState, target: &str, fence: &Fence) -> Resul
     Ok(())
 }
 
+/// Raw and key input to a terminal: the keys a person types, which no screen they did not see can
+/// make unsafe to send, unlike a whole line with its Enter.
+fn terminal_keys_unfenced(request: &ActionRequest) -> bool {
+    request.action_type == "terminal.input"
+        && matches!(
+            request.parameters.get("mode").and_then(Value::as_str),
+            Some("raw" | "key")
+        )
+}
+
 fn validate_fence(state: &AppState, fence: &Fence) -> Result<(), ApiError> {
     let parsed = fence
         .snapshot_id
@@ -9201,14 +9211,36 @@ pub(super) async fn action(
             remote_terminal_live_session(&state, &terminal_subject(&terminal_id), incarnation)?;
         if live.owner_host_id != client_host_id(&state.node) {
             validate_fence(&state, &request.fence)?;
-            let expected_sequence = request
-                .fence
-                .terminal_sequence
-                .ok_or_else(|| validation("terminal control requires a sequence fence"))?;
             let relay = state
                 .client_relay
                 .as_ref()
                 .ok_or_else(|| remote_unavailable_for_owner(&state, &live.owner_host_id))?;
+            // Typing keys needs no screen fence (see the local case below). The owner still wants
+            // a sequence, so one is read from it now: there is no stale window to lose.
+            let expected_sequence = if terminal_keys_unfenced(&request) {
+                let screen = relay
+                    .read(
+                        &live.owner_host_id,
+                        &crate::peer::ClientReadRequest {
+                            authority_actor: session.authority_actor.clone(),
+                            relay: None,
+                            request: crate::peer::ClientReadOperation::TerminalScreen {
+                                terminal_id: client_detail_id("terminal", &terminal_id),
+                                facts: false,
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(|error| remote_read_error(&live.owner_host_id, error))?;
+                screen["next_sequence"]
+                    .as_u64()
+                    .ok_or_else(|| validation("the terminal gave no sequence"))?
+            } else {
+                request
+                    .fence
+                    .terminal_sequence
+                    .ok_or_else(|| validation("terminal control requires a sequence fence"))?
+            };
             let mut value = relay
                 .read(
                     &live.owner_host_id,
@@ -9242,10 +9274,22 @@ pub(super) async fn action(
             .runtime_incarnation
             .as_deref()
             .ok_or_else(|| validation("terminal control requires an incarnation fence"))?;
-        let expected = request
-            .fence
-            .terminal_sequence
-            .ok_or_else(|| validation("terminal control requires a sequence fence"))?;
+        // Typing keys into a terminal whose screen moves on its own (an agent's spinner, a log)
+        // can never match the sequence a client read a moment before: the screen changes between
+        // the read and the key. The incarnation fence is what keeps keys from reaching a
+        // restarted program, so raw and key input need no sequence; a line sent with Enter and a
+        // resize still do (Nathan, 2026-10-06: the phone could not type into an attached terminal).
+        let unfenced = terminal_keys_unfenced(&request);
+        let expected = if unfenced {
+            request.fence.terminal_sequence
+        } else {
+            Some(
+                request
+                    .fence
+                    .terminal_sequence
+                    .ok_or_else(|| validation("terminal control requires a sequence fence"))?,
+            )
+        };
         let screen = terminal_screen_value(
             &state,
             &terminal_id,
@@ -9254,7 +9298,7 @@ pub(super) async fn action(
             Duration::ZERO,
         )
         .await?;
-        if screen["next_sequence"].as_u64() != Some(expected) {
+        if !unfenced && screen["next_sequence"].as_u64() != expected {
             return Err(stale("the terminal sequence fence is stale"));
         }
     }
@@ -15482,6 +15526,26 @@ mission "example/zero-run" state="ready" {
             .await
             .unwrap_err();
             assert_eq!(error.code, "stale-fence");
+        }
+        // Typed keys need no screen fence: the screen has moved on since `fence` read it, yet raw
+        // keys land, with the sequence or without it. A line with its Enter still needs it.
+        for (key, fence) in [
+            ("fence-raw", fence.clone()),
+            ("fence-raw-no-sequence", Fence { terminal_sequence: None, ..fence.clone() }),
+        ] {
+            let _ = action(
+                State(state.clone()),
+                Extension(snapshot.clone()),
+                Extension(session.clone()),
+                Json(request(
+                    "terminal.input",
+                    key,
+                    fence,
+                    json!({"terminal_id":"terminal/agent/fence-test","mode":"raw","value":"aw=="}),
+                )),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("raw input must not need a screen fence: {error:?}"));
         }
         let mut foreign = fence.clone();
         foreign.snapshot_id = foreign.snapshot_id.replacen(&state.node, "another-host", 1);
