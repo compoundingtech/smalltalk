@@ -15,6 +15,7 @@ use crate::harness_timeline::{Operation, Record};
 
 pub const WAKE_PIPE: &str = ".st-harness-events-wake";
 pub const DATABASE: &str = "st-harness-events.sqlite";
+pub const STATE_WAKE_PIPE: &str = ".st-harness-state-wake";
 const MAX_PENDING_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,11 +56,20 @@ fn open(agent_dir: &Path) -> Result<Connection> {
 /// Bind a fresh pipe inode before exposing its name. A predecessor retains its old descriptor
 /// and cannot steal its successor's wakeups. Pipe bytes are hints; startup always replays SQLite.
 pub fn bind_wake_pipe(agent_dir: &Path) -> Result<std::fs::File> {
+    bind_named_wake_pipe(agent_dir, WAKE_PIPE)
+}
+
+/// Current categorical state has its own wake reader, independent of the history drain.
+pub fn bind_state_wake_pipe(agent_dir: &Path) -> Result<std::fs::File> {
+    bind_named_wake_pipe(agent_dir, STATE_WAKE_PIPE)
+}
+
+fn bind_named_wake_pipe(agent_dir: &Path, pipe: &str) -> Result<std::fs::File> {
     use std::os::unix::{
         ffi::OsStrExt as _,
         fs::{FileTypeExt as _, OpenOptionsExt as _},
     };
-    let path = agent_dir.join(WAKE_PIPE);
+    let path = agent_dir.join(pipe);
     if let Ok(metadata) = path.symlink_metadata() {
         anyhow::ensure!(
             metadata.file_type().is_fifo(),
@@ -91,13 +101,17 @@ pub fn bind_wake_pipe(agent_dir: &Path) -> Result<std::fs::File> {
 }
 
 fn signal_wake(agent_dir: &Path) {
+    signal_named_wake(agent_dir, WAKE_PIPE);
+}
+
+fn signal_named_wake(agent_dir: &Path, pipe: &str) {
     use std::io::Write as _;
     use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
     let signal = (|| -> io::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(agent_dir.join(WAKE_PIPE))?;
+            .open(agent_dir.join(pipe))?;
         if !file.metadata()?.file_type().is_fifo() {
             return Err(io::Error::other("event wake path is not a pipe"));
         }
@@ -294,6 +308,9 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
     append_event(&tx, kind, &value)?;
     tx.commit()?;
     signal_wake(agent_dir);
+    if kind == "harness-state" {
+        signal_named_wake(agent_dir, STATE_WAKE_PIPE);
+    }
     Ok(())
 }
 
@@ -360,6 +377,7 @@ pub fn expire_state(agent_dir: &Path, expected: &Value) -> Result<()> {
     }
     tx.commit()?;
     signal_wake(agent_dir);
+    signal_named_wake(agent_dir, STATE_WAKE_PIPE);
     Ok(())
 }
 
