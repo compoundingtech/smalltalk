@@ -125,6 +125,7 @@ fn watched_ref_queue_collapses_after_restart_without_repinning_the_active_run() 
                 &serde_json::json!({"head":head.repeat(40)}),
                 now_ms() + 30_000,
                 &subscriptions,
+                None,
             )
             .unwrap()
     };
@@ -233,6 +234,7 @@ fn watched_ref_start_rechecks_the_head_inside_the_run_transaction_and_replays_st
                 &serde_json::json!({"head":head.repeat(40)}),
                 now_ms() + 30_000,
                 &[],
+                None,
             )
             .unwrap();
         store
@@ -426,4 +428,157 @@ async fn watched_ref_does_not_shorten_a_rate_limit_retry_deadline() {
         tokio::task::yield_now().await;
     }
     assert_eq!(provider.0.lock().unwrap().len(), 1);
+}
+
+struct CompletionProvider {
+    requests: tokio::sync::mpsc::UnboundedSender<(
+        ObservationRequest,
+        tokio::sync::oneshot::Sender<Result<crate::resource::ProviderObservation>>,
+    )>,
+}
+
+impl ResourceProvider for CompletionProvider {
+    fn observe(
+        &self,
+        request: ObservationRequest,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<crate::resource::ProviderObservation>> + Send + '_>> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.requests.send((request, send)).unwrap();
+        Box::pin(async move { receive.await? })
+    }
+}
+
+struct CompletionWriterBarrier {
+    checks: std::sync::atomic::AtomicUsize,
+    armed: Arc<Mutex<std::collections::HashSet<String>>>,
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    finished: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl FaultInjection for CompletionWriterBarrier {
+    fn fault(&self, scope: &str, subject: &str) -> Option<String> {
+        if subject != "observer/ref" {
+            return None;
+        }
+        if scope == "observer-completion-write"
+            && self.checks.fetch_add(1, Ordering::SeqCst) == 1
+        {
+            // The first check precedes Store I/O; the second is inside the writer
+            // transaction. Hold its ACK, not the scheduler mutex, until rearming ends.
+            assert!(self.armed.try_lock().is_ok(), "writer transaction retained the observer scheduling mutex");
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+        } else if scope == "observer-completion-finished" {
+            self.finished.send(()).unwrap();
+        }
+        None
+    }
+}
+
+async fn completion_during_writer_ack_does_not_block_rearming_or_publish_stale(failed: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&root.path().join("completion.sqlite3"), "node").unwrap());
+    apply_source(
+        &store,
+        "version 2\nresource \"ref\" { kind \"vcs.ref\" }\nobserver \"ref\" { resource \"resource/ref\"; provider \"github.ref\"; locator \"acme/garden@main\"; field \"head\" }",
+        "observer",
+    );
+    let default_desired = store.desired_subjects().unwrap();
+    apply_source(
+        &store,
+        "version 2\nsubscription \"watch\" { observer \"observer/ref\"; on \"head\"; to \"agent/example\"; delivery \"message\" }",
+        "watch",
+    );
+    let watched_desired = store.desired_subjects().unwrap();
+    apply_source(&store, "version 2\nsubscription \"watch\" { stop }", "unwatch");
+    // Cadence snapshots have the same durable observer revision. This isolates
+    // cancel/rearm's UUID fence from the independent selected-revision fence.
+    let (requests, mut pending) = tokio::sync::mpsc::unbounded_channel();
+    let (entered, mut writer_entered) = tokio::sync::mpsc::unbounded_channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (finished, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    let reconciler = Reconciler::new(
+        store.clone(),
+        Arc::new(FakeRuntime::default()),
+        "node".into(),
+        Arc::new(Notify::new()),
+    )
+    .with_resource_provider(Arc::new(CompletionProvider { requests }));
+    let armed = reconciler.armed_observers.clone();
+    let reconciler = Arc::new(reconciler.with_fault_injection(Arc::new(CompletionWriterBarrier {
+        checks: std::sync::atomic::AtomicUsize::new(0),
+        armed,
+        entered,
+        release: Mutex::new(released),
+        finished,
+    })));
+    reconciler.reconcile_resource_observers(&default_desired, &[]).unwrap();
+    let (initial, complete) = tokio::time::timeout(Duration::from_secs(5), pending.recv()).await.unwrap().unwrap();
+    assert_eq!(initial.every_ms, None);
+    let observation = |head: &str| crate::resource::ProviderObservation {
+        facts: serde_json::json!({"head":head}),
+        cursor: Some(head.into()),
+        next_check_unix_ms: now_ms() + 300_000,
+    };
+    complete.send(if failed {
+        Err(anyhow::anyhow!("retired provider request failed"))
+    } else {
+        Ok(observation("stale"))
+    }).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), writer_entered.recv()).await.unwrap().unwrap();
+
+    // A full pass may itself need the same writer for other stages. Exercise
+    // the actual observer scheduling stage while this completion owns the writer.
+    let schedule = reconciler.clone();
+    let rearm = tokio::task::spawn_blocking(move || {
+        schedule.reconcile_resource_observers(&watched_desired, &[]).unwrap();
+        schedule.reconcile_resource_observers(&default_desired, &[]).unwrap();
+    });
+    let scheduled = tokio::time::timeout(Duration::from_secs(1), rearm).await;
+    // Always release the writer before reporting a bounded-progress failure.
+    release.send(()).unwrap();
+    scheduled.expect("observer scheduling waited for completion's writer ACK").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), completions.recv()).await.unwrap().unwrap();
+
+    assert!(store.latest_actual_value("resource/ref").unwrap().is_none());
+    assert!(store.latest_actual_value("observer/ref").unwrap().is_none());
+    assert!(store.claims_for("resource/ref", Some("resource.observed")).unwrap().is_empty());
+    assert!(store.claims_for("observer/ref", Some("observer.state")).unwrap().is_empty());
+    assert!(reconciler.observer_deadlines.lock().unwrap().is_empty());
+    assert!(reconciler.observer_cursors.lock().unwrap().is_empty());
+    let (newest, complete) = tokio::time::timeout(Duration::from_secs(5), pending.recv()).await.unwrap().unwrap();
+    // The watched arm was retired before its task could enter the provider;
+    // if it did enter, drain it and select the rearmed default-cadence request.
+    let (newest, complete) = if newest.every_ms.is_some() {
+        drop(complete);
+        tokio::time::timeout(Duration::from_secs(5), pending.recv()).await.unwrap().unwrap()
+    } else {
+        (newest, complete)
+    };
+    assert_eq!(newest.every_ms, None);
+    assert_eq!(newest.cursor, None);
+    complete.send(Ok(observation("fresh"))).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), completions.recv()).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if store.latest_actual_value("resource/ref").unwrap()
+                .is_some_and(|actual| actual["facts"]["head"] == "fresh") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }).await.expect("the current default-cadence completion did not publish");
+    assert_eq!(store.latest_actual_value("resource/ref").unwrap().unwrap()["facts"]["head"], "fresh");
+    assert_eq!(store.latest_actual_value("observer/ref").unwrap().unwrap()["state"], "healthy");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observer_success_waiting_for_writer_ack_allows_rearm_and_rejects_stale_completion() {
+    completion_during_writer_ack_does_not_block_rearming_or_publish_stale(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observer_failure_waiting_for_writer_ack_allows_rearm_and_rejects_stale_state() {
+    completion_during_writer_ack_does_not_block_rearming_or_publish_stale(true).await;
 }

@@ -9175,6 +9175,19 @@ impl Store {
         self.append_claim_outcome(input).map(|(claim, _)| claim)
     }
 
+    /// Append a scheduler failure receipt only while its operation and desired revision remain current.
+    pub(crate) fn append_observer_state(
+        &self,
+        input: &ClaimInput,
+        desired_revision: &str,
+        current: &(dyn Fn() -> bool + Sync),
+    ) -> Result<ClaimRecord, St3Error> {
+        append_claim_with_subject_fences(
+            &self.graph, input, None, None, None,
+            Some((&input.subject, desired_revision, current)),
+        ).map(|(claim, _)| claim)
+    }
+
     pub(crate) fn append_claim_outcome(
         &self,
         input: &ClaimInput,
@@ -12494,6 +12507,9 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Record facts and deliveries atomically. Scheduler completions provide a predicate checked
+    /// inside the writer transaction before work and before releasing its savepoint; direct
+    /// consumers pass `None`. The predicate must release its scheduler lock before returning.
     #[allow(clippy::too_many_arguments)]
     pub fn record_resource_observation(
         &self,
@@ -12505,6 +12521,7 @@ impl Store {
         facts: &Value,
         next_check_unix_ms: u128,
         subscriptions: &[(String, SubscriptionSpec)],
+        current: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> Result<ResourceObservationOutcome, St3Error> {
         let facts = canonical_json_value(facts);
         let operation_hash = canonical_hash(&(
@@ -12519,6 +12536,8 @@ impl Store {
         let idempotency_key = format!("resource-observation:{operation_hash}");
         self.connection
             .batched(|transaction| -> Result<ResourceObservationOutcome, St3Error> {
+                check_observer_completion(transaction, observer, desired_revision, current)?;
+                let outcome = (|| {
                 if let Some(response) = transaction
                     .query_row(
                         "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -12529,17 +12548,6 @@ impl Store {
                     .map_err(internal)?
                 {
                     return serde_json::from_str(&response).map_err(internal);
-                }
-                let current_observer = current_desired_row_tx(transaction, observer).map_err(internal)?;
-                if current_observer
-                    .as_ref()
-                    .map(|desired| desired.revision.as_str())
-                    != Some(desired_revision)
-                {
-                    return Err(St3Error::new(
-                        "stale-observer-revision",
-                        format!("observer `{observer}` changed before its observation completed"),
-                    ));
                 }
                 let mut active_subscriptions = Vec::new();
                 for (subject, expected) in subscriptions {
@@ -13473,6 +13481,9 @@ impl Store {
                         ],
                     )
                     .map_err(internal)?;
+                Ok(outcome)
+                })()?;
+                check_observer_completion(transaction, observer, desired_revision, current)?;
                 Ok(outcome)
             })
             .map_err(|error| St3Error::new("internal", error))?
@@ -33038,6 +33049,88 @@ resource "refresh/file" {
     }
 
     #[test]
+    fn observer_completion_fences_roll_back_facts_state_and_idempotency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for failure in [false, true] {
+            for (accepted_checks, stale_revision) in [(0, false), (1, false), (2, true)] {
+                let store = Store::open_memory("node").unwrap();
+                let intent = crate::graph::parse_execution_intent(r#"version 2
+resource "fenced/file" { kind "filesystem.file" }
+observer "fenced/file" {
+  resource "resource/fenced/file"
+  provider "local.file"
+  locator "/tmp/st3-fenced-file"
+  field "status"
+}
+"#, "node", "fenced-run").unwrap();
+                store.apply_internal(&intent, "fenced-observer").unwrap();
+                let observer = intent.subjects.values().find(|subject| subject.kind == "observer")
+                    .unwrap().subject.as_str();
+                let resource = intent.subjects.values().find(|subject| subject.kind == "resource")
+                    .unwrap().subject.as_str();
+                let revision = store.selected_desired_revision(observer).unwrap().unwrap();
+                let selected = if stale_revision { "stale-revision" } else { &revision };
+                let input = ClaimInput {
+                    subject: observer.into(), kind: "observer.state".into(), actor: None,
+                    fields: BTreeMap::from([
+                        ("state".into(), json!("unreachable")),
+                        ("revision".into(), json!(revision)),
+                        ("attempt".into(), json!("fenced-attempt")),
+                        ("reason".into(), json!("provider failed")),
+                    ]),
+                    evidence: Vec::new(), expected_subject: None,
+                    idempotency_key: Some("fenced-failure".into()),
+                };
+                let before = store.index().unwrap();
+                let counts = || {
+                    let connection = store.readers.get();
+                    ["claims", "batches", "operations", "idempotency"].map(|table| {
+                        connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get::<_, u64>(0)).unwrap()
+                    })
+                };
+                let before_counts = counts();
+                let checks = AtomicUsize::new(0);
+                let current = || checks.fetch_add(1, Ordering::SeqCst) < accepted_checks;
+                let result = if failure {
+                    store.append_observer_state(&input, selected, &current).map(|_| ())
+                } else {
+                    store.record_resource_observation(
+                        observer, selected, Some("fenced-attempt"), resource, Some("cursor"),
+                        &json!({"status": "ready"}), 10, &[], Some(&current),
+                    ).map(|_| ())
+                };
+                assert_eq!(result.unwrap_err().code, if stale_revision {
+                    "stale-observer-revision"
+                } else {
+                    "observer-operation-retired"
+                });
+                assert_eq!(checks.load(Ordering::SeqCst), if stale_revision { 1 } else { accepted_checks + 1 });
+                assert_eq!(store.index().unwrap(), before);
+                assert_eq!(counts(), before_counts);
+                assert!(store.latest_actual_value(resource).unwrap().is_none());
+                assert!(store.latest_actual_value(observer).unwrap().is_none());
+
+                // Rejection must not poison the request's idempotency or operation cache.
+                if failure {
+                    let receipt = store.append_observer_state(&input, &revision, &|| true).unwrap();
+                    assert_eq!(store.latest_actual_value(observer).unwrap().unwrap()["state"], "unreachable");
+                    let retry = store.append_observer_state(&input, &revision, &|| true).unwrap();
+                    assert_eq!(retry.id, receipt.id);
+                } else {
+                    let outcome = store.record_resource_observation(
+                        observer, &revision, Some("fenced-attempt"), resource, Some("cursor"),
+                        &json!({"status": "ready"}), 10, &[], Some(&|| true),
+                    ).unwrap();
+                    assert!(outcome.baseline);
+                    assert_eq!(store.latest_actual_value(resource).unwrap().unwrap()["facts"]["status"], "ready");
+                    assert_eq!(store.latest_actual_value(observer).unwrap().unwrap()["state"], "healthy");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn unchanged_scheduled_observations_do_not_append_claims() {
         let store = Store::open_memory("node").unwrap();
         let source = r#"version 2
@@ -33067,31 +33160,11 @@ observer "quiet/file" {
         store.apply_internal(&intent, "quiet-observer").unwrap();
         let revision = store.selected_desired_revision(&observer).unwrap().unwrap();
         let facts = json!({"status": "ready"});
-        store
-            .record_resource_observation(
-                &observer,
-                &revision,
-                None,
-                &resource,
-                None,
-                &facts,
-                1,
-                &[],
-            )
+        store.record_resource_observation(&observer, &revision, None, &resource, None, &facts, 1, &[], None)
             .unwrap();
         let before = store.index().unwrap();
 
-        let outcome = store
-            .record_resource_observation(
-                &observer,
-                &revision,
-                None,
-                &resource,
-                None,
-                &facts,
-                2,
-                &[],
-            )
+        let outcome = store.record_resource_observation(&observer, &revision, None, &resource, None, &facts, 2, &[], None)
             .unwrap();
 
         assert_eq!(store.index().unwrap(), before);
@@ -33129,30 +33202,10 @@ observer "manual/file" {
         store.apply_internal(&intent, "manual-observer").unwrap();
         let revision = store.selected_desired_revision(&observer).unwrap().unwrap();
         let facts = json!({"status": "ready"});
-        store
-            .record_resource_observation(
-                &observer,
-                &revision,
-                None,
-                &resource,
-                None,
-                &facts,
-                1,
-                &[],
-            )
+        store.record_resource_observation(&observer, &revision, None, &resource, None, &facts, 1, &[], None)
             .unwrap();
 
-        store
-            .record_resource_observation(
-                &observer,
-                &revision,
-                Some("attempt-one"),
-                &resource,
-                Some("cursor-one"),
-                &facts,
-                2,
-                &[],
-            )
+        store.record_resource_observation(&observer, &revision, Some("attempt-one"), &resource, Some("cursor-one"), &facts, 2, &[], None)
             .unwrap();
 
         let receipt = store
@@ -33213,17 +33266,7 @@ observer "ordered/file" {
             Some("attempt-one".into())
         );
 
-        store
-            .record_resource_observation(
-                &observer,
-                &revision,
-                Some("attempt-one"),
-                &resource,
-                None,
-                &json!({"status": "ready"}),
-                1,
-                &[],
-            )
+        store.record_resource_observation(&observer, &revision, Some("attempt-one"), &resource, None, &json!({"status": "ready"}), 1, &[], None)
             .unwrap();
         assert_eq!(
             store.pending_observer_refresh_attempt(&observer).unwrap(),
@@ -47376,26 +47419,17 @@ version 2
                     &json!({"head": "stale"}),
                     50,
                     &subscriptions,
+                    None,
                 )
                 .unwrap_err()
                 .code,
             "stale-observer-revision"
         );
-        let baseline = store
-            .record_resource_observation(
-                "observer/github/acme/demo/pull/1",
-                &observer_revision,
-                None,
-                "resource/github/acme/demo/pull/1",
-                Some("cursor-one"),
-                &json!({
-                    "head": "resource/github/acme/demo/ref/a",
-                    "state": "open",
-                    "checks": ["pending"]
-                }),
-                100,
-                &subscriptions,
-            )
+        let baseline = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-one"), &json!({
+            "head": "resource/github/acme/demo/ref/a",
+            "state": "open",
+            "checks": ["pending"]
+        }), 100, &subscriptions, None)
             .unwrap();
         assert!(baseline.baseline);
         assert!(baseline.message_subjects.is_empty());
@@ -47416,57 +47450,27 @@ version 2
                 .unwrap()["state"],
             "pending"
         );
-        let unchanged = store
-            .record_resource_observation(
-                "observer/github/acme/demo/pull/1",
-                &observer_revision,
-                None,
-                "resource/github/acme/demo/pull/1",
-                Some("cursor-one"),
-                &json!({
-                    "head": "resource/github/acme/demo/ref/a",
-                    "state": "open",
-                    "checks": ["pending"]
-                }),
-                200,
-                &subscriptions,
-            )
+        let unchanged = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-one"), &json!({
+            "head": "resource/github/acme/demo/ref/a",
+            "state": "open",
+            "checks": ["pending"]
+        }), 200, &subscriptions, None)
             .unwrap();
         assert!(unchanged.changed_fields.is_empty());
         assert!(unchanged.observation_claim.is_none());
-        let changed = store
-            .record_resource_observation(
-                "observer/github/acme/demo/pull/1",
-                &observer_revision,
-                None,
-                "resource/github/acme/demo/pull/1",
-                Some("cursor-two"),
-                &json!({
-                    "head": "resource/github/acme/demo/ref/a",
-                    "state": "closed",
-                    "checks": ["pending"]
-                }),
-                300,
-                &subscriptions,
-            )
+        let changed = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-two"), &json!({
+            "head": "resource/github/acme/demo/ref/a",
+            "state": "closed",
+            "checks": ["pending"]
+        }), 300, &subscriptions, None)
             .unwrap();
         assert_eq!(changed.changed_fields, ["state"]);
         assert_eq!(changed.message_subjects.len(), 2);
-        let retry = store
-            .record_resource_observation(
-                "observer/github/acme/demo/pull/1",
-                &observer_revision,
-                None,
-                "resource/github/acme/demo/pull/1",
-                Some("cursor-two"),
-                &json!({
-                    "head": "resource/github/acme/demo/ref/a",
-                    "state": "closed",
-                    "checks": ["pending"]
-                }),
-                300,
-                &subscriptions,
-            )
+        let retry = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-two"), &json!({
+            "head": "resource/github/acme/demo/ref/a",
+            "state": "closed",
+            "checks": ["pending"]
+        }), 300, &subscriptions, None)
             .unwrap();
         assert_eq!(retry.message_subjects, changed.message_subjects);
         assert_eq!(store.messages(None, true).unwrap().len(), 2);
@@ -47488,39 +47492,19 @@ version 2
                 "stop-one-subscription",
             )
             .unwrap();
-        let after_stop = store
-            .record_resource_observation(
-                "observer/github/acme/demo/pull/1",
-                &observer_revision,
-                None,
-                "resource/github/acme/demo/pull/1",
-                Some("cursor-after-stop"),
-                &json!({
-                    "head": "resource/github/acme/demo/ref/a",
-                    "state": "open",
-                    "checks": ["pending"]
-                }),
-                350,
-                &subscriptions,
-            )
+        let after_stop = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-after-stop"), &json!({
+            "head": "resource/github/acme/demo/ref/a",
+            "state": "open",
+            "checks": ["pending"]
+        }), 350, &subscriptions, None)
             .unwrap();
         assert_eq!(after_stop.message_subjects.len(), 1);
         assert_eq!(store.messages(None, true).unwrap().len(), 3);
-        let unselected = store
-            .record_resource_observation(
-                "observer/github/acme/demo/pull/1",
-                &observer_revision,
-                None,
-                "resource/github/acme/demo/pull/1",
-                Some("cursor-three"),
-                &json!({
-                    "head": "resource/github/acme/demo/ref/a",
-                    "state": "open",
-                    "checks": ["passing"]
-                }),
-                400,
-                &subscriptions,
-            )
+        let unselected = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-three"), &json!({
+            "head": "resource/github/acme/demo/ref/a",
+            "state": "open",
+            "checks": ["passing"]
+        }), 400, &subscriptions, None)
             .unwrap();
         assert_eq!(unselected.changed_fields, ["checks"]);
         assert!(unselected.message_subjects.is_empty());
@@ -47582,17 +47566,7 @@ subscription "green" {
             .unwrap()
             .unwrap();
         let observe = |cursor: &str, checks: Value| {
-            store
-                .record_resource_observation(
-                    "observer/pull",
-                    &observer_revision,
-                    None,
-                    "resource/pull",
-                    Some(cursor),
-                    &json!({"checks": checks}),
-                    100,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/pull", &observer_revision, None, "resource/pull", Some(cursor), &json!({"checks": checks}), 100, &subscriptions, None)
                 .unwrap()
         };
 
@@ -47891,9 +47865,7 @@ observer "issue" {
             }))).unwrap();
             let observe = |observer: &str, resource: &str, facts: Value| {
                 let revision = store.selected_desired_revision(observer).unwrap().unwrap();
-                store.record_resource_observation(
-                    observer, &revision, None, resource, None, &facts, 50, &[],
-                ).unwrap();
+                store.record_resource_observation(observer, &revision, None, resource, None, &facts, 50, &[], None).unwrap();
             };
             observe("observer/issue", subject, json!({"state": "closed"}));
             let actual = store.latest_actual_value(subject).unwrap().unwrap();
@@ -47984,17 +47956,7 @@ observer "pull" {
                 .selected_desired_revision("observer/pull")
                 .unwrap()
                 .unwrap();
-            store
-                .record_resource_observation(
-                    "observer/pull",
-                    &revision,
-                    None,
-                    subject,
-                    None,
-                    &json!({"state": "closed"}),
-                    50,
-                    &[],
-                )
+            store.record_resource_observation("observer/pull", &revision, None, subject, None, &json!({"state": "closed"}), 50, &[], None)
                 .unwrap();
             let actual = store.latest_actual_value(subject).unwrap().unwrap();
             assert_eq!(actual["facts"]["state"], "closed");
@@ -50088,6 +50050,28 @@ pub fn verify_replica_batch(batch: &ReplicaBatch) -> Result<(), St3Error> {
     Ok(())
 }
 
+fn check_observer_completion(
+    transaction: &Transaction<'_>,
+    observer: &str,
+    desired_revision: &str,
+    current: Option<&(dyn Fn() -> bool + Sync)>,
+) -> Result<(), St3Error> {
+    if current.is_some_and(|current| !current()) {
+        return Err(St3Error::new(
+            "observer-operation-retired",
+            format!("observer `{observer}` operation retired before its completion was recorded"),
+        ));
+    }
+    let selected = current_desired_row_tx(transaction, observer).map_err(internal)?;
+    if selected.as_ref().map(|desired| desired.revision.as_str()) != Some(desired_revision) {
+        return Err(St3Error::new(
+            "stale-observer-revision",
+            format!("observer `{observer}` changed before its observation completed"),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn append_claim_fenced_outcome(
     graph: &GraphStore,
     input: &ClaimInput,
@@ -50102,7 +50086,7 @@ fn append_claim_with_fences(
     fence: Option<&crate::mailbox::Fence>,
     event_runtime: Option<&str>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
-    append_claim_with_subject_fences(graph, input, fence, event_runtime, None)
+    append_claim_with_subject_fences(graph, input, fence, event_runtime, None, None)
 }
 
 fn append_claim_with_subject_fences(
@@ -50111,6 +50095,7 @@ fn append_claim_with_subject_fences(
     fence: Option<&crate::mailbox::Fence>,
     event_runtime: Option<&str>,
     expected_subjects: Option<&BTreeMap<String, String>>,
+    observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
     if local_retention(&input.kind)
@@ -50126,6 +50111,10 @@ fn append_claim_with_subject_fences(
     // batch commits.
     graph.connection
         .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
+            if let Some((subject, revision, current)) = observer_completion {
+                check_observer_completion(transaction, subject, revision, Some(current))?;
+            }
+            let outcome = (|| {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             let settled_receipt = if let Some(fence) = fence {
                 check_mailbox_fence(transaction, fence)?;
@@ -50368,6 +50357,11 @@ fn append_claim_with_subject_fences(
                 register_operation_tx(transaction, &record).map_err(internal)?;
             }
             Ok((record, true))
+            })()?;
+            if let Some((subject, revision, current)) = observer_completion {
+                check_observer_completion(transaction, subject, revision, Some(current))?;
+            }
+            Ok(outcome)
         })
         .map_err(|error| St3Error::new("internal", error))?
 }
