@@ -2,7 +2,7 @@ use super::*;
 use crate::rollout::{self, Operation};
 
 impl<R: RuntimeControl> Reconciler<R> {
-    /// Apply shares suspend/rollout's fenced safe-point proof, without draining new intake.
+    /// Keep intake open while waiting; fence it atomically when the safe point is accepted.
     pub(super) fn defer_declared_restart(
         &self,
         subject: &DesiredSubject,
@@ -12,13 +12,23 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Some(pending) = rollout::deferred_restart(&self.store, &subject.subject)? else {
             return Ok(false);
         };
-        let blockers = crate::suspension::blockers(
-            &self.store, &subject.subject,
-            observation.incarnation_id.as_deref().context("deferred restart needs an incarnation")?,
-        )?;
+        if self.store.restart_cutover(&subject.subject)? {
+            return Ok(false);
+        }
+        let frontier = self.store.restart_frontier()?;
+        let incarnation = observation.incarnation_id.as_deref()
+            .context("deferred restart needs an incarnation")?;
+        let blockers = rollout::restart_blockers(&self.store, &subject.subject, incarnation)?;
         let expired = now >= pending.deadline_unix_ms;
         if !expired && blockers.is_empty() {
-            return Ok(false);
+            let token = self.store.selected_desired_token(&subject.subject)?
+                .context("deferred restart needs a desired claim")?;
+            self.store.commit_restart_cutover(
+                &subject.subject, &token, incarnation, frontier, pending.deadline_unix_ms,
+            )?;
+            // A separate pass renders only after the durable barrier is visible.
+            self.arm_restart(&format!("deferred-restart:{}", subject.subject), now);
+            return Ok(true);
         }
         self.record_once(
             &subject.subject,

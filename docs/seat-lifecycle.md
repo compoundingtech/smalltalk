@@ -346,13 +346,19 @@ st agents show agent/example/worker
 ```
 
 The safe point reuses suspend/rollout's incarnation-fenced quiescence proof: the harness is
-idle with no open ask or unsent input, no claimed work or running subagent, and a known native
-session. Unknown harness state is not idle. The pending declaration and absolute deadline
-survive daemon restarts; the incumbent's rendered files stay unchanged while it waits.
-Plain publication keeps work and message intake open, so a perpetually busy seat can remain
-pending until its deadline. The default maximum wait is thirty minutes; a positive duration
-up to seven days is accepted. Expiry changes the visible rollout phase to `held` and leaves
-the original seat running. It never forces interruption or automatically retries that hold.
+idle with no open harness or `ask_person` request, unsent input, claimed work, running
+subagent or pending message delivery, and a known native session. An answered person request
+still blocks until its origin work resumes and finishes. Unknown harness state is not idle.
+The pending declaration and absolute deadline survive daemon restarts; the incumbent's
+rendered files stay unchanged while it waits, and harness servicing and ready-work wakes continue.
+Plain publication keeps work and message intake open while pending or held. At the safe
+point, a durable desired-token/incarnation-fenced cutover barrier closes new work claims and
+message delivery before rendering or stopping. A concurrent claim either precedes that proof
+and postpones cutover, or sees the barrier and is refused; replacement or republication clears
+the fence. A perpetually busy seat can remain pending until its deadline. The default maximum
+wait is thirty minutes; a positive duration up to seven days is accepted. Expiry before cutover
+changes the visible rollout phase to `held` and leaves the original seat running. It never
+forces interruption or automatically retries that hold.
 `st agents show` reports the phase, blockers and reason; JSON also reports the deadline.
 
 Reapplying the same declaration and policy does not extend the deadline. Change the maximum

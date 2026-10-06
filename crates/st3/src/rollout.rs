@@ -37,6 +37,23 @@ pub fn deferred_restart(store: &Store, subject: &str) -> Result<Option<DeferredR
         .map(serde_json::from_value).transpose().map_err(Into::into)
 }
 
+/// Native quiescence plus st-owned asks and deliveries. An ask_person parks its
+/// origin step, releasing the claimant, so suspension blockers alone are insufficient.
+pub(crate) fn restart_blockers(store: &Store, subject: &str, incarnation: &str) -> Result<Vec<String>> {
+    let mut blockers = crate::suspension::blockers(store, subject, incarnation)?;
+    if store.restart_person_work_pending(subject)? {
+        blockers.push("pending-person-work".into());
+    }
+    if store.messages(Some(subject), false)?.iter().any(|message| {
+        matches!(message.status.as_str(), "sent" | "staged" | "delivered")
+    }) {
+        blockers.push("pending-delivery".into());
+    }
+    blockers.sort();
+    blockers.dedup();
+    Ok(blockers)
+}
+
 pub fn deferred_restart_status(store: &Store, subject: &str) -> Result<Option<serde_json::Value>> {
     let Some(pending) = deferred_restart(store, subject)? else {
         return Ok(None);
@@ -60,10 +77,11 @@ pub fn deferred_restart_status(store: &Store, subject: &str) -> Result<Option<se
     if desired.member.as_ref().is_none_or(|new| new.launch_changes(&old).is_empty()) {
         return Ok(None);
     }
-    let blocking = crate::suspension::blockers(store, subject, incarnation)?;
+    let cutover = store.restart_cutover(subject)?;
+    let blocking = restart_blockers(store, subject, incarnation)?;
     let expired = smallclaims::store::now_ms() >= pending.deadline_unix_ms;
     Ok(Some(json!({
-        "phase": if expired { "held" } else { "pending" },
+        "phase": if cutover { "stopping" } else if expired { "held" } else { "pending" },
         "mode": "when-idle",
         "kind": "apply-restart",
         "deadline_unix_ms": pending.deadline_unix_ms,
@@ -208,8 +226,7 @@ pub fn phase(
 /// Before cutover begins, a changed launch must not rewrite the running seat's files.
 pub fn hold_render(store: &Store, desired: &DesiredSubject) -> Result<bool> {
     if let Some(pending) = deferred_restart_status(store, &desired.subject)? {
-        return Ok(pending["phase"] == "held"
-            || pending["blocking"].as_array().is_some_and(|b| !b.is_empty()));
+        return Ok(pending["phase"] != "stopping");
     }
     let Some(selection) = store.rollout_selection(&desired.subject)? else {
         return Ok(false);

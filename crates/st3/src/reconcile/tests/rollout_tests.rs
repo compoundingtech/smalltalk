@@ -298,9 +298,94 @@ fn apply_restart_defers_work_and_asks_then_restarts_at_idle_across_reopen() {
     seat.reopen();
     seat.busy(false);
     seat.plain_step();
+    assert!(seat.runtime.stops.lock().is_empty());
+    assert_eq!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["phase"], "stopping");
+    seat.plain_step();
     assert_eq!(*seat.runtime.stops.lock(), ["original-1"]);
     seat.plain_step();
     assert_eq!(seat.runtime.starts.lock().len(), 1);
+}
+
+#[test]
+fn apply_restart_pending_keeps_incumbent_ready_work_wakes() {
+    let seat = Seat::new_with_owned(false);
+    let run = seat.work();
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "pending-work");
+    seat.plain_step();
+    let wakes = seat.store.work_wake_messages_for_reconcile(SUBJECT).unwrap();
+    assert!(wakes.iter().any(|message| work_message_target(message)
+        .is_some_and(|(step, _, _, incarnation)| step == run.steps[0].subject
+            && incarnation == harness_incarnation_key("original-1"))), "{wakes:?}");
+    assert!(seat.runtime.stops.lock().is_empty());
+}
+
+#[test]
+fn apply_restart_waits_for_ask_person_and_answered_work() {
+    let seat = Seat::new_with_owned(false);
+    let run = seat.work();
+    let request = |key: &str| crate::model::WorkRequest {
+        actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+        summary: Some("tending".into()), reason: None, evidence: Vec::new(),
+        idempotency_key: key.into(),
+    };
+    seat.store.work_action(&run.steps[0].subject, "claim", &request("claim")).unwrap();
+    let ask = seat.store.ask_person(&crate::model::PersonAskRequest {
+        legacy_request: None, person: "person/operator".into(), title: "Which bed?".into(),
+        reason: "Choose the next bed".into(), actor: SUBJECT.into(),
+        step: Some(run.steps[0].subject.clone()), new_run: None,
+        incarnation: Some("original-1".into()), request: None, idempotency_key: "bed".into(),
+    }).unwrap();
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "defer-ask");
+    seat.busy(false);
+    seat.plain_step();
+    assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+    assert!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["blocking"]
+        .as_array().unwrap().contains(&json!("pending-person-work")));
+    assert!(seat.runtime.stops.lock().is_empty());
+    seat.store.finish_person_step(&crate::model::PersonStepResponse {
+        delegation: None, subject: ask.subject, actor: "person/operator".into(),
+        summary: "The north bed".into(), evidence: Vec::new(), episode: None,
+        answer: None, idempotency_key: "north".into(),
+    }, false).unwrap();
+    seat.store.reconcile_person_asks().unwrap();
+    seat.plain_step();
+    assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+    seat.store.work_action(&run.steps[0].subject, "claim", &request("resume")).unwrap();
+    seat.store.work_action(&run.steps[0].subject, "complete", &request("done")).unwrap();
+    assert!(seat.runtime.stops.lock().is_empty());
+}
+
+#[test]
+fn apply_restart_cutover_serializes_with_claim_and_expires_with_incarnation() {
+    let seat = Seat::new_with_owned(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "fenced");
+    seat.busy(false);
+    let frontier = seat.store.restart_frontier().unwrap();
+    let token = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    let deadline = rollout::deferred_restart(&seat.store, SUBJECT).unwrap().unwrap().deadline_unix_ms;
+    assert!(rollout::restart_blockers(&seat.store, SUBJECT, "original-1").unwrap().is_empty());
+    let run = seat.work();
+    let request = |key: &str| crate::model::WorkRequest {
+        actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+        summary: Some("tending".into()), reason: None, evidence: Vec::new(),
+        idempotency_key: key.into(),
+    };
+    seat.store.work_action(&run.steps[0].subject, "claim", &request("claim-before")).unwrap();
+    assert!(!seat.store.commit_restart_cutover(SUBJECT, &token, "original-1", frontier, deadline).unwrap());
+    seat.store.work_action(&run.steps[0].subject, "complete", &request("done")).unwrap();
+    let frontier = seat.store.restart_frontier().unwrap();
+    assert!(rollout::restart_blockers(&seat.store, SUBJECT, "original-1").unwrap().is_empty());
+    assert!(seat.store.commit_restart_cutover(SUBJECT, &token, "original-1", frontier, deadline).unwrap());
+    assert_eq!(seat.store.work_action(&run.steps[1].subject, "claim", &request("claim-after"))
+        .unwrap_err().code, "seat-rollout-draining");
+    seat.append("runtime.observed", json!({
+        "status":"running","runtime_id":seat.desired().member.unwrap().runtime_id,
+        "host":"amber","terminal":true,"incarnation_id":"replacement-1",
+    }));
+    assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+    seat.store.work_action(&run.steps[1].subject, "claim", &crate::model::WorkRequest {
+        incarnation: Some("replacement-1".into()), ..request("replacement-claim")
+    }).unwrap();
 }
 
 #[test]
