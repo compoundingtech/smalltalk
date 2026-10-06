@@ -16,6 +16,7 @@ mod client_glasses;
 mod client_presence;
 mod client_v0_cli;
 mod client_v0_contract;
+mod cli_inventory_process;
 mod codex_bootstrap;
 mod command_recorder;
 mod completion_shells;
