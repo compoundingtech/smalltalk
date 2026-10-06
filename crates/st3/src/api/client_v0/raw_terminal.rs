@@ -2,6 +2,7 @@
 use super::*;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
+mod lease;
 
 const SUBPROTOCOL: &str = "st3.client.pty.v0";
 const CHUNK: usize = 16 * 1024;
@@ -31,6 +32,13 @@ fn authorize(session: &ClientSession, mode: st3_client::RawTerminalMode) -> Resu
         require_scope(session, "terminal.control")?;
     }
     Ok(())
+}
+
+pub(super) fn authorization_epoch(
+    state: &AppState,
+    session: &ClientSession,
+) -> Result<String, ApiError> {
+    lease::authorization_epoch(state, session)
 }
 
 pub(crate) async fn attachment(
@@ -72,6 +80,14 @@ pub(crate) async fn attachment(
                 ("session_actor".into(), json!(session.actor)),
                 ("person_id".into(), json!(session.authority_actor)),
                 ("raw_mode".into(), json!(mode_name(request.mode))),
+                (
+                    "raw_authorization_epoch".into(),
+                    if request.mode == st3_client::RawTerminalMode::Peek {
+                        json!(authorization_epoch(&state, &session)?)
+                    } else {
+                        Value::Null
+                    },
+                ),
                 (
                     "capability_hash".into(),
                     json!(credential_digest(&capability)),
