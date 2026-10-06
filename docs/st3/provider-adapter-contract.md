@@ -155,6 +155,14 @@ outbound operation.
 
 ## Verification required before live cutover
 
+Registering `external` changes the native schema registry and its compatibility
+digest. A previous registry rejects this sender as an unknown subject family; a
+single-host rollout is insufficient evidence that peers can validate and project
+these messages. Coordinate the native schema release across the relevant fleet
+members, or prove an explicit mixed-version compatibility path before importing
+new external senders. Restarting only the Discord program cannot install this API
+or update peer registries.
+
 Native tests must prove route refusal, actor separation, image upload ownership,
 import idempotency and unchanged ordinary-send protections. Adapter tests must
 prove images both ways, anonymous bounded CDN reads, reply correlation, migration

@@ -3962,6 +3962,7 @@ mod tests {
                 "daemon",
                 "doc",
                 "exec",
+                "external",
                 "file",
                 "fleet-invite",
                 "gate-operation",
