@@ -36,6 +36,14 @@ semantics, a compaction or model change, a reading at least five minutes after t
 one while the harness works, and any reading while it does not. The newest pending reading
 replicates when the harness stops working.
 
+The writer compares a latest observation with the newest replicated claim in canonical order,
+not local arrival order. Its subject/kind lookup explicitly uses
+`claims_subject_kind_accepted_index`: the acceptance-time prefix locates the newest timestamp
+group, and the full canonical key resolves ties within that group. It does not sort the subject's
+entire observation history on each write. Harness comparison still selects the exact requested
+incarnation when the newest claim belongs to another incarnation; this index choice changes no
+state-fold precedence, publication cadence, or runtime fence.
+
 A node can also send every local observation to an OpenTelemetry collector. The exporter is off
 unless the config names a collector:
 
