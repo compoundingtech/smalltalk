@@ -555,7 +555,7 @@ struct Choice {
     action: Action,
 }
 
-/// The graph path a row stands for, without its kind: `fleet/cos/standing/cos` for an agent.
+/// The graph path a row stands for, without its kind: `example/atlas/builder` for an agent.
 fn choice_path(action: &Action) -> Option<String> {
     match action {
         Action::Open(Pane::Agent(Some(id)) | Pane::Terminal(id)) => {
@@ -566,8 +566,8 @@ fn choice_path(action: &Action) -> Option<String> {
     }
 }
 
-/// `query` against `text`, or, when it holds several words, every word against it: "fleet cos"
-/// finds `agent/fleet/cos/standing/cos`, which no one-run match reaches across the slashes.
+/// `query` against `text`, or, when it holds several words, every word against it: "atlas builder"
+/// finds `agent/example/atlas/builder`, which no one-run match reaches across the slashes.
 fn fuzzy_words(query: &str, text: &str) -> Option<i64> {
     if let Some(score) = fuzzy(query, text) {
         return Some(score);
