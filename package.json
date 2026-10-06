@@ -1,0 +1,14 @@
+{
+  "name": "smalltalk-workspace",
+  "private": true,
+  "workspaces": [
+    "apps/ios",
+    "clients/typescript/st3-client",
+    "clients/typescript/st3-views"
+  ],
+  "packageManager": "pnpm@12.7.0",
+  "$genie": {
+    "source": "package.json.genie.ts",
+    "warning": "DO NOT EDIT - changes will be overwritten"
+  }
+}

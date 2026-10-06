@@ -10,8 +10,8 @@ Install Rust targets `aarch64-apple-ios` and `aarch64-apple-ios-sim`, then from 
 
 ```sh
 sh modules/st-fabric/build.sh
-npx expo prebuild --platform ios --no-install
-ST3_FABRIC_PROOF=1 npm run pods
+pnpm exec expo prebuild --platform ios --no-install
+ST3_FABRIC_PROOF=1 pnpm run pods
 ```
 
 Build Debug for an arm64 simulator of your own (`ARCHS=arm64 ONLY_ACTIVE_ARCH=YES`); the proof framework has no x86_64 simulator slice. The script targets iOS 16.4, including its C/assembly dependencies, and writes the XCFramework under `ios/build` inside the pod root. On a shared build host, wait until `pgrep -x xcodebuild` finds no process before starting Xcode. Generated static libraries and the device/simulator XCFramework are ignored; do not commit them. To restore the default build, reinstall pods without `ST3_FABRIC_PROOF`.
@@ -52,7 +52,7 @@ FABRIC_BIN=/path/to/fabric cargo test --manifest-path apps/ios/modules/st-fabric
 cargo clippy --manifest-path apps/ios/modules/st-fabric/rust/Cargo.toml --locked --all-targets -- -D warnings
 ```
 
-The independent byte test checks framing and malformed input. The pinned-daemon check verifies unknown-node and missing-grant denial, a half-closed request, a 5 MiB response that would stall without Acks, and explicit stop delivering EOF to an idle upstream. Run `npm run typecheck` and `npm test` in `apps/ios` for the app checks.
+The independent byte test checks framing and malformed input. The pinned-daemon check verifies unknown-node and missing-grant denial, a half-closed request, a 5 MiB response that would stall without Acks, and explicit stop delivering EOF to an idle upstream. After the root frozen install, run `pnpm typecheck` and `pnpm test` in `apps/ios` for the app checks.
 
 ## Recorded simulator result
 
@@ -74,10 +74,10 @@ For a cellular trial without Metro, regenerate the ignored native project and ex
 
 ```sh
 cd apps/ios
-npx expo prebuild --platform ios --clean --no-install
+pnpm exec expo prebuild --platform ios --clean --no-install
 node modules/st-fabric/prepare-phone.mjs --offline-debug
 # Build the Rust framework, then install enabled pods as described above.
-ST3_FABRIC_PROOF=1 npm run pods
+ST3_FABRIC_PROOF=1 pnpm run pods
 # Use Debug, FORCE_BUNDLING=1, and leave SKIP_BUNDLING unset.
 ```
 

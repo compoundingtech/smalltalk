@@ -1,0 +1,34 @@
+# Generated file - DO NOT EDIT
+# Source: BUCK.genie.ts
+
+load("@rules//buck2:materialization.bzl", "package_view")
+load("@rules//buck2:typescript.bzl", "tsgo_typecheck")
+
+package_view(
+    name = "package_tree",
+    dependency_view = "//buck2/dependencies:view_clients_typescript_st3_views_4839e64c8727",
+    files = {
+        "sessionView.ts": "sessionView.ts",
+        "package.json": "package.json",
+        "deviceSigning.ts": "deviceSigning.ts",
+        "conversationSimple.ts": "conversationSimple.ts",
+        "homeView.ts": "homeView.ts",
+        "time.ts": "time.ts",
+        "index.ts": "index.ts",
+        "requestView.ts": "requestView.ts",
+        "conversationView.ts": "conversationView.ts",
+        "clientName.ts": "clientName.ts",
+        "tsconfig.json": "tsconfig.json",
+    },
+    strip_project_references = True,
+    runtime = "//:package_tree_runtime",
+    runtime_entry = "package-tree.ts",
+    visibility = ["PUBLIC"],
+)
+
+tsgo_typecheck(
+    name = "typecheck",
+    package_tree = ":package_tree",
+    project = "tsconfig.json",
+    visibility = ["PUBLIC"],
+)

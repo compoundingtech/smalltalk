@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "exactOptionalPropertyTypes": true,
+    "noEmit": true,
+    "target": "ES2024",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["esnext", "dom"],
+    "types": []
+  },
+  "files": ["Schema.generated.ts"]
+}
