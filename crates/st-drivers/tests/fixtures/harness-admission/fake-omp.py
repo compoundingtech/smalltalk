@@ -9,18 +9,22 @@ if 'ST_ADMISSION_TRACE' not in os.environ:
     (root / 'provider-env').write_text(os.environ.get('ST_OMP_CHANNEL_EXPECTED_NATIVE_SESSION', 'unset') + '|' + os.environ.get('ST_OMP_CHANNEL_RESUME_GENERATION', 'unset') + '\n')
     sys.exit(0)
 (root / 'launches').open('a').write('probe\n')
-assert 'ST_AGENT' not in os.environ
+assert os.environ['ST_AGENT'] == 'admission.fixture'
+session_dir = pathlib.Path(sys.argv[sys.argv.index('--session-dir') + 1])
+assert session_dir.is_dir()
+assert session_dir.parent == pathlib.Path(os.environ['HOME']).parent
 assert 'ANTHROPIC_API_KEY' not in os.environ
 assert pathlib.Path(os.environ['HOME']).parent == pathlib.Path(os.environ['ST_ADMISSION_TRACE']).parent
 assert pathlib.Path.cwd().name == 'workspace'
-assert not any(pathlib.Path(os.environ['HOME']).iterdir())
+assert (pathlib.Path(os.environ['HOME']) / '.omp/agent/models.json').is_file()
 if (root / 'slow').exists():
     import time
     time.sleep(60)
 fixture = json.loads((root / 'capture.json').read_text())
 nonce = re.search(r'ADMISSION_NATIVE_[0-9-]+', pathlib.Path(os.environ['ST_OMP_CHANNEL_BIN']).read_text())[0]
 fixture = json.loads(json.dumps(fixture).replace(fixture['nonce'], nonce))
-endpoint = json.loads(pathlib.Path(os.environ['PI_CODING_AGENT_DIR'], 'models.json').read_text())['providers']['admission']['baseUrl']
+profile = pathlib.Path(os.environ.get('PI_CODING_AGENT_DIR', str(pathlib.Path(os.environ['HOME']) / '.omp/agent')))
+endpoint = json.loads((profile / 'models.json').read_text())['providers']['admission']['baseUrl']
 messages = [{'role': 'user', 'content': nonce}]
 for _ in range(2):
     payload = json.dumps({'messages': messages}).encode()
