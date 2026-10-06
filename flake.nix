@@ -360,6 +360,9 @@
           pname = "st3";
           inherit version;
           src = self;
+          # Only the dependency-only dummy source omits embedded hooks. Keep
+          # the fail-loud interpreter assertions below for both real builds.
+          passthru.cargoDependencyPostPatch = "";
           # Embedded hooks are published into immutable runtime hook sets. The
           # sandbox has no /usr/bin/env; patch before compilation for package/check.
           postPatch = ''
@@ -458,8 +461,6 @@
           # generator formats the Rust client it checks with rustfmt.
           nativeCheckInputs = [
             pkgs.bashInteractive
-            # Boot-canary ownership fixtures poll the real daemon through curl.
-            pkgs.curl
             # The completion tests drive the stub in each supported shell.
             pkgs.fish
             pkgs.zsh

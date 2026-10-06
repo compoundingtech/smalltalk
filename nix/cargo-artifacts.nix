@@ -63,6 +63,9 @@ let
     src = dummySource;
     outputs = [ "out" ];
     cargoArtifacts = null;
+    # Application-only embedded assets are absent from Crane's dummy source.
+    # Packages opt out explicitly; real package/check postPatch stays intact.
+    postPatch = (old.passthru or { }).cargoDependencyPostPatch or (old.postPatch or "");
     # Revision identities belong to the real workspace compilation. Putting
     # them in this derivation would invalidate third-party artifacts every push.
     CLI_BUILD_STAMP = "";
