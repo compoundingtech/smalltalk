@@ -18147,10 +18147,9 @@ fn latest_claim_of_kind_tx(
 ) -> Result<Option<ClaimRecord>, St3Error> {
     transaction
         .query_row(
-            &format!(
-                "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
-                 WHERE claims.subject=?1 AND claims.kind=?2 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
-            ),
+            // The same statement `Store::latest_claim` runs. Without the index hint SQLite picks
+            // `claims_subject_kind_index` and sorts every claim of the seat and kind.
+            &latest_claim_of_kind_query(),
             params![subject, kind],
             claim_from_row,
         )
