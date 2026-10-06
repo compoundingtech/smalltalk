@@ -128,7 +128,7 @@ mission "promotion-proof" state="ready" {{
             }
             if launched.is_none()
                 && let Some(incarnation) = store
-                    .claims_for("agent/node.promotion-seat", Some("runtime.action.succeeded")).unwrap()
+                    .observations_for("agent/node.promotion-seat", "runtime.action.succeeded").unwrap()
                     .iter()
                     .filter(|claim| claim.body.pointer("/fields/action").and_then(Value::as_str)
                         == Some("start"))
