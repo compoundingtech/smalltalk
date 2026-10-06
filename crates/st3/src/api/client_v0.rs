@@ -2106,14 +2106,33 @@ fn runtime_resources(
     snapshot: &ClientSnapshot,
     session: &ClientSession,
 ) -> anyhow::Result<Vec<Value>> {
+    runtime_resources_for_owner(state, history, snapshot, session, None)
+}
+
+fn runtime_resources_for_owner(
+    state: &AppState,
+    history: bool,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    owner: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
     // Runtime authority must come from the same status reduction used by every
     // other control path. A raw claim ordered last by this replica's ingest
     // index is not necessarily the causally current runtime observation.
-    let status = state.store.status_for_claim_kind_at(
-        "runtime.observed",
-        Some(snapshot.store_index),
-        history,
-    )?;
+    // Exact owner reads reduce just that subject at this snapshot.
+    let status = if let Some(owner) = owner {
+        state.store.status_for_subject_names_at(
+            BTreeSet::from([owner.to_owned()]),
+            snapshot.store_index,
+            history,
+        )?
+    } else {
+        state.store.status_for_claim_kind_at(
+            "runtime.observed",
+            Some(snapshot.store_index),
+            history,
+        )?
+    };
     // Each runtime's declaration and observation time, in one statement apiece for the list.
     let desired_tokens = state.store.selected_desired_tokens(
         &status
@@ -2987,6 +3006,8 @@ pub(super) async fn missions(
                 actor: query.actor.clone(),
                 owner_run: query.owner_run.clone(),
                 status: query.status.clone(),
+                owner: None,
+                state: None,
                 native_only: query.native_only,
                 items_digest: "sql-page".into(),
                 before_index: None,
@@ -3275,14 +3296,30 @@ pub(super) async fn terminals(
 ) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
     let history = query.history;
+    let owner = query.owner.clone();
+    let terminal_state = query.state.clone();
     client_snapshot_page(
         &state,
         snapshot,
         "terminals",
         &query,
         move |state, snapshot| {
-            let mut items = runtime_resources(state, history, snapshot, &session)?;
-            items.retain(|item| item.get("terminal_id").is_some_and(Value::is_string));
+            let mut items = runtime_resources_for_owner(
+                state,
+                history,
+                snapshot,
+                &session,
+                owner.as_deref(),
+            )?;
+            items.retain(|item| {
+                item.get("terminal_id").is_some_and(Value::is_string)
+                    && owner
+                        .as_deref()
+                        .is_none_or(|owner| item["owner_id"] == owner)
+                    && terminal_state
+                        .as_deref()
+                        .is_none_or(|state| item["state"] == state)
+            });
             Ok(items)
         },
     )

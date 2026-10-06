@@ -28,6 +28,22 @@ public actor St3Client {
         if history { query.append(.init(name: "history", value: "true")) }
         return try await get("v1/client/\(collection)", query: query)
     }
+    /// Exact server-side filters; refuses older servers that ignore them.
+    public func terminalsListFiltered(owner: String? = nil, state: String? = nil, cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> {
+        var query: [URLQueryItem] = []
+        if let owner { query.append(.init(name: "owner", value: owner)) }
+        if let state { query.append(.init(name: "state", value: state)) }
+        if let cursor { query.append(.init(name: "cursor", value: cursor)) }
+        if let limit { query.append(.init(name: "limit", value: String(limit))) }
+        if history { query.append(.init(name: "history", value: "true")) }
+        let response: Envelope<ResourcePage> = try await get("v1/client/terminals", query: query)
+        for (name, value) in [("owner", owner), ("state", state)] {
+            if let value, response.value.filters[name] != value {
+                throw NSError(domain: "st3.client.protocol", code: 1, userInfo: [NSLocalizedDescriptionKey: "The server does not support the terminal \(name) filter; upgrade the server"])
+            }
+        }
+        return response
+    }
     public func nowList(ownerRun: String, cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> {
         var query: [URLQueryItem] = [.init(name: "owner_run", value: ownerRun)]
         if let cursor { query.append(.init(name: "cursor", value: cursor)) }

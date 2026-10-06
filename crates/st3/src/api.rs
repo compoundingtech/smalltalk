@@ -157,6 +157,10 @@ struct ClientListQuery {
     owner_run: Option<String>,
     status: Option<String>,
     #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
     native_only: bool,
 }
 
@@ -171,6 +175,10 @@ struct ClientPageCursor {
     actor: Option<String>,
     owner_run: Option<String>,
     status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
     #[serde(default)]
     native_only: bool,
     items_digest: String,
@@ -1302,6 +1310,11 @@ fn client_page_read(
     query: &ClientListQuery,
     _pinned: bool,
 ) -> Result<ClientResourcePage, ApiError> {
+    let (owner, terminal_state) = if collection == "terminals" {
+        (query.owner.as_deref(), query.state.as_deref())
+    } else {
+        (None, None)
+    };
     let requested_limit = query
         .limit
         .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
@@ -1315,6 +1328,8 @@ fn client_page_read(
             || cursor.person != query.person
             || cursor.actor != query.actor
             || cursor.owner_run != query.owner_run
+            || cursor.owner.as_deref() != owner
+            || cursor.state.as_deref() != terminal_state
             || cursor.status != query.status
             || cursor.native_only != query.native_only
             || query
@@ -1416,6 +1431,8 @@ fn client_page_read(
             actor: query.actor.clone(),
             owner_run: query.owner_run.clone(),
             status: query.status.clone(),
+            owner: owner.map(str::to_owned),
+            state: terminal_state.map(str::to_owned),
             native_only: query.native_only,
             items_digest,
             before_index: None,
@@ -1428,7 +1445,7 @@ fn client_page_read(
     Ok(ClientResourcePage {
         kind: "page".into(),
         collection: collection.into(),
-        filters: client_page_filters(query),
+        filters: client_page_filters(collection, query),
         items: page_items,
         page: ClientPageInfo {
             limit,
@@ -1442,7 +1459,7 @@ fn client_page_read(
 }
 
 /// The filters a page names: the ones its query applied.
-fn client_page_filters(query: &ClientListQuery) -> BTreeMap<String, String> {
+fn client_page_filters(collection: &str, query: &ClientListQuery) -> BTreeMap<String, String> {
     let mut filters = BTreeMap::new();
     if query.history {
         filters.insert("history".into(), "all".into());
@@ -1455,6 +1472,16 @@ fn client_page_filters(query: &ClientListQuery) -> BTreeMap<String, String> {
     ] {
         if let Some(value) = value {
             filters.insert(name.into(), value.clone());
+        }
+    }
+    if collection == "terminals" {
+        for (name, value) in [
+            ("owner", query.owner.as_ref()),
+            ("state", query.state.as_ref()),
+        ] {
+            if let Some(value) = value {
+                filters.insert(name.into(), value.clone());
+            }
         }
     }
     if query.native_only {
@@ -3763,6 +3790,8 @@ async fn client_work_history(
                 actor: query.actor.clone(),
                 owner_run: query.owner_run.clone(),
                 status: query.status.clone(),
+                owner: None,
+                state: None,
                 native_only: query.native_only,
                 items_digest: "sql-page".into(),
                 before_index: None,
@@ -3774,7 +3803,7 @@ async fn client_work_history(
     let page = ClientResourcePage {
         kind: "page".into(),
         collection: "work".into(),
-        filters: client_page_filters(query),
+        filters: client_page_filters("work", query),
         items,
         page: ClientPageInfo {
             limit,
@@ -4439,6 +4468,8 @@ async fn client_history(
                 actor: query.actor.clone(),
                 owner_run: query.owner_run.clone(),
                 status: query.status.clone(),
+                owner: None,
+                state: None,
                 native_only: query.native_only,
                 items_digest: String::new(),
                 before_index: Some(next),
