@@ -2597,7 +2597,7 @@ impl Client {
                 })?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_raw_terminal_subprotocol(&response)?;
-                raw_terminal_connector(websocket, attachment.mode == RawTerminalMode::Peek)
+                raw_terminal_connector(websocket, mode == RawTerminalMode::Peek)
             }
             Endpoint::FabricLoopback(base) => {
                 let websocket_base = if let Some(base) = base.strip_prefix("https://") {
@@ -2619,7 +2619,7 @@ impl Client {
                 })?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_raw_terminal_subprotocol(&response)?;
-                raw_terminal_connector(websocket, attachment.mode == RawTerminalMode::Peek)
+                raw_terminal_connector(websocket, mode == RawTerminalMode::Peek)
             }
         }
     }
