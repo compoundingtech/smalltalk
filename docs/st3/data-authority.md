@@ -56,6 +56,12 @@ across resets. Restoring an older database while native producers continue runni
 those producers with new incarnations before current publication resumes. There is no peer retry, acknowledgement ledger or
 fallback to durable replication for these values. Current status reports source observation
 time and freshness, so an offline owner or dropped heartbeat ages visibly.
+Current-transition consumers read `Store::current_observation_boundary` with the feed/snapshot
+inside a pinned read. Its database epoch and retired local-cursor floor make missing transitions
+explicit: a different epoch, a cursor behind retired evidence, or a cursor ahead after restore
+requires resync from current values. Replacing or importing a register advances the retirement
+floor atomically with deleting its old feed row. This is a current snapshot/feed boundary;
+selected durable subscription wakes belong to graph-watch, rather than a telemetry replay log.
 
 Numeric `harness.usage` readings and account limits remain durable accounting facts for
 `st usage` and the 95% stop. Their existing first-reading, compaction/model-change, five-minute

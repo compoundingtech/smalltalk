@@ -15,7 +15,7 @@ mod seat_status;
 mod canonical;
 mod latest_values;
 use latest_values::{current_sql, harness_sql};
-pub use latest_values::{is_current_input, is_current_value};
+pub use latest_values::{CurrentObservationBoundary, is_current_input, is_current_value};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -2462,7 +2462,7 @@ impl Store {
         &self,
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
-        append_claim_with_subject_fences_mode(&self.graph, input, None, None, None, false)
+        append_claim_with_subject_fences_mode(&self.graph, input, None, None, None, None, false)
     }
 
     fn refresh_current_caches(&self) -> Result<()> {
@@ -50604,6 +50604,7 @@ fn append_claim_with_subject_fences(
         fence,
         event_runtime,
         expected_subjects,
+        observer_completion,
         true,
     )
 }
@@ -50614,6 +50615,7 @@ fn append_claim_with_subject_fences_mode(
     fence: Option<&crate::mailbox::Fence>,
     event_runtime: Option<&str>,
     expected_subjects: Option<&BTreeMap<String, String>>,
+    observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
     registers: bool,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;

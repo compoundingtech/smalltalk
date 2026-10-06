@@ -50,6 +50,32 @@ pub(super) fn initialize_epoch(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Current values retain a snapshot and bounded feed, not a replayable telemetry series.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CurrentObservationBoundary {
+    pub epoch: String,
+    pub local_cursor: u64,
+    pub retired_through_local_cursor: u64,
+}
+
+impl CurrentObservationBoundary {
+    pub fn requires_resync(&self, epoch: &str, local_cursor: u64) -> bool {
+        epoch != self.epoch
+            || local_cursor < self.retired_through_local_cursor
+            || local_cursor > self.local_cursor
+    }
+}
+
+fn retire_feed_through(tx: &Transaction<'_>, cursor: i64) -> Result<(), St3Error> {
+    tx.execute(
+        "INSERT INTO meta(key,value) VALUES ('current-value-retired-through',?1)
+         ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(meta.value AS INTEGER),?1) AS TEXT)",
+        [cursor],
+    )
+    .map_err(internal)?;
+    Ok(())
+}
+
 pub fn is_current_value(kind: &str) -> bool {
     matches!(
         kind,
@@ -346,6 +372,17 @@ pub(super) fn append(
         )
         .map_err(internal)?;
     }
+    let retired: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(id) FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
+         AND (?2!='harness.usage' OR json_extract(body,'$.fields.semantics')='context_occupancy')",
+            params![input.subject, input.kind, sequence],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
+    if let Some(retired) = retired {
+        retire_feed_through(&tx, retired)?;
+    }
     tx.execute(
         "DELETE FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
         AND (?2!='harness.usage' OR json_extract(body,'$.fields.semantics')='context_occupancy')",
@@ -404,6 +441,21 @@ fn update_readiness(tx: &Transaction<'_>, input: &ClaimInput) -> Result<(), St3E
 }
 
 impl Store {
+    /// The explicit reconnect boundary for consumers of current-observation transitions.
+    /// Read this alongside the feed/snapshot in a pinned read transaction. A cursor behind
+    /// retired evidence must resync from current values rather than promise missing history.
+    pub fn current_observation_boundary(&self) -> Result<CurrentObservationBoundary> {
+        Ok(self.readers.get().query_row(
+            "SELECT (SELECT value FROM meta WHERE key='current-value-epoch'),
+                    (SELECT COALESCE(MAX(id),0) FROM local_observations),
+                    COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='current-value-retired-through'),0)",
+            [], |row| Ok(CurrentObservationBoundary {
+                epoch: row.get(0)?, local_cursor: row.get(1)?,
+                retired_through_local_cursor: row.get(2)?,
+            }),
+        )?)
+    }
+
     /// Local dial failures are replace-in-place hints. They never wait behind graph writes.
     pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<bool> {
         let now = now_ms();
@@ -633,6 +685,7 @@ impl Store {
         let (local, _) =
             insert_local_observation_tx(&tx, &self.origin, &input, record.accepted_at_unix_ms)?;
         if let Some((_, _, old_id, _, _)) = previous {
+            retire_feed_through(&tx, old_id)?;
             tx.execute("DELETE FROM local_observations WHERE id=?1", [old_id])
                 .map_err(internal)?;
         }
@@ -667,6 +720,31 @@ mod tests {
             expected_subject: None,
             idempotency_key: None,
         }
+    }
+
+    #[test]
+    fn retired_current_transitions_require_resync_and_reopen_keeps_the_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("current.sqlite3");
+        let store = Store::open(&path, "node").unwrap();
+        let initial = store.current_observation_boundary().unwrap();
+        assert!(!initial.requires_resync(&initial.epoch, 0));
+        store.append_claim(&state("working", "one", 1)).unwrap();
+        let first = store.current_observation_boundary().unwrap();
+        store.append_claim(&state("idle", "one", 2)).unwrap();
+        let second = store.current_observation_boundary().unwrap();
+        assert!(second.requires_resync(&initial.epoch, 0));
+        assert!(!second.requires_resync(&first.epoch, first.local_cursor));
+        store.append_claim(&state("working", "one", 3)).unwrap();
+        let third = store.current_observation_boundary().unwrap();
+        assert!(third.requires_resync(&first.epoch, first.local_cursor));
+        assert!(!third.requires_resync(&third.epoch, second.local_cursor));
+        assert!(third.requires_resync("older-database", third.local_cursor));
+        assert!(third.requires_resync(&third.epoch, third.local_cursor + 1));
+        assert_eq!(store.local_observations_after(0, 10).unwrap().len(), 1);
+        drop(store);
+        let reopened = Store::open(&path, "node").unwrap();
+        assert_eq!(reopened.current_observation_boundary().unwrap(), third);
     }
 
     #[test]
