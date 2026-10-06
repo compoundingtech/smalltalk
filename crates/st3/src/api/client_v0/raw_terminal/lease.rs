@@ -622,6 +622,215 @@ mod tests {
             .unwrap();
     }
 
+    fn acquire(state: &AppState, session: &ClientSession) -> Arc<Lease> {
+        Lease::register(
+            state,
+            session,
+            "terminal/agent/shell",
+            "host/lease-owner",
+            "incarnation-one",
+            None,
+            &authorization_epoch(state, session).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_expires_at_sixty_seconds_despite_authority_proofs() {
+        let (_root, state, session) = fixture();
+        let lease = acquire(&state, &session);
+        for sequence in 1..60 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            lease.proof(&lease.binding.gateway_epoch, sequence).unwrap();
+        }
+        assert!(lease.check().is_ok());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            lease
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("lease-idle-expired")
+        );
+        assert!(
+            lease.selected_use(1).is_err(),
+            "expired streams cannot be resurrected"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_renewal_never_extends_absolute_and_fresh_rotation_is_independent() {
+        let (_root, state, session) = fixture();
+        let old = acquire(&state, &session);
+        let mut replacement = None;
+        for second in 1..300 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            old.proof(&old.binding.gateway_epoch, second).unwrap();
+            if second % 20 == 0 {
+                old.selected_use(second / 20).unwrap();
+            }
+            if second == 290 {
+                replacement = Some(acquire(&state, &session));
+            }
+            if let Some(new) = &replacement {
+                new.proof(&new.binding.gateway_epoch, second).unwrap();
+            }
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            old.check()
+                .unwrap_err()
+                .to_string()
+                .contains("lease-absolute-expired")
+        );
+        assert!(replacement.as_ref().unwrap().check().is_ok());
+        assert_ne!(
+            old.binding.lease_id,
+            replacement.as_ref().unwrap().binding.lease_id
+        );
+        assert!(old.selected_use(99).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_loss_closes_at_five_seconds_and_replays_do_not_refresh() {
+        let (_root, state, session) = fixture();
+        let lease = acquire(&state, &session);
+        lease.proof(&lease.binding.gateway_epoch, 2).unwrap();
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(lease.proof(&lease.binding.gateway_epoch, 2).is_err());
+        assert!(lease.proof(&lease.binding.gateway_epoch, 1).is_err());
+        assert!(lease.proof("restarted-watch", 3).is_err());
+        lease.selected_use(1).unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            lease
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("lease-watch-lost")
+        );
+    }
+
+    #[tokio::test]
+    async fn principal_and_incarnation_mutations_revoke_before_acknowledgement() {
+        let (_root, state, session) = fixture();
+        let old = acquire(&state, &session);
+        claim(
+            &state,
+            "person/alex",
+            "principal.key-revoked",
+            json!({"key":"old-key","reason":"test"}),
+        );
+        assert!(
+            old.check().is_err(),
+            "mutation returned before lease invalidation"
+        );
+        let replacement = acquire(&state, &session);
+        claim(
+            &state,
+            "agent/shell",
+            "runtime.observed",
+            json!({"status":"running","runtime_id":"runtime-shell","incarnation_id":"incarnation-two","terminal":true}),
+        );
+        assert!(
+            replacement.check().is_err(),
+            "incarnation mutation returned before invalidation"
+        );
+        assert!(old.check().is_err());
+    }
+
+    #[tokio::test]
+    async fn paired_actor_restriction_and_revocation_invalidate_all_generations() {
+        let (_root, state, mut session) = fixture();
+        session.actor = "client/device-one".into();
+        let grant = json!({"session_actor":session.actor,"person_id":session.authority_actor,"scopes":["terminal.read"],"expires_at_unix_ms":client_now_ms()+600_000,"credential_hash":"digest"});
+        claim(
+            &state,
+            "custom/client/device-one",
+            "custom.client.pairing-completed",
+            grant.clone(),
+        );
+        let old = acquire(&state, &session);
+        let replacement = acquire(&state, &session);
+        claim(
+            &state,
+            "custom/client/device-one",
+            "custom.client.pairing-revoked",
+            json!({"device_id":"device-one"}),
+        );
+        assert!(old.check().is_err());
+        assert!(replacement.check().is_err());
+        assert!(
+            Lease::register(
+                &state,
+                &session,
+                "terminal/agent/shell",
+                "host/lease-owner",
+                "incarnation-one",
+                None,
+                &old.acquisition_epoch
+            )
+            .is_err()
+        );
+        session.actor = "client/device-two".into();
+        let mut restricted = grant;
+        restricted["session_actor"] = json!(session.actor);
+        restricted["scopes"] = json!([]);
+        claim(
+            &state,
+            "custom/client/device-two",
+            "custom.client.pairing-completed",
+            restricted,
+        );
+        assert!(
+            Lease::register(
+                &state,
+                &session,
+                "terminal/agent/shell",
+                "host/lease-owner",
+                "incarnation-one",
+                None,
+                &old.acquisition_epoch
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_restriction_of_original_grant_revokes_forwarded_actor() {
+        let (_root, state, session) = fixture();
+        let local = acquire(&state, &session);
+        let mut binding = local.binding.clone();
+        binding.actor = "client/original".into();
+        binding.grant_subject = Some("custom/client/original".into());
+        let grant = json!({"fields":{"session_actor":"client/original","person_id":"person/alex","scopes":["terminal.read"],"expires_at_unix_ms":client_now_ms()+600_000}});
+        binding.grant_digest = Some(credential_digest(&serde_json::to_string(&grant).unwrap()));
+        let forwarded = Lease::register(
+            &state,
+            &session,
+            "terminal/agent/shell",
+            "host/lease-owner",
+            "incarnation-one",
+            Some(binding),
+            &authorization_epoch(&state, &session).unwrap(),
+        )
+        .unwrap();
+        assert!(forwarded.check().is_ok());
+        claim(
+            &state,
+            "custom/client/original",
+            "custom.client.pairing-completed",
+            json!({
+                "session_actor":"client/original","person_id":"person/alex","scopes":[],
+                "expires_at_unix_ms":client_now_ms()+600_000
+            }),
+        );
+        assert!(
+            forwarded.check().is_err(),
+            "owner restriction must invalidate the original subject/digest"
+        );
+    }
+
     #[tokio::test]
     async fn non_issuer_pairing_revoke_fails_without_committing() {
         let (_root, mut state, session) = fixture();
@@ -695,5 +904,35 @@ mod tests {
             json!({"key":"acquired-key","reason":"race"}),
         );
         assert_ne!(authorization_epoch(&state, &session).unwrap(), acquired);
+    }
+
+    #[tokio::test]
+    async fn an_acquired_capability_cannot_adopt_a_later_principal_epoch() {
+        let (_root, state, session) = fixture();
+        let acquired = authorization_epoch(&state, &session).unwrap();
+        // No lease is registered yet: invalidate between consumption and registration.
+        claim(
+            &state,
+            "person/alex",
+            "principal.key-revoked",
+            json!({"key":"acquired-key","reason":"race"}),
+        );
+        assert!(
+            Lease::register(
+                &state,
+                &session,
+                "terminal/agent/shell",
+                "host/lease-owner",
+                "incarnation-one",
+                None,
+                &acquired
+            )
+            .is_err()
+        );
+        let fresh = acquire(&state, &session);
+        assert!(
+            fresh.check().is_ok(),
+            "only a fresh authorization may acquire the new epoch"
+        );
     }
 }
