@@ -2447,6 +2447,10 @@ impl Store {
         {
             graph.heal_replay_backoff_ms = 0;
         }
+        // A preexisting store's declared-resource edges converge in bounded writer batches
+        // off the open path; open never waits on declaration history.
+        #[cfg(not(test))]
+        resource_references::spawn_backfill(&graph.connection);
         Ok(Self { graph, smalltalk })
     }
 
@@ -10842,8 +10846,13 @@ impl Store {
     }
 
     /// Incoming named edges, using the target index rather than scanning declaration bodies.
+    /// While a preexisting store's edge index is still being folded in bounded background
+    /// steps, the same answer comes straight from the selected declarations.
     pub fn declared_resource_referrers(&self, subject: &str) -> Result<Vec<Value>> {
         let connection = self.readers.get();
+        if resource_references::backfilling(&connection)? {
+            return resource_references::referrers_from_declarations(&connection, subject);
+        }
         let mut statement = connection.prepare_cached(
             "SELECT owner, name, reason FROM declared_resource_edges WHERE target=?1 ORDER BY owner, name",
         )?;
