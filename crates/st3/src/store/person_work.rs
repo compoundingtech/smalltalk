@@ -717,6 +717,18 @@ impl Store {
 
     pub(crate) fn reconcile_person_asks(&self) -> Result<bool> {
         let migrated = self.migrate_legacy_person_asks()?;
+        // Legacy requests can create the first ask, so migrate before checking for no work.
+        // Drop this read connection before submitting any cancellation transaction.
+        let has_asks: bool = {
+            let connection = self.readers.get();
+            connection
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM claims WHERE kind='work.person-asked')")?
+                .query_row([], |row| row.get(0))?
+        };
+        if !has_asks {
+            // A concurrent new ask is handled by the next notified reconcile pass.
+            return Ok(migrated);
+        }
         self.connection.batched(|tx| -> Result<bool> {
             let mut query = tx.prepare(&canonical_sql("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
                 FROM claims WHERE kind='work.person-asked' ORDER BY CANONICAL_ASC(claims)"))?;
@@ -989,6 +1001,38 @@ pub(super) fn project(tx: &Transaction<'_>, claim: &ClaimRecord) -> Result<bool,
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn empty_person_ask_reconciliation_does_not_wait_for_the_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(&root.path().join("claims.sqlite3"), "alder").unwrap();
+        let (held, is_held) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let (done, result) = std::sync::mpsc::sync_channel(1);
+        let completed = std::thread::scope(|scope| {
+            let store = &store;
+            let writer = scope.spawn(move || {
+                store.hold_writer_for_test(|| {
+                    held.send(()).unwrap();
+                    released.recv().unwrap();
+                });
+            });
+            is_held.recv().unwrap();
+            let reconcile = scope.spawn(move || {
+                done.send(store.reconcile_person_asks()).unwrap();
+            });
+            let completed = result.recv_timeout(std::time::Duration::from_secs(2));
+            // Always release the real writer before joining, including on a regression.
+            release.send(()).unwrap();
+            writer.join().unwrap();
+            reconcile.join().unwrap();
+            completed
+        });
+        assert!(
+            !completed.expect("empty reconciliation submitted a writer job").unwrap(),
+            "empty reconciliation must not report a change"
+        );
+    }
 
     pub(in crate::store) fn fixture() -> (Store, StepRunView, PersonAskRequest) {
         let store = Store::open_memory("alder").unwrap();
