@@ -28,21 +28,14 @@ pub(super) async fn bind(
     authorize(&request, peer.as_ref().map(|p| &p.0))?;
     let store = state.store.clone();
     let pty_root = state.pty_root.clone();
+    let node = state.node.clone();
     let peer = peer.map(|Extension(peer)| peer);
-    let bound = blocking_action(move || match store.bind_mailbox(&request) {
-        Err(error)
-            if error.code == "stale-mailbox-session"
-                && store.mailbox_bootstrap_pending(&request)?
-                && peer.as_ref().is_some_and(|peer| {
-                    startup::live_native_incarnation(&pty_root, peer, &request)
-                }) =>
-        {
-            Err(St3Error::new(
-                "mailbox-session-starting",
-                "waiting for the seat's running incarnation",
-            ))
-        }
-        result => result,
+    let bound = blocking_action(move || {
+        startup::bind_with_native_startup(&store, &request, || {
+            peer.as_ref().is_some_and(|peer| {
+                startup::live_native_incarnation(&store, &node, &pty_root, peer, &request)
+            })
+        })
     })
     .await?;
     signal_local_change(&state);

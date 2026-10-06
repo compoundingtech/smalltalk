@@ -11,7 +11,7 @@ pub(super) fn birth(pid: u32) -> Option<u64> {
 
 pub(super) fn is_descendant(mut pid: u32, root: u32) -> bool {
     let mut seen = std::collections::BTreeSet::new();
-    while pid > 1 && seen.insert(pid) {
+    while pid > 1 && seen.len() < 64 && seen.insert(pid) {
         let Some(identity) = identity(pid) else {
             return false;
         };
