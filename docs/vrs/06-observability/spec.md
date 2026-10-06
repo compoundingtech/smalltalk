@@ -291,15 +291,17 @@ Trace, metric, and log exporters use SDK-owned threads; none export on the daemo
 `new_current_thread` request reactor. The log bridge uses
 `experimental_use_tracing_span_context` to attach the active trace and span ids.
 
-With no `OTEL_EXPORTER_OTLP_ENDPOINT`, initialization builds no SDK providers or exporters.
-An atomic enabled gate returns before span construction. Local stderr diagnostics remain
-available. Standard `OTEL_*` environment variables configure export.
+With no `OTEL_EXPORTER_OTLP_ENDPOINT`, initialization builds no telemetry subscriber,
+SDK providers, exporters, or threads. An atomic enabled gate returns before span construction.
+Local stderr diagnostics remain available. Standard `OTEL_*` environment variables configure
+export. `OTEL_SDK_DISABLED=true` (case-insensitive) selects this disabled path for every st3
+unit. `ST3_CLI_OTEL=off` selects it for the CLI only.
 
 | Process unit | `service.name` | Shutdown budget |
 | --- | --- | --- |
 | `st up` daemon | `st3-daemon` | 5 s |
 | `peer::run_worker` replication worker | `st3-replication-worker` | 5 s |
-| One-shot CLI | `st3-cli` | 250 ms |
+| One-shot CLI | `st3-cli` | 50 ms if a trace was kept; no exporter wait otherwise |
 | Driver hook | No direct SDK export; daemon-mediated | No collector flush in the hook |
 | `driver claude-statusline` | None; `telemetry::local_only()` | No pipeline |
 
@@ -313,6 +315,24 @@ The shared resource contains `service.name`, `service.version` from
 resource builder, including the version. The platform edge supplies fleet-owned attributes.
 Flush and shutdown share one process-unit deadline across all three providers; an unreachable
 collector cannot extend it.
+
+Agent shells export the endpoint globally, and agent loops call the CLI thousands of times
+per hour. A hung collector must not delay each call. After the CLI root ends, `Telemetry`
+reads the tail sampler's shared kept count. If it is zero, CLI shutdown does not wait for the
+exporter. If it is positive, the CLI waits at most 50 ms for a detached helper to flush and
+shut down all providers. This is one hard deadline, not a separate budget per provider.
+The keep rules are errors, duration above 1 s, an admitted sampled parent, and the 1% ratio.
+The daemon and replication worker retain their 5 s deadline.
+
+A CLI flush timeout or an export error returned by provider `force_flush` or `shutdown`
+records the failure time in `otel-cli-backoff`. The file is in `$XDG_RUNTIME_DIR/st3/` when
+`XDG_RUNTIME_DIR` is set; otherwise it is in `$XDG_STATE_HOME/st3/`, with
+`~/.local/state/st3/` as the fallback when `XDG_STATE_HOME` is unset. CLI initialization
+reads this small file once, without locks or waits. If the current time is before the failure
+time plus 300 s, it selects the disabled path before creating the pipeline. Missing or corrupt
+files do not disable telemetry. Writers use a temporary file and atomic rename; readers
+tolerate concurrent writers. This negative cache does not affect the daemon or replication
+worker.
 
 ### Local-root sampling
 

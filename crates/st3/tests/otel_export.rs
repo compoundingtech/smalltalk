@@ -159,40 +159,134 @@ fn cli_without_endpoint_succeeds_without_export() {
     }
 }
 
-#[test]
-fn cli_unreachable_collector_exits_in_under_one_second() {
-    let Some(_collector) = otelite("cli_unreachable_collector_exits_in_under_one_second") else {
-        return;
-    };
-    let root = tempfile::tempdir().unwrap();
-    // Keep the bound listener alive without accepting. TCP connects, but HTTP cannot complete.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut command = isolated_command(Path::new(env!("CARGO_BIN_EXE_st3")), root.path());
+fn median(mut times: Vec<Duration>) -> Duration {
+    times.sort_unstable();
+    times[times.len() / 2]
+}
+
+fn timed_cli(root: &Path, endpoint: &str, disabled: bool, success: bool) -> Duration {
+    let mut command = isolated_command(st3(), root);
     command
-        .env(
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            format!("http://{}", listener.local_addr().unwrap()),
-        )
-        // The exporter timeout must exceed the CLI budget so it cannot mask unbounded teardown.
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
+        // Must exceed the CLI budget so the exporter cannot mask unbounded teardown.
         .env("OTEL_EXPORTER_OTLP_TIMEOUT", "10000")
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    missing_daemon(&mut command, root.path());
+    if disabled {
+        command.env("ST3_CLI_OTEL", "off");
+    }
+    if success {
+        command.arg("skill");
+    } else {
+        missing_daemon(&mut command, root);
+    }
     let started = Instant::now();
     let mut child = command.spawn().expect("run st3 with stalled collector");
     loop {
         if let Some(status) = child.try_wait().expect("observe st3 exit") {
             let elapsed = started.elapsed();
             let output = child.wait_with_output().unwrap();
-            assert_eq!(status.code(), Some(5), "missing-daemon exit: {output:?}");
-            assert!(elapsed < Duration::from_secs(1), "CLI took {elapsed:?}");
-            break;
+            assert_eq!(
+                status.code(),
+                Some(if success { 0 } else { 5 }),
+                "{output:?}"
+            );
+            return elapsed;
         }
-        if started.elapsed() >= Duration::from_secs(1) {
+        if started.elapsed() >= Duration::from_secs(5) {
             child.kill().expect("stop stalled st3");
             let output = child.wait_with_output().unwrap();
-            panic!("CLI exceeded its one-second wall-time bound: {output:?}");
+            panic!("CLI stalled during telemetry teardown: {output:?}");
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn cli_black_hole_collector_adds_at_most_50ms_then_backs_off() {
+    // Bound but never accept: TCP connects while HTTP cannot complete.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mut disabled = Vec::new();
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for _ in 0..9 {
+        let root = tempfile::tempdir().unwrap();
+        // Warm the exact binary before collecting paired measurements.
+        timed_cli(root.path(), &endpoint, true, false);
+        disabled.push(timed_cli(root.path(), &endpoint, true, false));
+        first.push(timed_cli(root.path(), &endpoint, false, false));
+        assert!(
+            root.path().join("run/st3/otel-cli-backoff").is_file(),
+            "first stalled flush must establish the negative cache"
+        );
+        second.push(timed_cli(root.path(), &endpoint, false, false));
+    }
+    let baseline = median(disabled);
+    let first_delta = median(first).saturating_sub(baseline);
+    let second_delta = median(second).saturating_sub(baseline);
+    // Nine-run medians reject isolated shared-host scheduling outliers. Allow 15 ms
+    // for startup/provider initialization, atomic cache writes, and scheduler noise.
+    assert!(
+        first_delta <= Duration::from_millis(65),
+        "first delta {first_delta:?}"
+    );
+    assert!(
+        second_delta <= Duration::from_millis(15),
+        "backoff delta {second_delta:?}"
+    );
+}
+
+#[test]
+fn cli_kept_nothing_does_not_wait() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mut disabled = Vec::new();
+    let mut enabled = Vec::new();
+    for _ in 0..9 {
+        // Each sample gets a private cache: an occasional 1% kept trace must not
+        // hide an unconditional flush in subsequent runs via negative caching.
+        let root = tempfile::tempdir().unwrap();
+        timed_cli(root.path(), &endpoint, true, true);
+        disabled.push(timed_cli(root.path(), &endpoint, true, true));
+        enabled.push(timed_cli(root.path(), &endpoint, false, true));
+    }
+    // No sampling test hook: the median tolerates up to four legitimately retained
+    // successes under the default 1% ratio. The same 15 ms noise allowance applies.
+    let delta = median(enabled).saturating_sub(median(disabled));
+    assert!(
+        delta <= Duration::from_millis(15),
+        "dropped-success delta {delta:?}"
+    );
+}
+
+#[test]
+fn otel_sdk_disabled_and_st3_cli_off_disable_export() {
+    let Some(collector) = otelite("otel_sdk_disabled_and_st3_cli_off_disable_export") else {
+        return;
+    };
+    for (switch, value) in [("OTEL_SDK_DISABLED", "TrUe"), ("ST3_CLI_OTEL", "off")] {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = isolated_command(&collector, root.path());
+        command
+            .args(["run", "--out"])
+            .arg(root.path().join("capture"))
+            .args(["--protocol", "http/json", "--", "env"])
+            .arg(format!("{switch}={value}"))
+            .arg(st3());
+        missing_daemon(&mut command, root.path());
+        let output = command
+            .output()
+            .expect("run disabled CLI with live otelite");
+        assert_eq!(output.status.code(), Some(5), "{switch}: {output:?}");
+        for signal in ["traces.ndjson", "metrics.ndjson", "logs.ndjson"] {
+            let path = root.path().join("capture").join(signal);
+            match std::fs::read(&path) {
+                Ok(bytes) => assert!(bytes.is_empty(), "{switch}: unexpected {signal}"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read {}: {error}", path.display()),
+            }
+        }
+        assert!(!root.path().join("run/st3/otel-cli-backoff").exists());
     }
 }

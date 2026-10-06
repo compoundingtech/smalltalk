@@ -10,6 +10,8 @@
 //! accepts it at :516-525). This never changes the live propagation context.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use opentelemetry::trace::{
@@ -207,6 +209,7 @@ pub struct LocalRootTailSampler<P: SpanProcessor> {
     inner: P,
     config: TailSamplingConfig,
     state: Mutex<State>,
+    forwarded: Arc<AtomicU64>,
 }
 
 impl<P: SpanProcessor> LocalRootTailSampler<P> {
@@ -227,6 +230,7 @@ impl<P: SpanProcessor> LocalRootTailSampler<P> {
             inner,
             config,
             state: Mutex::new(state),
+            forwarded: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -236,6 +240,11 @@ impl<P: SpanProcessor> LocalRootTailSampler<P> {
 
     pub fn stats(&self) -> TailSamplingStats {
         self.lock().stats
+    }
+
+    /// Counts spans actually forwarded, independently of the pending-trace lock.
+    pub fn forwarded_count(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.forwarded)
     }
 
     fn export(&self, mut span: SpanData) {
@@ -248,6 +257,7 @@ impl<P: SpanProcessor> LocalRootTailSampler<P> {
             context.trace_state().clone(),
         );
         self.inner.on_end(span);
+        self.forwarded.fetch_add(1, Ordering::Relaxed);
     }
 }
 

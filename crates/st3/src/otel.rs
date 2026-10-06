@@ -4,10 +4,12 @@
 //! respect per-signal opt-outs and retain correlation attributes, but always use
 //! the st3 unit's service name and explicit resource identity.
 
-use std::io::IsTerminal as _;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
@@ -50,10 +52,63 @@ impl Unit {
 
     fn shutdown_timeout(&self) -> Duration {
         match self {
-            Self::Cli => Duration::from_millis(250),
+            Self::Cli => Duration::from_millis(50),
             Self::Daemon | Self::ReplicationWorker => Duration::from_secs(5),
         }
     }
+}
+
+const CLI_BACKOFF_SECONDS: u64 = 300;
+
+fn cli_backoff_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })?;
+    Some(base.join("st3/otel-cli-backoff"))
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn cli_backoff_active(path: &Path, now: u64) -> bool {
+    // One bounded read; nonblocking/no-follow also tolerates a FIFO or racing symlink.
+    // No lock, collector contact, or retry is allowed on this hot initialization path.
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut value = String::new();
+    if file.take(32).read_to_string(&mut value).is_err() {
+        return false;
+    }
+    value
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|failure| now < failure.saturating_add(CLI_BACKOFF_SECONDS))
+}
+
+fn record_cli_failure(path: &Path, now: u64) -> std::io::Result<()> {
+    let Some(directory) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(directory)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    writeln!(temporary, "{now}")?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 pub fn resource_attributes(unit_service_name: &'static str, node: Option<&str>) -> Vec<KeyValue> {
@@ -137,6 +192,9 @@ pub struct Telemetry {
     meter_provider: Option<SdkMeterProvider>,
     logger_provider: Option<SdkLoggerProvider>,
     shutdown_timeout: Duration,
+    cli: bool,
+    cli_backoff: Option<PathBuf>,
+    forwarded: Option<Arc<AtomicU64>>,
 }
 
 impl Telemetry {
@@ -146,11 +204,28 @@ impl Telemetry {
             meter_provider: None,
             logger_provider: None,
             shutdown_timeout: unit.shutdown_timeout(),
+            cli: matches!(unit, Unit::Cli),
+            cli_backoff: None,
+            forwarded: None,
         };
         // These units previously installed no subscriber. Preserve that behavior when
         // export is disabled; only Driver and hook entrypoints own local diagnostics.
-        if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_none() {
+        if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_none()
+            || std::env::var("OTEL_SDK_DISABLED")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+            || (telemetry.cli && std::env::var("ST3_CLI_OTEL").as_deref() == Ok("off"))
+        {
             return telemetry;
+        }
+        if telemetry.cli {
+            telemetry.cli_backoff = cli_backoff_path();
+            if telemetry
+                .cli_backoff
+                .as_deref()
+                .is_some_and(|path| cli_backoff_active(path, unix_seconds()))
+            {
+                return telemetry;
+            }
         }
         let traces_enabled = signal_export_enabled("OTEL_TRACES_EXPORTER");
         let metrics_enabled = signal_export_enabled("OTEL_METRICS_EXPORTER");
@@ -171,12 +246,14 @@ impl Telemetry {
             {
                 Ok(exporter) => {
                     let config = TailSamplingConfig::default();
+                    let processor = LocalRootTailSampler::new(
+                        BatchSpanProcessor::builder(exporter).build(),
+                        config.clone(),
+                    );
+                    telemetry.forwarded = Some(processor.forwarded_count());
                     let provider = SdkTracerProvider::builder()
                         .with_sampler(crate::otel_sampler::head_sampler(&config))
-                        .with_span_processor(LocalRootTailSampler::new(
-                            BatchSpanProcessor::builder(exporter).build(),
-                            config,
-                        ))
+                        .with_span_processor(processor)
                         .with_resource(resource.clone())
                         .build();
                     opentelemetry::global::set_tracer_provider(provider.clone());
@@ -283,28 +360,53 @@ impl Telemetry {
         if tracer.is_none() && meter.is_none() && logger.is_none() {
             return;
         }
-        let deadline = Instant::now() + self.shutdown_timeout;
+        let kept = self
+            .forwarded
+            .as_ref()
+            .is_some_and(|count| count.load(Ordering::Relaxed) > 0);
+        let wait = !self.cli || kept;
+        let deadline = Instant::now()
+            + if wait {
+                self.shutdown_timeout
+            } else {
+                Duration::ZERO
+            };
+        let backoff = self.cli_backoff.clone().filter(|_| kept);
+        let helper_backoff = backoff.clone();
         let (done, waiting) = std::sync::mpsc::sync_channel(1);
-        // SDK 0.30's meter provider and PeriodicReader accept but IGNORE their timeout
-        // (meter_provider.rs:113,139; periodic_reader.rs:495). force_flush has no timeout.
-        // Keep all shutdown and Drop work off the caller; a timed-out thread is detached,
-        // never joined, so a stalled collector cannot extend the process-exit deadline.
+        // SDK 0.30 returns OTelSdkResult from provider shutdown. BatchSpanProcessor
+        // forwards the final export result; meter shutdown may ignore its timeout.
+        // Keep shutdown AND destruction off the caller, including when nothing was kept.
         let _ = std::thread::spawn(move || {
+            let mut failed = false;
             if let Some(provider) = tracer {
-                let _ = provider
-                    .shutdown_with_timeout(deadline.saturating_duration_since(Instant::now()));
+                failed |= provider
+                    .shutdown_with_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .is_err();
             }
             if let Some(provider) = logger {
-                let _ = provider
-                    .shutdown_with_timeout(deadline.saturating_duration_since(Instant::now()));
+                failed |= provider
+                    .shutdown_with_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .is_err();
             }
             if let Some(provider) = meter {
                 // Final collection is part of shutdown; force_flush would duplicate it.
-                let _ = provider.shutdown();
+                failed |= provider.shutdown().is_err();
+            }
+            if failed && let Some(path) = helper_backoff {
+                let _ = record_cli_failure(&path, unix_seconds());
             }
             let _ = done.send(());
         });
-        let _ = waiting.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        if wait
+            && waiting
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .is_err()
+            && let Some(path) = backoff
+        {
+            // The process can exit before the detached exporter wakes up.
+            let _ = record_cli_failure(&path, unix_seconds());
+        }
     }
 }
 
@@ -316,9 +418,72 @@ impl Drop for Telemetry {
 
 #[cfg(test)]
 mod tests {
-    use super::{SignalChoice, Unit, build_resource, signal_enabled};
+    use super::{
+        SignalChoice, Unit, build_resource, cli_backoff_active, record_cli_failure, signal_enabled,
+    };
     use opentelemetry::{Key, KeyValue, Value};
     use opentelemetry_sdk::Resource;
+
+    #[test]
+    fn cli_backoff_absent_proceeds() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!cli_backoff_active(&root.path().join("absent"), 1_000));
+    }
+
+    #[test]
+    fn cli_backoff_fresh_skips_until_exact_expiry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("st3/otel-cli-backoff");
+        record_cli_failure(&path, 1_000).unwrap();
+        assert!(cli_backoff_active(&path, 1_000));
+        assert!(cli_backoff_active(&path, 1_299));
+        assert!(!cli_backoff_active(&path, 1_300));
+    }
+
+    #[test]
+    fn cli_backoff_stale_proceeds() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("otel-cli-backoff");
+        record_cli_failure(&path, 1_000).unwrap();
+        assert!(!cli_backoff_active(&path, 1_301));
+    }
+
+    #[test]
+    fn cli_backoff_corrupt_proceeds() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("otel-cli-backoff");
+        for value in [
+            "",
+            "not a timestamp",
+            "-1",
+            "1000 garbage",
+            "18446744073709551616",
+        ] {
+            std::fs::write(&path, value).unwrap();
+            assert!(!cli_backoff_active(&path, 1_000), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn cli_backoff_write_atomically_replaces_previous_failure() {
+        use std::io::Read as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("st3/otel-cli-backoff");
+        record_cli_failure(&path, 1_000).unwrap();
+        let mut old_reader = std::fs::File::open(&path).unwrap();
+        record_cli_failure(&path, 2_000).unwrap();
+        let mut old_value = String::new();
+        old_reader.read_to_string(&mut old_value).unwrap();
+        // Existing readers retain the whole previous inode, never a partial rewrite.
+        assert_eq!(old_value, "1000\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "2000\n");
+        assert!(cli_backoff_active(&path, 2_100));
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
 
     #[test]
     fn signal_exporter_choices() {
