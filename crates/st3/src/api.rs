@@ -328,6 +328,11 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/capabilities", get(client_capabilities))
         .route("/v1/client/sets", get(owned_sets::list))
         .route("/v1/client/sets/{*id}", get(owned_sets::get))
+        .route("/v1/client/arrangements", get(client_v0::arrangements::list))
+        .route(
+            "/v1/client/arrangements/{person_name}/{uuid}",
+            get(client_v0::arrangements::get),
+        )
         .route("/v1/client/glasses", get(client_v0::glasses_list))
         .route(
             "/v1/client/glasses/{id}",
@@ -1113,6 +1118,14 @@ fn client_error_envelope(status: StatusCode, raw: &Value, request_id: &str) -> V
 }
 
 fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
+    if matches!(code, Some(
+        "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired"
+        | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle"
+        | "arrangement-body-too-large" | "arrangement-owner-forbidden"
+        | "invalid-arrangement-subject" | "invalid-arrangement-action"
+        | "invalid-arrangement-operations" | "invalid-arrangement-folder"
+        | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference"
+    )) { return false; }
     matches!(
         code,
         Some(
@@ -1141,6 +1154,21 @@ fn client_error_code(code: Option<&str>) -> String {
         | "unsupported-capability"
         | "validation-failed"
         | "idempotency-conflict"
+        | "arrangement-exists"
+        | "arrangement-folder-exists"
+        | "arrangement-retired"
+        | "arrangement-limit"
+        | "arrangement-folder-deleted"
+        | "arrangement-cycle"
+        | "arrangement-body-too-large"
+        | "arrangement-owner-forbidden"
+        | "invalid-arrangement-subject"
+        | "invalid-arrangement-action"
+        | "invalid-arrangement-operations"
+        | "invalid-arrangement-folder"
+        | "invalid-arrangement-name"
+        | "invalid-arrangement-key"
+        | "invalid-subject-reference"
         | "stale-fence"
         | "timeline-history-incomplete"
         | "cursor-gap"
@@ -1347,6 +1375,11 @@ fn client_page_read(
         (items, items_digest, 0, requested_limit, expires_at_unix_ms)
     };
     let end = offset.saturating_add(limit).min(items.len());
+    let end = if collection == "arrangements" {
+        client_v0::arrangements::window_end(&items, offset, end)?
+    } else {
+        end
+    };
     let page_items = items.get(offset..end).unwrap_or_default().to_vec();
     let has_more = end < items.len();
     if query.cursor.is_none() && has_more {
@@ -1555,7 +1588,15 @@ async fn client_capabilities(
             "max_glass_body_bytes": st3_schema::glasses::MAX_BODY_BYTES,
             "max_glasses": st3_schema::glasses::MAX_GLASSES,
             "max_glass_depth": st3_schema::glasses::MAX_DEPTH,
-            "max_glass_nodes": st3_schema::glasses::MAX_NODES
+            "max_glass_nodes": st3_schema::glasses::MAX_NODES,
+            "max_arrangement_body_bytes": st3_schema::arrangements::MAX_BODY_BYTES,
+            "max_arrangement_resource_bytes": st3_schema::arrangements::MAX_RESOURCE_BYTES,
+            "max_arrangements": st3_schema::arrangements::MAX_ARRANGEMENTS,
+            "max_arrangement_name_bytes": st3_schema::arrangements::MAX_NAME_BYTES,
+            "max_arrangement_key_bytes": st3_schema::arrangements::MAX_KEY_BYTES,
+            "max_arrangement_operations": st3_schema::arrangements::MAX_OPERATIONS,
+            "max_arrangement_folders": st3_schema::arrangements::MAX_FOLDERS,
+            "max_arrangement_placements": st3_schema::arrangements::MAX_PLACEMENTS
         },
         "event_cursor": cursor,
         "oldest_event_cursor": format!("event-cursor/{}/{oldest}", state.node),

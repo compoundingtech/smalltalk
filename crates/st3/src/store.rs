@@ -1,6 +1,9 @@
 pub mod custom;
 pub mod declarations;
 mod glass_heads;
+mod arrangements;
+#[cfg(test)]
+mod arrangements_tests;
 mod glasses;
 pub mod owned_sets;
 #[cfg(test)]
@@ -846,6 +849,11 @@ struct ViewEntry {
 }
 
 fn subject_head_at(connection: &Connection, subject: &str, store_index: u64) -> Result<u64> {
+    if subject.starts_with("arrangement/") {
+        let index: u64 = connection.query_row("SELECT changed_index FROM arrangements WHERE subject=?1", [subject], |row| row.get(0)).optional()?.unwrap_or(0);
+        anyhow::ensure!(index <= store_index, "arrangement snapshot frontier is stale");
+        return Ok(index);
+    }
     connection
         .prepare_cached(
             "SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1 AND store_index<=?2",
@@ -942,6 +950,22 @@ fn subject_status_at(
 ) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
     #[cfg(test)]
     SUBJECT_REDUCTIONS.with(|reductions| reductions.set(reductions.get() + 1));
+    if subject.starts_with("arrangement/") {
+        if owner_filter.is_some() { return Ok(None); }
+        let actual = arrangements::arrangement_at(connection, subject, at_index.unwrap_or(i64::MAX as u64))?;
+        let revision = actual.as_ref().and_then(|v| v["revision"].as_str()).map(str::to_owned);
+        let live = actual.is_some();
+        return Ok(Some((SubjectStatus {
+            subject: subject.into(), kind: Some("arrangement".into()),
+            desired_token: None, desired_revision: None, desired: None,
+            actual, actual_claim: revision.clone(), actual_origin: None,
+            harness: None, conflicts: vec![], claims: revision.into_iter().collect(),
+            owner_run: None, gap: None, reachability: if live { "reachable" } else { "unknown" }.into(),
+            reason: None, under: vec![],
+            projection: OperationalAnnotation { layer: if live { "current" } else { "history" }.into(), actionable: false,
+                reasons: if live { vec![] } else { vec!["retired-or-uncreated".into()] }, owner_generation: None, runtime_incarnation: None },
+        }, None)));
+    }
     let desired = desired_row_at(connection, subject, at_index)?;
     let member = desired
         .as_ref()
@@ -2590,6 +2614,7 @@ impl Store {
         rebuild_planning_tx(&transaction)?;
         resources::rebuild(&transaction)?;
         glass_heads::rebuild(&transaction)?;
+        arrangements::rebuild(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -9721,7 +9746,11 @@ impl Store {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-        let subjects = match prefix_upper_bound(prefix) {
+        let subjects = if prefix.starts_with("arrangement/") {
+            connection.prepare_cached("SELECT subject FROM arrangements WHERE subject>=?1 AND subject<?2 ORDER BY subject")?
+                .query_map(params![prefix, prefix_upper_bound(prefix).context("arrangement prefix bound")?], |row| row.get::<_,String>(0))?
+                .collect::<Result<BTreeSet<_>,_>>()?
+        } else { match prefix_upper_bound(prefix) {
             // One seek per subject instead of every claim of every subject in the range.
             Some(bound) => connection
                 .prepare_cached(RANGE_SUBJECTS)?
@@ -9738,7 +9767,7 @@ impl Store {
                     row.get::<_, String>(0)
                 })?
                 .collect::<Result<BTreeSet<_>, _>>()?,
-        };
+        }};
         drop(connection);
         self.status_for_subject_names_at(subjects, store_index, include_history)
     }
@@ -9753,7 +9782,10 @@ impl Store {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-        let subjects = if kind == "runtime.observed" {
+        let subjects = if kind == "arrangement.edited" {
+            connection.prepare_cached("SELECT subject FROM arrangements ORDER BY subject")?
+                .query_map([], |row| row.get::<_,String>(0))?.collect::<Result<BTreeSet<_>,_>>()?
+        } else if kind == "runtime.observed" {
             // One seek per runtime instead of every runtime observation.
             connection
                 .prepare_cached(RUNTIME_SUBJECTS)?
@@ -10057,7 +10089,7 @@ impl Store {
         let mut subjects = Vec::new();
         let mut pending_actions = Vec::new();
         for subject in subject_names {
-            if subject.starts_with("glass/") {
+            if subject.starts_with("glass/") || subject.starts_with("arrangement/") {
                 continue;
             }
             let reduced = match newest {
@@ -15265,6 +15297,7 @@ impl Store {
         matches!(
             kind,
             "lane.approved"
+                | "arrangement.edited"
                 | "lane.joined"
                 | "lane.left"
                 | "lane.marked"
@@ -19093,6 +19126,7 @@ fn append_claim_tx(
     st3_schema::owned_terminals::validate_declaration_owner(subject, kind, actor)
         .map_err(anyhow::Error::new)?;
     st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
+    st3_schema::arrangements::validate_actor(subject, actor).map_err(anyhow::Error::new)?;
     if kind == "owned-set.revised" { owned_sets::validate_receipt(subject, body).map_err(anyhow::Error::new)?; }
     let fields = schema_fields_for_body(kind, body)?;
     let claim_spec = st3_schema::registry()
@@ -19127,6 +19161,9 @@ fn append_claim_tx(
     }
     if kind == "message.sent" {
         agent_messages::flush(transaction)?;
+    }
+    if kind == "arrangement.edited" {
+        arrangements::project(transaction, &record)?;
     }
     normalize_local_projection_timestamps_tx(
         transaction,
@@ -19373,6 +19410,9 @@ fn selected_actual_source_at(
     desired_host: Option<&str>,
 ) -> Result<(Option<String>, Option<String>, bool)> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
+    if subject.starts_with("arrangement/") {
+        return Ok((arrangements::arrangement_at(connection, subject, at_index)?.and_then(|v| v["revision"].as_str().map(str::to_owned)), None, false));
+    }
     // Canonical order, not arrival order, so every node holding these claims selects the same
     // source. Only claims about the subject's actual state can be selected or conflict, so the
     // read leaves out its harness reports.
@@ -19521,6 +19561,9 @@ fn latest_actual_at(
     at_index: Option<u64>,
 ) -> Result<Option<Value>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
+    if subject.starts_with("arrangement/") {
+        return arrangements::arrangement_at(connection, subject, at_index);
+    }
     // Folded in canonical order, so two nodes holding the same claims agree however they
     // received them. `NOT LIKE` also leaves out harness kinds in any letter case, as it always
     // has; the ranges let SQLite seek past the subject's harness reports.
@@ -24035,6 +24078,8 @@ fn classify_replicated_claim_with_registry(
     .map_err(|e| St3Error::new(e.code, e.message))?;
     st3_schema::glasses::validate_owner(&claim.subject, claim.actor.as_deref())
         .map_err(|e| St3Error::new(e.code, e.message))?;
+    st3_schema::arrangements::validate_actor(&claim.subject, claim.actor.as_deref())
+        .map_err(|e| St3Error::new(e.code, e.message))?;
     if claim.subject.starts_with("glass/")
         && (!fields.contains_key("base_revision") || !fields.contains_key("replaced_revision"))
     {
@@ -24899,6 +24944,11 @@ fn try_project_simple_replication_tx(
         )
         .map_err(internal)?;
     }
+    for claim in &claims {
+        if claim.kind == "arrangement.edited" {
+            arrangements::project(transaction, claim).map_err(internal)?;
+        }
+    }
     let mut aggregates = BTreeMap::<String, Option<Aggregate>>::new();
     // A claim is left to its aggregate's rebuild when that aggregate is dirty, and left waiting
     // when it is about a run tree that nothing has created yet.
@@ -25149,6 +25199,7 @@ fn replay_graph_from_nothing_tx(transaction: &Transaction<'_>) -> Result<(), St3
     resources::rebuild(transaction).map_err(internal)?;
     glass_heads::rebuild(transaction).map_err(internal)?;
     custom::rebuild(transaction).map_err(internal)?;
+    arrangements::rebuild(transaction).map_err(internal)?;
     Ok(())
 }
 
@@ -48660,6 +48711,16 @@ fn append_claim_with_fences(
     fence: Option<&crate::mailbox::Fence>,
     event_runtime: Option<&str>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_claim_with_subject_fences(graph, input, fence, event_runtime, None)
+}
+
+fn append_claim_with_subject_fences(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    fence: Option<&crate::mailbox::Fence>,
+    event_runtime: Option<&str>,
+    expected_subjects: Option<&BTreeMap<String, String>>,
+) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
     if local_retention(&input.kind)
         || (input.actor.is_none() && system_local_retention(&input.kind))
@@ -48721,6 +48782,36 @@ fn append_claim_with_fences(
             if let Some((operation_id, request_digest)) = &operation {
                 checkpointed_operation_outcome(transaction, operation_id, request_digest)?;
             }
+            if let Some(expected_subjects) = expected_subjects {
+                for (subject, expected) in expected_subjects {
+                    // Layout edits merge, but retiring a folded duplicate must not lose
+                    // an edit accepted after the client read it.
+                    if subject == &input.subject
+                        && !(input.kind == "arrangement.edited"
+                            && input.fields.get("operations").and_then(Value::as_array)
+                                .is_some_and(|operations| operations.iter().any(|operation| operation["op"] == "retire")))
+                    { continue; }
+                    let actual = if let Some(id) = subject.strip_prefix("launch/") {
+                        transaction.query_row(
+                            "SELECT updated_at_unix_ms FROM planning_sessions WHERE id=?1",
+                            [id], |row| row.get::<_, String>(0),
+                        ).optional().map_err(internal)?.map(|time| format!("launch/{time}"))
+                    } else if subject.starts_with("arrangement/") {
+                        transaction.query_row(
+                            "SELECT revision FROM arrangements WHERE subject=?1 AND created=1 AND retired=0",
+                            [subject], |row| row.get::<_, String>(0),
+                        ).optional().map_err(internal)?
+                    } else {
+                        latest_claim_id_tx(transaction, subject).map_err(internal)?
+                    };
+                    if actual.as_deref() != Some(expected.as_str()) {
+                        return Err(St3Error::new("stale-subject", format!("subject `{subject}` changed"))
+                            .with_detail("subject", subject.clone())
+                            .with_detail("expected_head", json!(expected))
+                            .with_detail("current_head", json!(actual)));
+                    }
+                }
+            }
             // A native adoption may import old DND only before any explicit graph decision.
             // Check inside the writer transaction so a concurrent release always wins.
             if input.kind == "delivery.hold"
@@ -48744,8 +48835,11 @@ fn append_claim_with_fences(
                 }
             }
             if let Some(expected) = &input.expected_subject {
-                let actual =
-                    latest_claim_id_tx(transaction, &input.subject).map_err(internal)?;
+                let actual = if input.kind == "arrangement.edited" {
+                    transaction.query_row("SELECT revision FROM arrangements WHERE subject=?1", [&input.subject], |row| row.get::<_,String>(0)).optional().map_err(internal)?
+                } else {
+                    latest_claim_id_tx(transaction, &input.subject).map_err(internal)?
+                };
                 if &actual != expected {
                     return Err(St3Error::new(
                         "stale-subject",
@@ -48785,6 +48879,7 @@ fn append_claim_with_fences(
             if let Some(fields) = glasses::prepare(transaction, input)? {
                 stored_fields = Some(fields);
             }
+            arrangements::prepare(transaction, input)?;
             // A leave names its own batch as the last sequence of its window. The sequence is only
             // known here, under the writer lock, so a zero high water stands for "this batch".
             if input.kind == "fleet.member-left"
@@ -48820,8 +48915,11 @@ fn append_claim_with_fences(
                     })?;
                 return Ok((latest, false));
             }
-            let predecessor =
-                latest_claim_id_tx(transaction, &input.subject).map_err(internal)?;
+            let predecessor = if input.kind == "arrangement.edited" {
+                transaction.query_row("SELECT revision FROM arrangements WHERE subject=?1", [&input.subject], |row| row.get::<_, String>(0)).optional().map_err(internal)?
+            } else {
+                latest_claim_id_tx(transaction, &input.subject).map_err(internal)?
+            };
             let mut predecessors = predecessor.into_iter().collect::<Vec<_>>();
             // A placement handoff explicitly cites its local runtime and peer stop proof.
             // Keep same-subject evidence as causal links even when a newer declaration
@@ -48897,6 +48995,8 @@ pub fn validate_claim_input(input: &ClaimInput) -> Result<(), St3Error> {
     )
     .map_err(|e| St3Error::new(e.code, e.message))?;
     st3_schema::glasses::validate_owner(&input.subject, input.actor.as_deref())
+        .map_err(|e| St3Error::new(e.code, e.message))?;
+    st3_schema::arrangements::validate_actor(&input.subject, input.actor.as_deref())
         .map_err(|e| St3Error::new(e.code, e.message))?;
     claim_operation(input)?;
     Ok(())
@@ -49028,6 +49128,8 @@ const PROJECTION_DIGEST_TABLES: &[(&str, &[&str])] = &[
     ("blobs", &[]),
     ("documents", &["created_index"]),
     ("desired", &[]),
+    ("arrangements", &["changed_index"]),
+    ("arrangement_registers", &[]),
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),

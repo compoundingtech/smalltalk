@@ -1,5 +1,6 @@
 //! The authoritative st3 subject, resource, and claim registry.
 
+pub mod arrangements;
 pub mod custom;
 pub mod glasses;
 pub mod owned_terminals;
@@ -360,6 +361,9 @@ impl Registry {
                 ));
             }
         }
+        if spec.family == "arrangement" {
+            arrangements::owner(subject)?;
+        }
         Ok(spec)
     }
 
@@ -441,6 +445,12 @@ impl Registry {
                     ));
                 }
             }
+        }
+        if subject_spec.family == "arrangement" {
+            if kind != "arrangement.edited" {
+                return Err(error("claim-write-forbidden", "an arrangement requires arrangement.edited"));
+            }
+            arrangements::operations(subject, fields)?;
         }
         if subject_spec.family == "glass" {
             glasses::owner(subject)?;
@@ -539,6 +549,7 @@ impl Registry {
         actor: Option<&str>,
     ) -> Result<&ClaimSpec, ValidationError> {
         let spec = self.validate_claim(subject, kind, fields)?;
+        arrangements::validate_actor(subject, actor)?;
         let allowed = spec.write_policy == WritePolicy::OrdinaryClient
             || (spec.write_policy == WritePolicy::SameSubjectActor && actor == Some(subject));
         if !allowed {
@@ -745,6 +756,12 @@ fn build_registry() -> Registry {
         ),
         ("person", "person/IDENTITY", "A human actor.", false),
         (
+            "arrangement",
+            "arrangement/person/NAME/UUIDv7",
+            "A permanently person-owned shared folder arrangement.",
+            false,
+        ),
+        (
             "glass",
             "glass/person/NAME/UUID",
             "A private person workspace.",
@@ -867,6 +884,7 @@ fn build_registry() -> Registry {
 
 fn resource_specs() -> BTreeMap<String, ResourceSpec> {
     let mut resources = BTreeMap::new();
+    resources.insert("arrangement".into(), resource("arrangement", "A person-owned per-register arrangement.", &[("owner", FieldSpec { immutable: true, ..required_reference_to(&["person"]) }), ("body", object())]));
     resources.insert(
         "vcs.repository".into(),
         resource(
@@ -1149,6 +1167,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
                 "stop",
                 "subscription",
             ],
+        ),
+        (
+            "arrangement.edited",
+            &["arrangement"],
+            WritePolicy::OrdinaryClient,
+            Cardinality::Append,
+            Some("arrangements"),
+            false,
+            &[],
         ),
         (
             "glass.upserted",
@@ -2458,6 +2485,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("revision", string()),
             ("desired", object()),
         ],
+        "arrangement.edited" => &[("owner", required_reference_to(&["person"])), ("operations", required_array()), ("action_id", string()), ("action_digest", string())],
         "glass.upserted" => &[
             ("body", object()),
             ("base_revision", string()),
@@ -3887,6 +3915,7 @@ mod tests {
             [
                 "account",
                 "agent",
+                "arrangement",
                 "attention",
                 "checkpoint",
                 "checkpoint-excusal",
@@ -3928,6 +3957,7 @@ mod tests {
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
             [
+                "arrangement",
                 "ci.run",
                 "filesystem.file",
                 "harness.session-file",
@@ -3965,6 +3995,7 @@ mod tests {
                 "agent.placement.source-offline",
                 "agent.presence",
                 "agent.queue.moved",
+                "arrangement.edited",
                 "attention.requested",
                 "attention.resolved",
                 "checkpoint.excused",
@@ -4368,6 +4399,7 @@ mod tests {
             assert!(spec.fields.contains_key("attempt"));
         }
     }
+
 
     #[test]
     fn checked_in_schema_document_matches_the_registry() {
