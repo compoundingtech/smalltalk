@@ -945,6 +945,14 @@ fn runtime_view_entry(
     })
 }
 
+#[derive(Clone, Copy)]
+enum SubjectStatusMode {
+    Full,
+    /// Agent cards replace the harness with observed evidence and never expose desired
+    /// conflicts. Provenance is only the last canonical claim, and only without a declaration.
+    AgentCard,
+}
+
 /// One subject's status at `at_index`, and the action it asks of its host when it is current and
 /// differs from what is declared. With `owner_filter`, a subject another run owns is skipped.
 fn subject_status_at(
@@ -952,6 +960,16 @@ fn subject_status_at(
     subject: &str,
     at_index: Option<u64>,
     owner_filter: Option<&str>,
+) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
+    subject_status_at_with_mode(connection, subject, at_index, owner_filter, SubjectStatusMode::Full)
+}
+
+fn subject_status_at_with_mode(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    owner_filter: Option<&str>,
+    mode: SubjectStatusMode,
 ) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
     #[cfg(test)]
     SUBJECT_REDUCTIONS.with(|reductions| reductions.set(reductions.get() + 1));
@@ -983,14 +1001,25 @@ fn subject_status_at(
         at_index,
         member.as_ref().map(|member| member.host.as_str()),
     )?;
-    let harness = current_harness_at(connection, subject, at_index)?;
-    let claims = claim_ids_at(connection, subject, at_index)?;
-    let conflicts = desired_conflicts_at(
-        connection,
-        subject,
-        desired.as_ref().map(|row| row.claim_id.as_str()),
-        at_index,
-    )?;
+    let (harness, claims, conflicts) = match mode {
+        SubjectStatusMode::Full => (
+            current_harness_at(connection, subject, at_index)?,
+            claim_ids_at(connection, subject, at_index)?,
+            desired_conflicts_at(connection, subject, desired.as_ref().map(|row| row.claim_id.as_str()), at_index)?,
+        ),
+        SubjectStatusMode::AgentCard => {
+            let claims = if desired.is_some() {
+                Vec::new()
+            } else {
+                connection.prepare_cached(&canonical_sql(
+                    "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
+                     ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ))?.query_row(params![subject, at_index.unwrap_or(i64::MAX as u64)], |row| row.get::<_, String>(0))
+                    .optional()?.into_iter().collect()
+            };
+            (None, claims, Vec::new())
+        }
+    };
     let kind = desired.as_ref().map(|row| row.kind.clone());
     let owner_run = desired.as_ref().and_then(|row| row.owner_run.clone());
     let owner_generation = desired
@@ -10132,6 +10161,36 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn forget_current_views(&self) {
         self.smalltalk.forget_views();
+    }
+
+    /// Only fields consumed by agent cards, retaining the full reducer's membership,
+    /// reachability and operational annotation. Never use this for a public status response.
+    pub(crate) fn agent_card_status_at(
+        &self,
+        names: Option<&BTreeSet<String>>,
+        index: u64,
+        history: bool,
+    ) -> Result<StatusResponse> {
+        let connection = self.readers.get();
+        let index = selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
+        let names = match names {
+            Some(names) => names.clone(),
+            None => connection.prepare_cached(RANGE_SUBJECTS)?
+                .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?,
+        };
+        let names = if history { names } else {
+            self.current_view_candidates(&connection, names, index, true)?
+        };
+        let mut subjects = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some((status, _)) = subject_status_at_with_mode(
+                &connection, &name, Some(index), None, SubjectStatusMode::AgentCard,
+            )? && (history || status.projection.layer == "current") {
+                subjects.push(status);
+            }
+        }
+        Ok(StatusResponse { store_index: index, subjects, pending_actions: Vec::new() })
     }
 
     pub(crate) fn status_for_subject_names_at(
