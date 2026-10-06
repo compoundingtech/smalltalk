@@ -430,9 +430,11 @@ def killed_scenarios(node, seat, checks):
     seat.applied()
     after_foreign = json.loads(ledger_path.read_text())
     expect(after_foreign == owned, f"foreign hooks mutated the owned ledger: {after_foreign}")
+    authority = [row for row in seat.receipts() if row["event"] == "foreign-hook-authority"][-1]
     checks["foreign_claude_hooks_preserve_owned_child"] = {
         "native_session": owned.get("session_id"), "running_ids": sorted(owned["running"]),
         "ledger_unchanged": True,
+        "wrapper_authority": authority,
     }
     body = "mail remains deliverable while a background child runs"
     node.cli("conversations", "send", seat.subject, "--from", "person/eval",

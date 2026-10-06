@@ -91,13 +91,13 @@ def append(path, row):
         stream.write(json.dumps(row) + "\n")
 
 
-def hooks(event, payload):
+def hooks(event, payload, environment=None):
     base = {"session_id": session_id, "transcript_path": str(transcript()), "cwd": cwd,
             "hook_event_name": event}
     for group in settings.get("hooks", {}).get(event, []):
         for hook in group.get("hooks", []):
             result = subprocess.run(["bash", "-c", hook["command"]], input=json.dumps({**base, **payload}),
-                                    capture_output=True, text=True, timeout=60)
+                                    capture_output=True, text=True, timeout=60, env=environment)
             receipt("hook", hook_event=event, exit=result.returncode, stderr=result.stderr[-2000:])
 
 
@@ -186,6 +186,15 @@ def apply(op):
         start_session(op.get("source", "clear"))
     elif name == "foreign-hooks":
         foreign = str(uuid.uuid4())
+        # A delayed predecessor also carries its retired wrapper authority. Borrowing the
+        # current wrapper's sequence would synthesize a current parent PreToolUse instead.
+        current_seq = int(os.environ["ST_CLAUDE_SESSION_SEQ"])
+        if current_seq < 1:
+            raise RuntimeError("foreign hook proof needs an established wrapper sequence")
+        retired = {**os.environ, "ST_CLAUDE_SESSION": "retired-wrapper-" + foreign,
+                   "ST_CLAUDE_SESSION_SEQ": str(current_seq - 1)}
+        receipt("foreign-hook-authority", current_sequence=current_seq,
+                retired_sequence=current_seq - 1)
         for event, payload in [
             ("SessionEnd", {"reason": "clear"}),
             ("SubagentStart", {"agent_id": "foreign-child", "agent_type": "general-purpose"}),
@@ -194,7 +203,7 @@ def apply(op):
             ("PreToolUse", {"tool_name": "Agent", "tool_use_id": "foreign-launch",
                             "tool_input": {"description": "foreign launch"}}),
         ]:
-            hooks(event, {**payload, "session_id": foreign})
+            hooks(event, {**payload, "session_id": foreign}, environment=retired)
     elif name == "claim-ready":
         listed = subprocess.run([os.environ["ST3_BIN"], "work", "ls", "--as", os.environ["ST_AGENT"], "--json"],
                                 capture_output=True, text=True, timeout=60)
