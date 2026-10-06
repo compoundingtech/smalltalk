@@ -110,9 +110,13 @@ pub async fn run(
     };
     let mut subscription = Subscription::start(client.clone(), state.fence.clone(), report());
     let mut watch = st_drivers::reexec::ReplacementWatch::for_current_process();
-    let readiness = announce_ready(client, &state.fence);
+    // Retry the identical claim after a failed acknowledgement. The existing tick
+    // schedules retries; polling the POST separately keeps MCP input and EOF live.
+    let readiness_input = readiness_claim(&state.fence);
+    let readiness = announce_ready(client, &readiness_input);
     tokio::pin!(readiness);
     let mut readiness_recorded = false;
+    let mut readiness_pending = true;
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut messages = Vec::<MessageView>::new();
@@ -125,8 +129,14 @@ pub async fn run(
     let mut diagnostics = BTreeMap::<String, DiagnosticReport>::new();
     loop {
         tokio::select! {
-            _ = &mut readiness, if state.initialized && !readiness_recorded => {
-                readiness_recorded = true;
+            result = &mut readiness, if state.initialized && readiness_pending => {
+                readiness_pending = false;
+                readiness_recorded = result.is_ok();
+                if readiness_recorded {
+                    retries.remove("channel-ready");
+                } else {
+                    retry_failed(&mut retries, "channel-ready");
+                }
             },
             frame = subscription.receiver.recv() => match frame {
                 Some(Frame::Mailbox { messages: next }) => { messages = next; replayed = true; },
@@ -148,6 +158,11 @@ pub async fn run(
                 Some(st_drivers::reexec::StdinChunk::Failed(error)) => return Err(error.into()),
             },
             _ = interval.tick() => {
+                if state.initialized && !readiness_recorded && !readiness_pending
+                    && retry_ready(&retries, "channel-ready") {
+                    readiness.set(announce_ready(client, &readiness_input));
+                    readiness_pending = true;
+                }
                 subscription.report(json!({"transport":"claude-channel", "pid":std::process::id(),
                     "image":st_drivers::reexec::running_identity().map(|i| i.token()),
                     "follows":st_drivers::reexec::installed_binary().map(|path| path.display().to_string()),
@@ -325,35 +340,34 @@ pub async fn run(
     }
 }
 
-async fn announce_ready(client: &Client, fence: &Fence) {
+fn readiness_claim(fence: &Fence) -> ClaimInput {
     // Positive native readiness requires both initialization and the bound incarnation.
     // Publishing it must not hold up Claude's remaining MCP startup requests during an outage.
-    let _: Result<ClaimRecord> = client
-        .post(
-            "/v1/claims",
-            &ClaimInput {
-                subject: fence.subject.clone(),
-                kind: "harness.observed".into(),
-                actor: Some(fence.subject.clone()),
-                fields: {
-                    let mut fields = BTreeMap::from([
-                        ("state".into(), json!("ready")),
-                        ("driver".into(), json!("claude")),
-                        ("transport".into(), json!("claude-channel")),
-                        ("incarnation_id".into(), json!(fence.incarnation)),
-                    ]);
-                    crate::suspension::annotate_quiescence(&mut fields);
-                    fields
-                },
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some(format!(
-                    "channel-ready:{}:{}:{}",
-                    fence.subject, fence.incarnation, fence.epoch
-                )),
-            },
-        )
-        .await;
+    ClaimInput {
+        subject: fence.subject.clone(),
+        kind: "harness.observed".into(),
+        actor: Some(fence.subject.clone()),
+        fields: {
+            let mut fields = BTreeMap::from([
+                ("state".into(), json!("ready")),
+                ("driver".into(), json!("claude")),
+                ("transport".into(), json!("claude-channel")),
+                ("incarnation_id".into(), json!(fence.incarnation)),
+            ]);
+            crate::suspension::annotate_quiescence(&mut fields);
+            fields
+        },
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some(format!(
+            "channel-ready:{}:{}:{}",
+            fence.subject, fence.incarnation, fence.epoch
+        )),
+    }
+}
+
+async fn announce_ready(client: &Client, input: &ClaimInput) -> Result<ClaimRecord> {
+    client.post("/v1/claims", input).await
 }
 
 #[derive(Default)]
@@ -369,8 +383,10 @@ fn retry_ready(retries: &BTreeMap<String, Retry>, key: &str) -> bool {
 fn retry_failed(retries: &mut BTreeMap<String, Retry>, key: &str) {
     let retry = retries.entry(key.into()).or_default();
     retry.failures = retry.failures.saturating_add(1);
-    let seconds = (1_u64 << retry.failures.saturating_sub(1).min(5)).min(30);
-    retry.due = Some(Instant::now() + Duration::from_secs(seconds));
+    retry.due = Some(Instant::now() + retry_delay(retry.failures));
+}
+fn retry_delay(failures: u32) -> Duration {
+    Duration::from_secs((1_u64 << failures.saturating_sub(1).min(5)).min(30))
 }
 struct DiagnosticReport {
     reason: String,
@@ -624,6 +640,22 @@ fn request(line: &str, initialized: &mut bool) -> Result<Option<Value>> {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn claude_channel_retry_backoff_caps_at_thirty_seconds() {
+        for (failures, seconds) in [
+            (1, 1),
+            (2, 2),
+            (3, 4),
+            (4, 8),
+            (5, 16),
+            (6, 30),
+            (7, 30),
+            (u32::MAX, 30),
+        ] {
+            assert_eq!(retry_delay(failures), Duration::from_secs(seconds));
+        }
+    }
 
     #[test]
     fn claude_receipt_state_accepts_ledgers_written_before_native_acceptance_tracking() {

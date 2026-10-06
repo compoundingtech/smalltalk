@@ -127,6 +127,11 @@ loader logs cannot be attributed conclusively to that timeout.
 The channel now answers initialization and metadata requests while incarnation discovery and
 binding retry. A fresh binding also keeps waiting when its own nonterminal hook activity precedes
 `runtime.running`; those hooks allocate no ownership and cannot revive an exited incarnation.
+If that runtime observation never arrives, the existing bounded seat-restart recovery still
+bounds the missing-channel episode. After initialization and binding, a failed readiness POST
+retries the identical claim and idempotency key until acknowledged. The existing one-second tick
+schedules retries after 1, 2, 4, 8, 16 and then 30 seconds, capped there while failures continue.
+MCP requests and EOF remain responsive while that POST is pending.
 It reports no readiness and reads no mailbox until binding succeeds. When the
 daemon returns, the same initialized child attaches; a later transport outage reconnects using
 its existing fence. Native handoff tracking and receipts prevent replay. EOF cancels a pending

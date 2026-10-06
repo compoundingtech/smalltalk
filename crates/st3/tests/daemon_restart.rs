@@ -2094,6 +2094,137 @@ async fn claude_mcp_answers_during_binding_retries_and_eof_cancels_attachment() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_mcp_retries_readiness_without_blocking_requests_or_eof() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    // The second POST either succeeds, or remains pending until EOF cancels the child.
+    // Exercise the actual channel loop, rather than manually calling the POST twice.
+    for recover in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let mut daemon = Daemon::new(root);
+        declare_claude(&daemon, "agent/quartz");
+        daemon.observe_running("agent/quartz", "wrapper-readiness");
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let captured = attempts.clone();
+        let app = st3::api::router(daemon.state()).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let captured = captured.clone();
+                async move {
+                    if request.method() != axum::http::Method::POST
+                        || request.uri().path() != "/v1/claims"
+                    {
+                        return next.run(request).await;
+                    }
+                    let (parts, body) = request.into_parts();
+                    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    let input: Value = serde_json::from_slice(&bytes).unwrap();
+                    if input["kind"] == "harness.observed"
+                        && input["fields"]["transport"] == "claude-channel"
+                        && input["fields"]["state"] == "ready"
+                    {
+                        let count = {
+                            let mut attempts = captured.lock().unwrap();
+                            attempts.push(input);
+                            attempts.len()
+                        };
+                        if count == 1 {
+                            return axum::response::IntoResponse::into_response((
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                "readiness publication temporarily unavailable",
+                            ));
+                        }
+                        if !recover {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                    next.run(axum::extract::Request::from_parts(
+                        parts,
+                        axum::body::Body::from(bytes),
+                    ))
+                    .await
+                }
+            },
+        ));
+        daemon.start_isolated_app(app).await;
+        let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-readiness");
+        let (mut channel, mut input, received) =
+            fixture.open(root, &daemon, "wrapper-readiness").await;
+        wait_until(
+            "the failed readiness POST retries",
+            Duration::from_secs(5),
+            || attempts.lock().unwrap().len() >= 2,
+        )
+        .await;
+        writeln!(
+            input,
+            "{}",
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("readiness POST blocked MCP metadata")["id"],
+            2
+        );
+        if recover {
+            wait_until(
+                "the retry publishes durable readiness",
+                Duration::from_secs(5),
+                || {
+                    !daemon
+                        .store
+                        .claims_for("agent/quartz", Some("harness.observed"))
+                        .unwrap()
+                        .is_empty()
+                },
+            )
+            .await;
+            // Acknowledged readiness stops posting on subsequent ordinary ticks.
+            tokio::time::sleep(Duration::from_millis(2200)).await;
+            let claims = daemon
+                .store
+                .claims_for("agent/quartz", Some("harness.observed"))
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].body["fields"]["state"], "ready");
+        } else {
+            assert!(
+                daemon
+                    .store
+                    .claims_for("agent/quartz", Some("harness.observed"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        {
+            let attempts = attempts.lock().unwrap();
+            assert_eq!(
+                attempts.len(),
+                2,
+                "readiness retried after success or while a POST was still pending"
+            );
+            assert_eq!(
+                attempts[0], attempts[1],
+                "readiness retry mutated the claim or idempotency key"
+            );
+        }
+        drop(input);
+        wait_until(
+            "EOF cancels readiness publication",
+            Duration::from_secs(5),
+            || channel.try_wait().unwrap().is_some(),
+        )
+        .await;
+        assert!(channel.try_wait().unwrap().unwrap().success());
+        daemon.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receipt_forms() {
     if st3::test_support::supervise_test() {
         return;
