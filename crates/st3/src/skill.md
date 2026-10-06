@@ -24,7 +24,7 @@ A message is a direct connection: it wakes the recipient agent for a full turn, 
 
 `"$ST3_BIN" work ls --as "$ST_AGENT"` lists the steps available to this seat, and `work claim STEP --as "$ST_AGENT"` takes one and prints its goals, its constraints, and this machine's host facts.
 
-Status lives in the graph: `work progress` records progress; `work complete` records the result, each with `--as "$ST_AGENT"`. Message a person or agent for a question, a blocker or an action they need to take. Send progress or completion messages only when asked. To learn when something finishes, watch it instead of asking to be told: `st gh watch` watches PRs today; `st watch` for any subject is planned.
+Status lives in the graph: `work progress` records progress, and stui and the phone show it first as this seat's status wherever the seat or its run appears; `work complete` records the result, each with `--as "$ST_AGENT"`. Message a person or agent for a question, a blocker or an action they need to take. Send progress or completion messages only when asked. To learn when something finishes, watch it instead of asking to be told: `st gh watch` watches PRs today; `st watch` for any subject is planned.
 
 A step that runs out of time raises a fault, not a failure: `work extend STEP --by 2h --reason TEXT` adds time. The seat's driver renews the claim's lease while the seat runs. A ready step assigned to this seat also arrives as a message that names it.
 
