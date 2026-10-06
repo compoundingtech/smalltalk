@@ -10,6 +10,32 @@ A mission is an immutable definition in the claims graph. Publishing a mission d
 
 A mission run has one stable subject. Each immutable run generation binds that run to one exact mission revision.
 
+## First readiness under load
+
+The origin-local reconciler evaluates active mission runs with all-pending current generations
+first, newest first within each group. Each pass takes a finite snapshot and evaluates every
+needed run in it, including older runs and cleanup. New arrivals join the next snapshot. This
+protects a new run's first readiness from earlier runs' gate-result writes without changing
+dependencies, baselines, assignment eligibility, leases, or readiness epochs. It cannot preempt
+a writer operation or reconciliation stage already in progress, or bound the new run's own gates.
+
+When the evaluator reaches satisfied first-readiness predicates after **120,000 ms (two minutes)**
+with every current step still pending at epoch zero, it records `reconcile.fault` on that run with
+scope `scheduler/first-readiness`. The reason names the run and the wait observed at detection.
+The clock starts at the latest creation time of the run and its current steps, so a new generation
+gets its own grace period. This diagnosis happens at the actual admission boundary, after mission
+and step baselines, dependency, backoff, and assignment checks; ordinary predicate blockers do
+not become scheduler faults. It reports late evaluation when the evaluator reaches the run,
+including after a stalled writer returns; it is not an independent writer watchdog.
+
+The fault is recorded once while open, including across daemon restarts. Elapsed time alone does
+not replace it. Admission still proceeds; the next evaluation records recovery when the run no
+longer waits for first readiness, and termination also closes the fault. Its durable fault and
+recovery history remain available. An open fault appears immediately in `st missions show
+mission-run/EXAMPLE`, `st doctor` (`mission-first-readiness`), and the mission blocker and fault
+views in stui. The usual additional two-minute fault-attention delay does not apply because this
+scheduler diagnosis already has a two-minute threshold.
+
 ## Core rules
 
 - A mission has `draft`, `ready`, or `retired` state.

@@ -1676,7 +1676,9 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
             let run_id=run["id"].as_str().expect("run header id");
             let (total,done,steps)=store.mission_step_preview(run_id)?;
             let terminal=matches!(run["status"].as_str(),Some("completed"|"failed"|"cancelled"));
+            let scheduler_fault=store.reconcile_fault(run_id, crate::reconcile::FIRST_READINESS_FAULT_SCOPE)?;
             let must_act=if terminal {"nobody"} else if attention.contains(run_id) {"you"}
+                else if scheduler_fault.is_some() {"blocked"}
                 else if steps.iter().any(|s| matches!(s.status.as_str(),"ready"|"claimed"|"working")
                     && (s.assigned_to.is_some() || s.claimant.is_some() || !s.available_to.is_empty())) {"agent"}
                 else if steps.iter().any(|s| s.status=="blocked") {"blocked"} else {"system"};
@@ -1684,7 +1686,7 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
                 "id":step.subject,"path":step.step,"title":step.title,"state":client_work_state(&step.status),
                 "attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,
                 "agentless":step.agentless,"since":client_timestamp(step.updated_at_unix_ms),
-                "blocked_reason":step.blocked_reason,"blockers":step.blockers,
+                "blocked_reason":step.blocked_reason.as_deref().or_else(|| scheduler_fault.as_deref().filter(|_| step.status=="pending")),"blockers":step.blockers,
                 "goals":step.goals,"constraints":step.constraints
             })).collect::<Vec<_>>();
             let current=shown.iter().filter(|s| matches!(s["state"].as_str(),Some("ready"|"claimed"|"verifying"|"blocked")))
@@ -1693,10 +1695,12 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
                 "id":run["id"],"generation_id":run["generation_id"],"requester":run["requester"],
                 "status":run["status"],"phase":run["phase"],"progress":{"done":done,"total":total},
                 "current_steps":current,"must_act":must_act,
+                "blocker":scheduler_fault.map(|reason| json!({"step":steps.first().map(|step| &step.subject),"reason":reason,"scope":crate::reconcile::FIRST_READINESS_FAULT_SCOPE})),
                 "state_since":client_timestamp(run["updated_at_unix_ms"].as_u64().unwrap_or(0) as u128),
                 "steps":shown
             }))
         }).collect::<anyhow::Result<Vec<_>>>()?;
+        let state=if details.iter().any(|run| run["blocker"]["scope"]==crate::reconcile::FIRST_READINESS_FAULT_SCOPE) {"blocked"} else {state};
         let must_act=["you","agent","blocked","system"].into_iter()
             .find(|kind| details.iter().any(|run| run["must_act"]==*kind)).unwrap_or(if active>0 {"system"} else {"nobody"});
         let generations=newest.iter().map(|r| (r["id"].as_str().unwrap().to_owned(),r["generation_id"].clone()))
@@ -1935,6 +1939,8 @@ fn mission_resources_filtered(
                             "nobody"
                         } else if human_attention_runs.contains(run.subject.as_str()) {
                             "you"
+                        } else if run.scheduler_fault.is_some() {
+                            "blocked"
                         } else if run.steps.iter().any(|step| {
                             matches!(step.status.as_str(), "ready" | "claimed" | "working")
                                 && (step.assigned_to.is_some()
@@ -1966,10 +1972,12 @@ fn mission_resources_filtered(
                                 "at": client_timestamp(outcome.at_unix_ms),
                             })
                         });
-                    let blocker =
+                    let blocker = run.scheduler_fault.as_ref().map(|reason| json!({
+                        "step": run.steps.first().map(|step| &step.subject), "reason": reason, "scope": crate::reconcile::FIRST_READINESS_FAULT_SCOPE,
+                    })).or_else(||
                         run.steps.iter().find(|step| step.status == "blocked").map(
                             |step| json!({"step": step.subject, "reason": step.blocked_reason}),
-                        );
+                        ));
                     // A mission carries the steps of its open runs and its latest run, and its
                     // detail carries every run's steps, so a client never joins work to missions.
                     let shows_steps = selected_id.is_some()
@@ -2007,7 +2015,7 @@ fn mission_resources_filtered(
                                     "agentless": step.agentless,
                                     "since": client_timestamp(step.updated_at_unix_ms),
                                     "last_progress": step.progress_summary,
-                                    "blocked_reason": step.blocked_reason,
+                                    "blocked_reason": step.blocked_reason.as_deref().or_else(|| run.scheduler_fault.as_deref().filter(|_| step.status == "pending")),
                                     "blockers": step.blockers,
                                     "goals": step.goals,
                                     "constraints": step.constraints,
@@ -2042,6 +2050,7 @@ fn mission_resources_filtered(
                     }))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            let state = if run_details.iter().any(|run| run["blocker"]["scope"] == crate::reconcile::FIRST_READINESS_FAULT_SCOPE) { "blocked" } else { state };
             let must_act = ["you", "agent", "blocked", "system"]
                 .into_iter()
                 .find(|kind| run_details.iter().any(|run| run["must_act"] == *kind))

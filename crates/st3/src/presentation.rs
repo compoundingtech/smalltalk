@@ -164,6 +164,9 @@ pub(crate) fn render_mission_run(
     }
     for run in &visible_runs {
         append_named_list(&mut output, "STUCK GATES", &run.stuck_gates, style);
+        if let Some(fault) = &run.scheduler_fault {
+            let _ = writeln!(output, "SCHEDULER FAULT  {fault}");
+        }
     }
     if !selected.inputs.is_empty() {
         let _ = writeln!(output);
@@ -1479,6 +1482,7 @@ mod tests {
             steps,
             loops: Vec::new(),
             stuck_gates: Vec::new(),
+            scheduler_fault: None,
         }
     }
 

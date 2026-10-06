@@ -711,6 +711,27 @@ pub trait FaultInjection: Send + Sync + 'static {
     fn fault(&self, scope: &str, subject: &str) -> Option<String>;
 }
 
+pub(crate) const FIRST_READINESS_FAULT_AFTER_MS: u128 = 120_000;
+pub(crate) const FIRST_READINESS_FAULT_SCOPE: &str = "scheduler/first-readiness";
+
+fn first_readiness_pending(run: &MissionRunView) -> bool {
+    run.phase == "normal"
+        && !run.steps.is_empty()
+        && run
+            .steps
+            .iter()
+            .all(|step| step.status == "pending" && step.readiness_epoch == 0)
+}
+
+fn first_readiness_since(run: &MissionRunView) -> u128 {
+    run.steps
+        .iter()
+        .map(|step| step.created_at_unix_ms)
+        .max()
+        .unwrap_or(run.created_at_unix_ms)
+        .max(run.created_at_unix_ms)
+}
+
 pub struct Reconciler<R = NativeRuntime> {
     store: Arc<Store>,
     runtime: Arc<R>,
@@ -6571,6 +6592,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .map(|observation| observation.status)
         });
         let ids = self.store.active_mission_run_ids_for_origin(&self.host)?;
+        self.evaluate_mission_run_ids(ids)
+    }
+
+    fn evaluate_mission_run_ids(&self, ids: Vec<String>) -> Result<()> {
         let mut active_generations = BTreeSet::new();
         let mut active_steps = BTreeSet::new();
         let mut changed = false;
@@ -6654,7 +6679,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .iter()
             .flatten()
             .filter(|((subject, scope), _)| match scope.as_str() {
-                "mission-run" => !active.contains(subject),
+                "mission-run" | FIRST_READINESS_FAULT_SCOPE => !active.contains(subject),
                 "step" => !active_steps.contains(subject),
                 _ => false,
             })
@@ -6690,6 +6715,15 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn evaluate_active_mission_run(&self, run: &MissionRunView) -> Result<bool> {
+        if !first_readiness_pending(run)
+            || now_ms().saturating_sub(first_readiness_since(run)) < FIRST_READINESS_FAULT_AFTER_MS
+        {
+            self.close_fault(
+                &run.subject,
+                FIRST_READINESS_FAULT_SCOPE,
+                "the run no longer has an overdue first-readiness wait",
+            )?;
+        }
         if run.phase == "normal"
             && let Some(reason) = self.store.stale_subscription_pull_request_run(run)?
         {
@@ -7177,6 +7211,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                             )?;
                             return Ok(changed);
                         }
+                        // Use the actual admission predicates, including evaluated baselines.
+                        // Record the late first readiness without delaying its recovery.
+                        self.record_first_readiness_wait(run, now_ms())?;
                         changed |= self.store.set_step_state(&view.subject, "ready", None)?;
                         return Ok(changed);
                     }
@@ -7387,6 +7424,28 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .set_mission_run_state(&run.id, status, "normal", reason)?;
         }
         Ok(changed)
+    }
+
+    fn record_first_readiness_wait(&self, run: &MissionRunView, now: u128) -> Result<()> {
+        if !first_readiness_pending(run) {
+            return Ok(());
+        }
+        // A revision can replace an old run's generation. Its new steps get their own grace.
+        let since = first_readiness_since(run);
+        let waited = now.saturating_sub(since);
+        if waited < FIRST_READINESS_FAULT_AFTER_MS {
+            return Ok(());
+        }
+        // Elapsed time changes on every pass; it must not manufacture a new cause each time.
+        if self.open_faults()?.as_ref().is_some_and(|faults| {
+            faults.contains_key(&(run.subject.clone(), FIRST_READINESS_FAULT_SCOPE.into()))
+        }) {
+            return Ok(());
+        }
+        self.record_fault(&run.subject, FIRST_READINESS_FAULT_SCOPE, Err(anyhow::anyhow!(
+            "{} waited {waited}ms with every step pending before satisfied readiness predicates were reached (threshold {FIRST_READINESS_FAULT_AFTER_MS}ms)",
+            run.subject
+        )))
     }
 
     fn reconcile_mission_run_cleanup(&self, run: &MissionRunView) -> Result<bool> {
@@ -12783,6 +12842,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let subject = format!("gate-operation/predicate/{}", &digest[..32]);
             fields.insert("operation".into(), Value::String(subject.clone()));
+            if let Some(reason) = self
+                .fault_injection
+                .as_ref()
+                .and_then(|injection| injection.fault("gate-write", &subject))
+            {
+                anyhow::bail!(reason);
+            }
             self.record_once(&subject, "gate.result", fields)?;
         }
         Ok(outcome)
@@ -15243,10 +15309,11 @@ fn now_ms() -> u128 {
 mod tests {
     mod channel_recovery;
     mod differential;
+    mod first_readiness_tests;
     mod incremental_deadlines;
-    mod rollout_tests;
-    mod ref_watch_tests;
     mod pull_request_run_tests;
+    mod ref_watch_tests;
+    mod rollout_tests;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};

@@ -2209,6 +2209,9 @@ pub struct MissionRunView {
     /// Unresolved exit-code field gates on terminal execs, computed for mission details.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stuck_gates: Vec<String>,
+    /// An unresolved scheduler fault on this run, with its observed first-readiness wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_fault: Option<String>,
 }
 
 /// Who set a finished run's outcome, from what, and why.

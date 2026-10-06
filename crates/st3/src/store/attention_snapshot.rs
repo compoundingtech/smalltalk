@@ -461,8 +461,9 @@ impl Store {
         }
         let mut items = Vec::new();
         for ((source, scope, _origin), claim) in latest {
+            let first_readiness = scope == crate::reconcile::FIRST_READINESS_FAULT_SCOPE;
             if claim.body["fields"]["status"] != "faulted"
-                || as_of.saturating_sub(claim.accepted_at_unix_ms) < 120_000
+                || (!first_readiness && as_of.saturating_sub(claim.accepted_at_unix_ms) < 120_000)
             {
                 continue;
             }
@@ -471,6 +472,10 @@ impl Store {
                     continue;
                 };
                 if !person_work::run_live(&connection, &step.run, Some(&step.generation), true)? {
+                    continue;
+                }
+            } else if source.starts_with("mission-run/") {
+                if !person_work::run_live(&connection, &source, None, true)? {
                     continue;
                 }
             } else if !source.starts_with("daemon/")
@@ -489,13 +494,17 @@ impl Store {
                 launch_id: None,
                 variant_id: None,
                 message_id: None,
-                title: format!("st cannot reconcile {source}"),
+                title: if first_readiness {
+                    format!("First readiness was delayed for {source}")
+                } else {
+                    format!("st cannot reconcile {source}")
+                },
                 detail: format!(
                     "{scope}: {}. Inspect with `st subject {source}`.",
                     claim.body["fields"]["reason"].as_str().unwrap_or_default()
                 ),
                 mission: None,
-                mission_run: None,
+                mission_run: source.starts_with("mission-run/").then(|| source.clone()),
                 step: None,
                 targets: vec![source.clone()],
                 requested_at_unix_ms: claim.accepted_at_unix_ms,
