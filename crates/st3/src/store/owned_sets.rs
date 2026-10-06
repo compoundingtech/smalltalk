@@ -105,6 +105,10 @@ pub struct Preview {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub declaration_diffs: BTreeMap<String, declarations::DeclarationDiff>,
     pub effects: BTreeMap<String, String>,
+    #[serde(default)]
+    pub running_restart_count: usize,
+    #[serde(default)]
+    pub running_restarts: Vec<PlannedAction>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rollouts: BTreeMap<String, Value>,
     pub expected_subjects: BTreeMap<String, Vec<String>>,
@@ -741,6 +745,7 @@ pub(super) fn plan_tx(
         .collect();
     let mut changes = BTreeMap::<String, String>::new();
     let mut effects = BTreeMap::<String, String>::new();
+    let mut running_restarts = Vec::new();
     let mut heads = BTreeMap::new();
     let mut adoptions = BTreeMap::new();
     let mut retired = old
@@ -748,6 +753,11 @@ pub(super) fn plan_tx(
         .map(|v| v.receipt.retired.clone())
         .unwrap_or_default();
     for (s, revision) in &live {
+        if let Some(desired) = input.subjects.get(s)
+            && let Some(restart) = running_restart_at(transaction, desired, None)?
+        {
+            running_restarts.push(restart);
+        }
         let own = owner(transaction, s, None)?;
         if own.as_deref().is_some_and(|own| own != set) {
             blockers.push(format!("{s} belongs to another set"));
@@ -955,6 +965,8 @@ pub(super) fn plan_tx(
         source: options.source.clone(),
         changes,
         effects,
+        running_restart_count: running_restarts.len(),
+        running_restarts,
         rollouts: BTreeMap::new(),
         expected_subjects: heads,
         digest,
@@ -1297,6 +1309,7 @@ impl Store {
             &key,
             Some(actor),
             Some(options),
+            None,
         )
     }
 }

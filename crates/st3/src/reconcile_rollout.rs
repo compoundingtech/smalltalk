@@ -2,6 +2,38 @@ use super::*;
 use crate::rollout::{self, Operation};
 
 impl<R: RuntimeControl> Reconciler<R> {
+    /// Apply shares suspend/rollout's fenced safe-point proof, without draining new intake.
+    pub(super) fn defer_declared_restart(
+        &self,
+        subject: &DesiredSubject,
+        observation: &RuntimeObservation,
+        now: u128,
+    ) -> Result<bool> {
+        let Some(pending) = rollout::deferred_restart(&self.store, &subject.subject)? else {
+            return Ok(false);
+        };
+        let blockers = crate::suspension::blockers(
+            &self.store, &subject.subject,
+            observation.incarnation_id.as_deref().context("deferred restart needs an incarnation")?,
+        )?;
+        let expired = now >= pending.deadline_unix_ms;
+        if !expired && blockers.is_empty() {
+            return Ok(false);
+        }
+        self.record_once(
+            &subject.subject,
+            "runtime.reconcile-decision",
+            BTreeMap::from([
+                ("decision".into(), serde_json::json!(if expired { "restart-held" } else { "restart-pending" })),
+                ("reason".into(), serde_json::json!(if expired { "safe-point deadline reached; original seat keeps running" } else { "waiting for idle with no open ask" })),
+            ]),
+        )?;
+        if !expired {
+            self.arm_restart(&format!("deferred-restart:{}", subject.subject), pending.deadline_unix_ms);
+        }
+        Ok(true)
+    }
+
     pub(super) fn rollout_render_guard(&self, subject: &DesiredSubject) -> Result<()> {
         self.store.owned_desired_guard(subject)?;
         let Some(operation) = self.store.rollout(&subject.subject)? else {

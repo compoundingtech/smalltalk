@@ -4427,6 +4427,7 @@ dependencies = [
  "libghostty-vt",
  "libghostty-vt-sys",
  "notify",
+ "parking_lot",
  "portable-pty",
  "predicates",
  "proptest",

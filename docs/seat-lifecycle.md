@@ -325,11 +325,49 @@ connects straight to the PTY session, so a busy daemon cannot stall it. If the d
 answer within a second, st attaches to the seat's newest PTY session on that host without it and
 says so.
 
-A running seat restarts when you apply a declaration that changes how it launches: its
+A running seat restarts immediately by default when you apply a declaration that changes how it launches: its
 workspace, harness, model, effort, arguments or command. A change to its label, environment or
 restart policy keeps the running process and takes effect the next time it starts; use `st agents
 restart agent/example/worker --as person/ada` to apply it now. Restart preserves the declaration,
 works for top-level and mission seats, and waits for a new running incarnation.
+
+Both `st apply` and the legacy `st agents apply` announce `WILL RESTART N running seats`
+and list those seats before publishing, including with `--dry-run`. The count compares the
+running incarnation's launch receipt, not merely the previous declaration; stopped seats and
+unchanged launches are excluded. JSON output includes `running_restart_count` and
+`running_restarts`, while the announcement goes to stderr.
+
+To defer a launch change until the next safe point:
+
+```sh
+st apply worker.kdl --dry-run --as person/ada
+st apply worker.kdl --defer-restart --restart-max-wait 30m --as person/ada
+st agents show agent/example/worker
+```
+
+The safe point reuses suspend/rollout's incarnation-fenced quiescence proof: the harness is
+idle with no open ask or unsent input, no claimed work or running subagent, and a known native
+session. Unknown harness state is not idle. The pending declaration and absolute deadline
+survive daemon restarts; the incumbent's rendered files stay unchanged while it waits.
+Plain publication keeps work and message intake open, so a perpetually busy seat can remain
+pending until its deadline. The default maximum wait is thirty minutes; a positive duration
+up to seven days is accepted. Expiry changes the visible rollout phase to `held` and leaves
+the original seat running. It never forces interruption or automatically retries that hold.
+`st agents show` reports the phase, blockers and reason; JSON also reports the deadline.
+
+Reapplying the same declaration and policy does not extend the deadline. Change the maximum
+wait to request a new bounded wait, or explicitly keep immediate behavior:
+
+```sh
+st apply worker.kdl --restart-now --as person/ada
+```
+
+`--restart-now` removes a plain publication's pending restart policy even when the declaration
+itself is unchanged, and can interrupt busy work. It conflicts with `--defer-restart`.
+Remote hosts must advertise deferred-apply support before a plain deferred publication is
+accepted. With `--set`, `--defer-restart` selects the existing owned-seat native drain/resume
+rollout; its additional support requirements and explicit held-rollout retry rules are described
+in [owned-seat rollout](st3/owned-seat-cutover.md).
 
 Every relaunch of a seat continues its harness's last native session: `st agents restart`, a
 changed launch, a harness that hung up or crashed, a daemon restart, and a stop followed by a

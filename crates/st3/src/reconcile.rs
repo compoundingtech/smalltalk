@@ -2384,6 +2384,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     if let Some(error) = blocked.take() {
                                         return Err(error);
                                     }
+                                    if self.defer_declared_restart(
+                                        subject, &observation, now_ms(),
+                                    )? {
+                                        return Ok(());
+                                    }
                                     self.record_once(
                                         &subject.subject,
                                         "runtime.reconcile-decision",
@@ -4057,25 +4062,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         let launched = match launched.get(&subject.subject) {
             Some((known, launched)) if known == incarnation => launched.clone(),
             _ => {
-                // The latest start this node made launched the running incarnation; an adopted
-                // runtime it did not start has none, or an older one it then outlived.
-                let read = self
-                    .store
-                    .observations_for(&subject.subject, "runtime.action.succeeded")?
-                    .iter()
-                    .rev()
-                    .find_map(|claim| {
-                        claim
-                            .body
-                            .pointer("/fields/desired_token")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .map(|token| self.store.claim_by_id(&token))
-                    .transpose()?
-                    .flatten()
-                    .and_then(|claim| serde_json::from_value::<DesiredSubject>(claim.body).ok())
-                    .and_then(|desired| desired.member);
+                // Only the running incarnation's start receipt supplies its launch; receipts
+                // for another incarnation must not change either restart decisions or preview.
+                let read = crate::rollout::launched_member(
+                    &self.store, &subject.subject, incarnation,
+                )?.map(|(_, member)| member);
                 launched.insert(
                     subject.subject.clone(),
                     (incarnation.to_owned(), read.clone()),

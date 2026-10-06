@@ -99,6 +99,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }) {
                     self.record_once(&subject.subject, "runtime.observed", fields)?;
                 }
+                if subject.kind != "stop"
+                    && self.defer_declared_restart(subject, observation, now_ms())?
+                {
+                    stopped = false;
+                    continue;
+                }
                 stopped &= self.reconcile_runtime_stop(
                     &subject.subject,
                     &member.runtime_id,
