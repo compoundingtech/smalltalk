@@ -4290,6 +4290,18 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The id of a subject's newest claim in canonical order: a seek of the newest time block,
+    /// not a read of every claim of the subject.
+    pub fn latest_claim_id(&self, subject: &str) -> Result<Option<String>> {
+        crate::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        connection
+            .prepare_cached(&canonical_sql(LATEST_CLAIM_QUERY))?
+            .query_row([subject], |row| row.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Append a claim this node writes, through the runtime that knows its kind.
     pub fn append_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
         self.append_claim_outcome(input).map(|(claim, _)| claim)

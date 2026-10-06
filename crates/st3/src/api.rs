@@ -11525,6 +11525,9 @@ struct StatusQuery {
     at_index: Option<u64>,
     #[serde(default)]
     history: bool,
+    /// Only the subject's current harness; see `Store::status_harness_only`.
+    #[serde(default)]
+    harness_only: bool,
 }
 
 /// One subject's desired record. Each Claude seat's status line reads it on every render (every
@@ -11549,7 +11552,9 @@ async fn status(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let store = state.store.clone();
     blocking_store(move || {
-        if query.history {
+        if let (true, false, Some(subject)) = (query.harness_only, query.history, &query.subject) {
+            store.status_harness_only(subject)
+        } else if query.history {
             store.status_history(
                 query.subject.as_deref(),
                 query.owner_run.as_deref(),
