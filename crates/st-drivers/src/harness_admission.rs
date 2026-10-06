@@ -215,6 +215,17 @@ pub fn revoke_override(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ProbeDiagnostic {
+    phase: String,
+    outcome: String,
+    exit_code: Option<i32>,
+    elapsed_ms: u64,
+    stderr_tail: String,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Record {
     schema: String,
     identity: Identity,
@@ -222,6 +233,8 @@ struct Record {
     measurements: Vec<Measurement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     probe_failure: Option<Reason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<ProbeDiagnostic>,
 }
 
 /// The gate result used by both products, including the bounded diagnostic boundary.
@@ -383,23 +396,42 @@ fn admit_at(
                 && valid_measurements(driver, &record.measurements)
                 && matches!(
                     record.probe_failure,
-                    None | Some(Reason::AdmissionIndeterminate)
+                    None | Some(Reason::AdmissionIndeterminate | Reason::AdmissionLaunchRefused)
                 )
         });
     let record = match cached {
         Some(record) => record,
         None => {
+            let started = Instant::now();
             let probe = match driver {
                 Driver::Omp => omp::probe(
                     &executable,
                     adapter.context("omp needs its shipped extension")?,
                     &scratch,
                 ),
-                Driver::OpenCode => crate::opencode_session::probe_admission(&executable, &scratch),
+                Driver::OpenCode => crate::opencode_session::probe_admission(&executable, &scratch)
+                    .map(|measurements| {
+                        let diagnostic = measurements.iter().find(|m| !m.passed).map(|m| {
+                            ProbeDiagnostic {
+                                phase: m.check.as_str().into(),
+                                outcome: "missingEvidence".into(),
+                                exit_code: None,
+                                elapsed_ms: started.elapsed().as_millis() as u64,
+                                stderr_tail: scratch.stderr_tail("opencode.stderr").unwrap_or_default(),
+                                detail: format!("required {} evidence was not observed", m.check.as_str()),
+                            }
+                        });
+                        (measurements, diagnostic)
+                    }),
                 _ => unreachable!(),
             };
-            let (measurements, probe_failure) = match probe {
-                Ok(measurements) => (measurements, None),
+            let (measurements, probe_failure, diagnostic) = match probe {
+                Ok((measurements, diagnostic)) => {
+                    let failure = diagnostic.as_ref()
+                        .filter(|diagnostic| diagnostic.outcome == "launch-refused")
+                        .map(|_| Reason::AdmissionLaunchRefused);
+                    (measurements, failure, diagnostic)
+                }
                 Err(error) => {
                     tracing::warn!("{} admission indeterminate: {error:#}", driver.as_str());
                     (
@@ -408,9 +440,21 @@ fn admit_at(
                             .map(|&check| measurement(check, false))
                             .collect(),
                         Some(Reason::AdmissionIndeterminate),
+                        Some(ProbeDiagnostic {
+                            phase: "probe".into(),
+                            outcome: "error".into(),
+                            exit_code: None,
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                            stderr_tail: scratch.stderr_tail(&format!("{}.stderr", driver.as_str()))
+                                .unwrap_or_default(),
+                            detail: format!("{error:#}"),
+                        }),
                     )
                 }
             };
+            if let Some(diagnostic) = &diagnostic {
+                tracing::warn!(?diagnostic, "{} admission probe failed", driver.as_str());
+            }
             // Replacing the binary or adapter while the probe ran cannot produce a pass for
             // either build. Next launch measures the replacement under its own identity.
             anyhow::ensure!(
@@ -429,6 +473,7 @@ fn admit_at(
                 observed_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
                 measurements,
                 probe_failure,
+                diagnostic,
             };
             crate::fsatomic::replace(
                 &path,
@@ -439,6 +484,9 @@ fn admit_at(
             record
         }
     };
+    if let Some(diagnostic) = &record.diagnostic {
+        tracing::warn!(?diagnostic, "{} cached admission probe failed", driver.as_str());
+    }
     Ok(Admission {
         version: Some(version),
         failed: record.probe_failure.or_else(|| {
@@ -643,6 +691,7 @@ impl Scratch {
             "cache",
             "runtime",
             "tmp",
+            "sessions",
             "pty",
             "agent",
             "workspace/.git",
@@ -684,6 +733,21 @@ impl Scratch {
             .stdout(File::create(self.path(&format!("{name}.stdout")))?)
             .stderr(File::create(self.path(&format!("{name}.stderr")))?);
         Ok(ProbeProcess(command.spawn()?))
+    }
+    fn stderr_tail(&self, name: &str) -> Result<String> {
+        use std::io::{Seek, SeekFrom};
+        let path = self.path(name);
+        if !path.exists() {
+            return Ok(String::new());
+        }
+        let mut file = File::open(path)?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(4096)))?;
+        let mut bytes = Vec::new();
+        file.take(4096).read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).chars()
+            .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+            .collect())
     }
     pub(crate) fn capture(&self, name: &str) -> Result<String> {
         let path = self.path(name);
@@ -1289,6 +1353,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn guarded_launcher_is_admitted_without_real_profile_or_seat() {
+        let directory = tempfile::tempdir().unwrap();
+        let native = fake_omp(directory.path());
+        let guarded = directory.path().join("guarded-omp");
+        let sh = resolve_executable("sh").unwrap();
+        fs::write(&guarded, format!(
+            "#!{}\nif [ \"$1\" = --version ]; then exec {} \"$@\"; fi\ncount=0\nfor arg in \"$@\"; do [ \"$arg\" != --session-dir ] || count=$((count + 1)); done\nif [ \"$count\" != 1 ]; then echo 'missing session directory' >&2; exit 64; fi\nif [ -z \"${{ST_AGENT:-}}\" ]; then echo 'missing actor' >&2; exit 70; fi\nunset PI_CODING_AGENT_DIR\nexec {} \"$@\"\n",
+            sh.display(), native.display(), native.display(),
+        )).unwrap();
+        fs::set_permissions(&guarded, fs::Permissions::from_mode(0o700)).unwrap();
+        let adapter = directory.path().join("extension.ts");
+        fs::write(&adapter, "fixture").unwrap();
+        let admission = admit_at(
+            guarded.to_str().unwrap(), Driver::Omp, Some(&adapter), &directory.path().join("cache"),
+        ).unwrap();
+        assert!(admission.passed(), "{admission:?}");
+    }
+
+    #[test]
+    fn early_exit_records_stderr_status_and_failed_phase_in_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("omp");
+        let sh = resolve_executable("sh").unwrap();
+        fs::write(&binary, format!(
+            "#!{}\nif [ \"$1\" = --version ]; then echo omp/18.6.0; exit; fi\necho 'launcher: session contract rejected' >&2\nexit 64\n",
+            sh.display(),
+        )).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let admission = admit_fake(directory.path());
+        assert_eq!(admission.failed, Some(Reason::AdmissionLaunchRefused));
+        let record: Record = serde_json::from_slice(
+            &fs::read(admission.cache_path.unwrap()).unwrap(),
+        ).unwrap();
+        let diagnostic = record.diagnostic.unwrap();
+        assert_eq!(diagnostic.outcome, "launch-refused");
+        assert_eq!(diagnostic.exit_code, Some(64));
+        assert_eq!(diagnostic.phase, "launch");
+        assert_eq!(diagnostic.stderr_tail, "launcher: session contract rejected\n");
+    }
+
+    #[test]
     #[ignore = "requires an installed OpenCode; isolated loopback model, no credentials"]
     fn installed_opencode_admission() {
         let binary = resolve_executable("opencode").unwrap();
@@ -1318,7 +1423,8 @@ pub(crate) mod tests {
         for capture in ["omp.stdout", "omp.stderr", "events.jsonl", "channel.jsonl"] {
             eprintln!("{capture}: {}", scratch.capture(capture).unwrap());
         }
-        let result = result.unwrap();
+        let (result, diagnostic) = result.unwrap();
+        assert!(diagnostic.is_none(), "{diagnostic:?}");
         assert!(result.iter().all(|m| m.passed), "{result:?}");
     }
 }
