@@ -2006,6 +2006,14 @@
       "verification": "shared API restart case"
     },
     {
+      "command": "st work delegation",
+      "description": "Replace or revoke the person's allowed delegation list with decision evidence",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_delegation_policy_and_answers_preserve_identity_across_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
       "command": "st work done",
       "description": "Complete a person-assigned step with a response",
       "tests": [

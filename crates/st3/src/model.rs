@@ -1604,6 +1604,8 @@ pub struct EventRecord {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReviewRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationProof>,
     pub decision: String,
     #[serde(default)]
     pub reason: Option<String>,
@@ -1757,6 +1759,8 @@ pub struct SubscriptionRequestDecision {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionResolveRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationProof>,
     pub outcome: String,
     #[serde(default)]
     pub reason: Option<String>,
@@ -1853,6 +1857,8 @@ pub struct MessageSendRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MessageLifecycleRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationProof>,
     pub lifecycle: String,
     #[serde(default)]
     pub actor: Option<String>,
@@ -2547,6 +2553,8 @@ pub struct PersonAskRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PersonStepResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationProof>,
     pub subject: String,
     pub actor: String,
     pub summary: String,
@@ -2563,6 +2571,9 @@ pub struct PersonStepResponse {
 /// A person's response to an ask, as data: the typed answer when the ask was structured.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PersonAnswerView {
+    /// The person whose prior instruction the respondent recorded, when delegated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acted_for: Option<String>,
     pub ask: String,
     /// `completed` when the person answered, `cancelled` when the ask was withdrawn.
     pub status: String,
@@ -2574,6 +2585,29 @@ pub struct PersonAnswerView {
     pub answer: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
+}
+
+/// Evidence for recording a person's instruction without using their actor identity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationProof {
+    pub person: String,
+    pub policy: String,
+    pub message: String,
+    pub quote: String,
+    /// Exact asking claim, human gate request, or message's original sent claim.
+    pub episode: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationPolicyRequest {
+    pub person: String,
+    pub actor: String,
+    /// Replace the entire list; an empty list revokes delegation.
+    pub actions: Vec<String>,
+    pub evidence: Vec<String>,
+    pub idempotency_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

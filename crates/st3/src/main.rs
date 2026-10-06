@@ -3672,6 +3672,11 @@ struct AttentionRequestArgs {
 
 #[derive(Args)]
 struct AttentionResolveArgs {
+    #[command(flatten)]
+    delegation: DelegationArgs,
+    /// The update's original work.person-asked claim ID.
+    #[arg(long, requires = "acted_for")]
+    episode: Option<String>,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
     subject: String,
     #[arg(long, value_parser = ["resolved", "dismissed"])]
@@ -3696,6 +3701,8 @@ struct AttentionWithdrawArgs {
 
 #[derive(Subcommand)]
 enum WorkCommand {
+    /// Replace your allowed delegation list; repeat --action, or omit all to revoke.
+    Delegation(DelegationPolicyArgs),
     /// Open a one-step run for this seat without authoring a mission; then use claim.
     ///
     /// For a small independent authorized job: describe the result, use the returned claim
@@ -3882,6 +3889,8 @@ struct WorkUpdateArgs {
 
 #[derive(Args)]
 struct WorkDoneArgs {
+    #[command(flatten)]
+    delegation: DelegationArgs,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     subject: String,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
@@ -4206,6 +4215,11 @@ struct MessageReplyArgs {
 
 #[derive(Args)]
 struct MessageArchiveArgs {
+    #[command(flatten)]
+    delegation: DelegationArgs,
+    /// Original message.sent claim ID when acting for a person.
+    #[arg(long, requires = "acted_for")]
+    episode: Option<String>,
     #[arg(num_args = 1..)]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     references: Vec<String>,
@@ -4233,6 +4247,11 @@ struct MessageStatusArgs {
 
 #[derive(Args)]
 struct ReviewArgs {
+    #[command(flatten)]
+    delegation: DelegationArgs,
+    /// Exact gate.requested claim ID when acting for a person.
+    #[arg(long, requires = "acted_for")]
+    episode: Option<String>,
     /// The gate to answer: its `attention/...` ID from `st attention ls`, or the step, mission
     /// or loop run (`step-run/...`, `mission-run/...`, `loop-run/...`) that owns it.
     target: String,
@@ -4241,6 +4260,56 @@ struct ReviewArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
+}
+
+#[derive(Args, Default)]
+struct DelegationArgs {
+    /// Record a person's existing instruction, with yourself as the actor.
+    #[arg(long = "for", value_parser = parse_person_subject, requires_all = ["policy", "instruction", "quote", "episode"])]
+    acted_for: Option<String>,
+    /// Claim ID of the person's current person.delegation-set policy.
+    #[arg(long, requires = "acted_for")]
+    policy: Option<String>,
+    /// The person's original message/ID instructing this action.
+    #[arg(long, requires = "acted_for")]
+    instruction: Option<String>,
+    /// The person's instruction, quoted verbatim.
+    #[arg(long, requires = "acted_for")]
+    quote: Option<String>,
+}
+
+impl DelegationArgs {
+    fn proof(self, episode: Option<&str>) -> Result<Option<st3::model::DelegationProof>> {
+        let Some(person) = self.acted_for else {
+            return Ok(None);
+        };
+        Ok(Some(st3::model::DelegationProof {
+            person,
+            policy: self.policy.context("delegation needs --policy")?,
+            message: format!(
+                "message/{}",
+                normalize_message_reference(
+                    &self.instruction.context("delegation needs --instruction")?,
+                )
+            ),
+            quote: self.quote.context("delegation needs --quote")?,
+            episode: episode.context("delegation needs --episode")?.into(),
+        }))
+    }
+}
+
+#[derive(Args)]
+struct DelegationPolicyArgs {
+    #[arg(long = "for", value_parser = parse_person_subject)]
+    person: String,
+    #[arg(long = "as", value_parser = parse_actor_subject)]
+    actor: String,
+    #[arg(long = "action", value_parser = ["answer-ask", "close-item", "record-go-stop"])]
+    actions: Vec<String>,
+    #[arg(long, required = true)]
+    evidence: Vec<String>,
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -5081,6 +5150,8 @@ fn guard_mutating_cli_actor(
             _ => None,
         },
         Command::Work { command } => match command {
+            WorkCommand::Delegation(args) => Some(args.actor.as_str()),
+            WorkCommand::Done(args) | WorkCommand::CancelAsk(args) => Some(args.actor.as_str()),
             WorkCommand::Start(args) => Some(args.actor.as_str()),
             WorkCommand::Handoff(args) => Some(args.actor.as_str()),
             WorkCommand::Acknowledge(args) => Some(args.actor.as_str()),
@@ -5124,6 +5195,9 @@ fn guard_mutating_cli_actor(
             _ => None,
         },
         Command::Claim(args) => args.actor.as_deref(),
+        Command::Conversations {
+            command: MessageCommand::Archive(args),
+        } => args.actor.as_deref(),
         Command::Diagnostic(args) => Some(args.actor.as_str()),
         Command::Gh { command } => match command {
             GhCommand::Watch(args) => Some(args.actor.as_str()),
@@ -14132,6 +14206,7 @@ async fn run_review_decision(
         .post(
             &path,
             &ReviewRequest {
+                delegation: args.delegation.proof(args.episode.as_deref())?,
                 decision: decision.to_owned(),
                 reason: args.reason,
                 actor: Some(args.actor),
@@ -14263,6 +14338,7 @@ async fn run_attention(
                     .post(
                         "/v1/work/done",
                         &PersonStepResponse {
+                            delegation: None,
                             subject: item.subject.clone(),
                             actor: actor.clone(),
                             summary: String::new(),
@@ -14374,6 +14450,7 @@ async fn run_attention(
                         urlencoding::encode(&args.subject)
                     ),
                     &AttentionResolveRequest {
+                        delegation: args.delegation.proof(args.episode.as_deref())?,
                         outcome: args.outcome,
                         reason: args.reason,
                         actor: args.actor,
@@ -14421,6 +14498,8 @@ async fn run_attention(
                 client,
                 "changes-requested",
                 ReviewArgs {
+                    delegation: DelegationArgs::default(),
+                    episode: None,
                     target: args.target,
                     reason: Some(args.reason),
                     actor: args.actor,
@@ -14482,6 +14561,24 @@ async fn run_work(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        WorkCommand::Delegation(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let result: ClaimRecord = client
+                .post(
+                    "/v1/work/delegation",
+                    &st3::model::DelegationPolicyRequest {
+                        person: args.person,
+                        actor: args.actor,
+                        actions: args.actions,
+                        evidence: args.evidence,
+                        idempotency_key: args.idempotency_key.unwrap_or_else(|| {
+                            format!("delegation-policy:{}", uuid::Uuid::now_v7())
+                        }),
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
         WorkCommand::Start(args) => {
             reject_foreign_agent_actor(&args.actor)?;
             let response: StepRunView = client
@@ -14613,6 +14710,7 @@ async fn run_work(
                 .post(
                     path,
                     &PersonStepResponse {
+                        delegation: args.delegation.proof(args.episode.as_deref())?,
                         subject: args.subject,
                         actor: args.actor,
                         summary: args.summary.unwrap_or_default(),
@@ -15512,12 +15610,40 @@ async fn run_message(
             }
         }
         MessageCommand::Archive(args) => {
+            let delegation = args.delegation.proof(args.episode.as_deref())?;
             let actor = args
                 .actor
                 .context("message archive needs explicit --as to record its lifecycle")?;
             reject_foreign_agent_actor(&actor)?;
             let mut claims = Vec::with_capacity(args.references.len());
+            anyhow::ensure!(
+                delegation.is_none() || args.references.len() == 1,
+                "delegated archive names one message and episode at a time"
+            );
             for reference in args.references {
+                if let Some(proof) = &delegation {
+                    let reference = normalize_message_reference(&reference);
+                    let claim: ClaimRecord = client
+                        .post(
+                            &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
+                            &MessageLifecycleRequest {
+                                delegation: Some(proof.clone()),
+                                lifecycle: "closed".into(),
+                                actor: Some(actor.clone()),
+                                transport: None,
+                                runtime_id: None,
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: format!(
+                                    "delegated-archive:{reference}:{}:{}",
+                                    proof.policy, proof.message
+                                ),
+                            },
+                        )
+                        .await?;
+                    claims.push(claim);
+                    continue;
+                }
                 let message = read_message(client, &reference).await?;
                 accept_message(client, &message, &actor).await?;
                 claims.push(close_message(client, &reference, &actor).await?);
@@ -16057,6 +16183,7 @@ async fn accept_message(client: &Client, message: &MessageView, actor: &str) -> 
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(reference)),
             &MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "read".into(),
                 actor: Some(actor),
                 transport: None,
@@ -16081,6 +16208,7 @@ async fn deliver_message(
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
             &MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "delivered".into(),
                 actor: Some(actor.into()),
                 transport: None,
@@ -16107,6 +16235,7 @@ async fn stage_message(
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
             &MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "staged".into(),
                 actor: Some(actor.into()),
                 transport: Some(transport.into()),
@@ -16125,6 +16254,7 @@ async fn close_message(client: &Client, reference: &str, actor: &str) -> Result<
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
             &MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "closed".into(),
                 actor: Some(normalize_message_subject(actor)),
                 transport: None,
@@ -19586,18 +19716,24 @@ impl PiFamilyReports {
             match &self.fence {
                 Some(fence) => mailbox_receipt(client, fence, &message, "read").await?,
                 None => {
-                    let _: ClaimRecord = client.post(
-                        &format!("/v1/messages/{}/claims", urlencoding::encode(message.trim_start_matches("message/"))),
-                        &MessageLifecycleRequest {
-                            lifecycle: "read".into(),
-                            actor: Some(subject.into()),
-                            transport: None,
-                            runtime_id: None,
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: format!("pi-read:{subject}:{message}"),
-                        },
-                    ).await?;
+                    let _: ClaimRecord = client
+                        .post(
+                            &format!(
+                                "/v1/messages/{}/claims",
+                                urlencoding::encode(message.trim_start_matches("message/"))
+                            ),
+                            &MessageLifecycleRequest {
+                                delegation: None,
+                                lifecycle: "read".into(),
+                                actor: Some(subject.into()),
+                                transport: None,
+                                runtime_id: None,
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: format!("pi-read:{subject}:{message}"),
+                            },
+                        )
+                        .await?;
                 }
             }
             // Both transports retain the native receipt until the graph acknowledges it.
@@ -22713,6 +22849,9 @@ mod tests {
     #[test]
     fn a_harness_cannot_mutate_as_a_peer_or_person() {
         let cases: &[&[&str]] = &[
+            &["st3", "work", "done", "step-run/example/ask", "--as", "person/avery", "--summary", "Friday"],
+            &["st3", "conversations", "archive", "message/notice", "--as", "person/avery"],
+            &["st3", "work", "delegation", "--for", "person/avery", "--as", "person/avery", "--evidence", "claim/decision"],
             &[
                 "st3",
                 "missions",
@@ -25680,6 +25819,88 @@ mod tests {
             error
                 .to_string()
                 .contains("cannot reply as a non-participant")
+        );
+    }
+
+    #[test]
+    fn delegated_commands_require_complete_proof_and_keep_the_agent_actor() {
+        for command in [
+            vec![
+                "work",
+                "done",
+                "step-run/example/ask",
+                "--summary",
+                "Friday",
+            ],
+            vec!["conversations", "archive", "message/notice"],
+            vec!["attention", "approve", "step-run/example/build"],
+            vec![
+                "attention",
+                "reject",
+                "step-run/example/build",
+                "--reason",
+                "Stop",
+            ],
+            vec![
+                "attention",
+                "resolve",
+                "attention/update",
+                "--outcome",
+                "resolved",
+            ],
+        ] {
+            let mut args = vec!["st3"];
+            args.extend(command);
+            args.extend(["--as", "agent/example/helper", "--for", "person/avery"]);
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "missing proof: {args:?}"
+            );
+            args.extend([
+                "--policy",
+                "claim/policy",
+                "--instruction",
+                "message/decision",
+                "--quote",
+                "Friday",
+                "--episode",
+                "claim/episode",
+            ]);
+            let parsed = Cli::try_parse_from(&args).unwrap();
+            let (proof, actor) = match parsed.command {
+                Command::Work {
+                    command: WorkCommand::Done(args),
+                } => (args.delegation, args.actor),
+                Command::Conversations {
+                    command: MessageCommand::Archive(args),
+                } => (args.delegation, args.actor.unwrap()),
+                Command::Attention {
+                    command: AttentionCommand::Approve(args) | AttentionCommand::Reject(args),
+                } => (args.delegation, args.actor),
+                Command::Attention {
+                    command: AttentionCommand::Resolve(args),
+                } => (args.delegation, args.actor),
+                _ => panic!("unexpected delegated command"),
+            };
+            assert_eq!(actor, "agent/example/helper");
+            let proof = proof.proof(Some("claim/episode")).unwrap().unwrap();
+            assert_eq!(proof.person, "person/avery");
+            assert_eq!(proof.message, "message/decision");
+        }
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "work",
+                "delegation",
+                "--for",
+                "person/avery",
+                "--as",
+                "person/avery",
+                "--evidence",
+                "claim/decision",
+            ])
+            .is_ok(),
+            "a person can revoke by setting an empty action list"
         );
     }
 

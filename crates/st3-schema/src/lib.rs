@@ -1106,6 +1106,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
     let mut claims = BTreeMap::new();
     let definitions: &[ClaimDefinition<'_>] = &[
         (
+            "person.delegation-set",
+            &["person"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::StateTransition,
+            None,
+            false,
+            &[],
+        ),
+        (
             "harness.todo.observed",
             &["agent"],
             WritePolicy::SameSubjectActor,
@@ -2445,6 +2454,7 @@ fn claim_retention(kind: &str) -> Retention {
 
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
     let names: &[(&str, FieldSpec)] = match kind {
+        "person.delegation-set" => &[("actions", required_array())],
         "workspace.observed" => &[
             ("host", required_string()),
             ("workspace", required_string()),
@@ -3513,11 +3523,16 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         ],
         _ => &[],
     };
-    names
+    let mut fields: BTreeMap<String, FieldSpec> = names
         .iter()
         .cloned()
         .map(|(name, spec)| (name.into(), spec))
-        .collect()
+        .collect();
+    if matches!(kind, "work.person-done" | "gate.result" | "message.closed") {
+        fields.insert("acted_for".into(), reference_to(&["person"]));
+        fields.insert("delegation".into(), object());
+    }
+    fields
 }
 
 fn resource(kind: &str, description: &str, fields: &[(&str, FieldSpec)]) -> ResourceSpec {
@@ -4053,6 +4068,7 @@ mod tests {
                 "operational.failure",
                 "operational.recovered",
                 "owned-set.revised",
+                "person.delegation-set",
                 "planning-session.approved",
                 "planning-session.cancelled",
                 "planning-session.candidate-submitted",

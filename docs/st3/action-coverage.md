@@ -2,7 +2,7 @@
 
 The inventory covers every offered CLI command, every typed client action, every stui daemon effect, and the palette and local controls. It distinguishes real CLI/Unix transport tests, the live stui adapter, local reducer tests, and shared implementations. A test reference describes its actual layer; a shared implementation test alone is not a claim that the entire interactive UI was driven.
 
-`action-coverage.json` is the machine-readable source. Tests compare its 187 CLI rows with Clap's offered command tree, its 54 typed actions with the generated client contract and real dispatch builders, and its 19 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
+`action-coverage.json` is the machine-readable source. Tests compare its 220 CLI rows with Clap's offered command tree, its 54 typed actions with the generated client contract and real dispatch builders, and its 19 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
 
 ## Restart and stale-state model
 
@@ -284,6 +284,7 @@ edits and removes retired subjects without changing unfiltered reads.
 | `st work cancel-ask` | shared API restart case | [`cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st work claim` | real CLI over private Unix socket; disk store reopened between actions | [`cli_mission_output_and_manual_wake_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st work complete` | shared API restart case | [`cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
+| `st work delegation` | real CLI over private Unix socket; disk store reopened between actions | [`cli_delegation_policy_and_answers_preserve_identity_across_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st work done` | shared API restart case | [`cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st work extend` | real CLI over private Unix socket; disk store reopened between actions | [`cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st work fail` | shared API restart case | [`cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |

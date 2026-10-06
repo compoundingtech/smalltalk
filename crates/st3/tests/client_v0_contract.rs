@@ -3231,6 +3231,7 @@ mission "ios-proof" state="ready" {
         .store
         .finish_person_step(
             &st3::model::PersonStepResponse {
+                delegation: None,
                 subject: ask.subject,
                 actor: "person/alex".into(),
                 summary: "Simulator repaired".into(),
