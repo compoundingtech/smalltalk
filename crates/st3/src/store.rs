@@ -949,6 +949,72 @@ fn runtime_view_entry(
     })
 }
 
+/// Runtime authority without presentation, harness, planning or claim-history reduction.
+pub(crate) struct RuntimeAuthority {
+    pub actual: Option<Value>,
+    pub actual_origin: Option<String>,
+    pub reachability: String,
+}
+
+/// A single-origin runtime-only history cannot have rival runtime authority. Runtime observations
+/// append fields, so an omitted field retains its newest earlier value; explicit null replaces it.
+/// Other actual kinds and origins use the general fold and causal source selection instead.
+fn runtime_only_authority(
+    connection: &Connection,
+    subject: &str,
+) -> Result<Option<(Value, String)>> {
+    let mut sources = connection.prepare_cached(&format!(
+        "SELECT DISTINCT claims.kind, claims.origin FROM claims INDEXED BY claims_subject_kind_index
+         WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM} LIMIT 2"
+    ))?;
+    let mut rows = sources.query([subject])?;
+    let Some(row) = rows.next()? else { return Ok(None); };
+    if row.get::<_, String>(0)? != "runtime.observed" {
+        return Ok(None);
+    }
+    let origin = row.get::<_, String>(1)?;
+    if rows.next()?.is_some() {
+        return Ok(None);
+    }
+    let body: String = connection.prepare_cached(&format!(
+        "{} LIMIT 1", newest_claims_of_kind_query("claims.body", "runtime.observed"),
+    ))?.query_row(params![subject, i64::MAX], |row| row.get(0))?;
+    let latest: Value = serde_json::from_str(&body)?;
+    let latest = latest.get("fields").unwrap_or(&latest);
+    let mut older = connection.prepare_cached(&format!(
+        "SELECT claims.body FROM claims INDEXED BY claims_subject_kind_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='runtime.observed'
+           AND json_type(claims.body, CASE WHEN json_type(claims.body, '$.fields') IS NULL
+                         THEN ?2 ELSE ?3 END) IS NOT NULL
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    ))?;
+    let mut actual = serde_json::Map::new();
+    for (field, root_path, fields_path) in [
+        ("status", "$.status", "$.fields.status"),
+        ("runtime_id", "$.runtime_id", "$.fields.runtime_id"),
+        ("incarnation_id", "$.incarnation_id", "$.fields.incarnation_id"),
+        ("terminal", "$.terminal", "$.fields.terminal"),
+        ("reachability", "$.reachability", "$.fields.reachability"),
+    ] {
+        if let Some(value) = latest.get(field) {
+            actual.insert(field.into(), value.clone());
+        } else {
+            let body: Option<String> = older.query_row(
+                params![subject, root_path, fields_path],
+                |row| row.get(0),
+            ).optional()?;
+            if let Some(body) = body {
+                let value: Value = serde_json::from_str(&body)?;
+                if let Some(value) = value.get("fields").unwrap_or(&value).get(field) {
+                    actual.insert(field.into(), value.clone());
+                }
+            }
+        }
+    }
+    Ok(Some((Value::Object(actual), origin)))
+}
+
 /// One subject's status at `at_index`, and the action it asks of its host when it is current and
 /// differs from what is declared. With `owner_filter`, a subject another run owns is skipped.
 fn subject_status_at(
@@ -9823,6 +9889,47 @@ impl Store {
             claim_ids,
             receipt_claim_id: Some(receipt.id),
         })
+    }
+
+    /// The fields used by live terminal fences, with the same authority decisions as `status`.
+    pub(crate) fn runtime_authority(&self, subject: &str) -> Result<Option<RuntimeAuthority>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        if subject.starts_with("glass/") || subject.starts_with("arrangement/") {
+            return Ok(None);
+        }
+        let connection = self.readers.get();
+        // Eligibility, inherited fields and unknown claims must share one snapshot: a rival
+        // arriving between SELECTs must not be paired with the earlier single origin.
+        let connection = connection.unchecked_transaction()?;
+        let desired = desired_row_at(&connection, subject, None)?;
+        let (actual, actual_origin, conflict) = match runtime_only_authority(&connection, subject)? {
+            Some((actual, origin)) => (Some(actual), Some(origin), false),
+            None => {
+                let member = desired.as_ref()
+                    .and_then(|row| row.member.as_deref())
+                    .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok());
+                let actual = latest_actual_at(&connection, subject, None)?;
+                let (_, origin, conflict) = selected_actual_source_at(
+                    &connection, subject, None, member.as_ref().map(|member| member.host.as_str()),
+                )?;
+                (actual, origin, conflict)
+            }
+        };
+        let reachability = if conflict || has_unknown_claim_at(&connection, subject, None)?.is_some() {
+            "indeterminate"
+        } else {
+            actual.as_ref()
+                .and_then(|value| value.get("reachability"))
+                .and_then(Value::as_str)
+                .unwrap_or(if actual.is_some() {
+                    "reachable"
+                } else if desired.is_some() {
+                    "indeterminate"
+                } else {
+                    "unknown"
+                })
+        }.to_owned();
+        Ok(Some(RuntimeAuthority { actual, actual_origin, reachability }))
     }
 
     pub fn status(&self, selected: Option<&str>) -> Result<StatusResponse> {
@@ -22979,6 +23086,10 @@ mod fleet_admission_tests {
         assert_eq!(worker.reachability, "reachable", "{:?}", worker.reason);
         assert_eq!(worker.actual_origin.as_deref(), Some("current"));
         assert_eq!(worker.reason, None);
+        let authority = older.runtime_authority(subject).unwrap().unwrap();
+        assert_eq!(authority.reachability, "reachable");
+        assert_eq!(authority.actual_origin.as_deref(), Some("current"));
+        assert_eq!(authority.actual, worker.actual);
 
         // An unknown kind in the runtime family could change the answer: stay conservative.
         append(
@@ -22990,12 +23101,43 @@ mod fleet_admission_tests {
         sync(&current, &older);
         let status = older.status(Some(subject)).unwrap();
         assert_eq!(status.subjects[0].reachability, "indeterminate");
+        assert_eq!(older.runtime_authority(subject).unwrap().unwrap().reachability, "indeterminate");
         assert!(
             status.subjects[0]
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("runtime.restart-window-reset"))
         );
+    }
+
+    #[test]
+    fn runtime_authority_preserves_append_fields_nulls_and_other_actual_kinds() {
+        let subject = "agent/runtime-fence-fields";
+        for missing in ["status", "runtime_id", "incarnation_id", "terminal", "reachability"] {
+            let store = Store::open_memory("owner").unwrap();
+            let original = json!({"status":"running","runtime_id":"r","incarnation_id":"i",
+                                  "terminal":true,"reachability":"reachable"});
+            append(&store, "runtime.observed", subject, original.clone());
+            append(&store, "runtime.observed", subject, json!({"reason":"later partial report"}));
+            let narrow = store.runtime_authority(subject).unwrap().unwrap();
+            let status = store.status(Some(subject)).unwrap();
+            for field in ["status", "runtime_id", "incarnation_id", "terminal", "reachability"] {
+                assert_eq!(narrow.actual.as_ref().unwrap().get(field), status.subjects[0].actual.as_ref().unwrap().get(field));
+                assert_eq!(narrow.actual.as_ref().unwrap().get(field), original.get(field));
+            }
+            append(&store, "runtime.observed", subject, json!({missing: null}));
+            let narrow = store.runtime_authority(subject).unwrap().unwrap();
+            let status = store.status(Some(subject)).unwrap();
+            assert_eq!(narrow.actual.as_ref().unwrap().get(missing), Some(&Value::Null));
+            assert_eq!(narrow.reachability, status.subjects[0].reachability);
+            assert_eq!(narrow.actual.as_ref().unwrap().get(missing), status.subjects[0].actual.as_ref().unwrap().get(missing));
+            append(&store, "runtime.reconcile-decision", subject,
+                   json!({"decision":"hold","reachability":"unreachable"}));
+            let narrow = store.runtime_authority(subject).unwrap().unwrap();
+            let status = store.status(Some(subject)).unwrap();
+            assert_eq!(narrow.reachability, "unreachable");
+            assert_eq!(narrow.actual, status.subjects[0].actual);
+        }
     }
 
     #[test]
