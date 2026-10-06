@@ -366,6 +366,53 @@ async fn a_pre_pin_cli_completes_against_the_current_daemon() {
     server.abort();
 }
 
+#[tokio::test]
+async fn pre_pin_response_shapes_work_for_pinned_messages_and_explicitly_unpinned_observers() {
+    use st3_client::device::{CompletionOptions, KeyAlgorithm, SigningKey, complete_with_options};
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    wait_for_socket(&socket).await;
+    let local = Client::unix_as(&socket, PERSON);
+    // An old v1 proof-capable member returns no new optional root-proof field.
+    let remove_new_fields = axum::middleware::map_response(|response: axum::response::Response| async {
+        let (mut parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, 4 * 1024 * 1024).await.unwrap();
+        let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+        if let Some(value) = value.get_mut("value").and_then(Value::as_object_mut) {
+            value.remove("person_root_key_proof");
+        }
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        axum::response::Response::from_parts(parts, axum::body::Body::from(serde_json::to_vec(&value).unwrap()))
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone()).layer(remove_new_fields);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let profile = root.path().join("client/devices.json");
+    for (signs, unpinned) in [(true, false), (false, false), (false, true)] {
+        let challenge = local.pairing_begin(&PairingBegin { api_version: st3_client::API_VERSION.into(), device_name: "Earlier member".into(), person_id: PERSON.into(), full_control: signs.then_some(true), scopes: None }).await.unwrap().value;
+        let previous = std::fs::read(&profile).ok();
+        let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
+        let result = complete_with_options(&profile, &base, &challenge.pairing_id, &challenge.code, key,
+            CompletionOptions { fingerprint: if unpinned { None } else { challenge.person_root_fingerprint.as_deref() }, unpinned, ..Default::default() }).await;
+        if !signs && !unpinned {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("upgrade the member"));
+            assert!(error.contains("Possible orphaned device"));
+            assert_eq!(std::fs::read(&profile).ok(), previous);
+        } else {
+            let device = result.unwrap();
+            assert_eq!(device.signing_key.is_some(), signs);
+            assert_eq!(device.person_root_fingerprint.is_some(), !unpinned);
+        }
+    }
+    local_server.abort(); server.abort();
+}
+
 /// A phone's key, kept by the phone.
 struct Device {
     pair: EcdsaKeyPair,

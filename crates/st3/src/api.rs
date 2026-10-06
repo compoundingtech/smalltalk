@@ -328,6 +328,11 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/capabilities", get(client_capabilities))
         .route("/v1/client/sets", get(owned_sets::list))
         .route("/v1/client/sets/{*id}", get(owned_sets::get))
+        .route("/v1/client/arrangements", get(client_v0::arrangements::list))
+        .route(
+            "/v1/client/arrangements/{person_name}/{uuid}",
+            get(client_v0::arrangements::get),
+        )
         .route("/v1/client/glasses", get(client_v0::glasses_list))
         .route(
             "/v1/client/glasses/{id}",
@@ -347,6 +352,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/client/subject-definition",
             get(client_v0::subject_definition),
         )
+        .route("/v1/client/publication-definition", get(client_v0::publication_definition))
         .route("/v1/client/now", get(client_v0::now))
         .route("/v1/client/machines", get(client_v0::machines))
         .route("/v1/client/hosts/{*id}", get(client_v0::host_repositories))
@@ -1112,6 +1118,14 @@ fn client_error_envelope(status: StatusCode, raw: &Value, request_id: &str) -> V
 }
 
 fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
+    if matches!(code, Some(
+        "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired"
+        | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle"
+        | "arrangement-body-too-large" | "arrangement-owner-forbidden"
+        | "invalid-arrangement-subject" | "invalid-arrangement-action"
+        | "invalid-arrangement-operations" | "invalid-arrangement-folder"
+        | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference"
+    )) { return false; }
     matches!(
         code,
         Some(
@@ -1140,6 +1154,21 @@ fn client_error_code(code: Option<&str>) -> String {
         | "unsupported-capability"
         | "validation-failed"
         | "idempotency-conflict"
+        | "arrangement-exists"
+        | "arrangement-folder-exists"
+        | "arrangement-retired"
+        | "arrangement-limit"
+        | "arrangement-folder-deleted"
+        | "arrangement-cycle"
+        | "arrangement-body-too-large"
+        | "arrangement-owner-forbidden"
+        | "invalid-arrangement-subject"
+        | "invalid-arrangement-action"
+        | "invalid-arrangement-operations"
+        | "invalid-arrangement-folder"
+        | "invalid-arrangement-name"
+        | "invalid-arrangement-key"
+        | "invalid-subject-reference"
         | "stale-fence"
         | "timeline-history-incomplete"
         | "cursor-gap"
@@ -1346,6 +1375,11 @@ fn client_page_read(
         (items, items_digest, 0, requested_limit, expires_at_unix_ms)
     };
     let end = offset.saturating_add(limit).min(items.len());
+    let end = if collection == "arrangements" {
+        client_v0::arrangements::window_end(&items, offset, end)?
+    } else {
+        end
+    };
     let page_items = items.get(offset..end).unwrap_or_default().to_vec();
     let has_more = end < items.len();
     if query.cursor.is_none() && has_more {
@@ -1450,7 +1484,9 @@ where
     let (snapshot, items) = blocking_store(move || {
         reader.store.clone().read_snapshot(|index| {
             let snapshot = client_snapshot_at(&reader, index);
-            let items = read(&reader, &snapshot)?;
+            let items = reader
+                .store
+                .with_owned_set_snapshot_reads(|| read(&reader, &snapshot))?;
             Ok((snapshot, items))
         })
     })
@@ -1481,7 +1517,9 @@ fn client_sync_notice(state: &AppState) -> Option<ClientSyncNotice> {
                 .ok()
                 .flatten()
                 .map(client_timestamp),
-            estimated_catch_up_seconds: sync.estimated_catch_up_seconds,
+            estimated_catch_up_seconds: sync
+                .estimated_catch_up_seconds
+                .filter(|seconds| *seconds <= smallclaims::replication::MAX_SAFE_DURATION_SECONDS),
             diverged_since: sync
                 .diverged
                 .then_some(sync.graph_differs_since_unix_ms)
@@ -1550,7 +1588,15 @@ async fn client_capabilities(
             "max_glass_body_bytes": st3_schema::glasses::MAX_BODY_BYTES,
             "max_glasses": st3_schema::glasses::MAX_GLASSES,
             "max_glass_depth": st3_schema::glasses::MAX_DEPTH,
-            "max_glass_nodes": st3_schema::glasses::MAX_NODES
+            "max_glass_nodes": st3_schema::glasses::MAX_NODES,
+            "max_arrangement_body_bytes": st3_schema::arrangements::MAX_BODY_BYTES,
+            "max_arrangement_resource_bytes": st3_schema::arrangements::MAX_RESOURCE_BYTES,
+            "max_arrangements": st3_schema::arrangements::MAX_ARRANGEMENTS,
+            "max_arrangement_name_bytes": st3_schema::arrangements::MAX_NAME_BYTES,
+            "max_arrangement_key_bytes": st3_schema::arrangements::MAX_KEY_BYTES,
+            "max_arrangement_operations": st3_schema::arrangements::MAX_OPERATIONS,
+            "max_arrangement_folders": st3_schema::arrangements::MAX_FOLDERS,
+            "max_arrangement_placements": st3_schema::arrangements::MAX_PLACEMENTS
         },
         "event_cursor": cursor,
         "oldest_event_cursor": format!("event-cursor/{}/{oldest}", state.node),
@@ -2118,6 +2164,15 @@ fn client_agent_resources_selected(
         .collect::<BTreeMap<_, _>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
+    // Cards without a harness need only their actual claim's acceptance time, not its body.
+    // Keep the existing per-claim fallback if the bulk metadata read cannot be completed.
+    let actual_claim_times = store.claim_acceptance_times(
+        &status
+            .subjects
+            .iter()
+            .filter_map(|subject| subject.actual_claim.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let queued_steps = work_queues
         .values()
         .flat_map(|queue| {
@@ -2280,11 +2335,15 @@ fn client_agent_resources_selected(
                 .map(|harness| client_timestamp(harness.observed_at_unix_ms))
                 .or_else(|| {
                     subject.actual_claim.as_deref().and_then(|claim| {
-                        store
-                            .claim_by_id(claim)
-                            .ok()
-                            .flatten()
-                            .map(|claim| client_timestamp(claim.accepted_at_unix_ms))
+                        match &actual_claim_times {
+                            Ok(times) => times.get(claim).copied(),
+                            Err(_) => store
+                                .claim_by_id(claim)
+                                .ok()
+                                .flatten()
+                                .map(|claim| claim.accepted_at_unix_ms),
+                        }
+                        .map(client_timestamp)
                     })
                 })
                 .unwrap_or_default();
@@ -13747,6 +13806,120 @@ mod tests {
     use std::path::PathBuf;
 
     #[tokio::test]
+    async fn resources_page_keeps_rows_when_sync_forecast_is_unrepresentable() {
+        use smallclaims::replication::MAX_SAFE_DURATION_SECONDS;
+        use smallclaims::store::PeerSyncProgress;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.configured_peers = vec!["birch".into()];
+        for row in 0..9 {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: format!("resource/example/{row}"),
+                    kind: "resource.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("kind".into(), json!("vcs.pull-request")),
+                        (
+                            "facts".into(),
+                            json!({"opened_by": "agent/example", "number": row}),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let now = client_now_ms();
+        let mut progress = PeerSyncProgress::default();
+        progress.observe(0, Some((10_000, 0)), now - 610_000);
+        progress.observe(1_000, Some((9_000, 0)), now - 600_000);
+        for window in 1..=60 {
+            progress.observe(0, Some((9_000, 0)), now - 600_000 + window * 10_000);
+        }
+        assert_eq!(progress.view(now).unwrap().estimated_catch_up_seconds, None);
+        state
+            .store
+            .replication_sync
+            .lock()
+            .unwrap()
+            .insert("birch".into(), progress);
+
+        // An actual HTTP request over an isolated daemon's Unix socket, with the production
+        // router and resource projection. No fleet state or peer listener is involved.
+        let socket = root.path().join("api.sock");
+        let server_socket = socket.clone();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_socket, router(server_state))
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .unix_socket(socket.clone())
+            .build()
+            .unwrap();
+        let url = "http://localhost/v1/client/resources?opened_by=agent/example&limit=50";
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "isolated API did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let response = client.get(url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let envelope: Value = response.json().await.unwrap();
+        let page = &envelope["value"];
+        assert_eq!(page["items"].as_array().unwrap().len(), 9);
+        assert_eq!(page["sync"]["state"], "catching-up");
+        assert_eq!(page["sync"]["peers"][0]["peer_only_envelopes"], 9_000);
+        assert_eq!(
+            page["sync"]["peers"][0]["estimated_catch_up_seconds"],
+            Value::Null
+        );
+
+        // Guard the API boundary too: a pre-existing measurement can contain an unsafe value.
+        for (forecast, expected) in [
+            (Some(90), json!(90)),
+            (
+                Some(MAX_SAFE_DURATION_SECONDS),
+                json!(MAX_SAFE_DURATION_SECONDS),
+            ),
+            (Some(MAX_SAFE_DURATION_SECONDS + 1), Value::Null),
+            (Some(u64::MAX), Value::Null),
+            (None, Value::Null),
+        ] {
+            state
+                .store
+                .replication_sync
+                .lock()
+                .unwrap()
+                .get_mut("birch")
+                .unwrap()
+                .measured
+                .as_mut()
+                .unwrap()
+                .estimated_catch_up_seconds = forecast;
+            let response = client.get(url).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let envelope: Value = response.json().await.unwrap();
+            assert_eq!(envelope["value"]["items"], page["items"]);
+            assert_eq!(envelope["value"]["sync"]["state"], "catching-up");
+            assert_eq!(
+                envelope["value"]["sync"]["peers"][0]["estimated_catch_up_seconds"],
+                expected
+            );
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn a_seat_reads_its_own_desired_record_for_its_status_line() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -14627,6 +14800,46 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 );
             }
         }
+    }
+
+    #[test]
+    fn doctor_names_failed_admission_even_if_opencode_reports_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"version 2
+agent "fixture" { workspace "/tmp"; harness "opencode" {} }
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let plan = state.store.mission(&intent, crate::model::IntentInput { kdl: source.into(), source_name: None }).unwrap();
+        state.store.apply(&intent, &plan.subject_tokens, "admission-doctor").unwrap();
+        let subject = "agent/node.fixture";
+        let append = |kind: &str, fields: BTreeMap<String, Value>| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields, evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        append("runtime.observed", BTreeMap::from([
+            ("status".into(), json!("running")), ("runtime_id".into(), json!("fixture")),
+            ("incarnation_id".into(), json!("first")),
+        ]));
+        append("harness.diagnostic", BTreeMap::from([
+            ("code".into(), json!("harness-admission-failed")), ("status".into(), json!("degraded")),
+            ("severity".into(), json!("warning")),
+            ("reason".into(), json!("opencode 99.42.7 admission failed at admissionIdleEdge")),
+            ("incarnation_id".into(), json!("first")),
+        ]));
+        append("harness.observed", BTreeMap::from([
+            ("state".into(), json!("ready")), ("driver".into(), json!("opencode")),
+            ("incarnation_id".into(), json!("first")),
+        ]));
+        let report = doctor_report(&state).unwrap().0;
+        let readiness = report.checks.iter().find(|check| check.name == "driver-readiness").unwrap();
+        assert_eq!(readiness.status, "warn");
+        assert!(readiness.message.contains("admissionIdleEdge"), "{readiness:?}");
+        let index = state.store.index().unwrap();
+        let resources = client_agent_resources(&state.store, false, "snapshot", index).unwrap();
+        assert_eq!(resources[0]["state"], "waiting");
     }
 
     #[test]

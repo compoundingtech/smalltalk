@@ -51,10 +51,23 @@ pi's env fallbacks. Measured integration evidence:
   channel's frame discipline, not a shared file parameterized at runtime — the idle-edge and
   approval logic differ, and a shared file would make each harness's correctness depend on
   the other's branch.
-- **OMP-R05 Hard version gate.** The wrapper refuses to launch outside the verified range
-  (initially omp 18.x) using the codex/opencode admission convention: a later minor stays
-  rejected until the delivery-critical checks (event names, idle-edge behavior, approval
-  events) are repeated against it.
+- **OMP-R05 Hard measured admission.** Before owning the live seat, the wrapper measures
+  each unseen exact installed producer and shipped extension in an isolated scratch RPC session.
+  Extension load, lifecycle names, the positive post-`agent_end` idle edge, harmless approval
+  correlation, and completed consumption of one native delivery must all pass. Transport
+  acceptance is separate evidence. Cache the exact release with executable, package manifest and
+  available lockfile, interpreter, extension and probe identity; a same-version executable or
+  metadata replacement cannot reuse a pass. Never traverse the whole installation or refuse a
+  build for installation size.
+  A failed or indeterminate check refuses launch and names the boundary in doctor and agent
+  state. Empty HOME/XDG/workspace/PTY roots and a loopback model isolate managed seats,
+  credentials and history. A new passing version needs no allowlist or st update.
+  A person may explicitly bypass admission for one exact executable/interpreter/installation
+  and shipped extension with `st admission override omp --binary <path> --reason <reason>`.
+  Record this separately from measured evidence; retain refusals, identify the exception in
+  driver logs, and never transfer it to a replacement build/extension. `st admission revoke`
+  restores the normal gate on next launch. Admission does not stop an already-running provider;
+  there is no last-admitted-executable fallback.
 - **OMP-R06 Provider credential rejection is classified, not guessed.** A turn that ended on a
   provider error carries omp's own `errorId` classification bitfield to st2 unchanged; st2, not
   the asset, decides whether it names a rejected credential, and publishes the shared

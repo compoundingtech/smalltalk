@@ -49,11 +49,11 @@ fi`,
       ...setup,
       nixDevelopStep({ name: 'Build missing cache contents', flake: stage === 'genie' ? '.#genie' : '.', command: ['bash', 'scripts/ci-cache-warm', stage] }),
       { name: 'Save Nix outputs', run: 'bash scripts/ci-nix-cache save' },
-      // A snapshot can supply a warm build after an Actions entry was evicted. Fill
-      // that missing main entry directly; do not overwrite the snapshot with a fallback.
+      // PR/merge builds restore these entries and retain exact-source artifacts. Only
+      // protected main fills the shared dependency quota, including after eviction.
       ...(nixOnly ? [nixCacheStep] : [cargoCacheStep, nixCacheStep]).map((step) => ({
-        name: `Refill ${step.id} from the restored snapshot`,
-        if: `env.CI_BUILD_SNAPSHOT_HIT == '1' && steps.${step.id === 'cargo-cache' ? 'cargo-probe' : 'nix-probe'}.outputs.cache-hit != 'true'`,
+        name: `Save the missing main ${step.id}`,
+        if: `github.ref == 'refs/heads/main' && steps.${step.id === 'cargo-cache' ? 'cargo-probe' : 'nix-probe'}.outputs.cache-hit != 'true'`,
         uses: 'actions/cache/save@v4',
         with: { path: step.with.path, key: step.with.key },
       })),
@@ -66,8 +66,11 @@ export default githubWorkflow(auditCaches({
   name: 'Main upkeep',
   on: { push: { branches: ['main'] }, workflow_dispatch: {} },
   permissions: { contents: 'read', actions: 'read' },
-  // Every main SHA keeps its upkeep run; a later merge must not cancel cache saves or cost checks.
-  concurrency: { group: 'main-upkeep-${{ github.run_id }}', 'cancel-in-progress': false },
+  // Fill caches for current main; keep pinned manual runs independent.
+  concurrency: {
+    group: "main-upkeep-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.run_id }}",
+    'cancel-in-progress': "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
+  },
   actionlint: {
     ...defaultActionlintConfig,
     selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],

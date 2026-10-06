@@ -3645,6 +3645,109 @@ fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
 }
 
 #[test]
+fn a_resume_returning_another_thread_fails_without_rebinding_the_incarnation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _stop_exclusive = stop_flag_tests();
+    let binding_path = tmp.path().join("state/binding.json");
+    let control_state_path = tmp.path().join("state/control-state.json");
+    let prior_runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let prior_binding = CodexThreadBinding::new(&prior_runtime, "thread-prior".into());
+    atomic_json(&binding_path, &prior_binding).unwrap();
+
+    let socket = tmp.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialize"
+        );
+        write_json_message(
+            &mut websocket,
+            &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialized"
+        );
+        let loaded = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(loaded["method"], "thread/loaded/list");
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                "result": { "data": ["thread-prior"] }
+            }),
+        )
+        .unwrap();
+        let resume = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["params"]["threadId"], "thread-prior");
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                "result": {
+                    "thread": { "id": "thread-other", "status": { "type": "idle" } }
+                }
+            }),
+        )
+        .unwrap();
+    });
+
+    let stream = UnixStream::connect(&socket).unwrap();
+    let shutdown = stream.try_clone().unwrap();
+    let websocket = initialize_control(stream)
+        .unwrap()
+        .expect("no stop raised in tests");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let (resume_ready_tx, resume_ready_rx) = mpsc::channel();
+    let runtime_for_pump = runtime.clone();
+    let binding_for_pump = binding_path.clone();
+    let control_state_for_pump = control_state_path.clone();
+    let pump = thread::spawn(move || {
+        pump_control(
+            websocket,
+            &binding_for_pump,
+            &control_state_for_pump,
+            &runtime_for_pump,
+            Some(ControlResume {
+                thread_id: "thread-prior",
+                ready: resume_ready_rx,
+                tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: None,
+                preload: false,
+                preloaded: None,
+            }),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        )
+    });
+    resume_ready_tx.send(()).unwrap();
+    acknowledge_tui_thread_loaded(&rx);
+    let ControlEvent::Failed(error) = rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap() else {
+        panic!("a different thread did not fail closed");
+    };
+    assert!(
+        error.contains("expected thread-prior, received thread-other"),
+        "{error}"
+    );
+
+    server.join().unwrap();
+    let _ = shutdown.shutdown(Shutdown::Both);
+    pump.join().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<CodexThreadBinding>(&fs::read(&binding_path).unwrap()).unwrap(),
+        prior_binding
+    );
+    assert!(!control_state_path.exists());
+}
+
+#[test]
 fn a_binding_from_another_runtime_incarnation_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("binding.json");

@@ -70,6 +70,8 @@ pub(crate) struct ExternalSession {
     pub(crate) driver: ExternalDriver,
     pub(crate) native_id: String,
     pub(crate) transcript: PathBuf,
+    /// The provider home owning this rollout, independent of the daemon launch environment.
+    pub(crate) codex_home: Option<PathBuf>,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) title: Option<String>,
     pub(crate) started_at_unix_ms: u128,
@@ -137,6 +139,7 @@ struct SessionMetadata {
     driver: ExternalDriver,
     native_id: String,
     transcript: PathBuf,
+    codex_home: Option<PathBuf>,
     cwd: Option<PathBuf>,
     title: Option<String>,
     started_at_unix_ms: u128,
@@ -349,6 +352,7 @@ fn assemble_discovery(
             driver: item.driver,
             native_id: item.native_id,
             transcript: item.transcript,
+            codex_home: item.codex_home,
             cwd: item.cwd,
             title: item.title,
             started_at_unix_ms: item.started_at_unix_ms,
@@ -492,6 +496,10 @@ pub(crate) fn find_bound_transcript(
         if driver != ExternalDriver::Claude && metadata.native_id != native_id {
             continue;
         }
+        let mut metadata = metadata;
+        if driver == ExternalDriver::Codex {
+            metadata.codex_home = Some(home.join(".codex"));
+        }
         // The same session can leave a file in more than one project directory; the one
         // written most recently is the live one.
         if found
@@ -507,6 +515,7 @@ pub(crate) fn find_bound_transcript(
         driver,
         native_id: native_id.to_owned(),
         transcript: metadata.transcript,
+        codex_home: metadata.codex_home,
         cwd: metadata.cwd,
         title: metadata.title,
         started_at_unix_ms: metadata.started_at_unix_ms,
@@ -744,6 +753,7 @@ pub(crate) fn find_bound_pi_family_transcript(
         driver,
         native_id: metadata.native_id,
         transcript: metadata.transcript,
+        codex_home: metadata.codex_home,
         cwd: metadata.cwd,
         title: metadata.title,
         started_at_unix_ms: metadata.started_at_unix_ms,
@@ -795,6 +805,7 @@ pub(crate) fn find_managed_omp_transcript(
             driver: ExternalDriver::Omp,
             native_id: metadata.native_id,
             transcript: metadata.transcript,
+            codex_home: metadata.codex_home,
             cwd: metadata.cwd,
             title: metadata.title,
             started_at_unix_ms: metadata.started_at_unix_ms,
@@ -1106,9 +1117,24 @@ pub(crate) fn import_seat(session: &ExternalSession) -> Result<ImportSeat> {
     let mut args = KdlNode::new("args");
     match session.driver {
         ExternalDriver::Codex => {
-            args.entries_mut().push(KdlEntry::new("resume"));
-            args.entries_mut()
-                .push(KdlEntry::new(session.native_id.clone()));
+            // Authored `resume` argv bypasses the wrapper's exact-thread handshake.
+            // Pin the home as well: another home may contain a stale copy of this ID.
+            let home = session
+                .codex_home
+                .as_deref()
+                .context("the saved Codex session has no originating CODEX_HOME")?;
+            let home = fs::canonicalize(home)
+                .context("resolve the saved Codex session's originating CODEX_HOME")?;
+            let mut env = KdlNode::new("env");
+            let mut body = KdlDocument::new();
+            body.nodes_mut().push(string_node(
+                crate::suspension::RESUME_ENV,
+                &session.native_id,
+            ));
+            body.nodes_mut()
+                .push(string_node("CODEX_HOME", home.to_string_lossy().as_ref()));
+            env.set_children(body);
+            agent_body.nodes_mut().push(env);
         }
         ExternalDriver::Claude => {
             args.entries_mut().push(KdlEntry::new("--resume"));
@@ -1136,7 +1162,9 @@ pub(crate) fn import_seat(session: &ExternalSession) -> Result<ImportSeat> {
                 .push(KdlEntry::new(session.native_id.clone()));
         }
     }
-    harness_body.nodes_mut().push(args);
+    if !args.entries().is_empty() {
+        harness_body.nodes_mut().push(args);
+    }
     harness.set_children(harness_body);
     agent_body.nodes_mut().push(harness);
     agent_body
@@ -1269,7 +1297,7 @@ fn discover_files(
                 {
                     continue;
                 }
-                let in_session_root = roots.iter().any(|(driver, root)| {
+                let session_root = roots.iter().find(|(driver, root)| {
                     if *driver != candidate.driver {
                         return false;
                     }
@@ -1289,11 +1317,14 @@ fn discover_files(
                             depth >= 2 && (*driver != ExternalDriver::Omp || depth == 2)
                         })
                 });
-                if in_session_root
+                if let Some((driver, root)) = session_root
                     && seen.insert(path.to_owned())
                     && found.len() < MAX_DISCOVERED_FILES
-                    && let Ok(Some(metadata)) = read_metadata(candidate.driver, path)
+                    && let Ok(Some(mut metadata)) = read_metadata(candidate.driver, path)
                 {
+                    if *driver == ExternalDriver::Codex {
+                        metadata.codex_home = root.parent().map(Path::to_owned);
+                    }
                     found.push(metadata);
                 }
             }
@@ -1315,7 +1346,7 @@ fn discover_files(
         } else {
             usize::MAX
         };
-        for entry in WalkDir::new(root)
+        for entry in WalkDir::new(&root)
             .max_depth(max_depth)
             .follow_links(false)
             .into_iter()
@@ -1331,7 +1362,10 @@ fn discover_files(
             if found.len() >= MAX_DISCOVERED_FILES {
                 break;
             }
-            if let Ok(Some(metadata)) = read_metadata(driver, entry.path()) {
+            if let Ok(Some(mut metadata)) = read_metadata(driver, entry.path()) {
+                if driver == ExternalDriver::Codex {
+                    metadata.codex_home = root.parent().map(Path::to_owned);
+                }
                 found.push(metadata);
             }
         }
@@ -1401,6 +1435,7 @@ fn discover_opencode_sessions(home: &Path) -> Result<Vec<SessionMetadata>> {
             driver: ExternalDriver::OpenCode,
             native_id,
             transcript: database.clone(),
+            codex_home: None,
             cwd: directory
                 .filter(|value| !value.trim().is_empty())
                 .map(PathBuf::from),
@@ -1529,6 +1564,7 @@ fn parse_metadata(
         driver,
         native_id,
         transcript: path.to_owned(),
+        codex_home: None,
         cwd,
         title,
         started_at_unix_ms,
@@ -2199,6 +2235,10 @@ fn push_unrecognized(
     kind: Option<&str>,
     value: &Value,
 ) {
+    if driver == "omp" && omp_has_image_payload(value) {
+        push_omp_image_unavailable(items, sequence, timestamp, value);
+        return;
+    }
     let label = match kind {
         Some(kind) => format!("[unrecognized {driver} {what} `{kind}`]"),
         None => format!("[unrecognized {driver} {what} without a type]"),
@@ -2522,7 +2562,7 @@ fn normalize_omp(
                 sequence + 1,
                 &timestamp,
                 message["toolCallId"].as_str().unwrap_or_default(),
-                message.get("content").cloned().unwrap_or(Value::Null),
+                omp_result_images(driver, message.get("content").cloned().unwrap_or(Value::Null)),
                 message.get("isError").and_then(Value::as_bool).unwrap_or(false),
             );
             return;
@@ -2611,9 +2651,12 @@ fn push_omp_content(
                             .or_else(|| part.get("call_id"))
                             .and_then(Value::as_str)
                             .unwrap_or("native-call"),
-                        part.get("content").cloned().unwrap_or(Value::Null),
+                        omp_result_images(driver, part.get("content").cloned().unwrap_or(Value::Null)),
                     ),
                     Some(kind) if HIDDEN_REASONING_BLOCKS.contains(&kind) => {}
+                    Some("image") if driver == ExternalDriver::Omp => {
+                        push_omp_image_unavailable(items, item_sequence, &timestamp, part);
+                    }
                     Some("image") => {
                         push_content(items, item_sequence, &timestamp, role, "[image]")
                     }
@@ -2639,6 +2682,79 @@ fn push_omp_content(
             Some(json_kind(other)),
             other,
         ),
+    }
+}
+
+fn omp_image_availability(image: &Value) -> Value {
+    let reference = image.get("data").and_then(Value::as_str).filter(|reference| {
+        reference.strip_prefix("blob:sha256:").is_some_and(|digest| {
+            digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    });
+    let mut details = json!({
+        "_tag":"OmpImage","version":1,
+        "availability":if reference.is_some() { "unavailable" } else { "withheld" },
+        "reason":if reference.is_some() { "native_blob_not_fetchable" } else { "image_payload_not_authorized" },
+    });
+    if let Some(reference) = reference {
+        // This is not a st attachment ID: no origin/authorization evidence exists to fetch it.
+        details["native_ref"] = json!(reference);
+    }
+    if let Some(mime) = image.get("mimeType").and_then(Value::as_str)
+        .filter(|mime| matches!(*mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp"))
+    {
+        details["mime_type"] = json!(mime);
+    } else {
+        details["mime_availability"] = json!("unknown");
+    }
+    for key in ["width", "height"] {
+        if let Some(value) = image.get(key).and_then(Value::as_u64).filter(|value| *value <= 65_535) {
+            details[key] = json!(value);
+        }
+    }
+    details
+}
+
+fn push_omp_image_unavailable(
+    items: &mut Vec<Value>,
+    sequence: u64,
+    timestamp: &str,
+    image: &Value,
+) {
+    items.push(timeline_item(sequence, timestamp, "system", "error", json!({
+        "code":"native_image_unavailable",
+        "message":"Native image is unavailable through the conversation attachment service.",
+        "retryable":false,
+        "details":omp_image_availability(image),
+    })));
+}
+
+/// Unknown native shapes must not turn an image or a data URI into visible JSON text.
+fn omp_has_image_payload(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.trim_start().starts_with("data:"),
+        Value::Array(values) => values.iter().any(omp_has_image_payload),
+        Value::Object(fields) => {
+            fields.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                matches!(kind, "image" | "input_image" | "image_url")
+            }) || fields.contains_key("image_url")
+                || fields.values().any(omp_has_image_payload)
+        }
+        _ => false,
+    }
+}
+
+fn omp_result_images(driver: ExternalDriver, content: Value) -> Value {
+    if driver != ExternalDriver::Omp {
+        return content;
+    }
+    match content {
+        Value::Array(parts) => Value::Array(
+            parts.into_iter().map(|part| omp_result_images(driver, part)).collect(),
+        ),
+        other if omp_has_image_payload(&other) => omp_image_availability(&other),
+        other => other,
     }
 }
 
@@ -3105,6 +3221,7 @@ mod tests {
             driver: ExternalDriver::Omp,
             native_id: "saved-before-stall".into(),
             transcript: home.path().join("saved.jsonl"),
+            codex_home: None,
             cwd: None,
             title: None,
             started_at_unix_ms: 1,
@@ -3148,6 +3265,7 @@ mod tests {
             driver: ExternalDriver::Omp,
             native_id: "shared-id".into(),
             transcript: workspace.join("shared-id.jsonl"),
+            codex_home: None,
             cwd: Some(workspace.to_owned()),
             title: None,
             started_at_unix_ms: 1,
@@ -3340,6 +3458,142 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn omp_images_keep_safe_identity_and_typed_unavailability_without_pixels() {
+        let reference = format!("blob:sha256:{}", "a".repeat(64));
+        let image = json!({"type":"image","data":reference,"mimeType":"image/webp","width":640,"height":480});
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &json!({
+            "type":"message","id":"image-message","message":{"role":"user","content":[image.clone()]}
+        }), 0, "", &mut items);
+        let notice = items.iter().find(|item| item["type"] == "error").unwrap();
+        assert_eq!(notice["body"]["code"], "native_image_unavailable");
+        assert_eq!(notice["body"]["details"]["native_ref"], reference);
+        assert_eq!(notice["body"]["details"]["mime_type"], "image/webp");
+        assert_eq!(notice["body"]["details"]["availability"], "unavailable");
+        assert_eq!(notice["body"]["details"]["reason"], "native_blob_not_fetchable");
+        assert_eq!(notice["body"]["details"]["width"], 640);
+        assert_eq!(notice["body"]["details"]["height"], 480);
+
+        for data in ["planted-image-bytes", "https://user:secret@example.invalid/image", "blob:sha256:secret"] {
+            items.clear();
+            normalize_omp(ExternalDriver::Omp, &json!({
+                "type":"message","id":"image-tool","message":{
+                    "role":"toolResult","toolCallId":"image-call","isError":false,
+                    "content":[{"type":"text","text":"kept"},{"type":"image","data":data,"mimeType":"image/png"}]
+                }
+            }), 0, "", &mut items);
+            let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
+            assert_eq!(result["body"]["call_id"], "image-call");
+            assert_eq!(result["body"]["content"][0]["text"], "kept");
+            assert_eq!(result["body"]["content"][1]["_tag"], "OmpImage");
+            assert_eq!(result["body"]["content"][1]["availability"], "withheld");
+            assert_eq!(result["body"]["content"][1]["mime_type"], "image/png");
+            assert!(!serde_json::to_string(&items).unwrap().contains(data));
+        }
+    }
+
+    #[test]
+    fn omp_nested_result_images_withhold_bytes_and_unknown_mime() {
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &json!({
+            "type":"message","id":"nested-image","message":{"role":"tool","content":[{
+                "type":"toolResult","toolCallId":"nested-call","content":[{
+                    "type":"image","data":"planted-image-bytes","mimeType":"planted-mime-secret"
+                }]
+            }]}
+        }), 0, "", &mut items);
+        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
+        assert_eq!(result["body"]["content"][0]["mime_availability"], "unknown");
+        assert_eq!(result["body"]["content"][0]["reason"], "image_payload_not_authorized");
+        assert!(!serde_json::to_string(&items).unwrap().contains("planted-"));
+    }
+
+    #[test]
+    fn omp_images_reject_malformed_direct_refs_and_oversized_dimensions() {
+        let canonical = format!("blob:sha256:{}", "a".repeat(64));
+        for reference in [
+            format!("blob:sha256:{}", "A".repeat(64)),
+            format!("blob:sha256:{}", "a".repeat(63)),
+            format!("blob:sha256:{}", "a".repeat(65)),
+            format!("{canonical}trailing-data"),
+            format!("blob:sha256:{}", "é".repeat(32)),
+            "data:image/png;base64,planted-pixels".into(),
+        ] {
+            let mut items = Vec::new();
+            normalize_omp(ExternalDriver::Omp, &json!({
+                "type":"message","id":"malformed-image","message":{"role":"user","content":[{
+                    "type":"image","data":reference,"mimeType":"planted-mime",
+                    "width":9_007_199_254_740_992_u64,"height":65_536
+                }]}
+            }), 0, "", &mut items);
+            let details = &items.iter().find(|item| item["type"] == "error").unwrap()["body"]["details"];
+            assert_eq!(details["availability"], "withheld");
+            assert_eq!(details["reason"], "image_payload_not_authorized");
+            assert!(details.get("native_ref").is_none());
+            assert!(details.get("width").is_none());
+            assert!(details.get("height").is_none());
+            assert!(!serde_json::to_string(&items).unwrap().contains(&reference));
+        }
+        let details = omp_image_availability(&json!({
+            "type":"image","data":canonical,"width":65_535,"height":480
+        }));
+        assert_eq!(details["width"], 65_535);
+        assert_eq!(details["height"], 480);
+    }
+
+    #[test]
+    fn omp_images_withhold_unrecognized_and_single_object_payloads() {
+        let payload = "data:image/png;base64,planted-pixels";
+        for block in [
+            json!({"type":"input_image","image_url":payload}),
+            json!({"type":"image_url","image_url":{"url":payload}}),
+            json!({"type":"future_block","source":{"data":payload}}),
+        ] {
+            for content in [json!([block.clone()]), block.clone()] {
+                let mut items = Vec::new();
+                normalize_omp(ExternalDriver::Omp, &json!({
+                    "type":"message","id":"unknown-image","message":{"role":"user","content":content}
+                }), 0, "", &mut items);
+                let details = &items.iter().find(|item| item["type"] == "error").unwrap()["body"]["details"];
+                assert_eq!(details["_tag"], "OmpImage");
+                assert_eq!(details["availability"], "withheld");
+                assert!(!serde_json::to_string(&items).unwrap().contains(payload));
+            }
+            for content in [json!([{"type":"text","text":"kept"},block.clone()]), block.clone()] {
+                let mut items = Vec::new();
+                normalize_omp(ExternalDriver::Omp, &json!({
+                    "type":"message","id":"unknown-tool-image","message":{
+                        "role":"toolResult","toolCallId":"image-call","content":content
+                    }
+                }), 0, "", &mut items);
+                let result = &items.iter().find(|item| item["type"] == "tool_result").unwrap()["body"]["content"];
+                let placeholder = if result.is_array() {
+                    assert_eq!(result[0]["text"], "kept");
+                    &result[1]
+                } else {
+                    result
+                };
+                assert_eq!(placeholder["_tag"], "OmpImage");
+                assert_eq!(placeholder["availability"], "withheld");
+                assert!(!serde_json::to_string(&items).unwrap().contains(payload));
+            }
+        }
+    }
+
+    #[test]
+    fn pi_images_remain_plain_image_placeholders() {
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Pi, &json!({
+            "type":"message","id":"pi-image","message":{"role":"user","content":[{
+                "type":"image","data":"planted-pixels","mimeType":"image/png"
+            }]}
+        }), 0, "", &mut items);
+        let content = items.iter().find(|item| item["type"] == "content").unwrap();
+        assert_eq!(content["body"]["text"], "[image]");
+        assert!(!serde_json::to_string(&items).unwrap().contains("planted-pixels"));
     }
 
     #[test]
@@ -3549,6 +3803,7 @@ mod tests {
             driver: ExternalDriver::OpenCode,
             native_id: sessions[0].native_id.clone(),
             transcript: sessions[0].transcript.clone(),
+            codex_home: None,
             cwd: sessions[0].cwd.clone(),
             title: sessions[0].title.clone(),
             started_at_unix_ms: sessions[0].started_at_unix_ms,
@@ -3645,6 +3900,7 @@ mod tests {
             driver: ExternalDriver::OpenCode,
             native_id: "ses_native".into(),
             transcript: database,
+            codex_home: None,
             cwd: None,
             title: None,
             started_at_unix_ms: 1_700_000_000_000,
@@ -3733,6 +3989,7 @@ mod tests {
             driver: ExternalDriver::OpenCode,
             native_id: "ses_native".into(),
             transcript: database,
+            codex_home: None,
             cwd: None,
             title: None,
             started_at_unix_ms: 1_700_000_000_000,
@@ -3753,6 +4010,69 @@ mod tests {
         assert!(serde_json::to_vec(&timeline).unwrap().len() <= MAX_TIMELINE_BYTES as usize);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn codex_import_pins_the_physical_home_even_when_discovery_uses_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let origin = home.join(".codex-origin");
+        let directory = origin.join("sessions/2026/09/21");
+        fs::create_dir_all(&directory).unwrap();
+        std::os::unix::fs::symlink(&origin, home.join(".codex")).unwrap();
+        let transcript = directory.join("rollout-saved.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta", "payload": {"id": "saved", "cwd": root.path()}
+                })
+            ),
+        )
+        .unwrap();
+        let saved = discover_uncached(&home, None, true)
+            .unwrap()
+            .sessions
+            .pop()
+            .unwrap();
+        let imported = import_seat(&saved).unwrap();
+        let origin = fs::canonicalize(origin).unwrap();
+        // Repointing the discovery alias after import must never select the stale copy.
+        let stale = home.join(".codex-stale");
+        fs::create_dir_all(&stale).unwrap();
+        fs::remove_file(home.join(".codex")).unwrap();
+        std::os::unix::fs::symlink(&stale, home.join(".codex")).unwrap();
+        let document: KdlDocument = imported.kdl.parse().unwrap();
+        let body = document.get("agent").unwrap().children().unwrap();
+        let environment = body.get("env").unwrap().children().unwrap();
+        assert_eq!(
+            environment
+                .get("CODEX_HOME")
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_string(),
+            Some(origin.to_str().unwrap())
+        );
+        assert_eq!(
+            environment
+                .get(crate::suspension::RESUME_ENV)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_string(),
+            Some("saved")
+        );
+        assert!(
+            body.get("harness")
+                .unwrap()
+                .children()
+                .unwrap()
+                .get("args")
+                .is_none()
+        );
+    }
+
     fn transcript_session(driver: ExternalDriver, path: &Path) -> ExternalSession {
         ExternalSession {
             id: "session/external-test".into(),
@@ -3760,6 +4080,7 @@ mod tests {
             driver,
             native_id: "native".into(),
             transcript: path.to_owned(),
+            codex_home: None,
             cwd: None,
             title: None,
             started_at_unix_ms: 0,

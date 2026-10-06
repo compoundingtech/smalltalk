@@ -3,6 +3,10 @@
 
 name: Public repository check
 
+concurrency:
+  group: "public-repo-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main') || github.run_id }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+
 on:
   pull_request: null
   push:
@@ -10,11 +14,7 @@ on:
 
 jobs:
   public-repo:
-    runs-on:
-      [
-        namespace-profile-linux-x86-64;job.priority=1,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
     steps:
       - uses: actions/checkout@v4
       - name: Test repository guard

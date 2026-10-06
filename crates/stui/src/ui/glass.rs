@@ -2463,9 +2463,14 @@ impl Ui {
             KeyCode::Char('e') if control && conversation.is_some() => self.toggle_all_tools(),
             KeyCode::Char('p') if control && conversation.is_some() => self.toggle_simple(),
             KeyCode::Char('d') if control && conversation.is_some() => self.toggle_details(),
+            // Ctrl+R sends a message st never had again; with none to send it speaks into the box,
+            // as it does once the box is open (Nathan, 2026-10-05: it did nothing until a letter
+            // had opened the box).
             KeyCode::Char('r') if control && conversation.is_some() && self.live => {
                 if let Some(entry) = self.undelivered() {
                     self.effects.push(Effect::Resend { entry });
+                } else {
+                    self.start_voice();
                 }
             }
             // Backspace takes a message st never had back into the box, to change or delete.
@@ -3693,6 +3698,24 @@ mod tests {
             },
         );
         assert_eq!(shown(&ui, 0).as_deref(), Some(cos));
+    }
+
+    #[test]
+    fn ctrl_r_speaks_in_a_conversation_without_the_box_open_first() {
+        let mut ui = glass();
+        ui.live = true;
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        assert!(!ui.editing, "the box is closed");
+        ctrl(&mut ui, 'r');
+        // Without a speech helper (this test has none) it says so; before, it did nothing.
+        let flash = ui.flash.as_ref().map(|(message, _)| message.as_str());
+        assert!(
+            flash.is_some_and(|message| message.contains("voice")),
+            "ctrl+r reached voice: {flash:?}"
+        );
     }
 
     #[test]

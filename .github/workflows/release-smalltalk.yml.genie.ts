@@ -1,4 +1,4 @@
-import { linuxActionlintConfig, linuxRunner } from './workspace-ci.ts'
+import { linuxActionlintConfig, linuxRunner, linuxRunnerProfile, macosRunnerProfile } from './workspace-ci.ts'
 import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import { auditCaches } from './cache-audit.ts'
 import { githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
@@ -53,14 +53,13 @@ export default githubWorkflow(auditCaches({
         "fail-fast": false,
         "matrix": {
           "runner": [
-            linuxRunner[0],
-            "namespace-profile-macos-arm64"
+            linuxRunnerProfile,
+            macosRunnerProfile
           ]
         }
       },
       "runs-on": [
-        "${{ matrix.runner }}",
-        "namespace-features:github.run-id=${{ github.run_id }}"
+        "${{ matrix.runner }};github.run-id=${{ github.run_id }}"
       ],
       "timeout-minutes": 5,
       "steps": [
@@ -84,19 +83,18 @@ export default githubWorkflow(auditCaches({
         "matrix": {
           "include": [
             {
-              "runner": linuxRunner[0],
+              "runner": linuxRunnerProfile,
               "target": "x86_64-unknown-linux-gnu"
             },
             {
-              "runner": "namespace-profile-macos-arm64",
+              "runner": macosRunnerProfile,
               "target": "aarch64-apple-darwin"
             }
           ]
         }
       },
       "runs-on": [
-        "${{ matrix.runner }}",
-        "namespace-features:github.run-id=${{ github.run_id }}"
+        "${{ matrix.runner }};github.run-id=${{ github.run_id }}"
       ],
       "timeout-minutes": 90,
       "env": {

@@ -82,6 +82,15 @@ The value is read once per process. Retention still defaults to 128, preserving 
 prepared-statement reuse from #1234. Profiling counts fresh connections as
 `read connection opened`.
 
+Each reader keeps up to 128 prepared statements. Mailbox changed-since, owner/binding,
+local watermark, and snapshot fence checks reuse those statements; caching removes repeated
+SQL preparation but does not change the graph-wide wake fan-out.
+
+Status reachability checks walk the sparse `operations_conflict_index` and seek matching
+claims through `claims_operation_index`. An unrelated idempotency conflict must not turn
+every subject's status read into a scan of its historical JSON bodies. The operation ID's
+TEXT affinity is removed in that join so SQLite can seek the JSON-expression index.
+
 `st doctor` reports open, idle and active reader counts, peak open readers, total connections
 opened since startup, the configured cache target, and summed current reader targets without
 requiring SQLite MEMSTATUS. These are targets, not measured allocations: SQLite schema,
@@ -126,3 +135,12 @@ The bundled SQLite build uses `SQLITE_DEFAULT_MEMSTATUS=0` through the workspace
 configuration, including Cargo-based Nix builds. SQLite's process-wide allocation statistics
 are disabled by default, removing their shared allocator mutex; statement, process CPU and
 I/O accounting remain available.
+
+A full replication projection fallback always writes one bounded line to daemon stderr before
+replay starts, even without `ST3_PROFILE_DIR`. It names the phase, reason, previous frontier and
+entry target, for example `st: projection full replay phase=startup/project-replication-backlog
+reason=missing-health frontier=0 target=1200` (one physical log line). Reasons distinguish missing
+or unhealthy health, a frontier ahead of the log, a non-incremental kind, a work operation,
+malformed operation metadata, an operation conflict, and `incremental-error:CODE`. Healthy
+incremental chunks produce no fallback log. The target is the admitted index observed at entry;
+a full replay can also include claims admitted since that observation.
