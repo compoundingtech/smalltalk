@@ -26,22 +26,24 @@ The pilot retains this information in private adapter state. It does not route a
 arbitrary st message solely because its recipient has an external namespace.
 
 The first native import permission is deliberately narrow: the selected program
-seat declares its exact external source and target st agent:
+seat declares its enrolled external sources and target st agent:
 
 ```kdl
 version 2
 agent "example/bridge" {
   workspace "/srv/example/bridge"
   argv "/usr/bin/python3" "/srv/example/bridge/program.py"
-  tags st3.adapter.source="external/discord/user/404" st3.adapter.target="agent/example/test"
+  tags st3.adapter.sources="external/discord/user/404,external/discord/user/606" st3.adapter.target="agent/example/test"
 }
 ```
 
 The authenticated local actor must be that program seat. The import handler checks
 the selected declaration rather than accepting permissions asserted in the request.
-A different source, native person, target or undeclared adapter is refused. This
-first permission binds one account to one agent; multi-route enrollment needs a
-separate explicit contract.
+An unenrolled source, native person, target or undeclared adapter is refused. This
+first permission binds up to sixteen distinct accounts to one agent. Sources are
+a comma-separated list without spaces or duplicates; the singular
+`st3.adapter.source` remains supported for a single account. Multi-channel routing
+needs a separate explicit contract.
 
 ## Inbound import and images
 
@@ -74,8 +76,8 @@ that scan with `GET /v1/client/adapter/deliveries?after=INDEX&wait_ms=MILLISECON
 authenticated as the enrolled adapter. The server subscribes before reading, waits
 for graph change notifications for at most ten seconds, and returns a bounded page
 of at most 100 replies, a durable local frontier, host identity and `more` flag under
-`st3.adapter.delivery.v0`. It reads only the enrolled external account and its
-legacy `person/discord-404` mailbox during migration. Only replies from
+`st3.adapter.delivery.v0`. It reads only enrolled external accounts and their
+legacy `person/discord-404` mailboxes during migration. Only replies from
 the configured agent, addressed to one of those exact accounts and linked to a
 retained route, are exported. Native replies are sufficient; agents need no Discord
 client or token.
@@ -86,7 +88,8 @@ delivery. A backwards frontier or changed host requires explicit reconciliation.
 The bridge runs one wait request until the next Discord intake deadline; it wakes
 for replies without scanning history on a fixed timer. Discord intake remains
 five-second REST polling. This interim notification source observes global graph
-changes, so busy unrelated writes can wake it; selected resource notifications should
+changes internally, but unrelated writes do not end the wait or force another HTTP
+request. Selected resource notifications should
 replace that source when the graph-watch engine arrives.
 
 SQLite holds the provider/native message ID map, reply references, accepted intake

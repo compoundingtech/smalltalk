@@ -622,11 +622,31 @@ class NativeContract(unittest.TestCase):
                 self.assertEqual(native.send(picture), picture_id)
                 digest = hashlib.sha256(PNG).hexdigest()
                 reference = {'sha256': digest, 'size': len(PNG), 'media_type': 'image/png'}
-                self.assertEqual(native.image(reference, picture_id, AGENT)[2], PNG)
+                self.assertEqual(native.image(reference, picture_id, actor)[2], PNG)
                 deliveries = native.deliveries(0, 0)
                 self.assertEqual(deliveries['contract'], 'st3.adapter.delivery.v0')
                 self.assertEqual([item['subject'] for item in deliveries['items']], [answer_id])
                 self.assertEqual(native.deliveries(deliveries['cursor'], 1)['items'], [])
+                # Exercise the ordinary CLI reply and upload path as this harness's
+                # own actor, including a reply to a canonical external account.
+                declaration.write_text(declaration.read_text().replace(
+                    'st3.adapter.target=' + json.dumps(AGENT),
+                    'st3.adapter.target=' + json.dumps(actor)))
+                subprocess.run([binary, '--endpoint', str(sock), 'apply', str(declaration), '--as', actor], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                incoming = native.send({**picture, 'to': actor, 'idempotency_key': 'invented-cli-picture-909',
+                                        'attachments': [native.upload(PNG, 'image/png', actor)]})
+                image_path = root / 'invented.png'
+                image_path.write_bytes(PNG)
+                subprocess.run([binary, '--endpoint', str(sock), 'conversations', 'reply', incoming,
+                                '--from', actor, '--body', 'invented image reply', '--attach', str(image_path)],
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                page = native.deliveries(deliveries['cursor'], 0)
+                self.assertEqual(len(page['items']), 1)
+                reply = page['items'][0]
+                self.assertEqual(reply['from'], actor)
+                self.assertEqual(reply['to'], 'external/discord/user/404')
+                self.assertEqual(reply['in_reply_to'], incoming)
+                self.assertEqual(native.image(reference, reply['subject'], actor)[2], PNG)
             finally:
                 daemon.terminate()
                 try:

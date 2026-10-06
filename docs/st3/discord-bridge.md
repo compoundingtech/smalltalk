@@ -20,13 +20,15 @@ gets its own `person/discord-<id>` sender and reply correlation; enrollment does
 not change the primary route binding or erase delivery checkpoints. Bots and
 webhooks remain excluded. Enrollment applies to new channel messages, without
 replaying messages already skipped. Example: `--legacy-text --allow-user 606`.
-Additional accounts in external-identity mode require native multi-route enrollment
-and are refused by the current command. Images remain disabled in legacy mode.
+In native mode, the program-seat declaration must include each account in
+`st3.adapter.sources`; matching `--allow-user` flags enable them in the process.
+The primary probe account is included automatically by the process. Images remain disabled in legacy mode.
 
 The bridge is a normal-user Python process, run in a terminal or an st-supervised
 program seat. It polls one private
-Discord text channel every five seconds and routes one allowlisted Discord user
-to one explicitly configured st agent. It needs Python's standard library and the
+Discord text channel every five seconds and routes allowlisted Discord accounts
+to one explicitly configured st agent. Up to sixteen human accounts can be
+explicitly enrolled. It needs Python's standard library and the
 existing local st Unix socket. There is no package installation or root service setup.
 
 Use the private route prepared for the connectivity probe at
@@ -191,7 +193,7 @@ New imports use `external/discord/user/<id>` through the route-scoped native imp
 endpoint. Existing `person/discord-<id>` imports retain their original identity;
 the bridge reads both mailboxes and preserves their reply mappings.
 The program-seat declaration must bind the exact source and target through
-`st3.adapter.source` and `st3.adapter.target`, as shown in the example declaration.
+`st3.adapter.sources` and `st3.adapter.target`, as shown in the example declaration.
 The authenticated adapter uploads as itself and cannot impersonate a native person.
 Native person-to-provider-account edges can represent verified account links
 without collapsing the provider sender into a native person.

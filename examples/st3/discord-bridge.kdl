@@ -7,6 +7,6 @@ agent "example/discord-bridge" {
   host "local"
   workspace "/srv/example/smalltalk"
   restart "always"
-  tags st3.adapter.source="external/discord/user/404" st3.adapter.target="agent/example/discord-test"
-  argv "/usr/bin/python3" "-I" "/srv/example/smalltalk/scripts/st3-discord-bridge" "run" "--agent" "agent/example/discord-test" "--route" "/srv/example/discord/trial.json" "--token-file" "/srv/example/discord/bot.env"
+  tags st3.adapter.sources="external/discord/user/404,external/discord/user/606" st3.adapter.target="agent/example/discord-test"
+  argv "/usr/bin/python3" "-I" "/srv/example/smalltalk/scripts/st3-discord-bridge" "run" "--agent" "agent/example/discord-test" "--route" "/srv/example/discord/trial.json" "--allow-user" "606" "--token-file" "/srv/example/discord/bot.env"
 }

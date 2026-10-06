@@ -661,7 +661,7 @@ def main():
     parser.add_argument('--socket', type=Path, default=ROOT / 'st3.sock')
     parser.add_argument('--token-file', type=Path, help='Private dotenv file with one DISCORD_BOT_TOKEN entry; never evaluated as shell code.')
     parser.add_argument('--legacy-text', action='store_true', help='Keep provisional sender identities and text-only delivery on the current native daemon.')
-    parser.add_argument('--allow-user', action='append', default=[], help='Enroll another numeric Discord account in legacy text mode.')
+    parser.add_argument('--allow-user', action='append', default=[], help='Enroll another numeric Discord account; native mode also requires matching program-seat source enrollment.')
     parser.add_argument('--st-message')
     parser.add_argument('--discord-message')
     parser.add_argument('--part', type=int, default=0)
@@ -671,8 +671,8 @@ def main():
         if not re.fullmatch(r'agent/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*', args.agent):
             raise Stop('Name one explicit st agent subject.')
         route = route_file(args.route)
-        if any(not ID.fullmatch(user) for user in args.allow_user) or args.allow_user and not args.legacy_text:
-            raise Stop('Additional accounts need numeric IDs and legacy text mode until native multi-route enrollment is supported.')
+        if any(not ID.fullmatch(user) for user in args.allow_user) or len({route['user_id'], *args.allow_user}) > 16:
+            raise Stop('Enrollment needs numeric IDs and at most sixteen distinct accounts.')
         state = State(args.state or ROOT / ('discord-bridge/' + route['channel_id'] + '.sqlite'), route, args.agent)
         if args.action == 'status':
             print(json.dumps({'sender': 'external/discord/user/' + route['user_id'], 'agent': args.agent,

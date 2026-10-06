@@ -59,6 +59,7 @@ use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
+mod client_adapters;
 mod client_presence;
 mod client_v0;
 mod custom;
@@ -458,8 +459,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/blobs/{id}", get(client_blobs::get))
         .route("/v1/client/blobs/{id}/chunk", get(client_blobs::chunk))
-        .route("/v1/client/adapter/import", post(client_blobs::import_message))
-        .route("/v1/client/adapter/deliveries", get(client_blobs::deliveries))
+        .route("/v1/client/adapter/import", post(client_adapters::import_message))
+        .route("/v1/client/adapter/deliveries", get(client_adapters::deliveries))
         .route("/v1/client/pairings", post(client_v0::pairing_begin))
         .route(
             "/v1/client/pairings/{id}/complete",
