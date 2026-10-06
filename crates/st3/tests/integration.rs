@@ -20,6 +20,9 @@ mod cli_inventory_process;
 
 // Invoked only by cli_inventory_process's bounded-capture test. Keeping this
 // outside that module preserves its five selected fixture names.
+// The pipe holder deliberately outlives this helper process. Its test parent
+// owns the process group, kills it, and reaps its direct child at the deadline.
+#[allow(clippy::zombie_processes)]
 #[test]
 fn cli_inventory_capture_helper() {
     use std::io::Write as _;
