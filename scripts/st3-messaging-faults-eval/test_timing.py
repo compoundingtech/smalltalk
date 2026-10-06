@@ -28,7 +28,7 @@ class TimingTests(unittest.TestCase):
         ])
         self.assertEqual("new-incarnation", timing["channel_incarnation"])
         self.assertEqual({"channel_ready_observed": -100, "partition_cleared": 0,
-                          "first_peer_exchange_request": 100, "offer_accepted": 26999,
+                          "first_peer_exchange_request": 100, "staged_accepted": 26999,
                           "native_received": 27000, "read_accepted": 27004},
                          timing["after_partition_clear_ms"])
 
@@ -38,7 +38,7 @@ class TimingTests(unittest.TestCase):
         ])
         self.assertIsNone(timing["at_unix_ms"]["native_received"])
         self.assertIsNone(timing["at_unix_ms"]["read_accepted"])
-        self.assertIsNone(timing["at_unix_ms"]["offer_accepted"])
+        self.assertIsNone(timing["at_unix_ms"]["staged_accepted"])
 
 
 if __name__ == "__main__":

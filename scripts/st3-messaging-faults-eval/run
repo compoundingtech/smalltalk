@@ -333,6 +333,7 @@ def recovery_timing(subject, restored, channel_ready, channel_incarnation, link_
 
     Peer requests prove transport activity, not the recipient's local claim arrival.
     Channel readiness is the first observation in the existing readiness waits.
+    Staging precedes writing the native frame; only native receipts prove consumption.
     """
     def earliest(values):
         return min(values, default=None)
@@ -343,7 +344,7 @@ def recovery_timing(subject, restored, channel_ready, channel_incarnation, link_
         "first_peer_exchange_request": earliest(event["at_unix_ms"] for event in link_events
             if event["event"] == "request" and event["at_unix_ms"] >= restored
             and event.get("line", "").startswith("POST /v1/peer/exchange ")),
-        "offer_accepted": earliest(claim["accepted_at_unix_ms"] for claim in claims
+        "staged_accepted": earliest(claim["accepted_at_unix_ms"] for claim in claims
             if claim.get("subject") == subject and claim.get("kind") == "message.staged"),
         "native_received": earliest(row["at_unix_ms"] for row in rows
             if row.get("subject") == subject and row["event"] == "received"),

@@ -119,7 +119,8 @@ a systemd user runtime only when its bus exists, so runners without a user manag
 existing detached process path instead of trying to create scopes through a synthetic runtime.
 Recovery cases include `recovery_timing` in the result printed by a failed test: partition
 restoration, the observed current channel and its incarnation, the first peer exchange request,
-offer acceptance, native consumption, and read acceptance. These timestamps and offsets use
+staging acceptance, native consumption, and read acceptance. Staging precedes writing the
+native frame and does not prove an accepted offer. These timestamps and offsets use
 the recovery restoration time, independently of the later fresh send. `recovered-trace.json`
 retains the recovered message's graph claims. A peer request proves transport activity, not
 the recipient's local message arrival; channel readiness records an observation, not its first transition.
