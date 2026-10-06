@@ -18698,12 +18698,12 @@ fn claim_by_id_tx(connection: &Connection, id: &str) -> Result<Option<ClaimRecor
 struct SuspensionRead<'a>(&'a Connection, Option<&'a str>, Option<u64>);
 
 impl crate::suspension::SuspensionReader for SuspensionRead<'_> {
-    fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>> {
+    fn suspension_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
         let mut statement = self.0.prepare(&canonical_sql(
             "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
-             FROM claims WHERE subject=?1 AND (?2 IS NULL OR kind=?2) AND store_index<=?3
+             FROM claims WHERE subject=?1 AND kind='runtime.action.requested' AND store_index<=?2
              ORDER BY CANONICAL_ASC(claims)"))?;
-        Ok(statement.query_map(params![subject, kind, self.2.unwrap_or(i64::MAX as u64)], claim_from_row)?
+        Ok(statement.query_map(params![subject, self.2.unwrap_or(i64::MAX as u64)], claim_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     fn operation_claim(&self, key: &str) -> Result<Option<ClaimRecord>> {

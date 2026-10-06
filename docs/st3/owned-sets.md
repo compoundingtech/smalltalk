@@ -104,6 +104,9 @@ report `satisfied` or `running` while these entries remain. CLI apply prints the
 then exits nonzero, so automation must inspect readback instead of treating it as an atomic failure.
 Dry-run also exits nonzero for deferrals. Ordinary unowned apply refuses launch changes with
 `suspended-seat` and the blocker detail.
+Rust, Swift and TypeScript clients expose the additive optional `OwnedSet.deferred` map.
+Projection-only readers see environment values redacted in every proposed-declaration copy;
+full environment values require `read.declarations`, as for existing declaration reads.
 
 Resume continues the **previous** launch through the existing verified native-session protocol.
 It does not automatically publish a deferred declaration: the receipt clearly remains pending.

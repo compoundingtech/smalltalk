@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub(crate) trait SuspensionReader {
-    fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>>;
+    fn suspension_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>>;
     fn operation_claim(&self, key: &str) -> Result<Option<ClaimRecord>>;
     fn selected_desired_kind(&self, subject: &str) -> Result<Option<String>>;
     fn launch_lineage(&self, subject: &str) -> Result<Vec<String>>;
@@ -35,8 +35,8 @@ pub(crate) trait SuspensionReader {
 }
 
 impl SuspensionReader for Store {
-    fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>> {
-        std::ops::Deref::deref(self).claims_for(subject, kind)
+    fn suspension_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
+        std::ops::Deref::deref(self).claims_for(subject, Some("runtime.action.requested"))
     }
     fn operation_claim(&self, key: &str) -> Result<Option<ClaimRecord>> {
         Store::operation_claim(self, key)
@@ -161,7 +161,7 @@ fn evidence(claim: &ClaimRecord, index: usize) -> Option<&str> {
 
 /// The seat's requester-authored suspends and resumes, oldest first.
 fn requests(store: &impl SuspensionReader, subject: &str) -> Result<Vec<ClaimRecord>> {
-    let mut requests = store.claims_for(subject, Some("runtime.action.requested"))?;
+    let mut requests = store.suspension_requests(subject)?;
     requests.retain(|claim| {
         claim.actor.is_some() && matches!(action(claim), Some("suspend" | "resume"))
     });

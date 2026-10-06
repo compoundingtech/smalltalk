@@ -263,9 +263,10 @@ public struct OwnedSetResource: Codable, Sendable, Identifiable {
     public let id, kind, revision, updatedAt, claim: String
     public let receipt, visibility: JSONValue
     public let blockers: [String]
+    public let deferred: [String: JSONValue]?
     public let membersStatus: [JSONValue]
     public let commitStatus: JSONValue?
-    enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", claim, receipt, visibility, blockers, membersStatus = "members_status", commitStatus = "commit_status" }
+    enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", claim, receipt, visibility, blockers, deferred, membersStatus = "members_status", commitStatus = "commit_status" }
 }
 public enum Resource: Codable, Sendable, Identifiable {
     case attention(AttentionResource), message(MessageResource), launch(LaunchResource), launchVariant(LaunchVariantResource), launchDecision(LaunchDecisionResource), launchApproval(LaunchApprovalResource), mission(MissionResource), work(WorkResource), agent(AgentResource), runtime(RuntimeResource), observer(ObserverResource), subscription(SubscriptionResource), lane(LaneResource), machine(MachineResource), device(DeviceResource), operation(OperationResource), history(HistoryResource), session(SessionResource), glass(GlassResource), ownedSet(OwnedSetResource)

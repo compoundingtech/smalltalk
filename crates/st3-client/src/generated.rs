@@ -1562,6 +1562,8 @@ pub struct OwnedSet {
     pub claim: String,
     pub receipt: Value,
     pub blockers: Vec<String>,
+    #[serde(default)]
+    pub deferred: BTreeMap<String, Value>,
     pub members_status: Vec<Value>,
     pub visibility: Value,
     #[serde(default)]

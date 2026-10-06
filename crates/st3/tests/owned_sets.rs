@@ -1093,7 +1093,7 @@ async fn adoption_diff_reads_existing_unmanaged_definition_and_invalid_actors_ar
 #[tokio::test]
 async fn suspended_apply_guard_daemon_smoke_reports_blocker_and_never_requests_start() {
     let root = tempfile::tempdir().unwrap();
-    let key = Arc::new(MemberKey::generate());
+    let key = Arc::new(MemberKey::generate().unwrap().0);
     let d = daemon(root.path(), "amber", key.clone(), &key).await;
     let subject = "agent/garden/orchard";
     let mut initial = request(&d, 1, bundle("first", false)).await;
@@ -1123,6 +1123,12 @@ async fn suspended_apply_guard_daemon_smoke_reports_blocker_and_never_requests_s
     assert_eq!(status["members_status"][0]["rollout"], "deferred");
     assert_eq!(status["commit_status"]["satisfied"], false);
     assert_eq!(status["commit_status"]["running"], false);
+    let typed: st3_client::OwnedSet = serde_json::from_value(status.clone()).unwrap();
+    assert_eq!(typed.deferred[subject]["reason"], "Paused for the winter");
+    println!("guard readback: {}", json!({"subject":subject,
+        "rollout":status["members_status"][0]["rollout"],
+        "reason":status["members_status"][0]["blocker"]["reason"],
+        "satisfied":status["commit_status"]["satisfied"],"running":status["commit_status"]["running"]}));
     let reconciler = st3::reconcile::Reconciler::native(
         d.store.clone(), &root.path().join("amber"), None, Path::new("pty"),
         "amber".into(), "unused".into(), Arc::new(Notify::new()), watch::channel(0).0, None,
@@ -1130,6 +1136,7 @@ async fn suspended_apply_guard_daemon_smoke_reports_blocker_and_never_requests_s
     reconciler.reconcile_once().unwrap();
     assert_eq!(d.store.selected_desired_token(subject).unwrap(), Some(token));
     assert!(st3::suspension::current(&d.store, subject).unwrap().unwrap().holds_seat());
+    println!("native reconcile: original declaration still selected; suspension holds");
     assert!(!d.store.claims_for(subject, Some("runtime.action.requested")).unwrap()
         .iter().any(|claim| claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("start")));
 }

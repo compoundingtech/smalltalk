@@ -1134,6 +1134,11 @@ export type OwnedSet = ResourceHeader & {
   commit_status?: {
 
 } | null;
+  deferred?: {
+  [key: string]: {
+
+};
+};
   kind: "owned-set";
   members_status: Array<{
 

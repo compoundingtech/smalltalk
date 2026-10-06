@@ -1684,6 +1684,8 @@ export const OwnedSet = /*#__PURE__*/ (() => Schema.Struct({
   "blockers": Schema.Array(Schema.String),
   "claim": Schema.String,
   "commit_status": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE),
+  /** Suspended-seat publication blockers keyed by subject, including replication-race deferrals. */
+  "deferred": optionalKey(Schema.Record(Schema.String, Schema.Record(Schema.String, Schema.Unknown))).annotate({ description: "Suspended-seat publication blockers keyed by subject, including replication-race deferrals." }),
   "id": Id,
   "kind": Schema.Literal("owned-set"),
   "members_status": Schema.Array(Schema.Record(Schema.String, Schema.Unknown)),
