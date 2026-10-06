@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { inline, markdown } from './markdown.ts';
+import { filePath, inline, markdown } from './markdown.ts';
 
 assert.deepEqual(inline('a **b** `c` [d](http://e) f'), [
   { text: 'a ', style: 'plain' }, { text: 'b', style: 'bold' }, { text: ' ', style: 'plain' }, { text: 'c', style: 'code' },
@@ -29,3 +29,11 @@ assert.deepEqual(inline('https:// alone'), [{ text: 'https:// alone', style: 'pl
 assert.deepEqual(inline('nothttps://example.com'), [{ text: 'nothttps://example.com', style: 'plain' }]);
 // A markdown link keeps its target; one that is not http(s) is not opened.
 assert.deepEqual(inline('[x](javascript:alert)'), [{ text: 'x', style: 'link', url: undefined }]);
+
+// A path as a markdown target names a file on the writer's machine, which is copied, not opened.
+assert.equal(filePath('/home/example/repo/docs/spec.md'), '/home/example/repo/docs/spec.md');
+assert.equal(filePath('~/notes/a.md'), '~/notes/a.md');
+assert.equal(filePath('file:///srv/a.md'), '/srv/a.md');
+assert.equal(filePath('https://example.com/a'), undefined);
+assert.equal(filePath('doc/example/spec'), undefined);
+assert.deepEqual(inline('[spec](/srv/repo/spec.md)'), [{ text: 'spec', style: 'link', url: undefined, path: '/srv/repo/spec.md' }]);

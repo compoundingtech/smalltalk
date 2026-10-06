@@ -144,7 +144,7 @@ Unexplained empty output is a failure.
 
 Root and nested help lead with the human job and why. Product workflows are `now`, `missions`,
 `attention`, `launch`, `machines`, `agents`, `conversations`, `activity`, and `devices`. Operator
-workflows are `doctor`, `repair`, `replication`, and `service`. `subject`, `claim`, `trace`, `schema`,
+workflows are `doctor`, `admission`, `repair`, `replication`, and `service`. `subject`, `claim`, `trace`, `schema`,
 and `documents` are explicitly expert/debug. Internal tables and endpoints are not commands merely
 because they exist. Commands with the same why are merged; legacy aliases are removed.
 

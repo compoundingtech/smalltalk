@@ -423,7 +423,14 @@ name = "{peer.name}"
 url = "http://127.0.0.1:{proxies[1 - i]}"
 ''')
             wrapper = node.root / "bin/omp"
-            wrapper.write_text(f"#!/bin/sh\nexec setsid {shlex.quote(shutil.which('node'))} {shlex.quote(str(HERE / 'provider.mjs'))} \"$@\"\n")
+            # Admission already owns the child's process group. setsid would fork and
+            # return before --version/probe output, making the direct child look finished.
+            # Retain the separate session for the actual provider and its native faults.
+            provider = f"{shlex.quote(shutil.which('node'))} {shlex.quote(str(HERE / 'provider.mjs'))}"
+            wrapper.write_text(
+                f'#!/bin/sh\nif [ "$1" = "--version" ] || [ -n "$ST_ADMISSION_TRACE" ]; then\n'
+                f'  exec {provider} "$@"\nfi\nexec setsid {provider} "$@"\n'
+            )
             wrapper.chmod(0o755)
             await node.start()
         legacy_env = ""

@@ -65,7 +65,10 @@ impl Daemon {
     // Dropping this runtime also closes upgraded WebSocket connections, just as exiting
     // the daemon does. Aborting only the listener would leave those tasks alive.
     async fn start_isolated(&mut self) {
-        let state = self.state();
+        self.start_isolated_app(st3::api::router(self.state())).await;
+    }
+
+    async fn start_isolated_app(&mut self, app: axum::Router) {
         let socket = self.socket.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let thread = std::thread::spawn(move || {
@@ -76,7 +79,7 @@ impl Daemon {
                 .unwrap();
             runtime.block_on(async {
                 tokio::select! {
-                    result = st3::api::serve_unix_bound(&socket, &socket, st3::api::router(state)) => {
+                    result = st3::api::serve_unix_bound(&socket, &socket, app) => {
                         result.unwrap();
                     }
                     _ = stopped => {}
@@ -211,6 +214,18 @@ impl Daemon {
     }
 }
 
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            server.abort();
+        }
+        if let Some((stop, thread)) = self.isolated_server.take() {
+            let _ = stop.send(());
+            let _ = thread.join();
+        }
+    }
+}
+
 async fn wait_until(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + limit;
     while !condition() {
@@ -321,6 +336,244 @@ impl Drop for TestSeat {
             let _ = stop(child);
         }
     }
+}
+
+/// An actual native driver with a controlled provider. All signals and files belong to the
+/// test's process group and temporary home; TestSeat also cleans up on a failed assertion.
+async fn native_exit_driver(root: &Path, daemon: &mut Daemon) -> TestSeat {
+    let seat = "agent/grove/exit-orchid";
+    let mut command = seat_command(root, &daemon.socket);
+    declare_claude(daemon, seat);
+    daemon.observe_running(seat, "exit-orchid:one");
+    daemon.start_isolated().await;
+    let provider = r#"
+import os, signal, time
+from pathlib import Path
+home = Path(os.environ['HOME'])
+def stopped(signum, frame):
+    (home / 'provider-stopped').touch()
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stopped)
+(home / 'provider-pid').write_text(str(os.getpid()))
+while not (home / 'provider-finish').exists():
+    time.sleep(0.05)
+(home / 'provider-finished').touch()
+"#;
+    let mut driver = TestSeat(Some(
+        command
+            .env("ST_AGENT", seat)
+            .env("ST3_MAILBOX_TRANSPORT", "push")
+            .args([
+                "driver",
+                "claude",
+                "--subject",
+                seat,
+                "--",
+                "python3",
+                "-c",
+                provider,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    wait_until(
+        "the native provider starts",
+        Duration::from_secs(10),
+        || {
+            assert_alive(&mut driver, "the starting exit-report driver");
+            root.join("home/provider-pid").exists()
+                && daemon.has_diagnostic(seat, "exit-orchid:one", "claude-channel-unattached")
+        },
+    )
+    .await;
+    driver
+}
+
+fn request_driver_stop(driver: &Child) {
+    // Signal only the driver: its normal provider supervision must stop the child itself.
+    assert_eq!(unsafe { libc::kill(driver.id() as i32, libc::SIGTERM) }, 0);
+}
+
+async fn native_exit_finishes(root: &Path, driver: &mut TestSeat, limit: Duration) {
+    wait_until("the stopped driver exits", limit, || {
+        driver.try_wait().unwrap().is_some()
+    })
+    .await;
+    let status = driver.try_wait().unwrap().unwrap();
+    if !status.success() {
+        let mut stderr = String::new();
+        driver
+            .stderr
+            .as_mut()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        panic!("{status}: {stderr}; {}", driver_log(root));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_exit_stops_provider_and_driver_with_daemon_down() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    // Exercise both transient Unix-socket errors that previously retried forever.
+    for missing_socket in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let mut daemon = Daemon::new(root);
+        let mut driver = native_exit_driver(root, &mut daemon).await;
+        let provider_pid = std::fs::read_to_string(root.join("home/provider-pid"))
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        daemon.stop().await;
+        if missing_socket {
+            std::fs::remove_file(&daemon.socket).unwrap();
+        }
+        let requested = Instant::now();
+        request_driver_stop(&driver);
+        wait_until(
+            "the provider handles the driver's stop",
+            Duration::from_secs(5),
+            || root.join("home/provider-stopped").exists(),
+        )
+        .await;
+        let provider_stopped_after = requested.elapsed();
+        // Provider polling + five-second stop grace + 250-ms flag polling + two-second
+        // reporting budget fit inside eight seconds from the signal.
+        native_exit_finishes(
+            root,
+            &mut driver,
+            Duration::from_secs(8).saturating_sub(requested.elapsed()),
+        )
+        .await;
+        eprintln!(
+            "native exit: missing_socket={missing_socket}, provider stopped after {provider_stopped_after:?}, driver exited after {:?}",
+            requested.elapsed()
+        );
+        assert!(requested.elapsed() < Duration::from_secs(8));
+        assert_eq!(
+            unsafe { libc::kill(provider_pid, 0) },
+            -1,
+            "provider survived its driver"
+        );
+        assert!(driver_log(root).contains("two-second exit-report deadline"));
+        assert!(
+            driver.stop().is_empty(),
+            "exit reporting reached the terminal"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_exit_retries_past_stop_budget_without_signal_and_reports_on_recovery() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    let mut driver = native_exit_driver(root, &mut daemon).await;
+    daemon.stop().await;
+    std::fs::write(root.join("home/provider-finish"), "").unwrap();
+    wait_until(
+        "the provider finishes during the outage",
+        Duration::from_secs(5),
+        || root.join("home/provider-finished").exists(),
+    )
+    .await;
+    // Longer than the stop budget: a provider ending normally must not start a deadline.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    if driver.try_wait().unwrap().is_some() {
+        native_exit_finishes(root, &mut driver, Duration::ZERO).await;
+        panic!("driver exited before daemon recovery");
+    }
+    daemon.start_isolated().await;
+    native_exit_finishes(root, &mut driver, Duration::from_secs(5)).await;
+    let claims = daemon
+        .store
+        .claims_for("agent/grove/exit-orchid", Some("runtime.observed"))
+        .unwrap();
+    let terminal = claims
+        .iter()
+        .filter(|claim| claim.body["fields"]["status"] == "exited")
+        .collect::<Vec<_>>();
+    assert_eq!(terminal.len(), 1, "{claims:?}");
+    assert_eq!(
+        terminal[0].body["fields"]["incarnation_id"],
+        "exit-orchid:one"
+    );
+    assert_eq!(
+        terminal[0].body["fields"]["runtime_id"],
+        "grove/exit-orchid"
+    );
+    assert_eq!(terminal[0].body["fields"]["exit_code"], 0);
+    assert!(!driver_log(root).contains("exit-report deadline"));
+    assert!(driver.stop().is_empty());
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_exit_signal_after_provider_end_bounds_an_in_flight_request() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    let mut driver = native_exit_driver(root, &mut daemon).await;
+    daemon.stop().await;
+    // Recovery serves the final observation drain but never answers the terminal claim.
+    // This proves the budget cancels an in-flight report even when SIGTERM arrives later.
+    let posting_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = posting_exit.clone();
+    let app = st3::api::router(daemon.state()).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let observed = observed.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                if parts.uri.path() == "/v1/claims"
+                    && serde_json::from_slice::<Value>(&bytes).is_ok_and(|claim| {
+                        claim["kind"] == "runtime.observed" && claim["fields"]["status"] == "exited"
+                    })
+                {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return std::future::pending::<axum::response::Response>().await;
+                }
+                next.run(axum::extract::Request::from_parts(
+                    parts,
+                    axum::body::Body::from(bytes),
+                ))
+                .await
+            }
+        },
+    ));
+    daemon.start_isolated_app(app).await;
+    std::fs::write(root.join("home/provider-finish"), "").unwrap();
+    wait_until(
+        "the driver's terminal claim is in flight",
+        Duration::from_secs(5),
+        || posting_exit.load(std::sync::atomic::Ordering::SeqCst),
+    )
+    .await;
+    assert!(root.join("home/provider-finished").exists());
+    assert_alive(&mut driver, "the driver with an in-flight exit report");
+    let requested = Instant::now();
+    request_driver_stop(&driver);
+    // Two-second deadline + 250-ms polling; allow CI scheduling margin, with no provider grace.
+    native_exit_finishes(root, &mut driver, Duration::from_secs(5)).await;
+    eprintln!(
+        "native exit: cancelled in-flight terminal report and exited after {:?}",
+        requested.elapsed()
+    );
+    assert!(driver_log(root).contains("two-second exit-report deadline"));
+    assert!(driver.stop().is_empty());
+    daemon.stop().await;
 }
 
 fn declare_claude(daemon: &Daemon, seat: &str) {

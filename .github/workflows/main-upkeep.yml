@@ -13,8 +13,8 @@ permissions:
   actions: read
 
 concurrency:
-  group: "main-upkeep-${{ github.run_id }}"
-  cancel-in-progress: false
+  group: "main-upkeep-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.run_id }}"
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
 jobs:
   main-checks:

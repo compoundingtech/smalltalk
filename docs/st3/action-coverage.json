@@ -401,6 +401,22 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st admission override",
+      "description": "Explicitly allow an installed exact harness build with a recorded reason",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::person_admission_exception_is_local_reversible_and_never_spawns_the_producer"
+      ],
+      "verification": "real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child"
+    },
+    {
+      "command": "st admission revoke",
+      "description": "Remove the installed exact harness build exception",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::person_admission_exception_is_local_reversible_and_never_spawns_the_producer"
+      ],
+      "verification": "real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child"
+    },
+    {
       "command": "st agents apply",
       "description": "Preview and apply one KDL file containing durable agent seats",
       "tests": [
