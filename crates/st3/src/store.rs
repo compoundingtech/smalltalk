@@ -25001,7 +25001,7 @@ enum Aggregate {
 /// Mark an aggregate to be rebuilt, and say why in the profile: which trigger rebuilds run trees
 /// on a busy node decides which of them is worth fixing.
 fn mark_dirty(dirty: &mut BTreeSet<Aggregate>, aggregate: Aggregate, reason: &str) {
-    if matches!(aggregate, Aggregate::RunTree(_)) {
+    if matches!(aggregate, Aggregate::RunTree(_)) && crate::profile::enabled() {
         crate::profile::note(&format!("projection: run tree dirty: {reason}"));
     }
     dirty.insert(aggregate);
