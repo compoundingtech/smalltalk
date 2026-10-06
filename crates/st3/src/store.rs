@@ -20150,6 +20150,48 @@ fn current_harness_fold_at(
     at_index: Option<u64>,
     include_work_activity: bool,
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
+    current_harness_fold_at_with_observed(
+        connection,
+        subject,
+        at_index,
+        include_work_activity,
+        None,
+    )
+}
+
+// The observed copy remains raw: enrich it at the existing card-consumption
+// position, after complete status and claim-vector validation.
+#[cfg(test)]
+fn current_harness_at_with_raw_observed(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+) -> Result<(
+    Option<crate::model::CurrentHarnessView>,
+    Option<crate::model::CurrentHarnessView>,
+)> {
+    let mut captured = None;
+    let mut current = current_harness_fold_at_with_observed(
+        connection,
+        subject,
+        at_index,
+        true,
+        Some(&mut captured),
+    )?;
+    let observed = captured.unwrap_or_else(|| current.clone());
+    if let Some(view) = current.as_mut() {
+        seat_status::enrich_harness(connection, subject, at_index, view)?;
+    }
+    Ok((current, observed))
+}
+
+fn current_harness_fold_at_with_observed(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    include_work_activity: bool,
+    observed: Option<&mut Option<Option<crate::model::CurrentHarnessView>>>,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let runtime = connection
         .prepare_cached(&format!(
@@ -20419,6 +20461,16 @@ fn current_harness_fold_at(
             .as_ref()
             .is_none_or(|(_, _, _, harness_key)| key > *harness_key)
     {
+        // Capture before the work branch removes optional fields. Some(None)
+        // records that work exists without an observed harness state.
+        if let Some(observed) = observed {
+            *observed = Some(observed_harness_from_fold_fields(
+                current.clone(),
+                optional.clone(),
+                auth_restored,
+                incarnation_id,
+            ));
+        }
         return Ok(Some(crate::model::CurrentHarnessView {
             state: "working".into(),
             driver: optional.remove("driver").flatten(),
@@ -20434,8 +20486,22 @@ fn current_harness_fold_at(
             observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
         }));
     }
+    Ok(observed_harness_from_fold_fields(
+        current,
+        optional,
+        auth_restored,
+        incarnation_id,
+    ))
+}
+
+fn observed_harness_from_fold_fields(
+    current: Option<(String, String, u128, canonical::ClaimKey)>,
+    mut optional: BTreeMap<&'static str, Option<String>>,
+    auth_restored: bool,
+    incarnation_id: &str,
+) -> Option<crate::model::CurrentHarnessView> {
     let Some((mut state, claim, observed_at_unix_ms, _)) = current else {
-        return Ok(None);
+        return None;
     };
     if optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
         if auth_restored {
@@ -20445,7 +20511,7 @@ fn current_harness_fold_at(
             state = "needs-login".into();
         }
     }
-    Ok(Some(crate::model::CurrentHarnessView {
+    Some(crate::model::CurrentHarnessView {
         state,
         driver: optional.remove("driver").flatten(),
         incarnation_id: incarnation_id.to_owned(),
@@ -20458,7 +20524,7 @@ fn current_harness_fold_at(
         claim,
         since_unix_ms: observed_at_unix_ms,
         observed_at_unix_ms,
-    }))
+    })
 }
 
 fn working_episode_query() -> String {
@@ -49381,6 +49447,121 @@ message "human-attention" {
             let expected = full_canonical_claim_id_oracle(&store.readers.get(), subject, Some(cut));
             assert_eq!(actual, &expected);
             assert_eq!(actual.last(), expected.last());
+        }
+    }
+
+    fn checked_raw_harness_pair(store: &Store, subject: &str, index: u64) {
+        store
+            .read_snapshot(|_| {
+                let connection = store.readers.get();
+                let (current, mut observed) =
+                    current_harness_at_with_raw_observed(&connection, subject, Some(index))?;
+                assert_eq!(
+                    serde_json::to_value(&current)?,
+                    serde_json::to_value(current_harness_at(&connection, subject, Some(index))?)?
+                );
+                assert_eq!(
+                    serde_json::to_value(&observed)?,
+                    serde_json::to_value(current_harness_fold_at(
+                        &connection,
+                        subject,
+                        Some(index),
+                        false
+                    )?)?
+                );
+                if let Some(view) = observed.as_mut() {
+                    seat_status::enrich_harness(&connection, subject, Some(index), view)?;
+                }
+                assert_eq!(
+                    serde_json::to_value(observed)?,
+                    serde_json::to_value(store.observed_harness_at(subject, index)?)?
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn raw_harness_pair_keeps_work_and_observed_branches_separate() {
+        for with_observation in [false, true] {
+            let store = Store::open_memory("node").unwrap();
+            let subject = "agent/node.paired";
+            let append = |kind: &str, fields: Value| {
+                let claim = store
+                    .append_claim(&ClaimInput {
+                        subject: subject.into(),
+                        kind: kind.into(),
+                        actor: Some(subject.into()),
+                        fields: serde_json::from_value(fields).unwrap(),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+                assert!(store.claim_by_id(&claim.id).unwrap().is_some());
+                claim
+            };
+            checked_raw_harness_pair(&store, subject, store.index().unwrap());
+            append(
+                "runtime.observed",
+                json!({"status":"running", "runtime_id":"node.paired", "incarnation_id":"one"}),
+            );
+            checked_raw_harness_pair(&store, subject, store.index().unwrap());
+            if with_observation {
+                append(
+                    "harness.observed",
+                    json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "transport":null, "reason":null, "blocked_on":null, "ask":null, "input_buffer":null, "exit":null}),
+                );
+            }
+            let before_work = store.index().unwrap();
+            checked_raw_harness_pair(&store, subject, before_work);
+            let work = {
+                let mut connection = store.connection.lock().unwrap();
+                let tx = connection.transaction().unwrap();
+                let claim = append_claim_tx(&tx, "node", "step-run/paired/work", "work.progress", Some(subject),
+                    &json!({"fields":{"status":"working", "attempt":1, "readiness_epoch":1, "claimant":subject, "claim_incarnation":"one", "claim_expires_at_unix_ms":now_ms().saturating_add(60_000), "worker_reported":false, "summary":"paired work", "reason":null}}), &[], None).unwrap();
+                tx.commit().unwrap();
+                claim
+            };
+            let after_work = store.index().unwrap();
+            checked_raw_harness_pair(&store, subject, after_work);
+            store
+                .read_snapshot(|_| {
+                    let connection = store.readers.get();
+                    let (current, observed) = current_harness_at_with_raw_observed(
+                        &connection,
+                        subject,
+                        Some(after_work),
+                    )?;
+                    assert_eq!(current.unwrap().claim, work.id);
+                    assert_eq!(observed.is_some(), with_observation);
+                    if let Some(observed) = observed {
+                        assert_eq!(observed.state, "idle");
+                        assert_eq!(observed.driver.as_deref(), Some("codex"));
+                        assert_eq!(observed.transport, None);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            checked_raw_harness_pair(&store, subject, before_work);
+            if with_observation {
+                append(
+                    "harness.observed",
+                    json!({"state":"working", "driver":"codex", "incarnation_id":"one", "provider_auth":false}),
+                );
+                checked_raw_harness_pair(&store, subject, store.index().unwrap());
+                append(
+                    "harness.observed",
+                    json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "provider_auth":true}),
+                );
+                checked_raw_harness_pair(&store, subject, store.index().unwrap());
+            }
+            append(
+                "runtime.observed",
+                json!({"status":"running", "runtime_id":"node.paired", "incarnation_id":"two"}),
+            );
+            checked_raw_harness_pair(&store, subject, store.index().unwrap());
+            checked_raw_harness_pair(&store, subject, after_work);
         }
     }
 
