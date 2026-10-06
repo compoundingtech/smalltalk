@@ -391,6 +391,7 @@ export class St3Client {
     async terminalScreen(id: string): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`); }
     async arrangementsList(person: string, options: PageOptions = {}): Promise<EnvelopeOf<ArrangementPage>> { return this.get('/v1/client/arrangements' + query({ person, ...options })); }
     async arrangementsGet(personName: string, uuid: string): Promise<EnvelopeOf<Arrangement>> { return this.get(`/v1/client/arrangements/${encodeURIComponent(personName)}/${encodeURIComponent(uuid)}`); }
+    async terminalHistory(id: string, runtimeIncarnation: string, options: { before?: string; limit?: number } = {}): Promise<EnvelopeOf<TerminalHistory>> { bounded(options.limit, 200, 'limit'); return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/history` + query({ runtime_incarnation: runtimeIncarnation, ...options })); }
     async glassesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/glasses' + query(options)); }
     async glassesGet(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(routedId(id))}`); }
     async agentCreate(input: Omit<ActionOf<'agent.create'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.create' } as ActionOf<'agent.create'>); }

@@ -1627,6 +1627,16 @@ impl Client {
         ))
         .await
     }
+    pub async fn terminal_history(
+        &self,
+        terminal_id: &str,
+        runtime_incarnation: &str,
+        before: Option<&str>,
+        limit: u16,
+    ) -> Result<Envelope<TerminalHistory>, ClientError> {
+        self.terminal_history_internal(terminal_id, runtime_incarnation, before, limit)
+            .await
+    }
     pub async fn glasses_list(
         &self,
         cursor: Option<&str>,
