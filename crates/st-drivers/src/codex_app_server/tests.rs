@@ -2943,6 +2943,87 @@ fn control_initializes_before_recording_the_first_thread_only() {
 }
 
 #[test]
+fn live_control_request_blocks_until_the_bound_thread_resolves_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _stop_exclusive = stop_flag_tests();
+    let socket = tmp.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        assert_eq!(read_json_message(&mut websocket).unwrap().unwrap()["method"], "initialize");
+        write_json_message(&mut websocket, &json!({"id": 0, "result": {"userAgent": "fake"}})).unwrap();
+        assert_eq!(read_json_message(&mut websocket).unwrap().unwrap()["method"], "initialized");
+        write_json_message(&mut websocket, &json!({
+            "method": "thread/started", "params": {"thread": {
+                "id": "thread-main", "status": {"type": "idle"}
+            }}
+        })).unwrap();
+        write_json_message(&mut websocket, &json!({
+            "method": "turn/started", "params": {
+                "threadId": "thread-main", "turn": {"id": "turn-main"}
+            }
+        })).unwrap();
+        write_json_message(&mut websocket, &json!({
+            "id": 77, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-main", "turnId": "turn-main", "itemId": "item-1", "startedAtMs": 1}
+        })).unwrap();
+        release_rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap();
+        write_json_message(&mut websocket, &json!({
+            "method": "thread/status/changed", "params": {
+                "threadId": "thread-main", "status": {"type": "active", "activeFlags": []}
+            }
+        })).unwrap();
+    });
+    let stream = UnixStream::connect(&socket).unwrap();
+    let shutdown = stream.try_clone().unwrap();
+    let websocket = initialize_control(stream).unwrap().unwrap();
+    let state_path = tmp.path().join("state/control-state.json");
+    let binding_path = tmp.path().join("state/binding.json");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let runtime_for_pump = runtime.clone();
+    let state_for_pump = state_path.clone();
+    let (events_tx, events_rx) = mpsc::channel();
+    let pump = thread::spawn(move || pump_control(
+        websocket, &binding_path, &state_for_pump, &runtime_for_pump,
+        None, None, Arc::new(AtomicBool::new(false)), events_tx,
+    ));
+    let mut blocked = false;
+    for _ in 0..4 {
+        events_rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap();
+        if let Ok(bytes) = fs::read(&state_path)
+            && serde_json::from_slice::<CodexControlState>(&bytes).ok().is_some_and(|state| {
+                matches!(state.observed(), CodexObservedState::Held {
+                    reason: CodexHoldReason::WaitingOnApproval, ..
+                })
+            })
+        {
+            blocked = true;
+            break;
+        }
+    }
+    assert!(blocked, "the control stream did not publish the approval hold");
+    release_tx.send(()).unwrap();
+    let mut released = false;
+    for _ in 0..3 {
+        if events_rx.recv_timeout(TEST_EVENT_TIMEOUT).is_err() { break; }
+        if let Ok(bytes) = fs::read(&state_path)
+            && serde_json::from_slice::<CodexControlState>(&bytes).ok().is_some_and(|state| {
+                matches!(state.observed(), CodexObservedState::Active { .. })
+            })
+        {
+            released = true;
+            break;
+        }
+    }
+    assert!(released, "the matching status did not release the approval hold");
+    server.join().unwrap();
+    let _ = shutdown.shutdown(Shutdown::Both);
+    pump.join().unwrap();
+}
+
+#[test]
 fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response() {
     let tmp = tempfile::tempdir().unwrap();
     let _stop_exclusive = stop_flag_tests();
@@ -3061,6 +3142,8 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
                     approval_policy: Some("never".into()),
                     approvals_reviewer: None,
                     sandbox: Some("danger-full-access".into()),
+                    model: None,
+                    effort: None,
                 }),
                 preload: false,
                 preloaded: None,
@@ -3081,6 +3164,8 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
             approval_policy: Some(policy),
             approvals_reviewer: None,
             sandbox: Some(sandbox),
+            model: None,
+            effort: None,
         }) if policy == "never" && sandbox == "danger-full-access"
     ));
     assert!(matches!(
@@ -3171,6 +3256,8 @@ fn declared_resume_policy_preloads_before_the_tui_can_load_read_only() {
                     approval_policy: Some("never".into()),
                     approvals_reviewer: None,
                     sandbox: Some("danger-full-access".into()),
+                    model: None,
+                    effort: None,
                 }),
                 preload: true,
                 preloaded: Some(preloaded_tx),
@@ -3196,7 +3283,7 @@ fn declared_resume_policy_preloads_before_the_tui_can_load_read_only() {
 }
 
 #[test]
-fn rejected_resume_permission_projection_retries_once_with_provider_safe_policy() {
+fn rejected_declared_resume_settings_fail_without_downgrading_the_policy() {
     let tmp = tempfile::tempdir().unwrap();
     let _stop_exclusive = stop_flag_tests();
     let socket = tmp.path().join("server.sock");
@@ -3248,19 +3335,6 @@ fn rejected_resume_permission_projection_retries_once_with_provider_safe_policy(
         )
         .unwrap();
 
-        let fallback = read_json_message(&mut websocket).unwrap().unwrap();
-        assert_eq!(fallback["method"], "thread/resume");
-        assert_eq!(fallback["params"], json!({ "threadId": "thread-prior" }));
-        write_json_message(
-            &mut websocket,
-            &json!({
-                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
-                "result": {
-                    "thread": { "id": "thread-prior", "status": { "type": "idle" } }
-                }
-            }),
-        )
-        .unwrap();
         assert!(matches!(
             poll_json_message(&mut websocket).unwrap(),
             ControlRead::Timeout
@@ -3294,6 +3368,8 @@ fn rejected_resume_permission_projection_retries_once_with_provider_safe_policy(
                     approval_policy: Some("never".into()),
                     approvals_reviewer: None,
                     sandbox: Some("danger-full-access".into()),
+                    model: None,
+                    effort: None,
                 }),
                 preload: false,
                 preloaded: None,
@@ -3305,18 +3381,11 @@ fn rejected_resume_permission_projection_retries_once_with_provider_safe_policy(
     });
     resume_ready_tx.send(()).unwrap();
     acknowledge_tui_thread_loaded(&rx);
-    assert!(matches!(
-        rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap(),
-        ControlEvent::SafeFallbackActivated {
-            cause: "resumePermissionProjectionRejected",
-            ..
-        }
-    ));
-    assert!(matches!(
-        rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap(),
-        ControlEvent::Bound
-    ));
-    assert!(fallback_active.load(Ordering::SeqCst));
+    let failed = rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap();
+    assert!(matches!(failed, ControlEvent::Failed(ref reason)
+        if reason.contains("Codex rejected declared resume settings")), "{failed:?}");
+    assert!(!fallback_active.load(Ordering::SeqCst));
+    assert!(!tmp.path().join("state/binding.json").is_file());
 
     server.join().unwrap();
     let _ = shutdown.shutdown(Shutdown::Both);
@@ -5251,7 +5320,7 @@ fn an_unclassified_item_holds_until_the_next_idle_status() {
 }
 
 #[test]
-fn an_unclassified_server_request_holds_until_the_next_idle_status() {
+fn approval_request_blocks_until_matching_thread_reports_resolution() {
     let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
     let mut state = CodexControlState::new(&runtime, "thread-main".into());
     state
@@ -5262,18 +5331,72 @@ fn an_unclassified_server_request_holds_until_the_next_idle_status() {
         .unwrap();
 
     assert!(
-        !state
+        state
             .observe(&json!({
                 "id": 1,
                 "method": "item/commandExecution/requestApproval",
-                "params": {}
+                "params": {"threadId": "thread-main", "turnId": "turn-1"}
             }))
             .unwrap()
     );
-    assert!(matches!(
+    assert_eq!(
         state.observed(),
-        CodexObservedState::Active { .. }
-    ));
+        &CodexObservedState::Held {
+            reason: CodexHoldReason::WaitingOnApproval,
+            turn_id: Some("turn-1".into()),
+        }
+    );
+    let observation = state.observed().harness_observation().unwrap();
+    assert_eq!(
+        observation.blocked_on,
+        crate::harness_state::BlockedOn::Human
+    );
+    assert_eq!(observation.ask, crate::harness_state::Ask::Permission);
+    state = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert!(state.approval_request_pending);
+
+    assert!(
+        !state
+            .observe(&json!({
+                "method": "thread/status/changed",
+                "params": {"threadId": "thread-other", "status": {"type": "active"}}
+            }))
+            .unwrap()
+    );
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::Held {
+            reason: CodexHoldReason::WaitingOnApproval,
+            turn_id: Some("turn-1".into()),
+        }
+    );
+    assert!(state.observe(&json!({
+        "method": "thread/status/changed",
+        "params": {"threadId": "thread-main", "status": {"type": "active", "activeFlags": []}}
+    })).unwrap());
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::Active {
+            turn_id: "turn-1".into()
+        }
+    );
+
+    assert!(
+        state
+            .observe(&json!({
+                "id": 3, "method": "execCommandApproval", "params": {"threadId": "thread-main"}
+            }))
+            .unwrap()
+    );
+    assert!(state.observe(&json!({
+        "method": "turn/completed",
+        "params": {"threadId": "thread-main", "turn": {"id": "turn-1", "status": "completed"}}
+    })).unwrap());
+    assert_eq!(state.observed(), &CodexObservedState::Idle);
+
+    assert!(state.observe(&json!({
+        "method": "turn/started", "params": {"threadId": "thread-main", "turn": {"id": "turn-2"}}
+    })).unwrap());
 
     assert!(
         state
@@ -5288,7 +5411,7 @@ fn an_unclassified_server_request_holds_until_the_next_idle_status() {
         state.observed(),
         &CodexObservedState::Held {
             reason: CodexHoldReason::UnknownProtocol,
-            turn_id: Some("turn-1".into()),
+            turn_id: Some("turn-2".into()),
         }
     );
 
@@ -6188,6 +6311,8 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
             approval_policy: Some("never".into()),
             approvals_reviewer: None,
             sandbox: Some("workspace-write".into()),
+            model: Some("gpt-test".into()),
+            effort: None,
         }
     );
     assert_eq!(
@@ -6199,6 +6324,7 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
                 "threadId": "thread-prior",
                 "approvalPolicy": "never",
                 "sandbox": "workspace-write",
+                "model": "gpt-test",
             }
         })
     );
@@ -6206,6 +6332,7 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
         &json!({
             "result": {
                 "approvalPolicy": "never",
+                "model": "gpt-test",
                 "sandbox": { "type": "workspaceWrite" }
             }
         }),
@@ -6261,8 +6388,107 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
             approval_policy: Some("never".into()),
             approvals_reviewer: None,
             sandbox: Some("danger-full-access".into()),
+            model: Some("gpt-5.6-sol".into()),
+            effort: Some("xhigh".into()),
         })
     );
+    let request = control_resume_request("thread-prior", prepared.resume_permissions.as_ref());
+    assert_eq!(request["params"]["model"], "gpt-5.6-sol");
+    assert_eq!(request["params"]["config"]["model_reasoning_effort"], "xhigh");
+    let accepted = json!({"result": {
+        "approvalPolicy": "never", "sandbox": {"type": "dangerFullAccess"},
+        "model": "gpt-5.6-sol", "reasoningEffort": "xhigh"
+    }});
+    assert!(resume_permission_overrides_applied(&accepted, prepared.resume_permissions.as_ref().unwrap()));
+    let stale = json!({"result": {
+        "approvalPolicy": "never", "sandbox": {"type": "dangerFullAccess"},
+        "model": "gpt-6-sol", "reasoningEffort": "medium"
+    }});
+    assert!(!resume_permission_overrides_applied(&stale, prepared.resume_permissions.as_ref().unwrap()));
+}
+
+#[test]
+fn unattended_codex_defaults_approval_policy_without_overriding_a_declaration() {
+    let endpoint = "unix:///server.sock";
+    let plain = vec!["--model".into(), "gpt-6.1-sol".into(), "boot".into()];
+    let fresh = prepare_controlled_launch_args(endpoint, &plain, None);
+    assert!(!fresh.safe_fallback);
+    assert!(
+        fresh
+            .server_args
+            .windows(2)
+            .any(|v| v == ["-c", "approval_policy=\"never\""])
+    );
+    assert_eq!(
+        &fresh.tui_args[..6],
+        [
+            "--remote",
+            endpoint,
+            "--ask-for-approval",
+            "never",
+            "--model",
+            "gpt-6.1-sol"
+        ]
+    );
+    let resumed = prepare_controlled_launch_args(endpoint, &plain, Some("saved-thread"));
+    assert_eq!(
+        resumed
+            .resume_permissions
+            .as_ref()
+            .unwrap()
+            .approval_policy
+            .as_deref(),
+        Some("never")
+    );
+    assert_eq!(
+        resumed.tui_args,
+        [
+            "--remote",
+            endpoint,
+            "resume",
+            "--model",
+            "gpt-6.1-sol",
+            "saved-thread",
+            "boot"
+        ]
+    );
+
+    for explicit in [
+        vec!["--ask-for-approval=on-request".into(), "boot".into()],
+        vec![
+            "-c".into(),
+            "approval_policy = \"on-request\"".into(),
+            "boot".into(),
+        ],
+    ] {
+        let fresh = prepare_controlled_launch_args(endpoint, &explicit, None);
+        assert!(
+            !fresh
+                .server_args
+                .iter()
+                .any(|v| v == "approval_policy=\"never\"")
+        );
+        assert!(
+            !fresh
+                .tui_args
+                .windows(2)
+                .any(|v| v == ["--ask-for-approval", "never"])
+        );
+        let resumed = prepare_controlled_launch_args(endpoint, &explicit, Some("saved-thread"));
+        assert!(
+            !resumed
+                .server_args
+                .iter()
+                .any(|v| v == "approval_policy=\"never\"")
+        );
+        assert_eq!(
+            resumed
+                .resume_permissions
+                .as_ref()
+                .and_then(|v| v.approval_policy.as_deref()),
+            Some("on-request")
+        );
+    }
 }
 
 #[test]

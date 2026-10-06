@@ -528,6 +528,8 @@ pub struct CodexControlState {
     thread_id: String,
     subscribed: bool,
     observed: CodexObservedState,
+    #[serde(default)]
+    approval_request_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -630,7 +632,8 @@ impl CodexDeliveryConfig {
         ) {
             tracing::warn!(
                 "st codex: failed to report agent '{}' protocol rejection to supervisor '{}': {report_error:#}",
-                self.identity, supervisor
+                self.identity,
+                supervisor
             );
         }
     }
@@ -1298,8 +1301,9 @@ impl CodexInboxDelivery {
     /// recipient agent's act and the only settlement authority: an entry whose file left the inbox
     /// releases ownership, and this pump never moves a file.
     fn reconcile_inbox(&mut self, unread: &[message::Message]) -> Result<()> {
-        self.ledger
-            .prune(|filename| crate::push_mailbox::is_unread(&self.config.agent_dir, filename, unread))
+        self.ledger.prune(|filename| {
+            crate::push_mailbox::is_unread(&self.config.agent_dir, filename, unread)
+        })
     }
 
     fn refresh_if_due(&mut self) -> Result<()> {
@@ -1676,12 +1680,15 @@ impl CodexInboxDelivery {
             CodexObservedState::Idle
                 | CodexObservedState::Active { .. }
                 | CodexObservedState::TerminalError { .. }
-        ) && self.verified_snapshot.as_ref().is_some_and(|(_, snapshot)| {
-            matches!(
-                snapshot,
-                CodexObservedState::Held { .. } | CodexObservedState::AwaitingStatus
-            )
-        })
+        ) && self
+            .verified_snapshot
+            .as_ref()
+            .is_some_and(|(_, snapshot)| {
+                matches!(
+                    snapshot,
+                    CodexObservedState::Held { .. } | CodexObservedState::AwaitingStatus
+                )
+            })
         {
             // A failed transcript lookup cannot be the only way out of an old held snapshot.
             // Fresh positive live evidence permits another bounded thread/read, whose result
@@ -1987,6 +1994,7 @@ impl CodexControlState {
             thread_id,
             subscribed: false,
             observed: CodexObservedState::AwaitingStatus,
+            approval_request_pending: false,
         }
     }
 
@@ -2060,7 +2068,7 @@ impl CodexControlState {
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             return Ok(false);
         };
-        let before = self.observed.clone();
+        let before = (self.observed.clone(), self.approval_request_pending);
         match method {
             "thread/started" => {
                 let thread_id = required_string(message, "/params/thread/id", method)?;
@@ -2096,6 +2104,45 @@ impl CodexControlState {
                 let turn_id = required_string(message, "/params/turn/id", method)?;
                 let outcome = codex_turn_outcome(message.pointer("/params/turn"));
                 self.observe_turn_completed(turn_id, outcome);
+            }
+            "execCommandApproval"
+            | "applyPatchApproval"
+            | "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+                if message.get("id").is_some() =>
+            {
+                // This control subscriber never answers provider requests. Modern requests
+                // carry threadId; older ones use conversationId. The socket can broadcast
+                // requests for other threads, so an unattributed request proves no block here.
+                let request_thread = message
+                    .pointer("/params/threadId")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        message
+                            .pointer("/params/conversationId")
+                            .and_then(Value::as_str)
+                    });
+                if request_thread != Some(self.thread_id.as_str()) {
+                    return Ok(false);
+                }
+                let turn_id = message
+                    .pointer("/params/turnId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| match &self.observed {
+                        CodexObservedState::Active { turn_id }
+                        | CodexObservedState::Held {
+                            turn_id: Some(turn_id),
+                            ..
+                        } => Some(turn_id.clone()),
+                        _ => None,
+                    });
+                self.observed = CodexObservedState::Held {
+                    reason: CodexHoldReason::WaitingOnApproval,
+                    turn_id,
+                };
+                self.approval_request_pending = true;
             }
             "item/started" | "item/completed" => {
                 let thread_id = required_string(message, "/params/threadId", method)?;
@@ -2144,7 +2191,7 @@ impl CodexControlState {
                     "exitedReviewMode" => (CodexHoldReason::Review, true),
                     "contextCompaction" => (CodexHoldReason::Compaction, false),
                     _ if CLASSIFIED_CODEX_THREAD_ITEMS.contains(&item_type) => {
-                        return Ok(self.observed != before);
+                        return Ok((self.observed.clone(), self.approval_request_pending) != before);
                     }
                     _ => (CodexHoldReason::UnknownProtocol, false),
                 };
@@ -2163,10 +2210,13 @@ impl CodexControlState {
             }
             _ => return Ok(false),
         }
-        Ok(self.observed != before)
+        Ok((self.observed.clone(), self.approval_request_pending) != before)
     }
 
     fn observe_thread_status(&mut self, status: &str, blocked: Option<CodexHoldReason>) {
+        if blocked != Some(CodexHoldReason::WaitingOnApproval) {
+            self.approval_request_pending = false;
+        }
         self.observed = match status {
             "idle" => CodexObservedState::Idle,
             "active" => match (&self.observed, blocked) {
@@ -2242,6 +2292,17 @@ impl CodexControlState {
 
     fn observe_turn_started(&mut self, turn_id: String) {
         self.observed = match &self.observed {
+            CodexObservedState::Held {
+                reason: CodexHoldReason::WaitingOnApproval,
+                turn_id: Some(current),
+            } if current == &turn_id => self.observed.clone(),
+            CodexObservedState::Held {
+                reason: CodexHoldReason::WaitingOnApproval,
+                turn_id: None,
+            } => CodexObservedState::Held {
+                reason: CodexHoldReason::WaitingOnApproval,
+                turn_id: Some(turn_id),
+            },
             CodexObservedState::Active { turn_id: current } if current == &turn_id => {
                 self.observed.clone()
             }
@@ -2329,20 +2390,29 @@ impl CodexControlState {
             } => CodexObservedState::Idle,
             // Every other hold is owned by a signal that is not the turn lifecycle. A completion
             // is not evidence that a review or a compaction ended, that the thread reloaded, that
-            // a reported system error cleared, or that the human a turn was waiting on has
-            // answered, so it does not speak for them. Only the signal that minted the hold
-            // releases it: the waiting-on-human holds are minted from `activeFlags` on a thread
-            // status and are cleared by the next thread status that omits the flag.
+            // a reported system error cleared, or that a question was answered. A matching
+            // completion does settle an approval request below; otherwise the thread status
+            // that drops `waitingOnApproval` supplies the release edge.
             CodexObservedState::Held {
                 reason:
                     CodexHoldReason::Review
                     | CodexHoldReason::Compaction
                     | CodexHoldReason::UnknownProtocol
                     | CodexHoldReason::ConflictingTurn
-                    | CodexHoldReason::WaitingOnApproval
                     | CodexHoldReason::WaitingOnUserInput
                     | CodexHoldReason::NotLoaded
                     | CodexHoldReason::UnknownStatus,
+                ..
+            } => self.observed.clone(),
+            CodexObservedState::Held {
+                reason: CodexHoldReason::WaitingOnApproval,
+                turn_id: Some(current),
+            } if current == turn_id && self.approval_request_pending => {
+                self.approval_request_pending = false;
+                CodexObservedState::Idle
+            }
+            CodexObservedState::Held {
+                reason: CodexHoldReason::WaitingOnApproval,
                 ..
             } => self.observed.clone(),
             CodexObservedState::Held {
@@ -3556,6 +3626,8 @@ struct ResumePermissionOverrides {
     approval_policy: Option<String>,
     approvals_reviewer: Option<String>,
     sandbox: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 impl ResumePermissionOverrides {
@@ -3565,6 +3637,8 @@ impl ResumePermissionOverrides {
             ("approval_policy", self.approval_policy.as_deref()),
             ("approvals_reviewer", self.approvals_reviewer.as_deref()),
             ("sandbox_mode", self.sandbox.as_deref()),
+            ("model", self.model.as_deref()),
+            ("model_reasoning_effort", self.effort.as_deref()),
         ] {
             if let Some(value) = value {
                 overrides.push(format!("{key}={}", toml::Value::String(value.into())));
@@ -3583,6 +3657,12 @@ impl ResumePermissionOverrides {
         if let Some(sandbox) = &self.sandbox {
             params.insert("sandbox".into(), Value::String(sandbox.clone()));
         }
+        if let Some(model) = &self.model {
+            params.insert("model".into(), Value::String(model.clone()));
+        }
+        if let Some(effort) = &self.effort {
+            params.insert("config".into(), json!({"model_reasoning_effort": effort}));
+        }
     }
 
     fn diagnostic(&self, requested_policy_applied: bool) -> Value {
@@ -3590,6 +3670,8 @@ impl ResumePermissionOverrides {
             "approvalPolicy": self.approval_policy,
             "approvalsReviewer": self.approvals_reviewer,
             "sandbox": self.sandbox,
+            "model": self.model,
+            "effort": self.effort,
             "requestedPolicyApplied": requested_policy_applied,
         })
     }
@@ -3604,6 +3686,13 @@ fn prepare_controlled_launch_args(
     let exact = controlled_app_server_args(endpoint, authored_args).and_then(|mut server_args| {
         let resume_permissions =
             automatic_resume_permission_overrides(authored_args, resume_thread)?;
+        let default_approval = !authored_approval_policy(authored_args)?;
+        if default_approval && resume_permissions.is_none() {
+            insert_app_server_config_override(
+                &mut server_args,
+                "approval_policy=\"never\"".into(),
+            )?;
+        }
         if let Some(permissions) = &resume_permissions {
             // The remote TUI's resume argv cannot contain CLI permission flags. Project the
             // declaration into app-server defaults before either client loads the saved thread;
@@ -3612,9 +3701,13 @@ fn prepare_controlled_launch_args(
                 insert_app_server_config_override(&mut server_args, override_value)?;
             }
         }
+        let mut tui_args = controlled_tui_args(endpoint, authored_args, resume_thread)?;
+        if default_approval && resume_thread.is_none() {
+            tui_args.splice(2..2, ["--ask-for-approval".into(), "never".into()]);
+        }
         Ok((
             server_args,
-            controlled_tui_args(endpoint, authored_args, resume_thread)?,
+            tui_args,
             expected_resume_thread(authored_args, resume_thread)?.map(str::to_owned),
             resume_permissions,
         ))
@@ -3666,9 +3759,11 @@ fn automatic_resume_permission_overrides(
         return Ok(None);
     };
     let mut overrides = ResumePermissionOverrides {
-        approval_policy: None,
+        approval_policy: (!authored_approval_policy(authored_args)?).then(|| "never".into()),
         approvals_reviewer: None,
         sandbox: None,
+        model: None,
+        effort: None,
     };
     let mut index = 0;
     while index < insertion {
@@ -3700,6 +3795,32 @@ fn automatic_resume_permission_overrides(
                 validate_resume_approval_policy(value)?;
                 overrides.approval_policy = Some(value.clone());
                 index += 2;
+            }
+            "-m" | "--model" => {
+                overrides.model = Some(authored_args
+                    .get(index + 1)
+                    .context("Codex model option has no value")?
+                    .clone());
+                index += 2;
+            }
+            "-c" | "--config" => {
+                let value = authored_args
+                    .get(index + 1)
+                    .context("Codex config option has no value")?;
+                apply_resume_config_override(&mut overrides, value)?;
+                index += 2;
+            }
+            _ if argument.starts_with("--config=") => {
+                apply_resume_config_override(&mut overrides, argument.trim_start_matches("--config="))?;
+                index += 1;
+            }
+            _ if argument.starts_with("-c") && argument.len() > 2 => {
+                apply_resume_config_override(&mut overrides, &argument[2..])?;
+                index += 1;
+            }
+            _ if argument.starts_with("--model=") => {
+                overrides.model = Some(argument.trim_start_matches("--model=").into());
+                index += 1;
             }
             _ if argument.starts_with("--sandbox=") => {
                 let value = argument.trim_start_matches("--sandbox=");
@@ -3750,8 +3871,99 @@ fn automatic_resume_permission_overrides(
     }
     Ok((overrides.approval_policy.is_some()
         || overrides.approvals_reviewer.is_some()
-        || overrides.sandbox.is_some())
+        || overrides.sandbox.is_some()
+        || overrides.model.is_some()
+        || overrides.effort.is_some())
     .then_some(overrides))
+}
+
+fn apply_resume_config_override(
+    overrides: &mut ResumePermissionOverrides,
+    config: &str,
+) -> Result<()> {
+    let Some((key, value)) = config.split_once('=') else {
+        return Ok(());
+    };
+    let value = value.trim().trim_matches(['"', '\'']);
+    match key.trim() {
+        "approval_policy" => {
+            validate_resume_approval_policy(value)?;
+            overrides.approval_policy = Some(value.into());
+        }
+        "model_reasoning_effort" => {
+            anyhow::ensure!(
+                matches!(value, "minimal" | "low" | "medium" | "high" | "xhigh"),
+                "unsupported Codex reasoning effort '{value}'"
+            );
+            overrides.effort = Some(value.into());
+        }
+        "model" => overrides.model = Some(value.into()),
+        "sandbox_mode" => {
+            validate_resume_sandbox(value)?;
+            overrides.sandbox = Some(value.into());
+        }
+        "approvals_reviewer" => overrides.approvals_reviewer = Some(value.into()),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A declaration can select approvals either with the CLI option or a direct config override.
+/// The latter must take precedence over the unattended default on both fresh and resumed seats.
+fn authored_approval_policy(authored_args: &[String]) -> Result<bool> {
+    let boundary = interactive_root_prefix_end(authored_args)?;
+    let mut index = 0;
+    while index < boundary {
+        let arg = authored_args[index].as_str();
+        if matches!(
+            arg,
+            "--dangerously-bypass-approvals-and-sandbox"
+                | "--approve-for-me"
+                | "-a"
+                | "--ask-for-approval"
+        ) || arg.starts_with("--ask-for-approval=")
+            || (arg.starts_with("-a") && arg.len() > 2)
+        {
+            return Ok(true);
+        }
+        let config = if matches!(arg, "-c" | "--config") {
+            authored_args.get(index + 1).map(String::as_str)
+        } else {
+            arg.strip_prefix("--config=")
+                .or_else(|| arg.strip_prefix("-c"))
+        };
+        if config.is_some_and(|value| {
+            value
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "approval_policy")
+        }) {
+            return Ok(true);
+        }
+        index += if matches!(
+            arg,
+            "-c" | "--config"
+                | "-a"
+                | "--ask-for-approval"
+                | "-s"
+                | "--sandbox"
+                | "-m"
+                | "--model"
+                | "-p"
+                | "--profile"
+                | "-C"
+                | "--cd"
+                | "--add-dir"
+                | "--enable"
+                | "--disable"
+                | "--remote-auth-token-env"
+                | "--local-provider"
+        ) {
+            2
+        } else {
+            1
+        };
+    }
+    Ok(false)
 }
 
 fn validate_resume_sandbox(value: &str) -> Result<()> {
@@ -4199,7 +4411,7 @@ fn controlled_tui_args(
     // A remote task owns its permission policy. Codex 0.156 rejects attempts to override that
     // policy while resuming, so automatic resume preserves every non-permission global option but
     // omits permission and hook-trust overrides here. Hook trust is projected through the typed
-    // app-server preflight above, while the declared approval/sandbox policy is projected through
+    // app-server preflight above, while declared approval, sandbox, model and effort settings are projected through
     // this driver's typed control `thread/resume` after the owning TUI loads the thread. Fresh
     // launches and explicit authored resume/fork commands remain byte-for-byte exact.
     args.extend(resume_compatible_root_args(&authored_args[..insertion]));
@@ -4588,10 +4800,6 @@ fn wait_for_tui_loaded_thread(
 enum ControlEvent {
     TuiThreadLoaded(Sender<()>),
     ResumePermissionPolicyApplied(ResumePermissionOverrides),
-    SafeFallbackActivated {
-        cause: &'static str,
-        permissions: ResumePermissionOverrides,
-    },
     Bound,
     Observed,
     Closed,
@@ -4652,6 +4860,15 @@ fn resume_permission_overrides_applied(
                 .pointer("/result/sandbox/type")
                 .and_then(Value::as_str)
                 == Some(sandbox)
+        })
+        && expected.model.as_deref().is_none_or(|model| {
+            message.pointer("/result/model").and_then(Value::as_str) == Some(model)
+        })
+        && expected.effort.as_deref().is_none_or(|effort| {
+            message
+                .pointer("/result/reasoningEffort")
+                .and_then(Value::as_str)
+                == Some(effort)
         })
 }
 
@@ -4817,42 +5034,23 @@ fn pump_control(
                         subscription_pending,
                         "Codex control received an unexpected initial thread/resume response"
                     );
-                    if message.get("error").is_some()
-                        && let Some(rejected) = resume_permissions.take()
+                    if message.pointer("/error/code").and_then(Value::as_i64) == Some(-32600)
+                        && message.pointer("/error/message").and_then(Value::as_str)
+                            .is_some_and(|detail| detail.starts_with("no rollout found for thread id "))
                     {
-                        safe_fallback_active.store(true, Ordering::SeqCst);
-                        tracing::warn!(
-                            "st codex: app-server rejected the declared resume permission policy; continuing once with the provider-safe policy"
-                        );
-                        let _ = events.send(ControlEvent::SafeFallbackActivated {
-                            cause: "resumePermissionProjectionRejected",
-                            permissions: rejected,
-                        });
-                        write_json_message(
-                            &mut websocket,
-                            &control_resume_request(thread_id, None),
-                        )
-                        .context(
-                            "retrying Codex thread resume without rejected permission policy",
-                        )?;
-                        continue;
+                        anyhow::bail!("saved Codex resume binding has no persisted rollout for thread {thread_id}");
                     }
+                    anyhow::ensure!(message.get("error").is_none(),
+                        "Codex rejected declared resume settings: {}", message["error"]);
                     subscription_pending = false;
                     if let Some(expected_permissions) = resume_permissions.take() {
-                        if resume_permission_overrides_applied(&message, &expected_permissions) {
-                            let _ = events.send(ControlEvent::ResumePermissionPolicyApplied(
-                                expected_permissions,
-                            ));
-                        } else {
-                            safe_fallback_active.store(true, Ordering::SeqCst);
-                            tracing::warn!(
-                                "st codex: resumed thread did not report the declared permission policy; continuing in degraded provider-safe mode"
-                            );
-                            let _ = events.send(ControlEvent::SafeFallbackActivated {
-                                cause: "resumePermissionProjectionMismatch",
-                                permissions: expected_permissions,
-                            });
-                        }
+                        anyhow::ensure!(
+                            resume_permission_overrides_applied(&message, &expected_permissions),
+                            "Codex resume response did not apply declared settings"
+                        );
+                        let _ = events.send(ControlEvent::ResumePermissionPolicyApplied(
+                            expected_permissions,
+                        ));
                     }
                     let mut bound = CodexControlState::new(runtime, thread_id.to_string());
                     match bound
@@ -5493,17 +5691,6 @@ fn wait_for_binding(
                     permissions.diagnostic(true),
                 )?;
             }
-            Ok(ControlEvent::SafeFallbackActivated { cause, permissions }) => {
-                diagnostics.record(
-                    "safeFallbackActivated",
-                    json!({
-                        "cause": cause,
-                        "declaredPermissions": permissions.diagnostic(false),
-                        "mode": "minimalRemoteTui",
-                        "requestedPolicyApplied": false,
-                    }),
-                )?;
-            }
             Ok(ControlEvent::Bound) => return Ok(BindingWait::Bound),
             Ok(ControlEvent::Observed) => {}
             Ok(ControlEvent::Closed) => {
@@ -5544,8 +5731,7 @@ fn monitor_bound_tui(tui: &mut ProviderProcess, events: &Receiver<ControlEvent>)
             Ok(ControlEvent::TuiThreadLoaded(acknowledge)) => {
                 let _ = acknowledge.send(());
             }
-            Ok(ControlEvent::ResumePermissionPolicyApplied(_))
-            | Ok(ControlEvent::SafeFallbackActivated { .. }) => {}
+            Ok(ControlEvent::ResumePermissionPolicyApplied(_)) => {}
             Ok(ControlEvent::Bound) => {}
             Ok(ControlEvent::Observed) => {}
             // A stop signals the whole process group: the app-server can end the control
