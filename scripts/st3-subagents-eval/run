@@ -709,6 +709,8 @@ def main():
             shutil.rmtree(root, ignore_errors=True)
     (args.evidence / "result.json").write_text(json.dumps(result, indent=2, default=str) + "\n")
     print(json.dumps(result, indent=2, default=str))
+    if result["verdict"] != "pass":
+        emit_failure_files(args.evidence)
     return 0 if result["verdict"] == "pass" else 1
 
 
@@ -716,4 +718,5 @@ if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from st3_test_process import supervised_main
+    from st3_failure_evidence import emit_failure_files
     raise SystemExit(supervised_main(main))
