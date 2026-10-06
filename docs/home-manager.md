@@ -23,6 +23,10 @@ its previously published declaration; this module does not yet use managed-set a
 The optional `ptyPackage` replaces the bundled `pty` for both the daemon and
 seats, working around the executable-directory PATH precedence in #633.
 
+On Linux, `memoryMax` (default `8G`) and the optional `memoryHigh` set the daemon's systemd memory
+limits; `null` leaves a limit unset. Size `memoryMax` above the host's measured peak RSS: catch-up
+after downtime raises memory use, and an OOM kill restarts the daemon into the same catch-up.
+
 Activation atomically installs a real `st3` executable at `stateDir/bin/st3` (by default
 `~/.local/state/st3/bin/st3`) before restarting the daemon, with `st` as an alias in that directory.
 The daemon, declaration-apply service, and service PATH use this stable location so running seats

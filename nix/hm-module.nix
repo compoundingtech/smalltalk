@@ -100,6 +100,21 @@ in
       default = [ ];
       description = "Additional arguments passed to st3 up.";
     };
+    memoryHigh = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "4G";
+      description = "systemd MemoryHigh for the daemon (reclaim pressure before the hard limit); null leaves it unset.";
+    };
+    memoryMax = mkOption {
+      type = types.nullOr types.str;
+      default = "8G";
+      description = ''
+        systemd MemoryMax for the daemon; null leaves it unset. Size it above the host's measured
+        peak: RSS grows with catch-up after downtime and with reader caches, and an OOM kill at
+        this limit restarts into the same catch-up.
+      '';
+    };
     declarations = {
       seats = mkOption { type = types.listOf types.path; default = [ ]; description = "Seat KDL files to apply."; };
       missions = mkOption { type = types.listOf types.path; default = [ ]; description = "Mission KDL files to publish."; };
@@ -165,8 +180,8 @@ in
           CPUWeight = 1000;
           IOWeight = 1000;
           KillMode = "control-group";
-          MemoryMax = "1024M";
-        };
+        } // lib.optionalAttrs (cfg.memoryMax != null) { MemoryMax = cfg.memoryMax; }
+          // lib.optionalAttrs (cfg.memoryHigh != null) { MemoryHigh = cfg.memoryHigh; };
         Install.WantedBy = [ "default.target" ];
       };
     } // lib.optionalAttrs (cfg.declarationsApply.enable && hasDeclarations) {
