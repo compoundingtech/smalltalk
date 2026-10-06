@@ -17,6 +17,32 @@ mod client_presence;
 mod client_v0_cli;
 mod client_v0_contract;
 mod cli_inventory_process;
+
+// Invoked only by cli_inventory_process's bounded-capture test. Keeping this
+// outside that module preserves its five selected fixture names.
+#[test]
+fn cli_inventory_capture_helper() {
+    use std::io::Write as _;
+
+    match std::env::var("ST3_CLI_INVENTORY_CAPTURE_HELPER").as_deref() {
+        Ok("oversize") => {
+            std::io::stdout().write_all(&vec![b'x'; 1_048_577]).unwrap();
+        }
+        Ok("child") => {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli_inventory_capture_helper", "--nocapture"])
+                .env("ST3_CLI_INVENTORY_CAPTURE_HELPER", "hold")
+                .spawn()
+                .unwrap();
+        }
+        Ok("hold") => {
+            let marker = std::env::var_os("ST3_CLI_INVENTORY_CAPTURE_MARKER").unwrap();
+            std::fs::write(marker, b"started").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+        _ => {}
+    }
+}
 mod codex_bootstrap;
 mod command_recorder;
 mod completion_shells;

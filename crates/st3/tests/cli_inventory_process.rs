@@ -86,11 +86,11 @@ fn bounded_output(mut command: Command, limit: Duration) -> Result<Output, Strin
                 _ => unreachable!(),
             }
         }
-        if status.is_some() && stdout.is_some() && stderr.is_some() {
+        if let (Some(status), Some(stdout), Some(stderr)) = (&status, &stdout, &stderr) {
             return Ok(Output {
-                status: status.unwrap(),
-                stdout: stdout.unwrap(),
-                stderr: stderr.unwrap(),
+                status: *status,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
             });
         }
         if Instant::now() >= deadline {
@@ -241,24 +241,26 @@ fn literal_inventory_argument_after_terminator_reaches_a_benign_provider() {
 #[cfg(unix)]
 #[test]
 fn process_capture_rejects_oversize_and_child_held_pipes() {
-    let root = tempfile::tempdir().unwrap();
-    let large = root.path().join("large-output");
-    std::fs::write(&large, vec![b'x'; MAX_OUTPUT_BYTES + 1]).unwrap();
-    let mut output = Command::new("/bin/cat");
-    output.arg(large);
+    let mut output = Command::new(std::env::current_exe().unwrap());
+    output
+        .args(["--exact", "cli_inventory_capture_helper", "--nocapture"])
+        .env("ST3_CLI_INVENTORY_CAPTURE_HELPER", "oversize");
+    let oversize = bounded_output(output, Duration::from_secs(2)).unwrap_err();
     assert!(
-        bounded_output(output, Duration::from_secs(2))
-            .unwrap_err()
-            .contains("exceeds"),
-        "oversize stdout must be refused"
+        oversize.contains("exceeds"),
+        "oversize stdout must be refused: {oversize}"
     );
 
-    let mut held = Command::new("/bin/sh");
-    held.args(["-c", "/bin/sleep 5 & exit 0"]);
+    let mut held = Command::new(std::env::current_exe().unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("pipe-holder-started");
+    held.args(["--exact", "cli_inventory_capture_helper", "--nocapture"])
+        .env("ST3_CLI_INVENTORY_CAPTURE_HELPER", "child")
+        .env("ST3_CLI_INVENTORY_CAPTURE_MARKER", &marker);
+    let child_pipe = bounded_output(held, Duration::from_secs(2)).unwrap_err();
     assert!(
-        bounded_output(held, Duration::from_millis(250))
-            .unwrap_err()
-            .contains("deadline"),
-        "a descendant holding stdout open must be killed with the process group"
+        child_pipe.contains("deadline"),
+        "a descendant holding stdout open must be killed with the process group: {child_pipe}"
     );
+    assert!(marker.exists(), "the pipe-holding child did not start");
 }
