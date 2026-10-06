@@ -1307,7 +1307,13 @@ impl MainBackend {
 impl Backend for MainBackend {
     async fn ready(&self) {
         loop {
-            if self.client.get::<serde_json::Value>("/v1/health").await.is_ok() {
+            if let Ok(health) = self.client.get::<serde_json::Value>("/v1/health").await {
+                if let Some(warning) = crate::replication_worker_build::warning(
+                    &st_drivers::version::machine_version(),
+                    health.get("machine_version").and_then(Value::as_str),
+                ) {
+                    eprintln!("st replication-worker: WARNING: {warning}");
+                }
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1491,6 +1497,9 @@ fn smalltalk_routes() -> Router<PeerState> {
 /// Run the replication worker: sync this node's store, through its daemon, with the fleet.
 pub async fn run_worker(config: Config) -> Result<()> {
     config.validate()?;
+    if let Err(error) = crate::replication_worker_build::record(&config.state_dir) {
+        eprintln!("st replication-worker: WARNING: cannot report worker build: {error:#}");
+    }
     let worker = WorkerConfig {
         node: config.node.clone(),
         fleet_id: config
