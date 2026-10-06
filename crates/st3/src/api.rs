@@ -4017,13 +4017,17 @@ async fn client_agents(
     let store = state.store.clone();
     blocking_store(move || {
         let (Extension(snapshot), Json(mut page)) = page;
-        let items = client_agent_cards_for_page(
-            &store,
-            history,
-            snapshot.store_index,
-            &page.items,
-            &snapshot.created_at,
-        );
+        let items = store.read_snapshot(|_| {
+            Ok(store.with_owned_set_snapshot_reads(|| {
+                client_agent_cards_for_page(
+                    &store,
+                    history,
+                    snapshot.store_index,
+                    &page.items,
+                    &snapshot.created_at,
+                )
+            }))
+        })?;
         Ok(items.map(|items| {
             page.items = items;
             (Extension(snapshot), Json(page))
