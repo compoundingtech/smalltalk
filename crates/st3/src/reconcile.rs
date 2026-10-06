@@ -4953,6 +4953,44 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .environment
                 .remove(crate::suspension::RESUME_ENV);
         }
+        // The import claim has no incarnation: it is a bootstrap selector, not
+        // evidence that a driver has bound the session. Once a driver binds, normal
+        // continuation must follow its latest transcript rather than the import.
+        let import_bound = subject.subject.starts_with("agent/import/omp/")
+            && member.driver.as_deref() == Some("omp")
+            && member
+                .environment
+                .contains_key(crate::rollout::RESUME_PATH_ENV)
+            && !member
+                .environment
+                .contains_key(crate::rollout::OPERATION_ENV)
+            && !crate::suspension::current(&self.store, &subject.subject)?
+                .is_some_and(|state| state.action == "resume" && state.phase != "resumed")
+            && self
+                .store
+                .claims_for(&subject.subject, Some("harness.session-file"))?
+                .iter()
+                .any(|claim| {
+                    claim.body.get("fields").is_some_and(|fields| {
+                        fields.get("harness").and_then(Value::as_str) == Some("omp")
+                            && fields
+                                .get("incarnation_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.is_empty())
+                            && fields
+                                .get("session_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.is_empty())
+                    })
+                });
+        if import_bound {
+            launch_member
+                .environment
+                .remove(crate::suspension::RESUME_ENV);
+            launch_member
+                .environment
+                .remove(crate::rollout::RESUME_PATH_ENV);
+        }
         // Every other relaunch of a seat continues the native session its harness last bound,
         // so a restart, a hangup or a changed declaration never loses the conversation.
         launch_member
@@ -4962,7 +5000,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .environment
             .remove(crate::suspension::CONTINUE_PATH_ENV);
         let continued = if subject.kind == "agent"
-            && !member
+            && !launch_member
                 .environment
                 .contains_key(crate::suspension::RESUME_ENV)
             && let Some(harness) = member.driver.as_deref()
@@ -5494,6 +5532,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 resumed
                     .environment
                     .insert(suspended::RESUME_ENV.into(), session);
+                if agent.starts_with("agent/import/omp/") {
+                    // A cold resume names the suspension's session, not the import.
+                    resumed.environment.remove(crate::rollout::RESUME_PATH_ENV);
+                }
                 let before = self
                     .store
                     .latest_observation(agent, "runtime.action.succeeded")?
@@ -18438,6 +18480,148 @@ mission "feedback-review" state="ready" {
             .account_for_start("agent/node.worker", &binding, "node", now_ms())
             .unwrap();
         assert_eq!(kept.account.name, "ada/two");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omp_import_restart_follows_driver_binding_after_bootstrap() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let original_id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
+        let newer_id = "27a1a145-ed86-4e9d-80e7-071dace5e3d2";
+        let original = root.path().join(format!("2026-10-06_{original_id}.jsonl"));
+        fs::write(
+            &original,
+            format!("{{\"type\":\"session\",\"id\":\"{original_id}\"}}\n"),
+        )
+        .unwrap();
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+agent "import/omp/fixture" {{
+  workspace {:?}
+  harness "omp" {{}}
+  env {{
+    ST3_NATIVE_RESUME_SESSION "{original_id}"
+    ST3_NATIVE_RESUME_PATH {:?}
+  }}
+  restart "always"
+}}"#,
+                root.path().to_str().unwrap(),
+                original.to_str().unwrap()
+            ),
+            "omp-import-restart",
+        );
+        let subject = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.kind == "agent")
+            .unwrap();
+        let member = subject.member.as_ref().unwrap();
+        let binding = |id: &str, path: &Path, incarnation: Option<&str>| {
+            let mut fields = BTreeMap::from([
+                ("harness".into(), Value::String("omp".into())),
+                ("session_id".into(), Value::String(id.into())),
+                (
+                    "path".into(),
+                    Value::String(path.to_string_lossy().into_owned()),
+                ),
+            ]);
+            if let Some(incarnation) = incarnation {
+                fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
+            }
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.subject.clone(),
+                    kind: "harness.session-file".into(),
+                    actor: Some(subject.subject.clone()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        binding(original_id, &original, None);
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .perform_start(&subject, member, "import bootstrap")
+            .unwrap();
+        {
+            let starts = runtime
+                .started_members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let launch = starts.last().unwrap();
+            assert_eq!(launch.environment[crate::suspension::RESUME_ENV], original_id);
+            assert_eq!(
+                launch.environment[crate::rollout::RESUME_PATH_ENV],
+                original.to_str().unwrap()
+            );
+            assert!(
+                !launch
+                    .environment
+                    .contains_key(crate::suspension::CONTINUE_ENV)
+            );
+        }
+        let managed = root.path().join("provider-sessions");
+        fs::create_dir(&managed).unwrap();
+        let newer = managed.join(format!("2026-10-06_{newer_id}.jsonl"));
+        fs::write(
+            &newer,
+            format!("{{\"type\":\"session\",\"id\":\"{newer_id}\"}}\n"),
+        )
+        .unwrap();
+        binding(newer_id, &newer, Some("driver-first"));
+        for moved in [false, true] {
+            if moved {
+                fs::rename(&original, root.path().join("moved-original.jsonl")).unwrap();
+            }
+            reconciler
+                .perform_start(&subject, member, "restart after binding")
+                .unwrap();
+            let starts = runtime
+                .started_members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let launch = starts.last().unwrap();
+            assert!(
+                !launch
+                    .environment
+                    .contains_key(crate::suspension::RESUME_ENV)
+            );
+            assert!(
+                !launch
+                    .environment
+                    .contains_key(crate::rollout::RESUME_PATH_ENV)
+            );
+            assert_eq!(launch.environment[crate::suspension::CONTINUE_ENV], newer_id);
+            assert_eq!(
+                launch.environment[crate::suspension::CONTINUE_PATH_ENV],
+                newer.to_str().unwrap()
+            );
+            assert_eq!(
+                crate::native_resume::pi_family_argv(
+                    "omp",
+                    vec!["omp".into()],
+                    &managed,
+                    &launch.environment[crate::suspension::CONTINUE_ENV],
+                    Some(Path::new(
+                        &launch.environment[crate::suspension::CONTINUE_PATH_ENV],
+                    )),
+                )
+                .unwrap(),
+                vec!["omp", "--resume", newer.to_str().unwrap()]
+            );
+        }
     }
 
     #[test]

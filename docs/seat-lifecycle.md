@@ -164,6 +164,15 @@ holding the native session ID and `ST3_NATIVE_RESUME_PATH` pinning the absolute
 transcript path. The driver validates the transcript header, links its directory
 into the managed inventory without copying it, and launches OMP with that exact
 path. Missing or mismatched transcripts fail the launch rather than starting anew.
+The pair bootstraps the imported seat only until its driver publishes a native
+session binding with an incarnation. Subsequent restarts ignore the original pair
+and continue the latest bound native ID and transcript path, including after OMP
+switches sessions or the original imported file moves. Explicit suspension resumes
+and rollouts retain their strict selectors.
+
+The daemon and native driver must both support strict OMP import paths. An older
+driver with a new import declaration rejects the strict path contract; upgrade
+both before importing.
 
 ### Repair an OMP import created before strict resume
 
