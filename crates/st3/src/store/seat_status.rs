@@ -6,8 +6,14 @@ pub(crate) const WINDOW_MS: u128 = 7 * 24 * 60 * 60 * 1000;
 pub(crate) const MAX_TRANSITIONS: usize = 200;
 pub(crate) const STALE_MS: u128 = 90_000;
 
-pub(super) fn permission_blocked(blocked_on: Option<&str>, ask: Option<&str>) -> bool {
-    blocked_on == Some("human") && ask == Some("permission")
+pub(super) fn permission_blocked(
+    state: Option<&str>,
+    blocked_on: Option<&str>,
+    ask: Option<&str>,
+) -> bool {
+    state.is_some_and(|state| !matches!(state, "ended" | "indeterminate"))
+        && blocked_on == Some("human")
+        && ask == Some("permission")
 }
 
 pub(super) fn observation_time(claim: &ClaimRecord) -> u128 {
@@ -70,7 +76,7 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
                 if let Some(ask) = fields.get("ask") {
                     status.ask = ask.as_str();
                 }
-                status.harness = Some(if permission_blocked(status.blocked_on, status.ask) {
+                status.harness = Some(if permission_blocked(Some(state), status.blocked_on, status.ask) {
                     "blocked"
                 } else {
                     state

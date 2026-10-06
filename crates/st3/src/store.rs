@@ -18277,9 +18277,11 @@ fn publish_changed_harness_state_tx(
         let carried = |name: &str| fields.get(name).or_else(|| previous.get(name));
         claim.body["fields"]["state"] == fields["state"]
             && (seat_status::permission_blocked(
+                previous["state"].as_str(),
                 previous["blocked_on"].as_str(),
                 previous["ask"].as_str(),
             ) == seat_status::permission_blocked(
+                fields["state"].as_str(),
                 carried("blocked_on").and_then(Value::as_str),
                 carried("ask").and_then(Value::as_str),
             ))
@@ -20496,6 +20498,7 @@ fn current_harness_fold_at(
         && include_work_activity
         && key > runtime_key
         && !seat_status::permission_blocked(
+            current.as_ref().map(|(state, _, _, _)| state.as_str()),
             optional.get("blocked_on").and_then(|v| v.as_deref()),
             optional.get("ask").and_then(|v| v.as_deref()),
         )
@@ -20522,10 +20525,14 @@ fn current_harness_fold_at(
         return Ok(None);
     };
     if seat_status::permission_blocked(
+        Some(state.as_str()),
         optional.get("blocked_on").and_then(|v| v.as_deref()),
         optional.get("ask").and_then(|v| v.as_deref()),
     ) {
         state = "blocked".into();
+    } else if matches!(state.as_str(), "ended" | "indeterminate") {
+        optional.insert("blocked_on", None);
+        optional.insert("ask", None);
     }
     if optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
         if auth_restored {

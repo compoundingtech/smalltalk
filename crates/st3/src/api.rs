@@ -20587,11 +20587,15 @@ mission "agent-human" state="ready" {
         // The harness schema's terminal activity keeps precedence over a stale ask.
         observe_harness("ended");
         assert_eq!(agent()["state"], "failed");
+        assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["ask"].is_null());
         // Indeterminate activity keeps its existing waiting verdict; clients must not
         // present it as an answerable human ask.
         observe_harness("indeterminate");
         assert_eq!(agent()["state"], "waiting");
         assert_eq!(agent()["harness_state"], "indeterminate");
+        assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["ask"].is_null());
         observe_harness("working");
         observe_runtime("stopped");
         assert_eq!(agent()["state"], "stopped");
