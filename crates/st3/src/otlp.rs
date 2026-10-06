@@ -191,20 +191,23 @@ pub fn otlp_logs(node: &str, batch: &[ClaimRecord]) -> Value {
     let records = batch
         .iter()
         .flat_map(|observation| {
-            let fields = observation
-                .body
-                .get("fields")
-                .cloned()
-                .unwrap_or(Value::Null);
+            let fields = if observation.kind == "harness.timeline" {
+                st_drivers::capture_admission::sanitize_timeline_fields(
+                    observation.body.get("fields").unwrap_or(&Value::Null),
+                )
+            } else {
+                observation.body.get("fields").cloned().unwrap_or(Value::Null)
+            };
             let time = (observation.accepted_at_unix_ms * 1_000_000).to_string();
             let mut attributes = vec![
-                attribute("st3.subject", json!({ "stringValue": observation.subject })),
                 attribute("st3.kind", json!({ "stringValue": observation.kind })),
                 attribute(
                     "st3.local_id",
                     json!({ "intValue": local_observation_position(observation).unwrap_or(0).to_string() }),
                 ),
             ];
+            if observation.kind != "harness.timeline" {
+                attributes.push(attribute("st3.subject", json!({ "stringValue": observation.subject })));
             if let Some(actor) = &observation.actor {
                 attributes.push(attribute("st3.actor", json!({ "stringValue": actor })));
             }
@@ -213,6 +216,7 @@ pub fn otlp_logs(node: &str, batch: &[ClaimRecord]) -> Value {
                     "st3.incarnation_id",
                     json!({ "stringValue": incarnation }),
                 ));
+            }
             }
             let mut record = json!({
                 "timeUnixNano": time,
@@ -272,12 +276,17 @@ pub fn otlp_logs(node: &str, batch: &[ClaimRecord]) -> Value {
 /// One model response's spend, from the harness timeline entry st recorded for it.
 struct UsageResponse<'a> {
     observation: &'a ClaimRecord,
-    fields: &'a Value,
+    fields: Value,
 }
 
 impl<'a> UsageResponse<'a> {
     fn of(observation: &'a ClaimRecord) -> Option<Self> {
-        let fields = observation.body.get("fields")?;
+        if observation.kind != "harness.timeline" {
+            return None;
+        }
+        let fields = st_drivers::capture_admission::sanitize_timeline_fields(
+            observation.body.get("fields")?,
+        );
         (observation.kind == "harness.timeline"
             && fields["entry_type"] == "usage"
             && fields["body"]["semantics"] == "response")
@@ -287,7 +296,7 @@ impl<'a> UsageResponse<'a> {
             })
     }
 
-    fn text(&self, pointer: &str) -> &'a str {
+    fn text(&self, pointer: &str) -> &str {
         self.fields
             .pointer(pointer)
             .and_then(Value::as_str)
@@ -304,7 +313,7 @@ impl<'a> UsageResponse<'a> {
     }
 
     /// Bounded metric labels: no agent, step or run identity, which stay in the log record.
-    fn labels(&self) -> [(&'static str, &'a str); 4] {
+    fn labels(&self) -> [(&'static str, &str); 4] {
         [
             ("driver", self.text("/driver")),
             ("model", self.text("/body/model")),
@@ -320,8 +329,8 @@ impl<'a> UsageResponse<'a> {
         ("cache_write", "cache_write_tokens"),
     ];
 
-    /// `st.usage.response`: the response's attribution, tokens and cost as flat attributes, so a
-    /// log store can sum spend by agent, mission run, step, model and account.
+    /// Timeline telemetry exports only admitted counters and finite labels.
+    /// Provenance requires graph authority unavailable to this standalone serializer.
     fn log_record(&self) -> Value {
         let at = self.fields["observed_at_unix_ms"]
             .as_u64()
@@ -329,14 +338,7 @@ impl<'a> UsageResponse<'a> {
         let time = (at * 1_000_000).to_string();
         let string = |key: &str, value: &str| attribute(key, json!({ "stringValue": value }));
         let int = |key: &str, value: u64| attribute(key, json!({ "intValue": value.to_string() }));
-        let mut attributes = vec![
-            string("st.agent", &self.observation.subject),
-            string("st.mission_run", self.text("/attribution/mission_run_id")),
-            string("st.step", self.text("/attribution/step_id")),
-            string("st.incarnation_id", self.text("/incarnation_id")),
-            string("st.host", self.text("/host")),
-            string("st.pricing", self.text("/spend/pricing")),
-        ];
+        let mut attributes = Vec::new();
         for (name, value) in self.labels() {
             attributes.push(string(&format!("st.{name}"), value));
         }
@@ -565,12 +567,13 @@ mod tests {
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
     use std::sync::atomic::{AtomicU16, Ordering};
 
     #[derive(Clone, Default)]
     struct Collector {
         requests: Arc<Mutex<Vec<(HeaderMap, Value)>>>,
+        attempted_bodies: Arc<parking_lot::Mutex<Vec<Value>>>,
         status: Arc<AtomicU16>,
         metrics_status: Arc<AtomicU16>,
         traces_status: Arc<AtomicU16>,
@@ -582,6 +585,7 @@ mod tests {
         headers: HeaderMap,
         axum::Json(body): axum::Json<Value>,
     ) -> StatusCode {
+        collector.attempted_bodies.lock().push(body.clone());
         let signal_status = match uri.path() {
             "/v1/metrics" => collector.metrics_status.load(Ordering::SeqCst),
             "/v1/traces" => collector.traces_status.load(Ordering::SeqCst),
@@ -594,7 +598,7 @@ mod tests {
         })
         .unwrap_or(StatusCode::OK);
         if status.is_success() {
-            collector.requests.lock().unwrap().push((headers, body));
+            collector.requests.lock().push((headers, body));
         }
         status
     }
@@ -669,10 +673,7 @@ mod tests {
         );
         let attributes = record["attributes"].as_array().unwrap();
         for (key, value) in [
-            ("st3.subject", json!({"stringValue": "agent/node.worker"})),
             ("st3.kind", json!({"stringValue": "harness.timeline"})),
-            ("st3.actor", json!({"stringValue": "agent/node.worker"})),
-            ("st3.incarnation_id", json!({"stringValue": "inc-1"})),
             ("st3.local_id", json!({"intValue": "1"})),
         ] {
             assert!(
@@ -683,21 +684,15 @@ mod tests {
         let body = record["body"]["kvlistValue"]["values"].as_array().unwrap();
         assert!(body.contains(&json!({"key": "sequence", "value": {"intValue": "7"}})));
         assert!(body.contains(&json!({"key": "final", "value": {"boolValue": true}})));
-        assert!(body.contains(&json!({
-            "key": "body",
-            "value": {"kvlistValue": {"values": [
-                {"key": "media_type", "value": {"stringValue": "text/plain"}},
-                {"key": "text", "value": {"stringValue": "entry 7"}}
-            ]}}
-        })));
+        assert!(!request.to_string().contains("entry 7"));
     }
 
     #[tokio::test]
-    async fn each_model_response_exports_its_spend_as_a_log_and_bounded_counters() {
+    async fn model_response_exports_only_admitted_counters_and_withholds_labels() {
         let (collector, endpoint) = start_collector().await;
         let store = Arc::new(Store::open_memory("node-a").unwrap());
         let respond = |entry: u64, account: Option<&str>| {
-            let mut body = json!({"semantics": "response", "model": "claude-opus-5-5",
+            let mut body = json!({"policy_version":1,"semantics": "response", "model": "claude-opus-5-5",
                 "input_tokens": 1000, "output_tokens": 100, "cached_tokens": 10000,
                 "cache_write_tokens": 0, "total_tokens": 11100});
             if let Some(account) = account {
@@ -709,6 +704,7 @@ mod tests {
                     kind: "harness.timeline".into(),
                     actor: Some("agent/node.worker".into()),
                     fields: BTreeMap::from([
+                        ("policy_version".into(), json!(1)),
                         ("operation".into(), json!("append")),
                         ("entry_id".into(), json!(format!("usage-{entry}"))),
                         ("source_id".into(), json!(format!("source-{entry}"))),
@@ -743,7 +739,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exporter.export_once(&store).await.unwrap().exported, 3);
-        let requests = collector.requests.lock().unwrap();
+        let requests = collector.requests.lock();
         let usage = records(&requests[0].1)
             .into_iter()
             .filter(|record| record["eventName"] == "st.usage.response")
@@ -751,18 +747,10 @@ mod tests {
         assert_eq!(usage.len(), 3);
         assert_eq!(usage[0]["timeUnixNano"], "1700000000001000000");
         let attributes = usage[0]["attributes"].as_array().unwrap();
-        // Opus 5.5: $4 input, $20 output and $0.20 cache reads per million tokens.
         for (key, value) in [
-            ("st.agent", json!({"stringValue": "agent/node.worker"})),
-            ("st.model", json!({"stringValue": "claude-opus-5-5"})),
-            (
-                "st.account",
-                json!({"stringValue": "claude/aaaaaaaaaaaaaaaa"}),
-            ),
-            ("st.basis", json!({"stringValue": "estimated"})),
-            ("st.step", json!({"stringValue": "unknown"})),
+            ("st.model", json!({"stringValue": "unknown"})),
+            ("st.account", json!({"stringValue": "unknown"})),
             ("st.tokens.cache_read", json!({"intValue": "10000"})),
-            ("st.cost.microusd", json!({"intValue": "8000"})),
         ] {
             assert!(
                 attributes.contains(&json!({"key": key, "value": value})),
@@ -781,8 +769,12 @@ mod tests {
             .find(|metric| metric["name"] == "st_usage_cost_microusd_total")
             .unwrap();
         let points = cost["sum"]["dataPoints"].as_array().unwrap();
-        assert_eq!(points.len(), 2, "one point per account: {points:#?}");
-        assert!(points.iter().any(|point| point["asInt"] == "16000"));
+        assert_eq!(points.len(), 1, "withheld account labels cannot create distinct series");
+        for (_, body) in requests.iter() {
+            let exported = serde_json::to_string(body).unwrap();
+            assert!(!exported.contains("claude/aaaaaaaaaaaaaaaa"));
+            assert!(!exported.contains("claude-opus-5-5"));
+        }
         let labels = points[0]["attributes"]
             .as_array()
             .unwrap()
@@ -823,7 +815,7 @@ mod tests {
         );
         assert_eq!(store.otlp_export_cursor().unwrap(), 3);
         {
-            let requests = collector.requests.lock().unwrap();
+            let requests = collector.requests.lock();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].0["x-api-key"], "example-key");
             assert_eq!(records(&requests[0].1).len(), 3);
@@ -858,7 +850,7 @@ mod tests {
             }
         );
         assert_eq!(store.otlp_export_cursor().unwrap(), 6);
-        assert_eq!(collector.requests.lock().unwrap().len(), 3);
+        assert_eq!(collector.requests.lock().len(), 3);
     }
 
     fn observe_hook(store: &Store, event: &str) {
@@ -909,7 +901,7 @@ mod tests {
         assert_eq!(exporter.export_once(&store).await.unwrap().exported, 1);
         assert_eq!(store.otlp_export_cursor().unwrap(), 1);
         assert_eq!(exporter.export_once(&store).await.unwrap().exported, 0);
-        let requests = collector.requests.lock().unwrap();
+        let requests = collector.requests.lock();
         assert_eq!(
             requests.len(),
             6,
@@ -969,6 +961,49 @@ mod tests {
             records(&otlp_logs("node-a", &batch))[1]["severityText"],
             "WARN"
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_capture_credentials_never_reach_logs_or_failed_export_retries() {
+        const FAKE: &str = "invented-otlp-credential-1449";
+        let (collector, endpoint) = start_collector().await;
+        let store = Arc::new(Store::open_memory("capture-otlp").unwrap());
+        observe(&store,1);
+        let mut legacy = store.local_observations_after(0,10).unwrap();
+        legacy[0].subject = FAKE.into();
+        legacy[0].actor = Some(FAKE.into());
+        legacy[0].body["fields"]["body"] = json!({
+            "policy_version":1,"text":FAKE,"Authorization":format!("Bearer {FAKE}"),
+            "producer_safe":true,"encoded":"aW52ZW50ZWQtY3JlZGVudGlhbA==",
+        });
+        legacy[0].body["fields"]["source_id"] = json!(FAKE);
+        let logs = otlp_logs("capture-otlp",&legacy).to_string();
+        assert!(!logs.contains(FAKE));
+        assert!(!logs.contains("aW52ZW50ZWQtY3JlZGVudGlhbA=="));
+        let mut usage = legacy[0].clone();
+        usage.body["fields"]["entry_type"] = json!("usage");
+        usage.body["fields"]["body"] = json!({
+            "policy_version":1,"semantics":"response","model":FAKE,"account":FAKE,"total_tokens":7,
+        });
+        assert!(!otlp_logs("capture-otlp",&[usage]).to_string().contains(FAKE));
+        store.connection.write().execute(
+            "UPDATE local_observations SET body=?1", [legacy[0].body.to_string()],
+        ).unwrap();
+        let exporter = OtlpExporter::new(&OtlpConfig {
+            endpoint,headers_file:None,
+        },"capture-otlp").unwrap();
+        collector.status.store(503,Ordering::SeqCst);
+        assert!(exporter.export_once(&store).await.is_err());
+        assert_eq!(store.otlp_export_cursor().unwrap(),0);
+        collector.status.store(200,Ordering::SeqCst);
+        assert_eq!(exporter.export_once(&store).await.unwrap().exported,1);
+        assert_eq!(store.otlp_export_cursor().unwrap(),1);
+        let attempts = collector.attempted_bodies.lock();
+        assert_eq!(attempts.len(),2);
+        assert_eq!(attempts[0],attempts[1]);
+        assert!(!serde_json::to_string(&*attempts).unwrap().contains(FAKE));
+        assert!(!serde_json::to_string(&*attempts).unwrap()
+            .contains(&hex::encode(Sha256::digest(FAKE.as_bytes()))));
     }
 
     #[test]

@@ -8967,6 +8967,10 @@ impl Store {
         publication: &crate::harness_events::Publication,
     ) -> Result<(ClaimRecord, bool), St3Error> {
         let mut input = publication.claim.clone();
+        validate_timeline_envelope_presence(&input)?;
+        if let Some(admitted) = admitted_timeline_input(&input) {
+            input = admitted;
+        }
         if publication.sequence == 0
             || publication.runtime_incarnation.is_empty()
             || !matches!(
@@ -9029,6 +9033,25 @@ impl Store {
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
         self.graph.append_claim_outcome(input)
+    }
+
+    pub fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        self.graph.claim_by_id(id)?.map(|claim| admit_timeline_record_with_context(claim,&connection))
+            .transpose().map_err(Into::into)
+    }
+
+    pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        self.graph.latest_claim(subject, kind)?.map(|claim| admit_timeline_record_with_context(claim,&connection))
+            .transpose().map_err(Into::into)
+    }
+
+    pub fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>> {
+        let connection = self.readers.get();
+        self.graph.claims_for(subject, kind)?.into_iter()
+            .map(|claim| admit_timeline_record_with_context(claim,&connection))
+            .collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -9117,6 +9140,9 @@ impl Store {
         &self,
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
+        validate_timeline_envelope_presence(input)?;
+        let admitted = admitted_timeline_input(input);
+        let input = admitted.as_ref().unwrap_or(input);
         st3_schema::registry()
             .validate_public_claim(
                 &input.subject,
@@ -9247,7 +9273,7 @@ impl Store {
         ))?;
         let rows = statement.query_map(
             params![after as i64, limit.min(i64::MAX as usize) as i64],
-            |row| local_observation_from_row(&self.origin, row),
+            |row| admit_timeline_record_with_context(raw_local_observation_from_row(&self.origin,row)?,&connection),
         )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -9301,7 +9327,7 @@ impl Store {
             "SELECT * FROM ({LOCAL_OBSERVATION_COLUMNS} ORDER BY id DESC LIMIT ?1) ORDER BY id"
         ))?;
         let rows = statement.query_map([limit.min(i64::MAX as usize) as i64], |row| {
-            local_observation_from_row(&self.origin, row)
+            admit_timeline_record_with_context(raw_local_observation_from_row(&self.origin,row)?,&connection)
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -9379,7 +9405,7 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .optional()?
-            .map(|response| serde_json::from_str(&response).map_err(anyhow::Error::from))
+            .map(|response| serde_json::from_str(&response).map(admit_timeline_record).map_err(anyhow::Error::from))
             .transpose()
     }
 
@@ -11407,7 +11433,7 @@ impl Store {
             "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id"
         ))?;
         let rows = statement.query_map(params![subject, kind], |row| {
-            local_observation_from_row(&self.origin, row)
+            admit_timeline_record_with_context(raw_local_observation_from_row(&self.origin,row)?,&connection)
         })?;
         records.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
         records.sort_by_key(claim_log_order);
@@ -11426,7 +11452,7 @@ impl Store {
                         "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id DESC LIMIT 1"
                     ),
                     params![subject, kind],
-                    |row| local_observation_from_row(&self.origin, row),
+                    |row| admit_timeline_record_with_context(raw_local_observation_from_row(&self.origin,row)?,&connection),
                 )
                 .optional()?
         };
@@ -14240,7 +14266,7 @@ impl Store {
                     before_index,
                     limit.saturating_add(1) as u64
                 ],
-                |row| local_observation_from_row(&self.origin, row),
+                |row| admit_timeline_record_with_context(raw_local_observation_from_row(&self.origin,row)?,&connection),
             )?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
@@ -14324,6 +14350,10 @@ impl Store {
                  AND json_extract(body, '$.fields.incarnation_id')=?2
                  AND json_extract(body, '$.fields.operation')='append'
                  AND json_extract(body, '$.fields.entry_type')='truncation'
+                 AND json_type(body, '$.fields.policy_version')='integer'
+                 AND json_type(body, '$.fields.body.policy_version')='integer'
+                 AND json_extract(body, '$.fields.policy_version')=?4
+                 AND json_extract(body, '$.fields.body.policy_version')=?4
                  AND (?3 IS NULL OR store_index<?3)
              UNION ALL
              SELECT body -> '$.fields.body.omitted_from_sequence',
@@ -14333,9 +14363,13 @@ impl Store {
                  AND json_extract(body, '$.fields.incarnation_id')=?2
                  AND json_extract(body, '$.fields.operation')='append'
                  AND json_extract(body, '$.fields.entry_type')='truncation'
+                 AND json_type(body, '$.fields.policy_version')='integer'
+                 AND json_type(body, '$.fields.body.policy_version')='integer'
+                 AND json_extract(body, '$.fields.policy_version')=?4
+                 AND json_extract(body, '$.fields.body.policy_version')=?4
                  AND (?3 IS NULL OR after_store_index<?3)",
         )?;
-        let rows = statement.query_map(params![subject, incarnation, before_index], |row| {
+        let rows = statement.query_map(params![subject, incarnation, before_index,st_drivers::capture_admission::POLICY_VERSION], |row| {
             Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
         let mut intervals = Vec::new();
@@ -17559,6 +17593,122 @@ const LOCAL_OBSERVATION_COLUMNS: &str = "SELECT id, after_store_index, subject, 
 
 const LOCAL_OBSERVATION_ID_PREFIX: &str = "local-observation/";
 
+/// Capture metadata is re-admitted at the daemon, never trusted from a producer's
+/// coverage flags. Hashes and retry keys below are derived only from this result.
+fn admitted_timeline_input(input: &ClaimInput) -> Option<ClaimInput> {
+    if input.kind != "harness.timeline" {
+        return None;
+    }
+    let fields = st_drivers::capture_admission::sanitize_timeline_fields(&json!(input.fields));
+    let mut admitted = input.clone();
+    admitted.fields = serde_json::from_value(fields).expect("timeline admission returns an object");
+    admitted.evidence.clear();
+    admitted.idempotency_key = input.idempotency_key.as_ref().map(|_| format!(
+        "capture-v1:{}:{}:{}:{}:{}",
+        input.subject,
+        admitted.fields["incarnation_id"],
+        admitted.fields["entry_id"],
+        admitted.fields["revision"],
+        admitted.fields["operation"],
+    ));
+    Some(admitted)
+}
+
+fn admitted_timeline_body(body: &Value) -> Value {
+    json!({
+        "fields": st_drivers::capture_admission::sanitize_timeline_fields(
+            body.get("fields").unwrap_or(body),
+        ),
+        "evidence": [],
+    })
+}
+
+fn admit_timeline_record(mut record: ClaimRecord) -> ClaimRecord {
+    if record.kind == "harness.timeline" {
+        let safe_record = check_timeline_replication_claim(&record).is_ok();
+        record.body = admitted_timeline_body(&record.body);
+        // Legacy IDs/digests were computed from rejected bytes. Do not export them.
+        if !safe_record && local_observation_position(&record).is_none() {
+            record.id = format!("admitted-timeline/{}", record.store_index);
+            record.batch_id.clear();
+        }
+        record.operation_id = None;
+        record.request_digest = None;
+        record.predecessors.clear();
+    }
+    record
+}
+
+fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
+    smallclaims::store::claim_from_row(row).map(admit_timeline_record)
+}
+
+fn check_timeline_replication_claim(claim: &ClaimRecord) -> Result<(), St3Error> {
+    if claim.kind == "harness.timeline"
+        && (claim.body.get("fields").and_then(|fields| fields["policy_version"].as_u64())
+            != Some(st_drivers::capture_admission::POLICY_VERSION)
+            || admitted_timeline_body(&claim.body) != claim.body)
+    {
+        return Err(St3Error::new("capture-withheld", "timeline replication admission failed"));
+    }
+    Ok(())
+}
+
+fn validate_timeline_envelope_presence(input: &ClaimInput) -> Result<(), St3Error> {
+    if input.kind == "harness.timeline" {
+        for key in ["operation","entry_id","revision","role","entry_type","final","body","driver","incarnation_id","sequence"] {
+            if !input.fields.contains_key(key) {
+                return Err(St3Error::new("missing-claim-field",format!("a timeline observation requires {key}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn admit_timeline_record_with_context(record: ClaimRecord, connection: &Connection) -> rusqlite::Result<ClaimRecord> {
+    if record.kind != "harness.timeline" {
+        return Ok(record);
+    }
+    let fields = record.body.get("fields").unwrap_or(&record.body);
+    let mut trusted_context = Value::Null;
+    if fields["policy_version"].as_u64() == Some(st_drivers::capture_admission::POLICY_VERSION)
+        && fields["body"]["policy_version"].as_u64() == Some(st_drivers::capture_admission::POLICY_VERSION)
+        && fields["entry_type"] == "usage" && fields["body"]["semantics"] == "response"
+    {
+        // Hints are not authority: recover their exact tuple from the graph-derived
+        // spend ledger written by this daemon at original capture.
+        let attribution = &fields["attribution"];
+        let run = attribution["mission_run_id"].as_str().unwrap_or("");
+        let step = attribution["step_id"].as_str().unwrap_or("");
+        let context = connection.query_row(
+            "SELECT owner_run, owner_step, host FROM local_usage_spend
+             WHERE subject=?1 AND incarnation_id=?2 AND model='unknown' AND account=''
+               AND owner_run=?3 AND owner_step=?4 AND host=?5",
+            params![record.subject, fields["incarnation_id"].as_str().unwrap_or(""),
+                run, step, fields["host"].as_str().unwrap_or("")],
+            |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)),
+        ).optional()?;
+        if let Some((run,step,host)) = context {
+            let generation: Option<String> = connection.query_row(
+                "SELECT 'run-generation/' || generation_id FROM step_runs WHERE subject=?1",
+                [&step], |row|row.get(0),
+            ).optional()?;
+            trusted_context = json!({
+                "attribution":{"agent_id":record.subject,
+                    "mission_run_id":(!run.is_empty()).then_some(run),
+                    "generation_id":generation,"step_id":(!step.is_empty()).then_some(step)},
+                "host":host,
+            });
+        }
+    }
+    let body = json!({"fields":st_drivers::capture_admission::sanitize_timeline_fields_with_context(
+        fields,&trusted_context,
+    ),"evidence":[]});
+    let mut admitted = admit_timeline_record(record);
+    admitted.body = body;
+    Ok(admitted)
+}
+
 fn local_retention(kind: &str) -> bool {
     st3_schema::registry()
         .claim(kind)
@@ -17636,6 +17786,8 @@ fn insert_local_observation_tx(
     input: &ClaimInput,
     observed_at: u128,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    let admitted = admitted_timeline_input(input);
+    let input = admitted.as_ref().unwrap_or(input);
     let mut body = json!({
         "fields": &input.fields,
         "evidence": input.evidence,
@@ -17653,7 +17805,7 @@ fn insert_local_observation_tx(
                 [key],
                 |row| {
                     Ok((
-                        local_observation_from_row(origin, row)?,
+                        admit_timeline_record_with_context(raw_local_observation_from_row(origin,row)?,transaction)?,
                         row.get::<_, Option<String>>(7)?,
                     ))
                 },
@@ -17663,12 +17815,16 @@ fn insert_local_observation_tx(
     {
         // A retry must repeat the original request exactly, as for a claim.
         if stored_digest != request_digest {
-            return Err(St3Error::new(
+            let error = St3Error::new(
                 "idempotency-mismatch",
                 "the idempotency key already identifies a different request",
-            )
-            .with_detail("stored_digest", json!(stored_digest))
-            .with_detail("request_digest", json!(request_digest)));
+            );
+            return Err(if input.kind == "harness.timeline" {
+                error
+            } else {
+                error.with_detail("stored_digest", json!(stored_digest))
+                    .with_detail("request_digest", json!(request_digest))
+            });
         }
         return Ok((existing, false));
     }
@@ -17936,6 +18092,16 @@ fn insert_local_observation_tx(
                 )
                 .map_err(internal)?;
         }
+    }
+    if input.kind == "harness.timeline" {
+        let trusted_context = if body["fields"].get("attribution").is_some() {
+            json!({"attribution":body["fields"]["attribution"],"host":body["fields"]["host"]})
+        } else {
+            Value::Null
+        };
+        body = json!({"fields":st_drivers::capture_admission::sanitize_timeline_fields_with_context(
+            &body["fields"],&trusted_context,
+        ),"evidence":[]});
     }
     smallclaims::touched::note_wrote(|| format!("{} {}", input.kind, input.subject));
     transaction
@@ -18453,6 +18619,13 @@ fn local_observation_dedupe_key(kind: &str, key: &str) -> String {
 }
 
 fn local_observation_from_row(
+    origin: &str,
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ClaimRecord> {
+    raw_local_observation_from_row(origin,row).map(admit_timeline_record)
+}
+
+fn raw_local_observation_from_row(
     origin: &str,
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<ClaimRecord> {
@@ -19117,6 +19290,8 @@ fn append_claim_tx(
     predecessors: &[String],
     forced_batch: Option<&str>,
 ) -> Result<ClaimRecord> {
+    let admitted_body = (kind == "harness.timeline").then(|| admitted_timeline_body(body));
+    let body = admitted_body.as_ref().unwrap_or(body);
     if matches!(kind, "intent.desired" | "mission.published") {
         owned_sets::refuse_unmanaged(transaction, subject).map_err(anyhow::Error::new)?;
     }
@@ -24163,6 +24338,7 @@ fn classify_replicated_claim_with_registry(
     claim: &ClaimRecord,
     registry: &st3_schema::Registry,
 ) -> Result<ReplicatedClaimAdmission, St3Error> {
+    check_timeline_replication_claim(claim)?;
     if !registry.claims.contains_key(&claim.kind) && !st3_schema::is_custom_claim_kind(&claim.kind)
     {
         return Ok(ReplicatedClaimAdmission::UnknownKind);
@@ -41898,25 +42074,45 @@ mission "nested-work" state="ready" {
         );
     }
 
+    fn timeline_fixture_sequence(entry: &str) -> u64 {
+        const IDS: &[&str] = &[
+            "idle","answer","working","first","second","third","fourth","fifth","sixth",
+            "turn-a","turn-b","price-short","price-long","price-reported","after-resume",
+            "response-a","response-b","response-c","response-d","during","before",
+            "counted-before","too-old","recent","legacy-1","legacy-2","legacy-3",
+            "local-1","local-2","local-3","other-incarnation","later",
+        ];
+        if let Some(index) = entry.strip_prefix("entry-").and_then(|index|index.parse::<u64>().ok()) {
+            return 1_000 + index;
+        }
+        IDS.iter().position(|id|*id == entry).expect("registered timeline fixture") as u64 + 1
+    }
+
+    fn timeline_fixture_id(entry: &str) -> String {
+        format!("native/{}",timeline_fixture_sequence(entry))
+    }
+
     fn timeline_observation(subject: &str, incarnation: &str, entry: &str) -> ClaimInput {
         ClaimInput {
             subject: subject.into(),
             kind: "harness.timeline".into(),
             actor: Some(subject.into()),
             fields: BTreeMap::from([
+                ("policy_version".into(), json!(1)),
                 ("operation".into(), Value::String("append".into())),
-                ("entry_id".into(), Value::String(entry.into())),
+                ("entry_id".into(), json!(timeline_fixture_id(entry))),
+                ("source_id".into(), json!(timeline_fixture_id(entry))),
                 ("revision".into(), Value::from(1)),
                 ("role".into(), Value::String("assistant".into())),
                 ("entry_type".into(), Value::String("content".into())),
                 ("final".into(), Value::Bool(true)),
                 (
                     "body".into(),
-                    json!({"media_type": "text/plain", "text": entry}),
+                    json!({"policy_version":1,"media_type": "text/plain", "text": entry}),
                 ),
                 ("driver".into(), Value::String("codex".into())),
                 ("incarnation_id".into(), Value::String(incarnation.into())),
-                ("sequence".into(), Value::from(entry.len() as u64)),
+                ("sequence".into(), json!(timeline_fixture_sequence(entry))),
             ]),
             evidence: Vec::new(),
             expected_subject: None,
@@ -42044,21 +42240,19 @@ mission "nested-work" state="ready" {
         let mut changed = timeline_observation(subject, "inc-1", "second");
         changed.fields.insert(
             "body".into(),
-            json!({"media_type": "text/plain", "text": "a different body"}),
+            json!({"policy_version":1,"media_type": "text/plain", "text": "a different body"}),
         );
-        assert_eq!(
-            store.append_claim_outcome(&changed).unwrap_err().code,
-            "idempotency-mismatch",
-            "a retry with a changed body is not silently dropped"
-        );
+        let (same, appended) = store.append_claim_outcome(&changed).unwrap();
+        assert!(!appended, "different withheld prose is the same admitted retry");
+        assert_eq!(same.id,written[1].id);
+        changed.fields.insert("role".into(),json!("system"));
+        assert_eq!(store.append_claim_outcome(&changed).unwrap_err().code,"idempotency-mismatch");
         let mut elsewhere = timeline_observation("agent/node.other", "inc-1", "second");
         elsewhere.idempotency_key =
             timeline_observation(subject, "inc-1", "second").idempotency_key;
-        assert_eq!(
-            store.append_claim_outcome(&elsewhere).unwrap_err().code,
-            "idempotency-mismatch",
-            "a key reused for another subject does not return the first subject's row"
-        );
+        let elsewhere = store.append_claim_outcome(&elsewhere).unwrap().0;
+        assert_eq!(elsewhere.subject,"agent/node.other");
+        assert_ne!(elsewhere.id,written[1].id);
         let mut unkeyed = timeline_observation(subject, "inc-1", "second");
         unkeyed.idempotency_key = None;
         assert!(
@@ -42083,7 +42277,7 @@ mission "nested-work" state="ready" {
             .unwrap();
         assert_eq!(
             timeline_entries(&page),
-            ["first", "second", "third", "second"]
+            ["first", "second", "third", "second"].map(timeline_fixture_id)
         );
         assert_eq!(page.next_cursor, None);
 
@@ -42106,7 +42300,7 @@ mission "nested-work" state="ready" {
             .unwrap();
         assert_eq!(
             timeline_entries(&page),
-            ["first", "second", "third", "second"]
+            ["first", "second", "third", "second"].map(timeline_fixture_id)
         );
         let mut with_head = timeline_observation(subject, "inc-1", "fourth");
         with_head.expected_subject = Some(None);
@@ -42166,7 +42360,7 @@ mission "nested-work" state="ready" {
             claim.fields.insert(
                 "body".into(),
                 json!({
-                    "semantics": "response", "model": "claude-example", "turn_id": entry,
+                    "policy_version":1,"semantics": "response", "model": "claude-example", "turn_id": entry,
                     "input_tokens": input, "output_tokens": output,
                     "cached_tokens": reads, "cache_write_tokens": writes,
                     "total_tokens": input + output + reads + writes,
@@ -42207,7 +42401,7 @@ mission "nested-work" state="ready" {
         let mut second = record("turn-b", 5, 1, 30, 0);
         second
             .fields
-            .insert("source_id".into(), Value::String("same-response".into()));
+            .insert("source_id".into(), json!(timeline_fixture_id("turn-b")));
         let (observation, appended) = local.append_claim_outcome(&second).unwrap();
         assert!(appended);
         let rollup = local
@@ -42292,7 +42486,7 @@ mission "nested-work" state="ready" {
             let mut claim = timeline_observation(subject, incarnation, entry);
             claim.fields.insert("driver".into(), json!("codex"));
             claim.fields.insert("entry_type".into(), json!("usage"));
-            let mut body = json!({"semantics":"response", "model":"gpt-6.1-sol",
+            let mut body = json!({"policy_version":1,"semantics":"response", "model":"gpt-6.1-sol",
                 "input_tokens":input,"output_tokens":100,"total_tokens":input+100});
             if reported {
                 body["cost"] = json!(0.001);
@@ -42314,8 +42508,8 @@ mission "nested-work" state="ready" {
             provenance["price_table_version"],
             crate::pricing::price_table_version()
         );
-        assert_eq!(provenance["cost_source"], "computed");
-        assert_eq!(provenance["rates_usd_per_million_tokens"]["input"], 2.0);
+        assert_eq!(provenance["cost_source"], "unpriced");
+        assert!(provenance["rates_usd_per_million_tokens"].is_null());
         assert_eq!(baseline.fields["native_session_id"], "native-example");
         let since = baseline.fields["observed_at_unix_ms"].as_u64().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -42323,19 +42517,7 @@ mission "nested-work" state="ready" {
         let (_, _, mixed) = respond("inc-one", "price-reported", 10, true);
         assert_eq!(
             mixed.fields["pricing_provenance"].as_array().unwrap().len(),
-            3
-        );
-        let computed = mixed.fields["pricing_provenance"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|p| p["cost_source"] == "computed")
-            .collect::<Vec<_>>();
-        assert!(
-            computed
-                .iter()
-                .any(|p| p["rates_usd_per_million_tokens"]["input"] == 4.0
-                    && p["rates_usd_per_million_tokens"]["output"] == 15.0)
+            2
         );
         let reported = mixed.fields["pricing_provenance"]
             .as_array()
@@ -42497,7 +42679,7 @@ mission "nested-work" state="ready" {
     }
 
     #[test]
-    fn response_spend_is_priced_and_kept_apart_by_account_and_step() {
+    fn response_spend_preserves_graph_steps_and_withholds_uncovered_account_and_model() {
         let local = Store::open_memory("host-one").unwrap();
         let subject = "agent/example.worker";
         let observed = |state: &str, key: &str| {
@@ -42525,7 +42707,7 @@ mission "nested-work" state="ready" {
                 params![subject, seed.id, step],
             ).unwrap();
         };
-        let respond = |entry: &str, body: Value| {
+        let respond = |entry: &str, mut body: Value| {
             let mut claim = timeline_observation(subject, "inc-one", entry);
             claim
                 .fields
@@ -42536,6 +42718,7 @@ mission "nested-work" state="ready" {
             claim
                 .fields
                 .insert("driver".into(), Value::String("claude".into()));
+            body["policy_version"] = json!(1);
             claim.fields.insert("body".into(), body);
             let (observation, appended) = local.append_claim_outcome(&claim).unwrap();
             assert!(appended);
@@ -42554,12 +42737,10 @@ mission "nested-work" state="ready" {
         let start = now_ms() as u64;
         own_step("step-run/example/build");
         let build = respond("response-a", opus("claude/aaaaaaaaaaaaaaaa"));
-        // $4 input, $20 output, $0.20 cache read, $5 and $8 for five-minute and one-hour writes.
-        assert_eq!(
-            build.fields["cost_microusd"],
-            4_000 + 2_000 + 2_000 + 5_000 + 8_000
-        );
-        assert_eq!(build.fields["account"], "claude/aaaaaaaaaaaaaaaa");
+        assert_eq!(build.fields["cost_microusd"],0);
+        assert_eq!(build.fields["unpriced_tokens"],13100);
+        assert!(build.fields.get("account").is_none());
+        assert_eq!(build.fields["model"],"unknown");
         assert_eq!(build.fields["pricing"], crate::pricing::PRICING_REVISION);
         own_step("step-run/example/review");
         respond("response-b", opus("claude/bbbbbbbbbbbbbbbb"));
@@ -42575,50 +42756,35 @@ mission "nested-work" state="ready" {
         // Each key replicates even while the harness keeps working: a step change must not
         // leave the previous step's last totals pending behind the next step's.
         let replicated = local.claims_for(subject, Some("harness.usage")).unwrap();
-        assert_eq!(replicated.len(), 3, "{replicated:#?}");
-        // The local model's second response waits for the next interval, or for the harness
-        // to stop working.
+        assert_eq!(replicated.len(), 2, "{replicated:#?}");
+        // Further responses for the same authoritative step wait for the cadence.
         observed("ready", "spend-idle");
         assert_eq!(
             local
                 .claims_for(subject, Some("harness.usage"))
                 .unwrap()
                 .len(),
-            4
+            3
         );
 
         let rows = local
             .usage_period_rows(start.saturating_sub(1), now_ms() as u64 + 1)
             .unwrap();
-        let row = |step: &str, account: &str, model: &str| {
-            rows.iter()
-                .find(|row| {
-                    row["step"] == step && row["account"] == account && row["model"] == model
-                })
-                .unwrap_or_else(|| panic!("{step} {account} {model}: {rows:#?}"))
-        };
-        let build = row(
-            "step-run/example/build",
-            "claude/aaaaaaaaaaaaaaaa",
-            "claude-opus-5-5",
-        );
-        assert_eq!(build["cost_microusd"], 21_000);
-        assert_eq!(build["unpriced_tokens"], 0);
-        let review = row(
-            "step-run/example/review",
-            "claude/bbbbbbbbbbbbbbbb",
-            "claude-opus-5-5",
-        );
-        assert_eq!(review["cost_microusd"], 21_000);
-        assert_eq!(review["mission_run"], "mission-run/example");
-        let local_model = row("step-run/example/review", "", "local-example");
-        assert_eq!(local_model["total_tokens"], 87);
-        assert_eq!(
-            local_model["unpriced_tokens"], 77,
-            "an unpriced response is never free"
-        );
-        assert_eq!(local_model["cost_microusd"], 2_500);
-        assert_eq!(local_model["reported_cost_microusd"], 2_500);
+        assert_eq!(rows.len(),2);
+        let row = |step: &str| rows.iter().find(|row|row["step"] == step).unwrap();
+        let build = row("step-run/example/build");
+        assert_eq!(build["cost_microusd"],0);
+        assert_eq!(build["unpriced_tokens"],13100);
+        let review = row("step-run/example/review");
+        assert_eq!(review["mission_run"],"mission-run/example");
+        assert_eq!(review["total_tokens"],13187);
+        assert_eq!(review["unpriced_tokens"],13177);
+        assert_eq!(review["cost_microusd"],2500);
+        assert_eq!(review["reported_cost_microusd"],2500);
+        let exported = json!(rows).to_string();
+        assert!(!exported.contains("claude/aaaaaaaaaaaaaaaa"));
+        assert!(!exported.contains("claude/bbbbbbbbbbbbbbbb"));
+        assert!(!exported.contains("claude-opus-5-5"));
     }
 
     #[test]
@@ -42651,7 +42817,7 @@ mission "nested-work" state="ready" {
                 .insert("observed_at_unix_ms".into(), Value::from(at));
             claim.fields.insert(
                 "body".into(),
-                json!({"semantics": "response", "model": "claude-opus-5-5", "input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
+                json!({"policy_version":1,"semantics": "response", "model": "claude-opus-5-5", "input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
             );
             store.append_claim_outcome(&claim).unwrap().0.body["fields"]["attribution"].clone()
         };
@@ -42670,16 +42836,14 @@ mission "nested-work" state="ready" {
         {
             let store = Store::open(&path, "host-one").unwrap();
             // An older build kept every counted response forever, without a date.
-            store
-                .connection
-                .lock()
-                .unwrap()
-                .execute_batch(
-                    "CREATE TABLE local_usage_seen (subject TEXT NOT NULL, source_id TEXT NOT NULL,
-                        PRIMARY KEY(subject, source_id));
-                     INSERT INTO local_usage_seen VALUES ('agent/example.worker', 'counted-before');",
-                )
-                .unwrap();
+            let connection = store.connection.write();
+            connection.execute_batch(
+                "CREATE TABLE local_usage_seen (subject TEXT NOT NULL, source_id TEXT NOT NULL,
+                 PRIMARY KEY(subject,source_id));",
+            ).unwrap();
+            connection.execute("INSERT INTO local_usage_seen VALUES (?1,?2)",
+                params!["agent/example.worker",timeline_fixture_id("counted-before")],
+            ).unwrap();
         }
         let store = Store::open(&path, "host-one").unwrap();
         let subject = "agent/example.worker";
@@ -42690,13 +42854,13 @@ mission "nested-work" state="ready" {
                 .insert("entry_type".into(), Value::String("usage".into()));
             claim
                 .fields
-                .insert("source_id".into(), Value::String(entry.into()));
+                .insert("source_id".into(),json!(timeline_fixture_id(entry)));
             claim
                 .fields
                 .insert("observed_at_unix_ms".into(), Value::from(at as u64));
             claim.fields.insert(
                 "body".into(),
-                json!({"semantics": "response", "model": "claude-opus-5-5", "input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
+                json!({"policy_version":1,"semantics": "response", "model": "claude-opus-5-5", "input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
             );
             store.append_claim_outcome(&claim).unwrap();
         };
@@ -42726,7 +42890,7 @@ mission "nested-work" state="ready" {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(remembered, ["counted-before"]);
+        assert_eq!(remembered,[timeline_fixture_id("counted-before")]);
     }
 
     #[test]
@@ -42772,14 +42936,12 @@ mission "nested-work" state="ready" {
             .unwrap();
         assert_eq!(
             timeline_entries(&ascending),
-            [
-                "legacy-1", "legacy-2", "local-1", "legacy-3", "local-2", "local-3"
-            ]
+            ["legacy-1","legacy-2","local-1","legacy-3","local-2","local-3"].map(timeline_fixture_id)
         );
         let newest = store
             .timeline_claims_for_incarnation_at(subject, "inc-1", None, true, 2)
             .unwrap();
-        assert_eq!(timeline_entries(&newest), ["local-3", "local-2"]);
+        assert_eq!(timeline_entries(&newest), ["local-3","local-2"].map(timeline_fixture_id));
         assert!(newest.next_cursor.is_some());
         let legacy_three = ascending.claims[3].store_index;
         let before = store
@@ -42787,7 +42949,7 @@ mission "nested-work" state="ready" {
             .unwrap();
         assert_eq!(
             timeline_entries(&before),
-            ["local-1", "legacy-2", "legacy-1"],
+            ["local-1","legacy-2","legacy-1"].map(timeline_fixture_id),
             "a snapshot before a claim excludes the local observations written after it"
         );
         assert_eq!(
@@ -48731,6 +48893,9 @@ impl Store {
                 "the configured relay label does not match the batch label",
             ));
         }
+        for batch in &input.batches {
+            self.smalltalk.check_replication_batch(batch)?;
+        }
         for (hash, bytes) in &input.blobs {
             if hex::encode(Sha256::digest(bytes)) != *hash {
                 return Err(St3Error::new(
@@ -48968,6 +49133,9 @@ fn append_claim_with_subject_fences(
     event_runtime: Option<&str>,
     expected_subjects: Option<&BTreeMap<String, String>>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    validate_timeline_envelope_presence(input)?;
+    let admitted = admitted_timeline_input(input);
+    let input = admitted.as_ref().unwrap_or(input);
     validate_claim_input(input)?;
     if local_retention(&input.kind)
         || (input.actor.is_none() && system_local_retention(&input.kind))
@@ -49818,5 +49986,178 @@ mod harness_event_tests {
         input.sequence = 1;
         input.claim.kind = "intent.desired".into();
         assert!(store.append_harness_event(&input).is_err());
+    }
+}
+
+#[cfg(test)]
+mod daemon_capture_admission_tests {
+    use super::*;
+
+    const FAKE: &str = "invented-daemon-credential-1449";
+    const INCARNATION: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    fn input(sequence: u64, version: Option<u64>) -> ClaimInput {
+        let mut fields = json!({
+            "operation":"append", "entry_id":FAKE, "sequence":sequence,
+            "revision":1, "role":"assistant", "entry_type":"content", "final":true,
+            "body":{"policy_version":1, "text":FAKE, "coverage":true,
+                "nested":{"Authorization":format!("Bearer {FAKE}")}},
+            "driver":"omp", "incarnation_id":INCARNATION,
+            "source_id":FAKE, "diagnostic":FAKE, "producer_safe":true,
+        });
+        if let Some(version) = version {
+            fields["policy_version"] = json!(version);
+        }
+        ClaimInput {
+            subject:"agent/capture-fixture".into(), kind:"harness.timeline".into(),
+            actor:Some("agent/capture-fixture".into()),
+            fields:serde_json::from_value(fields).unwrap(),
+            evidence:vec![FAKE.into()], expected_subject:None,
+            idempotency_key:Some(FAKE.into()),
+        }
+    }
+
+    #[test]
+    fn persistence_and_retry_withhold_forged_coverage_and_raw_digests() {
+        let store = Store::open_memory("capture-fixture").unwrap();
+        for (sequence, version) in [(1,None), (2,Some(99)), (3,Some(1))] {
+            let input = input(sequence, version);
+            let (first, new) = store.append_claim_outcome(&input).unwrap();
+            assert!(new);
+            let (retry, new) = store.append_claim_outcome(&input).unwrap();
+            assert!(!new);
+            assert_eq!(first.id, retry.id);
+            assert_eq!(retry.body["fields"]["policy_version"], 1);
+            assert_eq!(retry.body["fields"]["body"]["withheld"], true);
+            assert!(retry.body["fields"].get("source_id").is_none());
+        }
+        // Inspect physical rows, not just a reader that could hide a persistence bypass.
+        let connection = store.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT body, dedupe_key, request_digest FROM local_observations",
+        ).unwrap();
+        let rows = statement.query_map([], |row| Ok((
+            row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?,
+        ))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(rows.len(), 3);
+        let encoded = json!(rows).to_string();
+        assert!(!encoded.contains(FAKE));
+        assert!(!encoded.contains(&hex::encode(Sha256::digest(FAKE.as_bytes()))));
+        let observations = store.local_observations_after(0,10).unwrap();
+        assert!(!serde_json::to_string(&observations).unwrap().contains(FAKE));
+        assert!(!crate::otlp::otlp_logs("capture-fixture",&observations).to_string().contains(FAKE));
+    }
+
+    #[test]
+    fn legacy_claims_and_local_rows_are_withheld_at_every_reader() {
+        let store = Store::open_memory("capture-fixture").unwrap();
+        let input = input(1,None);
+        let raw = json!({"fields":input.fields,"evidence":[FAKE]});
+        let legacy = {
+            let mut connection = store.connection.write();
+            let transaction = connection.transaction().unwrap();
+            let record = append_claim_record_tx(
+                &transaction,"capture-fixture",&input.subject,&input.kind,
+                input.actor.as_deref(),&raw,&[],None,
+            ).unwrap();
+            transaction.execute(
+                "INSERT INTO local_observations(after_store_index,subject,kind,actor,body,observed_at_unix_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![record.store_index,input.subject,input.kind,input.actor,raw.to_string(),now_ms() as i64],
+            ).unwrap();
+            transaction.commit().unwrap();
+            record
+        };
+        let exported = json!({
+            "page":store.claims_page(None,None,0,None,false,10).unwrap(),
+            "claim":store.claim_by_id(&legacy.id).unwrap(),
+            "latest":store.latest_claim(&input.subject,Some(&input.kind)).unwrap(),
+            "claims":store.claims_for(&input.subject,Some(&input.kind)).unwrap(),
+            "timeline":store.timeline_claims_for_incarnation_at(
+                &input.subject,INCARNATION,None,false,10,
+            ).unwrap(),
+            "local":store.local_observations_after(0,10).unwrap(),
+        }).to_string();
+        assert!(!exported.contains(FAKE));
+        assert!(!exported.contains(&legacy.id));
+        for result in [
+            store.export_replication_summary("fleet/capture"),
+            store.export_replication_exchange("fleet/capture",&ReplicationInventory::default()),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("capture-withheld"));
+            assert!(!error.contains(FAKE));
+            assert!(!error.contains(&legacy.id));
+        }
+        assert!(store.replication_inventory().is_err());
+    }
+
+    #[test]
+    fn real_replication_rejects_before_receipt_and_accepts_exact_admitted_controls() {
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let source = GraphStore::open_memory("capture-source",Arc::new(smallclaims::store::runtime::Plain)).unwrap();
+        source.bind_fleet(FLEET).unwrap();
+        let target = Store::open_memory("capture-target").unwrap();
+        target.bind_fleet(FLEET).unwrap();
+        let mut raw = input(1,Some(1));
+        raw.evidence.clear();
+        source.append_claim(&raw).unwrap();
+        let exchange = source.export_replication_exchange(FLEET,&ReplicationInventory::default()).unwrap();
+        let before: u64 = target.readers.get().query_row(
+            "SELECT COUNT(*) FROM replica_envelopes",[],|row|row.get(0),
+        ).unwrap();
+        for _ in 0..2 {
+            let error = target.receive_replication_exchange("capture-source",FLEET,&exchange).unwrap_err();
+            assert_eq!(error.code,"capture-withheld");
+            assert!(!error.to_string().contains(FAKE));
+        }
+        let after: u64 = target.readers.get().query_row(
+            "SELECT COUNT(*) FROM replica_envelopes",[],|row|row.get(0),
+        ).unwrap();
+        assert_eq!(before,after);
+        // Simulate a pre-policy daemon's pending receipt. Retrying admission must not
+        // copy its raw capture into replica_records or expose its digest inventory.
+        let pending = Store::open_memory("legacy-pending").unwrap();
+        pending.bind_fleet(FLEET).unwrap();
+        for envelope in &exchange.envelopes {
+            pending.connection.write().execute(
+                "INSERT INTO replica_envelopes(
+                    writer,sequence,envelope_hash,previous_hash,accepted_at_unix_ms,
+                    payload,relay,receipt_state,received_at_unix_ms
+                 ) VALUES (?1,?2,?3,?4,?5,?6,'legacy-relay','pending',?5)",
+                params![
+                    envelope.writer,envelope.sequence,envelope.hash,envelope.previous_hash,
+                    envelope.accepted_at_unix_ms.to_string(),envelope.payload,
+                ],
+            ).unwrap();
+        }
+        for _ in 0..2 {
+            assert!(pending.replication_inventory().unwrap_err().to_string().contains("capture-withheld"));
+            assert!(pending.export_replication_summary(FLEET).unwrap_err().to_string().contains("capture-withheld"));
+            let error = pending.validate_replication_backlog().unwrap_err().to_string();
+            assert!(error.contains("capture-withheld"));
+            assert!(!error.contains(FAKE));
+            let copied: u64 = pending.readers.get().query_row(
+                "SELECT COUNT(*) FROM replica_records",[],|row|row.get(0),
+            ).unwrap();
+            assert_eq!(copied,0);
+        }
+        let safe = GraphStore::open_memory("safe-source",Arc::new(smallclaims::store::runtime::Plain)).unwrap();
+        safe.bind_fleet(FLEET).unwrap();
+        let mut control = input(2,Some(1));
+        control.evidence.clear();
+        control.fields.insert("entry_type".into(),json!("status"));
+        control.fields.insert("body".into(),json!({"policy_version":1,"status":"running"}));
+        control.fields = serde_json::from_value(
+            st_drivers::capture_admission::sanitize_timeline_fields(&json!(control.fields)),
+        ).unwrap();
+        safe.append_claim(&control).unwrap();
+        let exchange = safe.export_replication_exchange(FLEET,&ReplicationInventory::default()).unwrap();
+        target.receive_replication_exchange("safe-source",FLEET,&exchange).unwrap();
+        assert!(!serde_json::to_string(&target.replica_envelopes(
+            exchange.envelopes.iter().map(|envelope| smallclaims::claim::ReplicaEnvelopeId {
+                writer:envelope.writer.clone(),sequence:envelope.sequence,hash:envelope.hash.clone(),
+            }).collect(),
+        ).unwrap()).unwrap().contains(FAKE));
     }
 }

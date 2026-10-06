@@ -14,6 +14,7 @@
 // a slow channel starts the session
 // without restored context rather than hanging it.
 import childProcess from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -117,6 +118,8 @@ type Stash = {
   todoNextPollAt?: number;
   todoSession?: string;
   todoReady?: boolean;
+  /** Native correlation keys remain bounded process memory, never hashes or exported IDs. */
+  timelineIdentities?: Map<string, string>;
 
   /** The structured `ask` tool call currently waiting for its matching result. */
   pendingAskToolCallId?: string;
@@ -751,61 +754,55 @@ export default function (pi: ExtensionAPI) {
     emitTodo(ctx, snapshot, source?.observedAt ?? new Date().toISOString(),
       hydrate ? "hydrate" : source?.sourceOp ?? "hydrate", hydrate);
   };
-  const boundedTimelineString = (value: unknown, limit = 16_384): string | undefined =>
-    typeof value === "string" ? value.slice(0, limit) : undefined;
   const normalizedTimelinePayload = (event: string, raw: unknown): Record<string, unknown> => {
-    const value = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
-    if (event === "tool_call") return {
-      toolCallId: boundedTimelineString(value.toolCallId ?? value.tool_call_id, 256),
-      toolName: boundedTimelineString(value.toolName ?? value.tool_name, 128),
-      input: { redacted: true },
-    };
-    if (event === "tool_result") return {
-      toolCallId: boundedTimelineString(value.toolCallId ?? value.tool_call_id, 256),
-      isError: value.isError === true,
-      content: { redacted: true },
-    };
-    const rawMessage = value.message;
-    const message = rawMessage && typeof rawMessage === "object"
-      ? rawMessage as Record<string, unknown>
-      : value;
-    let content: unknown = boundedTimelineString(message.content);
-    if (Array.isArray(message.content)) {
-      content = message.content.slice(0, 64).map((part) => {
-        if (typeof part === "string") return { text: part.slice(0, 16_384) };
-        if (!part || typeof part !== "object") return {};
-        return { text: boundedTimelineString((part as Record<string, unknown>).text) };
-      });
+    // This private, pipe-only entrypoint runs the Rust gate also used by native replay.
+    // Send the complete logical event, never a truncated prefix. Its stdin is not an
+    // outbox, daemon request, command argument, file, or telemetry export.
+    const withheld = { policy_version: 1, withheld: true, reason: "scanner-failure" };
+    if (!state.bin) return withheld;
+    const value = record(raw) ?? {};
+    const message = record(value.message);
+    const nativeId = event === "message_end" ? message?.id ?? value.id
+      : value.toolCallId ?? value.tool_call_id;
+    const key = typeof nativeId === "string" && nativeId.length <= 256
+      ? `${event === "message_end" ? "message" : "call"}:${nativeId}` : undefined;
+    const identities = state.timelineIdentities ??= new Map();
+    let captureId = key === undefined ? undefined : identities.get(key);
+    if (captureId === undefined) {
+      captureId = `${event === "message_end" ? "source" : "call"}/${randomUUID()}`;
+      if (key !== undefined) {
+        if (identities.size >= 1024) {
+          const oldest = identities.keys().next().value;
+          if (oldest !== undefined) identities.delete(oldest);
+        }
+        identities.set(key, captureId);
+      }
     }
-    const usage = message.usage && typeof message.usage === "object"
-      ? message.usage as Record<string, unknown>
-      : undefined;
-    // Per-response spend: the provider's disjoint token buckets, its model, and the cost the
-    // harness itself computed. Nothing else about the request leaves the harness.
-    const cost = usage?.cost && typeof usage.cost === "object"
-      ? usage.cost as Record<string, unknown>
-      : undefined;
-    return { message: {
-      id: boundedTimelineString(message.id, 256),
-      role: boundedTimelineString(message.role, 32),
-      content,
-      model: boundedTimelineString(message.model, 128),
-      provider: boundedTimelineString(message.provider, 64),
-      usage: usage ? {
-        input: finiteOrNull(usage.input ?? usage.inputTokens),
-        output: finiteOrNull(usage.output ?? usage.outputTokens),
-        cacheRead: finiteOrNull(usage.cacheRead),
-        cacheWrite: finiteOrNull(usage.cacheWrite),
-        totalTokens: finiteOrNull(usage.totalTokens),
-        cost: cost ? finiteOrNull(cost.total) : null,
-      } : undefined,
-    } };
+    const input = JSON.stringify({ event, payload: { ...value, capture_id: captureId } });
+    if (Buffer.byteLength(input, "utf8") > 65_536) {
+      return { policy_version: 1, withheld: true, reason: "scan-bound" };
+    }
+    const result = childProcess.spawnSync(state.bin, ["capture-sanitize"], {
+      input,
+      encoding: "utf8",
+      timeout: 1000,
+      maxBuffer: 131_072,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    if (result.error || result.status !== 0) return withheld;
+    const safe: unknown = JSON.parse(result.stdout);
+    if (!safe || typeof safe !== "object" || Array.isArray(safe)
+      || (safe as Record<string, unknown>).policy_version !== 1) return withheld;
+    return safe as Record<string, unknown>;
   };
   const sendTimeline = (event: string, payload: unknown) => {
     try {
-      sendFrame({ type: "timeline", event, payload: normalizedTimelinePayload(event, payload) });
+      const safe = normalizedTimelinePayload(event, payload);
+      sendFrame({ type: "timeline", event, policy_version: 1, payload: safe });
     } catch {
-      // Observability remains fail-open; Rust applies the durable byte/redaction policy.
+      // Never export raw parser/scanner errors, nor fall back to the rejected payload.
+      sendFrame({ type: "timeline", event, policy_version: 1,
+        payload: { policy_version: 1, withheld: true, reason: "scanner-failure" } });
     }
   };
 

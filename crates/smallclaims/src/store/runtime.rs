@@ -55,6 +55,22 @@ pub trait Runtime: Send + Sync {
         claim: &ClaimRecord,
     ) -> Result<ReplicatedClaimAdmission, Error>;
 
+    /// Check runtime-owned capture boundaries before an envelope is stored or exported.
+    /// Rejection must not include its payload, identifiers, or payload-derived hashes.
+    fn check_replication_envelope(&self, _envelope: &crate::claim::ReplicaEnvelope) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Check the equivalent batch boundary used by direct replication.
+    fn check_replication_batch(&self, _batch: &ReplicaBatch) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Refuse exporting inventory/summary digests of capture records that fail admission.
+    fn check_replication_export(&self, _connection: &Connection) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Append a claim this node writes, from a client's input. The runtime decides how the claim
     /// is kept (some kinds stay local observations), validates it, appends it through the graph
     /// and projects it. The bool says whether the claim is new rather than an idempotent repeat.

@@ -82,7 +82,7 @@ Daemon outages, a lost acknowledgement and driver re-execution leave unacknowled
 replay. The source runtime and driver remain attached to historical events when a successor
 publishes a backlog. Admission binds the Unix peer to its seat and checks the publishing runtime
 inside the daemon's writer transaction. Source runtime, spool sequence, claim kind and usage
-semantics identify an exact retry; changed input is rejected. Graph-derived claim fields are
+semantics identify an exact retry; changed admitted input is rejected. Graph-derived claim fields are
 persisted in the spool before the first HTTP attempt so retries preserve their original attribution.
 
 The outbox is transport recovery state, not graph authority. The daemon retains each admitted
@@ -103,6 +103,57 @@ requires an operations-coordinated provider restart, recovery of any unacknowled
 and archiving the drained outbox before starting the old producer;
 an old binary cannot adopt an event-producing provider. This work does not restart shared
 services or seats automatically.
+
+Conversation timeline admission uses policy version 1 in `st_drivers::capture_admission`.
+The reviewed provider-adapter/event registry admits only narrowly typed controls, counters,
+generated identities and validated delivery filenames. It does not establish complete
+credential coverage for arbitrary prose, native history, tool bodies, diagnostics or unknown
+fields: those fields are withheld whole, with fixed reasons and no rejected-content digest.
+Reasoning, new tool payloads, jobs, IRC, compaction payloads and Latest snapshots are not enabled.
+
+The secret registry contains only credential values already present in the harness's credential
+environment. It remains in memory, is not logged, hashed or exported, and never resolves a
+secret locator or reads another credential profile. Absent coverage is not evidence of safety.
+The shared scanner buffers complete logical fields across chunks before admission and decodes
+supported JSON escaping, percent, hex and base64 encodings. Limits are 64 KiB of input per field,
+depth 8, 128 KiB of scan work and 4,096 structural nodes; scanner/decoding failures and exhausted
+limits withhold the whole field, never a preview prefix or a raw fallback.
+
+The OMP extension invokes the private pipe-only `st capture-sanitize` entrypoint before sending
+timeline frames. Native replay and timeline writers use the same Rust gate. Native correlation
+keys remain bounded process memory; exported identities are generated, not raw-content hashes.
+Producer recovery rechecks older outbox records before HTTP publication. The daemon independently
+requires the matching version before persistence, API reads, follow responses and OTLP export.
+OTLP contains only admitted metadata for these timeline records.
+Declared account references are typed metadata, not credential values or login locators. Timeline
+admission independently validates the graph account-name grammar: 1–512 ASCII bytes, an
+alphanumeric first byte, remaining alphanumeric or `._-@/`, no empty or `..` segment and no
+trailing slash. Invalid references are dropped before deriving billing labels or exporting claims;
+valid declarations retain separate account attribution. Auxiliary event contracts are unchanged.
+
+Claude mail receipts retain their existing source/incarnation fences. New records carry bounded
+`delivery_filenames`; the receipt-only reader also accepts legacy `[st3-delivery:<filename>]`
+markers, including mixed-version records. Each filename must satisfy the anchored frozen bus
+grammar `^[0-9]{13}-[0-9a-z]{6}\.md$` and the shared scanner. This dual read never exports legacy
+prompt prose.
+
+Immutable replicated timeline records cannot be rewritten to change their content hashes.
+Unsafe or missing-policy timeline envelopes are refused before receipt, repair copies or export;
+summary/inventory export also refuses their raw-content digests, including pending envelopes.
+Such legacy data blocks the affected synchronization path rather than being silently trusted
+or deleted. Compatible version-1 sanitized envelopes remain admissible.
+
+Cross-node conversation relays independently recheck capture rows rather than trusting the
+origin's labels or policy assertions. Authored mail and auxiliary projections are reconstructed
+only from the gateway's graph authority. Opaque remote page cursors are withheld because their
+collection digest can include unseen rejected capture; `has_more` remains available with a fixed
+withholding status. Typed owner/session/position follow cursors remain usable. Remote error
+responses retain finite error codes and resynchronization flags, not origin diagnostics.
+
+This admission contract is limited to conversation timeline capture. Existing todo snapshots,
+context/model labels, turn diagnostics, ask reasons and native routing/session metadata retain
+their separate shipped contracts; policy version 1 is not a credential-safety guarantee for
+those auxiliary exports.
 
 The exporter keeps its cursor in `meta` and moves it only after the collector accepts a batch of
 at most 512 observations, including every log/metric/trace request that batch needs. Delivery is

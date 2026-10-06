@@ -56,6 +56,7 @@ use completion::{Complete, Entity, WorkFilter};
 mod cli_help;
 mod completion;
 mod presentation;
+mod capture_sanitize;
 
 use presentation::{
     OutputStyle, follow_snapshot, glance, mission_run_signature, relative_time,
@@ -4342,6 +4343,13 @@ fn main() -> ExitCode {
     // A recorder link starts st3 as `git` or `gh`. It must not build the async runtime.
     if let Some(program) = st3::recorder::invoked_program() {
         st3::recorder::run(program);
+    }
+    // The OMP extension invokes the shared admission gate before channel transport.
+    // Never initialize telemetry, daemon clients or diagnostics with this input.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("capture-sanitize"))
+    {
+        return capture_sanitize::run();
     }
     // What `st clients` lists for this process: its name and build, as reported.
     st3_client::set_client_name(format!("st {}", st_drivers::version::machine_version()));
@@ -17683,6 +17691,11 @@ impl ObservationClient<'_> {
         };
         let mut claim = claim.clone();
         bind_observation_account(&mut claim, account.as_deref());
+        if claim.kind == "harness.timeline" {
+            claim.fields = serde_json::from_value(
+                st_drivers::capture_admission::sanitize_timeline_fields(&serde_json::to_value(&claim.fields)?),
+            )?;
+        }
         if let Some((runtime, sequence, dir, _)) = self.event {
             let slot = format!(
                 "{}:{}",
@@ -17724,6 +17737,16 @@ fn bind_observation_account(claim: &mut ClaimInput, account: Option<&str>) {
     let Some(account) = account.filter(|name| !name.is_empty()) else {
         return;
     };
+    if claim.kind == "harness.timeline" {
+        if claim.fields.get("entry_type").and_then(Value::as_str) == Some("usage") {
+            claim.fields.insert("account_ref".into(), Value::String(account.into()));
+            let fields = Value::Object(std::mem::take(&mut claim.fields).into_iter().collect());
+            claim.fields = serde_json::from_value(
+                st_drivers::capture_admission::sanitize_timeline_fields(&fields),
+            ).expect("timeline admission returns object fields");
+        }
+        return;
+    }
     let Some(driver) = claim.fields.get("driver").and_then(Value::as_str) else {
         return;
     };
@@ -17737,13 +17760,6 @@ fn bind_observation_account(claim: &mut ClaimInput, account: Option<&str>) {
         }
         "harness.usage" => {
             claim.fields.insert("account".into(), Value::String(label));
-        }
-        "harness.timeline"
-            if claim.fields.get("entry_type").and_then(Value::as_str) == Some("usage") =>
-        {
-            if let Some(Value::Object(body)) = claim.fields.get_mut("body") {
-                body.insert("account".into(), Value::String(label));
-            }
         }
         _ => {}
     }
@@ -18151,11 +18167,12 @@ fn timeline_claim_fields(
     runtime_incarnation: &str,
 ) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::from([
+        ("policy_version".into(), Value::from(st_drivers::capture_admission::POLICY_VERSION)),
         (
             "operation".into(),
-            Value::String(operation.operation.clone()),
+            Value::String(operation.operation),
         ),
-        ("entry_id".into(), Value::String(operation.entry_id.clone())),
+        ("entry_id".into(), Value::String(operation.entry_id)),
         ("sequence".into(), Value::from(operation.sequence)),
         ("revision".into(), Value::from(operation.revision)),
         ("role".into(), Value::String(operation.role)),
@@ -18177,7 +18194,15 @@ fn timeline_claim_fields(
     {
         fields.insert("source_id".into(), Value::String(source_id));
     }
-    fields
+    // Recovery may load an older outbox or timeline file. Recheck before the
+    // HTTP request, not only after raw legacy bytes have reached the daemon.
+    let admitted = st_drivers::capture_admission::sanitize_timeline_fields(
+        &Value::Object(fields.into_iter().collect()),
+    );
+    match admitted {
+        Value::Object(fields) => fields.into_iter().collect(),
+        _ => unreachable!("the admission gate always returns a typed object"),
+    }
 }
 
 /// The driver cannot relaunch the native session its suspended seat names. Record the typed
@@ -21388,7 +21413,6 @@ fn claude_channel_consumed_delivery_filenames(
     agent_dir: &Path,
     incarnation: &str,
 ) -> Result<BTreeSet<String>> {
-    const PREFIX: &str = "[st3-delivery:";
     let Some(record) =
         st_drivers::harness_timeline::read(&st_drivers::harness_timeline::timeline_path(agent_dir))
     else {
@@ -21401,11 +21425,9 @@ fn claude_channel_consumed_delivery_filenames(
         .operations
         .iter()
         .filter(|operation| operation.role == "user" && operation.entry_type == "content")
-        .filter_map(|operation| operation.body.get("text").and_then(Value::as_str))
-        .flat_map(|text| text.split(PREFIX).skip(1))
-        .filter_map(|tail| tail.split_once(']').map(|(filename, _)| filename))
-        .filter(|filename| st_drivers::message::is_message_filename(filename))
-        .map(str::to_owned)
+        // Receipt-only dual read preserves historical/mixed-version ACKs without
+        // exporting legacy prompt prose. The shared gate validates whole filenames.
+        .flat_map(|operation| st_drivers::capture_admission::delivery_filenames(&operation.body))
         .collect())
 }
 
@@ -22296,10 +22318,12 @@ mod tests {
             let mut claim = ClaimInput {
                 subject: subject.clone(), kind: "harness.timeline".into(), actor: Some(subject),
                 fields: serde_json::from_value(json!({
+                    "policy_version": st_drivers::capture_admission::POLICY_VERSION,
                     "operation": "append", "entry_id": format!("response-{index}"), "source_id": format!("response-{index}"),
                     "sequence": 1, "revision": 1, "role": "system", "entry_type": "usage", "final": true,
                     "driver": "codex", "incarnation_id": "inc-one", "observed_at_unix_ms": now_ms() as u64,
-                    "body": {"semantics": "response", "model": "example-model", "input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+                    "body": {"policy_version": st_drivers::capture_admission::POLICY_VERSION,
+                        "semantics": "response", "input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
                 })).unwrap(),
                 evidence: Vec::new(), expected_subject: None, idempotency_key: None,
             };
@@ -25083,6 +25107,67 @@ mod tests {
         );
     }
 
+    fn claude_receipt_fixture(body: Value) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = st_drivers::harness_timeline::Writer::new(root.path(), "claude", "inc-2");
+        writer.append(
+            "prompt",
+            st_drivers::harness_timeline::Role::User,
+            st_drivers::harness_timeline::EntryType::Content,
+            json!({"text": "fixture"}),
+            true,
+        ).unwrap();
+        let path = st_drivers::harness_timeline::timeline_path(root.path());
+        let mut record = st_drivers::harness_timeline::read(&path).unwrap();
+        record.operations.retain(|entry| entry.entry_type == "content");
+        record.operations[0].body = body;
+        // Historical native records are outside capture's storage boundary.
+        fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+        root
+    }
+
+    #[test]
+    fn claude_delivery_receipts_read_typed_fields() {
+        let root = claude_receipt_fixture(json!({
+            "policy_version": 1,
+            "delivery_filenames": ["1784649988123-abc23z.md"],
+        }));
+        assert_eq!(
+            claude_channel_consumed_delivery_filenames(root.path(), "inc-2").unwrap(),
+            BTreeSet::from(["1784649988123-abc23z.md".into()]),
+        );
+    }
+
+    #[test]
+    fn claude_delivery_receipts_read_legacy_markers() {
+        let root = claude_receipt_fixture(json!({
+            "text": "[st3-delivery:1784649988123-abciou.md]\nlegacy prompt",
+        }));
+        assert_eq!(
+            claude_channel_consumed_delivery_filenames(root.path(), "inc-2").unwrap(),
+            BTreeSet::from(["1784649988123-abciou.md".into()]),
+        );
+    }
+
+    #[test]
+    fn claude_delivery_receipts_merge_mixed_versions_without_partial_filenames() {
+        let root = claude_receipt_fixture(json!({
+            "delivery_filenames": ["1784649988123-abc23z.md", "../1784649988123-abc23z.md"],
+            "text": "[st3-delivery:1784649988123-abc23z.md]\
+                [st3-delivery:1784649988123-abciou.md]\
+                [st3-delivery:1784649988123-abc23z.md-invented-secret]\
+                [st3-delivery:1784649988123-ABC23Z.md]",
+        }));
+        assert_eq!(
+            claude_channel_consumed_delivery_filenames(root.path(), "inc-2").unwrap(),
+            BTreeSet::from([
+                "1784649988123-abc23z.md".into(),
+                "1784649988123-abciou.md".into(),
+            ]),
+        );
+        assert!(claude_channel_consumed_delivery_filenames(root.path(), "inc-1").unwrap().is_empty());
+    }
+
     #[test]
     fn native_exit_claims_are_unique_per_incarnation() {
         assert_eq!(
@@ -26359,7 +26444,32 @@ mission "review" state="ready" {
         );
         assert_eq!(fields["incarnation_id"], "runtime-current");
         assert!(fields.get("evidence_incarnation").is_none());
-        assert_eq!(fields["body"]["text"], "answer");
+    }
+
+    #[test]
+    fn fake_credentials_legacy_timeline_publication_never_exports_raw_on_retry() {
+        let fake = "invented-legacy-outbox-credential";
+        let operation = st_drivers::harness_timeline::Operation {
+            operation: "append".into(),
+            entry_id: fake.into(),
+            sequence: 7,
+            revision: 1,
+            role: "assistant".into(),
+            entry_type: "content".into(),
+            final_entry: true,
+            body: json!({"text": fake, "unknown": fake, "sha256": hex::encode(Sha256::digest(fake))}),
+            driver: "omp".into(),
+            incarnation_id: "provider-current".into(),
+            observed_at_unix_ms: 1,
+            source_id: Some(fake.into()),
+        };
+        let first = timeline_claim_fields(operation.clone(), "runtime-current");
+        let retry = timeline_claim_fields(operation, "runtime-current");
+        assert_eq!(first, retry);
+        let exported = serde_json::to_string(&first).unwrap();
+        assert!(!exported.contains(fake));
+        assert!(!exported.contains(&hex::encode(Sha256::digest(fake))));
+        assert_eq!(first["incarnation_id"], "runtime-current");
     }
 
     #[test]

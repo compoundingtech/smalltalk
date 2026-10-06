@@ -105,6 +105,55 @@ impl Runtime for SmalltalkRuntime {
         classify_replicated_claim_with_registry(claim, self.claim_registry())
     }
 
+    fn check_replication_envelope(&self, envelope: &smallclaims::claim::ReplicaEnvelope) -> Result<(), St3Error> {
+        let refused = || St3Error::new("capture-withheld", "replication capture admission failed");
+        let bytes = envelope.payload.bytes().map_err(|_| refused())?;
+        if bytes.len() > smallclaims::sync::MAX_EXCHANGE_BYTES {
+            return Err(refused());
+        }
+        let payload: smallclaims::claim::ReplicaEnvelopePayload =
+            ciborium::from_reader(bytes).map_err(|_| refused())?;
+        self.check_replication_batch(&payload.batch)
+    }
+
+    fn check_replication_batch(&self, batch: &ReplicaBatch) -> Result<(), St3Error> {
+        for claim in &batch.claims {
+            check_timeline_replication_claim(claim)?;
+        }
+        Ok(())
+    }
+
+    fn check_replication_export(&self, connection: &Connection) -> Result<(), St3Error> {
+        let mut statement = connection.prepare_cached(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+             FROM claims WHERE kind='harness.timeline'",
+        ).map_err(internal)?;
+        let rows = statement.query_map([], smallclaims::store::claim_from_row).map_err(internal)?;
+        for row in rows {
+            check_timeline_replication_claim(&row.map_err(internal)?)?;
+        }
+        let mut pending = connection.prepare_cached(
+            "SELECT writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms, payload
+             FROM replica_envelopes WHERE receipt_state IN ('pending', 'degraded')",
+        ).map_err(internal)?;
+        let envelopes = pending.query_map([], |row| {
+            Ok(smallclaims::claim::ReplicaEnvelope {
+                writer: row.get(0)?,
+                sequence: row.get(1)?,
+                hash: row.get(2)?,
+                previous_hash: row.get(3)?,
+                accepted_at_unix_ms: row.get::<_, String>(4)?.parse().unwrap_or_default(),
+                payload: row.get(5)?,
+                member_key: None,
+                signature: None,
+            })
+        }).map_err(internal)?;
+        for envelope in envelopes {
+            self.check_replication_envelope(&envelope.map_err(internal)?)?;
+        }
+        Ok(())
+    }
+
     fn append_claim(
         &self,
         store: &GraphStore,

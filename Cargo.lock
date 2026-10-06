@@ -4258,6 +4258,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tungstenite 0.30.0",
+ "uuid",
  "wat",
 ]
 
@@ -4427,6 +4428,7 @@ dependencies = [
  "libghostty-vt",
  "libghostty-vt-sys",
  "notify",
+ "parking_lot",
  "portable-pty",
  "predicates",
  "proptest",

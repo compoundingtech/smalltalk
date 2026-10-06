@@ -3965,6 +3965,7 @@ pub fn validate_and_admit_envelope_tx(
     runtime: &dyn Runtime,
     outcome: &mut ReplicationAdmission,
 ) -> Result<(), St3Error> {
+    runtime.check_replication_envelope(envelope)?;
     let started = std::time::Instant::now();
     let payload_bytes = envelope.payload.bytes().map_err(|error| {
         St3Error::new(
@@ -4769,6 +4770,7 @@ impl Store {
     /// Seal this node's batches that have no envelope yet, and sign them. Only this takes the
     /// writer, and only when there are such batches.
     pub fn seal_local_batches(&self) -> Result<()> {
+        self.runtime.check_replication_export(&self.readers.get())?;
         // A checkpoint on a standalone busy member can accumulate ten minutes of writes.
         // Bound each writer loan, not just the scan range, so queued live writes run between
         // chunks. Capture the target once; concurrent writes belong to the next pass.
@@ -4808,6 +4810,7 @@ impl Store {
     /// read such as `st replication status` uses it and never waits for the writer; a batch
     /// written since the last exchange shows once the next exchange seals it.
     pub fn sealed_replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
+        self.runtime.check_replication_export(&self.readers.get())?;
         let current = |store: &Self| -> Result<Option<Arc<ReplicationSnapshot>>> {
             let store_index = store.index()?;
             let replica_generation = store.replica_generation.load(Ordering::Acquire);
@@ -5184,6 +5187,7 @@ impl Store {
             let Some(envelope) = envelope else {
                 continue;
             };
+            self.runtime.check_replication_envelope(&envelope)?;
             envelopes.push(envelope);
         }
         Ok(envelopes)
@@ -5231,6 +5235,7 @@ impl Store {
                 let mut signatures = 0;
                 let now = now_ms().to_string();
                 for envelope in &input.envelopes {
+                    self.runtime.check_replication_envelope(envelope)?;
                     // A checkpoint dropped this envelope here. Its tombstone already stands for it.
                     if checkpoint::envelope_tombstoned(
                         transaction,
@@ -5539,6 +5544,7 @@ impl Store {
                 let mut connection = self.connection.write();
                 let mut pass = connection.transaction()?;
                 for envelope in chunk {
+                    self.runtime.check_replication_envelope(envelope)?;
                     let started = std::time::Instant::now();
                     let hold = fleet_admission_hold(&pass, &membership, envelope)?;
                     outcome.verify += started.elapsed();
@@ -6623,8 +6629,7 @@ impl Store {
             let claims = claim_statement
                 .query_map([&id], claim_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
-            collect_referenced_blobs(&connection, &claims, &mut blobs)?;
-            batches.push(ReplicaBatch {
+            let batch = ReplicaBatch {
                 id,
                 origin,
                 replica_sequence,
@@ -6632,7 +6637,10 @@ impl Store {
                 hash,
                 accepted_at_unix_ms: accepted_at.parse().unwrap_or_default(),
                 claims,
-            });
+            };
+            self.runtime.check_replication_batch(&batch)?;
+            collect_referenced_blobs(&connection, &batch.claims, &mut blobs)?;
+            batches.push(batch);
         }
         Ok(ReplicationBatch {
             peer: self.origin.clone(),

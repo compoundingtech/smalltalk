@@ -14,11 +14,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
-use sha2::{Digest as _, Sha256};
+use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::flock::{FileLock, Mode, Open, open};
 use crate::fsatomic::{self, Durability, Staging};
+use crate::capture_admission::{self, Producer};
 
 const SCHEMA: &str = "st.harness-timeline.v1";
 const RECORD_NAME: &str = "harness-timeline";
@@ -26,7 +27,6 @@ const LOCK_NAME: &str = ".harness-timeline.lock";
 const MAX_OPERATIONS: usize = 4_096;
 const MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
-const MAX_STRING_CHARS: usize = 8_192;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,6 +112,9 @@ pub struct Writer {
     model: Option<String>,
     account: Option<String>,
     turn_models: BTreeMap<String, String>,
+    // Raw native keys are held only in bounded process memory, never hashed or persisted.
+    source_keys: BTreeMap<String, String>,
+    secret_registry: capture_admission::SecretRegistry,
 }
 
 impl Writer {
@@ -128,6 +131,8 @@ impl Writer {
             model: None,
             account: None,
             turn_models: BTreeMap::new(),
+            source_keys: BTreeMap::new(),
+            secret_registry: capture_admission::SecretRegistry::from_existing_environment(),
         }
     }
 
@@ -155,6 +160,19 @@ impl Writer {
         self.turn_models.insert(turn_id.into(), model.into());
     }
 
+    fn generated_source(&mut self, raw: &str) -> String {
+        if let Some(source) = self.source_keys.get(raw) {
+            return source.clone();
+        }
+        let generated = format!("source/{}", Uuid::new_v4());
+        if raw.len() <= 256 {
+            if self.source_keys.len() >= 1_024 {
+                self.source_keys.pop_first();
+            }
+            self.source_keys.insert(raw.into(), generated.clone());
+        }
+        generated
+    }
     pub fn append(
         &mut self,
         source_id: impl Into<String>,
@@ -174,6 +192,10 @@ impl Writer {
         body: Value,
         final_entry: bool,
     ) -> Result<()> {
+        anyhow::ensure!(
+            capture_admission::safe_routing_fence(&self.incarnation_id, &self.secret_registry),
+            "harness timeline routing fence withheld"
+        );
         fs::create_dir_all(
             self.path
                 .parent()
@@ -181,9 +203,9 @@ impl Writer {
         )?;
         let lock = open(&self.lock_path, Open::Create)?;
         let _held = FileLock::hold_blocking(lock, Mode::Exclusive)?;
+        let source_key = self.generated_source(&source_id);
         let event_dir = self.path.parent().unwrap();
         let event_transport = crate::harness_events::enabled(event_dir);
-        let source_key = pseudonym("source", &source_id);
         let mut record = if event_transport {
             Some(crate::harness_events::timeline_for_write(
                 event_dir,
@@ -208,6 +230,7 @@ impl Writer {
             next_sequence: 1,
             operations: Vec::new(),
         });
+        sanitize_retained_operations(&mut record, &self.secret_registry);
 
         let prior_operations = record.operations.len();
         anyhow::ensure!(
@@ -215,21 +238,12 @@ impl Writer {
                 self.driver.as_str(),
                 "codex" | "claude" | "pi" | "omp" | "opencode"
             ),
-            "unsupported harness timeline driver `{}`",
-            self.driver
+            "unsupported harness timeline driver"
         );
-        let source_id = pseudonym("source", &source_id);
-        let (mut body, redacted_bytes, redacted_items, truncated_items) =
-            normalize_body(entry_type, &source_id, body);
-        if entry_type == EntryType::Usage {
-            body["driver"] = Value::String(self.driver.clone());
-            if body["semantics"] == "response"
-                && body.get("account").is_none()
-                && let Some(account) = &self.account
-            {
-                body["account"] = Value::String(account.clone());
-            }
-        }
+        let source_id = source_key;
+        let body = capture_admission::sanitize_body_with_registry(
+            Producer::Driver, entry_type.as_str(), &body, &self.secret_registry,
+        );
         anyhow::ensure!(
             serde_json::to_vec(&body)?.len() <= MAX_BODY_BYTES,
             "normalized harness timeline body exceeds {MAX_BODY_BYTES} bytes"
@@ -291,33 +305,6 @@ impl Writer {
             observed_at_unix_ms,
             source_id: Some(source_id.clone()),
         });
-        if redacted_bytes > 0 || redacted_items > 0 {
-            push_notice(
-                &mut record,
-                &self.driver,
-                &self.incarnation_id,
-                &format!("{source_id}:redaction"),
-                EntryType::Redaction,
-                json!({"reason": "sensitive-content", "withheld_bytes": redacted_bytes, "withheld_items": redacted_items}),
-                observed_at_unix_ms,
-            );
-        }
-        if truncated_items > 0 {
-            let omitted = record.next_sequence;
-            push_notice(
-                &mut record,
-                &self.driver,
-                &self.incarnation_id,
-                &format!("{source_id}:truncation"),
-                EntryType::Truncation,
-                json!({
-                    "reason": "producer-bound",
-                    "omitted_from_sequence": omitted,
-                    "omitted_to_sequence": omitted,
-                }),
-                observed_at_unix_ms,
-            );
-        }
         if event_transport {
             return crate::harness_events::write_timeline(
                 event_dir,
@@ -363,7 +350,7 @@ fn push_notice(
         role: Role::System.as_str().into(),
         entry_type: entry_type.as_str().into(),
         final_entry: true,
-        body,
+        body: normalize_body(entry_type, body),
         driver: driver.into(),
         incarnation_id: incarnation_id.into(),
         observed_at_unix_ms,
@@ -904,6 +891,17 @@ pub fn observe_channel_frame(writer: &mut Writer, frame: &Value) -> Result<()> {
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let payload = frame.get("payload").unwrap_or(&Value::Null);
+    if payload.get("withheld").and_then(Value::as_bool) == Some(true) {
+        let mut body = capture_admission::sanitize_body(Producer::Driver, "redaction", payload);
+        body["withheld_items"] = json!(1);
+        return writer.append(
+            source_id(frame, "channel:withheld"),
+            Role::System,
+            EntryType::Redaction,
+            body,
+            true,
+        );
+    }
     if event == "tool_call" {
         let call = payload
             .get("toolCallId")
@@ -1022,25 +1020,33 @@ fn safe_summary(_value: &Value) -> String {
     "The harness reported an error.".into()
 }
 
-fn source_id(value: &Value, prefix: &str) -> String {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    let digest = hex_digest(&bytes);
-    format!("{prefix}:{}", &digest[..24])
+fn source_id(_value: &Value, prefix: &str) -> String {
+    // No native identity available: use a fresh generated key, never a raw-payload digest.
+    format!("{prefix}:{}", Uuid::new_v4())
 }
 
-fn stable_entry_id(driver: &str, incarnation_id: &str, source_id: &str) -> String {
-    let digest = hex_digest(format!("{driver}\0{incarnation_id}\0{source_id}").as_bytes());
-    format!("timeline-entry/{}", &digest[..32])
+fn stable_entry_id(_driver: &str, _incarnation_id: &str, source_id: &str) -> String {
+    let id = source_id.strip_prefix("source/").and_then(|id| Uuid::parse_str(id).ok())
+        .unwrap_or_else(Uuid::new_v4);
+    format!("timeline-entry/{id}")
 }
 
-fn pseudonym(kind: &str, value: &str) -> String {
-    let digest = hex_digest(format!("{kind}\0{value}").as_bytes());
-    format!("{kind}/{}", &digest[..24])
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+fn sanitize_retained_operations(record: &mut Record, registry: &capture_admission::SecretRegistry) {
+    let mut entries = BTreeMap::<String, String>::new();
+    for operation in &mut record.operations {
+        operation.body = capture_admission::sanitize_body_with_registry(
+            Producer::Daemon, &operation.entry_type, &operation.body, registry,
+        );
+        if capture_admission::generated_identifier(&operation.entry_id, registry).is_none() {
+            let generated = entries.entry(operation.entry_id.clone())
+                .or_insert_with(|| format!("timeline-entry/{}", Uuid::new_v4()));
+            operation.entry_id.clone_from(generated);
+        }
+        if operation.source_id.as_deref()
+            .and_then(|source| capture_admission::generated_identifier(source, registry)).is_none() {
+            operation.source_id = Some(format!("source/{}", operation.entry_id.trim_start_matches("timeline-entry/")));
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -1115,253 +1121,9 @@ fn validate_record(record: &Record) -> bool {
     true
 }
 
-/// Normalize by timeline discriminator. Free-form tool data and provider errors are represented by
-/// digests and bounded structural summaries; only user/assistant conversation content follows the
-/// explicit text-preservation policy below.
-fn normalize_body(entry_type: EntryType, source_id: &str, value: Value) -> (Value, u64, u64, u64) {
-    let raw_bytes = serde_json::to_vec(&value).unwrap_or_default();
-    match entry_type {
-        EntryType::Message => (
-            json!({"message_id": pseudonym("message", value.get("message_id").and_then(Value::as_str).unwrap_or(source_id))}),
-            0,
-            omitted_keys(&value, &["message_id", "reply_to"]),
-            0,
-        ),
-        EntryType::Content => {
-            let media_type = value
-                .get("media_type")
-                .and_then(Value::as_str)
-                .unwrap_or("text/plain");
-            let text = value.get("text").and_then(Value::as_str).unwrap_or("");
-            let (text, redacted, truncated) = normalize_conversation_text(text);
-            (
-                json!({"media_type": media_type, "text": text}),
-                redacted,
-                omitted_keys(&value, &["media_type", "text", "attachment_id"]),
-                truncated,
-            )
-        }
-        EntryType::ToolCall => {
-            let raw_call = value
-                .get("call_id")
-                .and_then(Value::as_str)
-                .unwrap_or(source_id);
-            let arguments = value.get("arguments").cloned().unwrap_or(Value::Null);
-            let bytes = serde_json::to_vec(&arguments).unwrap_or_default();
-            (
-                json!({
-                    "call_id": pseudonym("call", raw_call),
-                    "name": safe_tool_name(value.get("name").and_then(Value::as_str)),
-                    "arguments": {"redacted": true, "sha256": hex_digest(&bytes), "bytes": bytes.len()}
-                }),
-                bytes.len() as u64,
-                omitted_keys(&value, &["call_id", "name", "arguments"]),
-                0,
-            )
-        }
-        EntryType::ToolResult => {
-            let raw_call = value
-                .get("call_id")
-                .and_then(Value::as_str)
-                .unwrap_or(source_id);
-            let content = value.get("content").cloned().unwrap_or(Value::Null);
-            let bytes = serde_json::to_vec(&content).unwrap_or_default();
-            (
-                json!({
-                    "call_id": pseudonym("call", raw_call),
-                    "status": if value.get("status").and_then(Value::as_str) == Some("error") {"error"} else {"success"},
-                    "media_type": "application/vnd.st3.redacted+json",
-                    "content": {"redacted": true, "sha256": hex_digest(&bytes), "bytes": bytes.len()}
-                }),
-                bytes.len() as u64,
-                omitted_keys(&value, &["call_id", "status", "media_type", "content"]),
-                0,
-            )
-        }
-        EntryType::Status => {
-            let status = value
-                .get("status")
-                .and_then(Value::as_str)
-                .filter(|status| {
-                    matches!(
-                        *status,
-                        "queued" | "running" | "waiting" | "completed" | "failed" | "cancelled"
-                    )
-                })
-                .unwrap_or("waiting");
-            let detail = value
-                .get("detail")
-                .and_then(Value::as_str)
-                .map(|detail| normalize_conversation_text(detail).0);
-            let mut body = json!({"status": status});
-            if let Some(detail) = detail {
-                body["detail"] = Value::String(detail);
-            }
-            (body, 0, omitted_keys(&value, &["status", "detail"]), 0)
-        }
-        EntryType::Error => (
-            json!({
-                "code": safe_error_code(value.get("code").and_then(Value::as_str)),
-                "message": "The harness reported an error.",
-                "retryable": value.get("retryable").and_then(Value::as_bool).unwrap_or(false),
-                "details": {"redacted": true, "sha256": hex_digest(&raw_bytes)}
-            }),
-            raw_bytes.len() as u64,
-            omitted_keys(&value, &["code", "message", "retryable", "details"]),
-            0,
-        ),
-        EntryType::Usage => {
-            let mut body = Map::new();
-            for key in [
-                "semantics",
-                "driver",
-                "model",
-                "provider",
-                "account",
-                "input_tokens",
-                "output_tokens",
-                "cached_tokens",
-                "cache_write_tokens",
-                "cache_write_1h_tokens",
-                "reasoning_tokens",
-                "turn_id",
-                "total_tokens",
-                "context_used_tokens",
-                "context_window_tokens",
-                "context_used_percent",
-                "cost",
-                "currency",
-            ] {
-                if let Some(value) = value.get(key).filter(|value| !value.is_null()) {
-                    body.insert(key.into(), value.clone());
-                }
-            }
-            let allowed = [
-                "semantics",
-                "driver",
-                "model",
-                "provider",
-                "account",
-                "input_tokens",
-                "output_tokens",
-                "cached_tokens",
-                "cache_write_tokens",
-                "cache_write_1h_tokens",
-                "reasoning_tokens",
-                "turn_id",
-                "total_tokens",
-                "context_used_tokens",
-                "context_window_tokens",
-                "context_used_percent",
-                "cost",
-                "currency",
-            ];
-            (Value::Object(body), 0, omitted_keys(&value, &allowed), 0)
-        }
-        EntryType::Redaction => (
-            json!({
-                "reason": value.get("reason").and_then(Value::as_str).unwrap_or("sensitive-content"),
-                "withheld_bytes": value.get("withheld_bytes").and_then(Value::as_u64).unwrap_or(raw_bytes.len() as u64),
-                "withheld_items": value.get("withheld_items").and_then(Value::as_u64).unwrap_or(0),
-            }),
-            0,
-            0,
-            0,
-        ),
-        EntryType::Truncation => (
-            json!({
-                "reason": value.get("reason").and_then(Value::as_str).unwrap_or("producer-bound"),
-                "omitted_from_sequence": value.get("omitted_from_sequence").and_then(Value::as_u64).unwrap_or(0),
-                "omitted_to_sequence": value.get("omitted_to_sequence").and_then(Value::as_u64).unwrap_or(0),
-            }),
-            0,
-            0,
-            0,
-        ),
-    }
-}
-
-fn omitted_keys(value: &Value, allowed: &[&str]) -> u64 {
-    value.as_object().map_or(0, |object| {
-        object
-            .keys()
-            .filter(|key| !allowed.contains(&key.as_str()))
-            .count() as u64
-    })
-}
-
-fn normalize_conversation_text(text: &str) -> (String, u64, u64) {
-    let original_chars = text.chars().count();
-    let bounded = text.chars().take(MAX_STRING_CHARS).collect::<String>();
-    let mut redacted_bytes = 0_u64;
-    let mut output = String::with_capacity(bounded.len());
-    let mut cursor = 0;
-    let mut redact_next = false;
-    let words = bounded.match_indices(|character: char| !character.is_whitespace());
-    for (start, _) in words {
-        if start < cursor {
-            continue;
-        }
-        let end = bounded[start..]
-            .find(char::is_whitespace)
-            .map_or(bounded.len(), |offset| start + offset);
-        let word = &bounded[start..end];
-        output.push_str(&bounded[cursor..start]);
-        let lower = word.to_ascii_lowercase();
-        let sensitive = redact_next
-            || lower.starts_with("sk-")
-            || lower.starts_with("ghp_")
-            || word.starts_with("AKIA")
-            || lower.starts_with("token=")
-            || lower.starts_with("password=")
-            || lower.starts_with("authorization=");
-        if sensitive {
-            redacted_bytes = redacted_bytes.saturating_add(word.len() as u64);
-            if let Some((prefix, _)) = word.split_once('=') {
-                output.push_str(prefix);
-                output.push_str("=[REDACTED]");
-            } else {
-                output.push_str("[REDACTED]");
-            }
-            redact_next = false;
-        } else {
-            output.push_str(word);
-            redact_next = lower == "bearer" || lower == "authorization:";
-        }
-        cursor = end;
-    }
-    output.push_str(&bounded[cursor..]);
-    (
-        output,
-        redacted_bytes,
-        original_chars.saturating_sub(MAX_STRING_CHARS) as u64,
-    )
-}
-
-fn safe_tool_name(value: Option<&str>) -> String {
-    value
-        .filter(|name| {
-            !name.is_empty()
-                && name.len() <= 128
-                && name
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/'))
-        })
-        .unwrap_or("unknown")
-        .to_owned()
-}
-
-fn safe_error_code(value: Option<&str>) -> String {
-    value
-        .filter(|code| {
-            !code.is_empty()
-                && code.len() <= 128
-                && code
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-        })
-        .unwrap_or("harness-error")
-        .to_owned()
+/// A single policy gates both legacy files and the durable outbox, before serialization.
+fn normalize_body(entry_type: EntryType, value: Value) -> Value {
+    capture_admission::sanitize_body(Producer::Driver, entry_type.as_str(), &value)
 }
 
 fn compact_to_bounds(record: &mut Record) -> Result<Vec<u8>> {
@@ -1451,7 +1213,167 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_stop_publishes_bounded_assistant_text_from_only_its_exact_transcript() {
+    fn credential_bearing_routing_fences_are_withheld_before_local_persistence() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = "invented-registered-routing-credential";
+        let mut writer = Writer::new(root.path(), "omp", fake);
+        writer.secret_registry.register(fake);
+        let error = writer.append("event", Role::Assistant, EntryType::Content, json!({"text":"control"}), true)
+            .unwrap_err();
+        assert!(!error.to_string().contains(fake));
+        assert!(!timeline_path(root.path()).exists());
+    }
+
+    #[test]
+    fn generated_live_tool_identities_keep_distinct_events_and_retry_idempotence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = Writer::new(root.path(), "omp", "inc-current");
+        for (suffix, failed) in [(1, false), (2, true)] {
+            let capture_id = format!("call/00000000-0000-4000-8000-{suffix:012}");
+            for event in ["tool_call", "tool_result"] {
+                let payload = capture_admission::sanitize_channel_payload(event, &json!({
+                    "capture_id": capture_id, "toolCallId": "invented-unregistered-native-id",
+                    "input": "invented-unregistered-body", "content": "invented-unregistered-body",
+                    "isError": failed,
+                }));
+                let frame = json!({"type":"timeline","event":event,"payload":payload});
+                observe_channel_frame(&mut writer, &frame).unwrap();
+                observe_channel_frame(&mut writer, &frame).unwrap();
+            }
+        }
+        let record = read(&timeline_path(root.path())).unwrap();
+        assert_eq!(record.operations.iter().filter(|entry| entry.entry_type == "tool_call").count(), 2);
+        let results = record.operations.iter().filter(|entry| entry.entry_type == "tool_result")
+            .map(|entry| entry.body["status"].as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(results, ["success", "error"]);
+        let stored = fs::read_to_string(timeline_path(root.path())).unwrap();
+        assert!(!stored.contains("invented-unregistered-native-id"));
+        assert!(!stored.contains("invented-unregistered-body"));
+    }
+
+    #[test]
+    fn live_scanner_failures_publish_only_fixed_withholding_not_successful_tool_results() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = Writer::new(root.path(), "omp", "inc-current");
+        for reason in ["scan-bound", "scanner-failure"] {
+            observe_channel_frame(&mut writer, &json!({
+                "type":"timeline","event":"tool_result",
+                "payload":{"policy_version":1,"withheld":true,"reason":reason},
+            })).unwrap();
+        }
+        let record = read(&timeline_path(root.path())).unwrap();
+        assert_eq!(record.operations.iter().map(|entry| (entry.entry_type.as_str(), entry.body["reason"].as_str()))
+            .collect::<Vec<_>>(), [("redaction", Some("scan-bound")), ("redaction", Some("scanner-failure"))]);
+    }
+
+    #[test]
+    fn appending_scrubs_legacy_text_and_digest_identifiers_without_breaking_transitions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let legacy = |revision: u64, final_entry: bool| Operation {
+            operation: if final_entry { "finalize".into() } else { "append".into() },
+            entry_id: "timeline-entry/legacy-raw-digest".into(),
+            sequence: 1, revision, role: "assistant".into(), entry_type: "content".into(),
+            final_entry, body: json!({"text":"invented-legacy-credential","sha256":"legacy-raw-digest"}),
+            driver: "omp".into(), incarnation_id: "test-runtime".into(), observed_at_unix_ms: 1,
+            source_id: Some("source/legacy-raw-digest".into()),
+        };
+        let record = Record { schema: SCHEMA.into(), driver: "omp".into(), incarnation_id: "test-runtime".into(),
+            next_sequence: 2, operations: vec![legacy(1,false),legacy(2,true)] };
+        fs::write(timeline_path(temporary.path()),serde_json::to_vec(&record).unwrap()).unwrap();
+        let mut writer = Writer::new(temporary.path(),"omp","test-runtime");
+        writer.append("new-status",Role::System,EntryType::Status,json!({"status":"waiting"}),true).unwrap();
+        let record = read(&timeline_path(temporary.path())).unwrap();
+        let content = record.operations.iter().filter(|op| op.entry_type == "content").collect::<Vec<_>>();
+        assert_eq!(content.len(),2); assert_eq!(content[0].entry_id,content[1].entry_id);
+        assert_eq!(content[0].source_id,content[1].source_id);
+        assert_eq!(content[0].sequence,content[1].sequence);
+        assert_eq!(content[1].revision,2); assert!(content[1].final_entry);
+        assert_eq!(content[0].body["withheld"],true); assert_eq!(content[1].body["withheld"],true);
+        let file = fs::read_to_string(timeline_path(temporary.path())).unwrap();
+        for rejected in ["invented-legacy-credential","legacy-raw-digest","sha256"] { assert!(!file.contains(rejected)); }
+    }
+
+    #[test]
+    fn credentials_and_raw_digests_never_reach_local_timeline_or_durable_outbox() {
+        for durable_outbox in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            if durable_outbox {
+                crate::harness_events::enable(temporary.path(), "test-runtime").unwrap();
+                let sequence = crate::harness_state::claim(
+                    temporary.path(), "example/seat", "omp", "test-runtime",
+                ).unwrap();
+                crate::harness_state::Writer::new(temporary.path(), "example/seat", "omp", None)
+                    .with_ownership("test-runtime", sequence)
+                    .observe(crate::harness_state::Observation::new(
+                        crate::harness_state::Activity::Active,
+                        crate::harness_state::BlockedOn::None,
+                        crate::harness_state::InputBuffer::Unknown,
+                    )).unwrap();
+            }
+            let mut writer = Writer::new(temporary.path(), "omp", "test-runtime");
+            writer.secret_registry.register("invented-registered-credential");
+            let fixtures = [
+                "invented-registered-credential", "invented-unregistered-credential",
+                "Authorization: Bearer invented-token", "https://user:invented-password@example.invalid",
+                "invented\\u002dregistered\\u002dcredential", "%69nvented%2dcredential",
+                "base64:aW52ZW50ZWQtY3JlZGVudGlhbA==", "hex:696e76656e7465642d63726564656e7469616c",
+            ];
+            for (index, secret) in fixtures.iter().enumerate() {
+                for entry_type in [EntryType::Content, EntryType::ToolCall, EntryType::ToolResult, EntryType::Error] {
+                    writer.append(
+                        format!("{secret}:{index}:{}", entry_type.as_str()),
+                        Role::Assistant, entry_type,
+                        json!({"text":secret,"arguments":{"env":secret},"content":secret,"details":secret,
+                            "status":"error","retryable":true,"duration_ms":31,"unknown":secret}),
+                        true,
+                    ).unwrap();
+                }
+            }
+            let oversized = format!("{}invented-tail-credential", "x".repeat(128 * 1024));
+            writer.append("oversize-source", Role::Tool, EntryType::ToolResult,
+                json!({"status":"error","content":oversized}), true).unwrap();
+            let record = read(&timeline_path(temporary.path())).unwrap();
+            let captured = serde_json::to_string(&record).unwrap();
+            for fixture in fixtures { assert!(!captured.contains(fixture)); }
+            for rejected in ["invented-tail-credential", "sha256", "raw_digest", "oversize-source"] {
+                assert!(!captured.contains(rejected));
+            }
+            assert!(record.operations.iter().filter(|op| op.entry_type == "tool_result")
+                .all(|op| op.body["status"] == "error"));
+            assert!(record.operations.iter().filter(|op| op.entry_type == "error")
+                .all(|op| op.body["retryable"] == true));
+            if durable_outbox {
+                let pending = crate::harness_events::pending(temporary.path(), 128).unwrap();
+                let exported = serde_json::to_string(&pending).unwrap();
+                for fixture in fixtures { assert!(!exported.contains(fixture)); }
+                assert!(!exported.contains("invented-tail-credential"));
+                assert!(!exported.contains("sha256"));
+            } else {
+                let file = fs::read_to_string(timeline_path(temporary.path())).unwrap();
+                assert_eq!(file.trim(), captured);
+            }
+        }
+    }
+
+    #[test]
+    fn generated_source_identity_is_bounded_and_does_not_survive_as_raw_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut writer = Writer::new(temporary.path(), "omp", "test-runtime");
+        for index in 0..1_025 {
+            writer.generated_source(&format!("invented-source-{index}"));
+        }
+        assert_eq!(writer.source_keys.len(), 1_024);
+        let a = writer.generated_source("invented-source-1024");
+        assert_eq!(a, writer.generated_source("invented-source-1024"));
+        let long = "invented-secret".repeat(100);
+        let first = writer.generated_source(&long);
+        assert_ne!(first, writer.generated_source(&long));
+        assert!(!writer.source_keys.contains_key(&long));
+        assert!(Uuid::parse_str(first.strip_prefix("source/").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn claude_stop_withholds_text_and_enforces_the_exact_transcript_fence() {
         let temporary = tempfile::tempdir().unwrap();
         let home = temporary.path().join("home");
         let projects = home.join(".claude/projects/workspace");
@@ -1474,7 +1396,11 @@ mod tests {
             .filter(|op| op.entry_type == "content")
             .collect::<Vec<_>>();
         assert_eq!(content.len(), 1);
-        assert_eq!(content[0].body["text"], "Final answer");
+        assert_eq!(content[0].body["withheld"], true);
+        let captured = serde_json::to_string(&record).unwrap();
+        for rejected in ["draft", "Final answer", "Foreign answer", "answer-1"] {
+            assert!(!captured.contains(rejected));
+        }
         let wrong = json!({"session_id":"different","transcript_path":transcript});
         assert!(observe_claude_stop_transcript(&mut writer, &wrong, &home).is_err());
     }
@@ -1524,12 +1450,10 @@ mod tests {
             .filter(|op| op.entry_type == "usage")
             .collect::<Vec<_>>();
         assert_eq!(usage.len(), 2);
-        assert_eq!(usage[0].body["turn_id"], "turn-a");
         assert_eq!(usage[0].body["output_tokens"], 5);
         assert_eq!(usage[0].body["cache_write_tokens"], 11);
         assert_eq!(usage[0].body["cached_tokens"], 13);
         assert_eq!(usage[0].body["total_tokens"], 36);
-        assert_eq!(usage[1].body["turn_id"], "turn-b");
     }
 
     #[test]
@@ -1569,8 +1493,6 @@ mod tests {
             .filter(|op| op.entry_type == "usage")
             .collect::<Vec<_>>();
         assert_eq!(usage.len(), 2);
-        assert_eq!(usage[0].body["turn_id"], "turn-a");
-        assert_eq!(usage[1].body["turn_id"], "turn-a");
         assert_eq!(usage[0].body["total_tokens"], 10);
         assert_eq!(usage[1].body["total_tokens"], 31);
     }
@@ -1590,7 +1512,6 @@ mod tests {
             .filter(|op| op.entry_type == "usage")
             .collect::<Vec<_>>();
         assert_eq!(usage.len(), 2);
-        assert_eq!(usage[0].body["model"], "gpt-example");
         assert_eq!(
             usage
                 .iter()
@@ -1631,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn operations_are_stable_revisable_bounded_and_redacted() {
+    fn generated_in_memory_identity_preserves_transitions_without_capturing_text() {
         let temporary = tempfile::tempdir().unwrap();
         let mut writer = Writer::new(temporary.path(), "codex", "inc-1");
         writer
@@ -1643,9 +1564,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        drop(writer);
-        let mut restarted = Writer::new(temporary.path(), "codex", "inc-1");
-        restarted
+        writer
             .append(
                 "stream-1",
                 Role::Assistant,
@@ -1654,7 +1573,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        restarted
+        writer
             .append(
                 "stream-1",
                 Role::Assistant,
@@ -1675,16 +1594,8 @@ mod tests {
         assert_eq!(content[0].entry_id, content[1].entry_id);
         assert_eq!(content[0].sequence, content[1].sequence);
         assert_eq!(content[1].revision, 2);
-        assert_eq!(
-            content[1].body["text"],
-            "# Done\n\n  indented  text\nBearer [REDACTED]\n```sh\ntrue\n```"
-        );
-        assert!(
-            record
-                .operations
-                .iter()
-                .any(|op| op.entry_type == "redaction")
-        );
+        assert_eq!(content[0].body["withheld"], true);
+        assert_eq!(content[1].body["withheld"], true);
         let bytes = fs::read(timeline_path(temporary.path())).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("plaintext"));
         assert!(!String::from_utf8_lossy(&bytes).contains("stream-1"));
@@ -1713,7 +1624,6 @@ mod tests {
         let codex_dir = temporary.path().join("codex");
         let mut codex = Writer::new(&codex_dir, "codex", "codex-inc");
         let codex_fixture = fixture("codex");
-        assert_eq!(codex_fixture["provenance"]["version"], "0.146.0");
         for event in codex_fixture["events"].as_array().unwrap() {
             observe_codex(
                 &mut codex,
@@ -1749,7 +1659,6 @@ mod tests {
         let claude_dir = temporary.path().join("claude");
         let mut claude = Writer::new(&claude_dir, "claude", "claude-inc");
         let claude_fixture = fixture("claude");
-        assert_eq!(claude_fixture["provenance"]["harness"], "claude");
         for event in claude_fixture["events"].as_array().unwrap() {
             observe_claude(
                 &mut claude,
@@ -1773,7 +1682,6 @@ mod tests {
         let pi_dir = temporary.path().join("pi");
         let mut pi = Writer::new(&pi_dir, "pi", "pi-inc");
         let pi_fixture = fixture("pi");
-        assert_eq!(pi_fixture["provenance"]["version"], "0.84.2");
         for frame in pi_fixture["frames"].as_array().unwrap() {
             observe_channel_frame(&mut pi, frame).unwrap();
         }
@@ -1782,14 +1690,12 @@ mod tests {
             pi_record
                 .operations
                 .iter()
-                .any(|op| op.entry_type == "content"
-                    && op.body["text"] == "## Result\n\nExact  spacing\ntoken=[REDACTED]")
+                .any(|op| op.entry_type == "content" && op.body["withheld"] == true)
         );
 
         let omp_dir = temporary.path().join("omp");
         let mut omp = Writer::new(&omp_dir, "omp", "omp-inc");
         let omp_fixture = fixture("omp");
-        assert_eq!(omp_fixture["provenance"]["version"], "18.1.7");
         for frame in omp_fixture["frames"].as_array().unwrap() {
             observe_channel_frame(&mut omp, frame).unwrap();
         }
@@ -1880,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_usage_records_disjoint_buckets_and_the_paying_account() {
+    fn codex_usage_preserves_disjoint_buckets_but_withholds_identity_labels() {
         let temporary = tempfile::tempdir().unwrap();
         let mut writer = Writer::new(temporary.path(), "codex", "inc-current")
             .with_model(Some("gpt-example".into()))
@@ -1896,15 +1802,15 @@ mod tests {
         assert_eq!(usage[0]["output_tokens"], 50);
         assert_eq!(usage[0]["reasoning_tokens"], 20);
         assert_eq!(usage[0]["total_tokens"], 1050);
-        assert_eq!(usage[0]["account"], "codex/aaaaaaaaaaaaaaaa");
-        assert_eq!(
-            usage[1]["account"], "codex/bbbbbbbbbbbbbbbb",
-            "an account change applies to later responses only"
-        );
+        for body in &usage {
+            assert!(body.get("account").is_none());
+            assert!(body.get("model").is_none());
+            assert!(body.get("turn_id").is_none());
+        }
     }
 
     #[test]
-    fn channel_usage_keeps_model_cache_and_the_harness_cost() {
+    fn channel_usage_preserves_cache_counts_and_reported_cost() {
         let temporary = tempfile::tempdir().unwrap();
         let mut writer = Writer::new(temporary.path(), "omp", "inc-current");
         observe_channel_frame(
@@ -1920,7 +1826,6 @@ mod tests {
         .unwrap();
         let usage = usage_bodies(temporary.path());
         assert_eq!(usage.len(), 2);
-        assert_eq!(usage[0]["model"], "claude-example");
         assert_eq!(usage[0]["provider"], "anthropic");
         assert_eq!(usage[0]["cached_tokens"], 500);
         assert_eq!(usage[0]["cache_write_tokens"], 60);
@@ -1961,7 +1866,6 @@ mod tests {
         assert_eq!(usage[0]["cache_write_tokens"], 400);
         assert_eq!(usage[0]["cache_write_1h_tokens"], 300);
         assert_eq!(usage[0]["total_tokens"], 5432);
-        assert_eq!(usage[0]["account"], "claude/cccccccccccccccc");
     }
 
     #[test]
@@ -1995,7 +1899,6 @@ mod tests {
         observe_claude_stop_transcript(&mut writer, &payload, &home).unwrap();
         let usage = usage_bodies(&agent);
         assert_eq!(usage.len(), 2);
-        assert_eq!(usage[1]["turn_id"], "subagent:a1");
         assert_eq!(usage[1]["total_tokens"], 111);
 
         let mut file = fs::OpenOptions::new().append(true).open(&subagent).unwrap();

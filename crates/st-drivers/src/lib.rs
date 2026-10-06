@@ -13,6 +13,7 @@
 //! each declaration's command, environment, hooks, and workspace materialization block.
 
 pub mod account;
+pub mod capture_admission;
 pub mod catalog;
 pub mod catalog_archive;
 pub mod catalog_lock;

@@ -3202,6 +3202,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("signals", required_object()),
         ],
         "harness.timeline" => &[
+            ("policy_version", integer()),
+            ("account_ref", string()),
             (
                 "operation",
                 required_enum(&["append", "replace", "finalize"]),

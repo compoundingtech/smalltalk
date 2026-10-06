@@ -415,7 +415,8 @@ async fn conversation_page(
                 },
             )
             .await
-            .map_err(|error| remote_read_error(owner, error));
+            .map_err(|error| relay_conversation_error(owner, error))
+            .and_then(|value| admitted_relay_conversation(state,session,session_id,owner,value));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
     tokio::task::spawn_blocking(move || {
@@ -463,7 +464,8 @@ async fn conversation_changes_value(
                 },
             )
             .await
-            .map_err(|error| remote_read_error(owner, error));
+            .map_err(|error| relay_conversation_error(owner, error))
+            .and_then(|value| admitted_relay_conversation(state,session,session_id,owner,value));
     }
     conversation_changes_local(state, session, session_id, after, wait_ms).await
 }
@@ -3761,6 +3763,139 @@ fn session_message_body(claim: &ClaimRecord) -> Value {
     body
 }
 
+fn admitted_native_timeline_item(item: &Value) -> Value {
+    let fields = st_drivers::capture_admission::sanitize_timeline_fields(&json!({
+        "policy_version": item.get("policy_version"),
+        "operation": "append",
+        "entry_id": item.get("id"),
+        "sequence": item.get("sequence"),
+        "revision": item.get("revision"),
+        "role": item.get("role"),
+        "entry_type": item.get("type"),
+        "final": item.get("final"),
+        "body": item.get("body"),
+        "driver": "unknown",
+        "incarnation_id": "withheld",
+    }));
+    let timestamp = item.get("timestamp").and_then(Value::as_str)
+        .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+        .map(|stamp| stamp.to_rfc3339());
+    json!({
+        "source": "harness.timeline",
+        "policy_version": st_drivers::capture_admission::POLICY_VERSION,
+        "id": fields["entry_id"],
+        "sequence": fields["sequence"],
+        "revision": fields["revision"],
+        "timestamp": timestamp,
+        "role": fields["role"],
+        "type": fields["entry_type"],
+        "final": fields["final"],
+        "body": fields["body"],
+    })
+}
+
+fn relay_conversation_error(host: &str, error: anyhow::Error) -> ApiError {
+    let Ok(rejected) = error.downcast::<crate::peer::ClientReadRejected>() else {
+        return remote_unavailable(host);
+    };
+    let status = match rejected.code.as_str() {
+        "page-cursor-expired" | "timeline-history-incomplete" | "cursor-gap" => StatusCode::GONE,
+        "not-found" => StatusCode::NOT_FOUND,
+        "stale-fence" | "idempotency-conflict" => StatusCode::CONFLICT,
+        "validation-failed" => StatusCode::UNPROCESSABLE_ENTITY,
+        "forbidden" => StatusCode::FORBIDDEN,
+        _ => return remote_unavailable(host),
+    };
+    let mut details = serde_json::Map::new();
+    details.insert("owner_host_id".into(),json!(host));
+    if let Some(full_resync) = rejected.details.get("full_resync").and_then(Value::as_bool) {
+        details.insert("full_resync".into(),json!(full_resync));
+    }
+    ApiError {
+        status,code:rejected.code,
+        message:"the conversation owner could not provide an admitted response".into(),
+        details:Box::new(details),
+    }
+}
+
+/// Admit origin-owned capture independently. Origin source labels are not authority.
+fn admitted_relay_conversation(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    owner: &str,
+    mut value: Value,
+) -> Result<Value, ApiError> {
+    let snapshot = new_client_snapshot(state);
+    let query = ClientListQuery { limit: Some(200), ..Default::default() };
+    let mut authoritative = Vec::new();
+    if let Ok(page) = timeline_value(state,&snapshot,session,session_id,&query) {
+        authoritative.extend(page.0["items"].as_array().into_iter().flatten()
+            .filter(|row| row["source"] != "harness.timeline").cloned());
+    }
+    // Native and claim-backed pages use different mail IDs, both generated
+    // from gateway message.sent claims rather than origin assertions.
+    if let Ok(page) = native_timeline_page(state,&snapshot,session_id,&query,Vec::new()) {
+        authoritative.extend(page.0["items"].as_array().into_iter().flatten().cloned());
+    }
+    let rows = value.get_mut("items").and_then(Value::as_array_mut)
+        .ok_or_else(|| validation("the origin conversation has an invalid shape"))?;
+    let mut withheld = false;
+    for row in rows {
+        if let Some(trusted) = authoritative.iter().find(|trusted| {
+            trusted["id"].as_str().is_some() && trusted["id"] == row["id"]
+                && trusted["type"] == row["type"]
+        }) {
+            withheld |= *row != *trusted;
+            *row = trusted.clone();
+            continue;
+        }
+        let admitted = admitted_native_timeline_item(row);
+        withheld |= *row != admitted;
+        *row = admitted;
+    }
+    // Opaque page cursors digest the origin's whole pre-preview collection,
+    // including rows not supplied here. The gateway cannot prove their admission.
+    if let Some(page) = value.get_mut("page").and_then(Value::as_object_mut) {
+        let cursor_withheld = page.remove("next_cursor").is_some();
+        page.remove("cursor_expires_at");
+        page.retain(|key,_| matches!(key.as_str(),"limit" | "has_more"));
+        let limit = page.get("limit").and_then(Value::as_u64).unwrap_or(200).min(200);
+        let has_more = page.get("has_more").and_then(Value::as_bool).unwrap_or(true);
+        page.insert("limit".into(),json!(limit));
+        page.insert("has_more".into(),json!(has_more));
+        if withheld || cursor_withheld {
+            page.insert("capture_withheld".into(),Value::Bool(true));
+        }
+    }
+    if let Some(cursor) = value.get("next_cursor") {
+        let prefix = format!("conversation-cursor/{}/{}/",
+            owner.strip_prefix("host/").unwrap_or(owner),
+            session_id.trim_start_matches("session/"));
+        let valid = cursor.as_str().and_then(|cursor| cursor.strip_prefix(&prefix))
+            .is_some_and(|position| {
+                let mut parts = position.split('.');
+                (0..3).all(|_| parts.next().is_some_and(|part| {
+                    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                        && part.parse::<u64>().is_ok()
+                })) && parts.next().is_none()
+            });
+        if !valid {
+            return Err(validation("the origin conversation cursor is withheld"));
+        }
+    }
+    if value.get("page").is_some_and(|page| !page.is_object()) {
+        return Err(validation("the origin conversation page is withheld"));
+    }
+    let paged = value.get("page").is_some_and(Value::is_object);
+    let response = value.as_object_mut()
+        .ok_or_else(|| validation("the origin conversation has an invalid shape"))?;
+    response.retain(|key,_| matches!(key.as_str(),"items" | "page" | "next_cursor"));
+    response.insert("kind".into(),json!(if paged { "timeline-page" } else { "conversation-changes" }));
+    response.insert("session_id".into(),json!(session_id));
+    Ok(value)
+}
+
 fn native_timeline_page(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -3768,6 +3903,9 @@ fn native_timeline_page(
     query: &ClientListQuery,
     mut items: Vec<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    for item in &mut items {
+        *item = admitted_native_timeline_item(item);
+    }
     if let Some((owner, incarnation, _)) =
         super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
@@ -3911,45 +4049,28 @@ fn managed_transcript(
     }))
 }
 
-/// The timeline entry that says a managed seat's native transcript is not shown, and why.
-/// A timeline entry saying why the seat's transcript is not shown. When st3 bound the transcript
-/// but could not read it, the entry names the file, so the failure can be reported.
-fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str) -> Value {
+/// A fixed availability notice: never expose provider paths or diagnostic text.
+fn transcript_notice(session_id: &str, managed: &ManagedTranscript, _reason: &str) -> Value {
     let anchor = &managed.anchor;
-    let mut details = json!({ "driver": managed.driver, "claim_id": anchor.id });
-    match &managed.transcript {
-        Ok(external) => {
-            details["transcript"] = Value::String(external.transcript.display().to_string());
-        }
-        // Nothing has gone wrong: the seat has said nothing since it started.
-        Err(missing) if missing.not_yet => details["not_yet"] = Value::Bool(true),
-        Err(_) => {}
-    }
     let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
-    let digest = hex::encode(Sha256::digest(
-        format!("{}:transcript-not-bound", anchor.id).as_bytes(),
-    ));
     json!({
-        "id": format!("timeline-entry/{}/{}", session_id.trim_start_matches("session/"), &digest[..24]),
-        // Slot 2 of the observation's four sequence slots is otherwise unused.
+        "id": format!("timeline-entry/{}/transcript-unavailable", session_id.trim_start_matches("session/")),
         "sequence": anchor.store_index.saturating_mul(4).saturating_add(2),
         "revision": 1,
         "timestamp": client_timestamp(
-            fields
-                .get("observed_at_unix_ms")
-                .and_then(Value::as_u64)
-                .map(u128::from)
-                .unwrap_or(anchor.accepted_at_unix_ms),
+            fields.get("observed_at_unix_ms").and_then(Value::as_u64)
+                .map(u128::from).unwrap_or(anchor.accepted_at_unix_ms),
         ),
-        "role": "system",
-        "type": "error",
-        "final": true,
+        "role": "system", "type": "error", "final": true,
         "body": {
             "code": "transcript-not-bound",
-            "message": format!("transcript not bound: {reason}"),
+            "message": "native transcript is unavailable",
             "retryable": true,
-            "details": details
-        }
+            "details": {
+                "driver": managed.driver,
+                "not_yet": managed.transcript.as_ref().err().is_some_and(|missing| missing.not_yet),
+            },
+        },
     })
 }
 
@@ -4418,12 +4539,14 @@ pub(super) fn timeline_value(
             let tool_order_valid = if entry_type == "tool_result" {
                 body.get("call_id")
                     .and_then(Value::as_str)
-                    .is_some_and(|call_id| tool_calls.contains(call_id))
+                    .is_none_or(|call_id| tool_calls.contains(call_id))
             } else {
                 true
             };
             if !transition_valid || !tool_order_valid {
                 items.push(json!({
+                    "source": "harness.timeline",
+                    "policy_version": st_drivers::capture_admission::POLICY_VERSION,
                     "id": entry_id(&claim, "invalid-transition"),
                     "sequence": sequence,
                     "revision": 1,
@@ -4433,9 +4556,8 @@ pub(super) fn timeline_value(
                     "final": true,
                     "body": {
                         "code": "invalid-timeline-transition",
-                        "message": format!("driver timeline entry `{id}` has an invalid {operation} transition"),
-                        "retryable": false,
-                        "details": { "claim_id": claim.id }
+                        "message": "driver timeline entry has an invalid transition",
+                        "retryable": false
                     }
                 }));
                 continue;
@@ -4448,6 +4570,8 @@ pub(super) fn timeline_value(
             if operation == "append" {
                 explicit.insert(id.to_owned(), items.len());
                 items.push(json!({
+                    "source": "harness.timeline",
+                    "policy_version": st_drivers::capture_admission::POLICY_VERSION,
                     "id": id,
                     "sequence": sequence,
                     "revision": revision,
@@ -4461,6 +4585,8 @@ pub(super) fn timeline_value(
                 let sequence = items[index]["sequence"].clone();
                 let original_timestamp = items[index]["timestamp"].clone();
                 items[index] = json!({
+                    "source": "harness.timeline",
+                    "policy_version": st_drivers::capture_admission::POLICY_VERSION,
                     "id": id,
                     "sequence": sequence,
                     "revision": revision,
@@ -5203,18 +5329,18 @@ pub(super) async fn conversation_changes(
                 .read(
                     &owner,
                     &crate::peer::ClientReadRequest {
-                        authority_actor: session.authority_actor,
+                        authority_actor: session.authority_actor.clone(),
                         relay: None,
                         request: crate::peer::ClientReadOperation::ConversationChanges {
-                            session_id,
+                            session_id: session_id.clone(),
                             after: query.after,
                             wait_ms: query.wait_ms.unwrap_or(0).min(30_000),
                         },
                     },
                 )
                 .await
-                .map_err(|error| remote_read_error(&owner, error))?;
-            return Ok(Json(value));
+                .map_err(|error| relay_conversation_error(&owner, error))?;
+            return admitted_relay_conversation(&state,&session,&session_id,&owner,value).map(Json);
         }
     }
     conversation_changes_local(
@@ -5313,7 +5439,8 @@ async fn conversation_stream_socket(
                         },
                     )
                     .await
-                    .map_err(|error| remote_read_error(owner, error))
+                    .map_err(|error| relay_conversation_error(owner, error))
+                    .and_then(|value| admitted_relay_conversation(&state,&session,&session_id,owner,value))
             } else {
                 conversation_changes_local(
                     &state,
@@ -5453,11 +5580,10 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
     }
     let fields = record.body.get("fields").unwrap_or(&record.body);
     if record.kind == "harness.timeline" {
-        let resource_ids = fields
-            .get("incarnation_id")
-            .and_then(Value::as_str)
-            .map(|incarnation| vec![client_session_id(&record.subject, incarnation)])
-            .unwrap_or_default();
+        // Event bodies may predate admission. Derive the invalidation target from
+        // the graph's current session, never a hash of provider-supplied routing text.
+        let resource_ids = conversation_session_id(state, &record.subject)
+            .ok().into_iter().collect();
         return (
             "upsert".into(),
             resource_ids,
@@ -13167,7 +13293,7 @@ mission "example/zero-run" state="ready" {
             .await
             .unwrap();
         assert_eq!(replay["items"].as_array().unwrap().len(), 1);
-        assert_eq!(replay["items"][0]["body"]["text"], "reply");
+        assert_eq!(replay["items"][0]["body"]["withheld"],true);
         assert!(
             conversation_changes_local(&follower, &session, &session_id, Some(resume), 0)
                 .await
@@ -13450,7 +13576,7 @@ mission "example/zero-run" state="ready" {
     }
 
     #[test]
-    fn managed_codex_session_renders_its_exact_native_chat_not_only_status() {
+    fn managed_codex_session_withholds_native_credentials_and_follows_safe_identity() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let transcript = home.join(".codex/sessions/2026/09/24/managed.jsonl");
@@ -13464,7 +13590,7 @@ mission "example/zero-run" state="ready" {
             format!(
                 "{}\n{}\n",
                 json!({"type":"session_meta","timestamp":"2026-09-24T12:00:00Z","payload":{"id":native_id,"cwd":root.path(),"source":"test"}}),
-                json!({"type":"response_item","timestamp":"2026-09-24T12:00:01Z","payload":{"type":"message","role":"assistant","id":"answer","content":[{"type":"output_text","text":"Exact managed transcript"}]}}),
+                json!({"type":"response_item","timestamp":"2026-09-24T12:00:01Z","payload":{"type":"message","role":"assistant","id":"invented-api-credential-1449","content":[{"type":"output_text","text":"invented-api-credential-1449"}],"unknown":"invented-api-credential-1449"}}),
             ),
         )
         .unwrap();
@@ -13531,6 +13657,16 @@ mission "example/zero-run" state="ready" {
         let snapshot = new_client_snapshot(&state);
         let session = ClientSession::local(Some("person/alex")).unwrap();
         let session_id = super::managed_session_id(owner, incarnation);
+        let projected = safe_event_projection(&state, &EventRecord {
+            store_index: 1,
+            kind: "harness.timeline".into(),
+            subject: owner.into(),
+            body: json!({"fields":{"incarnation_id":"invented-api-credential-1449"}}),
+        });
+        assert_eq!(projected.1, [session_id.clone()]);
+        assert!(!serde_json::to_string(&projected).unwrap().contains(
+            &client_session_id(owner,"invented-api-credential-1449"),
+        ));
         let timeline = timeline_value(
             &state,
             &snapshot,
@@ -13541,9 +13677,12 @@ mission "example/zero-run" state="ready" {
         .unwrap()
         .0;
         assert!(timeline["items"].as_array().unwrap().iter().any(|item| {
-            item["type"] == "content" && item["body"]["text"] == "Exact managed transcript"
+            item["type"] == "content" && item["body"]["withheld"] == true
         }));
+        assert!(!timeline.to_string().contains("invented-api-credential-1449"));
+        assert!(!timeline.to_string().contains(&hex::encode(Sha256::digest(b"invented-api-credential-1449"))));
         let baseline = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        assert!(!baseline.to_string().contains("invented-api-credential-1449"));
         let baseline_cursor = baseline["next_cursor"].as_str().unwrap();
         state
             .store
@@ -13571,13 +13710,9 @@ mission "example/zero-run" state="ready" {
         writeln!(std::fs::OpenOptions::new().append(true).open(&transcript).unwrap(), "{}", json!({"type":"response_item","timestamp":"2026-09-24T12:00:02Z","payload":{"type":"message","role":"assistant","id":"later","content":[{"type":"output_text","text":"Native reply"}]}})).unwrap();
         let native_update =
             conversation_read_now(&state, &session, &session_id, Some(message_cursor)).unwrap();
-        assert!(
-            native_update["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| item["body"]["text"] == "Native reply")
-        );
+        assert!(native_update["items"].as_array().unwrap().iter()
+            .any(|item|item["type"] == "content" && item["body"]["withheld"] == true));
+        assert!(!native_update.to_string().contains("invented-api-credential-1449"));
         // A full replay page still resumes after hundreds of unrelated graph commits.
         let mut writer = std::fs::OpenOptions::new()
             .append(true)
@@ -13653,17 +13788,8 @@ mission "example/zero-run" state="ready" {
                     .find(|item| item["body"]["code"] == "transcript-not-bound")
                     .cloned()
                     .expect("an unreadable transcript is named");
-                assert_eq!(
-                    notice["body"]["details"]["transcript"],
-                    transcript.display().to_string()
-                );
-                assert!(
-                    notice["body"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .starts_with("transcript not bound: the transcript could not be read"),
-                    "{notice:#}"
-                );
+                assert!(notice["body"]["details"].get("transcript").is_none());
+                assert!(!notice.to_string().contains(&transcript.display().to_string()));
             }
             std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
@@ -13781,12 +13907,7 @@ mission "example/zero-run" state="ready" {
             .unwrap()
             .transcript
             .unwrap();
-        let timeline = crate::external_sessions::normalized_timeline(&exact).unwrap();
-        assert!(
-            timeline
-                .iter()
-                .any(|entry| entry["body"]["text"] == "Current Claude answer")
-        );
+        assert_eq!(exact.native_id,native_id);
         assert!(
             super::managed_transcript(&state, owner, "native-pty:old")
                 .unwrap()
@@ -13893,18 +14014,6 @@ mission "example/zero-run" state="ready" {
         assert_eq!(notice["type"], "error");
         assert_eq!(notice["role"], "system");
         assert_eq!(notice["body"]["details"]["driver"], "claude");
-        assert!(
-            notice["body"]["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("transcript not bound: the SessionStart hook did not bind"),
-            "{notice:#}"
-        );
-        assert!(
-            !unbound
-                .iter()
-                .any(|item| item["body"]["text"] == "Recovered without the hook")
-        );
 
         // The live driver named by the evidence proves its Claude child's session.
         #[cfg(target_os = "linux")]
@@ -13913,12 +14022,6 @@ mission "example/zero-run" state="ready" {
             fake.record_session(&home, native_id, None);
             observe(&fake.token());
             let bound = timeline();
-            assert!(
-                bound
-                    .iter()
-                    .any(|item| item["body"]["text"] == "Recovered without the hook"),
-                "{bound:#?}"
-            );
             assert!(
                 !bound
                     .iter()
@@ -13993,18 +14096,7 @@ mission "example/zero-run" state="ready" {
             .unwrap();
         assert_eq!(exact.native_id, "current");
         let timeline = crate::external_sessions::normalized_timeline(&exact).unwrap();
-        assert!(
-            timeline
-                .iter()
-                .any(|entry| entry["body"]["text"] == "Saved OMP answer")
-        );
         assert!(timeline.iter().any(|entry| entry["type"] == "tool_call"));
-        assert!(
-            timeline
-                .iter()
-                .any(|entry| entry["role"] == "tool"
-                    && entry["body"]["text"] == "{\"presence\":null}")
-        );
         assert!(
             super::managed_transcript(&state, owner, "123:2026-09-25T14:00:00Z")
                 .unwrap()
@@ -14099,13 +14191,6 @@ mission "example/zero-run" state="ready" {
                 .0
             };
             let before = timeline();
-            assert!(
-                before["items"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|entry| entry["body"]["text"] == "Seat A's bound conversation")
-            );
             // Another seat writes a newer session into the same linked directory.
             write_session(
                 &legacy.join(format!("2026-09-25T16-00-00-000Z_{sibling_id}.jsonl")),
@@ -14120,17 +14205,6 @@ mission "example/zero-run" state="ready" {
                 sibling_id,
                 "2026-09-25T14:00:00Z",
                 "Replaced transcript",
-            );
-            let missing = timeline();
-            assert!(
-                missing["items"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(
-                        |entry| entry["body"]["text"] != "Seat B's unrelated conversation"
-                            && entry["body"]["text"] != "Replaced transcript"
-                    )
             );
             assert!(
                 managed_transcript(&state, owner, incarnation)
@@ -14231,8 +14305,10 @@ mission "example/zero-run" state="ready" {
                         role: &str,
                         entry_type: &str,
                         final_entry: bool,
-                        body: Value| {
+                        mut body: Value| {
+            body["policy_version"] = json!(1);
             BTreeMap::from([
+                ("policy_version".into(),json!(1)),
                 ("operation".into(), Value::String(operation.into())),
                 ("entry_id".into(), Value::String(entry_id.into())),
                 ("revision".into(), Value::from(revision)),
@@ -14491,14 +14567,14 @@ mission "example/zero-run" state="ready" {
         );
         let final_content = entries
             .iter()
-            .find(|entry| entry["id"] == "timeline-entry/provider-content")
+            .find(|entry| entry["id"] == "native/100")
             .unwrap();
         assert_eq!(final_content["revision"], 3);
         assert_eq!(final_content["final"], true);
-        assert_eq!(final_content["body"]["text"], "final");
+        assert_eq!(final_content["body"]["withheld"],true);
         let inferred_usage = entries
             .iter()
-            .find(|entry| entry["id"] == "timeline-entry/usage-without-source-semantics")
+            .find(|entry| entry["id"] == "native/107")
             .unwrap();
         assert_eq!(inferred_usage["body"]["semantics"], "response");
         assert_eq!(inferred_usage["body"]["driver"], "codex");
@@ -14506,7 +14582,7 @@ mission "example/zero-run" state="ready" {
         assert!(
             entries
                 .iter()
-                .all(|entry| entry["id"] != "timeline-entry/wrong-incarnation"),
+                .all(|entry| entry["id"] != "native/101"),
             "explicit timeline claims are fenced to the live incarnation"
         );
         assert!(entries.windows(2).all(|pair| {
@@ -14621,11 +14697,14 @@ mission "example/zero-run" state="ready" {
             "status":"running", "runtime_id":"physical-retention-runtime",
             "incarnation_id":incarnation, "terminal":false,
         }));
-        let entry = |sequence, entry_type, body| json!({
-            "operation":"append", "entry_id":format!("timeline-entry/physical-{sequence}"),
-            "sequence":sequence, "revision":1, "role":"system", "entry_type":entry_type,
-            "final":true, "body":body, "driver":"codex", "incarnation_id":incarnation,
-        });
+        let entry = |sequence, entry_type, mut body: Value| {
+            body["policy_version"] = json!(1);
+            json!({
+                "policy_version":1,"operation":"append","entry_id":format!("native/{sequence}"),
+                "sequence":sequence,"revision":1,"role":"system","entry_type":entry_type,
+                "final":true,"body":body,"driver":"codex","incarnation_id":incarnation,
+            })
+        };
         append("harness.timeline", entry(3, "status", json!({"status":"running"})));
         let session = ClientSession::local(None).unwrap();
         let read = || {
@@ -14716,15 +14795,18 @@ mission "example/zero-run" state="ready" {
             chrono::DateTime::parse_from_rfc3339(&new_client_snapshot(&state).created_at)
                 .unwrap().timestamp_millis(),
         ).unwrap() + 1_000;
-        let entry = |sequence: u64, entry_type: &str, body: Value| ClaimInput {
+        let entry = |sequence: u64, entry_type: &str, mut body: Value| {
+            body["policy_version"] = json!(1);
+            ClaimInput {
             subject: subject.into(),
             kind: "harness.timeline".into(),
             actor: Some(subject.into()),
             fields: BTreeMap::from([
+                ("policy_version".into(),json!(1)),
                 ("operation".into(), Value::String("append".into())),
                 (
                     "entry_id".into(),
-                    Value::String(format!("timeline-entry/retention-{sequence}")),
+                    Value::String(format!("native/{sequence}")),
                 ),
                 ("sequence".into(), Value::from(sequence)),
                 ("revision".into(), Value::from(1)),
@@ -14739,6 +14821,7 @@ mission "example/zero-run" state="ready" {
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: Some(format!("timeline-retention-{sequence}")),
+            }
         };
         // One entry more than a timeline read returns, in one commit: a commit for each entry
         // took minutes on a busy disk.
@@ -14799,7 +14882,7 @@ mission "example/zero-run" state="ready" {
             item["timestamp"].as_str() <= notice["timestamp"].as_str()
         }), "a projection notice cannot become the oldest scroll-back boundary");
         assert!(page["items"].as_array().unwrap().iter().any(|item| {
-            item["id"] == "timeline-entry/retention-4097"
+            item["id"] == "native/4097"
         }));
         let mut update = entry(1, "status", json!({"status":"waiting", "detail":"old entry updated"}));
         update.fields.insert("operation".into(), json!("replace"));
@@ -15402,6 +15485,140 @@ mission "example/zero-run" state="ready" {
         assert!(!stored.contains(capability));
         assert!(!stored.contains("st3.cap."));
         assert!(!stored.contains("stream_capability"));
+    }
+
+    #[tokio::test]
+    async fn relay_conversations_recheck_capture_and_reconstruct_graph_mail() {
+        const FAKE: &str = "invented-relay-origin-credential-1449";
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let owner = test_state_named(owner_root.path(),"owner-node");
+        let mut gateway = test_state_named(gateway_root.path(),"gateway-node");
+        let agent = "agent/relay-capture";
+        let incarnation = "native-pty:relay-capture";
+        let session_id = super::managed_session_id(agent,incarnation);
+        for (subject,kind,fields) in [
+            (agent,"runtime.observed",json!({
+                "runtime_id":"relay-capture","incarnation_id":incarnation,"status":"running",
+            })),
+            ("message/relay-authored","message.sent",json!({
+                "from":"person/alex","to":agent,"session_id":session_id,
+                "content":"Authored Smalltalk mail survives the capture gate.",
+            })),
+        ] {
+            owner.store.append_claim(&ClaimInput {
+                subject:subject.into(),kind:kind.into(),actor:Some("person/alex".into()),
+                fields:serde_json::from_value(fields).unwrap(),evidence:Vec::new(),
+                expected_subject:None,idempotency_key:None,
+            }).unwrap();
+        }
+        gateway.store.import_replication("owner-node",&owner.store.export_replication(0).unwrap()).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let mut raw = native_timeline_page(
+            &owner,&new_client_snapshot(&owner),&session_id,&ClientListQuery::default(),Vec::new(),
+        ).unwrap().0;
+        let rows = raw["items"].as_array_mut().unwrap();
+        let mail_id = rows.iter().find(|row| row["type"] == "content").unwrap()["id"].clone();
+        // Even an existing graph mail ID does not make origin-provided content authoritative.
+        rows.iter_mut().find(|row| row["id"] == mail_id).unwrap()["body"]["text"] = json!(FAKE);
+        rows.push(json!({
+            "id":FAKE,"source":"smalltalk.mail","sequence":700,"revision":1,
+            "role":"assistant","type":"content","final":true,
+            "body":{"text":FAKE,"coverage":true},
+        }));
+        rows.push(json!({
+            "id":"native/701","source":"harness.timeline","policy_version":1,
+            "sequence":701,"revision":1,"role":"assistant","type":"content","final":true,
+            "body":{"policy_version":1,"text":FAKE,"coverage":true},
+        }));
+        raw["page"]["next_cursor"] = json!(hex::encode(Sha256::digest(FAKE.as_bytes())));
+        raw["session_id"] = json!(FAKE);
+        raw["diagnostic"] = json!(FAKE);
+        raw["page"]["diagnostic"] = json!(FAKE);
+        let secret = gateway_root.path().join("fleet-secret");
+        std::fs::write(&secret,[7_u8;32]).unwrap();
+        std::fs::set_permissions(&secret,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let auth = smallclaims::sync::FleetAuth::load("fleet-test",&secret).unwrap();
+        let cursor_session = session_id.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route("/v1/peer/client-read",axum::routing::post(
+            move |body: axum::body::Bytes| {
+                let (auth,mut value,session_id) = (auth.clone(),raw.clone(),cursor_session.clone());
+                async move {
+                    let request: crate::peer::ClientReadRequest = serde_json::from_slice(&body).unwrap();
+                    let failure = matches!(&request.request,
+                        crate::peer::ClientReadOperation::ConversationChanges { wait_ms: 1, .. });
+                    if matches!(request.request,crate::peer::ClientReadOperation::ConversationChanges { .. }) {
+                        value["kind"] = json!("conversation-changes");
+                        value.as_object_mut().unwrap().remove("page");
+                        value["next_cursor"] = json!(format!(
+                            "conversation-cursor/owner-node/{}/10.0.701",
+                            session_id.trim_start_matches("session/"),
+                        ));
+                    }
+                    let status = if failure {
+                        value = json!({"code":"cursor-gap","message":FAKE,
+                            "details":{"full_resync":true,"diagnostic":FAKE}});
+                        StatusCode::GONE
+                    } else {
+                        StatusCode::OK
+                    };
+                    let bytes = serde_json::to_vec(&json!({
+                        "api_version":"st3.v1","request_id":"relay-fixture",
+                        "snapshot_host":"owner-node","store_index":10,"value":value,
+                    })).unwrap();
+                    let headers = auth.response_headers_for(
+                        "/v1/peer/client-read","owner-node",&bytes,
+                        &smallclaims::sync::FleetAuth::body_digest(&body),
+                    ).unwrap();
+                    (status,headers,bytes)
+                }
+            },
+        ));
+        let server = tokio::spawn(async move { axum::serve(listener,router).await.unwrap(); });
+        gateway.client_relay = crate::peer::ClientRelay::from_config(&crate::config::Config {
+            node:"gateway-node".into(),fleet_id:Some("fleet-test".into()),
+            shared_secret_file:Some(secret),peers:vec![crate::config::PeerConfig {
+                name:"owner-node".into(),url:format!("http://{address}"),
+            }],..Default::default()
+        }).unwrap();
+        let page = conversation_page(&gateway,&session,&session_id,Some("host/owner-node")).await.unwrap();
+        // A safe visible page does not prove that its cursor's hidden rows were safe.
+        let mut opaque = page.clone();
+        opaque["page"]["next_cursor"] = json!(hex::encode(Sha256::digest(FAKE.as_bytes())));
+        let opaque = admitted_relay_conversation(
+            &gateway,&session,&session_id,"host/owner-node",opaque,
+        ).unwrap();
+        assert!(opaque["page"].get("next_cursor").is_none());
+        assert!(!opaque.to_string().contains(&hex::encode(Sha256::digest(FAKE.as_bytes()))));
+        let changes = conversation_changes_value(
+            &gateway,&session,&session_id,Some("host/owner-node"),None,0,
+        ).await.unwrap();
+        for value in [&page,&changes] {
+            let encoded = value.to_string();
+            assert!(!encoded.contains(FAKE));
+            assert!(!encoded.contains(&hex::encode(Sha256::digest(FAKE.as_bytes()))));
+            assert!(value["items"].as_array().unwrap().iter().any(|row| {
+                row["id"] == mail_id
+                    && row["body"]["text"] == "Authored Smalltalk mail survives the capture gate."
+            }));
+            assert!(value["items"].as_array().unwrap().iter().any(|row| {
+                row["id"] == "native/700" && row["body"]["withheld"] == true
+            }));
+        }
+        assert!(page["page"].get("next_cursor").is_none());
+        assert_eq!(page["page"]["capture_withheld"],true);
+        assert!(changes["next_cursor"].as_str().unwrap().ends_with("/10.0.701"));
+        let failure = conversation_changes_value(
+            &gateway,&session,&session_id,Some("host/owner-node"),None,1,
+        ).await.unwrap_err();
+        assert_eq!(failure.code,"cursor-gap");
+        assert_eq!(failure.details["full_resync"],true);
+        assert!(!serde_json::to_string(&json!({
+            "message":failure.message,"details":failure.details,
+        })).unwrap().contains(FAKE));
+        server.abort();
     }
 
     /// A member one build behind still routes to a terminal on a newer member whose seat reports
