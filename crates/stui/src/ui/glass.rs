@@ -2482,8 +2482,8 @@ impl Ui {
         {
             return false;
         }
-        // In a focused, attached terminal every key is the agent's; Ctrl+\ leaves it first.
-        if terminal_focused {
+        // Space control chords retain their owner; the other terminal keys go to the child.
+        if terminal_focused && !super::terminal_space_key(key) {
             return false;
         }
         // Alt and a letter or digit commands nothing: on a Mac Option types a character instead,
@@ -4260,6 +4260,124 @@ mod tests {
         ui.close_tab();
         assert!(ui.terminal_view(first).is_none());
         assert!(ui.terminal_view(second).is_some(), "the other stays attached");
+    }
+
+    #[test]
+    fn native_split_terminals_route_wheel_and_focus_to_their_own_connections() {
+        use pty_core::protocol::{MessageType, PacketReader, encode_packet};
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        fn input(peer: &mut UnixStream, reader: &mut PacketReader) -> Vec<u8> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                assert!(Instant::now() < deadline, "no terminal input");
+                let mut bytes = [0u8; 1024];
+                let count = peer.read(&mut bytes).unwrap();
+                for packet in reader.feed(&bytes[..count]).unwrap() {
+                    if packet.type_ == MessageType::Data {
+                        return packet.payload;
+                    }
+                }
+            }
+        }
+
+        let mut ui = glass();
+        let ids: Vec<_> = ui
+            .world
+            .agents
+            .items()
+            .iter()
+            .filter(|agent| agent.terminal)
+            .take(2)
+            .map(|agent| agent.id.clone())
+            .collect();
+        let [first, second] = &ids[..] else {
+            panic!("two demo terminals")
+        };
+        ui.open_in_glass(Pane::Agent(Some(first.clone())), Open::Tab);
+        ctrl(&mut ui, ']');
+        ui.open_in_glass(Pane::Agent(Some(second.clone())), Open::Right);
+        ctrl(&mut ui, ']');
+        let mut peers = Vec::new();
+        for agent in &ids {
+            let (client, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            ui.terminal_view_mut(agent).unwrap().native = Some(
+                crate::ui::pty::NativeTerminal::spawn(client, agent, "one".into(), 24, 80),
+            );
+            peer.write_all(&encode_packet(
+                MessageType::Screen,
+                b"\x1b[?1004h\x1b[?1003h\x1b[?1006h",
+            ))
+            .unwrap();
+            peers.push(peer);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ids.iter().all(|agent| {
+            ui.terminal_view(agent)
+                .unwrap()
+                .native
+                .as_ref()
+                .unwrap()
+                .mode()
+                .contains(alacritty_terminal::term::TermMode::MOUSE_MOTION)
+        }) {
+            assert!(Instant::now() < deadline, "screen did not arrive");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        screen(&ui);
+        let mut readers = [PacketReader::new(), PacketReader::new()];
+        ui.input_event(crossterm::event::Event::FocusGained);
+        assert_eq!(input(&mut peers[1], &mut readers[1]), b"\x1b[I");
+        let body = ui
+            .frame
+            .borrow()
+            .panes
+            .iter()
+            .find(|pane| pane.key == Pane::Terminal(first.clone()).key())
+            .unwrap()
+            .rect;
+        ui.terminal_selection_mode = true;
+        ui.input_event(crossterm::event::Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: body.x + 4,
+            row: body.y + 2,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(
+            input(&mut peers[0], &mut readers[0]),
+            b"\x1b[<65;5;3M".repeat(3)
+        );
+        assert_eq!(
+            ui.terminal.as_ref().unwrap().agent,
+            *second,
+            "wheel does not move focus"
+        );
+        let left = ui.frame.borrow().glass_leaves[0];
+        ui.input_event(crossterm::event::Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: left.x + 2,
+            row: left.y + 2,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(ui.terminal.as_ref().unwrap().agent, *first);
+        assert!(
+            !ui.terminal_selection_mode,
+            "selection override does not leak into another tab"
+        );
+        assert_eq!(input(&mut peers[1], &mut readers[1]), b"\x1b[O");
+        assert_eq!(input(&mut peers[0], &mut readers[0]), b"\x1b[I");
+        screen(&ui);
+        assert!(
+            ui.terminal_cursor.get().is_some(),
+            "the other split must not erase the focused cursor"
+        );
+        ui.input_event(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        ));
+        assert_eq!(input(&mut peers[0], &mut readers[0]), b"a");
     }
 
     #[test]

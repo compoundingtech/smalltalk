@@ -25,7 +25,7 @@ import threading
 import time
 
 
-FIRST_FRAME = "\u2261 st".encode()  # spaces' top bar
+FIRST_FRAME = b" working"  # The status bar's count is present even before st connects.
 
 
 def plain(output: bytes) -> bytes:
