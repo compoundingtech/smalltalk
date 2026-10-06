@@ -36,6 +36,11 @@ public struct ErrorEnvelope: Codable, Error, Sendable {
 public enum ErrorCode: Codable, Sendable, Equatable {
     case notFound, forbidden, unsupportedCapability, validationFailed, idempotencyConflict
     case attentionMigrated
+    case arrangementExists
+    case arrangementFolderExists, arrangementRetired, arrangementLimit, arrangementFolderDeleted
+    case arrangementCycle, arrangementBodyTooLarge, arrangementOwnerForbidden
+    case invalidArrangementSubject, invalidArrangementAction, invalidArrangementOperations
+    case invalidArrangementFolder, invalidArrangementName, invalidArrangementKey, invalidSubjectReference
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
@@ -48,6 +53,15 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "attention-migrated": .attentionMigrated; case "not-found": .notFound; case "forbidden": .forbidden
         case "unsupported-capability": .unsupportedCapability; case "validation-failed": .validationFailed
         case "idempotency-conflict": .idempotencyConflict; case "stale-fence": .staleFence
+        case "arrangement-exists": .arrangementExists
+        case "arrangement-folder-exists": .arrangementFolderExists
+        case "arrangement-retired": .arrangementRetired; case "arrangement-limit": .arrangementLimit
+        case "arrangement-folder-deleted": .arrangementFolderDeleted; case "arrangement-cycle": .arrangementCycle
+        case "arrangement-body-too-large": .arrangementBodyTooLarge; case "arrangement-owner-forbidden": .arrangementOwnerForbidden
+        case "invalid-arrangement-subject": .invalidArrangementSubject; case "invalid-arrangement-action": .invalidArrangementAction
+        case "invalid-arrangement-operations": .invalidArrangementOperations; case "invalid-arrangement-folder": .invalidArrangementFolder
+        case "invalid-arrangement-name": .invalidArrangementName; case "invalid-arrangement-key": .invalidArrangementKey
+        case "invalid-subject-reference": .invalidSubjectReference
         case "cursor-gap": .cursorGap; case "page-cursor-expired": .pageCursorExpired
         case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
         case "timeline-history-incomplete": .timelineHistoryIncomplete
@@ -63,6 +77,15 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .attentionMigrated: "attention-migrated"; case .notFound: "not-found"; case .forbidden: "forbidden"
         case .unsupportedCapability: "unsupported-capability"; case .validationFailed: "validation-failed"
         case .idempotencyConflict: "idempotency-conflict"; case .staleFence: "stale-fence"
+        case .arrangementExists: "arrangement-exists"
+        case .arrangementFolderExists: "arrangement-folder-exists"
+        case .arrangementRetired: "arrangement-retired"; case .arrangementLimit: "arrangement-limit"
+        case .arrangementFolderDeleted: "arrangement-folder-deleted"; case .arrangementCycle: "arrangement-cycle"
+        case .arrangementBodyTooLarge: "arrangement-body-too-large"; case .arrangementOwnerForbidden: "arrangement-owner-forbidden"
+        case .invalidArrangementSubject: "invalid-arrangement-subject"; case .invalidArrangementAction: "invalid-arrangement-action"
+        case .invalidArrangementOperations: "invalid-arrangement-operations"; case .invalidArrangementFolder: "invalid-arrangement-folder"
+        case .invalidArrangementName: "invalid-arrangement-name"; case .invalidArrangementKey: "invalid-arrangement-key"
+        case .invalidSubjectReference: "invalid-subject-reference"
         case .cursorGap: "cursor-gap"; case .pageCursorExpired: "page-cursor-expired"
         case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
         case .timelineHistoryIncomplete: "timeline-history-incomplete"
@@ -97,7 +120,9 @@ public struct Capability: Codable, Sendable { public let id: String; public let 
 public struct Limits: Codable, Sendable {
     public let maxPageItems: Int; public let maxEventItems: Int; public let maxResponseBytes: Int; public let maxWaitMS: UInt64
     public let maxGlassBodyBytes, maxGlasses, maxGlassDepth, maxGlassNodes: Int?
-    enum CodingKeys: String, CodingKey { case maxGlassBodyBytes = "max_glass_body_bytes", maxGlasses = "max_glasses", maxGlassDepth = "max_glass_depth", maxGlassNodes = "max_glass_nodes", maxPageItems = "max_page_items", maxEventItems = "max_event_items", maxResponseBytes = "max_response_bytes", maxWaitMS = "max_wait_ms" }
+    public let maxArrangementBodyBytes, maxArrangements, maxArrangementNameBytes, maxArrangementKeyBytes, maxArrangementOperations, maxArrangementFolders, maxArrangementPlacements: Int?
+    public let maxArrangementResourceBytes: Int?
+    enum CodingKeys: String, CodingKey { case maxArrangementResourceBytes = "max_arrangement_resource_bytes", maxArrangementBodyBytes = "max_arrangement_body_bytes", maxArrangements = "max_arrangements", maxArrangementNameBytes = "max_arrangement_name_bytes", maxArrangementKeyBytes = "max_arrangement_key_bytes", maxArrangementOperations = "max_arrangement_operations", maxArrangementFolders = "max_arrangement_folders", maxArrangementPlacements = "max_arrangement_placements", maxGlassBodyBytes = "max_glass_body_bytes", maxGlasses = "max_glasses", maxGlassDepth = "max_glass_depth", maxGlassNodes = "max_glass_nodes", maxPageItems = "max_page_items", maxEventItems = "max_event_items", maxResponseBytes = "max_response_bytes", maxWaitMS = "max_wait_ms" }
 }
 public struct Capabilities: Codable, Sendable {
     public let machineVersion: String?
@@ -247,6 +272,7 @@ public enum Resource: Codable, Sendable, Identifiable {
     /// A kind this client does not know, from a member newer than it: kept whole so an older
     /// client skips it or shows it plainly instead of failing the page it came in.
     case unknown(UnknownResource)
+    case arrangement(ArrangementResource)
     private struct Discriminator: Decodable { let kind: String }
     public init(from decoder: Decoder) throws {
         switch try Discriminator(from: decoder).kind {
@@ -269,12 +295,38 @@ public enum Resource: Codable, Sendable, Identifiable {
         case "history": self = .history(try HistoryResource(from: decoder))
         case "session": self = .session(try SessionResource(from: decoder))
         case "glass": self = .glass(try GlassResource(from: decoder))
+        case "arrangement": self = .arrangement(try ArrangementResource(from: decoder))
         case "owned-set": self = .ownedSet(try OwnedSetResource(from: decoder))
         default: self = .unknown(try UnknownResource(from: decoder))
         }
     }
-    public func encode(to encoder: Encoder) throws { switch self { case .attention(let v): try v.encode(to: encoder); case .message(let v): try v.encode(to: encoder); case .launch(let v): try v.encode(to: encoder); case .launchVariant(let v): try v.encode(to: encoder); case .launchDecision(let v): try v.encode(to: encoder); case .launchApproval(let v): try v.encode(to: encoder); case .mission(let v): try v.encode(to: encoder); case .work(let v): try v.encode(to: encoder); case .agent(let v): try v.encode(to: encoder); case .runtime(let v): try v.encode(to: encoder); case .observer(let v): try v.encode(to: encoder); case .subscription(let v): try v.encode(to: encoder); case .lane(let v): try v.encode(to: encoder); case .machine(let v): try v.encode(to: encoder); case .device(let v): try v.encode(to: encoder); case .operation(let v): try v.encode(to: encoder); case .history(let v): try v.encode(to: encoder); case .session(let v): try v.encode(to: encoder); case .glass(let v): try v.encode(to: encoder); case .ownedSet(let v): try v.encode(to: encoder); case .unknown(let v): try v.encode(to: encoder) } }
-    public var id: String { switch self { case .attention(let v): v.id; case .message(let v): v.id; case .launch(let v): v.id; case .launchVariant(let v): v.id; case .launchDecision(let v): v.id; case .launchApproval(let v): v.id; case .mission(let v): v.id; case .work(let v): v.id; case .agent(let v): v.id; case .runtime(let v): v.id; case .observer(let v): v.id; case .subscription(let v): v.id; case .lane(let v): v.id; case .machine(let v): v.id; case .device(let v): v.id; case .operation(let v): v.id; case .history(let v): v.id; case .session(let v): v.id; case .glass(let v): v.id; case .ownedSet(let v): v.id; case .unknown(let v): v.id } }
+    public func encode(to encoder: Encoder) throws {
+        switch self {
+        case .attention(let v): try v.encode(to: encoder)
+        case .message(let v): try v.encode(to: encoder)
+        case .launch(let v): try v.encode(to: encoder)
+        case .launchVariant(let v): try v.encode(to: encoder)
+        case .launchDecision(let v): try v.encode(to: encoder)
+        case .launchApproval(let v): try v.encode(to: encoder)
+        case .mission(let v): try v.encode(to: encoder)
+        case .work(let v): try v.encode(to: encoder)
+        case .agent(let v): try v.encode(to: encoder)
+        case .runtime(let v): try v.encode(to: encoder)
+        case .observer(let v): try v.encode(to: encoder)
+        case .subscription(let v): try v.encode(to: encoder)
+        case .lane(let v): try v.encode(to: encoder)
+        case .machine(let v): try v.encode(to: encoder)
+        case .device(let v): try v.encode(to: encoder)
+        case .operation(let v): try v.encode(to: encoder)
+        case .history(let v): try v.encode(to: encoder)
+        case .session(let v): try v.encode(to: encoder)
+        case .glass(let v): try v.encode(to: encoder)
+        case .arrangement(let v): try v.encode(to: encoder)
+        case .ownedSet(let v): try v.encode(to: encoder)
+        case .unknown(let v): try v.encode(to: encoder)
+        }
+    }
+    public var id: String { switch self { case .attention(let v): v.id; case .message(let v): v.id; case .launch(let v): v.id; case .launchVariant(let v): v.id; case .launchDecision(let v): v.id; case .launchApproval(let v): v.id; case .mission(let v): v.id; case .work(let v): v.id; case .agent(let v): v.id; case .runtime(let v): v.id; case .observer(let v): v.id; case .subscription(let v): v.id; case .lane(let v): v.id; case .machine(let v): v.id; case .device(let v): v.id; case .operation(let v): v.id; case .history(let v): v.id; case .session(let v): v.id; case .glass(let v): v.id; case .arrangement(let v): v.id; case .ownedSet(let v): v.id; case .unknown(let v): v.id } }
 }
 /// A resource of a kind this client does not model: its header, and every field as sent.
 public struct UnknownResource: Codable, Sendable, Identifiable {
@@ -436,7 +488,7 @@ public enum TerminalInputMode: String, Codable, Sendable { case line, raw, key }
 public struct TerminalInputParameters: Codable, Sendable { public var terminalID: String; public var mode: TerminalInputMode; public var value: String; public init(terminalID: String, mode: TerminalInputMode, value: String) { self.terminalID = terminalID; self.mode = mode; self.value = value }; enum CodingKeys: String, CodingKey { case terminalID = "terminal_id", mode, value } }
 public struct TerminalResizeParameters: Codable, Sendable { public var terminalID: String; public var rows: UInt16; public var columns: UInt16; public init(terminalID: String, rows: UInt16, columns: UInt16) { self.terminalID = terminalID; self.rows = rows; self.columns = columns }; enum CodingKeys: String, CodingKey { case terminalID = "terminal_id", rows, columns } }
 public struct TerminalAttachment: Codable, Sendable { public let attachmentID: String; public let terminalID: String; public let runtimeIncarnation: String; public let ownerHostID: String; public let streamURL: String; public let streamCapability: String?; public let state: String; public let expiresAt: String; public let reusable: Bool?; public let ttlS: UInt64?; public let retryHint: String?; enum CodingKeys: String, CodingKey { case attachmentID = "attachment_id", terminalID = "terminal_id", runtimeIncarnation = "runtime_incarnation", ownerHostID = "owner_host_id", streamURL = "stream_url", streamCapability = "stream_capability", state, expiresAt = "expires_at", reusable, ttlS = "ttl_s", retryHint = "retry_hint" } }
-public struct ActionResult: Codable, Sendable { public let kind: String; public let actionID: String; public let operationID: String; public let status: String; public let affectedIDs: [String]; public let snapshotID: String; public let terminalAttachment: TerminalAttachment?; enum CodingKeys: String, CodingKey { case kind, actionID = "action_id", operationID = "operation_id", status, affectedIDs = "affected_ids", snapshotID = "snapshot_id", terminalAttachment = "terminal_attachment" } }
+public struct ActionResult: Codable, Sendable { public let kind: String; public let actionID: String; public let operationID: String; public let status: String; public let affectedIDs: [String]; public let snapshotID: String; public let terminalAttachment: TerminalAttachment?; public let arrangementRevision: String?; enum CodingKeys: String, CodingKey { case kind, actionID = "action_id", operationID = "operation_id", status, affectedIDs = "affected_ids", snapshotID = "snapshot_id", terminalAttachment = "terminal_attachment", arrangementRevision = "arrangement_revision" } }
 
 public struct PairingBegin: Codable, Sendable { public let apiVersion: String; public let deviceName: String; public let personID: String; public let fullControl: Bool?; public let scopes: [String]?; public init(apiVersion: String, deviceName: String, personID: String, fullControl: Bool? = nil, scopes: [String]? = nil) { self.apiVersion = apiVersion; self.deviceName = deviceName; self.personID = personID; self.fullControl = fullControl; self.scopes = scopes }; enum CodingKeys: String, CodingKey { case apiVersion = "api_version", deviceName = "device_name", personID = "person_id", fullControl = "full_control", scopes } }
 public struct PairingChallenge: Codable, Sendable { public let kind: String; public let pairingID: String; public let code: String; public let expiresAt: String; enum CodingKeys: String, CodingKey { case kind, pairingID = "pairing_id", code, expiresAt = "expires_at" } }
@@ -522,4 +574,74 @@ public struct CustomReplyParameters: Codable, Sendable {
     public var fields: [String: JSONValue]
     public init(targetID: String, registration: String, revision: String, episode: String, fields: [String: JSONValue]) { self.targetID = targetID; self.registration = registration; self.revision = revision; self.episode = episode; self.fields = fields }
     enum CodingKeys: String, CodingKey { case targetID = "target_id", registration, revision, episode, fields }
+}
+
+public struct ArrangementRegister<Value: Codable & Sendable>: Codable, Sendable { public let value: Value; public let revision: String }
+public struct ArrangementPosition: Codable, Sendable { public let parent: String?; public let key: String }
+public struct ArrangementPlacement: Codable, Sendable { public let folder: String?; public let key: String }
+public struct ArrangementFolder: Codable, Sendable { public let name: ArrangementRegister<String>; public let position: ArrangementRegister<ArrangementPosition>; public let tombstone: ArrangementRegister<Bool>? }
+public struct ArrangementBody: Codable, Sendable { public let version: UInt; public let name: ArrangementRegister<String>; public let folders: [String: ArrangementFolder]; public let placements: [String: ArrangementRegister<ArrangementPlacement>] }
+public struct ArrangementResolved: Codable, Sendable { public let parents: [String: String?]; public let folders: [String: String?] }
+public struct ArrangementResource: Codable, Sendable, Identifiable {
+    public let id, kind, owner, revision, updatedAt: String
+    public let body: ArrangementBody
+    public let deleted: Bool
+    public let resolved: ArrangementResolved?
+    enum CodingKeys: String, CodingKey { case id, kind, owner, revision, updatedAt = "updated_at", body, deleted, resolved }
+}
+public typealias Arrangement = ArrangementResource
+public struct ArrangementPage: Codable, Sendable { public let kind, collection: String; public let filters: [String: String]; public let items: [Arrangement]; public let page: PageInfo; public let sync: SyncNotice?; public let replicated: ReplicatedNotice? }
+public struct ArrangementEditParameters: Codable, Sendable {
+    public let subject, owner: String
+    public let operations: [ArrangementOperation]
+    public init(subject: String, owner: String, operations: [ArrangementOperation]) { self.subject = subject; self.owner = owner; self.operations = operations }
+}
+public enum ArrangementOperation: Codable, Sendable {
+    case create(name: String), rename(name: String)
+    case folderCreate(id: String, name: String, parent: String?, key: String)
+    case folderRename(id: String, name: String)
+    case folderMove(id: String, parent: String?, key: String)
+    case folderDelete(id: String)
+    case subjectPlace(subject: String, folder: String?, key: String)
+    case retire
+    enum CodingKeys: String, CodingKey { case op, id, name, parent, key, subject, folder }
+    public init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        switch try box.decode(String.self, forKey: .op) {
+        case "create": self = .create(name: try box.decode(String.self, forKey: .name))
+        case "rename": self = .rename(name: try box.decode(String.self, forKey: .name))
+        case "folder.create": self = .folderCreate(id: try box.decode(String.self, forKey: .id), name: try box.decode(String.self, forKey: .name), parent: try box.decode(String?.self, forKey: .parent), key: try box.decode(String.self, forKey: .key))
+        case "folder.rename": self = .folderRename(id: try box.decode(String.self, forKey: .id), name: try box.decode(String.self, forKey: .name))
+        case "folder.move": self = .folderMove(id: try box.decode(String.self, forKey: .id), parent: try box.decode(String?.self, forKey: .parent), key: try box.decode(String.self, forKey: .key))
+        case "folder.delete": self = .folderDelete(id: try box.decode(String.self, forKey: .id))
+        case "subject.place": self = .subjectPlace(subject: try box.decode(String.self, forKey: .subject), folder: try box.decode(String?.self, forKey: .folder), key: try box.decode(String.self, forKey: .key))
+        case "retire": self = .retire
+        default: throw DecodingError.dataCorruptedError(forKey: .op, in: box, debugDescription: "Unknown arrangement operation")
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var box = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .create(let name): try box.encode("create", forKey: .op); try box.encode(name, forKey: .name)
+        case .rename(let name): try box.encode("rename", forKey: .op); try box.encode(name, forKey: .name)
+        case .folderCreate(let id, let name, let parent, let key): try box.encode("folder.create", forKey: .op); try box.encode(id, forKey: .id); try box.encode(name, forKey: .name); try box.encode(parent, forKey: .parent); try box.encode(key, forKey: .key)
+        case .folderRename(let id, let name): try box.encode("folder.rename", forKey: .op); try box.encode(id, forKey: .id); try box.encode(name, forKey: .name)
+        case .folderMove(let id, let parent, let key): try box.encode("folder.move", forKey: .op); try box.encode(id, forKey: .id); try box.encode(parent, forKey: .parent); try box.encode(key, forKey: .key)
+        case .folderDelete(let id): try box.encode("folder.delete", forKey: .op); try box.encode(id, forKey: .id)
+        case .subjectPlace(let subject, let folder, let key): try box.encode("subject.place", forKey: .op); try box.encode(subject, forKey: .subject); try box.encode(folder, forKey: .folder); try box.encode(key, forKey: .key)
+        case .retire: try box.encode("retire", forKey: .op)
+        }
+    }
+}
+public struct ArrangementCollectionFrame: Codable, Sendable {
+    public let kind: String
+    public let id: String?
+    public let collection: String?
+    public let snapshot: Snapshot?
+    public let items, upserts: [Arrangement]?
+    public let removes, order: [String]?
+    public let hasMore: Bool?
+    public let code, message: String?
+    public let retryable: Bool?
+    enum CodingKeys: String, CodingKey { case kind, id, collection, snapshot, items, upserts, removes, order, code, message, retryable, hasMore = "has_more" }
 }

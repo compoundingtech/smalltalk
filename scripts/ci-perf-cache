@@ -4,6 +4,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -53,8 +54,36 @@ def own_pr(run, number, repository, branch, commits):
 
 
 def download(repo, run, name, dest):
-    subprocess.run(['gh', 'run', 'download', str(run['id']), '--repo', repo,
-                    '--name', name, '--dir', str(dest)], check=True)
+    # Retry only transport/service failures of this exact artifact. Never replace
+    # the selected baseline, accept a partial download, or rerun the workload.
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        raise ValueError('artifact download destination already exists')
+    delays = (5, 15)
+    for attempt in range(3):
+        with tempfile.TemporaryDirectory(dir=dest.parent) as tmp:
+            staged = Path(tmp) / 'artifact'
+            cmd = ['gh', 'run', 'download', str(run['id']), '--repo', repo,
+                   '--name', name, '--dir', str(staged)]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            # gh errors can contain temporary signed URLs; omit them from CI logs.
+            output = re.sub(r'https?://[^\s<>\"\']+', '[URL omitted]',
+                            result.stdout + result.stderr)
+            if output:
+                print(output, file=sys.stderr, end='' if output.endswith('\n') else '\n', flush=True)
+            if result.returncode == 0:
+                shutil.move(staged, dest)
+                if attempt:
+                    print(f'Performance artifact download recovered: run {run["id"]}, '
+                          f'{name}, attempt {attempt + 1}', flush=True)
+                return
+            status = re.search(r'\bHTTP(?: Error)?\s+(429|500|502|503|504)\b', output)
+            if not status or attempt == len(delays):
+                raise subprocess.CalledProcessError(result.returncode, cmd)
+            print(f'::warning::P0: artifact download HTTP {status[1]}: run {run["id"]}, '
+                  f'{name}, attempt {attempt + 1}; retry in {delays[attempt]}s', flush=True)
+        time.sleep(delays[attempt])
 
 
 def git(work, *args):

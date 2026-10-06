@@ -282,3 +282,11 @@ fn codex_transcript_utf8_and_discovery_failures_preserve_delivery_and_private_wa
     }
     canary("codex", "utf8");
 }
+
+#[test]
+fn an_imported_codex_session_binds_exactly_on_first_launch_and_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    canary("codex", "import");
+}

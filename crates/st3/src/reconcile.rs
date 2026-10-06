@@ -659,6 +659,7 @@ impl NativeRuntime {
                         &environment,
                         member.display_name.as_deref(),
                         &member.tags,
+                        member.terminal_size,
                         predecessor,
                         operation,
                         guard,
@@ -671,6 +672,7 @@ impl NativeRuntime {
                         &environment,
                         member.display_name.as_deref(),
                         &member.tags,
+                        member.terminal_size,
                         predecessor,
                         operation,
                     )
@@ -686,6 +688,7 @@ impl NativeRuntime {
                     &environment,
                     member.display_name.as_deref(),
                     &member.tags,
+                    member.terminal_size,
                 )
             }
         } else {
@@ -757,6 +760,8 @@ pub struct Reconciler<R = NativeRuntime> {
     /// incarnation, so a pass compares the declared launch without reading the store.
     launched_members: Mutex<HashMap<String, (String, Option<MemberSpec>)>>,
     retired_predecessor_generations: Mutex<BTreeSet<String>>,
+    /// The person whose published launch geometry terminal seats start at.
+    person: Option<String>,
     #[cfg(test)]
     mission_declaration_parses: std::sync::atomic::AtomicUsize,
     file_watchers: Arc<Mutex<HashMap<String, notify::RecommendedWatcher>>>,
@@ -850,6 +855,7 @@ impl Reconciler<NativeRuntime> {
             endpoint,
             driver_state_dir: state_dir.join("drivers"),
             client_relay: None,
+            person: None,
             incoming_resumes: Arc::default(),
             st_binary: Some(publish_st_binary(state_dir)?),
             runtime_environment: BTreeMap::from([
@@ -928,6 +934,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             endpoint: "unused-test-endpoint".into(),
             driver_state_dir: std::env::temp_dir().join("st3-test-drivers"),
             client_relay: None,
+            person: None,
             incoming_resumes: Arc::default(),
             st_binary: None,
             runtime_environment: BTreeMap::new(),
@@ -986,6 +993,11 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     pub fn with_client_relay(mut self, relay: Option<crate::peer::ClientRelay>) -> Self {
         self.client_relay = relay;
+        self
+    }
+
+    pub fn with_person(mut self, person: Option<String>) -> Self {
+        self.person = person;
         self
     }
 
@@ -4884,6 +4896,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .entry(key.clone())
                 .or_insert_with(|| value.clone());
         }
+        if launch_member.terminal {
+            launch_member.terminal_size = self.launch_geometry()?;
+        }
         self.bind_account(subject, member, &mut launch_member)?;
         if let Some(id) = member.environment.get(crate::rollout::OPERATION_ENV) {
             let operation = self.store.rollout(&subject.subject)?.context("rollout disappeared before account selection")?;
@@ -5130,6 +5145,30 @@ impl<R: RuntimeControl> Reconciler<R> {
         )?;
         self.signal_changed();
         Ok(true)
+    }
+
+    /// The configured person's latest `terminal.launch-geometry`: the size their client draws a
+    /// seat at, so a seat started now needs no resize when they first open it. Nothing without a
+    /// configured person or before they publish one.
+    fn launch_geometry(&self) -> Result<Option<st_runtime::TerminalSize>> {
+        let Some(person) = &self.person else {
+            return Ok(None);
+        };
+        let Some(claim) = self
+            .store
+            .latest_observation(person, "terminal.launch-geometry")?
+        else {
+            return Ok(None);
+        };
+        let dimension = |name: &str| {
+            claim
+                .body
+                .pointer(&format!("/fields/{name}"))
+                .and_then(st3_schema::terminal_dimension)
+        };
+        Ok(dimension("rows")
+            .zip(dimension("columns"))
+            .map(|(rows, columns)| st_runtime::TerminalSize { rows, columns }))
     }
 
     /// Point a seat whose harness block binds an account (or a pool) at that account's login
@@ -8310,6 +8349,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
             driver: Some("loop-metric".into()),
+            terminal_size: None,
         };
         self.perform_start(
             &DesiredSubject {
@@ -12915,6 +12955,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
             driver: Some("mechanical-gate".into()),
+            terminal_size: None,
         };
         let desired = DesiredSubject {
             subject: operation.clone(),
@@ -13449,6 +13490,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
             driver: Some("llm-gate".into()),
+            terminal_size: None,
         };
         let desired = DesiredSubject {
             subject: result_subject,
@@ -16419,6 +16461,53 @@ version 2
         assert_eq!(gate.environment["ST_GATE"], "verify context");
         assert_eq!(gate.environment["ST_MISSION_RUN"], run.id);
         assert_eq!(gate.environment["ST_STEP"], "work");
+    }
+
+    #[test]
+    fn a_terminal_seat_starts_at_the_configured_persons_latest_launch_geometry() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        for (rows, columns) in [(24, 80), (48, 160)] {
+            store
+                .append_client_claim(&ClaimInput {
+                    subject: "person/avery".into(),
+                    kind: "terminal.launch-geometry".into(),
+                    actor: Some("person/avery".into()),
+                    fields: BTreeMap::from([
+                        ("rows".into(), Value::from(rows)),
+                        ("columns".into(), Value::from(columns)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        apply_source(
+            &store,
+            "version 2\nagent \"example/sized\" { workspace \"/tmp\"; command \"true\" }",
+            "sized-seat",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store,
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_person(Some("person/avery".into()));
+        reconciler.reconcile_once().unwrap();
+        let started = runtime.started_members.lock().unwrap();
+        let [seat] = started.as_slice() else {
+            panic!("expected one start, got {started:?}");
+        };
+        assert!(seat.terminal);
+        assert_eq!(
+            seat.terminal_size,
+            Some(st_runtime::TerminalSize {
+                rows: 48,
+                columns: 160
+            })
+        );
     }
 
     #[tokio::test]
