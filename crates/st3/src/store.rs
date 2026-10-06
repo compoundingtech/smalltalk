@@ -48991,6 +48991,19 @@ message "human-attention" {
             "new"
         );
         harness(Some("new"), "harness-new");
+        // The harness-only status a driver renews its leases from answers what the full one does,
+        // without the seat's claim ids; the fence's newest-claim seek names the last claim.
+        let only = store.status_harness_only(subject).unwrap();
+        assert_eq!(only.subjects.len(), 1);
+        assert!(only.subjects[0].claims.is_empty());
+        assert_eq!(
+            only.subjects[0].harness.as_ref().map(|harness| harness.incarnation_id.clone()),
+            store.current_harness(subject).unwrap().map(|harness| harness.incarnation_id)
+        );
+        assert_eq!(
+            store.latest_claim_id(subject).unwrap(),
+            store.claims_for(subject, None).unwrap().last().map(|claim| claim.id.clone())
+        );
         store
             .append_claim(&ClaimInput {
                 subject: subject.into(),
