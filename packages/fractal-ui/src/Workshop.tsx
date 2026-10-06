@@ -1,6 +1,6 @@
 import * as React from 'react'
 import * as Aria from 'react-aria-components'
-import { Badge, Button, Checkbox, CodeBlock, CommandMenu, ContextCard, Description, EmptyState, Entity, Input, Kbd, MenuTrigger, ModalDialog, Note, Pill, Progress, Spinner, StatusDot, Table, Tabs, Toggle, Tooltip, type CommandGroup, type Theme } from './kit'
+import { Badge, Button, Checkbox, CodeBlock, CommandMenu, ContextCard, Description, EmptyState, Entity, Input, Kbd, MenuTrigger, Modal, Note, Pill, Progress, Spinner, StatusDot, Table, Tabs, Toggle, Tooltip, type CommandGroup, type Theme } from './kit'
 
 export const directions = {
   folio: { name: 'Folio', index: '01', description: 'An annotated working notebook. Warm paper, plum ink, editorial headings.', character: 'Reflective / legible / deliberate', motion: '180 ms · soft ease', radius: '5 / 10 px', type: 'Trebuchet / Georgia / Courier' },
@@ -77,11 +77,11 @@ function Conversation({ theme }: { theme: Theme }) {
         <ToolCall />
         <Diff />
         <div className="mt-4 flex flex-wrap items-center gap-2">
-          <ModalDialog theme={theme} title="Review checkpoint" trigger={<Button variant="primary">Review checkpoint</Button>}>{close => <>
+          <Modal theme={theme} title="Review checkpoint" trigger={<Button variant="primary">Review checkpoint</Button>}>{close => <>
             <p className="my-3 leading-relaxed text-muted">Save these two synthetic file changes for review. No repository will be written.</p>
             <div className="mb-4 flex justify-between rounded-control bg-recess p-3"><span>Cache refresh</span><Pill tone="good">2 files ready</Pill></div>
             <div className="flex justify-end gap-2"><Button onPress={close}>Keep editing</Button><Button variant="primary" onPress={close}>Save checkpoint</Button></div>
-          </>}</ModalDialog>
+          </>}</Modal>
           <Tooltip label="Inspect changes without saving" placement="top"><Button>Compare changes</Button></Tooltip>
           <Pill tone="good">Tests passed</Pill>
         </div>

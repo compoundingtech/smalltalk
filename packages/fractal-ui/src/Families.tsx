@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Badge, Button, Checkbox, CheckIcon, CodeBlock, CommandMenu, ContextCard, CopyIcon, Description, EmptyState, Entity, Input, Kbd, MenuTrigger, ModalDialog, Note, Pill, Progress, Spinner, StatusDot, Table, Tabs, Toggle, Tooltip, XCircleIcon, type CommandGroup, type Theme } from './kit'
+import { Badge, Button, Checkbox, CheckIcon, CodeBlock, CommandMenu, ContextCard, CopyIcon, Description, EmptyState, Entity, Input, Kbd, MenuTrigger, Modal, Note, Pill, Progress, Spinner, StatusDot, Table, Tabs, Toggle, Tooltip, XCircleIcon, type CommandGroup, type Theme } from './kit'
 
 const familyLabel = 'text-[10px] font-semibold uppercase tracking-widest text-muted mb-3'
 function Family({ name, note, children }: { name: string; note?: string; children: React.ReactNode }) {
@@ -76,10 +76,10 @@ export function Families({ direction = 'folio', scheme = 'light', density = 'com
         <div className="flex flex-wrap gap-2"><MenuTrigger items={menuItems}><Button>Thread actions</Button></MenuTrigger><MenuTrigger items={menuItems}><Button size="sm">Compact menu</Button></MenuTrigger></div>
       </Family>
       <Family name="Modal" note="Focus trap, Escape and scrim dismissal; primary and secondary actions.">
-        <ModalDialog theme={theme} title="Save checkpoint?" trigger={<Button variant="primary">Open dialog</Button>}>{close => <>
+        <Modal theme={theme} title="Save checkpoint?" trigger={<Button variant="primary">Open dialog</Button>}>{close => <>
           <p className="my-3 leading-relaxed text-muted">Three synthetic files stay staged. Nothing outside this story changes.</p>
           <div className="flex justify-end gap-2"><Button onPress={close}>Keep editing</Button><Button variant="primary" onPress={close}>Save checkpoint</Button></div>
-        </>}</ModalDialog>
+        </>}</Modal>
       </Family>
       <Family name="Note / EmptyState" note="Severity notes and an honest empty state with a way forward.">
         <div className="space-y-2"><Note tone="neutral">Neutral context note.</Note><Note tone="warning" filled title="Attention">One thread waits on your decision.</Note><Note tone="danger" size="sm">The last check failed; retry is safe.</Note></div>

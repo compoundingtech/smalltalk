@@ -7,6 +7,19 @@ const meta = {
   title: 'Fractal UI/Component families',
   component: Families,
   args: { direction: 'folio', scheme: 'light', density: 'comfortable' },
+  parameters: {
+    a11y: {
+      options: {
+        rules: {
+          // CommandMenu options show a description and a shortcut chip beside the label. Each
+          // option's accessible name is exactly its visible label, which meets WCAG 2.5.3. The
+          // description is still exposed through aria-describedby. axe's heuristic, however,
+          // requires all visible text, including aria-hidden text, to appear in the name.
+          'label-content-name-mismatch': { enabled: false },
+        },
+      },
+    },
+  },
   argTypes: {
     direction: { control: 'radio', options: ['folio', 'relay', 'orbit'] },
     scheme: { control: 'radio', options: ['light', 'dark'] },

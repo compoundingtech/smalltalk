@@ -129,7 +129,7 @@ export function DialogBody({ title, children, close }: { title: string; children
     {children}
   </Aria.Dialog>
 }
-export function ModalDialog({ theme, title, children, trigger }: { theme: Theme; title: string; children: (close: () => void) => React.ReactNode; trigger?: React.ReactNode }) {
+export function Modal({ theme, title, children, trigger }: { theme: Theme; title: string; children: (close: () => void) => React.ReactNode; trigger?: React.ReactNode }) {
   return <Aria.DialogTrigger>{trigger ?? <Button variant="primary">{title}</Button>}
     <Aria.ModalOverlay isDismissable className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-6 data-[entering]:animate-in">
       <Aria.Modal className="w-full max-w-md">{({ state }) => <ThemeRoot {...theme} className="relative rounded-panel border border-line bg-panel shadow-2xl"><DialogBody title={title} close={() => state.close()}>{children(() => state.close())}</DialogBody></ThemeRoot>}</Aria.Modal>

@@ -40,7 +40,7 @@ Stories:
 | Kbd | Shortcut keys |
 | Toggle, Checkbox | `Switch`; checkbox with checked, indeterminate and disabled states |
 | Menu | `MenuTrigger` with popover, shortcut hints, separators |
-| Modal | `ModalDialog`: focus trap, Escape and scrim dismissal, explicit close |
+| Modal | `Modal`: focus trap, Escape and scrim dismissal, explicit close |
 | Table | Row headers, single replace-selection, compact, optional sticky header |
 | Tabs | Controlled; `shouldForceMount` keeps hidden panels' state |
 | Tooltip | Terse labels, configurable delay and placement, no close delay |

@@ -7,6 +7,6 @@ const config: StorybookConfig = {
   framework: '@storybook/react-vite',
   addons: ['@storybook/addon-docs', '@storybook/addon-a11y'],
   core: { disableTelemetry: true },
-  viteFinal: async (config) => ({ ...config, plugins: [...(config.plugins ?? []), tailwindcss()], server: { ...config.server, allowedHosts: true } }),
+  viteFinal: async (config) => ({ ...config, plugins: [...(config.plugins ?? []), tailwindcss()] }),
 }
 export default config
