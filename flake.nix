@@ -831,6 +831,8 @@
             rendered.systemd.user.services.smalltalk-apply.Service.ExecStart
           else
             rendered.launchd.agents.smalltalk-apply.config.ProgramArguments) true;
+          assert (!pkgs.stdenv.hostPlatform.isLinux)
+            || rendered.systemd.user.services.smalltalk.Service.MemoryMax == "8G";
           pkgs.runCommand "smalltalk-hm-module-eval" { } "touch $out";
         checks.wasm-resolver-feature = st2WasmResolver;
         checks.wasip2-resource-providers = st2ProviderRuntime;
