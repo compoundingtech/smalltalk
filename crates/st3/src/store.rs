@@ -13702,9 +13702,17 @@ impl Store {
         Self::usage_summary_from_rows(rows, incarnation)
     }
 
-    /// Fetch usage for a bounded resource page with one SQL read per SQLite
-    /// parameter chunk, then apply the same reduction as a detail read.
+    /// Fetch usage for the selected subjects, preserving the detail reduction and one
+    /// SQLite cut across timestamp streaming and canonical tie resolution.
     pub fn usage_summaries_at(
+        &self,
+        subjects: &[String],
+        at_index: Option<u64>,
+    ) -> Result<BTreeMap<String, UsageSummary>> {
+        self.read_snapshot(|_| self.usage_summaries_pinned(subjects, at_index))
+    }
+
+    fn usage_summaries_pinned(
         &self,
         subjects: &[String],
         at_index: Option<u64>,
@@ -13721,27 +13729,55 @@ impl Store {
                 continue;
             }
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = canonical_sql(&format!(
-                "SELECT subject, store_index, body, accepted_at_unix_ms FROM claims
+            // The accepted-time index supplies the first two canonical components without
+            // a wide-body temporary sorter. Resolve the remaining components only inside
+            // equal-timestamp groups, where they can actually decide the reduction order.
+            let sql = format!(
+                "SELECT subject, id, store_index, body, accepted_at_unix_ms
+                 FROM claims INDEXED BY claims_subject_kind_accepted_index
                  WHERE kind='harness.usage' AND store_index<={} AND subject IN ({placeholders})
-                 ORDER BY subject, CANONICAL_ASC(claims)",
+                 ORDER BY subject, length(accepted_at_unix_ms), accepted_at_unix_ms",
                 at_index.unwrap_or(i64::MAX as u64)
-            ));
+            );
             let mut statement = connection.prepare(&sql)?;
-            for row in statement.query_map(rusqlite::params_from_iter(chunk), |row| {
+            let rows = statement.query_map(rusqlite::params_from_iter(chunk), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
-            })? {
-                let (subject, index, body, accepted) = row?;
-                grouped
-                    .entry(subject)
-                    .or_default()
-                    .push(Ok((index, body, accepted)));
+            })?;
+            let mut ties = Vec::<(String, String, u64, String, String)>::new();
+            let mut flush = |ties: &mut Vec<(String, String, u64, String, String)>| -> Result<()> {
+                if ties.len() > 1 {
+                    let mut keyed = ties
+                        .drain(..)
+                        .map(|row| Ok((canonical::claim_key(&connection, &row.1)?, row)))
+                        .collect::<Result<Vec<_>>>()?;
+                    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                    ties.extend(keyed.into_iter().map(|(_, row)| row));
+                }
+                for (subject, _, index, body, accepted) in ties.drain(..) {
+                    grouped
+                        .entry(subject)
+                        .or_default()
+                        .push(Ok((index, body, accepted)));
+                }
+                Ok(())
+            };
+            for row in rows {
+                let row = row?;
+                if ties
+                    .last()
+                    .is_some_and(|previous| previous.0 != row.0 || previous.4 != row.4)
+                {
+                    flush(&mut ties)?;
+                }
+                ties.push(row);
             }
+            flush(&mut ties)?;
         }
         let mut summaries = BTreeMap::new();
         for (subject, rows) in grouped {
@@ -48427,6 +48463,85 @@ message "human-attention" {
                 .total_tokens,
             150
         );
+    }
+
+    #[test]
+    fn batched_usage_preserves_canonical_ties_and_snapshot_bound() {
+        let store = Store::open_memory("usage-node").unwrap();
+        let subjects = ["agent/usage-a", "agent/usage-b"];
+        let mut middle = 0;
+        for i in 0..602 {
+            let subject = subjects[i % 2];
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.usage".into(),
+                    actor: Some(subject.into()),
+                    fields: BTreeMap::from([
+                        ("driver".into(), json!("codex")),
+                        ("incarnation_id".into(), json!("same-incarnation")),
+                        (
+                            "semantics".into(),
+                            json!(if i % 4 < 2 {
+                                "session_cumulative"
+                            } else {
+                                "context_occupancy"
+                            }),
+                        ),
+                        ("total_tokens".into(), json!(100)),
+                        ("cost".into(), json!(i as f64)),
+                        ("context_used_tokens".into(), json!(i)),
+                        ("padding".into(), json!("x".repeat(4096))),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            if i == 299 {
+                middle = store.index().unwrap();
+            }
+        }
+        // Reverse timestamps and batch order: tied canonical winners differ from index row order.
+        {
+            let mut connection = store.connection.write();
+            let tx = connection.transaction().unwrap();
+            tx.execute(
+                "UPDATE claims SET accepted_at_unix_ms=CAST(1000000-(store_index/8) AS TEXT)
+                        WHERE kind='harness.usage'",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE batches SET replica_sequence=10000-(SELECT MIN(store_index)
+                        FROM claims WHERE claims.batch_id=batches.id)",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let selected = [
+            subjects[1].into(),
+            subjects[0].into(),
+            subjects[1].into(),
+            "agent/missing".into(),
+        ];
+        for at in [None, Some(middle)] {
+            let batch = store.usage_summaries_at(&selected, at).unwrap();
+            assert_eq!(batch.len(), 2);
+            assert_eq!(batch[subjects[0]].cost, Some(0.0));
+            assert_eq!(batch[subjects[1]].cost, Some(1.0));
+            assert_eq!(
+                batch[subjects[0]].context.as_ref().unwrap().used_tokens,
+                Some(2)
+            );
+            for subject in subjects {
+                assert_eq!(
+                    batch.get(subject),
+                    store.usage_summary_at(subject, None, at).unwrap().as_ref()
+                );
+            }
+        }
     }
 
     #[test]
