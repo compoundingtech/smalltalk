@@ -5847,6 +5847,7 @@ fn terminal_exec_gates_check(store: &Store) -> anyhow::Result<DoctorCheck> {
 
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
+    let machine_version = st_drivers::version::machine_version();
     match state.store.index() {
         Ok(index) => checks.push(DoctorCheck {
             name: "claim-store".into(),
@@ -6406,7 +6407,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         }),
     }
     if state.fleet_id.is_some() {
-        checks.push(crate::replication_worker_build::check(&state.state_dir));
+        checks.push(crate::replication_worker_build::check(&state.state_dir, &machine_version));
     }
     match state.store.idempotency_conflicts(5) {
         Ok((0, _)) => checks.push(DoctorCheck {
@@ -6580,7 +6581,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         "pass"
     };
     Ok(Json(DoctorReport {
-        machine_version: Some(st_drivers::version::machine_version()),
+        machine_version: Some(machine_version),
         status: report_status.into(),
         checks,
         performance: crate::performance::snapshot(),

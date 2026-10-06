@@ -44,14 +44,13 @@ pub(crate) fn warning(worker: &str, daemon: Option<&str>) -> Option<String> {
     }
 }
 
-pub(crate) fn check(state_dir: &Path) -> DoctorCheck {
+pub(crate) fn check(state_dir: &Path, daemon: &str) -> DoctorCheck {
     let report = fs::read(state_dir.join(FILE))
         .map_err(anyhow::Error::from)
         .and_then(|bytes| serde_json::from_slice::<WorkerBuild>(&bytes).map_err(Into::into));
     let (status, message) = match report {
         Ok(report) if worker_running(&report) => {
-            let daemon = st_drivers::version::machine_version();
-            match warning(&report.machine_version, Some(&daemon)) {
+            match warning(&report.machine_version, Some(daemon)) {
                 Some(message) => ("warn", message),
                 None => ("pass", format!(
                     "replication worker PID {} and same-host daemon run {daemon}", report.pid
@@ -99,33 +98,35 @@ mod tests {
     #[test]
     fn doctor_distinguishes_live_mismatch_missing_report_and_dead_worker() {
         let root = tempfile::tempdir().unwrap();
-        assert_eq!(check(root.path()).status, "warn");
+        let daemon = st_drivers::version::machine_version();
+        assert_eq!(check(root.path(), &daemon).status, "warn");
         record(root.path()).unwrap();
-        assert_eq!(check(root.path()).status, "pass");
+        assert_eq!(check(root.path(), &daemon).status, "pass");
         let mut report: WorkerBuild = serde_json::from_slice(
             &fs::read(root.path().join(FILE)).unwrap()
         ).unwrap();
         report.machine_version = "0.1.0+old".into();
         fs::write(root.path().join(FILE), serde_json::to_vec(&report).unwrap()).unwrap();
-        let mismatch = check(root.path());
+        let mismatch = check(root.path(), &daemon);
         assert_eq!(mismatch.status, "warn");
         assert!(mismatch.message.contains("0.1.0+old"));
         report.pid = 0;
         fs::write(root.path().join(FILE), serde_json::to_vec(&report).unwrap()).unwrap();
-        assert_eq!(check(root.path()).status, "warn");
+        assert_eq!(check(root.path(), &daemon).status, "warn");
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn reused_pid_cannot_make_a_stale_worker_report_pass() {
         let root = tempfile::tempdir().unwrap();
+        let daemon = st_drivers::version::machine_version();
         record(root.path()).unwrap();
         let mut report: WorkerBuild = serde_json::from_slice(
             &fs::read(root.path().join(FILE)).unwrap()
         ).unwrap();
         report.start_token = report.start_token.wrapping_add(1);
         fs::write(root.path().join(FILE), serde_json::to_vec(&report).unwrap()).unwrap();
-        let stale = check(root.path());
+        let stale = check(root.path(), &daemon);
         assert_eq!(stale.status, "warn");
     }
 }
