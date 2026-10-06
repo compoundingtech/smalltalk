@@ -3436,11 +3436,11 @@ fn run_connected(
         match wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics)? {
             BindingWait::Bound => {
                 diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
-                return monitor_bound_tui(&mut tui, &events_rx);
+                monitor_bound_tui(&mut tui, &events_rx)
             }
             BindingWait::Stopped => {
                 terminate_child(&mut tui);
-                return Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()));
+                Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()))
             }
             BindingWait::TuiExited(status) => {
                 anyhow::bail!("controlled Codex TUI exited before thread binding: {status}");
