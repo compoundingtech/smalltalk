@@ -235,8 +235,8 @@ impl Store {
         if input.expected_subject.is_some() {
             let mut merging = input.clone();
             merging.expected_subject = None;
-            return append_claim_with_subject_fences(&self.graph,&merging,None,None,Some(expected_subjects)).map(|(claim,_)| claim);
+            return append_claim_with_subject_fences(&self.graph,&merging,None,None,Some(expected_subjects),None).map(|(claim,_)| claim);
         }
-        append_claim_with_subject_fences(&self.graph,input,None,None,Some(expected_subjects)).map(|(claim,_)| claim)
+        append_claim_with_subject_fences(&self.graph,input,None,None,Some(expected_subjects),None).map(|(claim,_)| claim)
     }
 }
