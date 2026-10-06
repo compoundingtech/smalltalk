@@ -33,6 +33,50 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
+def emit_failure_evidence(out, report):
+    """Keep existing portable fixture evidence in a failed sandbox's build log.
+
+    Run after native cleanup and judging, never in the delivery/timing path.
+    Bound file reads and printed bytes; a truncated file is explicitly marked.
+    """
+    budget = 256 * 1024
+    half = 8 * 1024
+    names = ["reader.json", "recovered-trace.json", "trace.json", "link-events.json",
+             "before.json", "after.json"]
+    for node in ("amber", "cobalt"):
+        names.extend(f"{node}-{suffix}" for suffix in (
+            "replication.json", "driver-api-warnings.log", "daemon.log",
+            "worker.log", "native.log", "error-agent.json", "error-trace.jsonl"))
+    for case in report["cases"]:
+        if case["verdict"] == "pass":
+            continue
+        for name in names:
+            path = out / case["case"] / name
+            try:
+                with path.open("rb") as stream:
+                    size = os.fstat(stream.fileno()).st_size
+                    head = stream.read(min(size, half * 2, budget))
+                    tail = b""
+                    if size > len(head) and budget > len(head):
+                        head = head[:half]
+                        stream.seek(max(len(head), size - min(half, budget - len(head))))
+                        tail = stream.read(min(half, budget - len(head)))
+                budget -= len(head) + len(tail)
+                print(json.dumps({"native_failure_evidence": f"{case['case']}/{name}",
+                                  "file_bytes": size, "retained_bytes": len(head) + len(tail),
+                                  "omitted_bytes": size - len(head) - len(tail),
+                                  "head": head.decode(errors="replace"),
+                                  "tail": tail.decode(errors="replace")}), flush=True)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                print(json.dumps({"native_failure_evidence": f"{case['case']}/{name}",
+                                  "capture_error": str(error)}), flush=True)
+            if budget <= 0:
+                print(json.dumps({"native_failure_evidence": "byte budget exhausted"}), flush=True)
+                return
+
+
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -785,6 +829,8 @@ async def main(args):
     ended = datetime.datetime.now(datetime.timezone.utc)
     report.update(ended=ended.isoformat(), duration_seconds=(ended - started).total_seconds())
     write_json(args.out / "result.json", report)
+    if report["verdict"] != "pass":
+        emit_failure_evidence(args.out, report)
     return 0 if report["verdict"] == "pass" else 1
 
 
