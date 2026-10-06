@@ -42,7 +42,12 @@ export type ConversationHandlers = {
 
 type Client = Pick<St3Client, 'collectionStream' | 'terminalScreen' | 'terminalAttach' | 'terminalDetach'> & Partial<Pick<St3Client, 'capabilities'>>;
 /** How often a live socket is checked, and how long one check may take. */
-const PROBE_EVERY_MS = 10_000, PROBE_WAIT_MS = 5_000;
+const PROBE_EVERY_MS = 10_000, PROBE_WAIT_MS = 5_000, QUIET_BEFORE_PROBE_MS = 10_000;
+
+/** Whether st is asked anything: not while frames arrive, only once the stream has been quiet. */
+export function shouldProbe(lastFrameAt: number, now: number): boolean {
+  return now - lastFrameAt >= QUIET_BEFORE_PROBE_MS;
+}
 type Follow = { close(): void };
 
 function errorCode(error: unknown): string | undefined {
@@ -79,6 +84,8 @@ export class Feed {
   /** Windows (and the glasses) st stopped sending: how often they failed, and the timer to ask again. */
   private retries: Partial<Record<FeedWindow | typeof GLASSES, { failures: number; timer?: ReturnType<typeof setTimeout> }>> = {};
   private probe: ReturnType<typeof setInterval> | undefined;
+  /** When a frame last arrived on the open socket. */
+  private lastFrameAt = Date.now();
   private readonly unsubscribe: () => void;
   private readonly client: Client;
   private readonly handlers: FeedHandlers;
@@ -157,7 +164,8 @@ export class Feed {
 
   /**
    * A socket can stay open and silent while st is wedged or the network blackholed it, and the
-   * app would say live with old data. While live, st is asked something small every 10 s; a slow
+   * app would say live with old data. Nothing is asked of st while the stream speaks: any frame
+   * is proof of life. Only once it has been quiet for 10 s is st asked something small; a slow
    * answer is asked again at once, and only two misses in a row drop the socket.
    */
   private startProbing(): void {
@@ -166,6 +174,7 @@ export class Feed {
     const current = this.attempt;
     const once = () => Promise.race([capabilities().then(() => true, () => false), new Promise<boolean>(resolve => setTimeout(() => resolve(false), PROBE_WAIT_MS))]);
     this.probe = setInterval(() => {
+      if (!shouldProbe(this.lastFrameAt, Date.now())) return;
       void (async () => {
         if (await once() || await once()) return;
         if (current === this.attempt && !this.closed) this.dropped(new Error('st stopped answering'));
@@ -201,10 +210,11 @@ export class Feed {
     this.handlers.onConnection(this.failures ? 'reconnecting' : 'connecting');
     try {
       const opened = await this.client.collectionStream({
-        onFrame: frame => { if (!stale()) this.frame(frame); },
+        onFrame: frame => { if (!stale()) { this.lastFrameAt = Date.now(); this.frame(frame); } },
         onEnd: error => { if (!stale()) this.dropped(error ?? new Error('The collections socket closed.')); },
       });
       if (stale()) { opened.close(); return; }
+      this.lastFrameAt = Date.now();
       this.stream = opened;
       for (const name of Object.keys(FEED_WINDOWS) as FeedWindow[]) this.subscribeWindow(name);
       if (this.conversation) opened.subscribeConversation(CONVERSATION, this.conversation.target);
