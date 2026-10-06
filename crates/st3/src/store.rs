@@ -25558,16 +25558,19 @@ fn try_project_simple_replication_tx(
         }
         roots
     };
-    if !foreign_roots.is_empty() {
-        for claim in claims
-            .iter()
-            .filter(|claim| claim.origin == origin && run_tree_kind(&claim.kind))
+    for claim in claims
+        .iter()
+        .filter(|claim| claim.origin == origin && run_tree_kind(&claim.kind))
+    {
+        // A local extension is the exception: the write path does not set the step's blocked
+        // reason the way a replay does, so its tree is still rebuilt (extensions are rare).
+        if foreign_roots.is_empty() && claim.kind != "work.extended" {
+            continue;
+        }
+        if let Some(root) = run_tree_of_tx(transaction, &claim.subject)?
+            && (claim.kind == "work.extended" || foreign_roots.contains(&root))
         {
-            if let Some(root) = run_tree_of_tx(transaction, &claim.subject)?
-                && foreign_roots.contains(&root)
-            {
-                dirty.insert(Aggregate::RunTree(root));
-            }
+            dirty.insert(Aggregate::RunTree(root));
         }
     }
     for claim in &claims {
