@@ -105,14 +105,38 @@ pub fn sortable_key(key: &ClaimKey) -> Vec<u8> {
 }
 
 pub fn claim_key(connection: &Connection, id: &str) -> Result<ClaimKey> {
-    let position = position_sql("claims");
-    let (time, writer, sequence, batch, position, id) = connection.query_row(
-        &format!("SELECT claims.accepted_at_unix_ms, batches.origin, batches.replica_sequence,
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let position = position_sql("claims");
+        format!("SELECT claims.accepted_at_unix_ms, batches.origin, batches.replica_sequence,
             claims.batch_id, {position}, claims.id FROM claims JOIN batches ON batches.id=claims.batch_id
-            WHERE claims.id=?1"), [id], |row| Ok((
+            WHERE claims.id=?1")
+    });
+    let (time, writer, sequence, batch, position, id) = connection.prepare_cached(&QUERY)?
+        .query_row([id], |row| Ok((
             row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?,
             row.get::<_, String>(3)?, row.get::<_, u64>(4)?, row.get::<_, String>(5)?,
         )),
     )?;
     Ok((time.parse()?, writer, sequence, batch, position, id))
+}
+
+#[cfg(test)]
+#[test]
+fn claim_keys_preserve_numeric_time_and_record_or_legacy_position_order() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch(
+        "CREATE TABLE batches(id TEXT, origin TEXT, replica_sequence INTEGER);
+         CREATE TABLE claims(id TEXT, batch_id TEXT, accepted_at_unix_ms TEXT, store_index INTEGER);
+         CREATE TABLE replica_records(claim_id TEXT, position INTEGER);
+         INSERT INTO batches VALUES ('batch', 'writer', 2);
+         INSERT INTO claims VALUES ('a', 'batch', '10', 3), ('b', 'batch', '9', 2), ('c', 'batch', '10', 1);
+         INSERT INTO replica_records VALUES ('b', 8), ('b', 4);"
+    ).unwrap();
+    let mut keys: Vec<_> = ["a", "b", "c"].map(|id| claim_key(&connection, id).unwrap()).into();
+    keys.sort();
+    assert_eq!(keys, vec![
+        (9, "writer".into(), 2, "batch".into(), 4, "b".into()),
+        (10, "writer".into(), 2, "batch".into(), 0, "c".into()),
+        (10, "writer".into(), 2, "batch".into(), 2, "a".into()),
+    ]);
 }

@@ -66,8 +66,11 @@ export default githubWorkflow(auditCaches({
   name: 'Main upkeep',
   on: { push: { branches: ['main'] }, workflow_dispatch: {} },
   permissions: { contents: 'read', actions: 'read' },
-  // Every main SHA keeps its upkeep run; a later merge must not cancel cache saves or cost checks.
-  concurrency: { group: 'main-upkeep-${{ github.run_id }}', 'cancel-in-progress': false },
+  // Fill caches for current main; keep pinned manual runs independent.
+  concurrency: {
+    group: "main-upkeep-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.run_id }}",
+    'cancel-in-progress': "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
+  },
   actionlint: {
     ...defaultActionlintConfig,
     selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],

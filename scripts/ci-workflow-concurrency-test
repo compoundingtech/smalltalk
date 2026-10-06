@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Exercise cancellation groups from generated workflows with real event distinctions."""
+import ast
+from pathlib import Path
+import re
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def policy(workflow, event, run_id, pr=None, ref='refs/heads/main'):
+    text = (ROOT / '.github/workflows' / workflow).read_text()
+    block = re.search(r'^concurrency:\n((?:  .+\n)+)', text, re.M)
+    assert block, (workflow, 'missing concurrency policy')
+    fields = {}
+    context = {'event': event, 'run_id': run_id, 'pr': pr, 'ref': ref}
+
+    def expression(value):
+        for source, name in [('github.event.pull_request.number', 'pr'),
+                             ('github.event_name', 'event'), ('github.run_id', 'run_id'),
+                             ('github.ref', 'ref')]:
+            value = value.replace(source, name)
+        value = value.replace('&&', ' and ').replace('||', ' or ').strip()
+        tree = ast.parse(value, mode='eval')
+        allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare,
+                   ast.Eq, ast.Name, ast.Load, ast.Constant)
+        assert all(isinstance(node, allowed) for node in ast.walk(tree)), value
+        assert all(node.id in context for node in ast.walk(tree) if isinstance(node, ast.Name)), value
+        return eval(compile(tree, '<generated-concurrency>', 'eval'), {'__builtins__': {}}, context)
+
+    for line in block.group(1).splitlines():
+        key, value = line.strip().split(': ', 1)
+        if value.startswith(('"', "'")):
+            value = ast.literal_eval(value)
+        if key == 'group':
+            fields[key] = re.sub(r'\$\{\{(.*?)\}\}', lambda match: str(expression(match[1])), value)
+        else:
+            fields[key] = (bool(expression(value[3:-2])) if value.startswith('${{')
+                           else {'true': True, 'false': False}[value])
+    return fields['group'], fields['cancel-in-progress']
+
+
+for workflow in ['fleet.yml', 'perf.yml', 'public-repo.yml']:
+    first = policy(workflow, 'pull_request', 100, 42)
+    newer_head = policy(workflow, 'pull_request', 101, 42)
+    assert first == newer_head and first[1], (workflow, 'PR heads must replace each other')
+    assert policy(workflow, 'pull_request', 102, 43)[0] != first[0], workflow
+    print('passed:', workflow, 'latest head replaces only its own PR')
+
+# Preserve the established PR groups so old workflow revisions share the same cancellation key.
+assert policy('fleet.yml', 'pull_request', 100, 42)[0] == 'workspace-42-pull_request'
+assert policy('perf.yml', 'pull_request', 100, 42)[0] == 'perf-42'
+
+for workflow in ['main-upkeep.yml', 'perf.yml', 'public-repo.yml']:
+    old = policy(workflow, 'push', 100)
+    latest = policy(workflow, 'push', 101)
+    assert old == latest and latest[1], (workflow, 'main pushes must replace obsolete work')
+    print('passed:', workflow, 'only latest main push remains')
+
+for workflow in ['fleet.yml', 'main-upkeep.yml', 'perf.yml', 'public-repo.yml']:
+    for event in ['workflow_dispatch', 'schedule', 'merge_group']:
+        first, second = policy(workflow, event, 100), policy(workflow, event, 101)
+        assert not first[1] and not second[1] and first[0] != second[0], (workflow, event)
+        assert first[0] != policy(workflow, 'pull_request', 102, 42)[0], (workflow, event)
+    print('passed:', workflow, 'manual, scheduled and merge-group identities remain independent')
+
+assert policy('fleet.yml', 'merge_group', 100) == ('workspace-100-merge_group', False)
+assert not policy('main-upkeep.yml', 'push', 100, ref='refs/heads/other')[1]
+assert not policy('perf.yml', 'push', 100, ref='refs/heads/other')[1]

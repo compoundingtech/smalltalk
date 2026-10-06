@@ -97,5 +97,13 @@ replayed, the newest page arrives again with `replace: true`. An `error` frame e
 subscription only, for example while the owning host is unreachable. After a dropped socket,
 subscribe again on the new one.
 
+`has_more` describes history before the replacement window, not whether a delta has more
+changes. Delta frames omit it: absence means preserve the last known availability, never
+`false`. Clients retain this distinction through decoding and UI updates; an explicitly
+supplied boolean updates availability. A replacement (including a reconnect) or a changed
+session starts with its own availability and must not inherit the previous window's value.
+Older-page responses independently report whether there are entries before that page; once
+the session's start is reached, later live deltas do not reopen older-history paging.
+
 `st missions ls --watch`, `st attention ls --watch`, `st agents ls --watch`,
 and `st work ls --watch` consume this same transport.

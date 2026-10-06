@@ -98,7 +98,9 @@ and caller-supplied `Theme` tokens. The returned document contains styled lines 
 `PaneIntent` targets. `State` retains scrolling, tool expansion, display-column selection
 and composer drafts; send, open and older-history intents are executed by the embedding app.
 Replacement frames remove the previous bounded window; incremental frames revise entries
-by ID. `has_more` remains available so a client can distinguish bounded from complete history.
+by ID. Frame `has_more` is `Option<bool>`: an absent delta leaves the timeline's availability
+unchanged, while an explicit value updates it. A replacement or changed session starts fresh.
+The timeline keeps a boolean for the current window, and older pages track their own start.
 
 The shared crate and `stui` use workspace Ratatui 0.30. An embedding application must align its
 rendering dependency before passing buffers or lines across this boundary. Native conversations are not a terminal emulator: harness menus and arbitrary
