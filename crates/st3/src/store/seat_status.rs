@@ -70,11 +70,16 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
                     continue;
                 };
                 let status = statuses.entry(incarnation).or_default();
-                if let Some(blocked_on) = fields.get("blocked_on") {
-                    status.blocked_on = blocked_on.as_str();
-                }
-                if let Some(ask) = fields.get("ask") {
-                    status.ask = ask.as_str();
+                if matches!(state, "ended" | "indeterminate") {
+                    status.blocked_on = None;
+                    status.ask = None;
+                } else {
+                    if let Some(blocked_on) = fields.get("blocked_on") {
+                        status.blocked_on = blocked_on.as_str();
+                    }
+                    if let Some(ask) = fields.get("ask") {
+                        status.ask = ask.as_str();
+                    }
                 }
                 status.harness = Some(if permission_blocked(Some(state), status.blocked_on, status.ask) {
                     "blocked"
@@ -563,6 +568,40 @@ mod tests {
         let last = history["items"].as_array().unwrap().last().unwrap();
         assert_eq!(last["state"], "working");
         assert_eq!(last["runtime_incarnation"], "two");
+    }
+
+    #[test]
+    fn terminal_observation_fences_permission_before_sparse_work_resumes() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms() - 1_000;
+        let publish = |state: &str, fields: Value, time: u128| {
+            let mut fields = fields.as_object().unwrap().clone();
+            fields.insert("state".into(), json!(state));
+            fields.insert("incarnation_id".into(), json!("one"));
+            fields.insert("observed_at_ms".into(), json!(time as u64));
+            store.append_latest_observation(&input("harness.observed", json!(fields)), time)
+                .unwrap().0
+        };
+        publish("working", json!({"blocked_on":"human", "ask":"permission"}), at);
+        assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().state, "blocked");
+        let ended = publish("ended", json!({"blocked_on":"human", "ask":"permission"}), at + 1);
+        assert!(ended.body["fields"]["blocked_on"].is_null());
+        assert!(ended.body["fields"]["ask"].is_null());
+        let resumed = publish("working", json!({"reason":"resumed"}), at + 2);
+        assert!(resumed.body["fields"]["blocked_on"].is_null());
+        assert!(resumed.body["fields"]["ask"].is_null());
+        assert_eq!(resumed.body["fields"]["status_transition"], true);
+        assert_eq!(resumed.body["fields"]["observed_since_ms"], json!((at + 2) as u64));
+        let current = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(current.state, "working");
+        assert_eq!(current.since_unix_ms, at + 2);
+        assert!(current.blocked_on.is_none());
+        assert!(current.ask.is_none());
+        let history = store.seat_status_history("agent/cedar", at + 3).unwrap();
+        let states = history["items"].as_array().unwrap().iter()
+            .filter_map(|item| item["state"].as_str()).collect::<Vec<_>>();
+        assert_eq!(states, ["blocked", "ended", "working"]);
     }
 
     #[test]

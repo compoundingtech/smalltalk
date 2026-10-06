@@ -18254,6 +18254,10 @@ fn publish_changed_harness_state_tx(
             fields.insert("provider_auth".into(), value.clone());
         }
     }
+    if matches!(fields.get("state").and_then(Value::as_str), Some("ended" | "indeterminate")) {
+        fields.insert("blocked_on".into(), Value::Null);
+        fields.insert("ask".into(), Value::Null);
+    }
     let unchanged = latest.as_ref().is_some_and(|claim| {
         claim
             .body
@@ -20446,6 +20450,10 @@ fn current_harness_fold_at(
             && let Some(state) = fields.get("state").and_then(Value::as_str)
         {
             current = Some((state.to_owned(), claim, observed_at_unix_ms, key));
+        }
+        if matches!(fields.get("state").and_then(Value::as_str), Some("ended" | "indeterminate")) {
+            optional.entry("blocked_on").or_insert(None);
+            optional.entry("ask").or_insert(None);
         }
         for name in [
             "driver",
