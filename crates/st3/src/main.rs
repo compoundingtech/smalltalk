@@ -18652,7 +18652,7 @@ async fn run_pi_channel(
             &session,
             seq,
             &runtime,
-        )?.with_native_session(state.native_session.clone()))
+        )?.with_native_session(state.native_session.clone())?)
     } else {
         None
     };

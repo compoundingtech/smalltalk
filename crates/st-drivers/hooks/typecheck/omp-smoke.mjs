@@ -670,10 +670,13 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
   const newSessionFrames = readFrames().slice(beforeNewSession);
   assert.strictEqual(newSessionFrames[0].type, "session");
   assert.strictEqual(newSessionFrames[0].sessionId, nativeSession);
+  assert.strictEqual(newSessionFrames[1].type, "ready");
+  assert.strictEqual(newSessionFrames[1].sessionId, nativeSession);
+  assert.ok(newSessionFrames.findIndex((frame) => frame.type === "todo") > 1,
+    "new-session observations follow the binding confirmation");
   assert.strictEqual(todos().at(-1).session, nativeSession);
   assert.deepStrictEqual(todos().at(-1).totals, totals());
   assert.strictEqual(fs.readFileSync(pidPath, "utf8"), pidsBeforeBranch, "branch hydration does not reopen delivery");
-  assert.ok(!newSessionFrames.some((frame) => frame.type === "ready"), "branch hydration does not rerun delivery readiness");
   assert.strictEqual(handedOver.length, beforeBranchMail, "branch hydration preserves held mail");
   await handlers.get("agent_end")(successfulEnd, todoCtx);
   await pause(100);

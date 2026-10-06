@@ -342,7 +342,7 @@ mod tests {
             .unwrap().ownership_sequence.unwrap();
         let mut observer = st_drivers::pi_channel::EventObserver::new(
             &observations, &owner.join("sessions/omp"), "example/inventory", "omp", "provider-one", seq,
-            "example/inventory").unwrap().with_native_session(Some("native-one".into()));
+            "example/inventory").unwrap().with_native_session(Some("native-one".into())).unwrap();
         observer.observe(&json!({"type":"session", "sessionId":"native-two"})).unwrap();
         assert_eq!(call(&state, query("slash-commands")).await.unwrap_err().code, "stale-fence");
         st_drivers::harness_state::claim(&owner.join("observations"), "example/inventory", "omp", "provider-two").unwrap();

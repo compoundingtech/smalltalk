@@ -93,6 +93,10 @@ only on a matching `ready` frame. Recording, confirmation, and pending-candidate
 the current provider ownership sequence; a predecessor cannot delete a successor's candidate.
 Until confirmation, or after a provider has a recorded terminal exit, inventory reads return
 `stale-fence`. A startup ownership placeholder without an exit is not a terminal provider.
+Live native branch switches complete the same `session`/`ready` handshake on the existing channel
+without resetting mail or approval state. Cold-resume expected-session requirements apply only to
+the initial confirmed binding. Channel re-exec recovers that completed bootstrap from its existing
+same-provider durable ready binding; a later pending branch still refuses inventory reads.
 
 Collections are `files`, `skills`, `skill-commands`, and `slash-commands`. Responses distinguish
 `supported`, `unsupported`, and `unavailable`, with explicit `coverage`, `full_inventory`, reason,

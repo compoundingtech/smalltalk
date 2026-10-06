@@ -268,6 +268,18 @@ fn load_binding(
     load_binding_file(&state_dir.join(BINDING_FILE), agent, runtime_id)
 }
 
+/// Bootstrap completion survives channel re-exec, even while a later branch is pending.
+/// This is not inventory authority; owner reads must use `bound_native_session`.
+pub(crate) fn has_confirmed_channel_binding(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+    runtime_incarnation: &str,
+) -> Result<bool> {
+    Ok(load_binding(state_dir, agent, runtime_id)?
+        .is_some_and(|binding| binding.ready && binding.runtime_incarnation == runtime_incarnation))
+}
+
 /// Current, ready native session for an owner read. A pending switch is not a read authority.
 pub fn bound_native_session(
     state_dir: &Path,

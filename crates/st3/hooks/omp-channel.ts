@@ -774,6 +774,7 @@ export default function (pi: ExtensionAPI) {
       // A branch hydration binds its observation provenance on the existing channel. It must
       // not restart delivery, discard held mail, or reset ask/approval authority.
       sendFrame({ type: "session", sessionId: nativeSession });
+      sendFrame({ type: "ready", sessionId: nativeSession });
       state.todoSession = nativeSession;
       state.todoFingerprint = undefined;
       state.todoBranchKey = undefined;

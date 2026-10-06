@@ -565,6 +565,10 @@ impl EventObserver {
             crate::contracts::env(crate::omp_session::CHANNEL_EXPECTED_NATIVE_SESSION)
                 .filter(|value| !value.is_empty())
         } else { None };
+        anyhow::ensure!(
+            resume_generation.is_some() == expected_native_session.is_some(),
+            "OMP channel has an incomplete mandatory resume fence"
+        );
         let mut state =
             harness_state::Writer::new(agent_dir, identity, driver, Some(runtime_id.into()))
                 .with_ownership(session, seq);
@@ -587,10 +591,19 @@ impl EventObserver {
             native_session: None,
         })
     }
-    /// The channel resume state already authenticated this binding before re-exec.
-    pub fn with_native_session(mut self, native_session: Option<String>) -> Self {
+    /// Restore an authenticated native ID; durable confirmation alone consumes the cold fence.
+    pub fn with_native_session(mut self, native_session: Option<String>) -> Result<Self> {
+        if self.driver == "omp" && native_session.is_some()
+            && harness_state::with_current_ownership(&self.agent_dir, &self.owner, self.ownership_seq, || {
+                crate::omp_session::has_confirmed_channel_binding(
+                    &self.session_dir, &self.identity, &self.runtime, &self.owner)
+            })?
+        {
+            self.resume_generation = None;
+            self.expected_native_session = None;
+        }
         self.native_session = native_session;
-        self
+        Ok(self)
     }
     pub fn observe(&mut self, frame: &Value) -> Result<()> {
         if matches!(frame["type"].as_str(), Some("session" | "ready")) {
@@ -607,6 +620,8 @@ impl EventObserver {
                     crate::omp_session::confirm_channel_binding(&self.session_dir, &self.agent_dir,
                         &self.identity, &self.runtime, &self.owner, self.ownership_seq, native,
                         self.resume_generation)?;
+                    self.resume_generation = None;
+                    self.expected_native_session = None;
                 }
             }
             self.native_session = native.map(str::to_owned);
@@ -1088,12 +1103,24 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         crate::harness_events::enable(root.path(), "runtime-a").unwrap();
         let seq = harness_state::claim(root.path(), "agent/example", "omp", "provider-a").unwrap();
-        let mut observer = EventObserver::new(
-            root.path(), &root.path().join("sessions"), "agent/example", "omp", "provider-a", seq, "runtime-a",
-        ).unwrap();
+        let cold_observer = || {
+            let mut observer = EventObserver::new(
+                root.path(), &root.path().join("sessions"), "agent/example", "omp", "provider-a", seq, "runtime-a",
+            ).unwrap();
+            observer.resume_generation = Some(crate::residency::Generation(2));
+            observer.expected_native_session = Some("native-a".into());
+            observer
+        };
+        let mut observer = cold_observer();
+        assert!(observer.observe(&serde_json::json!({"type":"session","sessionId":"native-wrong"})).is_err());
+        let mut incomplete = cold_observer();
+        incomplete.resume_generation = None;
+        assert!(incomplete.observe(&serde_json::json!({"type":"session","sessionId":"native-a"})).is_err());
         observer.observe(&serde_json::json!({"type":"session","sessionId":"native-a"})).unwrap();
         assert_eq!(crate::omp_session::bound_native_session(&root.path().join("sessions"),
             "agent/example", "runtime-a", "provider-a").unwrap(), None);
+        observer = cold_observer().with_native_session(Some("native-a".into())).unwrap();
+        assert!(observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-wrong"})).is_err());
         observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-a"})).unwrap();
         assert_eq!(crate::omp_session::bound_native_session(&root.path().join("sessions"),
             "agent/example", "runtime-a", "provider-a").unwrap().as_deref(), Some("native-a"));
@@ -1115,11 +1142,13 @@ mod tests {
         assert!(observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-a"})).is_err());
         assert_eq!(crate::omp_session::bound_native_session(&root.path().join("sessions"),
             "agent/example", "runtime-a", "provider-a").unwrap(), None);
+        observer = cold_observer().with_native_session(Some("native-b".into())).unwrap();
         observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-b"})).unwrap();
         assert_eq!(crate::omp_session::bound_native_session(&root.path().join("sessions"),
             "agent/example", "runtime-a", "provider-a").unwrap().as_deref(), Some("native-b"));
         crate::harness_events::enable(root.path(), "runtime-b").unwrap();
         harness_state::claim(root.path(), "agent/example", "omp", "provider-b").unwrap();
+        assert!(cold_observer().with_native_session(Some("native-b".into())).is_err());
         assert!(observer.observe(&serde_json::json!({"type":"session","sessionId":"native-c"})).is_err());
         assert!(observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-b"})).is_err());
         let mut current_todo = todo_frame();
