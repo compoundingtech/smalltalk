@@ -7,11 +7,14 @@ It ships three switchable visual directions (**Folio**, **Relay**, **Orbit**). E
 ## Run
 
 ```sh
-pnpm install                              # at the workspace root
-pnpm --filter @smalltalk/fractal-ui storybook       # http://127.0.0.1:53705
-pnpm --filter @smalltalk/fractal-ui typecheck
-pnpm --filter @smalltalk/fractal-ui build-storybook # static build in storybook-static/
+cd packages/fractal-ui
+pnpm install --frozen-lockfile
+pnpm storybook        # http://127.0.0.1:53705
+pnpm typecheck
+pnpm build-storybook  # static build in storybook-static/
 ```
+
+Until the repository has a shared pnpm workspace, this package is self-contained: it has its own `pnpm-workspace.yaml` and lockfile, the same per-package-lockfile model the TypeScript clients use. When a root workspace lands, the package moves into it.
 
 The dev server binds to localhost on a fixed port (53705). To view it from another machine, forward the port, for example `ssh -L 53705:localhost:53705 <host>`, and open http://localhost:53705.
 
