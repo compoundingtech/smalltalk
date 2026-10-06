@@ -269,3 +269,129 @@ into `Environment=` lines alongside the existing `PATH`/`PTY_ROOT` serialization
    subscriber; correlated diagnostics migrated; otelite assertions extended to logs.
 
 Each PR lands CI-green independently; PR2/PR3 depend on PR1's plumbing only.
+
+## st3
+
+This section specifies the st3 core mechanism (O11Y-R10–R18). The st2 sections above retain
+their own process model. The design source is [#1580](https://github.com/compoundingtech/smalltalk/issues/1580).
+
+```text
+process tracing ── local-root buffer ── batch span processor ──┐
+metric instruments ── periodic reader ────────────────────────┼── SDK threads ── OTLP/HTTP JSON
+tracing events ── correlated log bridge ── batch processor ───┘
+hook signals ── daemon observations exporter ────────────────────────────────── OTLP/HTTP JSON
+```
+
+### Pipeline and identity
+
+`crates/st3/src/otel.rs` owns SDK initialization, resource construction, and shutdown.
+`crates/st3/src/otel_sampler.rs` owns head decisions and the local-root tail processor.
+The pipeline uses the crate versions and blocking-only OTLP feature set listed above.
+Trace, metric, and log exporters use SDK-owned threads; none export on the daemon's
+`new_current_thread` request reactor. The log bridge uses
+`experimental_use_tracing_span_context` to attach the active trace and span ids.
+
+With no `OTEL_EXPORTER_OTLP_ENDPOINT`, initialization builds no SDK providers or exporters.
+An atomic enabled gate returns before span construction. Local stderr diagnostics remain
+available. Standard `OTEL_*` environment variables configure export.
+
+| Process unit | `service.name` | Shutdown budget |
+| --- | --- | --- |
+| `st up` daemon | `st3-daemon` | 5 s |
+| `peer::run_worker` replication worker | `st3-replication-worker` | 5 s |
+| One-shot CLI | `st3-cli` | 250 ms |
+| Driver hook | No direct SDK export; daemon-mediated | No collector flush in the hook |
+| `driver claude-statusline` | None; `telemetry::local_only()` | No pipeline |
+
+`crates/st3/src/telemetry.rs` remains the hook path. Hooks hand signals to the daemon and
+never contact a collector. The statusline cadence exemption remains the DQ-C13 rule above;
+there is no `st3-hook` exporter.
+
+The shared resource contains `service.name`, `service.version` from
+`st_drivers::version::machine_version()`, a random per-process `service.instance.id`,
+`host.name`, and `st3.node`. The observations exporter in `crates/st3/src/otlp.rs` uses this
+resource builder, including the version. The platform edge supplies fleet-owned attributes.
+Flush and shutdown share one process-unit deadline across all three providers; an unreachable
+collector cannot extend it.
+
+### Local-root sampling
+
+```text
+span start ── record context + local-root membership ── span end ── bounded buffer
+                                                                    │
+local root ends ── error OR slow OR ratio OR admitted sampled parent ─┤
+                                                   keep → batch; drop → discard
+```
+
+The head sampler records spans even when the sampled bit is clear. It sets the sampled bit
+only for an admitted sampled parent or a deterministic trace-id ratio decision, both known
+at start. The default ratio is 0.01. Outbound context carries that decision; a downstream
+process makes its own error and duration decision.
+
+`LocalRootTailSampler` wraps the SDK `BatchSpanProcessor`. It buffers finished spans by
+trace and local root, records error status across the group, and decides when the local root
+ends. It keeps the group if any span has status `ERROR`, the local root lasts more than 1 s,
+the trace id meets the ratio, or a sampled incoming parent passes the rate bound. The
+parent-keep token bucket permits 20 traces/s per daemon. Exhausting that allowance does not
+remove an error, slow, or ratio keep.
+
+Defaults bound each trace to 512 buffered spans and the process to approximately 20,000
+buffered spans. Overflow drops are counted. Processor statistics expose kept, dropped,
+overflow-dropped, and parent-keep-throttled counts. No collector tail-sampling point is
+required. If only an upstream local root is slow, a fast downstream group can be absent.
+Metric instruments record independently of span sampling.
+
+### Metric naming and cardinality
+
+The repository-local st3 instrument namespace uses lowercase dot-separated names under
+`st3.`; HTTP instruments use the OpenTelemetry `http.server` namespace. Duration instruments
+end in `.duration` and use seconds. Depth, size, and age gauges describe saturation. Examples
+are `http.server.request.duration`, `st3.writer.wait.duration`, and `st3.fifo.depth`.
+Do not append Prometheus `_total` or `_seconds` suffixes to these OTLP instrument names.
+
+Label vocabularies are closed enums or bounded fleet membership. Unknown user-provided
+values map to `other`; routes are matched templates, not raw paths.
+
+| Label axis | Bound or vocabulary |
+| --- | --- |
+| `st3.client.class` | `cli`, `stui`, `fractal`, `web`, `replication-worker`, `omp-channel`, `hook`, `other` |
+| HTTP route, method, status class | Registered templates, methods, and status classes |
+| `claim_family` | Top-level registered kind segment, else `other` |
+| Reconcile `task` | `pass`, `deadline` |
+| Wake `cause`, FIFO `queue`, startup `phase`, replication `result` | Closed registries |
+| Replication `peer` | Fleet node membership |
+
+The instrument/label cross-products must total at most 2,000 active series per daemon.
+An enumeration test checks the budget, including histogram expansion. Duration buckets are
+`0.001`, `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`,
+`30`, and `60` seconds.
+
+### Attribute and context policy
+
+Agent, session, message, terminal, attachment, and lease ids are span attributes only:
+never metric labels or `span.label`. Capabilities and capability hashes never enter traces,
+metrics, or logs. Span names and labels use bounded operation vocabulary. Existing
+`profile::Op` and `profile::task` labels supply that vocabulary where available.
+
+W3C `traceparent` and `tracestate` are the wire context, not hash-derived identities.
+HTTP and WebSocket upgrade requests carry context; peer context belongs inside the
+`FleetAuth`-signed header set. Concrete propagation and instrumentation surfaces not
+specified by this core are recorded in [open questions](open-questions.md#st3).
+
+### Proof and overhead
+
+The core receiver proof uses `otelite` to inspect trace, metric, and correlated log export,
+process identity and version, and the unset-endpoint no-export control. Sampler proofs cover
+fast-drop, slow/error/parent/ratio keeps, parent throttling, buffer overflow, and independent
+metric recording. Shutdown proof uses an unreachable collector and the table's deadlines.
+
+Copied-store measurements compare endpoint-unset execution with an enabled `otelite` sink.
+They cover daemon CPU, p99 request latency, RSS, and sampled export rate against O11Y-R18.
+The core mechanism does not claim request-tree or client/peer round-trip coverage until
+those instrumentation surfaces exist.
+
+### Design questions
+
+The review questions and their resolution criteria are
+[ST3-O11Y-DQ01–DQ05](open-questions.md#st3): service naming, VRS placement, signed peer
+context, sampling location, and profiler ownership.

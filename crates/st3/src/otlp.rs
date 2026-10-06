@@ -420,6 +420,8 @@ fn otlp_usage_metrics(node: &str, batch: &[ClaimRecord]) -> Option<Value> {
 fn resource(node: &str) -> Value {
     json!({"attributes": [
         attribute("service.name", json!({"stringValue": "st"})),
+        attribute("service.version", json!({"stringValue": st_drivers::version::machine_version()})),
+        attribute("service.instance.id", json!({"stringValue": crate::otel::service_instance_id()})),
         attribute("host.name", json!({"stringValue": node})),
         attribute("st3.node", json!({"stringValue": node})),
     ]})

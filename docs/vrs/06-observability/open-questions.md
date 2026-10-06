@@ -23,3 +23,28 @@ Kept minimal; each blocks exactly one delivery slice, not the tree.
   `EnvironmentFile=` only if the variable count grows.
 - **Sampling.** Default is always-on given st2's low event volume. If supervisor-loop span volume
   proves noisy in Grafana, revisit parent-based sampling ratios — not before there is data.
+
+## st3
+
+These review questions come from [#1580](https://github.com/compoundingtech/smalltalk/issues/1580)
+and link to the [st3 design questions](spec.md#design-questions).
+
+- **ST3-O11Y-DQ01 Service names:** Are process names `st3-*` or version-neutral `st-*`?
+  Resolve by approving the registered service-name vocabulary; the core selects `st3-*`.
+- **ST3-O11Y-DQ02 VRS placement:** Does st3 belong in this observability tree or a sibling
+  tree? Resolve by approving the document boundary and the st2-only scope of O11Y-R07;
+  the core uses a separate st3 section here.
+- **ST3-O11Y-DQ03 Signed peer context:** Is `traceparent` inside the `FleetAuth`-signed
+  header set acceptable? Resolve by reviewing the signing contract and old-peer behavior.
+- **ST3-O11Y-DQ04 Sampling location:** Does local-root tail sampling run in process, or
+  does a central collector sample all exported spans? Resolve by reviewing network cost,
+  buffer bounds, and missing fast downstream groups; the core selects in-process sampling.
+- **ST3-O11Y-DQ05 Profiler ownership:** Does `ST3_PROFILE_DIR` remain a separate artifact,
+  or export the same spans? Resolve by comparing profiler coverage, overhead, and span
+  vocabulary with the SDK path.
+
+The core does not yet specify emission-site mechanisms for server request/admission/handler
+and stream spans, writer/read-pool spans, reconcile/FIFO/WAL metrics, startup phase spans,
+replication exchange/lag instruments, raw-terminal spans, client context injection, signed
+peer context, hook environment context, or durable-boundary span links. Their concrete
+mechanisms must preserve O11Y-R10–R18; this list is a scope boundary, not a delivery order.
