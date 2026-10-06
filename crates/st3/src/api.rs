@@ -67,6 +67,7 @@ mod delivery_probes;
 mod github_watch;
 mod harness_events;
 mod mailbox;
+mod native_process_identity;
 mod mail_backlog;
 mod owned_sets;
 mod terminal_view;
@@ -4988,11 +4989,11 @@ struct NativeDeliveryPeer {
 }
 
 fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
-    let start_token = st_runtime::process_start_token(pid).ok()?;
+    let start_token = native_process_identity::birth(pid)?;
     let (args, env) = local_process_arguments(pid)?;
     let mut peer = native_delivery_identity(pid, &args, &env)?;
     // Do not authenticate argv/environment from one process as a reused PID's caller.
-    if st_runtime::process_start_token(pid).ok()? != start_token {
+    if native_process_identity::birth(pid)? != start_token {
         return None;
     }
     peer.start_token = Some(start_token);

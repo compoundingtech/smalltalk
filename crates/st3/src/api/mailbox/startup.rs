@@ -1,5 +1,6 @@
 //! A native startup wait comes from live local launch evidence, not a retained status POST.
 use super::*;
+use crate::api::native_process_identity::{birth, is_descendant};
 
 pub(super) fn live_native_incarnation(
     pty_root: &std::path::Path,
@@ -23,7 +24,7 @@ pub(super) fn live_native_incarnation(
 
 fn same_caller_birth(peer: &NativeDeliveryPeer) -> bool {
     peer.start_token
-        .is_some_and(|start| st_runtime::process_start_token(peer.pid).ok() == Some(start))
+        .is_some_and(|start| birth(peer.pid) == Some(start))
 }
 
 fn matches_incarnation(
@@ -38,32 +39,6 @@ fn matches_incarnation(
             .pid
             .zip(observation.created_at.as_deref())
             .is_some_and(|(pid, at)| fence.incarnation == format!("{pid}:{at}"))
-}
-
-#[cfg(target_os = "linux")]
-fn is_descendant(mut pid: u32, root: u32) -> bool {
-    // Kernel peer identity must belong to this particular launch, even when an old
-    // process still has the same ST_AGENT. Cycles and unreadable ancestry fail closed.
-    let mut seen = std::collections::BTreeSet::new();
-    while pid > 1 && seen.insert(pid) {
-        if pid == root {
-            return true;
-        }
-        let Some(parent) = fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_owned()))
-            .and_then(|tail| tail.split_whitespace().nth(1)?.parse::<u32>().ok())
-        else {
-            return false;
-        };
-        pid = parent;
-    }
-    false
-}
-
-#[cfg(not(target_os = "linux"))]
-fn is_descendant(_pid: u32, _root: u32) -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -106,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn startup_wait_requires_the_kernel_peer_to_belong_to_the_launch() {
         struct OwnedChild(std::process::Child);
         impl Drop for OwnedChild {
@@ -137,7 +112,7 @@ mod tests {
             start_token: None,
         };
         assert!(!same_caller_birth(&peer));
-        let start = st_runtime::process_start_token(pid).unwrap();
+        let start = birth(pid).unwrap();
         peer.start_token = Some(start);
         assert!(same_caller_birth(&peer));
         peer.start_token = Some(start.wrapping_add(1));
