@@ -20914,6 +20914,14 @@ fn work_incarnation_key(incarnation: Option<&str>) -> String {
 }
 
 async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
+    let work: Vec<StepRunView> = client
+        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
+        .await?;
+    // Most resident seats hold no work. Only a held claim needs the status reduction
+    // that proves its harness incarnation is still live before renewing the lease.
+    if !work.iter().any(|step| work_claim_is_held_by(step, subject)) {
+        return Ok(());
+    }
     let status: StatusResponse = client
         .get(&format!(
             "/v1/status?subject={}",
@@ -20925,9 +20933,6 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
         .iter()
         .find(|candidate| candidate.subject == subject)
         .and_then(|candidate| candidate.harness.as_ref());
-    let work: Vec<StepRunView> = client
-        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
-        .await?;
     let mut failure = None;
     for step in work
         .into_iter()
@@ -21040,15 +21045,19 @@ fn renewal_lost_its_claim(error: &anyhow::Error) -> bool {
     )
 }
 
+fn work_claim_is_held_by(step: &StepRunView, subject: &str) -> bool {
+    matches!(
+        step.status.as_str(),
+        "claimed" | "working" | "verifying" | "blocked"
+    ) && step.claimant.as_deref() == Some(subject)
+}
+
 fn work_claim_has_active_harness(
     step: &StepRunView,
     subject: &str,
     harness: Option<&CurrentHarnessView>,
 ) -> bool {
-    matches!(
-        step.status.as_str(),
-        "claimed" | "working" | "verifying" | "blocked"
-    ) && step.claimant.as_deref() == Some(subject)
+    work_claim_is_held_by(step, subject)
         && harness.is_some_and(|harness| {
             harness.state != "ended"
                 && step.claim_incarnation.as_deref() == Some(harness.incarnation_id.as_str())
@@ -24806,6 +24815,35 @@ mod tests {
             "agent/node.worker",
             Some(&replacement)
         ));
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/other",
+            Some(&replacement)
+        ));
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            None
+        ));
+        let mut ended = replacement.clone();
+        ended.incarnation_id = "worker-one".into();
+        ended.state = "ended".into();
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            Some(&ended)
+        ));
+        for state in ["claimed", "working", "verifying", "blocked"] {
+            let mut held = step.clone();
+            held.status = state.into();
+            assert!(work_claim_is_held_by(&held, "agent/node.worker"));
+            assert!(!work_claim_is_held_by(&held, "agent/other"));
+        }
+        for state in ["ready", "pending", "completed", "cancelled", "failed"] {
+            let mut unheld = step.clone();
+            unheld.status = state.into();
+            assert!(!work_claim_is_held_by(&unheld, "agent/node.worker"));
+        }
     }
 
     #[test]
