@@ -272,7 +272,16 @@ impl PtyRuntime {
         if fence.is_file() {
             let previous = std::fs::read_to_string(&fence)
                 .with_context(|| format!("read PTY publication fence {}", fence.display()))?;
-            self.wait_for_publication(id, (!previous.is_empty()).then_some(previous.as_str()))?;
+            // Give the unknown launch one recovery window to publish. If it still has not,
+            // retire its fence and let this pass replace it with `pty run --force`.
+            match self.wait_for_publication(id, (!previous.is_empty()).then_some(previous.as_str())) {
+                Ok(_) => {}
+                Err(error)
+                    if error.downcast_ref::<PtySpawnTimeout>().is_some_and(|timeout| {
+                        timeout.phase == PtySpawnTimeoutPhase::Publication
+                    }) => {}
+                Err(error) => return Err(error),
+            }
             std::fs::remove_file(&fence)
                 .with_context(|| format!("clear PTY publication fence {}", fence.display()))?;
             before = self
@@ -1648,32 +1657,87 @@ exit 0
     }
 
     #[test]
-    fn an_unresolved_publication_fences_followup_launches() {
+    fn an_unresolved_publication_gets_only_one_recovery_window_before_respawn() {
         let root = tempfile::tempdir().unwrap();
         let binary = fake_pty(root.path(), "fake-pty-unresolved-publication", "");
         let runtime = PtyRuntime::new(root.path().join("registry"))
             .with_binary(binary.to_string_lossy())
             .with_spawn_timeout(Duration::from_millis(30));
-        let spawn = || spawn_work(&runtime, root.path(), &BTreeMap::new());
+        let fence = runtime.spawn_state_path("work", "pending");
 
-        let first = spawn().unwrap_err();
-        let second = spawn().unwrap_err();
+        for expected_launches in 1..=3 {
+            let error = spawn_work(&runtime, root.path(), &BTreeMap::new()).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<PtySpawnTimeout>().unwrap().phase,
+                PtySpawnTimeoutPhase::Publication
+            );
+            assert!(fence.is_file(), "keep the new launch's recovery window");
+            assert_eq!(
+                fs::read_to_string(binary.with_extension("count"))
+                    .unwrap()
+                    .trim(),
+                expected_launches.to_string(),
+                "an unresolved fence must not permanently block new launches"
+            );
+        }
+    }
 
-        assert_eq!(
-            first.downcast_ref::<PtySpawnTimeout>().unwrap().phase,
-            PtySpawnTimeoutPhase::Publication
-        );
-        assert_eq!(
-            second.downcast_ref::<PtySpawnTimeout>().unwrap().phase,
-            PtySpawnTimeoutPhase::Publication
-        );
+    #[test]
+    fn a_stale_publication_fence_respawns_in_the_same_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(root.path(), "fake-pty-stale-fence", "  publish new");
+        let runtime = PtyRuntime::new(root.path().join("registry"))
+            .with_binary(binary.to_string_lossy())
+            .with_spawn_timeout(Duration::from_millis(30));
+        fs::create_dir_all(runtime.spawn_state_directory()).unwrap();
+        let fence = runtime.spawn_state_path("work", "pending");
+        fs::write(&fence, "42:old").unwrap();
+
+        spawn_work(&runtime, root.path(), &BTreeMap::new()).unwrap();
+
+        assert!(!fence.exists());
         assert_eq!(
             fs::read_to_string(binary.with_extension("count"))
                 .unwrap()
                 .trim(),
-            "1",
-            "the unresolved first launch must fence later callers"
+            "1"
         );
+        assert_eq!(
+            runtime.snapshot().unwrap()[0].created_at.as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn a_late_publication_is_adopted_during_fence_recovery_without_respawn() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        let binary = fake_pty(root.path(), "fake-pty-late-fence", "");
+        let runtime = PtyRuntime::new(registry.clone())
+            .with_binary(binary.to_string_lossy())
+            .with_spawn_timeout(Duration::from_secs(1));
+        fs::create_dir_all(runtime.spawn_state_directory()).unwrap();
+        let fence = runtime.spawn_state_path("work", "pending");
+        fs::write(&fence, "42:old").unwrap();
+        let publisher_runtime = runtime.clone();
+        let publisher = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while publisher_runtime.try_spawn_lock("work").unwrap().is_some() {
+                assert!(Instant::now() < deadline, "spawn never acquired its lock");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            write_record(&registry, "work", serde_json::json!({"createdAt":"late"}));
+            write_pid(&registry, "work", std::process::id());
+            fs::write(registry.join("work.sock"), "").unwrap();
+        });
+
+        spawn_work(&runtime, root.path(), &BTreeMap::new()).unwrap();
+        publisher.join().unwrap();
+
+        assert!(!fence.exists());
+        assert!(!binary.with_extension("count").exists(), "do not double spawn");
+        assert_eq!(runtime.snapshot().unwrap()[0].created_at.as_deref(), Some("late"));
     }
 
     #[test]
