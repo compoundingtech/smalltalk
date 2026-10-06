@@ -56,7 +56,7 @@ use crate::model::{
     WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
 use crate::model::{PersonAskRequest, PersonStepResponse};
-use crate::store::Store;
+use crate::store::{AgentResourceDelta, Store};
 
 mod client_blobs;
 mod client_presence;
@@ -2051,6 +2051,7 @@ fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Re
 fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
     let local_host = client_host_id(store.origin());
     for item in items.iter_mut() {
+        item.as_object_mut().unwrap().remove("_queue_valid_until");
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
         }
@@ -2171,25 +2172,65 @@ fn client_agent_resources_uncached(
     client_agent_resources_selected(store, history, snapshot_index, None)
 }
 
+fn client_agent_activity(
+    store: &Store,
+    subject: &str,
+    harness: Option<&crate::model::CurrentHarnessView>,
+    snapshot_index: u64,
+) -> anyhow::Result<(Option<u128>, Option<u128>)> {
+    let activity = store.agent_last_activity_at(
+        subject,
+        harness.map(|harness| harness.incarnation_id.as_str()),
+        snapshot_index,
+    )?;
+    let silent_since = if let Some(harness) = harness.filter(|harness| harness.state == "working") {
+        let start = store
+            .agent_working_since(subject, &harness.incarnation_id, snapshot_index)?
+            .unwrap_or(harness.observed_at_unix_ms);
+        Some(activity.map_or(start, |activity| activity.max(start)))
+    } else {
+        None
+    };
+    Ok((activity, silent_since))
+}
+
 fn client_agent_resources_selected(
     store: &Store,
     history: bool,
     snapshot_index: u64,
-    changed: Option<(&BTreeSet<String>, &[Value])>,
+    changed: Option<AgentResourceDelta<'_>>,
 ) -> anyhow::Result<Vec<Value>> {
+    // A message changes activity, not seat status, usage, placement or queues. Patch
+    // these fields with the same reducer used by full cards; don't re-read every seat input.
+    if let Some(delta) = changed.filter(|delta| delta.activity_only)
+        && delta.subjects.iter().all(|subject|
+            delta.previous.iter().any(|card| card["id"].as_str() == Some(subject.as_str())))
+    {
+        return delta.previous.iter().map(|old| {
+            let harness: Option<crate::model::CurrentHarnessView> =
+                serde_json::from_value(old["_status_source"].clone())?;
+            let (activity, silent_since) = client_agent_activity(
+                store, old["id"].as_str().unwrap_or_default(), harness.as_ref(), snapshot_index,
+            )?;
+            let mut card = (**old).clone();
+            card["last_activity_at"] = json!(activity.map(client_timestamp));
+            card["silent_since"] = json!(silent_since.map(client_timestamp));
+            Ok(card)
+        }).collect();
+    }
     // Without history the store reduces only agents that can be current, including unhealthy
     // ones; the filters below keep the current layer either way.
     let status = match changed {
-        Some((subjects, _)) => {
-            store.status_for_subject_names_at(subjects.clone(), snapshot_index, history)?
+        Some(delta) => {
+            store.status_for_subject_names_at(delta.subjects.clone(), snapshot_index, history)?
         }
         None => store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?,
     };
     // Local harness/runtime observations do not change queues or their labels. Retain those
     // fields from the previous cards rather than scanning the fleet's work again.
-    let retain_queues = changed.is_some_and(|(subjects, previous)| {
-        subjects.iter().all(|subject| {
-            previous
+    let retain_queues = changed.is_some_and(|delta| {
+        delta.subjects.iter().all(|subject| {
+            delta.previous
                 .iter()
                 .any(|item| item["id"].as_str() == Some(subject.as_str()))
         })
@@ -2279,33 +2320,9 @@ fn client_agent_resources_selected(
                 .and_then(|harness| harness.driver.clone())
                 .or_else(|| subject.desired.as_ref().and_then(desired_harness_driver));
             let harness_state = subject.harness.as_ref().map(|harness| harness.state.clone());
-            let last_activity_at = store.agent_last_activity_at(
-                &subject.subject,
-                subject
-                    .harness
-                    .as_ref()
-                    .map(|harness| harness.incarnation_id.as_str()),
-                snapshot_index,
+            let (last_activity_at, silent_since) = client_agent_activity(
+                store, &subject.subject, subject.harness.as_ref(), snapshot_index,
             )?;
-            let silent_since = if harness_state.as_deref() == Some("working") {
-                let working_since = match subject.harness.as_ref() {
-                    Some(harness) => store
-                        .agent_working_since(
-                            &subject.subject,
-                            &harness.incarnation_id,
-                            snapshot_index,
-                        )?
-                        .or(Some(harness.observed_at_unix_ms)),
-                    None => None,
-                };
-                match (last_activity_at, working_since) {
-                    (Some(activity), Some(start)) => Some(activity.max(start)),
-                    (Some(activity), None) => Some(activity),
-                    (None, start) => start,
-                }
-            } else {
-                None
-            };
             // A live wrapper is necessary but not sufficient for a running agent. Native
             // harnesses only become running once the current runtime incarnation has produced a
             // ready observation; an ended or indeterminate harness must never be painted green
@@ -2444,6 +2461,7 @@ fn client_agent_resources_selected(
                 "next_work_id": queue.next_work_id,
                 "upcoming_work_ids": queue.upcoming_work_ids,
                 "queued_work_count": queue.queued_work_count,
+                "_queue_valid_until": queue.valid_until_unix_ms,
                 "current_work": queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
                 "next_work": queue.next_work_id.as_ref().and_then(label),
                 "upcoming_work": queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
@@ -2457,10 +2475,11 @@ fn client_agent_resources_selected(
                 "handoff": handoff,
                 "rollout": crate::rollout::status(store, &subject.subject)?,
             });
-            if let Some((_, previous)) = changed.filter(|_| retain_queues)
-                && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
+            if let Some(delta) = changed.filter(|_| retain_queues)
+                && let Some(old) = delta.previous.iter().find(|item| item["id"] == value["id"]) {
                 for field in ["current_work_ids", "active_work_count", "next_work_id",
-                    "upcoming_work_ids", "queued_work_count", "current_work", "next_work", "upcoming_work"] {
+                    "upcoming_work_ids", "queued_work_count", "current_work", "next_work", "upcoming_work",
+                    "_queue_valid_until"] {
                     value[field] = old[field].clone();
                 }
             }
@@ -3936,7 +3955,11 @@ async fn client_agents_detail(
             &store,
             history,
             snapshot_index,
-            Some((&selected, &[])),
+            Some(crate::store::AgentResourceDelta {
+                subjects: &selected,
+                previous: &[],
+                activity_only: false,
+            }),
         )?;
         add_agent_todos(&store, &mut items, snapshot_index)?;
         overlay_agent_resources(&store, &mut items, &created_at)?;
@@ -16530,7 +16553,7 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         assert_eq!(body["status"], "verifying");
     }
 
-    async fn get_request(app: Router, path: &str) -> (StatusCode, Value) {
+    pub(super) async fn get_request(app: Router, path: &str) -> (StatusCode, Value) {
         let response = app
             .oneshot(
                 Request::builder()
@@ -22722,3 +22745,8 @@ agent "seat" { workspace "/tmp"; command "true" }
 
 #[cfg(test)]
 mod work_incarnation_tests;
+
+#[cfg(test)]
+mod agent_resources_tests;
+#[cfg(test)]
+mod agent_resources_bench;
