@@ -49,7 +49,7 @@ pub mod principals;
 pub mod projection_digest;
 pub mod runtime;
 
-pub use runtime::Runtime;
+pub use runtime::{IncrementalProjection, Runtime};
 
 pub use canonical::{CANONICAL_ORDER, CANONICAL_ORDER_DESC, canonical_sql};
 pub use checkpoint::{
@@ -68,6 +68,22 @@ pub use checkpoint_agreement::{
     first_verifications, newest_seals, participants as checkpoint_participants, stable_checkpoints,
 };
 pub use checkpoint_trim::{CheckpointManifestNeed, TRIM_CHUNK_ENVELOPES, TrimFault};
+
+/// Keep diagnostics on one bounded line even when an error code or caller phase is untrusted.
+fn full_replay_log_line(phase: &str, reason: &str, frontier: u64, target: u64) -> String {
+    fn bounded(value: &str) -> String {
+        value
+            .chars()
+            .take(128)
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect()
+    }
+    format!(
+        "st: projection full replay phase={} reason={} frontier={frontier} target={target}",
+        bounded(phase),
+        bounded(reason)
+    )
+}
 
 /// The graph's tables: the claim log and its batches, operations, documents and blobs, replica
 /// envelopes and records, peers, fleet invites and checkpoints. A runtime adds its own.
@@ -5655,25 +5671,54 @@ impl Store {
     }
 
     pub fn project_replication_backlog(&self) -> Result<bool> {
-        self.project_replication_backlog_chunks(|| {}, || {})
+        self.project_replication_backlog_in_phase("replication")
+    }
+
+    /// Identify the caller's phase in the always-on full-replay diagnostic.
+    pub fn project_replication_backlog_in_phase(&self, phase: &str) -> Result<bool> {
+        self.project_replication_backlog_chunks(|| {}, || {}, phase, |line| eprintln!("{line}"))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn project_replication_backlog_with_log(
+        &self,
+        phase: &str,
+        log: impl FnMut(&str),
+    ) -> Result<bool> {
+        self.project_replication_backlog_chunks(|| {}, || {}, phase, log)
     }
 
     /// Exercise reads and queued writes between committed projection chunks.
     #[cfg(any(test, feature = "test-support"))]
     pub fn project_replication_backlog_with_yield(&self, between: impl FnMut()) -> Result<bool> {
-        self.project_replication_backlog_chunks(between, || {})
+        self.project_replication_backlog_chunks(
+            between,
+            || {},
+            "replication",
+            |line| eprintln!("{line}"),
+        )
     }
 
     /// Force an admission or deferral after the final index read, before clearing its state.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn project_replication_backlog_before_clear(&self, before_clear: impl FnMut()) -> Result<bool> {
-        self.project_replication_backlog_chunks(|| {}, before_clear)
+    pub fn project_replication_backlog_before_clear(
+        &self,
+        before_clear: impl FnMut(),
+    ) -> Result<bool> {
+        self.project_replication_backlog_chunks(
+            || {},
+            before_clear,
+            "replication",
+            |line| eprintln!("{line}"),
+        )
     }
 
     fn project_replication_backlog_chunks(
         &self,
         mut between: impl FnMut(),
         mut before_clear: impl FnMut(),
+        phase: &str,
+        mut log: impl FnMut(&str),
     ) -> Result<bool> {
         let _projecting = self
             .projection
@@ -5715,7 +5760,7 @@ impl Store {
                     .execute_batch("SAVEPOINT project_incremental")
                     .map_err(internal)?;
                 let incremental = crate::profile::span("projection/incremental");
-                let projected =
+                let fallback_reason =
                     match self
                         .runtime
                         .project_incremental(&transaction, &self.origin, through)
@@ -5724,7 +5769,10 @@ impl Store {
                             transaction
                                 .execute_batch("RELEASE project_incremental")
                                 .map_err(internal)?;
-                            projected
+                            match projected {
+                                IncrementalProjection::Projected => None,
+                                IncrementalProjection::Replay(reason) => Some(reason.to_owned()),
+                            }
                         }
                         Err(error) => {
                             crate::profile::note(&format!(
@@ -5736,11 +5784,13 @@ impl Store {
                                     "ROLLBACK TO project_incremental; RELEASE project_incremental",
                                 )
                                 .map_err(internal)?;
-                            false
+                            Some(format!("incremental-error:{}", error.code))
                         }
                     };
                 drop(incremental);
-                if !projected {
+                let projected = fallback_reason.is_none();
+                if let Some(reason) = fallback_reason {
+                    log(&full_replay_log_line(phase, &reason, frontier, target));
                     #[cfg(any(test, feature = "test-support"))]
                     FULL_REPLAYS.with(|replays| replays.set(replays.get() + 1));
                     let _replay = crate::profile::span("projection/full-replay");
@@ -7285,4 +7335,15 @@ pub fn append_claim_record_tx(
         predecessors: predecessors.to_vec(),
         accepted_at_unix_ms: now,
     })
+}
+
+#[cfg(test)]
+mod replay_log_tests {
+    #[test]
+    fn replay_log_is_bounded_and_single_line() {
+        let line = super::full_replay_log_line(&"phase\n".repeat(200), &"reason\r\t".repeat(200), u64::MAX, u64::MAX);
+        assert!(!line.contains(['\n', '\r', '\t']));
+        assert!(line.len() < 1200);
+        assert!(line.contains(&format!("frontier={} target={}", u64::MAX, u64::MAX)));
+    }
 }

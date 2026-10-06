@@ -24663,10 +24663,10 @@ fn rebuild_base_aggregate_tx(
     Ok(())
 }
 
-/// The incremental projection cannot extend the graph, for `reason`: count it when profiling.
-fn replay_needed(reason: String) -> bool {
+/// Retain the guard reason for the always-on log at the actual fallback boundary.
+fn replay_needed(reason: &'static str) -> IncrementalProjection {
     crate::profile::note(&format!("replay: {reason}"));
-    false
+    IncrementalProjection::Replay(reason)
 }
 
 #[cfg(test)]
@@ -24679,13 +24679,14 @@ fn try_project_all_simple_replication_tx(
         origin,
         current_index_tx(transaction).map_err(internal)?,
     )
+    .map(|decision| decision == IncrementalProjection::Projected)
 }
 
 fn try_project_simple_replication_tx(
     transaction: &Transaction<'_>,
     origin: &str,
     through: u64,
-) -> Result<bool, St3Error> {
+) -> Result<IncrementalProjection, St3Error> {
     let health: Option<(String, u64)> = transaction
         .query_row(
             "SELECT status, last_good_store_index FROM projection_health WHERE aggregate='graph'",
@@ -24695,12 +24696,13 @@ fn try_project_simple_replication_tx(
         .optional()
         .map_err(internal)?;
     let Some((status, frontier)) = health else {
-        return Ok(replay_needed("no projection health".into()));
+        return Ok(replay_needed("missing-health"));
     };
-    if status != "healthy" || frontier > current_index_tx(transaction).map_err(internal)? {
-        return Ok(replay_needed(format!(
-            "projection {status} or frontier ahead"
-        )));
+    if status != "healthy" {
+        return Ok(replay_needed("unhealthy-projection"));
+    }
+    if frontier > current_index_tx(transaction).map_err(internal)? {
+        return Ok(replay_needed("frontier-ahead"));
     }
     let mut statement = transaction
         .prepare(
@@ -24793,18 +24795,15 @@ fn try_project_simple_replication_tx(
                 && (claim.kind.starts_with("work.") || operation_parts(&claim.body).is_none()))
         {
             let reason = if !Store::simple_replication_kind(&claim.kind) && !has_operation {
-                "kind not projected incrementally"
+                "non-incremental-kind"
             } else if claim.kind.starts_with("work.") && has_operation {
-                "work claim with an operation"
+                "work-operation"
             } else if operation_parts(&claim.body).is_none() && has_operation {
-                "operation without a digest"
+                "malformed-operation"
             } else {
-                "kind not projected incrementally"
+                "non-incremental-kind"
             };
-            return Ok(replay_needed(format!(
-                "{reason}: {} from {}",
-                claim.kind, claim.origin
-            )));
+            return Ok(replay_needed(reason));
         }
         // Person asks add steps (and sometimes a whole run) in their own claim. Their response
         // also resumes an originating step. Rebuild the affected tree so a response received
@@ -24941,10 +24940,7 @@ fn try_project_simple_replication_tx(
             operation_tx(transaction, operation_id).map_err(internal)?
             && (stored_digest != request_digest || state != "active")
         {
-            return Ok(replay_needed(format!(
-                "operation conflict: {} from {}",
-                claim.kind, claim.origin
-            )));
+            return Ok(replay_needed("operation-conflict"));
         }
         register_operation_tx(transaction, claim).map_err(internal)?;
     }
@@ -25078,7 +25074,7 @@ fn try_project_simple_replication_tx(
         rebuild_planning_tx(transaction).map_err(internal)?;
     }
     owned_sets::project_tx(transaction)?;
-    Ok(true)
+    Ok(IncrementalProjection::Projected)
 }
 
 fn set_mission_run_state_tx(
@@ -31383,6 +31379,135 @@ agent "test/empty" { command "true" }
         append("message/unseen", "message.read", json!({"status": "read"}));
         assert!(!store.claims_since_only_quiet_notifications(before).unwrap());
     }
+
+    #[test]
+    fn full_replay_logs_every_guard_and_incremental_error_once() {
+        for reason in [
+            "missing-health",
+            "unhealthy-projection",
+            "frontier-ahead",
+            "non-incremental-kind",
+            "work-operation",
+            "malformed-operation",
+            "operation-conflict",
+            "incremental-error:internal",
+        ] {
+            FULL_REPLAYS.with(|count| count.set(0));
+            let store = Store::open_memory("node").unwrap();
+            store
+                .project_replication_backlog_with_log("test/setup", |_| {})
+                .unwrap();
+            let frontier = store.index().unwrap();
+            {
+                let mut connection = store.connection.lock().unwrap();
+                let transaction = connection.transaction().unwrap();
+                let operation = json!({"id":"op/replay-test", "request_digest":"digest-a"});
+                let (kind, body) = match reason {
+                    "non-incremental-kind" => ("work.unknown", json!({"fields":{}})),
+                    "work-operation" => {
+                        ("work.claimed", json!({"fields":{}, "_operation":operation}))
+                    }
+                    "malformed-operation" => (
+                        "harness.observed",
+                        json!({"fields":{"state":"ready"}, "_operation":{"id":"op/malformed"}}),
+                    ),
+                    "operation-conflict" => (
+                        "harness.observed",
+                        json!({"fields":{"state":"ready"}, "_operation":operation}),
+                    ),
+                    "incremental-error:internal" => ("intent.desired", json!({})),
+                    _ => ("harness.observed", json!({"fields":{"state":"ready"}})),
+                };
+                // Seed historical input without pre-projecting it or requiring a current schema.
+                let claim = append_claim_record_tx(
+                    &transaction,
+                    "node",
+                    "agent/node.test",
+                    kind,
+                    None,
+                    &body,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                if reason == "operation-conflict" {
+                    transaction.execute("INSERT INTO operations(id, request_digest, canonical_claim_id, state) VALUES ('op/replay-test', 'digest-b', ?1, 'active')", [&claim.id]).unwrap();
+                }
+                match reason {
+                    "missing-health" => {
+                        transaction
+                            .execute("DELETE FROM projection_health WHERE aggregate='graph'", [])
+                            .unwrap();
+                    }
+                    "unhealthy-projection" => {
+                        transaction.execute("UPDATE projection_health SET status='stale' WHERE aggregate='graph'", []).unwrap();
+                    }
+                    "frontier-ahead" => {
+                        transaction.execute("UPDATE projection_health SET last_good_store_index=999999 WHERE aggregate='graph'", []).unwrap();
+                    }
+                    _ => {}
+                }
+                transaction.commit().unwrap();
+            }
+            let target = store.index().unwrap();
+            let mut lines = Vec::new();
+            assert!(
+                store
+                    .project_replication_backlog_with_log(
+                        "startup/project-replication-backlog",
+                        |line| {
+                            // The log sink runs before any full-replay tables are changed.
+                            assert_eq!(store.index().unwrap(), target);
+                            lines.push(line.to_owned());
+                        }
+                    )
+                    .unwrap(),
+                "{reason}"
+            );
+            let expected_frontier = match reason {
+                "missing-health" => 0,
+                "frontier-ahead" => 999999,
+                _ => frontier,
+            };
+            assert_eq!(
+                lines,
+                [format!(
+                    "st: projection full replay phase=startup/project-replication-backlog reason={reason} frontier={expected_frontier} target={target}"
+                )],
+                "{reason}"
+            );
+            assert_eq!(
+                FULL_REPLAYS.with(std::cell::Cell::get),
+                2,
+                "one setup replay and one fallback: {reason}"
+            );
+            let digest = store
+                .replication_status(true, None, &[])
+                .unwrap()
+                .graph_digest;
+            store.replay_replication_graph().unwrap();
+            assert_eq!(
+                store
+                    .replication_status(true, None, &[])
+                    .unwrap()
+                    .graph_digest,
+                digest,
+                "{reason}"
+            );
+            lines.clear();
+            assert!(
+                store
+                    .project_replication_backlog_with_log("replication", |line| lines
+                        .push(line.to_owned()))
+                    .unwrap()
+            );
+            assert!(
+                lines.is_empty(),
+                "a healthy frontier must not log a fallback"
+            );
+        }
+    }
+
 
     #[test]
     fn simple_replication_rejects_structural_and_malformed_operation_claims() {

@@ -5463,7 +5463,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         eprintln!("st: mission run `{run}` stays over as this node's graph showed it");
     }
     let projected = st3::profile::task("startup project-replication-backlog", || {
-        store.project_replication_backlog()
+        store.project_replication_backlog_in_phase("startup/project-replication-backlog")
     })?;
     if !projected {
         eprintln!(
