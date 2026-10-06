@@ -1037,7 +1037,7 @@ pub fn run(context: Context) -> Result<()> {
         // once is not a burst of reads on a daemon that may already be busy.
         let reading = timelines.values().any(|timeline| timeline.older.loading);
         for (target, timeline) in &timelines {
-            if reading || wanted.len() > 0 {
+            if reading || !wanted.is_empty() {
                 break;
             }
             let pages = filled.get(target).copied().unwrap_or(0);
