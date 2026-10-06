@@ -25042,6 +25042,16 @@ enum Aggregate {
     Mission(String),
 }
 
+/// Mark an aggregate to be rebuilt, and say why in the profile: which trigger rebuilds run trees
+/// on a busy node decides which of them is worth fixing. The reason is one of a fixed list of
+/// strings, so the profile gains at most that many counters; nothing is read to decide it.
+fn mark_dirty(dirty: &mut BTreeSet<Aggregate>, aggregate: Aggregate, reason: &str) {
+    if matches!(aggregate, Aggregate::RunTree(_)) && crate::profile::enabled() {
+        crate::profile::note(&format!("projection: run tree dirty: {reason}"));
+    }
+    dirty.insert(aggregate);
+}
+
 /// Whether claims of `kind` belong to a mission run tree.
 fn run_tree_kind(kind: &str) -> bool {
     replay_projects_kind(kind)
@@ -25581,7 +25591,7 @@ fn try_project_simple_replication_tx(
         .filter(|claim| claim.origin == origin && run_tree_kind(&claim.kind))
     {
         if let Some(root) = run_tree_of_tx(transaction, &claim.subject)? {
-            dirty.insert(Aggregate::RunTree(root));
+            mark_dirty(&mut dirty, Aggregate::RunTree(root), "local claim");
         }
     }
     for claim in &claims {
@@ -25634,7 +25644,7 @@ fn try_project_simple_replication_tx(
             "work.person-asked" | "work.person-done" | "work.person-cancelled"
         ) && let Some(aggregate) = aggregate_of_tx(transaction, claim)?
         {
-            dirty.insert(aggregate);
+            mark_dirty(&mut dirty, aggregate, "person ask, answer or cancel");
         }
         if !Store::simple_replication_kind(&claim.kind) {
             let key = canonical::claim_key(transaction, &claim.id).map_err(internal)?;
@@ -25657,7 +25667,12 @@ fn try_project_simple_replication_tx(
             if ((out_of_order && claim.kind != "doc.bound") || repaired)
                 && let Some(aggregate) = aggregate_of_tx(transaction, claim)?
             {
-                dirty.insert(aggregate);
+                let reason = if repaired {
+                    "repaired claim"
+                } else {
+                    "structural claim sorting before projected ones"
+                };
+                mark_dirty(&mut dirty, aggregate, reason);
             }
             if claim.kind == "mission-run.created" {
                 let generation = claim
@@ -25682,7 +25697,7 @@ fn try_project_simple_replication_tx(
                     )
                     .map_err(internal)?;
                 if prior_dependents && let Some(aggregate) = aggregate_of_tx(transaction, claim)? {
-                    dirty.insert(aggregate);
+                    mark_dirty(&mut dirty, aggregate, "run created after claims that depend on it");
                 }
             }
             if claim.kind == "run-generation.created" {
@@ -25701,7 +25716,7 @@ fn try_project_simple_replication_tx(
                     )
                     .map_err(internal)?;
                 if prior_dependents && let Some(aggregate) = aggregate_of_tx(transaction, claim)? {
-                    dirty.insert(aggregate);
+                    mark_dirty(&mut dirty, aggregate, "generation created after its steps' claims");
                 }
             }
             if claim.kind == "mission.published" {
@@ -25744,7 +25759,11 @@ fn try_project_simple_replication_tx(
                 }
                 for run in waiting {
                     if let Some(root) = run_tree_of_tx(transaction, &run)? {
-                        dirty.insert(Aggregate::RunTree(root));
+                        mark_dirty(
+                            &mut dirty,
+                            Aggregate::RunTree(root),
+                            "mission published after runs waiting for its revision",
+                        );
                     }
                 }
             }
@@ -25784,7 +25803,11 @@ fn try_project_simple_replication_tx(
             // A work claim for a step that is not projected yet waits in the claim log; the
             // generation that creates the step rebuilds its tree and applies it.
             if let Some(root) = run_tree_of_tx(transaction, &claim.subject)? {
-                dirty.insert(Aggregate::RunTree(root));
+                mark_dirty(
+                    &mut dirty,
+                    Aggregate::RunTree(root),
+                    "another writer's work claim not newer than the step",
+                );
             }
             continue;
         }
