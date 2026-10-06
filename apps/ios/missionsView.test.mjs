@@ -49,3 +49,13 @@ assert.equal(missionRows(missions, [], [], true).rows.length, 3);
   assert.equal(hidden, 1);
   assert.equal(missionRows([yesterday, today], [], [], true, now).rows.length, 2);
 }
+
+// A run in progress shows what its step last reported (Nathan, 2026-10-06).
+{
+  const busy = mission('busy', 'running', [step('s', 'running', { last_progress: ' Tests pass;\n opening the PR ' }), step('t', 'ready')]);
+  const quiet = mission('quiet', 'running', [step('s', 'running')]);
+  const done = mission('done', 'completed', [step('s', 'completed', { last_progress: 'Finished' })]);
+  const { rows } = missionRows([busy, quiet, done], [], [], true, Date.parse('2026-09-30T12:00:00Z'));
+  const byId = Object.fromEntries(rows.map(row => [row.mission.id, row.progress]));
+  assert.deepEqual(byId, { 'mission/busy': 'Tests pass; opening the PR', 'mission/quiet': undefined, 'mission/done': undefined });
+}

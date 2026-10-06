@@ -60,7 +60,7 @@ export function MissionsScreen() {
         glyphColor={wordStyle(row.word).color}
         title={row.title}
         right={<Meter done={row.done} total={row.total} color={wordStyle(row.word).color} />}
-        second={`${row.path} · ${row.age}`}
+        second={row.progress ?? `${row.path} · ${row.age}`}
         onPress={() => navigation.navigate('Mission', { id: row.mission.id, title: row.title })}
       />}
       ListEmptyComponent={<Empty text={loadErrors.missions ? `Missions could not be loaded: ${loadErrors.missions}` : hasSynced ? 'No missions yet.' : 'Loading missions…'} />}
