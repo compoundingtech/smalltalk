@@ -115,7 +115,7 @@ export default githubWorkflow(auditCaches({
   // actionlint must know the Namespace shape label the stage jobs use.
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
+    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
   },
   jobs: {
     [pickRunnerJobId]: pickRunnerJob,
@@ -172,7 +172,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       'timeout-minutes': 20,
       steps: [
         ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
-        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
+        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
         ...buildSnapshotSave,
       ],
@@ -230,7 +230,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
     },
     // Two test partitions and the two supporting stages retain independent CPU capacity.
     // `linux-gate` below is the single required check that collects them.
-    'linux-tests': { ...linuxStageJob({
+    'linux-tests': linuxStageJob({
       name: 'linux-tests',
       stage: 'tests',
       setup: workspacePreparationSteps,
@@ -239,11 +239,8 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       // boot canary's evidence under target/boot-canaries.
       env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:1/2', CI_TEST_THREADS: '8' },
       extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
-      before: [nixDevelopStep({ name: 'Prove both shards cover every selected test', command: ['python3', 'scripts/ci-test-partitions'] }), {
-        ...nixDevelopStep({ name: 'Require every harness to hold old mail across boot and reconnect', command: ['python3', 'scripts/ci-mail-redelivery-canaries'] }),
-        id: 'mail-redelivery-canaries',
-      }],
-    }), outputs: { mail_redelivery: '${{ steps.mail-redelivery-canaries.outcome }}' } },
+      before: [nixDevelopStep({ name: 'Prove both shards cover every selected test', command: ['python3', 'scripts/ci-test-partitions'] })],
+    }),
     'linux-tests-shard-2': linuxStageJob({
       name: 'linux-tests-shard-2',
       stage: 'tests',
@@ -271,16 +268,19 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       description: 'Run fleet compatibility against the pinned older st3',
     }),
     'mail-redelivery-canaries': {
-      name: 'mail-redelivery-canaries',
-      needs: ['linux-tests'],
-      if: 'always()',
-      'runs-on': 'ubuntu-latest',
-      'timeout-minutes': 3,
-      steps: [{
-        name: 'Require the explicit zero-redelivery canaries to pass',
-        env: { RESULT: '${{ needs.linux-tests.outputs.mail_redelivery }}' },
-        run: '[ "$RESULT" = success ]',
-      }],
+      ...namespaceStageJob({
+        name: 'mail-redelivery-canaries',
+        stage: 'mail-redelivery-canaries',
+        description: 'Require every harness to hold old mail across boot and reconnect',
+        setup: workspacePreparationSteps.map((step: any) =>
+          step.id === 'cargo-cache' || step.id === 'nix-cache'
+            ? { ...step, with: { ...step.with, key: step.with.key.replace('${{ github.job }}', 'linux-tests'),
+                'restore-keys': step.with['restore-keys'].replaceAll('${{ github.job }}', 'linux-tests') } }
+            : step),
+        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_THREADS: '8' },
+        extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
+      }),
+      ...afterPickRunner,
     },
     'linux-gate': {
       name: 'linux-gate',
@@ -385,4 +385,4 @@ printf '| sekrets VM test | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SU
       ],
     },
   },
-}, {"pick-runner": "Runner selection uses live API state and builds nothing.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing.", "mail-redelivery-canaries": "Verifies the completed Linux canary outcome and builds nothing."}))
+}, {"pick-runner": "Runner selection uses live API state and builds nothing.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing."}))

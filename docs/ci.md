@@ -33,11 +33,26 @@ use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggreg
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once.
 
-Required Namespace jobs use run affinity and inline `job.priority=1` for merge groups and
-`ci-priority` PRs, or `job.priority=10` for ordinary PRs. Optional benchmarks keep their existing
-labels. Namespace schedules lower priority numbers first, ahead of unprioritized jobs, when
-capacity is exhausted; run affinity prevents another workflow from taking the runner started
-for a required job. This uses existing capacity and shapes. See Namespace's
+All Linux Namespace jobs use run affinity and the same inline `job.priority=1`: required
+Workspace jobs, optional benchmarks, manual Performance controls, main upkeep and releases.
+Using one class prevents a continuous stream of required jobs from overtaking older performance
+requests. Run affinity ensures that a runner started for a request is assigned to that run,
+so GitHub cannot hand it to a newer run with the same shape. Local `ci1-priority` and `ci1-merge`
+reservations continue to select only the primary test shard.
+
+Profile labels carry affinity inline, for example
+`namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}`.
+Shape labels retain `-with-features` and a separate
+`namespace-features:github.run-id=${{ github.run_id }}` label. Namespace does not support a
+separate `namespace-features:` label with profiles; see the
+[Runner Controls syntax](https://namespace.so/docs/solutions/github-actions/runner-controls).
+
+The queue still shares the existing Linux limit of 320 vCPUs / 640 GiB and must drain its older
+backlog. Queue time is measured separately from execution time; the shared class removes
+indefinite overtaking, rather than promising a fixed start time under arbitrary overload.
+An already queued job retains the labels from its immutable workflow revision. Recover old
+unprioritized controls with label-only revisions and new dispatches, preserving their source,
+fixtures and budgets; retain completed failures as evidence. See Namespace's
 [job ordering and priority controls](https://namespace.so/docs/solutions/github-actions/runner-controls/job-ordering).
 
 `scripts/ci-linux STAGE` runs one stage:
@@ -55,7 +70,7 @@ for a required job. This uses existing capacity and shapes. See Namespace's
   are timing-sensitive, so the build is retried up to three times.
 
 The primary test job proves that the two actual nextest inventories are disjoint and their union
-equals the full selected suite before running the explicit zero-retry mail canaries. It also
+equals the full selected suite. The explicit zero-retry mail canaries run in a parallel job. The primary also
 runs the standalone conversation model feature check. The second shard runs the remaining
 workspace and st2 tests on independent Namespace CPUs. `linux-gate` requires both shards;
 failure, cancellation or skipping either shard fails the gate. Each shard retains passing test
@@ -499,6 +514,14 @@ per-run entries. Matching native snapshots also retain it, so fresh nodes do not
 again. These Cargo builds do not produce Zig object-cache directories; empty cache declarations
 would miss on every run and are omitted.
 
+Workspace Cargo and Nix dependency entries are restored on PRs and merge groups. Only
+protected main fills missing entries: Linux main upkeep and main macOS runs save them
+explicitly after preparing valid outputs. Branch-scoped copies of these large archives
+would consume the repository's shared quota and evict the main entries every new PR
+needs. Repeated source heads retain their separate exact-source artifact snapshots.
+The secondary Linux shard reads the same dependency keys as the primary; snapshots
+remain specific to each job, source, platform and build recipe.
+
 Compiled outputs also have three-day artifact snapshots keyed by the actual full source SHA,
 job, platform, architecture, build flags and workflow contents. Native snapshots additionally
 fingerprint the installed Rust compiler and, on macOS, the Swift compiler and SDK. A fresh
@@ -530,19 +553,24 @@ accepted-source verification remain in place.
 
 ## Required mail redelivery canaries
 
-Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires seventeen named,
+Alongside the two Linux test shards, `scripts/ci-mail-redelivery-canaries` requires twenty named,
 unignored regressions: boot/reconnect mailbox suppression and recent unoffered recovery for
 Claude, Codex, OpenCode, Pi, and OMP; each harness's native suspend/resume canary with hour-old
 mail held and recent unoffered mail consumed exactly once; legacy polling recovery through the
 current offer's receipt sequence; and delivered-but-unread retention across native channel
-restart. The mailbox cases seed hour-old sent mail and recent staged and delivered-but-unread
+restart. Claude's missing-channel cases also require automatic recovery, attachment during
+recheck without replacing the seat, and durable parking after three failed replacements.
+The mailbox cases seed hour-old sent mail and recent staged and delivered-but-unread
 mail, prove zero historical offers, preserve explicit mailbox access, and recover an in-flight
 send after a daemon restart with exactly one receipt pair. Every selected test runs with zero retries.
 
 The script fails if any required test is missing, ignored, or filtered out. The named
-`mail-redelivery-canaries` check reads that step's actual outcome; a skipped step cannot pass.
+`mail-redelivery-canaries` check executes the script on its own Namespace 8x16 runner; a skipped
+or failed job cannot pass.
 `linux-gate` requires it, so this protection applies to pull requests and merge groups. It
-reuses the compiled Linux test runner instead of allocating another native-test runner.
+restores the main-seeded Linux test Cargo and Nix caches, prepares the same fixtures and rendered
+hooks, and retains its own logs, timing and failure evidence. It never uses the native priority
+or merge lanes, and neither test shard waits for it before starting its own suite.
 Apply the fifth live ruleset check after this workflow has passed on main.
 
 ## Generated files and existing workflows

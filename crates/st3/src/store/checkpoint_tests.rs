@@ -253,6 +253,11 @@ fn rollup(account: &str, at: u128, total: u64) -> Value {
         "model": "claude-example", "account": account, "owner_run": "mission-run/example",
         "owner_step": "step-run/example/build", "host": "alder",
         "total_tokens": total, "cost_microusd": total * 10, "observed_at_unix_ms": at as u64,
+        "native_session_id": "native-example",
+        "pricing_provenance": [{"price_table_id":"st.api-list","price_table_version":"example-version",
+            "cost_source":"computed","total_tokens":total,"cost_microusd":total*10,
+            "rates_usd_per_million_tokens":{"input":10.0,"output":10.0,"cache_read":10.0,
+                "cache_write_5m":10.0,"cache_write_1h":10.0}}],
     })
 }
 
@@ -365,6 +370,9 @@ fn a_usage_trim_keeps_lifetime_usage_and_the_proof_guards_it() {
             ))
             .unwrap();
     }
+    let period = store.usage_period_rows(0, u64::MAX).unwrap();
+    assert_eq!(period[0]["native_session_id"], "native-example");
+    assert_eq!(period[0]["pricing_provenance"][0]["total_tokens"], 300);
     let lifetime = store.usage_summary_at(AGENT, None, None).unwrap().unwrap();
     assert_eq!(lifetime.total_tokens, 300);
     let scratch = tempfile::tempdir().unwrap();

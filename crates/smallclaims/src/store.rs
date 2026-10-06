@@ -715,7 +715,10 @@ impl PeerSyncProgress {
         } else {
             sync.catch_up_rate_per_second
                 .filter(|rate| *rate > 0.0)
-                .map(|rate| (peer_only as f64 / rate).ceil() as u64)
+                .map(|rate| (peer_only as f64 / rate).ceil())
+                // JSON duration consumers require exact JavaScript-safe integer seconds.
+                .filter(|seconds| *seconds <= ((1_u64 << 53) - 1) as f64)
+                .map(|seconds| seconds as u64)
         };
         self.measured = Some(sync);
     }
@@ -3039,7 +3042,8 @@ pub fn replication_bucket_start(sequence: u64) -> u64 {
 /// peer provably lacks, bounded per exchange, and the local identities of the ranges both
 /// sides hold with different digests, so the peer can compute the reverse difference. Whole
 /// ranges are listed in order while they fit `listing_limit`. The first differing range is
-/// always listed, so each exchange settles at least one range and later ones follow.
+/// always listed. If payloadless checkpoint differences prevent it from settling, the sync
+/// worker requests a full inventory rather than repeating this prefix indefinitely.
 pub fn compact_replication_difference(
     inventory: &CompactReplicationInventory,
     buckets: &[ReplicationInventoryBucket],
@@ -3739,6 +3743,52 @@ pub fn sync_progress_estimates_catch_up_from_net_progress() {
         progress.view(30_000).unwrap().estimated_catch_up_seconds,
         Some(0)
     );
+}
+
+#[cfg(test)]
+#[test]
+pub fn sync_progress_omits_forecasts_outside_safe_integer_seconds() {
+    const MAX_SAFE_SECONDS: u64 = (1_u64 << 53) - 1;
+    let mut progress = PeerSyncProgress {
+        measured: Some(ReplicationPeerSync {
+            catch_up_rate_per_second: Some(1.0),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    progress.observe(0, Some((MAX_SAFE_SECONDS, 7)), 1_000);
+    assert_eq!(
+        progress.view(1_000).unwrap().estimated_catch_up_seconds,
+        Some(MAX_SAFE_SECONDS)
+    );
+    progress.observe(0, Some((MAX_SAFE_SECONDS + 1, 7)), 2_000);
+    let sync = progress.view(2_000).unwrap();
+    assert_eq!(sync.estimated_catch_up_seconds, None);
+    assert_eq!(sync.peer_only_envelopes, MAX_SAFE_SECONDS + 1);
+    assert_eq!(sync.local_only_envelopes, 7);
+    assert!(sync.catching_up);
+}
+
+#[cfg(test)]
+#[test]
+pub fn sync_progress_omits_stalled_forecasts_and_recovers_on_progress() {
+    let mut progress = PeerSyncProgress::default();
+    progress.observe(0, Some((10_000, 3)), 1_000);
+    progress.observe(1_000, Some((9_000, 3)), 11_000);
+    for window in 1..=60 {
+        progress.observe(0, Some((9_000, 3)), 11_000 + window * 10_000);
+    }
+    let sync = progress.view(611_000).unwrap();
+    assert_eq!(sync.estimated_catch_up_seconds, None);
+    assert_eq!(sync.peer_only_envelopes, 9_000);
+    assert_eq!(sync.local_only_envelopes, 3);
+    assert!(sync.catching_up);
+    assert!(sync.catch_up_rate_per_second.unwrap() > 0.0);
+
+    progress.observe(1_000, Some((8_000, 3)), 621_000);
+    let sync = progress.view(621_000).unwrap();
+    assert_eq!(sync.estimated_catch_up_seconds, Some(160));
+    assert_eq!(sync.peer_only_envelopes, 8_000);
 }
 
 pub fn collect_referenced_blobs(

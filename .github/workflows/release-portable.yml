@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   linux-x86_64:
-    runs-on: namespace-profile-linux-x86-64
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 30
     env:
       SOURCE_SHA: ${{ inputs.source_sha }}

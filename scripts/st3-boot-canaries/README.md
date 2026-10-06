@@ -33,7 +33,14 @@ Claude's `channel-missing` and `channel-uninitialized` scenarios restart with he
 but no usable channel. They require `claude-channel-unattached` with a blocked seat within
 45 seconds, a visible hold for early mail, and recovery with exactly one native offer and one
 staged/delivered/read receipt. Two further restarts must deliver fresh startup mail once without
-replaying recovered mail. The fault controls live only in each isolated workspace.
+replaying recovered mail. The missing-channel seat must restart automatically, continuing its
+native session. The uninitialized channel attaches during the recheck window and must keep its
+incarnation. Automatic recovery waits 10, 20 and 40 seconds after detection before each of three
+restarts; a channel still missing after the third replacement parks the seat with a visible
+failure and holds mail until an operator restart or a new declaration. The fault controls live
+only in each isolated workspace.
+The `channel-parked` scenario keeps the channel missing through all three replacements and
+restarts the daemon after parking; neither a fourth attempt nor a mail offer may appear.
 
 Every fresh scenario also checks that the native driver creates no `catalog.kdl`, `agent.kdl`,
 or polled `harness-state`, `harness-context`, and `harness-timeline` records, and that each seat

@@ -552,7 +552,7 @@ export type Envelope = {
   api_version: "st3.client.v0";
   request_id: RequestId;
   snapshot: Snapshot;
-  value: (Capabilities | DocumentContent | SubjectDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
+  value: (Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
 export type ErrorCode = ("attention-migrated" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
@@ -921,15 +921,32 @@ export type MissionStep = {
   attempt: number;
   blocked_reason?: string | null;
   blockers?: Array<Id>;
+  claim_expires_at?: (Timestamp | null);
   claimant?: (AgentId | null);
   constraints?: Array<string>;
   goals?: Array<string>;
   id: Id;
   last_progress?: string | null;
+  loop_max_rounds?: number | null;
+  loop_reason?: string | null;
+  loop_round?: number | null;
+  next_wake_at?: (Timestamp | null);
   path: string;
   since: Timestamp;
   state: WorkState;
   title?: string | null;
+  wake?: (MissionWake | null);
+  wake_reason?: string | null;
+};
+
+export type MissionWake = {
+  acknowledged_by?: string | null;
+  assignee: AgentId;
+  assignee_state: string;
+  attempts: number;
+  failure?: string | null;
+  incarnation_id: string;
+  last_attempt_at?: (Timestamp | null);
 };
 
 export type MustAct = ("you" | "agent" | "system" | "blocked" | "nobody" | string);
@@ -1120,6 +1137,16 @@ export type ProjectionEvent = Omit<{
   timestamp: Timestamp;
   type: "upsert" | "delete" | "timeline.delta" | "terminal.available" | "capabilities.changed";
 }, 'type' | 'body'> & ({ type: "timeline.delta"; body: TimelineDelta });
+
+export type PublicationDefinition = {
+  declaration: {
+
+};
+  kind: "publication-definition";
+  revision: Revision;
+  subject: string;
+  token: string;
+};
 
 export type ReplicatedNotice = {
   complete: boolean;
@@ -1576,6 +1603,7 @@ export type UsageLimit = {
   five_hour_percent?: number;
   five_hour_resets_at_unix_ms?: number;
   host: string;
+  identified?: boolean;
   measured_at_unix_ms: number;
   measured_by: string;
   plan?: string;
@@ -1592,6 +1620,30 @@ export type UsagePeriod = {
   until_ms: number;
 };
 
+export type UsagePricing = {
+  cache_write_1h_tokens: number;
+  cache_write_tokens: number;
+  cached_tokens: number;
+  cost_microusd: number;
+  cost_source: "provider_reported" | "computed" | "unpriced";
+  input_tokens: number;
+  output_tokens: number;
+  price_table_id?: string;
+  price_table_version?: string;
+  rates_usd_per_million_tokens?: UsagePricingRates;
+  reported_cost_microusd: number;
+  total_tokens: number;
+  unpriced_tokens: number;
+};
+
+export type UsagePricingRates = {
+  cache_read: number;
+  cache_write_1h: number;
+  cache_write_5m: number;
+  input: number;
+  output: number;
+};
+
 export type UsageRow = {
   account?: string;
   agent: Id;
@@ -1603,8 +1655,10 @@ export type UsageRow = {
   input_tokens: number;
   mission_run?: Id;
   model?: string;
+  native_session_id?: string;
   output_tokens: number;
   pricing?: string;
+  pricing_provenance?: Array<UsagePricing>;
   reported_cost_microusd: number;
   step?: Id;
   total_tokens: number;

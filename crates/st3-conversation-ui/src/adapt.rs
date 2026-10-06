@@ -48,6 +48,10 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
     };
     let mut stamped: Vec<(String, Entry)> = Vec::new();
     let mut tools: BTreeMap<String, usize> = BTreeMap::new();
+    // Claude emits a loaded skill as user content after the Skill result, without a call id.
+    // Match its base directory to a still-pending Skill call in this turn.
+    let mut skills: Vec<(String, usize)> = Vec::new();
+    let mut expanded_skills = BTreeSet::new();
     let mut delivery: BTreeMap<String, bool> = BTreeMap::new();
     // Graph messages the agent's harness received, from its own transcript.
     let mut delivered: BTreeSet<String> = BTreeSet::new();
@@ -130,6 +134,19 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
         }
         let body = match (&entry.role, &entry.body) {
             (TimelineRole::User | TimelineRole::System, TimelineBody::Content(content)) => {
+                let raw = content.text.as_deref().unwrap_or("");
+                if entry.role == TimelineRole::User
+                    && let Some(skill) = loaded_skill(raw)
+                    && let Some(pending) = skills.iter().rposition(|(name, _)| name == skill)
+                {
+                    let (_, index) = skills.remove(pending);
+                    if let Body::Tool { state, output, .. } = &mut stamped[index].1.body {
+                        *state = ToolState::Ok;
+                        *output = raw.trim().lines().map(str::to_owned).collect();
+                        expanded_skills.insert(index);
+                        continue;
+                    }
+                }
                 // Harness markup becomes what it means; context blocks disappear.
                 let bodies = harness_bodies(
                     entry.role == TimelineRole::User,
@@ -137,6 +154,9 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     &shown,
                     &mut delivered,
                 );
+                if bodies.iter().any(|body| matches!(body, Body::User(_))) {
+                    skills.clear();
+                }
                 for (index, mut body) in bodies.into_iter().enumerate() {
                     if let Body::Mail { from, to, .. } = &mut body {
                         *from = name(from);
@@ -154,6 +174,7 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                 continue;
             }
             (TimelineRole::Assistant, TimelineBody::Content(content)) => {
+                skills.clear();
                 let text = clean_message_text(content.text.as_deref().unwrap_or(""));
                 if text.is_empty() {
                     continue;
@@ -174,6 +195,14 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
             }
             (_, TimelineBody::ToolCall(call)) => {
                 tools.insert(call.call_id.clone(), stamped.len());
+                if call.name == "Skill"
+                    && let Some(skill) = call.arguments.get("skill").and_then(Value::as_str)
+                {
+                    skills.push((
+                        skill.rsplit(':').next().unwrap_or(skill).to_owned(),
+                        stamped.len(),
+                    ));
+                }
                 Body::Tool {
                     title: tool_title(&call.name, &call.arguments),
                     state: ToolState::Running,
@@ -202,7 +231,10 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     )) = stamped.get_mut(index)
                 {
                     *slot = state;
-                    *out = output;
+                    // Transcript revisions can put the result after the expansion.
+                    if !expanded_skills.contains(&index) {
+                        *out = output;
+                    }
                     continue;
                 }
                 Body::Tool {
@@ -395,22 +427,99 @@ fn unescape(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// Every `<tag …>` head in `text`, in order, so the blocks `take_blocks` returns can be matched
-/// with their attributes.
-fn heads(text: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}");
-    let mut found = Vec::new();
-    let mut from = 0;
-    while let Some(offset) = text[from..].find(&open) {
-        let start = from + offset;
-        let end = text[start..]
-            .find('>')
-            .map(|index| start + index + 1)
-            .unwrap_or(text.len());
-        found.push(text[start..end].to_owned());
-        from = end;
+/// Take only delivery wrappers that begin a line outside Markdown code fences. A mention
+/// in prose or inline code is content, even if it contains a complete example envelope.
+fn take_deliveries(text: &mut String, tag: &str) -> Vec<(String, String)> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    let mut fence: Option<(char, usize)> = None;
+    let mut consumed = 0;
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        if start < consumed {
+            continue;
+        }
+        let trimmed = line.trim();
+        if let Some(marker @ ('`' | '~')) = trimmed.chars().next() {
+            let length = trimmed.chars().take_while(|c| *c == marker).count();
+            if length >= 3 {
+                match fence {
+                    Some((open, count))
+                        if open == marker
+                            && length >= count
+                            && trimmed[length..].trim().is_empty() =>
+                    {
+                        fence = None
+                    }
+                    None => fence = Some((marker, length)),
+                    _ => {}
+                }
+                continue;
+            }
+        }
+        if fence.is_some() || !line.starts_with(&format!("<{tag} ")) {
+            continue;
+        }
+        let Some(head_end) = line.find('>') else {
+            continue;
+        };
+        let head = line[..=head_end].trim();
+        let valid = match tag {
+            "smalltalk-message" => {
+                let id = attribute(head, "id").filter(|id| !id.is_empty());
+                line[head_end + 1..].trim().is_empty()
+                    && ["from", "to", "sha256"]
+                        .iter()
+                        .all(|key| attribute(head, key).is_some_and(|value| !value.is_empty()))
+                    && attribute(head, "subject").is_some()
+                    && id
+                        .is_some_and(|id| attribute(head, "graph") == Some(format!("message/{id}")))
+            }
+            "channel" => {
+                attribute(head, "source").is_some_and(|source| {
+                    matches!(
+                        source.as_str(),
+                        "plugin:st3-channel:st3" | "plugin:st2-channel:st2"
+                    )
+                }) && attribute(head, "from").is_some()
+            }
+            _ => false,
+        };
+        if !valid {
+            continue;
+        }
+        let inner_start = start + head_end + 1;
+        let close = format!("</{tag}>");
+        let end = text[inner_start..].find(&close).map(|i| inner_start + i);
+        let inner_end = end.unwrap_or(text.len());
+        consumed = end.map(|end| end + close.len()).unwrap_or(text.len());
+        ranges.push((
+            start,
+            consumed,
+            text[inner_start..inner_end].to_owned(),
+            head.to_owned(),
+        ));
+    }
+    let found = ranges
+        .iter()
+        .map(|(_, _, body, head)| (body.clone(), head.clone()))
+        .collect();
+    for (start, end, _, _) in ranges.into_iter().rev() {
+        text.replace_range(start..end, "");
     }
     found
+}
+
+/// Claude's skill expansion starts with its base directory, whose basename is the skill name.
+fn loaded_skill(raw: &str) -> Option<&str> {
+    raw.lines()
+        .next()?
+        .strip_prefix("Base directory for this skill: ")?
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
 }
 
 /// A user or system entry from a harness transcript, turned into what a person should see.
@@ -465,11 +574,7 @@ fn harness_bodies(
     // is that message, already read or shown, never a line of its own.
     let mut enveloped = BTreeSet::new();
     // st's own envelope, as codex and the pi family receive it.
-    let envelopes = heads(&text, "smalltalk-message");
-    for (block, head) in take_blocks(&mut text, "smalltalk-message")
-        .into_iter()
-        .zip(envelopes)
-    {
+    for (block, head) in take_deliveries(&mut text, "smalltalk-message") {
         let from = attribute(&head, "from").unwrap_or_default();
         let subject = attribute(&head, "subject").unwrap_or_default();
         let graph = attribute(&head, "graph").unwrap_or_default();
@@ -489,28 +594,9 @@ fn harness_bodies(
         });
     }
     // A `<channel>` delivery announces mail that is already in the stream, so it becomes one line.
-    let mut deliveries = Vec::new();
-    let mut from = 0;
-    while let Some(offset) = text[from..].find("<channel") {
-        let start = from + offset;
-        let head_end = text[start..]
-            .find('>')
-            .map(|index| start + index + 1)
-            .unwrap_or(text.len());
-        let head = text[start..head_end].to_owned();
-        let sender = head
-            .split("from=\"")
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-            .unwrap_or("someone")
-            .to_owned();
-        deliveries.push((sender, attribute(&head, "messageId")));
-        from = start + 1;
-    }
-    for (block, (sender, message_id)) in take_blocks(&mut text, "channel")
-        .into_iter()
-        .zip(deliveries)
-    {
+    for (block, head) in take_deliveries(&mut text, "channel") {
+        let sender = attribute(&head, "from").unwrap_or_else(|| "someone".into());
+        let message_id = attribute(&head, "messageId");
         // A delivery of mail the stream shows marks that mail delivered; its PING line inside,
         // or the message the channel names (`messageId`), is the same delivery, not another.
         let id = block
@@ -657,6 +743,7 @@ fn tool_title(name: &str, arguments: &Value) -> String {
         "url",
         "query",
         "description",
+        "skill",
     ]
     .iter()
     .find_map(|key| arguments.get(key).and_then(Value::as_str));

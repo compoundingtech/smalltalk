@@ -430,6 +430,10 @@ pub struct UsageLimit {
     /// The declared account the measuring seat ran on, when it was bound to one.
     #[serde(default)]
     pub account_ref: Option<String>,
+    /// Whether the source named a provider identity or declared account, independent of freshness.
+    /// Older servers omit this metadata.
+    #[serde(default)]
+    pub identified: Option<bool>,
     pub driver: String,
     #[serde(default)]
     pub plan: Option<String>,
@@ -462,6 +466,41 @@ pub struct UsageRow {
     pub host: Option<String>,
     #[serde(default)]
     pub pricing: Option<String>,
+    #[serde(default)]
+    pub native_session_id: Option<String>,
+    #[serde(default)]
+    pub pricing_provenance: Option<Vec<UsagePricing>>,
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_write_1h_tokens: u64,
+    pub cached_tokens: u64,
+    pub cost_microusd: u64,
+    pub reported_cost_microusd: u64,
+    pub unpriced_tokens: u64,
+}
+
+/// Effective USD-per-million rates applied to the disjoint token buckets.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UsagePricingRates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write_5m: f64,
+    pub cache_write_1h: f64,
+}
+
+/// A price/source contribution, cumulative on claims and differenced on period reads.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UsagePricing {
+    #[serde(default)]
+    pub price_table_id: Option<String>,
+    #[serde(default)]
+    pub price_table_version: Option<String>,
+    pub cost_source: String,
+    #[serde(default)]
+    pub rates_usd_per_million_tokens: Option<UsagePricingRates>,
     pub total_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -483,6 +522,16 @@ pub struct CanonicalNode {
     pub properties: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<CanonicalNode>,
+}
+
+/// Canonical compiler values of an applied seat, mission, or schedule publication.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PublicationDefinition {
+    pub kind: String,
+    pub subject: String,
+    pub declaration: BTreeMap<String, Value>,
+    pub revision: String,
+    pub token: String,
 }
 
 /// Applied desired state, not the original declaration file or a proposed mission revision.
@@ -880,6 +929,34 @@ pub struct MissionStep {
     pub goals: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<String>,
+    #[serde(default)]
+    pub loop_round: Option<u32>,
+    #[serde(default)]
+    pub loop_max_rounds: Option<u32>,
+    #[serde(default)]
+    pub loop_reason: Option<String>,
+    /// Earliest work eligibility, not a promise of wake dispatch.
+    #[serde(default)]
+    pub next_wake_at: Option<String>,
+    #[serde(default)]
+    pub wake_reason: Option<String>,
+    #[serde(default)]
+    pub wake: Option<MissionWake>,
+    #[serde(default)]
+    pub claim_expires_at: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MissionWake {
+    pub assignee: String,
+    pub assignee_state: String,
+    pub incarnation_id: String,
+    pub attempts: u32,
+    #[serde(default)]
+    pub last_attempt_at: Option<String>,
+    #[serde(default)]
+    pub acknowledged_by: Option<String>,
+    #[serde(default)]
+    pub failure: Option<String>,
 }
 /// A step named for display: its mission, run, path, title and first goal.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

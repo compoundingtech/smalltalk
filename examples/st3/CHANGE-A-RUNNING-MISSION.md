@@ -7,7 +7,7 @@ steps have durable state:
 
 ```sh
 revision_workspace="$(mktemp -d)"
-st missions publish examples/st3/mission-revision.kdl --as person/operator
+st apply examples/st3/mission-revision.kdl --as person/operator
 st missions start example/revisable-change \
   --id example/revisable-change/first \
   --workspace "$revision_workspace" \
@@ -20,7 +20,7 @@ st missions start example/revisable-change \
 This publishes a new immutable definition successfully:
 
 ```sh
-st missions publish examples/st3/mission-revision-v2.kdl --as person/operator
+st apply examples/st3/mission-revision-v2.kdl --as person/operator
 st missions show mission-run/example/revisable-change/first
 ```
 

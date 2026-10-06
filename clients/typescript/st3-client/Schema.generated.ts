@@ -1362,21 +1362,43 @@ export const MissionRunOutcome = /*#__PURE__*/ (() => Schema.Struct({
 export type MissionRunOutcome = typeof MissionRunOutcome.Type
 export type MissionRunOutcomeEncoded = typeof MissionRunOutcome.Encoded
 
+export const MissionWake = /*#__PURE__*/ (() => Schema.Struct({
+  "acknowledged_by": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "assignee": AgentId,
+  "assignee_state": Schema.String,
+  "attempts": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "failure": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "incarnation_id": Schema.String,
+  "last_attempt_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE)
+}).annotate({ identifier: "MissionWake" }))()
+export type MissionWake = typeof MissionWake.Type
+export type MissionWakeEncoded = typeof MissionWake.Encoded
+
 export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   "agentless": optionalKey(Schema.Boolean),
   "assignee": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
   "attempt": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "blocked_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "blockers": optionalKey(Schema.Array(Id)),
+  "claim_expires_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "claimant": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
   "constraints": optionalKey(Schema.Array(Schema.String)),
   "goals": optionalKey(Schema.Array(Schema.String)),
   "id": Id,
   "last_progress": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "loop_max_rounds": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
+  "loop_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  /** Current round of this step's loop, enriched on mission detail reads. */
+  "loop_round": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE).annotate({ description: "Current round of this step's loop, enriched on mission detail reads." }),
+  /** Observed not-before time: earliest work eligibility, not a promise of wake dispatch. */
+  "next_wake_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Observed not-before time: earliest work eligibility, not a promise of wake dispatch." }),
   "path": Schema.String,
   "since": Timestamp,
   "state": WorkState,
-  "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
+  "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "wake": Schema.OptionFromOptionalNullOr(MissionWake, NULL_NONE),
+  /** The deferral's blocked reason, or the observed wake failure when no deferral reason exists. */
+  "wake_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "The deferral's blocked reason, or the observed wake failure when no deferral reason exists." })
 }).annotate({ identifier: "MissionStep" }))()
 export type MissionStep = typeof MissionStep.Type
 export type MissionStepEncoded = typeof MissionStep.Encoded
@@ -2040,6 +2062,17 @@ export const PairingChallenge = /*#__PURE__*/ (() => Schema.Struct({
 export type PairingChallenge = typeof PairingChallenge.Type
 export type PairingChallengeEncoded = typeof PairingChallenge.Encoded
 
+/** Canonical publication values with resolved compiler defaults; requires read.declarations. */
+export const PublicationDefinition = /*#__PURE__*/ (() => Schema.Struct({
+  "declaration": Schema.Record(Schema.String, Schema.Unknown),
+  "kind": Schema.Literal("publication-definition"),
+  "revision": Revision,
+  "subject": Schema.String.check(Schema.isPattern(new RegExp("^(agent|mission|schedule)/[^\\s]+$", "u"))),
+  "token": Schema.String.check(Schema.isMinLength(1))
+}).annotate({ identifier: "PublicationDefinition", description: "Canonical publication values with resolved compiler defaults; requires read.declarations." }))()
+export type PublicationDefinition = typeof PublicationDefinition.Type
+export type PublicationDefinitionEncoded = typeof PublicationDefinition.Encoded
+
 export const RequestId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:request)/[^\\s]+$", "u"), "request").annotate({ identifier: "RequestId" }))()
 export type RequestId = typeof RequestId.Type
 export type RequestIdEncoded = typeof RequestId.Encoded
@@ -2115,6 +2148,8 @@ export const UsageLimit = /*#__PURE__*/ (() => Schema.Struct({
   "five_hour_percent": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))),
   "five_hour_resets_at_unix_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "host": Schema.String,
+  /** The source named a provider identity or declared account; independent of quota freshness. Absent on older servers. */
+  "identified": optionalKey(Schema.Boolean).annotate({ description: "The source named a provider identity or declared account; independent of quota freshness. Absent on older servers." }),
   "measured_at_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "measured_by": Schema.String,
   "plan": optionalKey(Schema.String),
@@ -2124,6 +2159,35 @@ export const UsageLimit = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "UsageLimit" }))()
 export type UsageLimit = typeof UsageLimit.Type
 export type UsageLimitEncoded = typeof UsageLimit.Encoded
+
+export const UsagePricingRates = /*#__PURE__*/ (() => Schema.Struct({
+  "cache_read": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cache_write_1h": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cache_write_5m": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "input": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "output": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "UsagePricingRates" }))()
+export type UsagePricingRates = typeof UsagePricingRates.Type
+export type UsagePricingRatesEncoded = typeof UsagePricingRates.Encoded
+
+/** Cumulative contribution on claims; period contribution on usage reads. Provider-reported costs have no disclosed price table or rates. Missing provenance on historical claims is unknown. */
+export const UsagePricing = /*#__PURE__*/ (() => Schema.Struct({
+  "cache_write_1h_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cache_write_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cached_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cost_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cost_source": Schema.Literals(["provider_reported","computed","unpriced"]),
+  "input_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "output_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "price_table_id": optionalKey(Schema.String),
+  "price_table_version": optionalKey(Schema.String),
+  "rates_usd_per_million_tokens": optionalKey(UsagePricingRates),
+  "reported_cost_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "total_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "unpriced_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "UsagePricing", description: "Cumulative contribution on claims; period contribution on usage reads. Provider-reported costs have no disclosed price table or rates. Missing provenance on historical claims is unknown." }))()
+export type UsagePricing = typeof UsagePricing.Type
+export type UsagePricingEncoded = typeof UsagePricing.Encoded
 
 export const UsageRow = /*#__PURE__*/ (() => Schema.Struct({
   "account": optionalKey(Schema.String),
@@ -2136,8 +2200,10 @@ export const UsageRow = /*#__PURE__*/ (() => Schema.Struct({
   "input_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "mission_run": optionalKey(Id),
   "model": optionalKey(Schema.String),
+  "native_session_id": optionalKey(Schema.String),
   "output_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "pricing": optionalKey(Schema.String),
+  "pricing_provenance": optionalKey(Schema.Array(UsagePricing)),
   "reported_cost_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "step": optionalKey(Id),
   "total_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -2160,7 +2226,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded

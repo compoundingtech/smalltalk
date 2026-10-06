@@ -19,7 +19,7 @@ generated round mission, which holds the step:
 mission `mission/__st3/example/garden-work/loop/prepare-note/round` references missing eligible agent `agent/example/worker`
 ```
 
-A durable agent is a top-level seat, applied with `st agents apply`. It has no mission owner, so
+A durable agent is a top-level seat, applied with `st apply`. It has no mission owner, so
 no mission's end can stop it. Work reaches it as mission steps assigned to its exact subject.
 
 ## Supported way: apply a seat, then run work
@@ -46,7 +46,7 @@ Then run these four ST commands in order.
 1. Apply the seat:
 
    ```sh
-   st agents apply examples/st3/seats/omp.kdl --as person/operator
+   st apply examples/st3/seats/omp.kdl --as person/operator
    ```
 
    **This is the step that creates the agent.** Verify it:
@@ -58,7 +58,7 @@ Then run these four ST commands in order.
 2. Publish the finite work definition:
 
    ```sh
-   st missions publish examples/st3/walkthrough-work.kdl --as person/operator
+   st apply examples/st3/walkthrough-work.kdl --as person/operator
    ```
 
    Publication stores an immutable ready definition; it does not start a run. The missing-agent
@@ -81,7 +81,7 @@ Then run these four ST commands in order.
    st missions show mission-run/example/garden-work/first-change
    ```
 
-`missions publish FILE --as ACTOR` previews and publishes exact authored KDL. A person actor is an
+`apply FILE --as ACTOR` previews and publishes exact authored KDL. A person actor is an
 explicit trusted local operator. An agent actor is checked against the agent's already-current
 `mission-authority`; authority written into the candidate being published cannot grant itself.
 

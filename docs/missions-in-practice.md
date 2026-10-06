@@ -34,7 +34,7 @@ mission "garden/readme" state="ready" {
   }
 }
 EOF
-st missions publish missions/readme.kdl --as person/ada
+st apply missions/readme.kdl --as person/ada
 st missions start garden/readme --id garden/readme/one \
   --workspace "$PWD" --as person/ada
 st missions show mission-run/garden/readme/one
@@ -102,7 +102,7 @@ mission "garden/summary" state="ready" {
   }
 }
 EOF
-st missions publish missions/summary.kdl --as person/ada
+st apply missions/summary.kdl --as person/ada
 st missions start garden/summary --id garden/summary/one \
   --after mission-run/garden/readme/one --workspace "$PWD" --as person/ada
 st agents queue agent/garden/worker

@@ -164,7 +164,7 @@ st agents start import/claude/ID --harness claude --workspace WORKSPACE \
   --arg=--resume --arg NATIVE_SESSION_ID --arg=--permission-mode --arg auto \
   --as person/ada --print-kdl > imported.kdl
 st agents stop agent/import/claude/ID --as person/ada
-st agents apply imported.kdl --as person/ada
+st apply imported.kdl --as person/ada
 ```
 
 One limit remains: a resumed Claude Code session does not load st's channel yet, so st cannot
@@ -266,7 +266,7 @@ agent "example/worker" {
 Apply it and look at it:
 
 ```sh
-st agents apply worker.kdl --as person/ada
+st apply worker.kdl --as person/ada
 st agents show agent/example/worker
 st terminals peek agent/example/worker
 ```

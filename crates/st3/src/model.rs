@@ -1074,6 +1074,8 @@ pub struct PlannedAction {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MissionResponse {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub declaration_diffs: BTreeMap<String, crate::store::declarations::DeclarationDiff>,
     pub store_index: u64,
     pub source_hash: String,
     pub normalized: Value,

@@ -65,7 +65,7 @@ names it.
 Publish exact authored seat KDL without creating a planner session:
 
 ```sh
-st agents apply agents/example.kdl --as person/operator
+st apply agents/example.kdl --as person/operator
 ```
 
 The convenience form is `st agents start agents/example --harness codex --workspace
@@ -111,7 +111,7 @@ Stop the authorized st2 agent first. Remove only the st2-generated files that co
 Apply the seat, then use a readable run ID for the first finite work trial:
 
 ```sh
-st agents apply agents/example.kdl --as person/operator
+st apply agents/example.kdl --as person/operator
 st missions start work/example \
   --id agents/example/pilot \
   --workspace /work/st3-runs/example \
