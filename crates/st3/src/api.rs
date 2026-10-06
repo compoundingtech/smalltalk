@@ -812,8 +812,7 @@ async fn response_envelope(
                     })
                 })
             })
-            .and_then(|cursor| decode_client_cursor(&cursor).ok())
-            .map(|cursor| cursor.snapshot)
+            .and_then(|cursor| decode_client_cursor_snapshot(&cursor).ok())
     });
     // Authentication can scan pairing claims, and creating a snapshot reads the store. Both
     // must leave the async acceptor free to admit independent requests when SQLite is busy.
@@ -1296,6 +1295,14 @@ fn decode_client_cursor(cursor: &str) -> Result<ClientPageCursor, ApiError> {
         message: "the page cursor is malformed".into(),
         details: Box::default(),
     })
+}
+
+fn decode_client_cursor_snapshot(cursor: &str) -> Result<ClientSnapshot, ApiError> {
+    if cursor.starts_with(client_v0::NATIVE_PAGE_CURSOR_PREFIX) {
+        client_v0::native_page_cursor_snapshot(cursor)
+    } else {
+        decode_client_cursor(cursor).map(|cursor| cursor.snapshot)
+    }
 }
 
 fn client_page_expired(message: impl Into<String>) -> ApiError {
