@@ -23169,6 +23169,13 @@ mod fleet_admission_tests {
         admission
     }
 
+    /// A modern live observation travels separately from signed durable inventory.
+    fn sync_transport(from: &Store, to: &Store, peer: &str) {
+        sync(from,to);
+        let record = from.own_transport_value(peer).unwrap().unwrap();
+        to.receive_current_value(&record).unwrap();
+    }
+
     fn admitted(store: &Store, claim: &ClaimRecord) -> bool {
         store.claim_by_id(&claim.id).unwrap().is_some()
     }
@@ -24023,7 +24030,7 @@ mod fleet_admission_tests {
         observer
             .record_transport_observation("elm", "up", None, Some(success))
             .unwrap();
-        sync(&observer, &receiver);
+        sync_transport(&observer, &receiver, "elm");
         let expected = vec![("cedar".into(), "elm".into())];
         assert_eq!(
             receiver
@@ -24054,7 +24061,8 @@ mod fleet_admission_tests {
             .claims_for("host/elm", Some("transport.observed"))
             .unwrap()
             .len();
-        assert_eq!(count, 2);
+        assert_eq!(count, 0);
+        let current_id = observer.own_transport_value("elm").unwrap().unwrap().id;
         observer
             .record_transport_observation("elm", "up", None, None)
             .unwrap();
@@ -24065,13 +24073,14 @@ mod fleet_admission_tests {
                 .len(),
             count
         );
-        sync(&observer, &receiver);
+        assert_eq!(observer.own_transport_value("elm").unwrap().unwrap().id,current_id);
+        sync_transport(&observer, &receiver, "elm");
         assert_eq!(receiver.transport_links().unwrap(), expected);
 
         observer
             .record_transport_observation("elm", "unknown", None, None)
             .unwrap();
-        sync(&observer, &receiver);
+        sync_transport(&observer, &receiver, "elm");
         assert!(
             receiver.transport_links().unwrap().is_empty(),
             "latest unknown never revives an earlier up"
@@ -24083,12 +24092,11 @@ mod fleet_admission_tests {
         use smallclaims::store::{TRANSPORT_LINK_CLOCK_SKEW_MS, TRANSPORT_LINK_MAX_AGE_MS};
         let observer = node("cedar", None, None);
         let receiver = node("birch", None, None);
-        let claim = append(
-            &observer,
-            "transport.observed",
-            "host/elm",
-            json!({"status":"up"}),
-        );
+        let claim = observer.append_legacy_claim(&ClaimInput {
+            subject:"host/elm".into(),kind:"transport.observed".into(),actor:None,
+            fields:serde_json::from_value(json!({"status":"up"})).unwrap(),
+            evidence:vec![],expected_subject:None,idempotency_key:None,
+        }).unwrap();
         let accepted = claim.accepted_at_unix_ms;
         sync(&observer, &receiver);
         assert_eq!(
@@ -24140,7 +24148,8 @@ mod fleet_admission_tests {
         observer
             .record_transport_observation("elm", "up", None, None)
             .unwrap();
-        sync(&observer, &receiver);
+        sync_transport(&observer, &receiver, "elm");
+        let original = observer.own_transport_value("elm").unwrap().unwrap().id;
         // Quiet listening links remain available beyond the old 90-second cutoff, without
         // generating refresh claims at each 30-60-second exchange.
         for elapsed in [
@@ -24159,8 +24168,9 @@ mod fleet_admission_tests {
                     .claims_for("host/elm", Some("transport.observed"))
                     .unwrap()
                     .len(),
-                1
+                0
             );
+            assert_eq!(observer.own_transport_value("elm").unwrap().unwrap().id,original);
             assert_eq!(
                 receiver.transport_links().unwrap(),
                 vec![("cedar".into(), "elm".into())]
@@ -24175,12 +24185,13 @@ mod fleet_admission_tests {
                 .claims_for("host/elm", Some("transport.observed"))
                 .unwrap()
                 .len(),
-            2
+            0
         );
         let refreshed = observer
             .latest_claim("host/elm", Some("transport.observed"))
             .unwrap()
             .unwrap();
+        assert_ne!(refreshed.id,original);
         assert_eq!(
             refreshed.body["fields"]["last_success_at"],
             json!(start + TRANSPORT_LINK_REFRESH_MS)
@@ -24193,7 +24204,7 @@ mod fleet_admission_tests {
                 .claims_for("host/elm", Some("transport.observed"))
                 .unwrap()
                 .len(),
-            2
+            0
         );
     }
 
@@ -24221,7 +24232,7 @@ mod fleet_admission_tests {
             observer
                 .record_transport_observation("elm", "up", None, Some(success))
                 .unwrap();
-            sync(&observer, &receiver);
+            sync_transport(&observer, &receiver, "elm");
             assert_eq!(
                 receiver.transport_links_at(read_at).unwrap(),
                 vec![("cedar".into(), "elm".into())]

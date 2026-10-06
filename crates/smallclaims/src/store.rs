@@ -4283,6 +4283,11 @@ impl Store {
                  WHERE claims.subject=?1 AND ?2 IS NULL ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
             )
         };
+        let query = if let Some(kind) = kind {
+            self.runtime.current_observation_sql(kind, &query)
+        } else {
+            query
+        };
         connection
             .prepare_cached(&query)?
             .query_row(params![subject, kind], claim_from_row)
@@ -6197,14 +6202,14 @@ impl Store {
             })
         };
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(&canonical_sql(
+        let mut statement = connection.prepare_cached(&self.runtime.current_observation_sql("transport.observed", &canonical_sql(
             "SELECT origin, subject, json_extract(body, '$.fields.status'),
                     accepted_at_unix_ms, json_extract(body, '$.fields.last_success_at') FROM (
                 SELECT origin, subject, body, accepted_at_unix_ms,
                     ROW_NUMBER() OVER (PARTITION BY origin, subject ORDER BY CANONICAL_DESC(claims)) AS canonical_rank
                 FROM claims WHERE kind='transport.observed'
              ) WHERE canonical_rank=1 ORDER BY origin, subject",
-        ))?;
+        )))?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -6259,11 +6264,11 @@ impl Store {
             .readers
             .get()
             .query_row(
-                &canonical_sql(
+                &self.runtime.current_observation_sql("transport.observed", &canonical_sql(
                     "SELECT body, accepted_at_unix_ms FROM claims
                 WHERE subject=?1 AND kind='transport.observed' AND origin=?2
                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ),
+                )),
                 params![subject, self.origin],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )

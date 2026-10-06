@@ -100,6 +100,14 @@ impl Runtime for SmalltalkRuntime {
         compatibility_digest(&self.claim_registry().digest())
     }
 
+    fn current_observation_sql(&self, kind: &str, sql: &str) -> String {
+        if is_current_value(kind) {
+            current_sql(sql)
+        } else {
+            sql.to_owned()
+        }
+    }
+
     fn classify_replicated_claim(
         &self,
         _connection: &Connection,
