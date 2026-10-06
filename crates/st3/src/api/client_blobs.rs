@@ -67,6 +67,13 @@ fn blob_reply(value: Value) -> Json<Value> {
     Json(value)
 }
 
+fn external_source(source: &str) -> bool {
+    source.len() <= 512 && source.starts_with("external/")
+        && source.split('/').count() == 4
+        && source.split('/').all(|part| !part.is_empty()
+            && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+}
+
 #[derive(Deserialize)]
 pub(super) struct DeliveryQuery {
     #[serde(default)]
@@ -91,6 +98,9 @@ pub(super) async fn deliveries(
             .then(|| (member["tags"]["st3.adapter.source"].as_str(), member["tags"]["st3.adapter.target"].as_str()))
     }).and_then(|(source, target)| source.zip(target))
         .ok_or_else(|| ApiError::bad(St3Error::new("adapter-route-refused", "delivery watch requires an enrolled program seat")))?;
+    if !external_source(source) || !target.starts_with("agent/") {
+        return Err(ApiError::bad(St3Error::new("adapter-route-refused", "delivery watch requires an external source and agent destination")));
+    }
     let legacy = source.strip_prefix("external/discord/user/").map(|id| format!("person/discord-{id}"));
     let mut changed = state.event_notify.subscribe();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(query.wait_ms.min(10_000));
@@ -131,9 +141,7 @@ pub(super) async fn import_message(
     require_scope(&session, "control.messages")?;
     let actor = &session.authority_actor;
     let source = &request.from;
-    if !actor.starts_with("agent/") || !source.starts_with("external/") || source.len() > 512
-        || source.split('/').any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
-        || source.split('/').count() != 4
+    if !actor.starts_with("agent/") || !external_source(source) || !request.to.starts_with("agent/")
     {
         return Err(ApiError::bad(St3Error::new("adapter-route-refused", "an adapter import needs its agent actor and an external provider account")));
     }
@@ -545,6 +553,8 @@ agent "example/bridge" {
         assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
         let blob = json_of(&bytes)["value"]["blob"].as_str().unwrap().to_owned();
         let payload = json!({"idempotency_key":"adapter-image-505", "from":"external/discord/user/404", "to":"agent/example/test", "content":"image from Discord", "attachments":[{"blob":blob,"media_type":"image/png"}]});
+        let (ordinary_status, _, _) = call(&app, "POST", "/v1/messages", actor, Some("application/json"), serde_json::to_vec(&payload).unwrap()).await;
+        assert_ne!(ordinary_status, StatusCode::OK, "ordinary sends must not bypass adapter enrollment");
         let (status, _, bytes) = call(&app, "POST", "/v1/client/adapter/import", actor, Some("application/json"), serde_json::to_vec(&payload).unwrap()).await;
         assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
         let value = json_of(&bytes);

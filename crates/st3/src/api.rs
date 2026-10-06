@@ -11232,6 +11232,12 @@ fn accept_message_receipt_with_upload_owner(
     device_signature: Option<smallclaims::principal::ClaimSignature>,
     upload_owner: Option<&str>,
 ) -> Result<MessageSendReceipt, ApiError> {
+    if request.from.starts_with("external/") && upload_owner.is_none() {
+        return Err(ApiError::bad(St3Error::new(
+            "adapter-route-refused",
+            "external sender imports require the enrolled adapter endpoint",
+        )));
+    }
     if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "empty-message",
