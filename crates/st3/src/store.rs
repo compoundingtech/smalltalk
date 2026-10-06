@@ -103,7 +103,7 @@ mod person_work;
 mod subagents;
 mod watches;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
-pub use limits::{AccountLimit, LIMITS_ACTOR, LimitsOutcome, LimitsPolicy};
+pub use limits::{AccountLimit, LIMITS_ACTOR, LIMITS_CATCH_UP_PAGE, LimitsOutcome, LimitsPolicy};
 pub use subagents::{
     EndedSubagent, SUBAGENT_KINDS, SUBAGENT_LEASE_MS, SubagentSweep, SubagentView,
 };

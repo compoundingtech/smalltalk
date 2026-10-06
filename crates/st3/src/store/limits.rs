@@ -209,7 +209,7 @@ pub(super) fn create_limits_schema(connection: &Connection) -> Result<()> {
 const LIMITS_APPEND_PAGE: usize = 64;
 /// Claims one catch-up page folds: about 25 ms of writer time, after which the writer serves what
 /// queued meanwhile.
-pub(crate) const LIMITS_CATCH_UP_PAGE: usize = 200;
+pub const LIMITS_CATCH_UP_PAGE: usize = 200;
 const LIMITS_READY: &str = "account_limits_ready";
 
 /// Check the projection's version when a store opens. Opening never folds history: a store that
