@@ -349,9 +349,16 @@
           # sandbox has no /usr/bin/env; patch before compilation for package/check.
           postPatch = ''
             for hook in crates/st3/hooks/claude-observe.sh crates/st3/hooks/claude-statusline.sh; do
-              if [ -f "$hook" ]; then
-                # --host uses HOST_PATH, which omits native Bash under strictDeps.
-                HOST_PATH=${pkgs.bash}/bin:$HOST_PATH patchShebangs --host "$hook"
+              if [ ! -f "$hook" ]; then
+                echo "Missing embedded Claude hook: $hook" >&2
+                exit 1
+              fi
+              # --host uses HOST_PATH, which omits native Bash under strictDeps.
+              HOST_PATH=${pkgs.bash}/bin:$HOST_PATH patchShebangs --host "$hook"
+              IFS= read -r shebang < "$hook"
+              if [ "$shebang" != "#!${pkgs.bash}/bin/bash" ]; then
+                echo "Wrong embedded Claude hook interpreter in $hook: $shebang" >&2
+                exit 1
               fi
             done
           '';
