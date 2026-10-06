@@ -522,6 +522,12 @@ CREATE TABLE IF NOT EXISTS step_runs (
     UNIQUE(generation_id, step_path)
 );
 CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, generation_id, step_path);
+-- The recursive descendant-runs query joins runs to the steps that started them. Without these two
+-- it scanned every mission run, then built a throwaway index on parent_step_run for each level:
+-- 3.6 to 4.7 ms a call, 1,213 calls in one run-tree rebuild on a real store.
+CREATE INDEX IF NOT EXISTS step_runs_generation_index ON step_runs(generation_id);
+CREATE INDEX IF NOT EXISTS mission_runs_parent_step_index ON mission_runs(parent_step_run)
+WHERE parent_step_run IS NOT NULL;
 CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, status);
 -- The steps a lease holds, a handful of all the steps a fleet has ever run.
 CREATE INDEX IF NOT EXISTS step_runs_lease_index ON step_runs(lease_owner)
