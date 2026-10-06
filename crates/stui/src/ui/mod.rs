@@ -1491,7 +1491,12 @@ impl Ui {
         let selected = selected.min(listing.ids.len().saturating_sub(1));
         let mut rows: Vec<(Option<usize>, Line<'static>, bool)> = Vec::new();
         let mut selected_range = (0, 0);
+        // Whether the item before was a heading or a note: a note joins it without a gap.
+        let mut joined = false;
         for item in &listing.items {
+            let before = joined;
+            joined = matches!(item, Item::Header { .. } | Item::Note(_));
+            let joined = before;
             match item {
                 Item::Header {
                     title,
@@ -1502,7 +1507,8 @@ impl Ui {
                         rows.push((None, Line::default(), false));
                     }
                     let label = format!(" {title}");
-                    let count = format!("{count} ");
+                    // A heading with nothing to count (usage's summary) shows no number.
+                    let count = if *count == 0 { String::new() } else { format!("{count} ") };
                     let fill = width.saturating_sub(text::width(&label) + text::width(&count) + 1);
                     rows.push((
                         None,
@@ -1555,10 +1561,26 @@ impl Ui {
                 }
                 Item::Folder(line) => rows.push((None, line.clone(), false)),
                 Item::Note(line) => {
-                    if !rows.is_empty() {
+                    // Notes straight after a heading or another note read as one block; a note
+                    // after rows stands apart. Each wraps to the width instead of being cut.
+                    if !rows.is_empty() && !joined {
                         rows.push((None, Line::default(), false));
                     }
-                    rows.push((None, line.clone(), false));
+                    let runs = line
+                        .spans
+                        .iter()
+                        .map(|span| text::run(span.content.to_string(), span.style))
+                        .collect::<Vec<_>>();
+                    let lead = text::run(" ", theme::dim());
+                    for wrapped in text::wrap(
+                        &runs,
+                        width.saturating_sub(1),
+                        &[],
+                        std::slice::from_ref(&lead),
+                        None,
+                    ) {
+                        rows.push((None, wrapped, false));
+                    }
                 }
             }
         }

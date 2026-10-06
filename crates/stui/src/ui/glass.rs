@@ -3958,6 +3958,22 @@ mod tests {
     }
 
     #[test]
+    fn usage_in_a_narrow_pane_reads_whole_a_limit_to_a_line_and_notes_wrapped() {
+        // Nathan, 2026-10-06: the usage view was cut off and double spaced.
+        let mut ui = glass();
+        ui.toggle_usage();
+        let shown = screen(&ui);
+        let lines = shown.lines().collect::<Vec<_>>();
+        let weekly = lines.iter().position(|line| line.contains("weekly   23%")).unwrap();
+        assert!(lines[weekly + 1].contains("5-hour   41%"), "{shown}");
+        let summary = lines.iter().position(|line| line.contains("summary")).unwrap();
+        assert!(
+            lines[summary + 1].contains("$77.30"),
+            "the summary starts straight under its heading: {shown}"
+        );
+    }
+
+    #[test]
     fn ctrl_a_opens_an_agents_actions_and_restart_asks_first() {
         let mut ui = glass();
         ui.live = true;
