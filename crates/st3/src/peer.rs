@@ -1658,6 +1658,7 @@ mod tests {
 
     include!("peer/raw_terminal_tests.rs");
     include!("peer/stale_link_tests.rs");
+    include!("peer/raw_lease_tests.rs");
 
     #[tokio::test]
     async fn a_gateway_streams_a_remote_terminal_through_owner_long_polls() {
