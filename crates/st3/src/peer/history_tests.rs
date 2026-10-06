@@ -178,10 +178,11 @@ async fn paired_history_pages_read_the_actual_remote_pty_owner() {
     let replacement = runtime.snapshot().unwrap().into_iter().find(|live| live.name == "history-smoke").unwrap();
     let replacement_incarnation = format!("{}:{}", replacement.pid.unwrap(), replacement.created_at.unwrap());
     assert_ne!(replacement_incarnation, incarnation);
-    let new_metadata = pty_core::registry::read_metadata_in(&owner.pty_root, "history-smoke").unwrap();
+    let replacement_metadata = fs::read(owner.pty_root.join("history-smoke.json")).unwrap();
+    let new_metadata: pty_core::registry::SessionMetadata = serde_json::from_slice(&replacement_metadata).unwrap();
+    assert_eq!(format!("{}:{}", new_metadata.daemon_pid.unwrap(), new_metadata.created_at), replacement_incarnation);
     assert_ne!(new_metadata.generation.unwrap(), captured_request.expected_generation);
     let gate = std::os::unix::net::UnixListener::bind(gated_root.join("history-smoke.sock")).unwrap();
-    let actual_root = owner.pty_root.clone();
     let gate_metadata = gated_root.join("history-smoke.json");
     let gated = std::thread::spawn(move || {
         use std::io::{Read, Write};
@@ -201,7 +202,11 @@ async fn paired_history_pages_read_the_actual_remote_pty_owner() {
         assert_eq!(request.limit, captured_request.limit);
         assert_eq!(request.before, captured_request.before);
         eprintln!("Q35_PHYSICAL request_matched_identity_cutover unix_ms={}", registry_now_ms());
-        fs::copy(actual_root.join("history-smoke.json"), gate_metadata).unwrap();
+        // Publish exact pre-read native bytes: accelerated file-copy I/O can
+        // block beyond the fixed RPC deadline even for tiny metadata files.
+        eprintln!("Q35_PHYSICAL genuine_metadata_write_begin unix_ms={}", registry_now_ms());
+        fs::write(gate_metadata, replacement_metadata).unwrap();
+        eprintln!("Q35_PHYSICAL genuine_metadata_write_done unix_ms={}", registry_now_ms());
         client.write_all(&encode_packet(MessageType::History, &serde_json::to_vec(&response).unwrap())).unwrap();
         eprintln!("Q35_PHYSICAL actual_old_page_replied unix_ms={}", registry_now_ms());
     });
