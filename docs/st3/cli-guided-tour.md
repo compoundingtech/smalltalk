@@ -433,12 +433,20 @@ We do not leave a wait running. Check the boundary between product detail (`agen
 history (`subject`/`trace`).
 
 `st trace show SUBJECT --follow`, `st missions show RUN --follow`, and the viewer started by
-`st missions start --follow` keep retrying request timeouts and daemon outages until stopped.
-Retries use exponential backoff from 100 ms up to 5 s with jitter and print one `follow gap`
-line on stderr per interrupted request. Trace resumes after the last delivered index;
-mission viewers retain their last displayed snapshot and resume polling the same run.
-These follow reads wait indefinitely even with `--daemon-wait 0`. Authentication, not-found,
-validation, and other non-transient errors still stop the viewer immediately with a nonzero exit.
+`st missions start --follow` retry request timeouts with a 5–15 s initial delay, doubling with
+jitter up to a 60 s cap. Deadline backoff persists across successful reads for the lifetime of
+the viewer: timing out a client read does not cancel the server's work. Unreachable-daemon
+retries start at 100 ms with jitter, double up to 5 s, and exit nonzero after five continuous
+minutes without an answer, including refused or absent sockets. These follow policies take
+precedence over `--daemon-wait`, including `--daemon-wait 0`.
+
+One `follow gap` line on stderr reports the interruption's duration and next retry delay;
+after a complete page or snapshot is delivered, one `follow recovered after N s` line reports
+its total duration. Trace resumes after the last delivered index and uses a 30 s event long poll
+with a 35 s client deadline. Mission viewers retain their last displayed snapshot and keep the
+250 ms healthy polling interval. Authentication, not-found, validation, and other non-transient
+errors still stop the viewer immediately with a nonzero exit. Request timeouts may retry
+indefinitely; Ctrl-C stops either viewer.
 
 ### 16. `schema` and `claim` — discover and use the graph vocabulary
 

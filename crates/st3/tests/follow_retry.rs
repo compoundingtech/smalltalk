@@ -1,6 +1,6 @@
-//! The real CLI retries a lost answer without replaying delivered history or snapshots.
-//! Each fake daemon owns a temporary Unix socket. A timeout is injected by holding its
-//! connection until the client's actual request deadline closes it, without timing a sleep.
+//! Real CLI processes exit 2 immediately on non-transient follow errors.
+//! Timeout, delivery, idle-poll and backoff proofs use an injected clock in follow_tests.rs.
+//! Each fake daemon here owns a temporary Unix socket.
 use std::process::Output;
 use std::time::Duration;
 
@@ -15,8 +15,6 @@ const TREE_PATH: &str = "/v1/mission-runs?root=mission-run%2Fexample%2Ffollow-fi
 
 enum Reply {
     Value(Value),
-    Timeout,
-    Disconnect,
     Error(u16),
 }
 
@@ -39,13 +37,6 @@ async fn scripted_cli(args: &[&str], script: Vec<(String, Reply)>) -> Output {
                 format!("GET {expected} HTTP/1.1")
             );
             let (status, body) = match reply {
-                Reply::Timeout => {
-                    let mut rest = Vec::new();
-                    caller.read_to_end(&mut rest).await.unwrap();
-                    assert!(rest.is_empty());
-                    continue;
-                }
-                Reply::Disconnect => continue,
                 Reply::Value(value) => (
                     200,
                     json!({
@@ -86,24 +77,8 @@ async fn scripted_cli(args: &[&str], script: Vec<(String, Reply)>) -> Output {
     output
 }
 
-fn claims_path(after: u64) -> String {
-    format!("/v1/claims?subject=host%2Ffollow-fixture&after_index={after}&order=asc&limit=1")
-}
-
 fn events_path(after: u64) -> String {
-    format!("/v1/events?after={after}&subject=host%2Ffollow-fixture")
-}
-
-fn event(index: u64) -> Value {
-    json!({"store_index": index, "kind": "transport.observed", "subject": SUBJECT, "body": {}})
-}
-
-fn claim(index: u64) -> Value {
-    json!({
-        "id": format!("claim/{index}"), "store_index": index, "batch_id": "batch/fixture",
-        "subject": SUBJECT, "kind": "transport.observed", "origin": "fixture", "actor": null,
-        "body": {"status": format!("event-{index}")}, "predecessors": [], "accepted_at_unix_ms": 0,
-    })
+    format!("/v1/events?after={after}&wait=true&timeout_ms=30000&subject=host%2Ffollow-fixture")
 }
 
 fn run(status: &str, phase: &str) -> Value {
@@ -133,140 +108,6 @@ fn assert_refusal(output: &Output, gaps: usize) {
         "{}",
         stderr(output)
     );
-}
-
-#[tokio::test]
-async fn trace_follow_retries_timeout_after_last_delivered_index_once() {
-    let initial = "/v1/claims?limit=2&order=asc&subject=host%2Ffollow-fixture&after_index=10";
-    let output = scripted_cli(
-        &[
-            "--json",
-            "trace",
-            "show",
-            SUBJECT,
-            "--after-index",
-            "10",
-            "--limit",
-            "2",
-            "--follow",
-        ],
-        vec![
-            (
-                initial.into(),
-                Reply::Value(json!({"claims": [], "next_cursor": null})),
-            ),
-            (events_path(10), Reply::Value(json!([event(11), event(12)]))),
-            (events_path(12), Reply::Timeout),
-            (events_path(12), Reply::Disconnect),
-            (events_path(12), Reply::Value(json!([event(13), event(14)]))),
-            (events_path(14), Reply::Error(404)),
-        ],
-    )
-    .await;
-    assert_refusal(&output, 1);
-    assert!(stderr(&output).contains("request and response limit of 15000 ms"));
-    let delivered: Vec<u64> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| {
-            serde_json::from_str::<Value>(line).unwrap()["store_index"]
-                .as_u64()
-                .unwrap()
-        })
-        .collect();
-    assert_eq!(delivered, [11, 12, 13, 14]);
-}
-
-#[tokio::test]
-async fn trace_follow_retries_claim_details_before_advancing_index() {
-    let initial = "/v1/claims?limit=2&order=asc&subject=host%2Ffollow-fixture&after_index=10";
-    let output = scripted_cli(
-        &[
-            "trace",
-            "show",
-            SUBJECT,
-            "--after-index",
-            "10",
-            "--limit",
-            "2",
-            "--follow",
-        ],
-        vec![
-            (
-                initial.into(),
-                Reply::Value(json!({"claims": [], "next_cursor": null})),
-            ),
-            (events_path(10), Reply::Value(json!([event(11), event(12)]))),
-            (
-                claims_path(10),
-                Reply::Value(json!({"claims": [claim(11)], "next_cursor": null})),
-            ),
-            (claims_path(11), Reply::Timeout),
-            (
-                claims_path(11),
-                Reply::Value(json!({"claims": [claim(12)], "next_cursor": null})),
-            ),
-            (events_path(12), Reply::Error(422)),
-        ],
-    )
-    .await;
-    assert_refusal(&output, 1);
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(stdout.matches("event-11").count(), 1, "{stdout}");
-    assert_eq!(stdout.matches("event-12").count(), 1, "{stdout}");
-}
-
-async fn mission_timeout(interrupt_tree: bool) {
-    let before = run("running", "normal");
-    let after = run("running", "recovered");
-    let finished = run("completed", "normal");
-    let mut script = vec![
-        (RUN_PATH.into(), Reply::Value(before.clone())),
-        (TREE_PATH.into(), Reply::Value(json!([before]))),
-    ];
-    if interrupt_tree {
-        script.push((RUN_PATH.into(), Reply::Value(after.clone())));
-        script.push((TREE_PATH.into(), Reply::Timeout));
-    } else {
-        script.push((RUN_PATH.into(), Reply::Timeout));
-        script.push((RUN_PATH.into(), Reply::Value(after.clone())));
-    }
-    script.extend([
-        (TREE_PATH.into(), Reply::Value(json!([after]))),
-        (RUN_PATH.into(), Reply::Value(finished.clone())),
-        (TREE_PATH.into(), Reply::Value(json!([finished]))),
-    ]);
-    let output = scripted_cli(&["missions", "show", RUN, "--follow"], script).await;
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(
-        stderr(&output).matches("follow gap:").count(),
-        1,
-        "{}",
-        stderr(&output)
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let states: Vec<_> = stdout
-        .lines()
-        .filter(|line| line.starts_with("STATE"))
-        .collect();
-    assert_eq!(
-        states,
-        [
-            "STATE     running · normal",
-            "STATE     running · recovered",
-            "STATE     completed · normal"
-        ]
-    );
-}
-
-#[tokio::test]
-async fn mission_follow_retries_run_timeout_without_repeating_snapshots() {
-    mission_timeout(false).await;
-}
-
-#[tokio::test]
-async fn mission_follow_retries_tree_timeout_without_repeating_snapshots() {
-    mission_timeout(true).await;
 }
 
 #[tokio::test]

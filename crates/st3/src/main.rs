@@ -55,6 +55,8 @@ use completion::{Complete, Entity, WorkFilter};
 
 mod cli_help;
 mod completion;
+#[cfg(test)]
+mod follow_tests;
 mod presentation;
 
 use presentation::{
@@ -1699,7 +1701,7 @@ enum MissionViewCommand {
 struct MissionShowArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionOrRun)))]
     mission_or_run: String,
-    /// Follow until finished or stopped; retry daemon outages and request timeouts indefinitely.
+    /// Follow until finished or stopped; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(long)]
     follow: bool,
 }
@@ -1802,7 +1804,7 @@ struct MissionRunStartArgs {
     #[arg(long, value_name = "RUN")]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     after: Option<String>,
-    /// Follow until finished or stopped; retry daemon outages and request timeouts indefinitely.
+    /// Follow until finished or stopped; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(long)]
     follow: bool,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
@@ -2218,7 +2220,7 @@ struct TraceArgs {
     limit: usize,
     #[arg(long)]
     after_index: Option<u64>,
-    /// Follow until stopped; retry daemon outages and request timeouts from the last index.
+    /// Follow from the last index; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(short = 'f', long)]
     follow: bool,
 }
@@ -6813,36 +6815,51 @@ fn started_revision_note(
 
 async fn follow_mission_run(
     client: &Client,
-    mut run: MissionRunView,
+    run: MissionRunView,
     _cursor: u64,
     json_output: bool,
 ) -> Result<()> {
-    let client = client.clone().with_follow_retry();
-    let client = &client;
-    let mut prior = String::new();
     let interactive = std::io::stdout().is_terminal();
     let _screen = if !json_output && interactive {
         Some(TerminalScreen::open()?)
     } else {
         None
     };
-    let style = OutputStyle::stdout();
+    follow_mission_run_to(
+        client, run, json_output, interactive, OutputStyle::stdout(), &mut std::io::stdout(),
+    ).await
+}
+
+async fn follow_mission_run_to(
+    client: &Client,
+    mut run: MissionRunView,
+    json_output: bool,
+    interactive: bool,
+    style: OutputStyle,
+    output: &mut impl std::io::Write,
+) -> Result<()> {
+    let client = client.clone().with_follow_retry();
+    let client = &client;
+    let mut prior = String::new();
     loop {
         let runs = load_mission_run_tree(client, &run).await?;
         let summary = mission_run_signature(&runs)?;
         if summary != prior && !json_output {
             let frame = render_mission_run(&run, &runs, style, current_unix_ms()?);
-            print!(
+            write!(
+                output,
                 "{}",
                 follow_snapshot(&frame, interactive, !prior.is_empty())
-            );
-            std::io::stdout().flush()?;
+            )?;
+            output.flush()?;
             prior = summary;
         }
+        client.follow_recovered();
         match run.status.as_str() {
             status if mission_run_follow_succeeded(status) => {
                 return if json_output {
-                    print_value(&run, true)
+                    writeln!(output, "{}", serde_json::to_string_pretty(&run)?)?;
+                    Ok(())
                 } else {
                     Ok(())
                 };
@@ -7695,6 +7712,15 @@ async fn run_inspect(client: &Client, args: InspectArgs, json_output: bool) -> R
 }
 
 async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Result<()> {
+    run_trace_to(client, args, json_output, &mut std::io::stdout()).await
+}
+
+async fn run_trace_to(
+    client: &Client,
+    args: TraceArgs,
+    json_output: bool,
+    output: &mut impl std::io::Write,
+) -> Result<()> {
     anyhow::ensure!(
         args.limit > 0 && args.limit <= 500,
         "the trace limit must be 1 through 500"
@@ -7710,16 +7736,19 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
     for claim in claims {
         cursor = cursor.max(claim.store_index);
         if json_output {
-            println!("{}", serde_json::to_string(&claim)?);
+            writeln!(output, "{}", serde_json::to_string(&claim)?)?;
         } else {
-            print_trace_claim(&claim);
+            write_trace_claim(output, &claim)?;
         }
     }
     if !args.follow {
         return Ok(());
     }
+    client.follow_recovered();
     loop {
-        let mut event_query = vec![format!("after={cursor}")];
+        let mut event_query = vec![
+            format!("after={cursor}"), "wait=true".into(), "timeout_ms=30000".into(),
+        ];
         if let Some(subject) = &args.subject {
             event_query.push(format!("subject={}", urlencoding::encode(subject)));
         }
@@ -7731,7 +7760,7 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
             .await?;
         for event in events {
             if json_output {
-                println!("{}", serde_json::to_string(&event)?);
+                writeln!(output, "{}", serde_json::to_string(&event)?)?;
             } else {
                 let claims: ClaimsPage = client
                     .get(&format!(
@@ -7745,16 +7774,18 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
                     .into_iter()
                     .find(|claim| claim.store_index == event.store_index)
                 {
-                    print_trace_claim(&claim);
+                    write_trace_claim(output, &claim)?;
                 } else {
-                    println!(
+                    writeln!(
+                        output,
                         "{}\t{}\t{}\t(no claim details)",
                         event.store_index, event.kind, event.subject
-                    );
+                    )?;
                 }
             }
             cursor = cursor.max(event.store_index);
         }
+        client.follow_recovered();
     }
 }
 
@@ -7784,7 +7815,7 @@ async fn trace_claims(client: &Client, args: &TraceArgs) -> Result<Vec<ClaimReco
     Ok(claims)
 }
 
-fn print_trace_claim(claim: &ClaimRecord) {
+fn write_trace_claim(output: &mut impl std::io::Write, claim: &ClaimRecord) -> Result<()> {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
     let summary = ["state", "status", "verdict", "action", "reason"]
         .into_iter()
@@ -7802,16 +7833,19 @@ fn print_trace_claim(claim: &ClaimRecord) {
     .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
     .unwrap_or_else(|| claim.accepted_at_unix_ms.to_string());
     if summary.is_empty() {
-        println!(
+        writeln!(
+            output,
             "{}\t{}\t{}\t{}",
             claim.store_index, timestamp, claim.kind, claim.subject
-        );
+        )?;
     } else {
-        println!(
+        writeln!(
+            output,
             "{}\t{}\t{}\t{}\t{}",
             claim.store_index, timestamp, claim.kind, claim.subject, summary
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn trace_scalar(value: &Value) -> String {
