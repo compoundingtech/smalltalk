@@ -24,7 +24,8 @@ use smallclaims::store::checkpoint_agreement::*;
 /// reading, so it no longer witnesses the reading the account fold selects. Version 9 preserves
 /// bounded observed status history and the beginning of the current state.
 /// Version 10 retains native credential edges and their bounded status transitions.
-pub const RULES_VERSION: u32 = 10;
+/// Version 11 includes arrangement tables in the graph proof and rebuilds them during replay.
+pub const RULES_VERSION: u32 = 11;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -83,6 +84,8 @@ render.applied slot=subject keep=newest min-age-before-cut=5d
 runtime.readiness-deadline-reached slot=subject keep=newest min-age-before-cut=5d
 sealed=every-admitted-claim-of-an-envelope-before-the-cut-but-repaired-originals
 proof=the-sealed-claims-and-the-blobs-they-reference
+graph=shared-projection-tables-including-arrangements-and-arrangement_registers-even-when-empty
+replay=clear-arrangements-and-arrangement_registers,rebuild-from-sealed-arrangement-claims
 guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope
 witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
 carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
@@ -684,8 +687,10 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
 }
 
 /// Tables projected from claims, children before the tables their foreign keys name.
-pub(crate) const PROJECTION_TABLES: [&str; 21] = [
+pub(crate) const PROJECTION_TABLES: [&str; 23] = [
     "operations",
+    "arrangement_registers",
+    "arrangements",
     "resource_observations",
     "glass_heads",
     "local_glass_head_pending",
@@ -726,6 +731,7 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
     rebuild_planning_tx(transaction)?;
     resources::rebuild(transaction)?;
     glass_heads::rebuild(transaction)?;
+    arrangements::rebuild(transaction)?;
     Ok(())
 }
 
@@ -742,6 +748,11 @@ pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128)
                 i64::MAX as u64
             )?),
         );
+    }
+    if subject.starts_with("arrangement/") {
+        let person = st3_schema::arrangements::owner(subject).map_err(anyhow::Error::new)?;
+        answers.insert("arrangements".into(), json!(super::arrangements::arrangements_at(connection, person, i64::MAX as u64)?));
+        answers.insert("arrangement".into(), json!(super::arrangements::arrangement_at(connection, subject, i64::MAX as u64)?));
     }
     answers.insert(
         "actual".into(),

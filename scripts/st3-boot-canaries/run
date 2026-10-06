@@ -18,6 +18,8 @@ step it names. SCENARIO is one of
                     message waits, and resume brings back the same native session, which holds
                     that old mail and reads a fresh message. Then a resume whose transcript is gone fails with a typed reason and the
                     seat stays suspended.
+    import          a saved Codex session binds its exact ID and originating home on first import
+                    and restart, while a stale copy exists in the daemon's default environment
     utf8            Codex recovers a receipt from a split UTF-8 transcript and keeps delivering
                     through discovery I/O failures, with private, rate-limited warnings.
 
@@ -39,13 +41,14 @@ import time
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.dont_write_bytecode = True
-from st_boundary import fresh_seat_findings
+from st_boundary import fresh_seat_findings, output_findings
 
 HARNESSES = ("claude", "codex", "pi", "omp", "opencode")
-SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend", "utf8", "channel-missing", "channel-uninitialized")
+SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend", "utf8", "channel-missing", "channel-uninitialized", "channel-parked", "import")
 RUN_ID = "c1"
 MISSION = "canary/boot"
 LETTERS = "abcde"
+IMPORTED_SUBJECT = None
 
 
 class Failure(Exception):
@@ -207,7 +210,7 @@ client_gateway_socket = "{root / 'run/client.sock'}"
 
 
 def seat_subject(letter):
-    return f"agent/{RUN_ID}/seat-{letter}"
+    return IMPORTED_SUBJECT or f"agent/{RUN_ID}/seat-{letter}"
 
 
 def mission_source(node, count, harness, hold=False):
@@ -221,7 +224,8 @@ def mission_source(node, count, harness, hold=False):
     gate "never" { exists "mission-run/${ST_MISSION_RUN}/never" }
   }""" if hold else ""
     for letter in LETTERS[:count]:
-        seats += f'''
+        if not IMPORTED_SUBJECT:
+            seats += f'''
   agent "seat-{letter}" {{
     workspace "{node.root / 'ws'}"
     restart "always"
@@ -229,7 +233,7 @@ def mission_source(node, count, harness, hold=False):
   }}'''
         steps += f'''
   step "work-{letter}" {{
-    assigned-to "agent/${{ST_MISSION_RUN}}/seat-{letter}"
+    assigned-to "{IMPORTED_SUBJECT or ('agent/${ST_MISSION_RUN}/seat-' + letter)}"
     goal "Boot canary: claim this step."
   }}'''
     return f'''version 2
@@ -255,6 +259,8 @@ def parked(node, subject):
         body = row.get("body", row)
         fields = body.get("fields", body)
         if row.get("kind") == "runtime.reconcile-decision" and "crash-loop" in str(fields.get("key", "")):
+            return fields
+        if row.get("kind") == "runtime.action.failed" and fields.get("action") == "claude-channel-recovery":
             return fields
     return None
 
@@ -345,10 +351,15 @@ def driver_processes(node):
     return rows
 
 
-def check_boundary(node):
+def check_boundary(node, stopped=False):
     """A fresh seat's processes stay inside st's boundary."""
     processes = node.seat_processes(with_environment=True)
-    violations = list(fresh_seat_findings(node.root, processes))
+    if stopped:
+        if processes:
+            fail("a parked seat still has live processes")
+        violations = list(output_findings(node.root))
+    else:
+        violations = list(fresh_seat_findings(node.root, processes))
     if violations:
         fail("fresh seat boundary: " + "; ".join(violations))
 
@@ -605,7 +616,7 @@ def codex_transcript_recovery(node, seats):
 def claude_attachment(node, seats, mode):
     """Hooks can be idle with no usable MCP channel. Hold early mail, then recover once."""
     control = node.root / "ws/claude-channel-mode"
-    control.write_text(mode)
+    control.write_text("missing-once" if mode == "missing" else mode)
     old = seats.incarnations["a"]
     node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
     early = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
@@ -622,10 +633,20 @@ def claude_attachment(node, seats, mode):
         fail(f"unattached channel did not visibly hold early mail: {delivery}")
     if native_offer_count(node, early) != 0:
         fail("an unattached channel offered early mail")
-    control.unlink()
-    if mode == "missing":
-        node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+    blocked_incarnation = seats.view("a")[0].get("incarnation_id")
+    if mode == "uninitialized":
+        control.unlink()
     seats.prove("channel-recovered", fresh_incarnation=mode == "missing")
+    recovered_incarnation = seats.view("a")[0].get("incarnation_id")
+    recovery_claims = (node.api("/v1/claims?subject=" + seat_subject("a") + "&limit=100") or {}).get("claims", [])
+    automatic = [row for row in recovery_claims if row.get("kind") == "runtime.action.requested"
+                 and row.get("body", {}).get("fields", {}).get("operation") == "claude-channel-recovery"]
+    if mode == "missing":
+        if recovered_incarnation == blocked_incarnation or len(automatic) != 1:
+            fail(f"the missing channel did not recover with one automatic restart: {automatic}")
+        continued_session(node, "automatic channel recovery")
+    elif recovered_incarnation != blocked_incarnation or automatic:
+        fail("a channel initialized during recheck was unnecessarily restarted")
     until(lambda: (node.api("/v1/messages/read/" + early) or {}).get("status") in ("read", "closed"),
           seats.bound, "early mail did not recover after channel attachment")
     until(lambda: native_offer_count(node, early) == 1, seats.bound, "early mail was not offered once")
@@ -636,6 +657,9 @@ def claude_attachment(node, seats, mode):
             if phases[kind] != 1:
                 fail(f"{reference} has {phases[kind]} {kind} receipts, expected one")
     exact_receipts(early)
+    for probe in seats.read_probes:
+        if native_offer_count(node, probe) != 1:
+            fail(f"channel recovery replayed a boot probe: {probe}")
     # Restart twice more and send within startup, while retaining the first probe's proof.
     for index in range(2):
         node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
@@ -650,6 +674,86 @@ def claude_attachment(node, seats, mode):
     if native_offer_count(node, early) != 1:
         fail("a second restart replayed the recovered mail")
     exact_receipts(early)
+
+
+def claude_channel_parked(node, seats):
+    """A permanently missing channel exhausts a durable budget and keeps mail held."""
+    (node.root / "ws/claude-channel-mode").write_text("missing")
+    node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+    early = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
+                      "--subject", "parked attachment probe", "--body", "mail while unattached")["subject"]
+    check_boundary(node)
+    until(lambda: parked(node, seat_subject("a")), 180, "permanent channel failure never parked")
+    until(lambda: "claude-channel-unattached" in json.dumps(seats.view("a")[0]),
+          10, "parked channel failure lost its visible reason")
+
+    def attempts():
+        claims = (node.api("/v1/claims?subject=" + seat_subject("a") + "&limit=500") or {}).get("claims", [])
+        return [row for row in claims if row.get("kind") == "runtime.action.requested"
+                and row.get("body", {}).get("fields", {}).get("operation") == "claude-channel-recovery"]
+
+    if len(attempts()) != 3:
+        fail(f"channel failure used {len(attempts())} recovery attempts, expected three")
+    starts = len([row for row in receipts(node, "a") if row.get("event") == "started"])
+    until(lambda: len([row for row in receipts(node, "a") if row.get("event") == "ended"]) == starts,
+          20, "parked channel did not stop its provider")
+    node.kill_daemon()
+    node.start()
+    time.sleep(30)
+    if len(attempts()) != 3 or len([row for row in receipts(node, "a") if row.get("event") == "started"]) != starts:
+        fail("parked channel restarted after the daemon lost its in-memory budget")
+    if native_offer_count(node, early) != 0:
+        fail("parked channel offered mail without attachment")
+    delivery = (node.api("/v1/messages/delivery/" + early) or {}).get("delivery")
+    if not delivery or delivery.get("state") != "waiting" or not delivery.get("reason"):
+        fail(f"parked channel lost the mail hold: {delivery}")
+
+
+def prepare_codex_import(node):
+    """Discovery sees a symlinked home; the launch environment contains a stale copy."""
+    global IMPORTED_SUBJECT
+    native = "019fae17-c215-7882-a4d9-5f247168ffce"
+    origin = node.root / "home/.codex-origin"
+    stale = node.root / "home/.codex-stale"
+    for home in (origin, stale):
+        directory = home / "sessions/2026/09/21"
+        directory.mkdir(parents=True)
+        (directory / f"rollout-2026-09-21T08-00-00-{native}.jsonl").write_text(
+            json.dumps({"type": "session_meta", "payload": {
+                "id": native, "cwd": str(node.root / "ws"), "source": "test"}}) + "\n")
+    (node.root / "home/.codex").symlink_to(origin)
+    node.env["CODEX_HOME"] = str(stale)
+    node.start()
+    listed = node.json("import", "ls", "--all")
+    items = listed.get("value", listed)["items"]
+    external = next(item for item in items if item.get("native_session_id") == native)
+    imported = node.json("import", "run", external["id"], "--as", "person/eval")
+    IMPORTED_SUBJECT = next(subject for subject in imported.get("value", imported)["affected_ids"]
+                            if subject.startswith("agent/import/"))
+    return native, origin
+
+
+def prove_codex_import(node, seats, native, origin):
+    def exact_binding():
+        view = node.json("agents", "show", seat_subject("a")).get("value", {})
+        if view.get("incarnation_id") != seats.incarnations["a"]:
+            return False
+        for row in trace(node, seat_subject("a")):
+            fields = row.get("body", {}).get("fields", {})
+            if (row.get("kind") == "harness.session-file" and
+                    fields.get("incarnation_id") == seats.incarnations["a"]):
+                if fields.get("session_id") != native:
+                    fail(f"the imported incarnation bound another native ID: {fields}")
+                return True
+        return False
+    until(exact_binding, seats.bound, "the imported incarnation did not bind the selected native ID")
+    sessions = native_sessions(node, "a")
+    if not sessions or any(session != (native, True) for session in sessions):
+        fail(f"the imported seat selected another session: {sessions}")
+    providers = [environment for _, argv, environment in node.seat_processes(True)
+                 if "stub-codex.py" in argv]
+    if not providers or any(f"CODEX_HOME={origin}" not in env for env in providers):
+        fail("an imported provider did not use the pinned originating CODEX_HOME")
 
 
 def scenario(node, seats, name, scratch, replacement_binary=None):
@@ -669,10 +773,19 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
     if name == "suspend":
         suspend_and_resume(node, seats, node.harness)
         return
+    if name == "channel-parked":
+        claude_channel_parked(node, seats)
+        return
     if name.startswith("channel-"):
         claude_attachment(node, seats, name.removeprefix("channel-"))
         return
-    if name == "restart":
+    if name == "import":
+        native, origin = node.import_selection
+        prove_codex_import(node, seats, native, origin)
+        node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval")
+        seats.prove("import-restart")
+        prove_codex_import(node, seats, native, origin)
+    elif name == "restart":
         node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
         seats.prove("restart")
         continued_session(node, "restart")
@@ -716,6 +829,8 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
         fail(f"unknown scenario {name}")
     # Keep watching after the new mail succeeds, through several channel polls.
     time.sleep(3)
+    if name == "import":
+        prove_codex_import(node, seats, *node.import_selection)
     counts = probe_reads()
     repeated = {ref: counts[ref] for ref in previous_probes if counts[ref] != 1}
     if repeated:
@@ -728,7 +843,12 @@ def run(args, root, evidence):
     letters = LETTERS[:count]
     seats = Seats(node, letters, args.bound)
     try:
-        node.start()
+        if args.scenario == "import":
+            if args.harness != "codex":
+                fail("the import regression uses Codex")
+            node.import_selection = prepare_codex_import(node)
+        else:
+            node.start()
         source = root / "mission.kdl"
         source.write_text(mission_source(node, count, args.harness, hold=args.scenario == "suspend"))
         node.cli("missions", "publish", str(source), "--as", "person/eval")
@@ -752,11 +872,13 @@ def run(args, root, evidence):
                 fail("fresh native seats used polled harness records: " + str(records))
             if len(spools) != len(letters):
                 fail("a fresh native seat has no durable observation spool")
-            # A suspended seat has no driver to acknowledge what its last one committed while it
-            # stopped, and no process to inspect; `suspend` checks both while the resumed seat runs.
-            if args.scenario != "suspend":
+            # Suspended and parked seats have no driver to acknowledge their final spool or
+            # process to inspect; both scenarios check the launch boundary while still running.
+            if args.scenario not in ("suspend", "channel-parked"):
                 wait_drained(spools, args.bound)
                 check_boundary(node)
+            elif args.scenario == "channel-parked":
+                check_boundary(node, stopped=True)
         return {"verdict": "pass", "harness": args.harness, "scenario": args.scenario,
                 "seconds_to_boot": seats.timings, "catalog_files": len(catalogs_after),
                 "harness_record_files": len(records), "observation_spools": len(spools)}
@@ -766,7 +888,7 @@ def run(args, root, evidence):
     finally:
         try:
             for letter in letters:
-                terminal = node.pty("peek", "--plain", "--full", f"c1.seat-{letter}")
+                terminal = node.pty("peek", "--plain", "--full", seat_subject(letter).removeprefix("agent/").replace("/", "."))
                 (evidence / f"terminal-{letter}.txt").write_text(terminal.stdout + terminal.stderr)
                 if node.daemon is not None and node.daemon.poll() is None:
                     (evidence / f"trace-{letter}.jsonl").write_text(

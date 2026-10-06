@@ -2021,7 +2021,8 @@ impl CodexControlState {
         let thread_id = required_string(message, "/result/thread/id", "thread/resume response")?;
         anyhow::ensure!(
             thread_id == self.thread_id,
-            "Codex control thread/resume returned a different thread"
+            "Codex control thread/resume returned a different thread: expected {}, received {thread_id}",
+            self.thread_id
         );
         let status = required_string(
             message,

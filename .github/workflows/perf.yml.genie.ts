@@ -1,5 +1,5 @@
 import { defaultActionlintConfig, githubWorkflow, nixDevelopStep, plainFlakeSetupSteps } from '../../repos/effect-utils/genie/external.ts'
-import { buildEnv, linuxStageRunner, readOnlyBinaryCaches } from './workspace-ci.ts'
+import { buildEnv, linuxRunner, linuxStageRunner, readOnlyBinaryCaches } from './workspace-ci.ts'
 
 const snapshotAttempt = "!cancelled() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (steps.load.outcome == 'success' || steps.load.outcome == 'failure')"
 const snapshotPublished = "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
@@ -32,12 +32,13 @@ export default githubWorkflow({
   },
   permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' },
   concurrency: {
-    group: 'perf-${{ github.event.pull_request.number || github.run_id }}',
-    'cancel-in-progress': "${{ github.event_name == 'pull_request' }}",
+    // Preserve the existing PR group; replace obsolete main pushes, never pinned controls.
+    group: "perf-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main') || github.run_id }}",
+    'cancel-in-progress': "${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
   },
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
+    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
   },
   jobs: {
     'perf-load': {

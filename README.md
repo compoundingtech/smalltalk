@@ -3,6 +3,8 @@
 Smalltalk turns your coding agents into a team that doesn't need babysitting. Describe the work once as a mission, with its goals, its constraints and the checks that prove it's done right, not just done. Agents on your own machines carry it through, survive restarts, and bring you only the decisions that are yours to make. You plan and decide; your agents do the rest, all day and overnight.
 
 `st` runs agents as durable seats and records work, messages, and decisions in a graph.
+Publish seats, missions, and schedules with `st apply FILE...`; add `--dry-run` to validate
+and preview, or `--dry-run --check` to run the exec gates too.
 One daemon runs on each machine; your machines can join a fleet. Use the terminal UI, CLI,
 or iOS app to follow work and talk to agents. Each person currently runs their own fleet.
 

@@ -6,8 +6,11 @@ Workspace CI runs on pull requests, merge groups and manual dispatch. The merge 
 exact commit that lands on `main`; its successful checks stay attached to that SHA, so a main push
 does not repeat the workspace gate. `Main upkeep` verifies those five checks, runs `perf-cost`
 (which the queue skips), and fills missing main-scope caches on Namespace. macOS CI is currently
-disabled. Each non-PR run uses its own `github.run_id` in the concurrency group, so
-successive pushes do not cancel checks or cache saves. PR updates still cancel stale checks.
+disabled. PR updates cancel obsolete runs for that PR in Workspace CI, Performance and the
+public-content guard. Main upkeep, Performance and public checks keep only the latest main push;
+older pushes must not keep consuming runners after their source is superseded. Manual dispatch,
+scheduled Performance controls and merge-group runs retain independent `github.run_id` groups.
+The required queue checks and their runner reservations are unchanged.
 
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) replaces the fleet's
 former Linux `st/ci` execution. The retained macOS workflow (`.github/workflows/macos.yml`) is
@@ -33,11 +36,26 @@ use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggreg
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once.
 
-Required Namespace jobs use run affinity and inline `job.priority=1` for merge groups and
-`ci-priority` PRs, or `job.priority=10` for ordinary PRs. Optional benchmarks keep their existing
-labels. Namespace schedules lower priority numbers first, ahead of unprioritized jobs, when
-capacity is exhausted; run affinity prevents another workflow from taking the runner started
-for a required job. This uses existing capacity and shapes. See Namespace's
+All Linux Namespace jobs use run affinity and the same inline `job.priority=1`: required
+Workspace jobs, optional benchmarks, manual Performance controls, main upkeep and releases.
+Using one class prevents a continuous stream of required jobs from overtaking older performance
+requests. Run affinity ensures that a runner started for a request is assigned to that run,
+so GitHub cannot hand it to a newer run with the same shape. Local `ci1-priority` and `ci1-merge`
+reservations continue to select only the primary test shard.
+
+Profile labels carry affinity inline, for example
+`namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}`.
+Shape labels retain `-with-features` and a separate
+`namespace-features:github.run-id=${{ github.run_id }}` label. Namespace does not support a
+separate `namespace-features:` label with profiles; see the
+[Runner Controls syntax](https://namespace.so/docs/solutions/github-actions/runner-controls).
+
+The queue still shares the existing Linux limit of 320 vCPUs / 640 GiB and must drain its older
+backlog. Queue time is measured separately from execution time; the shared class removes
+indefinite overtaking, rather than promising a fixed start time under arbitrary overload.
+An already queued job retains the labels from its immutable workflow revision. Recover old
+unprioritized controls with label-only revisions and new dispatches, preserving their source,
+fixtures and budgets; retain completed failures as evidence. See Namespace's
 [job ordering and priority controls](https://namespace.so/docs/solutions/github-actions/runner-controls/job-ordering).
 
 `scripts/ci-linux STAGE` runs one stage:
@@ -55,7 +73,7 @@ for a required job. This uses existing capacity and shapes. See Namespace's
   are timing-sensitive, so the build is retried up to three times.
 
 The primary test job proves that the two actual nextest inventories are disjoint and their union
-equals the full selected suite before running the explicit zero-retry mail canaries. It also
+equals the full selected suite. The explicit zero-retry mail canaries run in a parallel job. The primary also
 runs the standalone conversation model feature check. The second shard runs the remaining
 workspace and st2 tests on independent Namespace CPUs. `linux-gate` requires both shards;
 failure, cancellation or skipping either shard fails the gate. Each shard retains passing test
@@ -116,6 +134,9 @@ Fixture command helpers clear inherited `ST_AGENT`/`ST3_*`; temporary-repository
 isolate global/system config, hooks, signing and author identity on each command. Real
 repository commits keep the host's Git policy. Run the same suite from an agent seat with
 `nix develop --command cargo nextest run -p st3 --locked --profile ci --retries 0`.
+Provider fixtures that load st3 extensions publish their isolated hook set with
+`st3::hooks::ensure_installed`, preserving every declared asset and relative import.
+
 Boot, delivery-probe and messaging-fault fixtures put large executable copies in Cargo's target scratch
 directory, keeping their Unix sockets in short temporary paths. This avoids exhausting a
 host's temporary-filesystem quota when debug binaries are copied by parallel cases.
@@ -325,8 +346,8 @@ warm caches kept on the machine. GitHub has no overflow between runner labels, s
 starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
 through the API and picks the primary test partition's pool:
 
-- `ci1` when at least `CI1_MIN_IDLE` (default 4) general runners are online and idle. This leaves
-  CPU capacity for the priority and merge reservations;
+- `ci1` when at least `CI1_MIN_IDLE` (default 1) general runners are online and idle. Priority
+  and merge-only workers are excluded from this ordinary pool;
 - `ci1-priority` for trusted PRs labelled `ci-priority`, without an idle-count or token dependency.
   Pending urgent checks get the next free general runners; one slot stays reserved for priority
   and merge work after urgent checks finish;
@@ -338,9 +359,19 @@ through the API and picks the primary test partition's pool:
   unavailable, and always for a pull request from a fork. The repository is public and a self-hosted
   runner runs whatever a job asks, so fork code never reaches ci1 (and forks receive no secrets).
 
-Only `linux-tests` reads `pick-runner`'s output and falls back to Namespace when it is empty.
-The second shard, Clippy, compatibility, generated-file checks, TypeScript, isolation and cost
-jobs always use existing Namespace capacity, keeping their builds off ci1's test cores. The
+`linux-tests` reads the primary output and falls back to Namespace when it is empty.
+The second shard and mail canaries read separate outputs, each choosing only `ci1` general
+capacity. The picker counts online, idle general runners and subtracts one slot when the primary
+may also use that pool. It offers the remaining slots to the second shard, then the canaries;
+each falls back to the same Namespace priority and run affinity when no slot remains. The
+primary's admission threshold does not strand idle slots for these two extra jobs. A previous
+threshold of four sent the primary to Namespace even when three general workers were free;
+the one-slot default lets both shards and canaries use those three workers.
+Neither extra output can select `ci1-priority` or `ci1-merge`. A missing status token, failed
+lookup, or malformed response leaves the extra jobs on Namespace, while reserved primary
+routing remains available without that token. Forks never reach any ci1 output.
+Clippy, compatibility, generated-file checks, TypeScript, isolation and cost
+jobs always use existing Namespace capacity. The
 aggregate stays on GitHub-hosted capacity regardless of that choice. The required check names
 are unchanged; `linux-gate` names both test shards, its supporting stages and the redelivery
 canary instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
@@ -350,14 +381,16 @@ label while urgent required checks are pending. It also lends the other general 
 priority work during that interval, so queued ordinary work cannot take the next free slot.
 A guard applies labels after every ephemeral registration, before the runner accepts work.
 It changes labels without interrupting running jobs; the dedicated merge runner stays available.
-Two runs that pick at the same moment can both choose ci1; the later run's jobs then wait for
-runners on ci1.
+This is a snapshot of idle capacity, not an atomic reservation. Two runs that pick at the same
+moment can both choose ci1; the later run's jobs then wait for runners on ci1. Each picker allocates
+distinct slots within its own run; it never promises one idle worker to both extra jobs.
 
 The switch is the repository variable `CI1_RUNNERS`: unset (the default), `pick-runner` is skipped
 and all workload jobs go to Namespace. `on` turns the choice on, and unsetting it turns
 it off again without a pull request. `pick-runner` reads the runners with the
 `CI1_RUNNERS_READ_TOKEN` secret, a token that may only read the organization's self-hosted runners;
-without it non-queue runs go to Namespace. Merge-group runs need no organization status token; a failed PR-label lookup retains merge capacity.
+without it ordinary primary and extra jobs go to Namespace. Reserved merge/priority primary
+selection needs no organization status token; a failed PR-label lookup retains merge capacity.
 
 On ci1 each runner is ephemeral: it takes one job, runs it as its own user in a fresh work directory
 with its own `/tmp`, and nothing the job started outlives it. The runner names a Cargo home in
@@ -499,6 +532,14 @@ per-run entries. Matching native snapshots also retain it, so fresh nodes do not
 again. These Cargo builds do not produce Zig object-cache directories; empty cache declarations
 would miss on every run and are omitted.
 
+Workspace Cargo and Nix dependency entries are restored on PRs and merge groups. Only
+protected main fills missing entries: Linux main upkeep and main macOS runs save them
+explicitly after preparing valid outputs. Branch-scoped copies of these large archives
+would consume the repository's shared quota and evict the main entries every new PR
+needs. Repeated source heads retain their separate exact-source artifact snapshots.
+The secondary Linux shard reads the same dependency keys as the primary; snapshots
+remain specific to each job, source, platform and build recipe.
+
 Compiled outputs also have three-day artifact snapshots keyed by the actual full source SHA,
 job, platform, architecture, build flags and workflow contents. Native snapshots additionally
 fingerprint the installed Rust compiler and, on macOS, the Swift compiler and SDK. A fresh
@@ -530,19 +571,24 @@ accepted-source verification remain in place.
 
 ## Required mail redelivery canaries
 
-Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires seventeen named,
+Alongside the two Linux test shards, `scripts/ci-mail-redelivery-canaries` requires twenty named,
 unignored regressions: boot/reconnect mailbox suppression and recent unoffered recovery for
 Claude, Codex, OpenCode, Pi, and OMP; each harness's native suspend/resume canary with hour-old
 mail held and recent unoffered mail consumed exactly once; legacy polling recovery through the
 current offer's receipt sequence; and delivered-but-unread retention across native channel
-restart. The mailbox cases seed hour-old sent mail and recent staged and delivered-but-unread
+restart. Claude's missing-channel cases also require automatic recovery, attachment during
+recheck without replacing the seat, and durable parking after three failed replacements.
+The mailbox cases seed hour-old sent mail and recent staged and delivered-but-unread
 mail, prove zero historical offers, preserve explicit mailbox access, and recover an in-flight
 send after a daemon restart with exactly one receipt pair. Every selected test runs with zero retries.
 
 The script fails if any required test is missing, ignored, or filtered out. The named
-`mail-redelivery-canaries` check reads that step's actual outcome; a skipped step cannot pass.
+`mail-redelivery-canaries` check executes the script on its own Namespace 8x16 runner; a skipped
+or failed job cannot pass.
 `linux-gate` requires it, so this protection applies to pull requests and merge groups. It
-reuses the compiled Linux test runner instead of allocating another native-test runner.
+restores the main-seeded Linux test Cargo and Nix caches, prepares the same fixtures and rendered
+hooks, and retains its own logs, timing and failure evidence. It never uses the native priority
+or merge lanes, and neither test shard waits for it before starting its own suite.
 Apply the fifth live ruleset check after this workflow has passed on main.
 
 ## Generated files and existing workflows
@@ -664,6 +710,14 @@ for the scheduler's limits, and GitHub's [merge queue settings](https://docs.git
 for the distinction between build concurrency and merge batch size.
 
 ## Superseded merge groups
+
+Push concurrency in Main upkeep, Performance and the public guard is scoped to protected main.
+A new main push cancels obsolete automatic work; its upkeep still probes and fills the current
+main's exact cache entries. PR groups use the PR number, rather than its head SHA, so a new head
+replaces the old one. Manual pinned validations are never grouped with PR or push runs. Old
+immutable workflow revisions can remain queued: before cancelling a backlog entry, compare its
+event, source and PR state with current main or the PR's latest head, retain its original timing
+and cancellation, and leave manual controls and merge groups to their owners.
 
 The `namespace-capacity` job also watches `merge_group` events on a GitHub-hosted runner,
 independent of ci1 and Namespace availability. It polls the group's ref and required check statuses

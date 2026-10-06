@@ -205,3 +205,70 @@ test('resource pages decode only through ResourcesPage, never the generic Page',
     assert.equal(Rich.decodeUnknownSync(Rich.Page, 'strict')(page('missions')).collection, 'missions');
     assert.throws(() => Rich.decodeUnknownSync(Rich.Page)(page('resources')));
 });
+
+test('usage pricing provenance round-trips while legacy rows remain readable', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const counts = { total_tokens: 1100, input_tokens: 1000, output_tokens: 100,
+        cache_write_tokens: 0, cache_write_1h_tokens: 0, cached_tokens: 0,
+        cost_microusd: 3000, reported_cost_microusd: 0, unpriced_tokens: 0 };
+    const legacy = { agent: 'agent/example.usage', pricing: 'old-label', ...counts };
+    const decode = Rich.decodeUnknownSync(Rich.UsageRow, 'strict');
+    assert.deepEqual(Schema.encodeSync(Rich.UsageRow)(decode(legacy)), legacy);
+    const wire = { ...legacy, native_session_id: 'native-example', pricing_provenance: [{
+        price_table_id: 'st.api-list', price_table_version: 'example-version', cost_source: 'computed',
+        rates_usd_per_million_tokens: { input: 2, output: 10, cache_read: 0.1, cache_write_5m: 2.5, cache_write_1h: 2.5 },
+        ...counts,
+    }] };
+    assert.deepEqual(Schema.encodeSync(Rich.UsageRow)(decode(wire)), wire);
+    for (const cost_source of ['provider_reported', 'unpriced']) {
+        const value = { ...legacy, pricing_provenance: [{ cost_source, ...counts }] };
+        assert.deepEqual(Schema.encodeSync(Rich.UsageRow)(decode(value)), value);
+    }
+    assert.throws(() => decode({ ...wire, pricing_provenance: [{ ...wire.pricing_provenance[0], cost_source: 'invented' }] }));
+    assert.throws(() => decode({ ...wire, pricing_provenance: [{ ...wire.pricing_provenance[0], rates_usd_per_million_tokens: { input: 2 } }] }));
+});
+
+test('usage identity metadata is additive and independent of quota age', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const wire = { account: 'claude/unknown', driver: 'claude', measured_at_unix_ms: 1000, measured_by: 'agent/example/worker', host: 'alder', seats: [] };
+    const decode = Rich.decodeUnknownSync(Rich.UsageLimit, 'strict');
+    assert.equal(Object.hasOwn(decode(wire), 'identified'), false);
+    for (const identified of [false, true]) {
+        const decoded = decode({ ...wire, identified });
+        assert.equal(decoded.identified, identified);
+        assert.equal(Schema.encodeSync(Rich.UsageLimit)(decoded).identified, identified);
+    }
+    assert.throws(() => decode({ ...wire, identified: 'stale' }));
+});
+
+test('arrangement subscriptions require a concrete owner and placements preserve explicit root', async () => {
+    const [{ Schema, Option }, Rich] = await modules;
+    const command = { kind: 'subscribe', id: 'sidebar', collection: 'arrangements', person: 'person/ada', limit: 100 };
+    const decodeCommand = Rich.decodeUnknownSync(Rich.CollectionCommand, 'strict');
+    assert.equal(decodeCommand(command).person, 'person/ada');
+    for (const person of [undefined, null, 'agent/ada', 'person/ada/other']) {
+        assert.throws(() => decodeCommand({ ...command, person }));
+    }
+    const operation = { op: 'subject.place', subject: 'agent/ada/worker', folder: null, key: 'a0' };
+    const decoded = Rich.decodeUnknownSync(Rich.ArrangementOperation, 'strict')(operation);
+    assert(Option.isNone(decoded.folder));
+    assert.deepEqual(Schema.encodeSync(Rich.ArrangementOperation)(decoded), operation);
+    assert.throws(() => Rich.decodeUnknownSync(Rich.ArrangementOperation, 'strict')({ ...operation, folder: 'not-a-folder-id' }));
+    for (const subject of ['pty/person/ada/019a0000-0000-7000-8000-000000000001', 'session/worker']) {
+        assert.throws(() => Rich.decodeUnknownSync(Rich.ArrangementOperation, 'strict')({ ...operation, subject }));
+    }
+    assert.throws(() => Rich.decodeUnknownSync(Rich.ArrangementOperation, 'strict')({ ...operation, parent: null }));
+    assert.throws(() => Rich.decodeUnknownSync(Rich.ArrangementTombstoneRegister, 'strict')({ value: false, revision: 'claim/deleted' }));
+});
+
+test('arrangement resources keep deleted folder positions and missing-seat placements distinct from resolved locations', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const fixture = require('../../../fixtures/clients/arrangements-v1.json');
+    const encoded = Schema.encodeSync(Rich.Arrangement)(Rich.decodeUnknownSync(Rich.Arrangement, 'strict')(fixture.resource));
+    const deletedID = Object.keys(encoded.body.folders).find(id => encoded.body.folders[id].tombstone !== null);
+    assert.equal(encoded.body.folders[deletedID].position.value.key, 'a0');
+    assert.equal(encoded.body.placements['agent/ada/worker'].value.folder, deletedID);
+    assert.equal(encoded.resolved.folders['agent/ada/worker'], null);
+    assert.equal(encoded.body.placements['agent/ada/offline'].value.key, 'a1');
+    assert.equal(encoded.body.folders[deletedID].tombstone.value, true);
+});

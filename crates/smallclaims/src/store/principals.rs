@@ -671,7 +671,7 @@ impl Store {
     /// Make sure this node holds a signing key for `actor` when it is a person or an agent,
     /// minting one and writing its delegation the first time. Without a node key nothing is
     /// minted, and claims stay unsigned as before.
-    pub(crate) fn ensure_principal_key(&self, actor: &str) -> Result<(), St3Error> {
+    pub fn ensure_principal_key(&self, actor: &str) -> Result<(), St3Error> {
         let family = match Family::of(actor) {
             Some(family @ (Family::Person | Family::Agent)) => family,
             _ => return Ok(()),

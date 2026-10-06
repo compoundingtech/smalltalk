@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""The required check rejects absent/ignored canaries and preserves zero-retry failures."""
+import json
+import os
+from pathlib import Path
+import runpy
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+required = runpy.run_path(str(ROOT / 'scripts/ci-mail-redelivery-canaries'))['REQUIRED']
+assert len(required) >= 19
+
+with tempfile.TemporaryDirectory() as directory:
+    tmp = Path(directory)
+    cargo = tmp / 'cargo'
+    cargo.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+with Path(os.environ['CARGO_CALLS']).open('a') as stream:
+    stream.write(json.dumps(sys.argv[1:]) + '\\n')
+Path(os.environ['CARGO_SCRATCH']).write_text(os.environ.get('TMPDIR', ''))
+if sys.argv[2] == 'list':
+    print(Path(os.environ['CARGO_LIST']).read_text())
+else:
+    print('retained canary execution outcome')
+    sys.exit(int(os.environ['CARGO_RUN_EXIT']))
+''')
+    cargo.chmod(0o755)
+    listing, calls, summary = (tmp / name for name in ('list.json', 'calls.jsonl', 'summary'))
+    env = {**os.environ, 'PATH': f"{tmp}:{os.environ['PATH']}",
+           'CARGO_LIST': str(listing), 'CARGO_CALLS': str(calls), 'CARGO_RUN_EXIT': '0',
+           'CARGO_SCRATCH': str(tmp / 'cargo-scratch'), 'CI_TEST_THREADS': '8',
+           'GITHUB_STEP_SUMMARY': str(summary), 'RUNNER_TEMP': str(tmp)}
+    # Exercise the actual logging wrapper without adding Cargo to the generator shell.
+    # Product-boundary checks have their own suite; these stand-ins isolate status propagation.
+    wrapper_root = tmp / 'wrapper'
+    (wrapper_root / 'scripts').mkdir(parents=True)
+    for name in ('ci-linux', 'ci-mail-redelivery-canaries'):
+        (wrapper_root / 'scripts' / name).write_text((ROOT / 'scripts' / name).read_text())
+    for name in ('check-st-boundary-test', 'check-st-boundary'):
+        (wrapper_root / 'scripts' / name).write_text('pass\n')
+
+    def check(case, expected, wrapper=False):
+        tests = {name: {'ignored': False, 'filter-match': {'status': 'matches'}} for name in required}
+        first = sorted(required)[0]
+        if case == 'missing':
+            del tests[first]
+        elif case == 'ignored':
+            tests[first]['ignored'] = True
+        elif case == 'filtered':
+            tests[first]['filter-match']['status'] = 'mismatch'
+        listing.write_text(json.dumps({'rust-suites': {'st3': {'testcases': tests}}}))
+        calls.write_text('')
+        summary.write_text('')
+        env['CARGO_RUN_EXIT'] = '17' if case == 'failure' else '0'
+        command = ['bash', 'scripts/ci-linux', 'mail-redelivery-canaries'] if wrapper else [
+            'python3', 'scripts/ci-mail-redelivery-canaries']
+        result = subprocess.run(command, cwd=wrapper_root if wrapper else ROOT, env=env, text=True, capture_output=True)
+        assert result.returncode == expected, (case, result.stdout, result.stderr)
+        commands = [json.loads(line) for line in calls.read_text().splitlines()]
+        assert commands[0][:2] == ['nextest', 'list']
+        expression = commands[0][commands[0].index('-E') + 1]
+        assert all(f'test(={name})' in expression for name in required)
+        if case in ('missing', 'ignored', 'filtered'):
+            assert len(commands) == 1, 'must fail before running an incomplete suite'
+            assert 'missing, ignored or filtered required canaries' in result.stderr
+        else:
+            run = commands[1]
+            assert run[:2] == ['nextest', 'run'] and run[run.index('--retries') + 1] == '0'
+            assert run[run.index('--test-threads') + 1] == '8', 'bound canaries on the larger native host too'
+            assert run[run.index('--no-tests') + 1] == 'fail'
+            assert '--partition' not in run
+            assert run[run.index('--profile') + 1] == 'ci' and '--locked' in run
+            if case == 'success':
+                assert f'All {len(required)} required mail redelivery canaries passed with zero retries.' in summary.read_text()
+            else:
+                assert 'passed with zero retries' not in summary.read_text()
+        if wrapper:
+            assert (tmp / 'ci-logs/mail-redelivery-canaries.time').read_text().split()[1] == str(expected)
+            assert 'retained canary execution outcome' in (tmp / 'ci-logs/mail-redelivery-canaries.log').read_text()
+
+    check('missing', 1)
+    check('ignored', 1)
+    check('filtered', 1)
+    check('success', 0)
+    check('failure', 1, wrapper=True)
+    env['CI_LOCAL_CARGO_HOME'] = str(tmp / 'native-cargo-home')
+    check('failure', 1, wrapper=True)
+    assert (tmp / 'cargo-scratch').read_text() == str(tmp / 't'), 'native canaries must keep short scratch paths on the runner tmpfs'
+
+print(f'Mail canary guards passed: all {len(required)} required names, zero retries, and logged failure propagation.')

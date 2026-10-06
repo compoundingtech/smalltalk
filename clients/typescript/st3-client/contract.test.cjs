@@ -302,3 +302,18 @@ test('reads bounded seat status history through the paired gateway', async () =>
     assert.equal(result.value.complete, false);
     assert.equal(result.value.items[0].reset, true);
 });
+
+test('canonical publication read encodes mission and schedule subjects and preserves defaults', async () => {
+    const calls = [];
+    const declaration = { max_active_runs: 1, revision_cutover: 'restart-active', steps: { inspect: { retry: { attempts: 1, backoff_ms: 0 } } } };
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async (url) => {
+        calls.push(url);
+        return response(envelope(url.endsWith('/capabilities') ? capabilities : { kind: 'publication-definition', subject: new URL(url).searchParams.get('subject'), declaration, revision: 'a'.repeat(64), token: 'claim/example' }));
+    } });
+    for (const subject of ['mission/example/readback', 'schedule/example/daily']) {
+        const result = await client.publicationDefinition(subject);
+        assert.equal(result.value.subject, subject);
+        assert.deepEqual(result.value.declaration, declaration);
+        assert.equal(calls.at(-1), 'https://example.test/v1/client/publication-definition?subject=' + encodeURIComponent(subject));
+    }
+});

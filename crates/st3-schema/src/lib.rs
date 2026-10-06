@@ -1,5 +1,6 @@
 //! The authoritative st3 subject, resource, and claim registry.
 
+pub mod arrangements;
 pub mod custom;
 pub mod glasses;
 pub mod owned_terminals;
@@ -360,6 +361,9 @@ impl Registry {
                 ));
             }
         }
+        if spec.family == "arrangement" {
+            arrangements::owner(subject)?;
+        }
         Ok(spec)
     }
 
@@ -431,6 +435,22 @@ impl Registry {
         }
         if kind == "harness.todo.observed" {
             validate_harness_todo(fields)?;
+        }
+        if kind == "terminal.launch-geometry" {
+            for name in ["rows", "columns"] {
+                if fields.get(name).and_then(terminal_dimension).is_none() {
+                    return Err(error(
+                        "invalid-claim-field",
+                        format!("claim field `{name}` on `{kind}` must fit a positive u16"),
+                    ));
+                }
+            }
+        }
+        if subject_spec.family == "arrangement" {
+            if kind != "arrangement.edited" {
+                return Err(error("claim-write-forbidden", "an arrangement requires arrangement.edited"));
+            }
+            arrangements::operations(subject, fields)?;
         }
         if subject_spec.family == "glass" {
             glasses::owner(subject)?;
@@ -529,6 +549,7 @@ impl Registry {
         actor: Option<&str>,
     ) -> Result<&ClaimSpec, ValidationError> {
         let spec = self.validate_claim(subject, kind, fields)?;
+        arrangements::validate_actor(subject, actor)?;
         let allowed = spec.write_policy == WritePolicy::OrdinaryClient
             || (spec.write_policy == WritePolicy::SameSubjectActor && actor == Some(subject));
         if !allowed {
@@ -539,6 +560,14 @@ impl Registry {
         }
         Ok(spec)
     }
+}
+
+/// A terminal's row or column count: a positive integer that fits a `u16`, as pty takes it.
+pub fn terminal_dimension(value: &Value) -> Option<u16> {
+    value
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| *value != 0)
 }
 
 fn enum_label(value: &impl Serialize) -> String {
@@ -727,6 +756,12 @@ fn build_registry() -> Registry {
         ),
         ("person", "person/IDENTITY", "A human actor.", false),
         (
+            "arrangement",
+            "arrangement/person/NAME/UUIDv7",
+            "A permanently person-owned shared folder arrangement.",
+            false,
+        ),
+        (
             "glass",
             "glass/person/NAME/UUID",
             "A private person workspace.",
@@ -849,6 +884,7 @@ fn build_registry() -> Registry {
 
 fn resource_specs() -> BTreeMap<String, ResourceSpec> {
     let mut resources = BTreeMap::new();
+    resources.insert("arrangement".into(), resource("arrangement", "A person-owned per-register arrangement.", &[("owner", FieldSpec { immutable: true, ..required_reference_to(&["person"]) }), ("body", object())]));
     resources.insert(
         "vcs.repository".into(),
         resource(
@@ -1131,6 +1167,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
                 "stop",
                 "subscription",
             ],
+        ),
+        (
+            "arrangement.edited",
+            &["arrangement"],
+            WritePolicy::OrdinaryClient,
+            Cardinality::Append,
+            Some("arrangements"),
+            false,
+            &[],
         ),
         (
             "glass.upserted",
@@ -1830,6 +1875,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "terminal.launch-geometry",
+            &["person"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
+        ),
+        (
             "message.sent",
             &["message"],
             WritePolicy::OrdinaryClient,
@@ -2431,6 +2485,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("revision", string()),
             ("desired", object()),
         ],
+        "arrangement.edited" => &[("owner", required_reference_to(&["person"])), ("operations", required_array()), ("action_id", string()), ("action_digest", string())],
         "glass.upserted" => &[
             ("body", object()),
             ("base_revision", string()),
@@ -3038,6 +3093,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("reported_cost_microusd", integer()),
             ("unpriced_tokens", integer()),
             ("pricing", string()),
+            ("pricing_provenance", array()),
+            ("native_session_id", string()),
             (
                 "semantics",
                 required_enum(&[
@@ -3211,6 +3268,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("incarnation_id", string()),
             ("runtime_id", string()),
             ("sequence", integer()),
+        ],
+        // The pane size a person's client draws seats at. A seat that st launches after it
+        // starts at this size; a live seat keeps its own.
+        "terminal.launch-geometry" => &[
+            ("rows", required_integer()),
+            ("columns", required_integer()),
         ],
         "message.sent" => &[
             ("from", reference()),
@@ -3852,6 +3915,7 @@ mod tests {
             [
                 "account",
                 "agent",
+                "arrangement",
                 "attention",
                 "checkpoint",
                 "checkpoint-excusal",
@@ -3893,6 +3957,7 @@ mod tests {
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
             [
+                "arrangement",
                 "ci.run",
                 "filesystem.file",
                 "harness.session-file",
@@ -3930,6 +3995,7 @@ mod tests {
                 "agent.placement.source-offline",
                 "agent.presence",
                 "agent.queue.moved",
+                "arrangement.edited",
                 "attention.requested",
                 "attention.resolved",
                 "checkpoint.excused",
@@ -4048,6 +4114,7 @@ mod tests {
                 "subscription.watch-ended",
                 "terminal.input.requested",
                 "terminal.input.result",
+                "terminal.launch-geometry",
                 "transport.observed",
                 "work.claimed",
                 "work.extended",
@@ -4270,6 +4337,61 @@ mod tests {
     }
 
     #[test]
+    fn a_person_publishes_only_their_own_positive_launch_geometry() {
+        let geometry = |rows: Value, columns: Value| {
+            BTreeMap::from([("rows".into(), rows), ("columns".into(), columns)])
+        };
+        let publish = |subject: &str, fields: &BTreeMap<String, Value>, actor: &str| {
+            registry()
+                .validate_public_claim(subject, "terminal.launch-geometry", fields, Some(actor))
+                .map(|_| ())
+                .map_err(|error| error.code)
+        };
+        let valid = geometry(Value::from(48), Value::from(160));
+        assert_eq!(publish("person/avery", &valid, "person/avery"), Ok(()));
+        assert_eq!(
+            publish(
+                "person/avery",
+                &geometry(Value::from(1), Value::from(65_535)),
+                "person/avery"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            publish("person/avery", &valid, "person/intruder"),
+            Err("claim-write-forbidden")
+        );
+        assert_eq!(
+            publish("person/avery", &valid, "agent/avery"),
+            Err("claim-write-forbidden")
+        );
+        assert_eq!(
+            publish("agent/avery", &valid, "agent/avery"),
+            Err("invalid-claim-subject")
+        );
+        for (rows, columns) in [
+            (Value::from(0), Value::from(80)),
+            (Value::from(24), Value::from(0)),
+            (Value::from(65_536), Value::from(80)),
+            (Value::from(24), Value::from(-80)),
+            (Value::from("24"), Value::from(80)),
+        ] {
+            assert_eq!(
+                publish("person/avery", &geometry(rows, columns), "person/avery"),
+                Err("invalid-claim-field")
+            );
+        }
+        assert_eq!(
+            publish(
+                "person/avery",
+                &BTreeMap::from([("rows".into(), Value::from(24))]),
+                "person/avery"
+            ),
+            Err("missing-claim-field")
+        );
+    }
+
+    #[test]
     fn terminal_work_reports_are_once_per_attempt() {
         for kind in ["work.submitted", "work.failed"] {
             let spec = registry().claim(kind).unwrap();
@@ -4277,6 +4399,7 @@ mod tests {
             assert!(spec.fields.contains_key("attempt"));
         }
     }
+
 
     #[test]
     fn checked_in_schema_document_matches_the_registry() {

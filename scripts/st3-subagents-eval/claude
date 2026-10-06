@@ -59,6 +59,7 @@ argv = sys.argv[1:]
 if argv[:1] in (["plugin"], ["mcp"]) or "--version" in argv:
     sys.exit(1)
 settings = json.loads(option(argv, "--settings") or "{}")
+mcp = json.loads(option(argv, "--mcp-config") or "{}")
 receipt("started", argv=argv)
 
 cwd = str(WORKSPACE)
@@ -202,6 +203,29 @@ def stop(*_):
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGHUP, stop)
 start_session("startup")
+# Hooks alone do not make a healthy Claude seat: keep the real MCP channel initialized
+# throughout this eval so automatic channel recovery does not replace its parent harness.
+server = mcp.get("mcpServers", {}).get("st3")
+if not server:
+    raise RuntimeError("the subagent stand-in requires the st3 MCP channel")
+channel = subprocess.Popen([server["command"], *server.get("args", [])], stdin=subprocess.PIPE,
+                           stdout=subprocess.PIPE, text=True, bufsize=1,
+                           env={**os.environ, **server.get("env", {})})
+channel.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": "2025-06-18", "capabilities": {"experimental": {"claude/channel": {}}},
+    "clientInfo": {"name": "subagent-claude-stub", "version": "0"}}}) + "\n")
+channel.stdin.flush()
+receipt("mcp", initialize=json.loads(channel.stdout.readline()))
+channel.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+channel.stdin.flush()
+
+
+def read_channel():
+    for line in channel.stdout:
+        receipt("mcp-frame", frame=json.loads(line))
+
+
+threading.Thread(target=read_channel, daemon=True).start()
 receipt("ready", session=session_id)
 offset = int(OFFSET.read_text()) if OFFSET.exists() else 0
 while not stopping:
@@ -216,4 +240,6 @@ while not stopping:
         offset += 1
         OFFSET.write_text(str(offset))
     time.sleep(0.2)
+channel.stdin.close()
+channel.wait(timeout=10)
 receipt("ended")

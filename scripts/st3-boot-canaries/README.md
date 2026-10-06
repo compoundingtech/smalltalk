@@ -7,8 +7,8 @@ message.
     run BINARY EVIDENCE_DIR HARNESS SCENARIO [--bound SECONDS] [--scratch DIR] [--replacement-binary BINARY]
 
 `HARNESS` is `claude`, `codex`, `pi`, `omp` or `opencode`. `SCENARIO` is `fresh`, `restart`,
-`daemon-restart`, `reexec`, `concurrent` or `suspend`; `run --help` says what each does. Each
-stand-in keeps its sessions the way its harness does, so `suspend` proves that a resumed seat comes
+`daemon-restart`, `reexec`, `concurrent`, `suspend` or (Codex only) `import`; `run --help` says
+what each does. Each stand-in keeps its sessions the way its harness does, so `suspend` proves that a resumed seat comes
 back on the session it suspended on, holds hour-old mail, and consumes recent never-offered
 mail exactly once. The Rust wrapper
 `crates/st3/tests/boot_canaries.rs` runs every pair as its own test in the required Linux gate.
@@ -33,7 +33,14 @@ Claude's `channel-missing` and `channel-uninitialized` scenarios restart with he
 but no usable channel. They require `claude-channel-unattached` with a blocked seat within
 45 seconds, a visible hold for early mail, and recovery with exactly one native offer and one
 staged/delivered/read receipt. Two further restarts must deliver fresh startup mail once without
-replaying recovered mail. The fault controls live only in each isolated workspace.
+replaying recovered mail. The missing-channel seat must restart automatically, continuing its
+native session. The uninitialized channel attaches during the recheck window and must keep its
+incarnation. Automatic recovery waits 10, 20 and 40 seconds after detection before each of three
+restarts; a channel still missing after the third replacement parks the seat with a visible
+failure and holds mail until an operator restart or a new declaration. The fault controls live
+only in each isolated workspace.
+The `channel-parked` scenario keeps the channel missing through all three replacements and
+restarts the daemon after parking; neither a fourth attempt nor a mail offer may appear.
 
 Every fresh scenario also checks that the native driver creates no `catalog.kdl`, `agent.kdl`,
 or polled `harness-state`, `harness-context`, and `harness-timeline` records, and that each seat
@@ -42,6 +49,10 @@ Re-execution must preserve the provider processes as well as the seat incarnatio
 rolling upgrade, give `run` the predecessor binary and use `--replacement-binary` for the new
 binary with the `reexec` scenario. That mode allows predecessor catalogs, but checks their bytes
 remain unchanged after adoption and a new message reaches the same provider session.
+
+The Codex `import` scenario imports a saved rollout from a symlinked home while the daemon
+environment names a stale copy in another home. Its first launch and explicit restart must bind
+the exact selected ID, claim work and read mail using the pinned originating `CODEX_HOME`.
 
 ## What is real and what is not
 

@@ -58,6 +58,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_observations` | Local | Local-retention observations and their local frontier/id; never replicated. |
 | `local_subscription_mission_deferrals` | Local | Local reconciler capacity backoff/retry scheduling. |
 | `local_usage_spend` | Local | Local provider usage and cost accumulation before publication. |
+| `local_usage_provenance` | Local | Cumulative pricing contributions for the same local usage publication slots. Published metadata travels in `harness.usage` claims; this accumulator is excluded from replicated projection digests. |
 | `local_usage_responses` | Local | Local usage-input deduplication, trimmed after 30 days. |
 | `local_limit_stops` | Local | Seats this node's limits policy stopped, once per account and weekly window. |
 | `local_latest_slots` | Local | Local latest-retention publication slots and pending local observation pointers. |
@@ -95,6 +96,31 @@ overflow becomes visible when a slot opens. Deleted IDs remain retired.
 Historical snapshot reads retain the claim fold, as do reads while projection work is pending.
 Latest eligibility and pinned-head retrieval share one SQL snapshot so a concurrent append
 cannot leak a later head into an earlier `through` snapshot. Durable glass claims are not pruned.
+### Arrangement heads added after the baseline audit
+
+Person arrangements are shared claim-derived projections, not local sidebar caches.
+`arrangements` stores subject-keyed owner/creation/retirement/revision heads with canonical
+winner keys and projected update time. `arrangements_owner_index(owner, subject)` indexes
+owner identity; `arrangements_live_owner_index(owner, subject)` selects created, unretired
+collection rows, and `arrangements_changed_index(changed_index)` supports local change seeks.
+`arrangements_owner_changed_index(owner, changed_index)` seeks each owner's stale frontier,
+including retired and pending heads without traversing them.
+`arrangement_registers` stores `(subject, register)`-keyed raw
+values, winning claim revisions and canonical winner keys. Admission updates these heads
+in the same transaction as the durable `arrangement.edited` claim. List/detail and write
+validation read heads without folding edit history.
+
+Both tables are graph-digest-covered. The local `arrangements.changed_index` invalidation
+frontier is excluded; owner, retirement, source revisions, raw register values and canonical
+winner keys are shared. Replay rebuilds both tables, and checkpoint proof readers compare
+the same arrangement read answers. There is no new checkpoint drop rule, including for
+agent-authored edits. Effective tombstone ancestors and concurrent-cycle cuts derive from
+raw position heads deterministically without rewriting their registers.
+
+The canonical audit history includes a live arrangement with folder and placement registers.
+Both tables participate in shuffle/restart/checkpoint row comparisons and per-column
+incremental-digest mutation/rollback checks. Binary winner keys are serialized as hex in
+the independent row oracle, preserving their complete canonical bytes.
 
 ## Every store_index order
 

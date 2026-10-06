@@ -10,8 +10,32 @@ Send one JSON command per subscription:
 {"kind":"subscribe","id":"missions-tab","collection":"missions","limit":50}
 ```
 
-Collections are `missions`, `attention`, `agents`, and `work`, plus `terminal` (below). The optional
-`actor` filter applies to work, `person` to attention, and `status` to agents.
+Collections are `missions`, `attention`, `agents`, `work`, `glasses`, and `arrangements`,
+plus `terminal` and `conversation` (below). The optional `actor` filter applies to work,
+`person` to attention, and `status` to agents. For `arrangements`, `person: "person/NAME"`
+is required: agents explicitly select a fleet person's collection, never an inferred
+owner. Each read checks `read.arrangements` and the selected person's access. For example:
+
+```json
+{"kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":100}
+```
+
+To follow one selected arrangement, add optional `subject: ArrangementId`:
+
+```json
+{"kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","subject":"arrangement/person/ada/019a0000-0000-7000-8000-000000000002"}
+```
+
+The subject must belong to `person`; a mismatched owner is refused. This window
+contains only that subject (zero or one items), independent of the owner's
+subject-ordered count/byte prefix. It receives a snapshot, full-resource upserts
+and the normal retirement removal, with `has_more: false`. An absent or retired
+subject starts empty. Individual resource byte bounds still apply. Omitting
+`subject` retains the existing owner-wide bounded window.
+
+Arrangement snapshots and changes carry full typed arrangement resources. Folder or
+placement changes are full resource upserts; retirement sends the arrangement ID in
+`removes`. Glass privacy and its person-only selection are unchanged.
 A window contains 1–200 current items. History remains on the
 corresponding paged HTTP reads. Send `{"kind":"unsubscribe","id":"missions-tab"}`
 to remove a subscription. IDs are chosen by the client and unique on the socket.
@@ -35,6 +59,15 @@ Each window is read inside one SQLite snapshot, and its fence names that
 snapshot's store index, so rows always match their fence. Commits that land
 while a window is read neither tear it nor delay it; they arrive in the next
 `changes` frame.
+
+Windows complete independently: a slow collection read does not prevent new
+subscription commands or ready conversation and terminal frames from being
+handled. Each subscription still delivers its snapshot before its changes.
+Replacing or removing a subscription discards its pending collection result;
+changes observed during a read schedule another read of that window.
+Each socket permits at most eight physical collection reads, including store
+work still finishing after cancellation. Replacements wait for a read slot
+without blocking command admission or unrelated ready frames.
 
 An `error` frame reports a permanent refusal and ends that subscription. A
 `resync` frame with `retryable: true` reports a temporary read failure; the server
@@ -87,6 +120,14 @@ again with its new revision. When too much changed for one frame, or a change ca
 replayed, the newest page arrives again with `replace: true`. An `error` frame ends that
 subscription only, for example while the owning host is unreachable. After a dropped socket,
 subscribe again on the new one.
+
+`has_more` describes history before the replacement window, not whether a delta has more
+changes. Delta frames omit it: absence means preserve the last known availability, never
+`false`. Clients retain this distinction through decoding and UI updates; an explicitly
+supplied boolean updates availability. A replacement (including a reconnect) or a changed
+session starts with its own availability and must not inherit the previous window's value.
+Older-page responses independently report whether there are entries before that page; once
+the session's start is reached, later live deltas do not reopen older-history paging.
 
 `st missions ls --watch`, `st attention ls --watch`, `st agents ls --watch`,
 and `st work ls --watch` consume this same transport.
