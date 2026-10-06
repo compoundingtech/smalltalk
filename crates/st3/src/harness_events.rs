@@ -9,3 +9,10 @@ pub struct Publication {
     pub sequence: u64,
     pub claim: ClaimInput,
 }
+
+/// A replaceable categorical snapshot, independent of the ordered event acknowledgement.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CurrentPublication {
+    pub runtime_incarnation: String,
+    pub claim: ClaimInput,
+}

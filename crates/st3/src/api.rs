@@ -569,6 +569,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages/cleanup", post(mail_backlog::cleanup))
         .route("/v1/mailbox", get(mailbox::subscribe))
         .route("/v1/harness-events", post(harness_events::publish))
+        .route("/v1/harness-state", post(harness_events::publish_current))
         .route("/v1/mailbox/bind", post(mailbox::bind))
         .route("/v1/mailbox/attachment", get(mailbox::attachment))
         .route("/v1/mailbox/receipts", post(mailbox::receipt))
