@@ -18636,6 +18636,14 @@ async fn run_pi_channel(
         }
         None => {
             let incarnation = wait_for_agent_incarnation(client, subject).await?;
+            if push_mailbox_enabled() {
+                // An argv seat can run its channel before reconciliation publishes
+                // runtime.running. Give bind the same starting handshake as a typed
+                // harness; it still allocates no ownership until this incarnation is live.
+                retry_while_daemon_unreachable(subject, || {
+                    publish_harness_state(client, subject, driver, "starting", Some(&incarnation), None)
+                }).await?;
+            }
             let context_name = format!("doc/context/{identity}/now");
             let context = retry_while_daemon_unreachable(subject, || {
                 latest_document_text(client, &context_name)
