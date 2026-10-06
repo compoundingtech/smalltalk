@@ -2005,9 +2005,10 @@ export type ConversationContentRefEncoded = typeof ConversationContentRef.Encode
 export const TimelineBlock = /*#__PURE__*/ (() => Schema.Struct({
   "continuation": optionalKey(ConversationContentRef),
   "id": Schema.String,
-  /** text, reasoning, tool_call, tool_output, image, job, subagent, ask, status, unknown; future kinds remain readable as JSON */
-  "kind": Schema.String.annotate({ description: "text, reasoning, tool_call, tool_output, image, job, subagent, ask, status, unknown; future kinds remain readable as JSON" }),
-  "payload": Schema.Unknown,
+  /** text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, unknown; future kinds remain readable as JSON */
+  "kind": Schema.String.annotate({ description: "text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, unknown; future kinds remain readable as JSON" }),
+  /** Native JSON; {body_ref:true} refers to the containing known fallback body without duplication */
+  "payload": Schema.Unknown.annotate({ description: "Native JSON; {body_ref:true} refers to the containing known fallback body without duplication" }),
   "source_type": Schema.String
 }).annotate({ identifier: "TimelineBlock" }))()
 export type TimelineBlock = typeof TimelineBlock.Type

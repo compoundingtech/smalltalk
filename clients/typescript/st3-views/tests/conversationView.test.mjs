@@ -50,7 +50,7 @@ assert.deepEqual(fromHarness(true, '<command-name>/review</command-name><command
 assert.deepEqual(fromHarness(false, '<task-notification><status>completed</status><summary>Agent finished</summary></task-notification>'), [{ kind: 'event', tone: 'quiet', text: 'background task completed: Agent finished' }]);
 assert.equal(fromHarness(true, '<channel source="plugin:st3-channel:st3" from="agent/x">\nSubject: Hi\n</channel>')[0].text, 'delivered to the agent: Hi · from agent/x');
 assert.equal(cleanMessageText('[PING] ? hello [id:message/xyz]'), 'hello');
-assert.equal(cleanMessageText('keep\n```\n<thinking>code stays</thinking>\n```\n<thinking>gone</thinking>'), 'keep\n```\n<thinking>code stays</thinking>\n```');
+assert.equal(cleanMessageText('keep\n```\n<thinking>code stays</thinking>\n```\n<thinking>gone</thinking>'), 'keep\n```\n<thinking>code stays</thinking>\n```\n<thinking>gone</thinking>');
 
 // A tool result with no call still shows; a malformed argument still gets a title.
 assert.equal(conversationEntries([e('tool_result', 'tool', { call_id: 'nope', status: 'error', content: 'bad' })], names)[0].body.state, 'failed');
@@ -200,3 +200,10 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   const bodies = fromHarness(true, turn);
   assert.deepEqual(bodies.map(body => [body.kind, body.text]), [['mail', 'is this a watcher?']]);
 }
+
+const exposed = '<analysis>invented-token</analysis><thinking>visible</thinking>';
+assert.equal(conversationEntries([{id:'raw',timestamp:'2026-10-06T12:00:00Z',role:'assistant',type:'content',body:{text:exposed}}], new Map())[0].body.text, exposed);
+
+const unknownNative = '[unrecognized future]\n{"raw":{"token":"invented-token"}}';
+assert.equal(conversationEntries([{id:'unknown',timestamp:'2026-10-06T12:00:00Z',role:'system',type:'content',body:{text:unknownNative,blocks:[{kind:'unknown'}]}}],new Map())[0].body.text,unknownNative);
+assert.equal(fromHarness(true,'<analysis>visible invented-token</analysis>')[0].text,'<analysis>visible invented-token</analysis>');

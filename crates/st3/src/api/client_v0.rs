@@ -4344,10 +4344,8 @@ pub(super) fn timeline_value(
             query,
         )?;
         for item in &mut page.items {
-            if !session.conversation_blocks {
-                if let Some(body) = item["body"].as_object_mut() {
-                    body.remove("blocks");
-                }
+            if !session.conversation_blocks && let Some(body) = item["body"].as_object_mut() {
+                body.remove("blocks");
             }
         }
         page.items.reverse();

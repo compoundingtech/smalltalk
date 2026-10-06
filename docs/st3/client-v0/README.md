@@ -1507,11 +1507,12 @@ owner references. Every fetch rebinds the authorized session, entry/revision and
 native source identity; no client-supplied file path or image URL is accepted. A
 chunk contains base64 `data`, `media_type`, `offset`, total `size` and nullable
 `next_offset`. Chunks hold at most 256 KiB of decoded bytes; native image reads are
-limited to 32 MiB and five seconds for URLs, with explicit errors. Oversized JSON
+limited to 32 MiB, with explicit errors. Transcript URLs are never fetched by the owner. Oversized JSON
 payloads show an 8 KiB UTF-8 prefix labelled as truncated JSON text, and a reference
 recovers the full valid JSON. The existing 1 MB page bound still applies.
 
-A changed/replaced source (including an append) invalidates earlier references:
+Edited records, replacement, binding changes and owner restarts invalidate references;
+append-only growth preserves existing refs:
 HTTP 410 `conversation-content-invalidated`, `retryable: true`, and
 `details.full_resync: true` tell the client to reload before fetching again. A
 reachable owner with unreadable/missing bytes returns `transcript-unavailable`;
@@ -1520,3 +1521,13 @@ unreachable owner reads retain `remote-unavailable` and carry
 labels `transcript-unavailable`; retiring its stored-history fallback is owned by
 the separate no-agent-history mission. This contract adds no durable content class,
 claim kind, retention rule, spool, or image blob copy.
+
+Native conversation `read.projections` grants full transcript access, including
+secrets in exposed reasoning, tool arguments/output and unknown JSON. Projection-only
+paired displays and anonymous local Unix readers have this access. No content is scrubbed.
+Known blocks can use `payload: {body_ref: true}` to refer to the containing fallback
+body without duplicating its bytes. Content refs authenticate one native record;
+chunk reads do not rebuild the session. The owner never requests transcript HTTP(S)
+URLs. External images use an `image_link` block for explicit client opening; file
+reads are restricted to content-addressed files in the bound Pi/OMP blob store. MIME comes from passive image
+signatures, with SVG/HTML/unrecognized bytes returned only as opaque octets.

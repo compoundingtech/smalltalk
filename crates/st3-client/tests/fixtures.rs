@@ -344,10 +344,7 @@ fn timeline_models_tolerate_future_discriminators() {
     .expect("a newer tool status must not break an older client");
     assert!(matches!(
         tool.body,
-        TimelineBody::ToolResult(TimelineToolResultBody {
-            status: TimelineToolStatus::Unknown,
-            ..
-        })
+        TimelineBody::ToolResult(result) if result.status == TimelineToolStatus::Unknown
     ));
 
     let usage: TimelineEntry = serde_json::from_value(entry(

@@ -120,6 +120,13 @@
   },
   {
     "body": {
+      "kind": "user",
+      "value": "<system-reminder>\nInternal context the person never sees.\n</system-reminder>"
+    },
+    "id": "delivery-18#0"
+  },
+  {
+    "body": {
       "kind": "tool",
       "value": {
         "output": [

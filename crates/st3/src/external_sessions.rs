@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use chrono::NaiveDateTime;
 use chrono::{DateTime, Utc};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 use rusqlite::{Connection, OpenFlags, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use walkdir::WalkDir;
@@ -832,6 +832,137 @@ pub(crate) fn timestamp(unix_ms: u128) -> String {
 
 /// Normalize a native transcript into timeline entries.
 ///
+/// Volatile entry locator; removed before a timeline leaves the owner. It contains no
+/// conversation bytes and is authenticated inside the owner content reference.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "format", rename_all = "kebab-case")]
+pub(crate) enum NativeLocator {
+    Jsonl {
+        offset: u64,
+        length: u64,
+        digest: String,
+        sequence: u64,
+        timestamp: String,
+        line_index: usize,
+    },
+    Sqlite {
+        part_id: String,
+        message_id: String,
+        digest: String,
+        message_digest: String,
+        sequence: u64,
+        timestamp: String,
+        role: String,
+    },
+}
+
+/// Read one identified native record, independent of the size of the session history.
+pub(crate) fn normalized_record(
+    session: &ExternalSession,
+    locator: &NativeLocator,
+) -> Result<Vec<Value>> {
+    let mut items = Vec::new();
+    match locator {
+        NativeLocator::Jsonl {
+            offset,
+            length,
+            digest: expected,
+            sequence,
+            timestamp,
+            line_index,
+        } => {
+            anyhow::ensure!(
+                session.driver != ExternalDriver::OpenCode && *length <= MAX_TIMELINE_BYTES,
+                "invalid native locator"
+            );
+            let mut file = File::open(&session.transcript)?;
+            file.seek(SeekFrom::Start(*offset))?;
+            let mut bytes = Vec::new();
+            file.take(*length).read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() as u64 == *length && hex::encode(Sha256::digest(&bytes)) == *expected,
+                "native entry changed"
+            );
+            let text = String::from_utf8_lossy(&bytes);
+            let text = text.trim();
+            match serde_json::from_str::<Value>(text) {
+                Ok(value) => {
+                    normalize_native_line(session.driver, &value, *sequence, timestamp, &mut items)
+                }
+                Err(error) => {
+                    let recovered = recover_trailing_record(text);
+                    push_unreadable_line(
+                        &mut items,
+                        *sequence,
+                        timestamp,
+                        session.driver,
+                        *line_index,
+                        &error,
+                        recovered.is_some(),
+                    );
+                    if let Some(value) = recovered {
+                        normalize_native_line(
+                            session.driver,
+                            &value,
+                            sequence.saturating_add(1),
+                            timestamp,
+                            &mut items,
+                        );
+                    }
+                }
+            }
+        }
+        NativeLocator::Sqlite {
+            part_id,
+            message_id,
+            digest: expected,
+            message_digest,
+            sequence,
+            timestamp,
+            role,
+        } => {
+            anyhow::ensure!(
+                session.driver == ExternalDriver::OpenCode,
+                "invalid native locator"
+            );
+            let connection = open_opencode_database(&session.transcript)?;
+            let (created, message): (Option<i64>, Option<String>) = connection.query_row(
+                "SELECT time_created, data FROM message WHERE id = ?1 AND session_id = ?2",
+                params![message_id, session.native_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let message = message
+                .as_deref()
+                .and_then(|encoded| serde_json::from_str::<Value>(encoded).ok())
+                .unwrap_or(Value::Null);
+            anyhow::ensure!(
+                native_message_digest(created, &message) == *message_digest,
+                "native message display context changed"
+            );
+            let encoded: String = connection.query_row(
+                "SELECT data FROM part WHERE id = ?1 AND session_id = ?2 AND message_id = ?3",
+                params![part_id, session.native_id, message_id],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(digest(&encoded) == *expected, "native part changed");
+            let native_role = message.get("role").and_then(Value::as_str);
+            let displayed_role = match native_role {
+                Some("user" | "assistant" | "system" | "tool" | "toolResult" | "tool_result")
+                | None => role.as_str(),
+                Some(role) => role,
+            };
+            normalize_opencode_part(
+                &serde_json::from_str(&encoded)?,
+                &mut sequence.clone(),
+                timestamp,
+                displayed_role,
+                &mut items,
+            )?;
+        }
+    }
+    Ok(items)
+}
+
 /// Harnesses change their files between releases, crash mid-write, and occasionally tear a
 /// record. The reader is liberal in what it accepts: one unreadable unit (a line that is not
 /// UTF-8, is not JSON, or carries a kind this reader does not know) costs only that unit, never
@@ -842,13 +973,13 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
     if session.driver == ExternalDriver::OpenCode {
         return normalized_opencode_timeline(session);
     }
-    let metadata = fs::metadata(&session.transcript)
-        .with_context(|| format!("inspect transcript {}", session.transcript.display()))?;
     let mut file = File::open(&session.transcript)
         .with_context(|| format!("read transcript {}", session.transcript.display()))?;
+    let metadata = file.metadata()?;
     let start = metadata.len().saturating_sub(MAX_TIMELINE_BYTES);
     file.seek(SeekFrom::Start(start))?;
-    let mut reader = BufReader::new(file);
+    // Freeze a high-water mark: appends during this read belong to the next read.
+    let mut reader = BufReader::new(file.take(metadata.len() - start));
     let mut read_error = None;
     // Where each line starts in the file: an entry's identity, which must not change as the
     // read window slides along a growing transcript.
@@ -877,6 +1008,8 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
                     String::from_utf8_lossy(&buffer).into_owned(),
                     terminated,
                     offset,
+                    buffer.len() as u64,
+                    hex::encode(Sha256::digest(&buffer)),
                 ));
                 offset += buffer.len() as u64;
                 if !terminated {
@@ -903,9 +1036,11 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
     }
     // An entry without its own timestamp takes its predecessor's, so it stays in place when
     // the timeline is merged by time with Small Talk messages.
-    let mut last_timestamp = timestamp(session.updated_at_unix_ms);
+    let mut last_timestamp = timestamp(session.started_at_unix_ms);
     let mut next_free_sequence = 0_u64;
-    for (line_index, (line, terminated, line_start)) in lines.into_iter().enumerate() {
+    for (line_index, (line, terminated, line_start, length, record_digest)) in
+        lines.into_iter().enumerate()
+    {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -951,6 +1086,17 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
                     );
                 }
             }
+        }
+        let locator = serde_json::to_value(NativeLocator::Jsonl {
+            offset: line_start,
+            length,
+            digest: record_digest,
+            sequence,
+            timestamp: last_timestamp.clone(),
+            line_index,
+        })?;
+        for item in &mut items[first_new..] {
+            item["_source"] = locator.clone();
         }
         if let Some(highest) = items[first_new..]
             .iter()
@@ -1848,6 +1994,15 @@ fn external_session_id(driver: ExternalDriver, native_id: &str) -> String {
     )
 }
 
+// Streaming updates to token/model/completion metadata do not change an existing part.
+// Only message fields that determine its displayed attribution/timing fence the ref.
+fn native_message_digest(created: Option<i64>, message: &Value) -> String {
+    digest(&format!(
+        "{created:?}:{}",
+        message.get("role").and_then(Value::as_str).unwrap_or("system")
+    ))
+}
+
 fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>> {
     let connection = open_opencode_database(&session.transcript)?;
     let mut message_statement = connection.prepare(
@@ -1882,7 +2037,7 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
     // A database from an OpenCode release without the part table still shows its messages.
     let mut part_statement = connection
         .prepare(
-            "SELECT data FROM part WHERE session_id = ?1 AND message_id = ?2 \
+            "SELECT id, data FROM part WHERE session_id = ?1 AND message_id = ?2 \
              ORDER BY time_created, id",
         )
         .ok();
@@ -1897,7 +2052,13 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
         let message = encoded
             .and_then(|encoded| serde_json::from_str::<Value>(&encoded).ok())
             .unwrap_or(Value::Null);
-        let role = normalized_role(message.get("role").and_then(Value::as_str));
+        let message_digest = native_message_digest(created, &message);
+        let native_role = message.get("role").and_then(Value::as_str);
+        let role = match native_role {
+            Some("user" | "assistant" | "system" | "tool" | "toolResult" | "tool_result")
+            | None => normalized_role(native_role),
+            Some(role) => role,
+        };
         if let Some(created) = created {
             last_created = created.max(0) as u128;
         }
@@ -1907,7 +2068,7 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             &mut additions,
             next_opencode_sequence(&mut sequence)?,
             &at,
-            role,
+            normalized_role(Some(role)),
             &message_id,
         );
         extend_bounded_opencode_timeline(
@@ -1920,7 +2081,7 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             continue;
         };
         let parts = match part_statement.query_map(params![session.native_id, message_id], |row| {
-            row.get::<_, Option<String>>(0)
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         }) {
             Ok(parts) => parts.collect::<Vec<_>>(),
             Err(_) => {
@@ -1929,115 +2090,28 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             }
         };
         for encoded_part in parts {
-            let Some(part) = encoded_part
-                .ok()
-                .flatten()
-                .and_then(|encoded| serde_json::from_str::<Value>(&encoded).ok())
-            else {
+            let Ok((part_id, Some(encoded_part))) = encoded_part else {
+                skipped_rows += 1;
+                continue;
+            };
+            let Ok(part) = serde_json::from_str::<Value>(&encoded_part) else {
                 skipped_rows += 1;
                 continue;
             };
             let mut additions = Vec::with_capacity(2);
-            match part.get("type").and_then(Value::as_str) {
-                Some("text") => {
-                    if let Some(text) = part.get("text").and_then(Value::as_str) {
-                        push_content(
-                            &mut additions,
-                            next_opencode_sequence(&mut sequence)?,
-                            &at,
-                            role,
-                            text,
-                        );
-                    }
-                }
-                Some("tool") => {
-                    let call_id = part
-                        .get("callID")
-                        .or_else(|| part.get("callId"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("native-call");
-                    let name = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
-                    let state = part.get("state").unwrap_or(&Value::Null);
-                    push_tool_call(
-                        &mut additions,
-                        next_opencode_sequence(&mut sequence)?,
-                        &at,
-                        call_id,
-                        name,
-                        state.get("input").cloned().unwrap_or_else(|| json!({})),
-                    );
-                    let status = state.get("status").and_then(Value::as_str);
-                    if matches!(status, Some("completed" | "error")) {
-                        push_tool_result_with_status(
-                            &mut additions,
-                            next_opencode_sequence(&mut sequence)?,
-                            &at,
-                            call_id,
-                            state
-                                .get("output")
-                                .or_else(|| state.get("error"))
-                                .cloned()
-                                .unwrap_or(Value::Null),
-                            status == Some("error"),
-                        );
-                    }
-                }
-                Some("image" | "input_image" | "image_url" | "output_image") => {
-                    push_image(
-                        &mut additions,
-                        next_opencode_sequence(&mut sequence)?,
-                        &at,
-                        role,
-                        &part,
-                    );
-                }
-                Some(kind) if REASONING_BLOCKS.contains(&kind) => {
-                    push_reasoning(
-                        &mut additions,
-                        next_opencode_sequence(&mut sequence)?,
-                        &at,
-                        role,
-                        &part,
-                    );
-                }
-                Some("file")
-                    if part
-                        .get("mime")
-                        .and_then(Value::as_str)
-                        .is_some_and(|mime| mime.starts_with("image/")) =>
-                {
-                    push_image(
-                        &mut additions,
-                        next_opencode_sequence(&mut sequence)?,
-                        &at,
-                        role,
-                        &part,
-                    );
-                }
-                Some("file") => {
-                    let name = part
-                        .get("filename")
-                        .or_else(|| part.get("url"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("attachment");
-                    push_content(
-                        &mut additions,
-                        next_opencode_sequence(&mut sequence)?,
-                        &at,
-                        role,
-                        &format!("[file: {name}]"),
-                    );
-                }
-                Some(kind) if OPENCODE_HIDDEN_PARTS.contains(&kind) => {}
-                kind => push_unrecognized(
-                    &mut additions,
-                    next_opencode_sequence(&mut sequence)?,
-                    &at,
-                    "opencode",
-                    "part",
-                    kind,
-                    &part,
-                ),
+            let entry_sequence = sequence;
+            normalize_opencode_part(&part, &mut sequence, &at, role, &mut additions)?;
+            let locator = serde_json::to_value(NativeLocator::Sqlite {
+                part_id,
+                message_id: message_id.clone(),
+                digest: digest(&encoded_part),
+                message_digest: message_digest.clone(),
+                sequence: entry_sequence,
+                timestamp: at.clone(),
+                role: normalized_role(Some(role)).to_owned(),
+            })?;
+            for item in &mut additions {
+                item["_source"] = locator.clone();
             }
             extend_bounded_opencode_timeline(
                 &mut items,
@@ -2092,6 +2166,107 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
     Ok(items.into_iter().map(|(item, _)| item).collect())
 }
 
+fn normalize_opencode_part(
+    part: &Value,
+    sequence: &mut u64,
+    at: &str,
+    role: &str,
+    additions: &mut Vec<Value>,
+) -> Result<()> {
+    if !matches!(role, "user" | "assistant" | "system" | "tool") {
+        push_native_block(
+            additions,
+            next_opencode_sequence(sequence)?,
+            at,
+            "system",
+            (
+                "unknown",
+                part.get("type").and_then(Value::as_str).unwrap_or("part"),
+            ),
+            json!({"raw":part,"source_role":role}),
+            &format!("[unknown opencode role `{role}`]"),
+        );
+        return Ok(());
+    }
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                push_content(additions, next_opencode_sequence(sequence)?, at, role, text);
+            }
+        }
+        Some("tool") => {
+            let call_id = part
+                .get("callID")
+                .or_else(|| part.get("callId"))
+                .and_then(Value::as_str)
+                .unwrap_or("native-call");
+            let name = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            let state = part.get("state").unwrap_or(&Value::Null);
+            push_tool_call(
+                additions,
+                next_opencode_sequence(sequence)?,
+                at,
+                call_id,
+                name,
+                state.get("input").cloned().unwrap_or_else(|| json!({})),
+            );
+            let status = state.get("status").and_then(Value::as_str);
+            if matches!(status, Some("completed" | "error")) {
+                push_tool_result_with_status(
+                    additions,
+                    next_opencode_sequence(sequence)?,
+                    at,
+                    call_id,
+                    state
+                        .get("output")
+                        .or_else(|| state.get("error"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    status == Some("error"),
+                );
+            }
+        }
+        Some("image" | "input_image" | "image_url" | "output_image") => {
+            push_image(additions, next_opencode_sequence(sequence)?, at, role, part);
+        }
+        Some(kind) if REASONING_BLOCKS.contains(&kind) => {
+            push_reasoning(additions, next_opencode_sequence(sequence)?, at, role, part);
+        }
+        Some("file")
+            if part
+                .get("mime")
+                .and_then(Value::as_str)
+                .is_some_and(|mime| mime.starts_with("image/")) =>
+        {
+            push_image(additions, next_opencode_sequence(sequence)?, at, role, part);
+        }
+        Some("file") => {
+            let name = part
+                .get("filename")
+                .or_else(|| part.get("url"))
+                .and_then(Value::as_str)
+                .unwrap_or("attachment");
+            push_content(
+                additions,
+                next_opencode_sequence(sequence)?,
+                at,
+                role,
+                &format!("[file: {name}]"),
+            );
+        }
+        kind => push_unrecognized(
+            additions,
+            next_opencode_sequence(sequence)?,
+            at,
+            "opencode",
+            "part",
+            kind,
+            part,
+        ),
+    }
+    Ok(())
+}
+
 fn next_opencode_sequence(sequence: &mut u64) -> Result<u64> {
     let current = *sequence;
     *sequence = (*sequence)
@@ -2107,7 +2282,43 @@ fn extend_bounded_opencode_timeline(
     additions: Vec<Value>,
 ) {
     let byte_limit = usize::try_from(MAX_TIMELINE_BYTES).unwrap_or(usize::MAX);
-    for item in additions {
+    for mut item in additions {
+        let raw_size = serde_json::to_vec(&item).map_or(byte_limit, |encoded| encoded.len());
+        if raw_size > byte_limit {
+            item["_oversized_bytes"] = json!(raw_size);
+            let payload_sizes = item["body"]["blocks"]
+                .as_array()
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .map(|block| {
+                            let payload = if block["payload"] == json!({"body_ref":true}) {
+                                &item["body"]
+                            } else {
+                                &block["payload"]
+                            };
+                            serde_json::to_vec(payload).expect("native JSON").len()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            item["_oversized_payload_bytes"] = json!(payload_sizes);
+            let marker = json!(format!(
+                "[st truncated this native timeline value: size limit; {raw_size} bytes; fetch from owner]"
+            ));
+            for key in ["text", "arguments", "content"] {
+                if item["body"].get(key).is_some() {
+                    item["body"][key] = marker.clone();
+                }
+            }
+            if let Some(blocks) = item["body"]["blocks"].as_array_mut() {
+                for block in blocks {
+                    if block["payload"] != json!({"body_ref":true}) {
+                        block["payload"] = marker.clone();
+                    }
+                }
+            }
+        }
         let item_bytes = serde_json::to_vec(&item).map_or(byte_limit, |encoded| encoded.len());
         let mut additional_bytes = item_bytes + usize::from(!items.is_empty());
         while items.len() >= MAX_TIMELINE_LINES
@@ -2172,51 +2383,11 @@ fn prepend_opencode_truncation(
     }
 }
 
-/// Codex records that are known and are not conversation: session headers, the event stream
-/// that mirrors response items, turn settings, and accounting.
-const CODEX_BOOKKEEPING: &[&str] = &[
-    "session_meta",
-    "event_msg",
-    "turn_context",
-    "token_usage_record",
-    "world_state",
-];
-/// Native workspace snapshots are bookkeeping, rather than harness-shown content.
-const CODEX_HIDDEN_ITEMS: &[&str] = &["ghost_snapshot"];
-/// Claude records that are known and are not conversation: UI and session bookkeeping.
-const CLAUDE_BOOKKEEPING: &[&str] = &[
-    "file-history-snapshot",
-    "file-history-delta",
-    "queue-operation",
-    "permission-mode",
-    "mode",
-    "atis-latch",
-    "last-prompt",
-    "ai-title",
-    "custom-title",
-    "cost-state",
-    "progress",
-    "agent-name",
-    "tag",
-    "pr-link",
-    "bridge-session",
-    "fork-context-ref",
-];
-/// Reasoning blocks explicitly exposed in the native transcript.
+// Only native session headers are omitted. All records whose harness visibility has
+// not been established are retained as raw blocks; see the design's visibility audit.
+const CODEX_BOOKKEEPING: &[&str] = &["session_meta"];
 const REASONING_BLOCKS: &[&str] = &["thinking", "redacted_thinking", "reasoning"];
-/// Pi and OMP records that are known and are not conversation.
-const OMP_BOOKKEEPING: &[&str] = &[
-    "session",
-    "label",
-    "session_info",
-    "custom",
-    "credential_pin",
-    "title",
-];
-/// OpenCode parts that are known and deliberately not shown.
-const OPENCODE_HIDDEN_PARTS: &[&str] = &[
-    "snapshot",
-];
+const OMP_BOOKKEEPING: &[&str] = &["session"];
 
 /// A native timestamp as the timeline carries it. RFC 3339 text is kept as written; a number is
 /// Unix milliseconds (or seconds, when too small to be milliseconds). Anything else is absent,
@@ -2288,8 +2459,7 @@ fn push_unrecognized(
         sequence,
         timestamp,
         role,
-        block_kind,
-        kind.unwrap_or(what),
+        (block_kind, kind.unwrap_or(what)),
         json!({"raw": value}),
         &label,
     );
@@ -2302,8 +2472,7 @@ fn push_native_block(
     sequence: u64,
     timestamp: &str,
     role: &str,
-    kind: &str,
-    source_type: &str,
+    (kind, source_type): (&str, &str),
     payload: Value,
     label: &str,
 ) {
@@ -2348,10 +2517,12 @@ fn push_reasoning(
         sequence,
         timestamp,
         role,
-        "reasoning",
-        part.get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("reasoning"),
+        (
+            "reasoning",
+            part.get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("reasoning"),
+        ),
         json!({"text":text,"raw":part}),
         "[reasoning]",
     );
@@ -2363,8 +2534,10 @@ fn push_image(items: &mut Vec<Value>, sequence: u64, timestamp: &str, role: &str
         sequence,
         timestamp,
         role,
-        "image",
-        part.get("type").and_then(Value::as_str).unwrap_or("image"),
+        (
+            "image",
+            part.get("type").and_then(Value::as_str).unwrap_or("image"),
+        ),
         part.clone(),
         "[image]",
     );
@@ -2396,7 +2569,9 @@ fn normalize_codex(value: &Value, sequence: u64, fallback_timestamp: &str, items
     match payload.get("type").and_then(Value::as_str) {
         Some("message") => {
             // Provider bootstrap instructions are not a visible chat turn.
+            if matches!(payload["role"].as_str(), Some("system" | "developer")) { return; }
             if !matches!(payload["role"].as_str(), Some("user" | "assistant")) {
+                push_unrecognized(items, sequence, &timestamp, "codex", "message", payload["role"].as_str(), value);
                 return;
             }
             let role = normalized_role(payload["role"].as_str());
@@ -2468,7 +2643,6 @@ fn normalize_codex(value: &Value, sequence: u64, fallback_timestamp: &str, items
             payload.get("output").cloned().unwrap_or(Value::Null),
         ),
         Some("reasoning") => push_reasoning(items, sequence, &timestamp, "assistant", payload),
-        Some(kind) if CODEX_HIDDEN_ITEMS.contains(&kind) => {}
         kind => push_unrecognized(
             items,
             sequence,
@@ -2510,6 +2684,8 @@ fn normalize_claude(
                     &timestamp,
                     "user",
                 );
+            } else {
+                push_unrecognized(items, sequence, &timestamp, "claude", "attachment", value.pointer("/attachment/type").and_then(Value::as_str), value);
             }
             return;
         }
@@ -2520,10 +2696,11 @@ fn normalize_claude(
                 && !text.trim().is_empty()
             {
                 push_content(items, sequence, &timestamp, "system", text);
+            } else {
+                push_unrecognized(items, sequence, &timestamp, "claude", "system", value.get("subtype").and_then(Value::as_str), value);
             }
             return;
         }
-        Some(kind) if CLAUDE_BOOKKEEPING.contains(&kind) => return,
         kind => {
             push_unrecognized(items, sequence, &timestamp, "claude", "entry", kind, value);
             return;
@@ -2639,6 +2816,8 @@ fn normalize_omp(
                     "system",
                     &format!("[{label} {kind}]\n{summary}"),
                 );
+            } else {
+                push_unrecognized(items, sequence, &timestamp, label, "entry", Some(kind), value);
             }
             return;
         }
@@ -2664,6 +2843,12 @@ fn normalize_omp(
     }
     let message = &value["message"];
     let native_role = message.get("role").and_then(Value::as_str);
+    if let Some(native_role) = native_role
+        && !matches!(native_role, "user" | "assistant" | "system" | "tool" | "toolResult" | "tool_result" | "bashExecution" | "branchSummary" | "compactionSummary")
+    {
+        push_unrecognized(items, sequence, &timestamp, label, "message role", Some(native_role), value);
+        return;
+    }
     let role = normalized_role(native_role);
     let message_id = value["id"]
         .as_str()
@@ -2894,7 +3079,7 @@ fn timeline_item(
     if let Some(kind) = kind {
         body["blocks"] = json!([{
             "id":format!("native-{sequence}/0"), "kind":kind,
-            "source_type":entry_type, "payload":body.clone()
+            "source_type":entry_type, "payload":{"body_ref":true}
         }]);
     }
     json!({
@@ -4174,12 +4359,13 @@ mod tests {
         }
         let labels = texts(&items);
         assert!(labels[0].starts_with("[unrecognized claude entry `brand-new-kind`]"));
-        assert!(labels[1].starts_with("[unrecognized claude entry without a type]"));
-        assert_eq!(labels[2], "[reasoning]\nprivate");
-        assert!(labels[3].starts_with("[unrecognized claude content block `hologram`]"));
-        assert_eq!(labels[4], "[image · load from owner]");
-        assert_eq!(labels[5], "visible");
-        assert_eq!(labels.len(), 6);
+        assert!(labels[2].starts_with("[unrecognized claude entry without a type]"));
+        assert_eq!(labels[3], "[reasoning]\nprivate");
+        assert!(labels[4].starts_with("[unrecognized claude content block `hologram`]"));
+        assert_eq!(labels[5], "[image · load from owner]");
+        assert_eq!(labels[6], "visible");
+        assert_eq!(labels.len(), 7);
+        assert!(labels[1].starts_with("[unrecognized claude entry `file-history-snapshot`]"));
         assert!(labels.iter().any(|text| text.contains("private")));
         for item in &items {
             if item["body"]["text"]
@@ -4195,6 +4381,29 @@ mod tests {
             .unwrap();
         assert_eq!(result["body"]["status"], "error");
         assert_unique_ids(&items);
+    }
+
+    #[test]
+    fn future_native_roles_use_legacy_system_envelopes_and_keep_raw_attribution() {
+        let stamp = timestamp(0);
+        let value = json!({"type":"message","message":{"role":"future-role","content":[{"type":"text","text":"invented-token"}]}});
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &value, 16, &stamp, &mut items);
+        assert_eq!(items[0]["role"], "system");
+        assert_eq!(items[0]["body"]["blocks"][0]["payload"]["raw"], value);
+        let mut sequence = 1;
+        let mut items = Vec::new();
+        let part = json!({"type":"text","text":"invented-token"});
+        normalize_opencode_part(&part, &mut sequence, &stamp, "future-role", &mut items).unwrap();
+        assert_eq!(items[0]["role"], "system");
+        assert_eq!(
+            items[0]["body"]["blocks"][0]["payload"],
+            json!({"raw":part,"source_role":"future-role"})
+        );
+        assert_ne!(
+            native_message_digest(Some(1), &json!({"role":"future-role"})),
+            native_message_digest(Some(1), &json!({"role":"another-role"}))
+        );
     }
 
     #[test]
@@ -4234,10 +4443,11 @@ mod tests {
             &fallback,
             &mut items,
         );
-        assert_eq!(
-            texts(&items),
-            ["a message delivered while busy", "Conversation compacted"]
-        );
+        let labels = texts(&items);
+        assert_eq!(labels[0], "a message delivered while busy");
+        assert!(labels[1].contains("total_tokens_reminder"));
+        assert_eq!(labels[2], "Conversation compacted");
+        assert!(labels[3].contains("turn_duration"));
         assert_eq!(items[1]["role"], "user");
         assert_eq!(items[2]["role"], "system");
     }
@@ -4299,7 +4509,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_codex_records_and_items_are_labelled_and_known_ones_stay_hidden() {
+    fn codex_event_mirrors_and_unknown_records_are_retained_raw() {
         let fallback = timestamp(0);
         let mut items = Vec::new();
         for (sequence, value) in [
@@ -4328,13 +4538,15 @@ mod tests {
             normalize_codex(&value, sequence, &fallback, &mut items);
         }
         let labels = texts(&items);
-        assert!(labels[0].starts_with("[reasoning]"));
-        assert!(labels[1].starts_with("[unrecognized codex record `new_record_kind`]"));
-        assert!(labels[2].starts_with("[unrecognized codex response item `web_search_call`]"));
-        assert_eq!(labels[3], "[image · load from owner]");
-        assert!(labels[4].starts_with("[unrecognized codex message part `input_hologram`]"));
-        assert_eq!(labels[5], "typed");
-        assert_eq!(labels.len(), 6);
+        assert!(labels[1].starts_with("[reasoning]"));
+        assert!(labels[2].starts_with("[unrecognized codex record `new_record_kind`]"));
+        assert!(labels[3].starts_with("[unrecognized codex response item `web_search_call`]"));
+        assert_eq!(labels[4], "[image · load from owner]");
+        assert!(labels[5].starts_with("[unrecognized codex message part `input_hologram`]"));
+        assert_eq!(labels[6], "typed");
+        assert_eq!(labels.len(), 7);
+        assert!(labels[0].contains("event_msg"));
+        assert!(labels[0].contains("dup"));
         assert_unique_ids(&items);
     }
 

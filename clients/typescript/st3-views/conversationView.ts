@@ -39,8 +39,6 @@ function short(id: string): string {
 
 // ------------------------------------------------------------------ text cleanup
 
-const HIDDEN_TAGS = ['analysis', 'thinking', 'think', 'internal', 'system-reminder', 'function_calls', 'tool_result'];
-
 function stripInternalMarkup(input: string): string {
   let inChannel = false;
   let text = input.split('\n').filter(line => {
@@ -49,18 +47,6 @@ function stripInternalMarkup(input: string): string {
     if (inChannel && trimmed === '</channel>') { inChannel = false; return false; }
     return !(trimmed.startsWith('[st3-delivery:') && trimmed.endsWith('.md]'));
   }).join('\n');
-  for (const tag of HIDDEN_TAGS) {
-    for (;;) {
-      const lower = text.toLowerCase();
-      const start = lower.indexOf(`<${tag}`);
-      if (start < 0) break;
-      const openEnd = lower.indexOf('>', start);
-      if (openEnd < 0) { text = text.slice(0, start); break; }
-      const close = lower.indexOf(`</${tag}>`, openEnd + 1);
-      if (close < 0) { text = text.slice(0, start); break; }
-      text = text.slice(0, start) + text.slice(close + tag.length + 3);
-    }
-  }
   return text;
 }
 
@@ -83,8 +69,6 @@ export function cleanMessageText(raw: string): string {
   const reference = text.lastIndexOf(' [id:message/');
   return reference >= 0 && text.endsWith(']') ? text.slice(0, reference).trimEnd() : text;
 }
-
-const CONTEXT_BLOCKS = ['system-reminder', 'local-command-caveat', 'environment_context', 'permissions', 'collaboration_mode', 'multi_agent_mode', 'apps_instructions', 'plugins_instructions', 'skills_instructions', 'user_instructions', 'developer_instructions', 'command-message', 'command-args'];
 
 /** Take every `<tag …>…</tag>` block out of `text`; a block that never closes runs to the end. */
 function takeBlocks(text: { value: string }, tag: string): string[] {
@@ -226,11 +210,14 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
     } catch { /* not JSON: nothing to show */ }
     if (answers.length) bodies.push({ kind: 'user', text: answers.join('\n') });
   }
-  for (const tag of CONTEXT_BLOCKS) takeBlocks(text, tag);
+  if (raw.includes("<command-name")) takeBlocks(text, "command-args"); // displayed with the parsed command
   // st's own notes beside a delivery tell the agent something; the person never typed them.
   text.value = text.value.split('\n').filter(line => !ST_DELIVERY_NOTES.includes(line.trim())).join('\n');
   const rest = cleanMessageText(text.value);
-  if (isUser && rest) bodies.unshift({ kind: 'user', text: rest });
+  if (rest) {
+    if (isUser) bodies.unshift({ kind: 'user', text: rest });
+    else bodies.push({kind:'event',tone:'quiet',text:rest});
+  }
   return bodies;
 }
 
@@ -362,15 +349,18 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
     switch (entry.type) {
       case 'content': {
         const raw = contentText(entry.body);
-        if (entry.role === 'user' || entry.role === 'system') {
+        const nativeBlocks = Array.isArray(body.blocks) && body.blocks.some(block => record(block).kind !== 'text');
+        if ((entry.role === 'user' || entry.role === 'system') && (nativeBlocks || raw.startsWith('[unrecognized '))) {
+          push(entry, entry.id, entry.role === 'user' ? {kind:'user',text:raw} : {kind:'event',tone:'quiet',text:raw});
+        } else if (entry.role === 'user' || entry.role === 'system') {
           // Mail read from a delivery is named as the stream names it, as stui does.
           fromHarness(entry.role === 'user', raw, shown, delivered).forEach((part, index) => push(entry, `${entry.id}#${index}`, part.kind === 'mail' ? { ...part, from: name(part.from), to: name(part.to) } : part));
         } else if (entry.role === 'tool') {
-          const lines = cleanMessageText(raw).split('\n');
+          const lines = raw.split('\n');
           if (lines.join('').trim()) push(entry, entry.id, { kind: 'tool', title: lines[0], state: 'ok', output: lines.slice(1) });
         } else {
-          const text = cleanMessageText(raw);
-          if (text) push(entry, entry.id, { kind: 'assistant', text });
+          const text = raw;
+          if (text.trim()) push(entry, entry.id, entry.role === 'assistant' ? { kind: 'assistant', text } : {kind:'event',tone:'quiet',text:`[unknown role]\n${text}`});
         }
         break;
       }

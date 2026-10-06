@@ -1663,8 +1663,8 @@ impl Client {
     ) -> Result<Envelope<ConversationContentChunk>, ClientError> {
         self.get(&format!(
             "/v1/client/conversations/{}/content/{}/chunk?offset={offset}",
-            percent_encode(id),
-            percent_encode(reference)
+            percent_encode_segment(id),
+            percent_encode_segment(reference)
         ))
         .await
     }

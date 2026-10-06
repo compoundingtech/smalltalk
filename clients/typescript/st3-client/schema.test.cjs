@@ -276,7 +276,7 @@ test('arrangement resources keep deleted folder positions and missing-seat place
 test('normalized conversation fallbacks and open block payloads survive schema round trips', async () => {
     const [{ Schema }, Rich] = await modules;
     const fixture = require('../../../docs/st3/client-v0/fixtures/normalized-conversation-legacy.json');
-    for (const entry of fixture) {
+    for (const entry of fixture.value.items) {
         const decoded = Rich.decodeUnknownSync(Rich.TimelineEntry, 'strict')(entry);
         assert.deepEqual(Schema.encodeSync(Rich.TimelineEntry)(decoded), { ...entry, timestamp: new Date(entry.timestamp).toISOString() });
     }

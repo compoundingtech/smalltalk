@@ -1784,9 +1784,9 @@ pub enum TimelineType {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TimelineBody {
     Message(Box<TimelineMessageBody>),
-    Content(TimelineContentBody),
-    ToolCall(TimelineToolCallBody),
-    ToolResult(TimelineToolResultBody),
+    Content(Box<TimelineContentBody>),
+    ToolCall(Box<TimelineToolCallBody>),
+    ToolResult(Box<TimelineToolResultBody>),
     Status(TimelineStatusBody),
     Error(TimelineErrorBody),
     Usage(Box<TimelineUsageBody>),

@@ -1,9 +1,27 @@
 //! Owner-local wire normalization. References contain no path or payload and hold no durable
-//! state: a fetch rebinds the exact native source and refuses a changed revision.
+//! state: a fetch reads one authenticated native record and refuses edited/replaced content.
 use super::*;
 use crate::external_sessions::{ExternalConversation, ExternalSession};
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac as _};
 use std::io::Read as _;
+use std::sync::LazyLock;
+
+// Bound expensive reads without a queued backlog or a second content cache.
+static READ_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static REF_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
+    let mut key = [0; 32];
+    getrandom::fill(&mut key).expect("owner reference key entropy");
+    key
+});
+fn read_slot(slots: &tokio::sync::Semaphore) -> Result<tokio::sync::SemaphorePermit<'_>, ApiError> {
+    slots.try_acquire().map_err(|_| ApiError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        code: "rate-limited".into(),
+        message: "owner conversation reads are busy; retry this read".into(),
+        details: Box::default(),
+    })
+}
 
 const VALUE_BYTES: usize = 8 * 1024;
 const CHUNK_BYTES: usize = 256 * 1024;
@@ -87,41 +105,90 @@ fn basis(source: &ExternalSession) -> Result<String, ApiError> {
     };
     #[cfg(not(unix))]
     let identity = format!("{:?}", metadata.created().ok());
-    // SQLite may change in its WAL without touching the database file.
-    let wal = source.transcript.with_file_name(format!(
-        "{}-wal",
-        source
-            .transcript
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-    ));
-    let wal_revision = std::fs::metadata(wal).ok().map(|metadata| {
-        (
-            metadata.len(),
-            metadata.modified().ok().map(|time| format!("{time:?}")),
-        )
-    });
     Ok(hex::encode(Sha256::digest(
         serde_json::to_vec(&json!([
             source.driver.as_str(),
             source.native_id,
-            source.revision,
             source.transcript,
-            identity,
-            wal_revision,
-            metadata.len(),
-            metadata.modified().ok().map(|time| format!("{time:?}"))
+            identity
         ]))
         .map_err(ApiError::internal)?,
     )))
 }
 
+#[derive(Deserialize, Serialize)]
+struct ContentLocator {
+    basis: String,
+    session: String,
+    entry: Value,
+    revision: Value,
+    pointer: String,
+    image: bool,
+    native: Value,
+}
+
 fn reference(basis: &str, session: &str, item: &Value, pointer: &str) -> String {
-    let identity = json!([basis, session, item["id"], item["revision"], pointer]);
-    hex::encode(Sha256::digest(
-        serde_json::to_vec(&identity).expect("JSON value encodes"),
-    ))
+    let locator = ContentLocator {
+        basis: basis.into(),
+        session: session.into(),
+        entry: item["id"].clone(),
+        revision: item["revision"].clone(),
+        pointer: pointer.into(),
+        image: item
+            .pointer(pointer)
+            .is_some_and(|value| image(value) && !external_image(value)),
+        native: item["_source"].clone(),
+    };
+    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&locator).expect("JSON value encodes"));
+    let mut mac = Hmac::<Sha256>::new_from_slice(&*REF_KEY).expect("HMAC key");
+    mac.update(encoded.as_bytes());
+    format!(
+        "v1.{encoded}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
+}
+
+fn locator(wanted: &str, session: &str) -> Result<ContentLocator, ApiError> {
+    if wanted.len() > 4096 {
+        return Err(invalidated());
+    }
+    let mut parts = wanted.split('.');
+    if parts.next() != Some("v1") {
+        return Err(invalidated());
+    }
+    let encoded = parts.next().ok_or_else(invalidated)?;
+    let tag = URL_SAFE_NO_PAD
+        .decode(parts.next().ok_or_else(invalidated)?)
+        .map_err(|_| invalidated())?;
+    if parts.next().is_some() {
+        return Err(invalidated());
+    }
+    let mut mac = Hmac::<Sha256>::new_from_slice(&*REF_KEY).expect("HMAC key");
+    mac.update(encoded.as_bytes());
+    mac.verify_slice(&tag).map_err(|_| invalidated())?;
+    let locator: ContentLocator =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).map_err(|_| invalidated())?)
+            .map_err(|_| invalidated())?;
+    if locator.session != session
+        || locator.pointer.len() > 512
+        || !(locator.pointer == "/body" || locator.pointer.starts_with("/body/"))
+    {
+        return Err(invalidated());
+    }
+    Ok(locator)
+}
+
+fn located_value(source: &ExternalSession, locator: &ContentLocator) -> Result<Value, ApiError> {
+    if basis(source)? != locator.basis {
+        return Err(invalidated());
+    }
+    let native = serde_json::from_value(locator.native.clone()).map_err(|_| invalidated())?;
+    crate::external_sessions::normalized_record(source, &native)
+        .map_err(|_| invalidated())?
+        .into_iter()
+        .find(|item| item["id"] == locator.entry && item["revision"] == locator.revision)
+        .and_then(|item| item.pointer(&locator.pointer).cloned())
+        .ok_or_else(invalidated)
 }
 
 fn clipped(text: &str) -> String {
@@ -158,14 +225,25 @@ fn image(value: &Value) -> bool {
         )
 }
 
-fn image_media(value: &Value) -> &str {
+fn image_media(_value: &Value) -> &str {
+    // Native MIME labels are untrusted. Fetch reports the detected passive image format.
+    "application/octet-stream"
+}
+
+fn external_image(value: &Value) -> bool {
+    image_source(value)
+        .is_some_and(|source| source.starts_with("https://") || source.starts_with("http://"))
+}
+
+fn image_source(value: &Value) -> Option<&str> {
     value
-        .get("mimeType")
-        .or_else(|| value.get("mime_type"))
-        .or_else(|| value.get("mime"))
-        .or_else(|| value.pointer("/source/media_type"))
+        .get("data")
+        .or_else(|| value.pointer("/source/data"))
+        .or_else(|| value.get("image_url").filter(|value| value.is_string()))
+        .or_else(|| value.pointer("/image_url/url"))
+        .or_else(|| value.pointer("/source/url"))
+        .or_else(|| value.get("url"))
         .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream")
 }
 
 fn continuation(reference: String, media: &str, size: Option<usize>, reason: &str) -> Value {
@@ -178,6 +256,9 @@ fn continuation(reference: String, media: &str, size: Option<usize>, reason: &st
 
 fn image_refs(value: &mut Value, pointer: &str, basis: &str, session: &str, item: &Value) {
     if image(value) {
+        if external_image(value) {
+            return;
+        }
         *value = json!({"type":"image","content":continuation(reference(basis,session,item,pointer),image_media(value),None,"on-demand")});
         return;
     }
@@ -208,6 +289,7 @@ pub(super) fn read(
     session: &ClientSession,
     session_id: &str,
 ) -> Result<Vec<Value>, ApiError> {
+    let _slot = read_slot(&READ_SLOTS)?;
     let before = basis(source)?;
     let items =
         crate::external_sessions::normalized_timeline(source).map_err(ApiError::internal)?;
@@ -236,9 +318,22 @@ pub(super) fn prepare(
             .ok_or_else(|| ApiError::internal("native body is not an object"))?;
         if let Some(blocks) = body.get_mut("blocks").and_then(Value::as_array_mut) {
             for (index, block) in blocks.iter_mut().enumerate() {
-                let pointer = format!("/body/blocks/{index}/payload");
-                let encoded = serde_json::to_vec(&block["payload"]).map_err(ApiError::internal)?;
-                if block["kind"] == "image" {
+                let body_ref = block["payload"] == json!({"body_ref":true});
+                let pointer = if body_ref {
+                    "/body".to_owned()
+                } else {
+                    format!("/body/blocks/{index}/payload")
+                };
+                if body_ref {
+                    block["payload"] = original["body"].clone();
+                    block["payload"]
+                        .as_object_mut()
+                        .expect("native body")
+                        .remove("blocks");
+                }
+                if block["kind"] == "image" && external_image(&block["payload"]) {
+                    block["kind"] = json!("image_link");
+                } else if block["kind"] == "image" {
                     block["continuation"] = continuation(
                         reference(&basis, session_id, &original, &pointer),
                         image_media(&block["payload"]),
@@ -254,11 +349,17 @@ pub(super) fn prepare(
                         session_id,
                         &original,
                     );
-                    if encoded.len() > VALUE_BYTES {
+                    let encoded =
+                        serde_json::to_vec(&block["payload"]).map_err(ApiError::internal)?;
+                    if encoded.len() > VALUE_BYTES || original["_oversized_bytes"].is_number() {
                         block["continuation"] = continuation(
                             reference(&basis, session_id, &original, &pointer),
                             "application/json",
-                            Some(encoded.len()),
+                            Some(
+                                original["_oversized_payload_bytes"][index]
+                                    .as_u64()
+                                    .map_or(encoded.len(), |size| size as usize),
+                            ),
                             "size-limit",
                         );
                         bound(&mut block["payload"]);
@@ -270,15 +371,25 @@ pub(super) fn prepare(
             .get("blocks")
             .and_then(Value::as_array)
             .and_then(|blocks| blocks.first())
+            && block["kind"] == "unknown"
         {
-            if block["kind"] == "unknown" {
-                let label = body
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .and_then(|text| text.lines().next())
-                    .unwrap_or("[unknown]");
-                body["text"] = json!(format!("{label}\n{}", block["payload"]));
-            }
+            let label = body
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(|text| text.lines().next())
+                .unwrap_or("[unknown]");
+            body["text"] = json!(format!("{label}\n{}", block["payload"]));
+        }
+        if let Some(block) = body
+            .get("blocks")
+            .and_then(Value::as_array)
+            .and_then(|blocks| blocks.first())
+            && block["kind"] == "image_link"
+        {
+            body["text"] = json!(format!(
+                "[external image link · open explicitly]\n{}",
+                block["payload"]
+            ));
         }
         // Fallback bodies use known v0 types and also move native pixels to owner fetch refs.
         for key in ["text", "arguments", "content"] {
@@ -297,9 +408,30 @@ pub(super) fn prepare(
                 }
             }
         }
+        let mut fallback = original["body"].clone();
+        fallback
+            .as_object_mut()
+            .expect("native body")
+            .remove("blocks");
+        if let Some(blocks) = body.get_mut("blocks").and_then(Value::as_array_mut) {
+            for (index, block) in blocks.iter_mut().enumerate() {
+                if original["body"]["blocks"][index]["payload"] == fallback
+                    || original["body"]["blocks"][index]["payload"] == json!({"body_ref":true})
+                {
+                    block["payload"] = json!({"body_ref": true});
+                }
+            }
+        }
         if !session.conversation_blocks {
             body.remove("blocks");
         }
+        item.as_object_mut().expect("native item").remove("_source");
+        item.as_object_mut()
+            .expect("native item")
+            .remove("_oversized_bytes");
+        item.as_object_mut()
+            .expect("native item")
+            .remove("_oversized_payload_bytes");
     }
     if basis != self::basis(source)? {
         return Err(invalidated());
@@ -374,46 +506,30 @@ pub(super) async fn chunk_local(
     offset: u64,
 ) -> Result<Value, ApiError> {
     require_scope(session, "read.projections")?;
-    if wanted.len() != 64 || !wanted.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(invalidated());
-    }
-    // Source discovery and bounded transcript scans run off the async reactor. No cache or
-    // durable reference registry is introduced by this request.
+    let locator = locator(wanted, session_id)?;
+    let _slot = read_slot(&READ_SLOTS)?;
     let request_state = state.clone();
     let request_session = session_id.to_owned();
-    let request_reference = wanted.to_owned();
-    let (source, before, value) = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+    let (bytes, media) = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
         let source = source(&request_state, &request_session)?;
-        let before = basis(&source)?;
-        let items =
-            crate::external_sessions::normalized_timeline(&source).map_err(ApiError::internal)?;
-        let mut found = None;
-        for item in &items {
-            find_content(
-                &item["body"],
-                "/body",
-                item,
-                &before,
-                &request_session,
-                &request_reference,
-                &mut found,
-            );
+        let value = located_value(&source, &locator)?;
+        let result = if locator.image {
+            image_bytes(&source, &value)?
+        } else {
+            (
+                serde_json::to_vec(&value).map_err(ApiError::internal)?,
+                "application/json".to_owned(),
+            )
+        };
+        // Recheck this record after fetching bytes; an append does not affect its digest.
+        let rebound = self::source(&request_state, &request_session)?;
+        if located_value(&rebound, &locator)? != value {
+            return Err(invalidated());
         }
-        Ok((source, before, found.ok_or_else(invalidated)?))
+        Ok(result)
     })
     .await
     .map_err(ApiError::internal)??;
-    let (bytes, media) = if image(&value) {
-        image_bytes(&source, &value).await?
-    } else {
-        (
-            serde_json::to_vec(&value).map_err(ApiError::internal)?,
-            "application/json".to_owned(),
-        )
-    };
-    if before != basis(&source)? || basis(&self::source(state, session_id)?)? != before {
-        return Err(invalidated());
-    }
     let start =
         usize::try_from(offset).map_err(|_| validation("content offset is out of range"))?;
     if start > bytes.len() {
@@ -427,75 +543,13 @@ pub(super) async fn chunk_local(
     )
 }
 
-fn find_content(
-    value: &Value,
-    pointer: &str,
-    item: &Value,
-    basis: &str,
-    session: &str,
-    wanted: &str,
-    found: &mut Option<Value>,
-) {
-    if found.is_some() {
-        return;
-    }
-    if reference(basis, session, item, pointer) == wanted {
-        *found = Some(value.clone());
-        return;
-    }
-    match value {
-        Value::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                find_content(
-                    value,
-                    &format!("{pointer}/{index}"),
-                    item,
-                    basis,
-                    session,
-                    wanted,
-                    found,
-                );
-            }
-        }
-        Value::Object(values) => {
-            for (key, value) in values {
-                find_content(
-                    value,
-                    &format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1")),
-                    item,
-                    basis,
-                    session,
-                    wanted,
-                    found,
-                );
-            }
-        }
-        _ => {}
-    }
-}
-
-async fn image_bytes(
-    source: &ExternalSession,
-    value: &Value,
-) -> Result<(Vec<u8>, String), ApiError> {
-    let encoded = value
-        .get("data")
-        .or_else(|| value.pointer("/source/data"))
-        .or_else(|| value.get("image_url").filter(|value| value.is_string()))
-        .or_else(|| value.pointer("/image_url/url"))
-        .or_else(|| value.get("url"))
-        .and_then(Value::as_str)
+fn image_bytes(source: &ExternalSession, value: &Value) -> Result<(Vec<u8>, String), ApiError> {
+    let encoded = image_source(value)
         .ok_or_else(|| transcript_unavailable("native image has no readable source"))?;
-    let mut media = image_media(value).to_owned();
     let bytes = if let Some(uri) = encoded.strip_prefix("data:") {
         let (header, body) = uri
             .split_once(',')
             .ok_or_else(|| validation("native image data URI is malformed"))?;
-        media = header
-            .split(';')
-            .next()
-            .unwrap_or("application/octet-stream")
-            .to_owned();
         if header.ends_with(";base64") {
             STANDARD
                 .decode(body)
@@ -507,62 +561,33 @@ async fn image_bytes(
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(validation("native blob reference is malformed"));
         }
-        // OMP/Pi native layout is <agent-home>/sessions/<project>/<session>.jsonl;
-        // its provider-owned blob store is <agent-home>/blobs/<sha256>.
-        let home = source
-            .transcript
-            .ancestors()
-            .find(|path| path.file_name().is_some_and(|name| name == "sessions"))
-            .and_then(|path| path.parent())
-            .ok_or_else(|| transcript_unavailable("native blob store is not bound"))?;
-        let file = std::fs::File::open(home.join("blobs").join(digest))
-            .map_err(|_| transcript_unavailable("native image blob is missing"))?;
-        let mut bytes = Vec::new();
-        file.take((IMAGE_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(ApiError::internal)?;
+        let root = blob_root(source)?;
+        let bytes = read_blob(&root, &root.join(digest))?;
+        if hex::encode(Sha256::digest(&bytes)) != digest {
+            return Err(invalidated());
+        }
         bytes
     } else if let Some(path) = encoded.strip_prefix("file://") {
         let decoded =
             urlencoding::decode(path).map_err(|_| validation("native file URI is malformed"))?;
-        let file = std::fs::File::open(decoded.as_ref())
-            .map_err(|_| transcript_unavailable("native image file is missing"))?;
-        let mut bytes = Vec::new();
-        file.take((IMAGE_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(ApiError::internal)?;
+        let root = blob_root(source)?;
+        let path = std::path::Path::new(decoded.as_ref());
+        let digest = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                validation("native file URI must name a content-addressed harness blob")
+            })?;
+        let bytes = read_blob(&root, path)?;
+        if hex::encode(Sha256::digest(&bytes)) != digest {
+            return Err(invalidated());
+        }
         bytes
     } else if encoded.starts_with("https://") || encoded.starts_with("http://") {
-        let response = reqwest::Client::new()
-            .get(encoded)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            .map_err(|_| transcript_unavailable("native image URL could not be read by its owner"))?
-            .error_for_status()
-            .map_err(|_| transcript_unavailable("native image URL returned an error"))?;
-        if let Some(content_type) = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-        {
-            media = content_type.to_owned();
-        }
-        if response
-            .content_length()
-            .is_some_and(|size| size > IMAGE_BYTES as u64)
-        {
-            return Err(validation("native image exceeds the 32 MiB read limit"));
-        }
-        let mut response = response;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(ApiError::internal)? {
-            if bytes.len().saturating_add(chunk.len()) > IMAGE_BYTES {
-                return Err(validation("native image exceeds the 32 MiB read limit"));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        bytes
+        return Err(transcript_unavailable(
+            "external image link: open it explicitly in the client; the owner does not fetch URLs",
+        ));
     } else {
         STANDARD
             .decode(encoded)
@@ -571,7 +596,109 @@ async fn image_bytes(
     if bytes.len() > IMAGE_BYTES {
         return Err(validation("native image exceeds the 32 MiB read limit"));
     }
+    let media = detected_media(&bytes).to_owned();
     Ok((bytes, media))
+}
+
+fn blob_root(source: &ExternalSession) -> Result<std::path::PathBuf, ApiError> {
+    if !matches!(
+        source.driver,
+        crate::external_sessions::ExternalDriver::Omp
+            | crate::external_sessions::ExternalDriver::Pi
+    ) {
+        return Err(transcript_unavailable("native blob store is not bound"));
+    }
+    let root = source
+        .transcript
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "sessions"))
+        .and_then(|path| path.parent())
+        .ok_or_else(|| transcript_unavailable("native blob store is not bound"))?
+        .join("blobs");
+    let metadata = std::fs::symlink_metadata(&root)
+        .map_err(|_| transcript_unavailable("native blob store is missing"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(validation(
+            "native blob store must be a bound directory, not a symlink",
+        ));
+    }
+    let parent = root
+        .parent()
+        .expect("blob store parent")
+        .canonicalize()
+        .map_err(ApiError::internal)?;
+    let canonical = root.canonicalize().map_err(ApiError::internal)?;
+    if canonical.parent() != Some(parent.as_path()) {
+        return Err(validation(
+            "native blob store escaped its bound provider home",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn read_blob(root: &std::path::Path, path: &std::path::Path) -> Result<Vec<u8>, ApiError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| transcript_unavailable("native image blob is missing"))?;
+    if canonical.parent() != Some(root) {
+        return Err(validation(
+            "native image path is outside the bound harness blob store",
+        ));
+    }
+    let name = canonical
+        .file_name()
+        .ok_or_else(|| validation("native image path is invalid"))?;
+    #[cfg(unix)]
+    let file = {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root)
+            .map_err(ApiError::internal)?;
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| validation("native image path is invalid"))?;
+        // The open directory pins the store, and O_NOFOLLOW refuses last-moment symlink swaps.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(transcript_unavailable(
+                "native image blob could not be opened",
+            ));
+        }
+        unsafe { std::fs::File::from_raw_fd(fd) }
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(root.join(name)).map_err(ApiError::internal)?;
+    if !file.metadata().map_err(ApiError::internal)?.is_file() {
+        return Err(validation("native image blob is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take((IMAGE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(ApiError::internal)?;
+    Ok(bytes)
+}
+
+fn detected_media(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else {
+        "application/octet-stream"
+    } // SVG/HTML and unrecognized bytes never get an active image MIME.
 }
 
 #[cfg(test)]
@@ -608,7 +735,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let raw =
             json!({"type":"future","nested":{"token":"invented-token","large":"é".repeat(10000)}});
-        let pixels = vec![7u8; CHUNK_BYTES + 123];
+        let mut pixels = vec![7u8; CHUNK_BYTES + 123];
+        pixels[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
         let image = json!({"type":"image","mimeType":"image/png","data":STANDARD.encode(&pixels)});
         let source = fixture(
             root.path(),
@@ -640,7 +768,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["reasoning", "tool_call", "unknown", "image"]
         );
-        assert_eq!(blocks[1]["payload"]["arguments"]["nested"]["value"], "full");
+        assert_eq!(blocks[1]["payload"], json!({"body_ref":true}));
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item["type"] == "tool_call")
+                .unwrap()["body"]["arguments"]["nested"]["value"],
+            "full"
+        );
         assert_eq!(blocks[2]["continuation"]["reason"], "size-limit");
         assert!(blocks[2]["payload"].as_str().unwrap().contains("truncated"));
         assert_eq!(blocks[3]["payload"], json!({}));
@@ -650,26 +785,20 @@ mod tests {
                 .contains(&STANDARD.encode(&pixels))
         );
         assert!(serde_json::to_vec(&items).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
-        let before = basis(&source).unwrap();
         let original = crate::external_sessions::normalized_timeline(&source).unwrap();
-        let mut unknown = None;
-        for item in &original {
-            find_content(
-                &item["body"],
-                "/body",
-                item,
-                &before,
-                &source.id,
-                blocks[2]["continuation"]["ref"].as_str().unwrap(),
-                &mut unknown,
-            );
-        }
-        assert_eq!(unknown.unwrap(), json!({"raw":raw}));
+        let location = locator(
+            blocks[2]["continuation"]["ref"].as_str().unwrap(),
+            &source.id,
+        )
+        .unwrap();
+        assert_eq!(
+            located_value(&source, &location).unwrap(),
+            json!({"raw":raw})
+        );
         let (decoded, mime) = image_bytes(
             &source,
             &original.last().unwrap()["body"]["blocks"][0]["payload"],
         )
-        .await
         .unwrap();
         assert_eq!(decoded, pixels);
         assert_eq!(mime, "image/png");
@@ -705,7 +834,8 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt as _;
         let root = tempfile::tempdir().unwrap();
-        let pixels = vec![11u8; CHUNK_BYTES + 101];
+        let mut pixels = vec![11u8; CHUNK_BYTES + 101];
+        pixels[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
         let large = json!({"type":"future", "token":"invented-token", "large":"é".repeat(10000)});
         let native = fixture(
             root.path(),
@@ -773,6 +903,18 @@ mod tests {
             .unwrap();
         assert_eq!(result.len(), CHUNK_BYTES);
         assert_eq!(first["value"]["size"], pixels.len());
+        // Native appends between chunks preserve both image and unknown-block refs.
+        use std::io::Write as _;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&native.transcript).unwrap(), "{}", json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"appended while fetching"}]}})).unwrap();
+        let (status, grown) = request(format!("/v1/client/sessions/{id}/timeline"), true).await;
+        assert_eq!(status, StatusCode::OK, "{grown}");
+        assert!(
+            grown["value"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["body"]["text"] == "appended while fetching")
+        );
         let next = first["value"]["next_offset"].as_u64().unwrap();
         let (status, last) = request(format!("{route}?offset={next}"), true).await;
         assert_eq!(status, StatusCode::OK, "{last}");
@@ -840,17 +982,21 @@ mod tests {
             token,
             reference(&before, &source.id, &revised, "/body/blocks/0/payload")
         );
+        let location = locator(&token, &source.id).unwrap();
+        assert!(locator(&token, "session/other").is_err());
+        let mut forged = token.clone();
+        forged.push('x');
+        assert!(locator(&forged, &source.id).is_err());
+        std::fs::write(&source.transcript, "replacement\n").unwrap();
+        assert_eq!(
+            before,
+            basis(&source).unwrap(),
+            "same inode, but entry digest must refuse the edit"
+        );
+        assert!(located_value(&source, &location).is_err());
+        std::fs::rename(&source.transcript, source.transcript.with_extension("old")).unwrap();
         std::fs::write(&source.transcript, "replacement\n").unwrap();
         assert_ne!(before, basis(&source).unwrap());
-        assert_ne!(
-            token,
-            reference(
-                &basis(&source).unwrap(),
-                &source.id,
-                item,
-                "/body/blocks/0/payload"
-            )
-        );
         assert_eq!(invalidated().code, "conversation-content-invalidated");
     }
 
@@ -899,6 +1045,316 @@ mod tests {
                 .unwrap_err()
                 .code,
             "conversation-content-invalidated"
+        );
+    }
+    #[tokio::test]
+    async fn images_do_not_grant_file_or_network_authority_or_trust_native_mime() {
+        let root = tempfile::tempdir().unwrap();
+        let source = fixture(root.path(), json!([]));
+        let blobs = root.path().join(".omp/agent/blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let png = b"\x89PNG\r\n\x1a\npassive-invented-test";
+        let digest = hex::encode(Sha256::digest(png));
+        let path = blobs.join(&digest);
+        std::fs::write(&path, png).unwrap();
+        for data in [
+            format!("blob:sha256:{digest}"),
+            format!("file://{}", path.display()),
+            format!("data:text/html;base64,{}", STANDARD.encode(png)),
+        ] {
+            let (bytes, media) = image_bytes(
+                &source,
+                &json!({"type":"image","mimeType":"text/html","data":data}),
+            )
+            .unwrap();
+            assert_eq!(bytes, png);
+            assert_eq!(media, "image/png");
+        }
+        let secret = root.path().join("invented-key");
+        std::fs::write(&secret, "invented-private-key").unwrap();
+        assert!(
+            image_bytes(
+                &source,
+                &json!({"type":"image","data":format!("file://{}",secret.display())})
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            let escape = blobs.join("escape");
+            std::os::unix::fs::symlink(&secret, &escape).unwrap();
+            assert!(
+                image_bytes(
+                    &source,
+                    &json!({"type":"image","data":format!("file://{}",escape.display())})
+                )
+                .is_err()
+            );
+        }
+        for bytes in [
+            b"<svg><script>alert(1)</script></svg>".as_slice(),
+            b"<html>active</html>",
+            b"invented-private-key",
+        ] {
+            let (_, mime) = image_bytes(
+                &source,
+                &json!({"type":"image","mimeType":"image/png","data":STANDARD.encode(bytes)}),
+            )
+            .unwrap();
+            assert_eq!(mime, "application/octet-stream");
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        for url in [
+            format!(
+                "http://{}/redirect-to-private",
+                listener.local_addr().unwrap()
+            ),
+            "http://169.254.169.254/latest/meta-data/".into(),
+            "https://example.invalid/image".into(),
+        ] {
+            let value = json!({"type":"image","url":url});
+            assert!(external_image(&value));
+            assert!(image_bytes(&source, &value).is_err());
+        }
+        let linked = fixture(
+            root.path(),
+            json!([{"type":"image_url","image_url":{"url":"http://127.0.0.1/invented-image"}}]),
+        );
+        let mut session = ClientSession::local(Some("person/example")).unwrap();
+        session.conversation_blocks = true;
+        let page = read(&linked, &session, &linked.id).unwrap();
+        let link = page
+            .iter()
+            .flat_map(|item| item["body"]["blocks"].as_array().into_iter().flatten())
+            .find(|block| block["kind"] == "image_link")
+            .unwrap();
+        assert_eq!(
+            link["payload"]["image_url"]["url"],
+            "http://127.0.0.1/invented-image"
+        );
+        assert!(link.get("continuation").is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "owner must not make even the first HTTP request"
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_display_key_uses_projection_scope_for_raw_content_and_revocation() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let native = fixture(
+            root.path(),
+            json!([{ "type":"future", "secret":"invented-token", "large":"x".repeat(10000) }]),
+        );
+        let mut state = super::super::tests::test_state_named(root.path(), "paired-owner-test");
+        state.native_session_home = Some(root.path().into());
+        let mut local = ClientSession::local(Some("person/example")).unwrap();
+        local.conversation_blocks = true;
+        let entries = read(&native, &local, &native.id).unwrap();
+        let token = entries
+            .iter()
+            .flat_map(|item| item["body"]["blocks"].as_array().into_iter().flatten())
+            .find_map(|block| block["continuation"]["ref"].as_str())
+            .unwrap();
+        let route = format!(
+            "/v1/client/conversations/{}/content/{token}/chunk",
+            native.id.trim_start_matches("session/")
+        );
+        let credential = "invented-display-credential";
+        let app = super::super::super::fabric_router(state.clone());
+        for (scopes, expected) in [
+            (json!([]), StatusCode::FORBIDDEN),
+            (json!(["read.projections"]), StatusCode::OK),
+        ] {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "custom/client/invented-display".into(),
+                    kind: "custom.client.pairing-completed".into(),
+                    actor: Some("person/example".into()),
+                    fields: BTreeMap::from([
+                        (
+                            "credential_hash".into(),
+                            json!(credential_digest(credential)),
+                        ),
+                        ("session_actor".into(), json!("client/invented-display")),
+                        ("person_id".into(), json!("person/example")),
+                        ("scopes".into(), scopes),
+                        (
+                            "expires_at_unix_ms".into(),
+                            json!(client_now_ms() as u64 + 60000),
+                        ),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&route)
+                        .header(AUTHORIZATION, format!("Bearer {credential}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::OK {
+                let bytes = axum::body::to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                let raw = STANDARD
+                    .decode(value["value"]["data"].as_str().unwrap())
+                    .unwrap();
+                assert!(String::from_utf8(raw).unwrap().contains("invented-token"));
+            }
+        }
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/client/invented-display".into(),
+                kind: "custom.client.pairing-revoked".into(),
+                actor: Some("person/example".into()),
+                fields: BTreeMap::new(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(route)
+                    .header(AUTHORIZATION, format!("Bearer {credential}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn concurrent_read_limit_has_no_waiting_backlog() {
+        let slots = tokio::sync::Semaphore::new(4);
+        let held: Vec<_> = (0..4).map(|_| slots.try_acquire().unwrap()).collect();
+        assert_eq!(read_slot(&slots).unwrap_err().code, "rate-limited");
+        drop(held);
+        assert!(read_slot(&slots).is_ok());
+    }
+    #[test]
+    fn sqlite_large_rows_get_continuations_and_refs_survive_wal_appends() {
+        use rusqlite::{Connection, params};
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("opencode.db");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, time_created INTEGER, data TEXT);").unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES ('message-one','native-test',1,?1)",
+                params![json!({"role":"assistant"}).to_string()],
+            )
+            .unwrap();
+        let output = "x".repeat(17 * 1024 * 1024);
+        let tool = json!({"type":"tool","callID":"call-one","tool":"shell","state":{"status":"completed","input":{"command":"invented"},"output":output}});
+        connection
+            .execute(
+                "INSERT INTO part VALUES ('part-one','native-test','message-one',1,?1)",
+                params![tool.to_string()],
+            )
+            .unwrap();
+        let mut native = fixture(root.path(), json!([]));
+        native.driver = ExternalDriver::OpenCode;
+        native.transcript = database;
+        let mut session = ClientSession::local(Some("person/example")).unwrap();
+        session.conversation_blocks = true;
+        let page = read(&native, &session, &native.id).unwrap();
+        let item = page
+            .iter()
+            .find(|item| item["type"] == "tool_result")
+            .expect("oversized native result is retained");
+        assert_eq!(
+            item["body"]["blocks"][0]["payload"],
+            json!({"body_ref":true})
+        );
+        assert!(
+            item["body"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("truncated")
+        );
+        let reference = item["body"]["blocks"][0]["continuation"]["ref"]
+            .as_str()
+            .unwrap();
+        let location = locator(reference, &native.id).unwrap();
+        assert!(serde_json::to_vec(&page).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
+        let bound = basis(&native).unwrap();
+        connection.execute("INSERT INTO part VALUES ('later','native-test','message-one',2,'{\"type\":\"text\",\"text\":\"later\"}')",[]).unwrap();
+        connection
+            .execute(
+                "UPDATE message SET data = ?1 WHERE id = 'message-one'",
+                params![
+                    json!({"role":"assistant","tokens":{"output":42},"completed":true}).to_string()
+                ],
+            )
+            .unwrap();
+        assert_eq!(basis(&native).unwrap(), bound);
+        assert_eq!(
+            located_value(&native, &location).unwrap()["content"],
+            output
+        );
+        let raw = json!({"type":"future","large":output});
+        connection
+            .execute(
+                "INSERT INTO part VALUES ('oversized-unknown','native-test','message-one',3,?1)",
+                params![raw.to_string()],
+            )
+            .unwrap();
+        let page = read(&native, &session, &native.id).unwrap();
+        let block = page
+            .iter()
+            .flat_map(|item| item["body"]["blocks"].as_array().into_iter().flatten())
+            .find(|block| block["kind"] == "unknown")
+            .expect("oversized raw item gets a display stub, not dropped");
+        let token = block["continuation"]["ref"].as_str().unwrap();
+        let full = located_value(&native, &locator(token, &native.id).unwrap()).unwrap();
+        assert_eq!(full, json!({"raw":raw}));
+        assert_eq!(
+            block["continuation"]["size"],
+            serde_json::to_vec(&full).unwrap().len()
+        );
+        assert!(serde_json::to_vec(&page).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
+        connection.execute("UPDATE part SET data = '{\"type\":\"text\",\"text\":\"edited\"}' WHERE id = 'part-one'",[]).unwrap();
+        assert!(located_value(&native, &location).is_err());
+        connection
+            .execute(
+                "UPDATE message SET data = ?1 WHERE id = 'message-one'",
+                params![json!({"role":"future-role-token"}).to_string()],
+            )
+            .unwrap();
+        let page = read(&native, &session, &native.id).unwrap();
+        assert!(page.iter().all(|item| item["role"] == "system"));
+        let block = page
+            .iter()
+            .flat_map(|item| item["body"]["blocks"].as_array().into_iter().flatten())
+            .find(|block| block["continuation"].get("ref").is_some())
+            .unwrap();
+        let token = block["continuation"]["ref"].as_str().unwrap();
+        let location = locator(token, &native.id).unwrap();
+        assert_eq!(location.native["role"], "system");
+        assert!(!location.native.to_string().contains("future-role-token"));
+        assert_eq!(
+            located_value(&native, &location).unwrap()["source_role"],
+            "future-role-token"
         );
     }
 }

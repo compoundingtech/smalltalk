@@ -1084,3 +1084,15 @@ fn a_persons_signed_message_says_which_device_signed_it_and_whether_it_checks() 
     // An old message with no signature says nothing.
     assert_eq!(mark(serde_json::json!({"verdict": "unsigned"})), None);
 }
+
+#[test]
+fn native_unknown_system_blocks_and_user_reasoning_tags_remain_visible() {
+    let raw = "[unrecognized future]\n{\"raw\":{\"token\":\"invented-token\"}}";
+    let entry: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({"id":"timeline-entry/raw","sequence":1,"revision":1,"timestamp":"2026-10-06T12:00:00Z","role":"system","type":"content","final":true,"body":{"media_type":"text/plain","text":raw,"blocks":[{"id":"raw","kind":"unknown","source_type":"future","payload":{"raw":{"token":"invented-token"}}}]}})).unwrap();
+    let shown = crate::adapt::conversation(&[entry], &std::collections::BTreeMap::new());
+    assert!(matches!(&shown[0].body, Body::Event(text) if text == raw));
+    assert_eq!(
+        clean_message_text("<analysis>visible invented-token</analysis>"),
+        "<analysis>visible invented-token</analysis>"
+    );
+}

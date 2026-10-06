@@ -199,7 +199,11 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                         continue;
                     }
                 }
-                // Harness markup becomes what it means; context blocks disappear.
+                // Structural harness envelopes become what they mean.
+                if content.blocks.iter().any(|block| block.kind != "text") || raw.starts_with("[unrecognized ") {
+                    stamped.push((entry.timestamp.clone(), Entry { id:entry.id.clone(), at, body: if entry.role == TimelineRole::User { Body::User(raw.to_owned()) } else { Body::Event(raw.to_owned()) } }));
+                    continue;
+                }
                 let mut bodies = harness_bodies(
                     entry.role == TimelineRole::User,
                     content.text.as_deref().unwrap_or(""),
@@ -556,24 +560,8 @@ fn self_closing_tag(line: &str) -> bool {
 }
 
 /// Blocks harnesses add to a transcript for the model's benefit. None of it is conversation.
-const CONTEXT_BLOCKS: &[&str] = &[
-    "system-reminder",
-    "local-command-caveat",
-    "environment_context",
-    "permissions",
-    "collaboration_mode",
-    "multi_agent_mode",
-    "apps_instructions",
-    "plugins_instructions",
-    "skills_instructions",
-    "user_instructions",
-    "developer_instructions",
-    "command-message",
-    "command-args",
-];
-
 /// Take every `<tag …>…</tag>` block out of `text`, returning the inner texts. A block that
-/// never closes runs to the end, so a truncated wrapper cannot leak either.
+/// never closes runs to the end. Only structural delivery/command wrappers are parsed.
 fn take_blocks(text: &mut String, tag: &str) -> Vec<String> {
     let mut found = Vec::new();
     let open = format!("<{tag}");
@@ -916,8 +904,8 @@ fn harness_bodies(
             bodies.push(Body::User(answers.join("\n")));
         }
     }
-    for tag in CONTEXT_BLOCKS {
-        take_blocks(&mut text, tag);
+    if raw.contains("<command-name") {
+        take_blocks(&mut text, "command-args"); // already displayed with the parsed command
     }
     // st's own notes beside a delivery tell the agent something; the person never typed them.
     let text = text
@@ -926,8 +914,9 @@ fn harness_bodies(
         .collect::<Vec<_>>()
         .join("\n");
     let rest = clean_message_text(&text);
-    if is_user && !rest.is_empty() {
-        bodies.insert(0, Body::User(rest));
+    if !rest.is_empty() {
+        if is_user { bodies.insert(0, Body::User(rest)); }
+        else { bodies.push(Body::Event(rest)); }
     }
     bodies
 }

@@ -6,7 +6,10 @@ final class ConversationNormalizationTests: XCTestCase {
     func testNormalizedFallbackDecodesWithFrozenOldTimelineEnum() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }
-        let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/normalized-conversation-legacy.json"))
+        let envelopeData = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/normalized-conversation-legacy.json"))
+        let envelope = try JSONSerialization.jsonObject(with: envelopeData) as! [String: Any]
+        let page = envelope["value"] as! [String: Any]
+        let data = try JSONSerialization.data(withJSONObject: page["items"]!)
         let old = try JSONDecoder().decode([LegacyTimelineEntry].self, from: data)
         XCTAssertEqual(old.count, 6)
         guard case .toolCall(let call) = old[1].body else { return XCTFail("missing full tool arguments") }

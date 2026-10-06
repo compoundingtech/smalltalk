@@ -1,11 +1,11 @@
 # Conversation normalization design (#1561)
 
-Nathan decided on 2026-10-06: no outbox/queue and no stored agent history; status
+The project owner decided on 2026-10-06: no outbox/queue and no stored agent history; status
 is a best-effort latest-wins value with a very short timeout. Conversations are
 read from their owner machine at request time, including managed seats. cos owns
 a separate mission to remove the outbox and stored transcript operations. The
 first implementation includes this design; its wire contract still goes
-to Nathan via the curator for exact-head approval before implementation is queued.
+to the project owner via the curator for exact-head approval before implementation is queued.
 If a harness shows content in its terminal, st shows it in the conversation. Normalize
 for stui, web and phone without token filtering, secret scrubbing, allow-lists or
 fail-closed sanitizers. Access checks remain. Show only reasoning the harness exposes;
@@ -17,12 +17,40 @@ Keep the timeline envelope (`id`, source `sequence`, `revision`, `timestamp`, `r
 `type`, `final`, `body`) and use a negotiated `body.blocks` array. Each block has
 `id`, `kind`, `source_type` and `payload`; optional `continuation` describes an
 owner-fetched remainder. Kinds are text, reasoning, tool_call, tool_output, image,
-job, subagent, ask, status and unknown. Preserve native identities, call/result
+job, subagent, ask, status, image_link and unknown. For standard known bodies,
+`payload: {body_ref: true}` refers to the containing entry's fallback body, avoiding
+an identical second copy; a continuation still fetches the original full body. Preserve native identities, call/result
 correlation, revisions, supplied timing and failure state. Job/subagent payloads
 preserve supplied parent/activity links; an historical ask is never a live picker.
 Unknown uses `payload: {raw: <original JSON>}` and retains the native type and role
 when supplied. Future fields and full structured tool arguments survive; unknown
-blocks have a readable JSON view. Unknown role means unknown attribution, not omission.
+blocks have a readable JSON view. Rust and phone adapters preserve tagged text and
+raw system/unknown fallbacks; structural mail/command envelopes can still normalize
+into their existing display shapes. Setup-like XML context is not stripped from
+entries the API has already exposed. Unknown role means unknown attribution, not omission.
+
+### Native record visibility audit
+
+Omit only established native setup metadata or an explicit harness-hidden marker.
+When visibility is unproven, retain the raw record instead of guessing it is internal.
+
+| Harness records | Decision and reason |
+| --- | --- |
+| Codex `session_meta` | Omit the session identity/cwd setup header; it is not a terminal turn. |
+| Codex `event_msg`, `turn_context`, `token_usage_record`, `world_state`, response `ghost_snapshot` | Retain raw; terminal visibility varies by native subtype/release. No generic exclusion of event mirrors. |
+| Codex message roles `system`/`developer` | Omit provider bootstrap instructions, not terminal chat turns; unknown/future roles are retained raw. |
+| Claude `progress`, `file-history-snapshot`, `file-history-delta`, `queue-operation`, `permission-mode`, `mode`, `atis-latch`, `last-prompt`, `ai-title`, `custom-title`, `cost-state`, `agent-name`, `tag`, `pr-link`, `bridge-session`, `fork-context-ref` | Retain raw; no demonstrated generic harness-hidden rule. |
+| Claude attachments other than queued commands and system records without text | Retain raw; queued prompts and textual notices keep their known display shape. |
+| Pi/OMP `session` | Omit the native session setup header. |
+| Pi/OMP `custom_message` with explicit `display: false` | Omit because the native extension explicitly marks it hidden from its terminal. |
+| Pi/OMP `custom`, `label`, `session_info`, `credential_pin`, `title`, model/thinking changes and summary records without text | Retain raw; summaries with text remain readable native notes. |
+| OpenCode `snapshot` | Retain raw; visibility is not established across releases. |
+| Any unknown record/block/role | Retain original JSON and original attribution with a visible unknown label. |
+
+These decisions avoid silent per-type exclusions. Bounded native input windows and
+undecodable records still produce visible size/read notices; they are transport
+limitations. Oversized OpenCode items receive bounded display stubs and full owner
+continuations, rather than being dropped before ref generation.
 
 Start in `crates/st3/src/external_sessions.rs`; use the same normalizer for owner
 side-input updates, reads and follow. Remove deliberate visible-reasoning exclusions, image
@@ -42,15 +70,39 @@ Use `GET /v1/client/conversations/{session}/content/{ref}/chunk?offset=N` for
 image bytes and oversized block bodies. The opaque ref is scoped to the authorized
 session, entry/revision and owner source identity, not an arbitrary path or URL.
 Return bounded bytes with media type, total size and next offset; check authorization
-and binding on every fetch. Resolve native blobs, inline/base64 bytes and harness-shown
-image links on the owner. Reuse transport/chunk machinery, not message-attachment
-authority: a native image need not have a graph message ID. Source changes invalidate
-refs visibly. Native absence or fetch failure is availability, not content withholding.
+and binding on every fetch. Inline/base64 pixels and files in the bound Pi/OMP
+content-addressed provider blob store can be read on demand. Blob digests are
+verified on every fetch, so changed pixels cannot be joined across chunks. A transcript `file://` URI grants no
+access outside that store; symlink escapes and non-regular files are rejected.
+The daemon never requests transcript HTTP(S) URLs, including their redirects;
+`image_link` retains the original URL and JSON for explicit opening by the client.
+Detected PNG/JPEG/GIF/WebP signatures determine image MIME; native MIME labels are
+ignored. SVG/HTML and unrecognized bytes remain fetchable as opaque octets and
+must never be rendered as active image/HTML content. Reuse transport/chunk
+machinery, not message-attachment authority: a native image need not have a graph
+message ID. Native absence or fetch failure is availability, not content scrubbing.
+
+`read.projections` is the raw-transcript read scope. It authorizes full native
+reasoning, arguments/output, unknown JSON and image bytes, including secrets the
+agent saw. This includes anonymous local read-only Unix sessions, identified local
+actors, and projection-only paired display/phone keys. There is no separate secret
+filter or raw-content scope. Pairing scope changes and revocation apply to every
+chunk request, including owner-forwarded requests.
 
 The present 8 KiB/value and 1 MB/page bounds protect memory and transport only.
 The initial chunk contract returns up to 256 KiB decoded bytes; image reads have
-a visible 32 MiB limit and a five-second URL timeout. Appends also invalidate
-issued references in this first slice; clients reload rather than join revisions.
+a visible 32 MiB decoded limit. Four expensive owner timeline/chunk reads can run
+concurrently; excess reads return `rate-limited`, without a queued backlog.
+An authenticated ref contains a JSONL offset/length/digest or SQLite part/message
+identity/digest (message role/time, independent of streaming usage updates),
+entry/revision, session and stable native file identity. It contains
+no path or content. Each chunk directly normalizes only that record and checks it
+again after fetching bytes, rather than rebuilding the entire timeline or hashing
+every JSON node. Appends, including SQLite WAL growth, preserve existing refs;
+record edits, file replacement, binding changes or an owner process restart return
+`conversation-content-invalidated` with `full_resync: true`. The ephemeral owner
+HMAC key is neither stored nor replicated. Timeline reads capture a finite native
+high-water mark; concurrent appends belong to the following read.
 Count encoded response bytes, preserve valid JSON/UTF-8, and mark every clipped
 value with its reason, original size when known and continuation. Fetching the
 remainder recovers full arguments/output/unknown JSON; do not cut JSON into an
@@ -65,7 +117,7 @@ merged #1512 provides mailbox dependency wakes, not a completed conversation IVM
 
 The conversation model, prepared pages and search content remain bounded volatile
 memory: #1487's proposed SQLite-backed shape cannot persist conversation bytes under
-Nathan's decision. Rebuild after restart/eviction from the native source, without a
+the project owner's decision. Rebuild after restart/eviction from the native source, without a
 durable ingestion queue or second transcript. Validate owner availability and file
 identity/revision on requests; bring the fold to the captured native high-water mark
 or report explicit partial progress. Replacement/truncation invalidates its old basis.
@@ -151,7 +203,10 @@ The normalization mission performs none of this removal or live-store cleanup.
 
 ## Client compatibility
 
-Existing stui/iOS clients must stay usable. Swift currently decodes a closed
+Existing stui/iOS clients must stay usable. The frozen old-Swift decode fixture is
+hand-authored from six contract cases, not generated by the normalizer. Separate
+real owner HTTP tests exercise normalizer-produced legacy/negotiated responses,
+full chunk reads, paired credentials and authenticated fleet forwarding. Swift currently decodes a closed
 `TimelineType` enum, so sending new top-level kinds to old clients is breaking.
 Advertise/negotiate blocks and chunk fetch; retain existing entry types and complete
 text/JSON fallbacks with explicit transport truncation notices for legacy clients.
@@ -179,9 +234,9 @@ These are dependencies/coordination points, not approval or reasons to duplicate
 unknown bodies contradict #1561. Merged #1482 deliberately withholds image bytes/URLs;
 replace that policy with authorized owner fetch. Closed #1507/#1560's unknown-block
 allow-list and argument withholding, and #1449's sanitizer/capture slice 1, are
-superseded and must not enter this stack. Coordinate #1546 separately: Nathan's
+superseded and must not enter this stack. Coordinate #1546 separately: the project owner's
 no-outbox/latest-status decision supersedes the earlier history lane plan; cos and
-Johannes's assistant own reconciliation and removal, not this normalization builder.
+the collaborating assistant own reconciliation and removal, not this normalization builder.
 
 Normalization PRs: contract/normalizer and withholding removal; owner chunk/image
 fetch; shared/generated clients and renderers. Managed reader/writer cutover and
