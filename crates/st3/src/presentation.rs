@@ -135,6 +135,9 @@ pub(crate) fn render_mission_run(
         );
     }
     let _ = writeln!(output, "REVISION  {}", selected.revision);
+    if let Some(provenance) = &selected.provenance {
+        output.push_str(&st3::provenance::render(provenance));
+    }
     let _ = writeln!(output, "GENERATION {}", selected.generation);
     let _ = writeln!(output, "WORKSPACE {}", selected.workspace);
     let _ = writeln!(output, "REQUESTER {}", selected.requester);
@@ -1447,6 +1450,7 @@ mod tests {
 
     fn run(subject: &str, parent: Option<&str>, steps: Vec<StepRunView>) -> MissionRunView {
         MissionRunView {
+            provenance: None,
             subject: subject.into(),
             id: subject
                 .strip_prefix("mission-run/")

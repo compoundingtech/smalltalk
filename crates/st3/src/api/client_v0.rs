@@ -382,7 +382,7 @@ fn conversation_owner_host(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner))
         {
-            return Err(remote_unavailable(owner));
+            return Err(remote_unavailable_for_owner(state, owner));
         }
     }
     Ok(remote)
@@ -400,7 +400,7 @@ async fn conversation_page(
         let relay = state
             .client_relay
             .as_ref()
-            .ok_or_else(|| remote_unavailable(owner))?;
+            .ok_or_else(|| remote_unavailable_for_owner(state, owner))?;
         return relay
             .read(
                 owner,
@@ -448,7 +448,7 @@ async fn conversation_changes_value(
         let relay = state
             .client_relay
             .as_ref()
-            .ok_or_else(|| remote_unavailable(owner))?;
+            .ok_or_else(|| remote_unavailable_for_owner(state, owner))?;
         return relay
             .read(
                 owner,
@@ -5244,7 +5244,7 @@ pub(super) async fn conversation_changes(
             let relay = state
                 .client_relay
                 .as_ref()
-                .ok_or_else(|| remote_unavailable(&owner))?;
+                .ok_or_else(|| remote_unavailable_for_owner(&state, &owner))?;
             let value = relay
                 .read(
                     &owner,
@@ -5314,7 +5314,7 @@ pub(super) async fn conversation_stream(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner))
         {
-            return Err(remote_unavailable(owner));
+            return Err(remote_unavailable_for_owner(&state, owner));
         }
     } else {
         conversation_read_now(&state, &session, &session_id, query.after.as_deref())?;
@@ -5344,7 +5344,7 @@ async fn conversation_stream_socket(
                 let relay = state
                     .client_relay
                     .as_ref()
-                    .ok_or_else(|| remote_unavailable(owner))?;
+                    .ok_or_else(|| remote_unavailable_for_owner(&state, owner))?;
                 relay
                     .read(
                         owner,
@@ -6222,7 +6222,7 @@ fn remote_terminal_live_session(
         .as_ref()
         .is_none_or(|relay| !relay.reaches(&owner_host_id))
     {
-        return Err(remote_unavailable(&owner_host_id));
+        return Err(remote_unavailable_for_owner(state, &owner_host_id));
     }
     let actual = selected
         .actual
@@ -6424,7 +6424,7 @@ pub(super) async fn terminal_screen(
             let relay = state
                 .client_relay
                 .as_ref()
-                .ok_or_else(|| remote_unavailable(&host))?;
+                .ok_or_else(|| remote_unavailable_for_owner(&state, &host))?;
             if !acting_party(&session) {
                 return Err(forbidden(
                     "remote terminal screen requires a concrete person or agent",
@@ -6689,7 +6689,7 @@ async fn remote_terminal_stream_socket(
     incarnation: String,
 ) {
     let Some(relay) = state.client_relay.as_ref() else {
-        sink.fail(&remote_unavailable(&owner)).await;
+        sink.fail(&remote_unavailable_for_owner(&state, &owner)).await;
         return;
     };
     let terminal_id = client_detail_id("terminal", &id);
@@ -6928,7 +6928,7 @@ fn terminal_attachment_response(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner_host_id))
     {
-        return Err(remote_unavailable(owner_host_id));
+        return Err(remote_unavailable_for_owner(state, owner_host_id));
     }
     let latest = claims
         .last()
@@ -7969,7 +7969,7 @@ async fn create_agent(
             .client_relay
             .as_ref()
             .filter(|relay| relay.reaches(&client_host_id(&host)))
-            .ok_or_else(|| remote_unavailable(&client_host_id(&host)))?;
+            .ok_or_else(|| remote_unavailable_for_owner(state, &client_host_id(&host)))?;
         let value = relay
             .read(
                 &client_host_id(&host),
@@ -9167,7 +9167,7 @@ pub(super) async fn action(
             let relay = state
                 .client_relay
                 .as_ref()
-                .ok_or_else(|| remote_unavailable(&live.owner_host_id))?;
+                .ok_or_else(|| remote_unavailable_for_owner(&state, &live.owner_host_id))?;
             let mut value = relay
                 .read(
                     &live.owner_host_id,
@@ -9259,7 +9259,7 @@ pub(super) async fn action(
             let relay = state
                 .client_relay
                 .as_ref()
-                .ok_or_else(|| remote_unavailable(&live.owner_host_id))?;
+                .ok_or_else(|| remote_unavailable_for_owner(&state, &live.owner_host_id))?;
             let screen = relay
                 .read(
                     &live.owner_host_id,
@@ -15803,7 +15803,7 @@ mission "example/zero-run" state="ready" {
         assert_eq!(indeterminate["operational"]["actionable"], false);
     }
     #[test]
-    fn status_freshness_refreshes_after_the_agent_cache_without_resetting_since() {
+    fn status_freshness_uses_cached_card_time_without_resetting_since() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "status-cache");
         let subject = "agent/cedar";
@@ -15819,9 +15819,19 @@ mission "example/zero-run" state="ready" {
         let index = state.store.index().unwrap();
         let before = client_agent_resources(&state.store, false, "", index).unwrap();
         let before = before.iter().find(|item| item["id"] == subject).unwrap();
-        assert_eq!(before["observation"], "stale");
-        assert_eq!(before["harness_state"], "indeterminate");
+        // The quick read uses the cached card's receipt time. The backdated payload time is
+        // deliberately no longer recovered by a separate per-request history query.
+        assert_eq!(before["observation"], "current");
+        assert_eq!(before["harness_state"], "idle");
         assert!(before.get("_status_source").is_none());
+        let mut aged = vec![before.clone()];
+        let mut cached_harness = state.store.observed_harness_at(subject, index).unwrap().unwrap();
+        cached_harness.observed_at_unix_ms = client_now_ms() - 91_000;
+        aged[0]["_status_source"] = json!(cached_harness);
+        overlay_agent_resources(&state.store, &mut aged, "").unwrap();
+        assert_eq!(aged[0]["observation"], "stale");
+        assert_eq!(aged[0]["harness_state"], "indeterminate");
+        assert_eq!(aged[0]["since"], before["since"]);
         append("harness.observed", json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "observed_at_ms":client_now_ms() as u64}));
         assert_eq!(state.store.index().unwrap(), index, "same state stays local within the publish interval");
         let after = client_agent_resources(&state.store, false, "", index).unwrap();

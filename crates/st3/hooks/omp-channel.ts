@@ -548,7 +548,12 @@ export default function (pi: ExtensionAPI) {
         if (child.stdin.destroyed) return;
         child.stdin.write(JSON.stringify(frame) + "\n");
       };
-      send({ type: "session", sessionId: nativeSessionId });
+      const sessionFile = ctx.sessionManager.getSessionFile?.();
+      const sessionBinding = {
+        sessionId: nativeSessionId,
+        ...(typeof sessionFile === "string" ? { sessionFile } : {}),
+      };
+      send({ type: "session", ...sessionBinding });
 
       // Historical channels can fail their API request while Tokio still waits on a
       // blocking stdin read during shutdown. Wake that read so exit reaches the existing
@@ -605,7 +610,7 @@ export default function (pi: ExtensionAPI) {
             send({ type: "delivered", meta: accepted.meta });
             if (accepted.read) send({ type: "read", meta: accepted.meta });
           }
-          send({ type: "ready", sessionId: nativeSessionId });
+          send({ type: "ready", ...sessionBinding });
           state.todoReady = true;
           observeTodoBranch(ctx, true);
           // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
@@ -720,7 +725,9 @@ export default function (pi: ExtensionAPI) {
       if (!hydrate) return;
       // A branch hydration binds its observation provenance on the existing channel. It must
       // not restart delivery, discard held mail, or reset ask/approval authority.
-      sendFrame({ type: "session", sessionId: nativeSession });
+      const sessionFile = ctx.sessionManager.getSessionFile?.();
+      sendFrame({ type: "session", sessionId: nativeSession,
+        ...(typeof sessionFile === "string" ? { sessionFile } : {}) });
       state.todoSession = nativeSession;
       state.todoFingerprint = undefined;
       state.todoBranchKey = undefined;

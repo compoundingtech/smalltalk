@@ -1175,12 +1175,7 @@ mod tests {
                         .map(|spec| (desired.subject, spec))
                 })
                 .collect::<Vec<_>>();
-            state.store.record_resource_observation(
-                &thread.observer(), &state.store.selected_desired_revision(&thread.observer()).unwrap().unwrap(),
-                None, &thread.resource(), None,
-                &json!({"repository_id": 7, "issues": [{"number": 12, "new": false, "state": "open", "recent_comments": comments}]}),
-                0, &subscriptions,
-            ).unwrap();
+            state.store.record_resource_observation(&thread.observer(), &state.store.selected_desired_revision(&thread.observer()).unwrap().unwrap(), None, &thread.resource(), None, &json!({"repository_id": 7, "issues": [{"number": 12, "new": false, "state": "open", "recent_comments": comments}]}), 0, &subscriptions, None).unwrap();
         };
         observe(json!([]));
         apply("version 2\nstop \"agent/eval.worker\"\n", "stop");

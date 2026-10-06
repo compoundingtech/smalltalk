@@ -179,7 +179,7 @@ fn blob_parts(id: &str) -> Result<String, ApiError> {
     })
 }
 
-fn read_error(host: &str, error: anyhow::Error) -> ApiError {
+fn read_error(state: &AppState, host: &str, error: anyhow::Error) -> ApiError {
     match error.downcast_ref::<ClientReadRejected>() {
         Some(rejected) if rejected.code != "remote-unavailable" => ApiError {
             status: StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -187,7 +187,7 @@ fn read_error(host: &str, error: anyhow::Error) -> ApiError {
             message: rejected.message.clone(),
             details: Box::default(),
         },
-        _ => remote_unavailable(host),
+        _ => remote_unavailable_for_owner(state, host),
     }
 }
 
@@ -228,7 +228,7 @@ async fn ensure_local(
     let relay = state
         .client_relay
         .as_ref()
-        .ok_or_else(|| remote_unavailable(&attachment.origin))?;
+        .ok_or_else(|| remote_unavailable_for_owner(state, &attachment.origin))?;
     let message = message.map(message_subject).unwrap_or_default();
     let mut bytes = Vec::new();
     loop {
@@ -246,17 +246,17 @@ async fn ensure_local(
                 },
             )
             .await
-            .map_err(|error| read_error(&attachment.origin, error))?;
+            .map_err(|error| read_error(state, &attachment.origin, error))?;
         let size = value["size"].as_u64().unwrap_or(u64::MAX);
         let chunk = value["data"]
             .as_str()
             .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
-            .ok_or_else(|| remote_unavailable(&attachment.origin))?;
+            .ok_or_else(|| remote_unavailable_for_owner(state, &attachment.origin))?;
         if size > MAX_BLOB_BYTES as u64
             || chunk.is_empty() && (bytes.len() as u64) < size
             || bytes.len() + chunk.len() > MAX_BLOB_BYTES
         {
-            return Err(remote_unavailable(&attachment.origin));
+            return Err(remote_unavailable_for_owner(state, &attachment.origin));
         }
         bytes.extend_from_slice(&chunk);
         if bytes.len() as u64 >= size {

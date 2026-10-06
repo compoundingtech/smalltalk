@@ -100,6 +100,8 @@ struct FrameInfo {
     agent_narrow: bool,
     /// The first palette row drawn.
     palette_top: usize,
+    /// Glasses: where the right-click menu was drawn, while it is open.
+    menu: Option<Rect>,
 }
 
 struct Demo {
@@ -337,6 +339,11 @@ pub struct Ui {
     pub(crate) simple: bool,
     /// An attached terminal shown in place of the conversation.
     pub(crate) terminal: Option<TerminalView>,
+    /// Glasses: the other terminals still attached, each behind its own tab or split. The one
+    /// whose tab has focus is `terminal`; they swap places as focus moves.
+    pub(crate) parked: Vec<TerminalView>,
+    /// Glasses: the right-click menu, while it is open.
+    pub(crate) context: Option<glass::ContextMenu>,
     /// A Ctrl-C or Ctrl-D pressed once in a terminal, waiting for its confirming second press.
     terminal_confirm: Option<(KeyCode, Instant)>,
     /// The New mission form: title, request, mission id, workspace; and the focused field.
@@ -448,6 +455,8 @@ impl Ui {
             older_wanted: RefCell::default(),
             popover: None,
             chat: None,
+            parked: Vec::new(),
+            context: None,
             said: None,
             voice: None,
             answering: None,
@@ -875,6 +884,41 @@ impl Ui {
     }
 
     /// Attach the image on this machine's clipboard to the message being written.
+    /// The top bar's connection word, clicked: live opens this machine, where its clients and
+    /// links show; anything else says why it is not reached (Nathan, 2026-10-06).
+    fn show_connection(&mut self) {
+        match self.world.link.clone() {
+            Link::Live => {
+                let machine = format!("machine/{}", self.world.host);
+                let known = self
+                    .world
+                    .machines
+                    .items()
+                    .iter()
+                    .any(|candidate| format!("machine/{}", candidate.name) == machine);
+                if !self.world.diverged.is_empty() {
+                    self.flash(format!(
+                        "Diverged from {}: what shows here can be wrong until that host is repaired",
+                        self.world.diverged.join(", ")
+                    ));
+                }
+                if known {
+                    self.open(&machine);
+                } else if self.world.diverged.is_empty() {
+                    self.flash(format!(
+                        "Connected to {} as {}",
+                        self.world.host, self.world.person
+                    ));
+                }
+            }
+            Link::Connecting => self.flash(format!(
+                "Connecting to {}: st has not answered yet",
+                self.world.host
+            )),
+            Link::Offline(reason) => self.flash(reason),
+        }
+    }
+
     fn attach_clipboard(&mut self) {
         let Some(key) = self.draft_key() else { return };
         // kitty hands over the person's own clipboard through the terminal, wherever stui
@@ -1491,7 +1535,12 @@ impl Ui {
         let selected = selected.min(listing.ids.len().saturating_sub(1));
         let mut rows: Vec<(Option<usize>, Line<'static>, bool)> = Vec::new();
         let mut selected_range = (0, 0);
+        // Whether the item before was a heading or a note: a note joins it without a gap.
+        let mut joined = false;
         for item in &listing.items {
+            let before = joined;
+            joined = matches!(item, Item::Header { .. } | Item::Note(_));
+            let joined = before;
             match item {
                 Item::Header {
                     title,
@@ -1502,7 +1551,8 @@ impl Ui {
                         rows.push((None, Line::default(), false));
                     }
                     let label = format!(" {title}");
-                    let count = format!("{count} ");
+                    // A heading with nothing to count (usage's summary) shows no number.
+                    let count = if *count == 0 { String::new() } else { format!("{count} ") };
                     let fill = width.saturating_sub(text::width(&label) + text::width(&count) + 1);
                     rows.push((
                         None,
@@ -1555,10 +1605,26 @@ impl Ui {
                 }
                 Item::Folder(line) => rows.push((None, line.clone(), false)),
                 Item::Note(line) => {
-                    if !rows.is_empty() {
+                    // Notes straight after a heading or another note read as one block; a note
+                    // after rows stands apart. Each wraps to the width instead of being cut.
+                    if !rows.is_empty() && !joined {
                         rows.push((None, Line::default(), false));
                     }
-                    rows.push((None, line.clone(), false));
+                    let runs = line
+                        .spans
+                        .iter()
+                        .map(|span| text::run(span.content.to_string(), span.style))
+                        .collect::<Vec<_>>();
+                    let lead = text::run(" ", theme::dim());
+                    for wrapped in text::wrap(
+                        &runs,
+                        width.saturating_sub(1),
+                        &[],
+                        std::slice::from_ref(&lead),
+                        None,
+                    ) {
+                        rows.push((None, wrapped, false));
+                    }
                 }
             }
         }
@@ -2384,7 +2450,7 @@ impl Ui {
     }
 
     fn draw_terminal(&self, buf: &mut Buffer, area: Rect, agent: &str) {
-        let Some(view) = self.terminal.as_ref().filter(|view| view.agent == agent) else {
+        let Some(view) = self.terminal_view(agent) else {
             buf.set_stringn(
                 area.x,
                 area.y + 1,
@@ -2425,12 +2491,19 @@ impl Ui {
                 height: area.height.saturating_sub(1),
                 ..area
             };
-            self.terminal_size
-                .set((body.height.max(1), body.width.max(1)));
-            self.terminal_body.set(Some(body));
+            // Where the mouse maps and where a new attach starts is the focused terminal's body;
+            // every attached terminal fits its own.
+            let focused = self.terminal.as_ref().is_some_and(|view| view.agent == agent)
+                || self.parked.is_empty();
+            if focused {
+                self.terminal_size
+                    .set((body.height.max(1), body.width.max(1)));
+                self.terminal_body.set(Some(body));
+            }
             native.fit(body.height, body.width);
             // The person's own cursor only where nothing is drawn over the terminal.
             let real = self.terminal_focused()
+                && self.focused_pane() == Some(Pane::Terminal(agent.to_owned()))
                 && !self.help
                 && self.popover.is_none()
                 && !self.palette_open();
@@ -3018,7 +3091,10 @@ impl Ui {
     fn input_event(&mut self, event: Event) {
         match event {
             Event::Key(key) => self.key(key),
-            Event::Paste(text) => self.paste(text),
+            Event::Paste(text) => {
+                self.sync_terminal_slot();
+                self.paste(text)
+            }
             Event::Mouse(mouse) => self.mouse(mouse),
             _ => {}
         }
@@ -3028,6 +3104,7 @@ impl Ui {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        self.sync_terminal_slot();
         // Listening takes every key until the words are sent, kept or dropped.
         if self.voice_key(key) {
             return;
@@ -3674,6 +3751,63 @@ impl Ui {
         self.attach_terminal(&agent.id);
     }
 
+    /// The view of the terminal attached for `agent`, the focused one or one behind another tab.
+    pub(crate) fn terminal_view(&self, agent: &str) -> Option<&TerminalView> {
+        self.terminal
+            .as_ref()
+            .filter(|view| view.agent == agent)
+            .or_else(|| self.parked.iter().find(|view| view.agent == agent))
+    }
+
+    pub(crate) fn terminal_view_mut(&mut self, agent: &str) -> Option<&mut TerminalView> {
+        if self.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+            return self.terminal.as_mut();
+        }
+        self.parked.iter_mut().find(|view| view.agent == agent)
+    }
+
+    /// About to attach `agent`: in a glass another attached terminal stays attached behind its
+    /// own tab (Nathan, 2026-10-06: two terminals in two splits); elsewhere it is let go.
+    pub(crate) fn park_for(&mut self, agent: &str) {
+        self.parked.retain(|view| view.agent != agent);
+        if let Some(old) = self.terminal.take()
+            && old.agent != agent
+            && self.glasses.is_some()
+        {
+            self.parked.push(old);
+        }
+    }
+
+    /// Put the terminal whose tab has focus in `terminal`, where keys and the mouse find it.
+    pub(crate) fn sync_terminal_slot(&mut self) {
+        if self.glasses.is_none() || self.parked.is_empty() {
+            return;
+        }
+        let Some(Pane::Terminal(agent)) = self.focused_pane() else {
+            return;
+        };
+        if self.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+            return;
+        }
+        if let Some(index) = self.parked.iter().position(|view| view.agent == agent) {
+            let wanted = self.parked.remove(index);
+            if let Some(old) = self.terminal.replace(wanted) {
+                self.parked.push(old);
+            }
+        }
+    }
+
+    /// Let go of `agent`'s terminal wherever it is attached; whether there was one.
+    pub(crate) fn drop_terminal(&mut self, agent: &str) -> bool {
+        let before = self.parked.len();
+        self.parked.retain(|view| view.agent != agent);
+        let focused = self.terminal.as_ref().is_some_and(|view| view.agent == agent);
+        if focused {
+            self.terminal = None;
+        }
+        focused || self.parked.len() != before
+    }
+
     /// Attach `agent`'s terminal: followed live, or the demo's in demo mode.
     pub(crate) fn attach_terminal(&mut self, agent: &str) {
         // A plain shell is a terminal of its own, not an agent's.
@@ -3684,6 +3818,7 @@ impl Ui {
                 });
                 self.flash("Opening the terminal…");
             } else {
+                self.park_for(agent);
                 self.terminal = Some(TerminalView {
                     agent: agent.to_owned(),
                     title: "shell · demo terminal".into(),
@@ -3711,6 +3846,7 @@ impl Ui {
             self.effects.push(Effect::OpenTerminal { agent: agent.id });
             self.flash("Opening the terminal…");
         } else {
+            self.park_for(&agent.id);
             self.terminal = Some(TerminalView {
                 agent: agent.id.clone(),
                 title: format!("{} · demo terminal", agent.name),
@@ -4449,13 +4585,30 @@ impl Ui {
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent) {
+        self.sync_terminal_slot();
         if self.help {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.help = false;
             }
             return;
         }
+        // The right-click menu takes the next press: a row acts, anywhere else only closes it.
+        if self.context.is_some() && matches!(mouse.kind, MouseEventKind::Down(_)) {
+            let inside = self
+                .frame
+                .borrow()
+                .menu
+                .is_some_and(|rect| contains(rect, mouse.column, mouse.row));
+            if !inside || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.context = None;
+                return;
+            }
+        }
         if self.terminal_mouse(mouse) {
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) && self.glasses.is_some() {
+            self.open_context_menu(mouse.column, mouse.row);
             return;
         }
         // A tab dragged to another place or a split's edge.
@@ -4707,6 +4860,8 @@ impl Ui {
                 self.open_from_sidebar();
             }
             Hit::Usage => self.toggle_usage(),
+            Hit::Connection => self.show_connection(),
+            Hit::Menu(action) => self.run_menu_action(action),
             Hit::SidebarSection(section) => {
                 if let Some(glasses) = self.glasses.as_mut() {
                     glasses.sidebar.section = section;

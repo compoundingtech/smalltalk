@@ -2015,25 +2015,43 @@ fn client_agent_resources(
     at: &str,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut items = store.cached_agent_resources(snapshot_index, history, |changed| {
+    let mut items = client_agent_resources_cached(store, history, snapshot_index)?;
+    overlay_agent_resources(store, &mut items, at)?;
+    Ok(items)
+}
+
+fn client_agent_resources_cached(
+    store: &Store,
+    history: bool,
+    snapshot_index: u64,
+) -> anyhow::Result<Vec<Value>> {
+    store.cached_agent_resources(snapshot_index, history, |changed| {
         let mut items = client_agent_resources_selected(store, history, snapshot_index, changed)?;
-        let subjects = items
-            .iter()
-            .filter_map(|item| item["id"].as_str().map(str::to_owned))
-            .collect::<Vec<_>>();
-        let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
-        for item in &mut items {
-            let claims = observations.get(item["id"].as_str().unwrap_or_default());
-            item["todo"] = client_v0::agent_todo_value(
-                claims.and_then(|claims| claims.get("harness.todo.observed")),
-                claims.and_then(|claims| claims.get("harness.session-file")),
-                item["incarnation_id"].as_str(),
-            );
-        }
+        add_agent_todos(store, &mut items, snapshot_index)?;
         Ok(items)
-    })?;
+    })
+}
+
+fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Result<()> {
+    let subjects = items
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let observations = store.agent_todo_observations_for(&subjects, index)?;
+    for item in items {
+        let claims = observations.get(item["id"].as_str().unwrap_or_default());
+        item["todo"] = client_v0::agent_todo_value(
+            claims.and_then(|claims| claims.get("harness.todo.observed")),
+            claims.and_then(|claims| claims.get("harness.session-file")),
+            item["incarnation_id"].as_str(),
+        );
+    }
+    Ok(())
+}
+
+fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
     let local_host = client_host_id(store.origin());
-    for item in &mut items {
+    for item in items.iter_mut() {
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
         }
@@ -2043,12 +2061,17 @@ fn client_agent_resources(
             .remove("_status_source")
             .unwrap_or(Value::Null);
         let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
-        let observation = store.seat_observation_at(
-            item["id"].as_str().unwrap_or_default(),
-            harness.as_ref(),
-            snapshot_index,
-            client_now_ms(),
-        )?;
+        // Freshness is approximate presentation. Use the card's already reduced observation;
+        // querying diagnostic and local-observation history here made every read grow with it.
+        let observation = match harness {
+            None => "missing",
+            Some(harness)
+                if client_now_ms().saturating_sub(harness.observed_at_unix_ms) > 90_000 =>
+            {
+                "stale"
+            }
+            Some(_) => "current",
+        };
         item["observation"] = json!(observation);
         if observation == "stale" && item["harness_state"] == "idle" {
             item["harness_state"] = json!("indeterminate");
@@ -2058,8 +2081,8 @@ fn client_agent_resources(
         }
         overlay_delivery_presence(item, &local_host);
     }
-    overlay_subagents(store, &mut items)?;
-    Ok(items)
+    overlay_subagents(store, items)?;
+    Ok(())
 }
 
 /// A seat's latest suspend or resume as client-v0 shows it.
@@ -3495,6 +3518,9 @@ fn client_launch_variant_resources(
                     .get(&session.mission)
                     .ok_or_else(|| anyhow::anyhow!("preview mission is missing"))?;
                 let mut normalized = serde_json::to_value(mission)?;
+                if let Some(provenance) = preview.mission.mission_provenance.get(&session.mission) {
+                    normalized["provenance"] = serde_json::to_value(provenance)?;
+                }
                 client_safe_json(&mut normalized);
                 let diagnostics = client_launch_diagnostics(preview);
                 let compact_preview =
@@ -3858,24 +3884,39 @@ async fn client_agents(
 ) -> Result<ClientPageResponse, ApiError> {
     let history = query.history;
     let status = query.status.clone();
-    client_snapshot_page(
+    let page = client_snapshot_page(
         &state,
         snapshot,
         "agents",
         &query,
         move |state, snapshot| {
-            let mut items = client_agent_resources(
-                &state.store,
-                history,
-                &snapshot.created_at,
-                snapshot.store_index,
-            )?;
+            let mut items = if status.is_some() {
+                client_agent_resources(
+                    &state.store,
+                    history,
+                    &snapshot.created_at,
+                    snapshot.store_index,
+                )?
+            } else {
+                client_agent_resources_cached(&state.store, history, snapshot.store_index)?
+            };
             if let Some(status) = status.as_deref() {
                 items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
             }
             Ok(items)
         },
     )
+    .await?;
+    if query.status.is_some() {
+        return Ok(page);
+    }
+    // Name/id ordering is independent of the live overlays. Only the returned page needs them.
+    let store = state.store.clone();
+    blocking_store(move || {
+        let (Extension(snapshot), Json(mut page)) = page;
+        overlay_agent_resources(&store, &mut page.items, &snapshot.created_at)?;
+        Ok((Extension(snapshot), Json(page)))
+    })
     .await
 }
 
@@ -3889,8 +3930,18 @@ async fn client_agents_detail(
     let history = query.history;
     let created_at = snapshot.created_at.clone();
     let snapshot_index = snapshot.store_index;
+    let subject = client_detail_id("agent", &id);
     let items = blocking_store(move || {
-        client_agent_resources(&store, history, &created_at, snapshot_index)
+        let selected = BTreeSet::from([subject]);
+        let mut items = client_agent_resources_selected(
+            &store,
+            history,
+            snapshot_index,
+            Some((&selected, &[])),
+        )?;
+        add_agent_todos(&store, &mut items, snapshot_index)?;
+        overlay_agent_resources(&store, &mut items, &created_at)?;
+        Ok(items)
     })
     .await?;
     client_detail(items, "agent", &id)
@@ -3948,7 +3999,7 @@ async fn client_sessions_detail(
                 let relay = state
                     .client_relay
                     .as_ref()
-                    .ok_or_else(|| remote_unavailable(&remote_host))?;
+                    .ok_or_else(|| remote_unavailable_for_owner(&state, &remote_host))?;
                 if !client_v0::acting_party(&session) {
                     return Err(ApiError::bad(St3Error::new(
                         "forbidden",
@@ -4003,7 +4054,7 @@ async fn forward_client_read(
     let relay = state
         .client_relay
         .as_ref()
-        .ok_or_else(|| remote_unavailable(&target))?;
+        .ok_or_else(|| remote_unavailable_for_owner(&state, &target))?;
     relay.forward(&request).await.map(Json).map_err(|error| {
         match error.downcast_ref::<crate::peer::ClientReadRejected>() {
             Some(rejected) => ApiError {
@@ -4012,7 +4063,7 @@ async fn forward_client_read(
                 message: rejected.message.clone(),
                 details: Box::new(rejected.details.clone()),
             },
-            None => remote_unavailable(&target),
+            None => remote_unavailable_for_owner(&state, &target),
         }
     })
 }
@@ -4030,6 +4081,29 @@ fn remote_unavailable(host: &str) -> ApiError {
             "no route to owner {host}: this node cannot dial it and no peer reaches it; cached data remains usable"
         ),
         details: Box::new(details),
+    }
+}
+
+/// A known dial-out owner syncs outward but has no inbound owner transport.
+fn remote_unavailable_for_owner(state: &AppState, host: &str) -> ApiError {
+    let dial_out = if let Some(relay) = &state.client_relay {
+        relay.is_dial_out_owner(host)
+    } else {
+        host.strip_prefix("host/").is_some_and(|name| {
+            state.store.fleet_view_sealed().is_ok_and(|view| {
+                view.members.iter().any(|member| {
+                    member.name == name && member.state == "current" && member.mode == "dial-out"
+                })
+            })
+        })
+    };
+    if dial_out {
+        remote_read_error(
+            host,
+            crate::peer::ClientReadRejected::dial_out_owner(host).into(),
+        )
+    } else {
+        remote_unavailable(host)
     }
 }
 
@@ -4241,7 +4315,7 @@ async fn relayed_messages_page(
         .client_relay
         .as_ref()
         .filter(|relay| relay.reaches(owner))
-        .ok_or_else(|| remote_unavailable(owner))?;
+        .ok_or_else(|| remote_unavailable_for_owner(state, owner))?;
     let value = relay
         .read(
             owner,
@@ -7856,9 +7930,16 @@ async fn preview_planning_variant(
     let kdl = planning_document_text(&state, &candidate.kdl)?;
     let (intent, mission_response) = mission_source(&state, &kdl, None)?;
     let mission = &intent.missions[&session.mission];
-    let graph = render_planning_graph(mission);
+    let mut graph = render_planning_graph(mission);
+    if let Some(provenance) = mission_response.mission_provenance.get(&session.mission) {
+        graph.push('\n');
+        graph.push_str(&crate::provenance::render(provenance));
+    }
     let diff = render_planning_diff(&mission_response);
     let mut normalized = serde_json::to_value(mission).map_err(ApiError::internal)?;
+    if let Some(provenance) = mission_response.mission_provenance.get(&session.mission) {
+        normalized["provenance"] = serde_json::to_value(provenance).map_err(ApiError::internal)?;
+    }
     client_safe_json(&mut normalized);
     let diagnostics = launch_diagnostics(&mission_response.blockers, &mission_response.warnings);
     let hash = launch_preview_token_values(
@@ -8015,6 +8096,10 @@ async fn propose_planning_variant(
     let result =
         if reviewers.is_empty() && matches!(old.revision_cutover, RevisionCutover::RestartActive) {
             RevisionSubmissionView {
+                provenance: state
+                    .store
+                    .mission_provenance(&session.mission, &mission.revision)
+                    .map_err(ApiError::internal)?,
                 status: "applied".into(),
                 mission_run: state
                     .store
@@ -8040,6 +8125,10 @@ async fn propose_planning_variant(
                 )
                 .map_err(ApiError::bad)?;
             RevisionSubmissionView {
+                provenance: state
+                    .store
+                    .mission_provenance(&session.mission, &mission.revision)
+                    .map_err(ApiError::internal)?,
                 status: proposal.status.clone(),
                 mission_run: state
                     .store
@@ -9836,14 +9925,24 @@ async fn apply(
 async fn get_mission(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<crate::model::MissionSpec>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let id = id.strip_prefix("mission/").unwrap_or(&id).to_owned();
     let store = state.store.clone();
     let id_for_read = id.clone();
-    blocking_store(move || store.mission_spec(&id_for_read, None))
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("mission `mission/{id}` does not exist")))
+    blocking_store(move || {
+        let Some(mission) = store.mission_spec(&id_for_read, None)? else {
+            return Ok(None);
+        };
+        let provenance = store.mission_provenance(&id_for_read, &mission.revision)?;
+        let mut value = serde_json::to_value(mission)?;
+        if let Some(provenance) = provenance {
+            value["provenance"] = serde_json::to_value(provenance)?;
+        }
+        Ok(Some(value))
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(|| ApiError::not_found(format!("mission `mission/{id}` does not exist")))
 }
 
 async fn put_document(
@@ -12206,7 +12305,7 @@ async fn revise_mission_run(
         .map_err(ApiError::bad)?;
     // A failed run has no active work to drain, so it adopts an unreviewed revision now.
     let reopening = current.status == "failed" && current.phase == "terminal";
-    let revised = if reviewers.is_empty()
+    let mut revised = if reviewers.is_empty()
         && (reopening || matches!(old.revision_cutover, RevisionCutover::RestartActive))
     {
         let mission_run = state
@@ -12220,6 +12319,7 @@ async fn revise_mission_run(
             )
             .map_err(ApiError::bad)?;
         RevisionSubmissionView {
+            provenance: None,
             status: "applied".into(),
             mission_run,
             proposal: None,
@@ -12236,6 +12336,7 @@ async fn revise_mission_run(
             )
             .map_err(ApiError::bad)?;
         RevisionSubmissionView {
+            provenance: None,
             status: proposal.status.clone(),
             mission_run: state
                 .store
@@ -12245,6 +12346,10 @@ async fn revise_mission_run(
             proposal: Some(proposal),
         }
     };
+    revised.provenance = state
+        .store
+        .mission_provenance(mission_id, &replacement.revision)
+        .map_err(ApiError::internal)?;
     signal_changed(&state);
     Ok(Json(revised))
 }
@@ -12260,6 +12365,10 @@ fn cached_revision_submission(
         .map_err(ApiError::internal)?
     {
         return Ok(Some(RevisionSubmissionView {
+            provenance: state
+                .store
+                .mission_provenance(&mission_run.mission, &mission_run.revision)
+                .map_err(ApiError::internal)?,
             status: "applied".into(),
             mission_run,
             proposal: None,
@@ -12283,6 +12392,10 @@ fn cached_revision_submission(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::internal("the proposal mission run is unavailable"))?;
     Ok(Some(RevisionSubmissionView {
+        provenance: state
+            .store
+            .mission_provenance(&mission_run.mission, &proposal.candidate_revision)
+            .map_err(ApiError::internal)?,
         status: proposal.status.clone(),
         mission_run,
         proposal: Some(proposal),
@@ -13917,7 +14030,7 @@ async fn host_agent_workspace(
         .client_relay
         .as_ref()
         .filter(|relay| relay.reaches(&host_id))
-        .ok_or_else(|| remote_unavailable(&host_id))?;
+        .ok_or_else(|| remote_unavailable_for_owner(&state, &host_id))?;
     let value = relay
         .read(
             &host_id,
@@ -14967,6 +15080,94 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         held.join().unwrap();
         read.join().unwrap();
         assert!(result.unwrap().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_detail_does_not_materialize_unrelated_cached_cards() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &plan.subject_tokens, "point-card")
+            .unwrap();
+        let snapshot = new_client_snapshot(&state);
+        // An unrelated cached card cannot be decoded as a harness. A point read must not touch it.
+        state
+            .store
+            .cached_agent_resources(snapshot.store_index, false, |_| {
+                Ok(vec![
+                    json!({"id":"agent/node.cobalt", "_status_source":true}),
+                ])
+            })
+            .unwrap();
+        let Json(card) = client_agents_detail(
+            State(state),
+            Extension(snapshot),
+            AxumPath("node.amber".into()),
+            Query(ClientListQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(card["id"], "agent/node.amber");
+        assert_eq!(card["name"], "node.amber");
+        assert!(card.get("todo").is_some());
+        assert!(card.get("_status_source").is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_page_overlays_only_returned_cards_and_retains_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let snapshot = new_client_snapshot(&state);
+        state.store.cached_agent_resources(snapshot.store_index, false, |_| {
+            Ok(vec![
+                json!({"id":"agent/amber", "name":"amber", "updated_at":"", "_status_source":null}),
+                json!({"id":"agent/cobalt", "name":"cobalt", "updated_at":"", "_status_source":null}),
+                // This third card is deliberately undecodable and must remain off the first pages.
+                json!({"id":"agent/indigo", "name":"indigo", "_status_source":true}),
+            ])
+        }).unwrap();
+        let (_, Json(first)) = client_agents(
+            State(state.clone()),
+            Extension(snapshot.clone()),
+            Query(ClientListQuery {
+                limit: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0]["id"], "agent/amber");
+        assert_eq!(first.items[0]["observation"], "missing");
+        assert!(first.items[0].get("_status_source").is_none());
+        assert!(first.page.has_more);
+        let (_, Json(second)) = client_agents(
+            State(state),
+            Extension(snapshot),
+            Query(ClientListQuery {
+                limit: Some(1),
+                cursor: first.page.next_cursor,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0]["id"], "agent/cobalt");
+        assert!(second.page.has_more);
     }
 
     #[test]
