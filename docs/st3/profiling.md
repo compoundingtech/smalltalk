@@ -110,11 +110,14 @@ The agent-card cache holds its mutex only while selecting or publishing immutabl
 rows, not while building cards. A request's SQLite snapshot therefore does not wait at that
 mutex behind another request's disk reads.
 
-Every five seconds the daemon's dedicated checkpoint connection attempts a passive WAL
-checkpoint outside the writer queue. Once every frame is backfilled, it attempts `TRUNCATE`
-with zero busy timeout. Active readers or writers defer recycling; the daemon never waits for
-them while holding the writer queue. The ordinary 1,000-page SQLite auto-checkpoint remains
-enabled. A passive copy can take time on slow storage, but does not acquire the writer lock.
+Every five seconds a dedicated native thread attempts a passive WAL checkpoint outside the
+writer queue. Once every frame is backfilled, it attempts `TRUNCATE` with zero busy timeout.
+Active readers or writers defer recycling; the daemon never waits for them while holding the
+writer queue. The ordinary 1,000-page SQLite auto-checkpoint remains enabled. A passive copy
+can take time on slow storage, but does not acquire the writer lock. Open failures retry;
+caught panics reopen the connection after a one-minute cooldown. Worker error logs are
+limited to one per minute. The detached thread is not a Tokio blocking task, so runtime
+shutdown does not wait for a long backfill.
 
 `st doctor` reports open, idle and active reader counts, peak open readers, total connections
 opened since startup, the configured cache target, and summed current reader targets without
