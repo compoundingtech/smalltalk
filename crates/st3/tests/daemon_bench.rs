@@ -1488,6 +1488,11 @@ fn standing_agents(store: &Store, prefix: &str, count: usize) {
 fn synthetic_fields(spec: &st3_schema::ClaimSpec, index: usize) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::new();
     for (name, field) in &spec.fields {
+        // Delegation is opt-in and needs a real policy and instruction. These background
+        // claims model ordinary writes; fabricated proof would only make them refused.
+        if matches!(name.as_str(), "delegation" | "acted_for") {
+            continue;
+        }
         if !field.required && !index.is_multiple_of(3) {
             continue;
         }
