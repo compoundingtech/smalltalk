@@ -6821,6 +6821,47 @@ mod tests {
     }
 
     #[test]
+    fn voice_that_never_answers_cannot_hold_the_keys() {
+        // Nathan, 2026-10-06 (bluey): keys stopped working, Ctrl+Q did not quit, until the
+        // terminal tab was closed.
+        let mut ui = Ui::new(demo::world());
+        ui.switch_tab(1);
+        let input = ui.draft_key().expect("a conversation is open");
+        let mut waiting = voice::VoiceState::stand_in(&input);
+        waiting.started = Instant::now() - Duration::from_secs(30);
+        ui.voice = Some(waiting);
+        ui.step_voice();
+        assert!(ui.voice.is_none(), "a helper silent for 30 s is given up");
+        assert!(
+            ui.flash.as_ref().is_some_and(|(text, _)| text.contains("keys work again")),
+            "{:?}",
+            ui.flash
+        );
+        // While it listens, a chord is not swallowed: Ctrl+Q quits.
+        ui.voice = Some(voice::VoiceState::stand_in(&input));
+        ui.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(ui.voice.is_none());
+        assert!(ui.quit, "Ctrl+Q went through");
+        // Plain typing still waits (it must not mix into the words) and Esc drops them.
+        let mut ui = Ui::new(demo::world());
+        ui.switch_tab(1);
+        let input = ui.draft_key().unwrap();
+        let mut heard = voice::VoiceState::stand_in(&input);
+        heard.device = "Built-in microphone".into();
+        ui.voice = Some(heard);
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(ui.voice.is_some());
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.voice.is_none());
+        // Leaving its conversation ends it.
+        let mut away = voice::VoiceState::stand_in("agent/example/someone-else");
+        away.device = "Built-in microphone".into();
+        ui.voice = Some(away);
+        ui.step_voice();
+        assert!(ui.voice.is_none());
+    }
+
+    #[test]
     fn remind_me_later_hides_a_message_and_the_badge_counts_what_is_left() {
         let mut ui = Ui::new(demo::world());
         let index = ui.ids().iter().position(|id| id == "attention/6").unwrap();
