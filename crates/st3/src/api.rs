@@ -5212,6 +5212,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "status": "ready",
         "node": state.node,
         "version": env!("CARGO_PKG_VERSION"),
+        "machine_version": st_drivers::version::machine_version(),
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
@@ -6403,6 +6404,9 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             status: "fail".into(),
             message: error.to_string(),
         }),
+    }
+    if state.fleet_id.is_some() {
+        checks.push(crate::replication_worker_build::check(&state.state_dir));
     }
     match state.store.idempotency_conflicts(5) {
         Ok((0, _)) => checks.push(DoctorCheck {
