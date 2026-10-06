@@ -193,6 +193,10 @@ class AppServer:
         params = message.get("params") or {}
         if method == "initialize":
             self.send(client, {"id": ident, "result": {"userAgent": "codex-stub"}})
+        elif method == "config/read":
+            self.send(client, {"id": ident, "result": {
+                "config": {"approval_policy": None},
+                "origins": {"approval_policy": None}}})
         elif method == "thread/start":
             if not self.thread_id:
                 self.thread_id = str(uuid.uuid4())

@@ -3420,32 +3420,30 @@ fn run_connected(
         }
     };
     let result = (|| -> Result<TuiEnd> {
-        loop {
-            diagnostics.record(
-                "tuiStarted",
-                json!({
-                    "pid": tui.id(),
-                    "safeFallback": safe_fallback_active.load(Ordering::SeqCst),
-                }),
-            )?;
-            if let Some(ready) = resume_ready_tx.take() {
-                ready
-                    .send(())
-                    .context("starting Codex control resume after the TUI launched")?;
+        diagnostics.record(
+            "tuiStarted",
+            json!({
+                "pid": tui.id(),
+                "safeFallback": safe_fallback_active.load(Ordering::SeqCst),
+            }),
+        )?;
+        if let Some(ready) = resume_ready_tx.take() {
+            ready
+                .send(())
+                .context("starting Codex control resume after the TUI launched")?;
+        }
+        diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
+        match wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics)? {
+            BindingWait::Bound => {
+                diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
+                return monitor_bound_tui(&mut tui, &events_rx);
             }
-            diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
-            match wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics)? {
-                BindingWait::Bound => {
-                    diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
-                    return monitor_bound_tui(&mut tui, &events_rx);
-                }
-                BindingWait::Stopped => {
-                    terminate_child(&mut tui);
-                    return Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()));
-                }
-                BindingWait::TuiExited(status) => {
-                    anyhow::bail!("controlled Codex TUI exited before thread binding: {status}");
-                }
+            BindingWait::Stopped => {
+                terminate_child(&mut tui);
+                return Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()));
+            }
+            BindingWait::TuiExited(status) => {
+                anyhow::bail!("controlled Codex TUI exited before thread binding: {status}");
             }
         }
     })();
