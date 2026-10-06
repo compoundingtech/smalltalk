@@ -260,6 +260,8 @@ pub fn run(context: Context) -> Result<()> {
     // Each conversation st has sent, kept after it closes so reopening it shows its last entries.
     let mut timelines: BTreeMap<String, st3_conversation_ui::Timeline> = BTreeMap::new();
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
+    // How many earlier pages each conversation read on its own to fill its first screen.
+    let mut filled: BTreeMap<String, usize> = BTreeMap::new();
     // The agent or session whose conversation the feed holds.
     let mut conversing: Vec<String> = Vec::new();
     // The session each conversation was last subscribed again for, so it is asked once.
@@ -426,6 +428,9 @@ pub fn run(context: Context) -> Result<()> {
                     items,
                 } => {
                     failed.remove(&target);
+                    if replace && !timelines.get(&target).is_some_and(|timeline| timeline.older.paged) {
+                        filled.remove(&target);
+                    }
                     ui.conversation_updated(&target);
                     timelines
                         .entry(target)
@@ -1017,7 +1022,23 @@ pub fn run(context: Context) -> Result<()> {
             }
         }
         // Scrolling to the top of a conversation asks for the page before it; one at a time.
-        for target in ui.take_older_wanted() {
+        // A first load that shows little (a page that is mostly tool calls) reads on by itself,
+        // a few pages at most, until about a screenful of rows is there.
+        let mut wanted = ui.take_older_wanted();
+        let mut names = None;
+        for (target, timeline) in &timelines {
+            let pages = filled.get(target).copied().unwrap_or(0);
+            if !extras.live || !wants_fill(timeline, pages) {
+                continue;
+            }
+            let names = names.get_or_insert_with(|| adapt::names(&model, &person));
+            let entries = adapt::conversation(&timeline.items, names);
+            if st3_conversation_ui::display_rows(&entries) < FILL_ROWS {
+                *filled.entry(target.clone()).or_default() += 1;
+                wanted.insert(target.clone());
+            }
+        }
+        for target in wanted {
             let Some(timeline) = timelines.get_mut(&target) else {
                 continue;
             };
@@ -1377,6 +1398,21 @@ fn conversations(
 
 /// Entries per page read back: st's largest, so a long session takes few requests.
 const OLDER_PAGE: usize = 200;
+
+/// About this many rows, as the person sees them, are there once a conversation opens.
+const FILL_ROWS: usize = 200;
+
+/// The most earlier pages one conversation reads on its own to get there.
+const FILL_PAGES: usize = 7;
+
+/// Whether a conversation may read one more earlier page on its own: there is more before it,
+/// no page is in flight or has just failed, and it has not used up its pages.
+fn wants_fill(timeline: &st3_conversation_ui::Timeline, pages_read: usize) -> bool {
+    !timeline.older.loading
+        && timeline.older.failed.is_none()
+        && timeline.more_before()
+        && pages_read < FILL_PAGES
+}
 
 /// st keeps a page cursor for five minutes; one older than this starts again from the newest.
 const OLDER_CURSOR_LIFE: Duration = Duration::from_secs(240);
@@ -2124,6 +2160,25 @@ async fn send_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_first_screen_reads_earlier_pages_only_while_it_may() {
+        let mut timeline = st3_conversation_ui::Timeline {
+            has_more: true,
+            ..Default::default()
+        };
+        assert!(super::wants_fill(&timeline, 0));
+        assert!(super::wants_fill(&timeline, super::FILL_PAGES - 1));
+        assert!(!super::wants_fill(&timeline, super::FILL_PAGES));
+        timeline.older.loading = true;
+        assert!(!super::wants_fill(&timeline, 0));
+        timeline.older.loading = false;
+        timeline.older.failed = Some("st is slow".into());
+        assert!(!super::wants_fill(&timeline, 0));
+        timeline.older.failed = None;
+        timeline.has_more = false;
+        assert!(!super::wants_fill(&timeline, 0));
+    }
+
     #[test]
     fn a_terminal_that_is_slow_to_connect_says_how_long_and_who_is_slow() {
         use super::connecting_text;
