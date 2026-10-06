@@ -957,7 +957,8 @@ mod tests {
             // Several inside the newest hour stay, so the highest of the hour still decides.
             read(&store, seat, Some("claude/aaaa"), 90.0, now + 167 * HOUR + 10);
             read(&store, seat, Some("claude/aaaa"), 60.0, now + 167 * HOUR + 20);
-            assert_eq!(count(&store), 3);
+            // The reading two hours earlier fell out of the newest's hour; the two inside stay.
+            assert_eq!(count(&store), 2);
             assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(90.0));
         }
         // A store opened again, and one whose projection is lost, answer the same.
