@@ -60,7 +60,13 @@ fn identity(pid: u32) -> Option<Identity> {
     }
     // SAFETY: the full structure was initialized by proc_pidinfo above.
     let info = unsafe { info.assume_init() };
-    if info.pbi_pid != pid || info.pbi_status == libc::SZOMB || info.pbi_start_tvusec >= 1_000_000 {
+    // PROC_FLAG_INEXIT is defined in Apple's proc_info.h (not exported by libc).
+    const IN_EXIT: u32 = 4;
+    if info.pbi_pid != pid
+        || info.pbi_status == libc::SZOMB
+        || info.pbi_flags & IN_EXIT != 0
+        || info.pbi_start_tvusec >= 1_000_000
+    {
         return None;
     }
     let birth = info
