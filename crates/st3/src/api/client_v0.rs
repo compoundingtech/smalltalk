@@ -7464,8 +7464,7 @@ fn validate_message_session(
         .into_iter()
         .find(|subject| {
             subject.subject == recipient
-                && (subject.subject.starts_with("agent/")
-                    || subject.kind.as_deref() == Some("agent"))
+                && subject.subject.starts_with("agent/")
                 && subject.projection.layer == "current"
         })
         .map(|subject| -> anyhow::Result<Option<String>> {
