@@ -29766,7 +29766,9 @@ mod tests {
     fn an_agent_card_build_does_not_hold_other_read_snapshots_at_the_cache_lock() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&directory.path().join("graph.db"), "node").unwrap());
-        store.cached_agent_resources(0, true, |_| Ok(vec![json!({"id":"agent/cached"})])).unwrap();
+        store
+            .cached_agent_resources(0, true, |_| Ok(vec![json!({"id": "agent/cached"})]))
+            .unwrap();
         let (entered, building) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
         let slow = store.clone();
@@ -29777,15 +29779,18 @@ mod tests {
                     released.recv().unwrap();
                     Ok(Vec::new())
                 })
-            }).unwrap();
+            })
+            .unwrap();
         });
         building.recv().unwrap();
         let (finished, result) = std::sync::mpsc::channel();
         let reader = store.clone();
         let other = std::thread::spawn(move || {
-            finished.send(reader.read_snapshot(|_| {
-                reader.cached_agent_resources(0, true, |_| panic!("cached snapshot was lost"))
-            })).unwrap();
+            finished
+                .send(reader.read_snapshot(|_| {
+                    reader.cached_agent_resources(0, true, |_| panic!("cached snapshot was lost"))
+                }))
+                .unwrap();
         });
         let completed = result.recv_timeout(std::time::Duration::from_secs(1));
         release.send(()).unwrap();
