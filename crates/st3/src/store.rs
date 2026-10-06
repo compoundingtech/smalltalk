@@ -9482,34 +9482,78 @@ impl Store {
         let chunk = chunk.max(1).min(i64::MAX as usize) as i64;
         let max_per_subject_kind = max_per_subject_kind.max(1).min(i64::MAX as usize) as i64;
         let mut deleted = 0;
+        // The newest observation of a subject and kind always stays. Rows past retention go
+        // through the time index, and a row is "not the newest" when a later id exists for its
+        // subject and kind, one seek in `local_observations_subject_kind_index`. This used to
+        // rank every row of the table with a window function inside the writer's hold, every
+        // chunk of every pass, even when nothing was due.
         loop {
             let connection = self.connection.write();
             let removed = connection.execute(
                 "DELETE FROM local_observations WHERE id IN (
-                    SELECT id FROM (
-                        SELECT id, observed_at_unix_ms,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY subject, kind ORDER BY id DESC
-                               ) AS newest_rank
-                        FROM local_observations
-                    )
-                    WHERE newest_rank > 1
-                      AND (observed_at_unix_ms < ?1 OR newest_rank > ?2)
-                    ORDER BY id
-                    LIMIT ?3
+                    SELECT id FROM local_observations AS old
+                    WHERE observed_at_unix_ms < ?1
+                      AND EXISTS (SELECT 1 FROM local_observations AS newer
+                                  WHERE newer.subject=old.subject AND newer.kind=old.kind
+                                    AND newer.id>old.id)
+                    ORDER BY observed_at_unix_ms
+                    LIMIT ?2
                  )",
                 params![
                     older_than_unix_ms.min(i64::MAX as u128) as i64,
-                    max_per_subject_kind,
                     chunk
                 ],
             )?;
             drop(connection);
             deleted += removed;
             if (removed as i64) < chunk {
-                return Ok(deleted);
+                break;
             }
         }
+        // The cap: only a subject and kind with more rows than the cap has any. Find them on a
+        // reader, then delete below the cap's id, a few rows at a time.
+        let over_cap = {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare_cached(
+                "SELECT subject, kind FROM local_observations
+                 GROUP BY subject, kind HAVING COUNT(*) > ?1",
+            )?;
+            statement
+                .query_map([max_per_subject_kind], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (subject, kind) in over_cap {
+            loop {
+                let connection = self.connection.write();
+                // The newest id past the cap: rank `cap + 1` from the newest.
+                let boundary: Option<i64> = connection
+                    .query_row(
+                        "SELECT id FROM local_observations WHERE subject=?1 AND kind=?2
+                         ORDER BY id DESC LIMIT 1 OFFSET ?3",
+                        params![subject, kind, max_per_subject_kind],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(boundary) = boundary else {
+                    break;
+                };
+                let removed = connection.execute(
+                    "DELETE FROM local_observations WHERE id IN (
+                        SELECT id FROM local_observations
+                        WHERE subject=?1 AND kind=?2 AND id<=?3 ORDER BY id LIMIT ?4
+                     )",
+                    params![subject, kind, boundary, chunk],
+                )?;
+                drop(connection);
+                deleted += removed;
+                if (removed as i64) < chunk {
+                    break;
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     /// Forget the responses counted before `older_than_unix_ms`, in short transactions of at
