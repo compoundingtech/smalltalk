@@ -1434,6 +1434,24 @@ impl Backend for MainBackend {
         self.client.get("/v1/internal/fleet/membership").await
     }
 
+    async fn record_worker(
+        &self,
+        peer: &str,
+        worker: smallclaims::replication::ReplicationWorkerStatus,
+    ) -> Result<()> {
+        let _: Value = self
+            .client
+            .post(
+                "/v1/internal/replication/worker-status",
+                &smallclaims::replication::ReplicationWorkerStatusRequest {
+                    peer: peer.to_owned(),
+                    worker,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn record_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
         let _: serde_json::Value = self
             .client

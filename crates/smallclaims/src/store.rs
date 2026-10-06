@@ -687,6 +687,7 @@ pub struct PeerSyncProgress {
     pub heal_started_at_unix_ms: Option<u128>,
     pub heal_backoff_ms: u128,
     pub heal: Option<ReplicationHealReport>,
+    pub worker: Option<crate::replication::ReplicationWorkerStatus>,
     /// How many envelopes this node held when it took the last measurement.
     pub measured_inventory_envelopes: u64,
 }
@@ -6323,6 +6324,20 @@ impl Store {
             .any(|progress| progress.view(now).is_some_and(|sync| sync.diverged))
     }
 
+    /// Update host-local worker status without writing the graph.
+    pub fn record_replication_worker(
+        &self,
+        peer: &str,
+        worker: crate::replication::ReplicationWorkerStatus,
+    ) {
+        self.replication_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(peer.to_owned())
+            .or_default()
+            .worker = Some(worker);
+    }
+
     /// The latest sync measurement for each configured peer that has one.
     pub fn replication_peer_sync(
         &self,
@@ -6452,6 +6467,7 @@ impl Store {
                         let updated_at = row.get::<_, String>(6)?.parse::<u128>().ok();
                         Ok((
                             ReplicationPeerStatus {
+                                worker: None,
                                 peer: peer.clone(),
                                 status: row.get(0)?,
                                 last_success_at_unix_ms: row
@@ -6475,6 +6491,7 @@ impl Store {
                 .optional()?
                 .unwrap_or((
                     ReplicationPeerStatus {
+                        worker: None,
                         peer: peer.clone(),
                         status: "unknown".into(),
                         last_success_at_unix_ms: None,
@@ -6519,6 +6536,12 @@ impl Store {
                 status.refusal_reason = Some(reason);
                 status.last_error = None;
             }
+            status.worker = self
+                .replication_sync
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(peer)
+                .and_then(|progress| progress.worker.clone());
             status.sync = sync.get(peer).cloned();
             // A comparison can finish after the peer row's receipt timestamp. Once that
             // peer is last-seen after a failed exchange, its cached measurement is stale

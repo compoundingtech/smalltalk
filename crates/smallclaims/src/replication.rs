@@ -421,7 +421,23 @@ pub struct UnhealthyProjection {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationWorkerStatusRequest {
+    pub peer: String,
+    pub worker: ReplicationWorkerStatus,
+}
+
+/// Host-local worker state; absent after restart until the worker next attempts a peer.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReplicationWorkerStatus {
+    pub phase: String,
+    pub last_attempt_at_unix_ms: u128,
+    pub next_retry_at_unix_ms: Option<u128>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplicationPeerStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<ReplicationWorkerStatus>,
     pub peer: String,
     pub status: String,
     pub last_success_at_unix_ms: Option<u128>,

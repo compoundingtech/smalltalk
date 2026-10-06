@@ -1643,6 +1643,16 @@ async fn rejoin_exchanges_live_claims_beyond_differing_checkpoint_tombstones() {
     if st3::test_support::supervise_test() {
         return;
     }
+    rejoin_tombstone_fixture(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejoin_slow_exports_preserve_live_claims_and_show_overload_retry() {
+    if st3::test_support::supervise_test() { return; }
+    rejoin_tombstone_fixture(true).await;
+}
+
+async fn rejoin_tombstone_fixture(slow_export: bool) {
     let root = tempfile::tempdir().unwrap();
     let mut birch = anchor(root.path(), "birch").await;
     let mut cedar = joined(root.path(), &birch, "cedar", &[]).await;
@@ -1696,10 +1706,31 @@ async fn rejoin_exchanges_live_claims_beyond_differing_checkpoint_tombstones() {
             .as_u64()
             .unwrap()
     });
+    if slow_export {
+        // Restart only the isolated daemon with the fixture-only injection. Each response
+        // export takes 25 seconds, beyond the old caller's entire 20-second HTTP deadline.
+        cedar.env.push(("ST3_TEST_REPLICATION_EXPORT_DELAY_MS".into(), "25000".into()));
+        cedar.stop();
+        cedar.start().await;
+        cedar.stop_worker();
+    }
     birch.start_worker();
     cedar.start_worker();
+    if slow_export {
+        wait_until("signed overload exposes polling phase and retry", 90, || async {
+            let status = birch.st_json(&["replication", "status"]);
+            status["peers"].as_array().unwrap().iter().any(|peer| {
+                peer["worker"]["phase"] == "overload"
+                    && peer["worker"]["last_attempt_at_unix_ms"].as_u64().is_some()
+                    && peer["worker"]["next_retry_at_unix_ms"].as_u64().is_some()
+            })
+        }).await;
+        let text = birch.st_ok(&["replication", "status"]);
+        assert!(text.contains("worker overload"), "{text}");
+        assert!(text.contains("next retry in"), "{text}");
+    }
     for (node, before) in [&birch, &cedar].into_iter().zip(before) {
-        wait_until("both rejoined workers exchange successfully", 15, || async {
+        wait_until("both rejoined workers exchange successfully", if slow_export { 180 } else { 15 }, || async {
             node.st_json(&["replication", "status"])["timings"]["exchanges"]
                 .as_u64()
                 .unwrap() >= before + 4
@@ -1709,7 +1740,7 @@ async fn rejoin_exchanges_live_claims_beyond_differing_checkpoint_tombstones() {
             node.name, status["timings"]["exchanges"], status["timings"]["envelopes_received"]);
     }
     for node in [&birch, &cedar] {
-        wait_for_notes(node, &expected, 30, &[&birch, &cedar]).await;
+        wait_for_notes(node, &expected, if slow_export { 180 } else { 30 }, &[&birch, &cedar]).await;
         let connection =
             rusqlite::Connection::open(node.state_dir().join("claims.sqlite3")).unwrap();
         let count: u64 = connection

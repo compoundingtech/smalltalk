@@ -605,6 +605,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(replication_peer_failure),
         )
         .route(
+            "/v1/internal/replication/worker-status",
+            post(replication_worker_status),
+        )
+        .route(
             "/v1/internal/replication/checkpoint",
             post(replication_checkpoint_manifest),
         )
@@ -6756,6 +6760,13 @@ async fn replication_export(
     State(state): State<AppState>,
     Json(request): Json<ReplicationExportRequest>,
 ) -> Result<Json<ReplicationExportResponse>, ApiError> {
+    #[cfg(feature = "test-support")]
+    if !request.summary_only
+        && let Ok(millis) = std::env::var("ST3_TEST_REPLICATION_EXPORT_DELAY_MS")
+        && let Ok(millis) = millis.parse::<u64>()
+    {
+        tokio::time::sleep(Duration::from_millis(millis)).await;
+    }
     let store = state.store.clone();
     blocking_store(move || {
         let exchange = if request.summary_only {
@@ -6955,6 +6966,16 @@ fn elapsed_words(ms: u128) -> String {
 
 fn replication_receive_has_new_data(received: usize) -> bool {
     received != 0
+}
+
+/// Pure local memory update. Older daemons answer 404 rather than interpreting worker
+/// progress as a failed exchange during a worker/daemon rolling restart.
+async fn replication_worker_status(
+    State(state): State<AppState>,
+    Json(request): Json<smallclaims::replication::ReplicationWorkerStatusRequest>,
+) -> Json<Value> {
+    state.store.record_replication_worker(&request.peer, request.worker);
+    Json(json!({ "recorded": true, "changed": false }))
 }
 
 async fn replication_peer_failure(
@@ -7299,6 +7320,7 @@ async fn refuse_while_leaving(
                 | "/v1/internal/replication/export"
                 | "/v1/internal/replication/receive"
                 | "/v1/internal/replication/peer-failure"
+                | "/v1/internal/replication/worker-status"
                 | "/v1/internal/replication/heal/answer"
                 | "/v1/internal/replication/heal/next"
                 | "/v1/internal/replication/checkpoint"
@@ -16759,6 +16781,30 @@ agent "good" {{ workspace {:?}; command "true" }}
             disk["message"].as_str().unwrap().contains("GiB free"),
             "{disk}"
         );
+    }
+
+    #[tokio::test]
+    async fn replication_worker_status_changes_only_local_memory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.configured_peers = vec!["cedar".into()];
+        let index = state.store.index().unwrap();
+        let app = router(state.clone());
+        let attempt = smallclaims::store::now_ms();
+        let retry = attempt + 30_000;
+        let (status, response) = json_request(app.clone(), "/v1/internal/replication/worker-status", json!({
+            "peer": "cedar", "worker": {"phase": "backoff",
+                "last_attempt_at_unix_ms": attempt, "next_retry_at_unix_ms": retry}
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["changed"], false);
+        let (status, response) = get_request(app, "/v1/replication/status").await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["peers"][0]["worker"]["phase"], "backoff");
+        assert_eq!(response["peers"][0]["worker"]["last_attempt_at_unix_ms"], json!(attempt));
+        assert_eq!(response["peers"][0]["worker"]["next_retry_at_unix_ms"], json!(retry));
+        assert!(response["peers"][0]["last_error"].is_null());
+        assert_eq!(state.store.index().unwrap(), index);
     }
 
     #[tokio::test]
