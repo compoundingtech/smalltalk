@@ -881,6 +881,15 @@ const PROBES: &[Probe] = &[
             "idempotency_key": format!("cost-ask-{attempt}"),
         })
     }),
+    post("POST /v1/work/delegation", "/v1/work/delegation", |fixture, attempt| {
+        json!({
+            "person": "person/bench-operator",
+            "actor": "person/bench-operator",
+            "actions": ["answer-ask"],
+            "evidence": [fixture.items["claim"]],
+            "idempotency_key": format!("cost-delegation-{attempt}"),
+        })
+    }),
     post("POST /v1/work/done", "/v1/work/done", |fixture, attempt| {
         json!({
             "subject": fixture.asks.get(attempt).cloned().unwrap_or_default(),
