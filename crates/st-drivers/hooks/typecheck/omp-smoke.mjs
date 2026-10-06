@@ -81,9 +81,11 @@ process.env.ST_OMP_CHANNEL_SEQ = "1";
 const mod = await import(process.argv[2] ?? "./smoke-out/omp-channel.mjs");
 assert.strictEqual(typeof mod.default, "function", "extension exports its entry point");
 
-const expectedState = state => ({ type: "state", state,
-  ...(process.argv[2]?.includes("st-omp") ? { backgroundJobs: null } : {}),
-});
+// Compare the state axes, not optional telemetry defaults. Counts have semantic checks below.
+const expectedState = state => ({ type: "state", state });
+const stateFrames = () => readFrames().filter(frame => frame.type === "state").map(frame =>
+  Object.fromEntries(Object.entries(frame).filter(([key]) =>
+    ["type", "state", "blockedOn", "ask", "reason"].includes(key))));
 const handlers = new Map();
 // Every message the extension hands to omp, with the options it chose.
 const handedOver = [];
@@ -181,7 +183,7 @@ for (const ctx of [bareCtx, fullCtx, throwingCtx]) {
 const activeCtx = { ...fullCtx, isIdle: () => false };
 await handlers.get("session_start")({}, activeCtx);
 await new Promise((resolve) => setTimeout(resolve, 50));
-const beforeAsk = readFrames().filter((frame) => frame.type === "state").length;
+const beforeAsk = stateFrames().length;
 await handlers.get("tool_call")(
   {
     toolName: "ask",
@@ -194,8 +196,7 @@ await handlers.get("tool_call")(
 );
 await handlers.get("tool_result")({ toolName: "read", toolCallId: "unrelated" }, activeCtx);
 await new Promise((resolve) => setTimeout(resolve, 50));
-let askStates = readFrames()
-  .filter((frame) => frame.type === "state")
+let askStates = stateFrames()
   .slice(beforeAsk);
 assert.deepStrictEqual(askStates, [
   {
@@ -207,7 +208,7 @@ assert.deepStrictEqual(askStates, [
 ]);
 await handlers.get("tool_result")({ toolName: "ask", toolCallId: "ask-1" }, activeCtx);
 await new Promise((resolve) => setTimeout(resolve, 50));
-askStates = readFrames().filter((frame) => frame.type === "state").slice(beforeAsk);
+askStates = stateFrames().slice(beforeAsk);
 assert.deepStrictEqual(askStates.at(-1), expectedState("active"));
 
 // Every poll is generation-fenced. New activity, an automatic continuation, and a terminal error
@@ -218,19 +219,19 @@ const successfulEnd = {
   messages: [{ role: "assistant", stopReason: "stop" }],
 };
 
-let beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+let beforeSettleCase = stateFrames().length;
 await handlers.get("agent_end")(successfulEnd, settleCtx);
 await handlers.get("agent_start")({}, settleCtx);
 settleIdle = true;
 await new Promise((resolve) => setTimeout(resolve, 250));
 assert.deepStrictEqual(
-  readFrames().filter((frame) => frame.type === "state").slice(beforeSettleCase),
+  stateFrames().slice(beforeSettleCase),
   [expectedState("active")],
   "new activity must cancel the older settle poll",
 );
 
 settleIdle = false;
-beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+beforeSettleCase = stateFrames().length;
 let beforeTurns = readFrames().filter((frame) => frame.type === "turn").length;
 await handlers.get("agent_end")(successfulEnd, settleCtx);
 await handlers.get("agent_end")(
@@ -243,7 +244,7 @@ await handlers.get("agent_end")(
 settleIdle = true;
 await new Promise((resolve) => setTimeout(resolve, 250));
 assert.strictEqual(
-  readFrames().filter((frame) => frame.type === "state").length,
+  stateFrames().length,
   beforeSettleCase,
   "willContinue must cancel the older poll and start no new settle",
 );
@@ -256,7 +257,7 @@ assert.deepStrictEqual(
 );
 
 settleIdle = false;
-beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+beforeSettleCase = stateFrames().length;
 beforeTurns = readFrames().filter((frame) => frame.type === "turn").length;
 await handlers.get("agent_end")(successfulEnd, settleCtx);
 await handlers.get("agent_end")(
@@ -281,7 +282,7 @@ await new Promise((resolve) => setTimeout(resolve, 250));
 // verbatim — st2, not this asset, decides whether that names a rejected credential. `errorStatus`
 // stays off the wire on purpose.
 assert.strictEqual(
-  readFrames().filter((frame) => frame.type === "state").length,
+  stateFrames().length,
   beforeSettleCase,
   "terminal error must cancel the older poll without asserting a state word",
 );
@@ -300,11 +301,11 @@ settleIdle = false;
 await handlers.get("agent_start")({}, settleCtx);
 await handlers.get("agent_end")(successfulEnd, settleCtx);
 await new Promise((resolve) => setTimeout(resolve, 5250));
-beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+beforeSettleCase = stateFrames().length;
 settleIdle = true;
 await new Promise((resolve) => setTimeout(resolve, 250));
 assert.deepStrictEqual(
-  readFrames().filter((frame) => frame.type === "state").slice(beforeSettleCase),
+  stateFrames().slice(beforeSettleCase),
   [expectedState("idle")],
   "native idle after a slow unwind must replace working without another turn",
 );
@@ -316,11 +317,11 @@ await handlers.get("agent_end")(successfulEnd, settleCtx);
 await handlers.get("session_start")({}, activeCtx);
 await handlers.get("agent_start")({}, activeCtx);
 await new Promise((resolve) => setTimeout(resolve, 50));
-beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+beforeSettleCase = stateFrames().length;
 settleIdle = true;
 await new Promise((resolve) => setTimeout(resolve, 250));
 assert.deepStrictEqual(
-  readFrames().filter((frame) => frame.type === "state").slice(beforeSettleCase),
+  stateFrames().slice(beforeSettleCase),
   [],
   "a retired context cannot mark a busy successor idle",
 );
@@ -475,7 +476,7 @@ for (const modal of ["ask", "approval"]) {
   }
   await pause(50);
   const modalPid = Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1));
-  const beforeModalReconnect = readFrames().filter((frame) => frame.type === "state").length;
+  const beforeModalReconnect = stateFrames().length;
   const readyBeforeModalReconnect = readFrames().filter((frame) => frame.type === "ready").length;
   process.kill(modalPid, "SIGKILL");
   for (let i = 0; i < 50 &&
@@ -487,7 +488,7 @@ for (const modal of ["ask", "approval"]) {
   await pause(250);
   assert.notStrictEqual(Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1)), modalPid);
   assert.deepStrictEqual(
-    readFrames().filter((frame) => frame.type === "state").slice(beforeModalReconnect),
+    stateFrames().slice(beforeModalReconnect),
     [],
     `${modal} reconnect must not fabricate idle while waiting for the operator`,
   );
@@ -498,7 +499,7 @@ for (const modal of ["ask", "approval"]) {
   }
   await pause(50);
   assert.deepStrictEqual(
-    readFrames().filter((frame) => frame.type === "state").at(-1),
+    stateFrames().at(-1),
     expectedState("idle"),
     `${modal} resolution permits a positive idle observation`,
   );
@@ -553,10 +554,10 @@ assert.deepStrictEqual(subHandedOver, [], "the subagent never gets the seat's ma
 assert.ok(acknowledged().includes("message/after-subagent"));
 // The top-level session names itself `main` on omp 18.3.2 and later; its events still flow.
 const mainCtx = { ...fullCtx, agent: { kind: "main", id: "Main", name: "main", depth: 0 } };
-const framesBeforeMain = readFrames().length;
+const statesBeforeMain = stateFrames().length;
 await handlers.get("agent_start")({}, mainCtx);
 await pause(50);
-assert.deepStrictEqual(readFrames().slice(framesBeforeMain), [expectedState("active")]);
+assert.deepStrictEqual(stateFrames().slice(statesBeforeMain), [expectedState("active")]);
 await handlers.get("agent_end")(successfulEnd, mainCtx);
 fs.rmSync(outboxPath, { force: true });
 
@@ -768,14 +769,89 @@ if (process.argv[2]?.includes("st-omp")) {
   await handlers.get("session_shutdown")({}, unknownCtx);
 }
 
+// Parent task lifecycle counts survive duplicate starts, unrelated results, idle, and reconnect.
+// An unavailable native snapshot is unknown, not zero; a replacement session retires its tasks.
+if (process.argv[2]?.includes("st-omp")) {
+  const listeners = new Set();
+  pi.events = { on: (name, handler) => {
+    if (name === "task:subagent:lifecycle") listeners.add(handler);
+    return () => listeners.delete(handler);
+  } };
+  const emitTask = (id, status) => {
+    for (const listener of listeners) listener({ id, status });
+  };
+  let countSession = "count-parent-one";
+  let countJobs = [{ type: "task", agentId: "alpha" }];
+  const countCtx = { ...fullCtx,
+    sessionManager: { ...fullCtx.sessionManager, getSessionId: () => countSession },
+    getAsyncJobSnapshot: () => ({ running: countJobs }),
+  };
+  const latestCount = () => readFrames().filter(frame => frame.type === "state").at(-1);
+  const expectCount = async (expected, message) => {
+    for (let attempt = 0; attempt < 100 && latestCount()?.runningSubagents !== expected; attempt++) await pause(20);
+    assert.strictEqual(latestCount()?.runningSubagents, expected, message);
+  };
+  await handlers.get("session_start")({}, countCtx);
+  await expectCount(1, "late load recovers already-running tasks");
+  emitTask("alpha", "started");
+  emitTask("alpha", "started");
+  emitTask("unrelated", "completed");
+  await pause(50);
+  assert.strictEqual(latestCount().runningSubagents, 1, "duplicates and unrelated ends cannot change cardinality");
+  emitTask("beta", "started");
+  emitTask("alpha", "completed");
+  await pause(50);
+  assert.strictEqual(latestCount().state, "idle", "background tasks do not fabricate parent activity");
+  assert.strictEqual(latestCount().runningSubagents, 1, "one task remains after its sibling completes");
+  await handlers.get("session_start")({}, countCtx);
+  await pause(100);
+  assert.strictEqual(latestCount().runningSubagents, 1, "same-session reconnect preserves native tasks");
+  emitTask("beta", "aborted");
+  await expectCount(0, "aborting the remaining task clears the count");
+  for (const terminal of ["completed", "failed", "aborted"]) {
+    emitTask(`next-${terminal}`, "started");
+    await expectCount(1);
+    emitTask(`next-${terminal}`, terminal);
+    await expectCount(0, `${terminal} retires the owning task`);
+  }
+  await handlers.get("agent_start")({}, countCtx);
+  await pause(50);
+  await handlers.get("agent_end")({ messages: [{
+    role: "assistant", stopReason: "error", errorMessage: "upstream temporarily unavailable",
+  }] }, countCtx);
+  const statesAfterFailure = stateFrames().length;
+  emitTask("after-failure", "started");
+  countJobs = [];
+  await pause(1250);
+  assert.strictEqual(stateFrames().length, statesAfterFailure,
+    "task/job updates must not replay working over an authored terminal failure");
+  await handlers.get("agent_start")({}, countCtx);
+  await expectCount(1, "new parent activity can report the still-running task");
+  emitTask("after-failure", "completed");
+  await expectCount(0);
+  const retiredListener = [...listeners][0];
+  countSession = "count-parent-two";
+  countJobs = [];
+  await handlers.get("session_branch")({}, countCtx);
+  await handlers.get("agent_end")({}, countCtx);
+  retiredListener({ id: "retired-task", status: "started" });
+  await pause(250);
+  assert.strictEqual(latestCount().runningSubagents, 0, "retired session callbacks cannot contaminate a successor");
+  countSession = "count-parent-three";
+  await handlers.get("session_start")({}, { ...countCtx, getAsyncJobSnapshot: () => null });
+  await expectCount(null, "unavailable capture is unknown, not zero");
+  await handlers.get("session_shutdown")({}, countCtx);
+  delete pi.events;
+}
+
 // `session_shutdown` has no reason field upstream and always denotes process exit. Closing must
 // make a later observational frame a no-op.
-const beforeShutdown = readFrames().filter((frame) => frame.type === "state").length;
+const beforeShutdown = stateFrames().length;
 await handlers.get("session_shutdown")({}, fullCtx);
 await handlers.get("agent_start")({}, fullCtx);
 await new Promise((resolve) => setTimeout(resolve, 50));
 assert.strictEqual(
-  readFrames().filter((frame) => frame.type === "state").length,
+  stateFrames().length,
   beforeShutdown,
   "shutdown without a reason closes the channel",
 );

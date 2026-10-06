@@ -128,6 +128,8 @@ type Stash = {
   running?: boolean;
   /** Tool calls announced by `tool_call` and not yet answered by `tool_result`. */
   toolCallsInFlight?: Set<string>;
+  /** Aggregate only the owning parent's native task lifecycle; never child extension events. */
+  subagentCounts?: { session: string; running: Set<string>; known: boolean; unsubscribe: () => void };
   /** Messages held during a running turn, oldest first. */
   held?: HeldMessage[];
   /** Releases held messages after HOLD_MAX_MS behind a running tool call. */
@@ -406,6 +408,47 @@ export default function (pi: ExtensionAPI) {
       } | undefined)?.getAsyncJobSnapshot?.();
       return Array.isArray(snapshot?.running) ? snapshot.running.length : null;
     } catch { return null; }
+  };
+  const runningSubagents = (): number | null => state.subagentCounts?.known
+    ? state.subagentCounts.running.size : null;
+  const observeSubagentCounts = (ctx: ExtensionContext) => {
+    const session = ctx.sessionManager.getSessionId();
+    const previous = state.subagentCounts;
+    previous?.unsubscribe();
+    state.subagentCounts = undefined;
+    if (typeof pi.events?.on !== "function" || typeof session !== "string" || !session) return;
+    const running = previous?.session === session ? previous.running : new Set<string>();
+    let known = previous?.session === session && previous.known;
+    if (!known) {
+      // A late-loaded parent extension can recover already-running detached tasks without
+      // reading a child transcript. Normal startup begins observing before any task starts.
+      try {
+        const snapshot = (ctx as ExtensionContext & {
+          getAsyncJobSnapshot?: () => { running?: unknown } | null;
+        }).getAsyncJobSnapshot?.();
+        if (Array.isArray(snapshot?.running)) {
+          running.clear();
+          known = true;
+          for (const job of snapshot.running) {
+            const item = record(job);
+            if (item?.type === "task" && typeof item.agentId !== "string") known = false;
+            if (item?.type === "task" && typeof item.agentId === "string") running.add(item.agentId);
+          }
+        }
+      } catch { /* The lifecycle bus remains the authority for subsequent transitions. */ }
+    }
+    const unsubscribe = pi.events.on("task:subagent:lifecycle", (raw: unknown) => {
+      if (state.subagentCounts?.session !== session) return;
+      const event = record(raw);
+      if (typeof event?.id !== "string" || !event.id || event.id.length > 256) return;
+      const before = running.size;
+      if (event.status === "started") running.add(event.id);
+      else if (event.status === "completed" || event.status === "failed" || event.status === "aborted") {
+        running.delete(event.id);
+      } else return;
+      if (running.size !== before && lastStateFrame) sendFrame(lastStateFrame);
+    });
+    state.subagentCounts = { session, running, known: !!known, unsubscribe };
   };
   const applyLabel = async (ctx: ExtensionContext) => {
     if (!state.label) return;
@@ -688,6 +731,9 @@ export default function (pi: ExtensionAPI) {
   // Frames are observational — st decides what becomes of them — and a closed channel drops
   // them silently.
   const sendFrame = (frame: Record<string, unknown>) => {
+    // Counts are not evidence that a failed parent turn resumed. Retire its cached state
+    // before either the task bus or job polling can replay working over the failure.
+    if (frame.type === "turn" && record(frame.error)) lastStateFrame = undefined;
     const child = state.child;
     if (!child || !child.stdin || child.stdin.destroyed) return;
     // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
@@ -700,7 +746,7 @@ export default function (pi: ExtensionAPI) {
     if (frame.type === "state") {
       lastStateFrame = frame;
       lastBackgroundJobs = backgroundJobs();
-      frame = { ...frame, backgroundJobs: lastBackgroundJobs };
+      frame = { ...frame, backgroundJobs: lastBackgroundJobs, runningSubagents: runningSubagents() };
     }
     child.stdin.write(JSON.stringify(frame) + "\n");
   };
@@ -1325,15 +1371,18 @@ export default function (pi: ExtensionAPI) {
   });
   onWidened("session_switch", async (_event, ctx) => {
     await applyLabel(ctx);
+    observeSubagentCounts(ctx);
     await open(ctx);
     await applyLabel(ctx);
   });
   for (const event of ["session_tree", "session_branch"]) {
     onWidened(event, async (_event, ctx) => {
+      observeSubagentCounts(ctx);
       observeTodoBranch(ctx, true);
     });
   }
   onWidened("session_start", async (_event, ctx) => {
+    observeSubagentCounts(ctx);
     // Awaited before the session's first turn, which is what makes restored context reach the boot
     // prompt rather than the turn after it.
     await applyLabel(ctx);
@@ -1358,6 +1407,8 @@ export default function (pi: ExtensionAPI) {
   // the named predecessor.
   onWidened("session_shutdown", async () => {
     state.shuttingDown = true;
+    state.subagentCounts?.unsubscribe();
+    state.subagentCounts = undefined;
     // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
     clearTimeout(state.restoringAsk?.timer);
     state.restoringAsk = undefined;
