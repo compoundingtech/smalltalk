@@ -49624,6 +49624,25 @@ message "human-attention" {
                     serde_json::to_value(observed)?,
                     serde_json::to_value(store.observed_harness_at(subject, index)?)?
                 );
+                store.forget_current_views();
+                let full = subject_status_at(&connection, subject, Some(index), None)?.unwrap();
+                let cached = store.agent_card_status_for_names_at(
+                    BTreeSet::from([subject.into()]),
+                    index,
+                    true,
+                )?;
+                assert_eq!(
+                    serde_json::to_value(&cached.subjects[0])?,
+                    serde_json::to_value(&full.0)?
+                );
+                assert_eq!(
+                    serde_json::to_value(&cached.pending_actions)?,
+                    serde_json::to_value(full.1.into_iter().collect::<Vec<_>>())?
+                );
+                assert_eq!(
+                    serde_json::to_value(store.observed_harness_for_card_at(subject, index)?)?,
+                    serde_json::to_value(store.observed_harness_at(subject, index)?)?
+                );
                 Ok(())
             })
             .unwrap();
@@ -49883,6 +49902,7 @@ message "human-attention" {
                 ("incarnation_id".into(), json!("first")),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
         let refusal = append(
             "harness.diagnostic",
@@ -49903,6 +49923,7 @@ message "human-attention" {
                 ("incarnation_id".into(), json!("first")),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         let refused = store.current_harness(subject).unwrap().unwrap();
         assert!(!refused.is_ready());
         assert_eq!(refused.state, "indeterminate");
@@ -49915,6 +49936,7 @@ message "human-attention" {
                 ("incarnation_id".into(), json!("first")),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         let exited = store.current_harness(subject).unwrap().unwrap();
         assert!(exited.reason.unwrap().contains("admissionLifecycle"));
         assert_eq!(exited.since_unix_ms, refusal.accepted_at_unix_ms);
@@ -49933,6 +49955,7 @@ message "human-attention" {
                 ("incarnation_id".into(), json!("second")),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
     }
 
@@ -49970,6 +49993,7 @@ message "human-attention" {
                 ("incarnation_id".into(), Value::String("first".into())),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
         append(
             "harness.diagnostic",
@@ -49988,6 +50012,7 @@ message "human-attention" {
                 ("incarnation_id".into(), Value::String("first".into())),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         let blocked = store.current_harness(subject).unwrap().unwrap();
         assert_eq!(blocked.state, "needs-login");
         assert_eq!(blocked.reason.as_deref(), Some("providerAuth"));
@@ -50009,6 +50034,7 @@ message "human-attention" {
                 ("incarnation_id".into(), Value::String("second".into())),
             ]),
         );
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
     }
 
@@ -50054,6 +50080,7 @@ message "human-attention" {
         );
         // A channel that initializes behind the prompt must not make the seat look ready.
         append("harness.observed", Some(subject), ready("first"));
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         let blocked = store.current_harness(subject).unwrap().unwrap();
         assert_eq!(blocked.state, "blocked");
         assert_eq!(blocked.reason.as_deref(), Some("providerTrustPrompt"));
@@ -50061,6 +50088,7 @@ message "human-attention" {
 
         append("runtime.observed", None, running("second"));
         append("harness.observed", Some(subject), ready("second"));
+        checked_raw_harness_pair(&store, subject, store.index().unwrap());
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
     }
 }
