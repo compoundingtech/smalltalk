@@ -47,9 +47,13 @@ and link to the [st3 design questions](spec.md#design-questions).
   artifact, or export the same spans? Resolve by comparing profiler coverage, overhead,
   and span vocabulary with the SDK path. The curator's working assumption is that the
   profiler stays separate.
+- **ST3-O11Y-DQ6 SIGTERM flush:** `st up` has no SIGTERM handler. A systemd stop skips
+  telemetry shutdown and loses the last batch interval of daemon spans, metrics, and logs.
+  Options: (a) accept this loss; (b) add a SIGTERM flush path bounded by 5 s before termination.
+  Resolve by reviewing the daemon lifecycle change and the systemd stop timeout.
 
-The core does not yet specify emission-site mechanisms for server request/admission/handler
-and stream spans, writer/read-pool spans, reconcile/FIFO/WAL metrics, startup phase spans,
+The core does not yet specify emission-site mechanisms for stream spans, writer/read-pool
+spans, reconcile/FIFO/WAL metrics, startup phase spans,
 replication exchange/lag instruments, raw-terminal spans, client context injection, signed
 peer context, hook environment context, or durable-boundary span links. Their concrete
 mechanisms must preserve O11Y-R10–R18; this list is a scope boundary, not a delivery order.

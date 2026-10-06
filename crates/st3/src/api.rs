@@ -953,7 +953,6 @@ async fn response_envelope_unbounded(
         .into_response();
     }
     let started = Instant::now();
-    let request_method = request.method().clone();
     let request_path = request.uri().path().to_owned();
     let request_query = request.uri().query().map(str::to_owned);
     let long_poll = request_query.as_deref().is_some_and(asks_to_wait);
@@ -968,6 +967,21 @@ async fn response_envelope_unbounded(
         .get::<crate::profile::Caller>()
         .map(|caller| caller.0.clone())
         .unwrap_or_else(|| "(tcp)".into());
+    let request_method = request.method().clone();
+    let client_class = crate::otel_client_class::ClientClass::from_header(
+        request
+            .headers()
+            .get(client_presence::CLIENT_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    );
+    // The OTel server span exists only while trace export is on; the disabled path
+    // constructs nothing (st2's O11Y-R02 gate).
+    let otel = request_trace(
+        &request_method,
+        &request_route,
+        client_class,
+        request.headers(),
+    );
     let profile = crate::profile::Op::start(
         format!("{} {request_route}", request.method()),
         Some(caller.clone()),
@@ -1017,21 +1031,40 @@ async fn response_envelope_unbounded(
         let admission_queue = profile.as_ref().map(|op| op.wall_span("admission/queue"));
         let mut diagnostic_queue =
             crate::relay_trace::span(crate::relay_trace::Phase::AdmissionQueue);
+        let admission_trace = otel.as_ref().map(|server| {
+            let _parent = server.enter();
+            tracing::info_span!(target: "st3::http", "admission.queue")
+        });
+        let server_trace = otel.clone();
         let admitted = crate::api::read_deadline::spawn_blocking(move || {
             diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
             drop(admission_queue);
+            drop(admission_trace);
+            let _server = server_trace.as_ref().map(|span| span.enter());
             let _entered = crate::profile::enter(auth_profile.as_ref());
             let authentication_span = crate::profile::span("admission/authenticate");
+            let authenticate_trace = server_trace
+                .as_ref()
+                .map(|_| tracing::info_span!(target: "st3::http", "admission.authenticate"));
+            let _authenticate = authenticate_trace.as_ref().map(|span| span.enter());
             let authentication =
                 crate::relay_trace::result(crate::relay_trace::Phase::Authenticate, || {
                     client_v0::authenticate(&auth_state, &auth_request, transport)
                 });
+            drop(_authenticate);
+            drop(authenticate_trace);
             drop(authentication_span);
             let snapshot = (!defer_detail_snapshot).then(|| {
                 let snapshot_span = crate::profile::span("admission/snapshot");
+                let snapshot_trace = server_trace
+                    .as_ref()
+                    .map(|_| tracing::info_span!(target: "st3::http", "admission.snapshot"));
+                let _snapshot = snapshot_trace.as_ref().map(|span| span.enter());
                 let snapshot = crate::relay_trace::work(crate::relay_trace::Phase::Snapshot, || {
                     client_request_snapshot(&auth_state, cursor_snapshot.flatten())
                 });
+                drop(_snapshot);
+                drop(snapshot_trace);
                 drop(snapshot_span);
                 snapshot
             });
@@ -1068,11 +1101,22 @@ async fn response_envelope_unbounded(
             let handler_queue = profile.as_ref().map(|op| op.wall_span("handler/queue"));
             let mut diagnostic_queue =
                 crate::relay_trace::span(crate::relay_trace::Phase::HandlerQueue);
+            let handler_queue_trace = otel.as_ref().map(|server| {
+                let _parent = server.enter();
+                tracing::info_span!(target: "st3::http", "handler.queue")
+            });
+            let server_trace = otel.clone();
             let forwarded_handler = request_path == crate::peer::CLIENT_READ_FORWARD_PATH;
             let remote = served_remote.clone();
             match crate::api::read_deadline::spawn_handler(move || {
                 diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
                 drop(handler_queue);
+                drop(handler_queue_trace);
+                let _server = server_trace.as_ref().map(|span| span.enter());
+                let handler_trace = server_trace
+                    .as_ref()
+                    .map(|_| tracing::info_span!(target: "st3::http", "handler"));
+                let _handler = handler_trace.as_ref().map(|span| span.enter());
                 if let Some(profile) = &handler_profile {
                     profile.queued();
                 }
@@ -1135,6 +1179,15 @@ async fn response_envelope_unbounded(
         if let Some(profile) = profile {
             profile.finish();
         }
+        crate::otel::record_http_request_duration(
+            request_method.as_str(),
+            &request_route,
+            client_class,
+            response.status(),
+            started.elapsed(),
+        );
+        // A 101 upgrade ends the server span here; the WebSocket stream never holds it.
+        finish_request_trace(otel, response.status());
         return response;
     }
     let enveloping = Instant::now();
@@ -1227,6 +1280,14 @@ async fn response_envelope_unbounded(
             remote: served_remote.load(std::sync::atomic::Ordering::Relaxed),
         },
     );
+    crate::otel::record_http_request_duration(
+        request_method.as_str(),
+        &request_route,
+        client_class,
+        status,
+        started.elapsed(),
+    );
+    finish_request_trace(otel, status);
     if let Some(profile) = profile {
         profile.enveloped(enveloping.elapsed(), body.len());
         profile.finish();
@@ -1235,6 +1296,54 @@ async fn response_envelope_unbounded(
 }
 
 static REQUEST_LATENCY: OnceLock<Mutex<request_latency::Meter>> = OnceLock::new();
+/// The request's OTel server span: named `METHOD {route}`, a local root unless the caller
+/// sent a valid W3C `traceparent`/`tracestate`, which HTTP requests and WebSocket
+/// upgrades carry alike. `None` whenever trace export is off, so that path allocates
+/// nothing. Children (`admission.queue`, `admission.authenticate`, `admission.snapshot`,
+/// `handler.queue`, `handler`) are created while this span is entered, so they parent to
+/// it across the `spawn_blocking` boundary through cloned handles.
+fn request_trace(
+    method: &axum::http::Method,
+    route: &str,
+    client_class: crate::otel_client_class::ClientClass,
+    headers: &axum::http::HeaderMap,
+) -> Option<tracing::Span> {
+    if !crate::otel::export_enabled() {
+        return None;
+    }
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let span_name = format!("{} {route}", method.as_str());
+    let span = tracing::info_span!(
+        target: "st3::http",
+        "http server request",
+        "otel.name" = span_name.as_str(),
+        "otel.kind" = "server",
+        "span.label" = route,
+        "http.request.method" = method.as_str(),
+        "http.route" = route,
+        "st3.client.class" = client_class.as_str(),
+        "http.response.status_code" = tracing::field::Empty,
+    );
+    span.set_parent(crate::otel::extract_remote_context(headers));
+    Some(span)
+}
+
+/// Record the response status, mark server faults (5xx, or a handler panic surfaced as a
+/// 500) as span errors — a 4xx is the caller's, not the server's — and end the server
+/// span by dropping its last handle.
+fn finish_request_trace(server: Option<tracing::Span>, status: axum::http::StatusCode) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let Some(server) = server else {
+        return;
+    };
+    server.record("http.response.status_code", i64::from(status.as_u16()));
+    if status.is_server_error() {
+        server.set_status(opentelemetry::trace::Status::error(format!(
+            "HTTP {status}"
+        )));
+    }
+}
+
 
 fn request_latency() -> &'static Mutex<request_latency::Meter> {
     REQUEST_LATENCY.get_or_init(|| Mutex::new(request_latency::Meter::default()))

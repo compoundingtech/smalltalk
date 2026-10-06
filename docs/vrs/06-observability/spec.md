@@ -366,6 +366,31 @@ attribute. The decision wait must be long enough for the daemon's SDK batch dela
 delivery of the completed root and its spans. RED metrics are exported independently and
 are never sampled.
 
+### Server request spans
+
+`response_envelope` constructs one local root span per request only when trace export is
+enabled. Its name is `"{METHOD} {route}"`, where `route` is the matched route template or
+`/unmatched`, never the raw path.
+
+```text
+{METHOD} {route}
+├── admission.queue
+├── admission.authenticate
+├── admission.snapshot
+├── handler.queue
+└── handler
+```
+
+The root attributes are `http.request.method`, `http.route`, `http.response.status_code`,
+`st3.client.class`, and `span.label` equal to the route. A 5xx response or a handler error
+sets status `ERROR`; a 4xx response alone does not. WebSocket routes end the server span at
+the 101 response, not when the socket closes.
+
+The server extracts W3C `traceparent` and `tracestate` from HTTP request and WebSocket
+upgrade headers and uses the extracted context as the parent. When a remote parent exists,
+the server root span records its sampled flag as the boolean `st.parent.sampled` attribute.
+The collector sampling policy uses that attribute; the process exports every span.
+
 ### Metric naming and cardinality
 
 The repository-local st3 instrument namespace uses lowercase dot-separated names under
@@ -379,15 +404,42 @@ values map to `other`; routes are matched templates, not raw paths.
 
 | Label axis | Bound or vocabulary |
 | --- | --- |
-| `st3.client.class` | `cli`, `stui`, `fractal`, `web`, `replication-worker`, `omp-channel`, `hook`, `other` |
+| `st3.client.class` | The 12 values in the client class table below |
 | HTTP route, method, status class | Registered templates, methods, and status classes |
 | `claim_family` | Top-level registered kind segment, else `other` |
 | Reconcile `task` | `pass`, `deadline` |
 | Wake `cause`, FIFO `queue`, startup `phase`, replication `result` | Closed registries |
 | Replication `peer` | Fleet node membership |
 
-The instrument/label cross-products must total at most 2,000 active series per daemon.
-An enumeration test checks the budget, including histogram expansion. Duration buckets are
+`ClientClass::as_str` defines the closed `st3.client.class` vocabulary. Classification uses
+the trimmed `x-st3-client` header, limited to 120 characters, with case-insensitive matching.
+The rules run in this order: `omp-channel`, `replication-worker`, `hook`, `driver`,
+`peer`/`fabric`/`relay`, `stui`, `smalltalk-`, `fractal`, `web`/`browser`, then CLI prefixes.
+The class is observational only; it does not grant identity or authority.
+
+| `st3.client.class` | Header shape |
+| --- | --- |
+| `cli` | `st`, `st <machine_version>`, `st <subcommand>`, or `st3 <subcommand>` such as `st3 doctor` |
+| `stui` | Prefix `stui`, such as `stui <version>` |
+| `fractal` | Prefix `fractal` |
+| `web` | Contains `web` or `browser` |
+| `app` | Prefix `smalltalk-`, including `smalltalk-ios <version> (<build>)`, `smalltalk-ide <version>`, and `smalltalk-example-tui <version>` |
+| `replication-worker` | Contains `replication-worker`, such as `st3 replication-worker` |
+| `omp-channel` | Contains `omp-channel`, such as `st3 driver omp-channel` or `agent/<seat> · st3 driver omp-channel` |
+| `driver` | Contains `driver`, such as `st3 driver omp`, `st3 driver codex`, or `agent/<seat> · st3 driver <driver>` |
+| `hook` | Contains `hook`, such as `st3 driver-hook` |
+| `peer` | Contains `peer`, `fabric`, or `relay` |
+| `other` | Any other present value; `curl` maps here on purpose, not to `cli` |
+| `unknown` | Header absent or blank after trimming |
+
+`http.server.request.duration` records request duration in seconds at the same point as
+the in-memory meter, independent of trace sampling. Its labels are `http.request.method`,
+`http.route`, `st3.client.class`, and `http.response.status_class`. An SDK cardinality limit
+caps this instrument at 1,500 series; excess combinations go to the
+`otel.metric.overflow=true` series. This runtime cap enforces O11Y-R14's 2,000 active-series
+budget rather than the theoretical label product.
+
+Duration buckets are
 `0.001`, `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`,
 `30`, and `60` seconds.
 
@@ -417,11 +469,11 @@ call within the backoff window. It does not compare whole-process timing medians
 
 Copied-store measurements compare endpoint-unset execution with an enabled `otelite` sink.
 They cover daemon CPU, p99 request latency, RSS, and collector-sampled export rate against O11Y-R18.
-The core mechanism does not claim request-tree or client/peer round-trip coverage until
-those instrumentation surfaces exist.
+The server request tree is specified above. The core does not claim client/peer round-trip
+coverage until those instrumentation surfaces exist.
 
 ### Design questions
 
 The review questions and their resolution criteria are
-[ST3-O11Y-DQ01–DQ05](open-questions.md#st3): service naming, VRS placement, signed peer
-context, sampling location, and profiler ownership.
+[ST3-O11Y-DQ01–DQ05 and ST3-O11Y-DQ6](open-questions.md#st3): service naming, VRS placement,
+signed peer context, sampling location, profiler ownership, and SIGTERM flush.
