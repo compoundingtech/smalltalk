@@ -706,6 +706,12 @@ it keeps sets every field a reader takes from the dropped one:
   claims from older builds stay;
 - `harness.limits` readings, keeping each seat's newest.
 
+Checkpoint rules v12 additionally retain the greatest source-time harness observation and native
+authentication observation for each runtime incarnation. This keeps a newer capture usable even
+when older history was accepted later. `harness.current` is never dropped by these rules: its
+source ordering differs from canonical receipt ordering, so a future drop rule requires an explicit
+reader-equivalence proof. Declaring that kind `latest` does not enable immediate trimming.
+
 Every model response also goes to OpenTelemetry when `[observations.otlp]` is set: an
 `st.usage.response` log with its agent, mission run, step, model, account, tokens and cost, and
 the counters `st_usage_tokens_total` and `st_usage_cost_microusd_total`, labelled only by

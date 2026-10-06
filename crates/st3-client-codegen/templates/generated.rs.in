@@ -1111,6 +1111,13 @@ pub struct Agent {
     /// The subagents this seat's harness runs now, oldest first. An older daemon omits them.
     #[serde(default)]
     pub subagents: Vec<AgentSubagent>,
+    /// Native running counts, independent of leased subagent metadata. Missing/null is unknown.
+    #[serde(default)]
+    pub running_subagents: Option<u64>,
+    #[serde(default)]
+    pub background_jobs: Option<u64>,
+    #[serde(default)]
+    pub history_gap: Option<HarnessHistoryGap>,
     /// The seat's latest suspend or resume and its phase. An older daemon omits it.
     #[serde(default)]
     pub suspension: Option<AgentSuspension>,
@@ -1250,6 +1257,16 @@ pub enum AgentQueuePlacement {
     Before,
     After,
 }
+/// Explicit aggregate native history loss, not a fabricated transition.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessHistoryGap {
+    pub runtime_incarnation: String,
+    pub count: u64,
+    pub from_ms: u64,
+    pub to_ms: u64,
+    pub reason: String,
+}
+
 /// One agent seat's current claim and its ordered queue of mission runs.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct StatusHistory {
@@ -1258,6 +1275,8 @@ pub struct StatusHistory {
     pub items: Vec<StatusTransition>,
     pub retained_from: String,
     pub complete: bool,
+    #[serde(default)]
+    pub history_gaps: Vec<HarnessHistoryGap>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct StatusTransition {

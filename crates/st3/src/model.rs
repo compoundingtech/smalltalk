@@ -1508,6 +1508,15 @@ pub struct ClientSyncPeer {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HarnessHistoryGap {
+    pub runtime_incarnation: String,
+    pub count: u64,
+    pub from_ms: u64,
+    pub to_ms: u64,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CurrentHarnessView {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1521,6 +1530,10 @@ pub struct CurrentHarnessView {
     pub blocked_on: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_jobs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_subagents: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_buffer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1551,6 +1564,8 @@ mod current_harness_view_tests {
             reason: reason.map(str::to_owned),
             blocked_on: None,
             ask: None,
+            background_jobs: None,
+            running_subagents: None,
             input_buffer: None,
             exit: None,
             claim: "claim/one".into(),

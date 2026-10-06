@@ -24,8 +24,8 @@ use smallclaims::store::checkpoint_agreement::*;
 /// reading, so it no longer witnesses the reading the account fold selects. Version 9 preserves
 /// bounded observed status history and the beginning of the current state.
 /// Version 10 retains native credential edges and their bounded status transitions.
-/// Version 11 includes arrangement tables in the graph proof and rebuilds them during replay.
-pub const RULES_VERSION: u32 = 11;
+/// Version 12 preserves source-time observation and native-auth winners for the current lane.
+pub const RULES_VERSION: u32 = 12;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -63,7 +63,7 @@ pub(crate) const REQUEST_CLOSERS: [&str; 3] = [
 
 /// A canonical description of every rule. The rules digest hashes it with `RULES_VERSION`.
 pub(crate) const RULES_DESCRIPTION: &str = "\
-harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start
+harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start,newest-source,newest-native-auth-source
 seat.status-history slot=subject keep=last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,current-state-run-start
 harness.timeline slot=subject,incarnation_id keep=newest min-age-before-cut=5d
 loop.state slot=subject keep=first-and-last-of-each-run-of-status-and-round,first-with-items
@@ -138,6 +138,9 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
         slot
     };
     match claim.kind.as_str() {
+        // Source order is not canonical receipt order. Until a source-witness rule is proven,
+        // categorical current claims stay; Retention::Latest is not a checkpoint drop rule.
+        "harness.current" => None,
         // A legacy observation without an incarnation falls back to store index comparisons in
         // `current_harness_at`, so it stays.
         "harness.observed" => field_str(claim, "incarnation_id")
@@ -248,6 +251,17 @@ pub(crate) fn harness_keep(claims: &[&ClaimRecord]) -> BTreeSet<usize> {
     let mut keep = BTreeSet::new();
     keep.insert(0);
     keep.insert(claims.len() - 1);
+    if let Some((position, _)) = claims.iter().enumerate()
+        .max_by_key(|(_, claim)| seat_status::observation_time(claim))
+    {
+        keep.insert(position);
+    }
+    if let Some((position, _)) = claims.iter().enumerate()
+        .filter(|(_, claim)| fields(claim).and_then(|fields| fields.get("provider_auth")).and_then(Value::as_bool).is_some())
+        .max_by_key(|(_, claim)| seat_status::observation_time(claim))
+    {
+        keep.insert(position);
+    }
     // `park_unready_crash_loop` asks whether the incarnation was ever ready; `harness_was_ready`
     // asks the same without a provider-login reason.
     if let Some(position) = claims.iter().position(|claim| ready(claim)) {

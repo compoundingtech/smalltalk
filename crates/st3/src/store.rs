@@ -280,6 +280,42 @@ ON claims(
 WHERE json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
     THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NOT NULL;
 
+-- Categorical snapshots compete by bounded source time, never by FIFO receipt time.
+CREATE INDEX IF NOT EXISTS claims_harness_source_index
+ON claims(subject,
+    json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END),
+    kind,
+    min(CASE WHEN json_type(body, '$.fields.observed_at_ms')='integer'
+             AND json_extract(body, '$.fields.observed_at_ms')>=0
+        THEN json_extract(body, '$.fields.observed_at_ms')
+        ELSE CAST(accepted_at_unix_ms AS INTEGER) END, CAST(accepted_at_unix_ms AS INTEGER)),
+    length(accepted_at_unix_ms), accepted_at_unix_ms)
+WHERE kind IN ('harness.current','harness.observed');
+CREATE INDEX IF NOT EXISTS claims_harness_auth_source_index
+ON claims(subject,
+    json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END),
+    kind,
+    min(CASE WHEN json_type(body, '$.fields.observed_at_ms')='integer'
+             AND json_extract(body, '$.fields.observed_at_ms')>=0
+        THEN json_extract(body, '$.fields.observed_at_ms')
+        ELSE CAST(accepted_at_unix_ms AS INTEGER) END, CAST(accepted_at_unix_ms AS INTEGER)),
+    length(accepted_at_unix_ms), accepted_at_unix_ms)
+WHERE kind IN ('harness.current','harness.observed')
+    AND json_type(body, '$.fields.provider_auth') IN ('true','false');
+CREATE INDEX IF NOT EXISTS claims_harness_gap_index
+ON claims(subject,
+    json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END),
+    json_extract(body, '$.fields.history_gap_count'),
+    json_extract(body, '$.fields.history_gap_from_ms'),
+    json_extract(body, '$.fields.history_gap_to_ms'),
+    store_index)
+WHERE kind='harness.current'
+    AND json_type(body, '$.fields.history_gap_count')='integer'
+    AND json_extract(body, '$.fields.history_gap_count')>0;
+
 -- Attachment checks must not walk a quiet seat's accumulated hook and work history.
 -- Only phase transitions publish these diagnostics, so a current-runtime lookup stays small.
 CREATE INDEX IF NOT EXISTS claims_claude_attachment_index
@@ -787,6 +823,12 @@ const RUN_HAS_PRIOR_CLAIMS: &str =
 const INCARNATION_OF_CLAIM: &str =
     "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
         THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END)";
+
+const HARNESS_SOURCE_TIME: &str =
+    "min(CASE WHEN json_type(body, '$.fields.observed_at_ms')='integer'
+             AND json_extract(body, '$.fields.observed_at_ms')>=0
+        THEN json_extract(body, '$.fields.observed_at_ms')
+        ELSE CAST(accepted_at_unix_ms AS INTEGER) END, CAST(accepted_at_unix_ms AS INTEGER))";
 
 /// The predicate of `mission_runs_open_index`, word for word, so SQLite can use the index.
 const OPEN_MISSION_RUN: &str = "mission_runs.status NOT IN ('completed','failed','cancelled')";
@@ -19966,6 +20008,8 @@ fn update_prompt_fence(
         reason: text("reason"),
         blocked_on: Some("human".into()),
         ask: None,
+        background_jobs: None,
+        running_subagents: None,
         input_buffer: None,
         exit: None,
         claim,
@@ -20025,6 +20069,8 @@ fn claude_attachment_fence(
         reason: Some("claude-channel-unattached".into()),
         blocked_on: Some("channel".into()),
         ask: None,
+        background_jobs: None,
+        running_subagents: None,
         input_buffer: None,
         exit: None,
         claim,
@@ -20086,6 +20132,8 @@ fn current_harness_fold_at(
             reason: Some(reason),
             blocked_on: None,
             ask: None,
+            background_jobs: None,
+            running_subagents: None,
             input_buffer: None,
             exit: None,
             claim,
@@ -20097,6 +20145,9 @@ fn current_harness_fold_at(
         return Ok(None);
     }
 
+    let current_source =
+        seat_status::current_source_at(connection, subject, incarnation_id, at_index)?;
+
     // A terminal modal holds even if a parallel native channel reports idle or work progress.
     // Only a successful subsequent screen observation or a new runtime lifts this fence.
     if let Some(harness) = update_prompt_fence(connection, subject, incarnation_id, at_index)? {
@@ -20104,16 +20155,22 @@ fn current_harness_fold_at(
     }
 
     // A native credential refusal is independent of activity, and work claims cannot erase it.
-    let auth = connection.prepare_cached(&canonical_sql(
-        "SELECT id, accepted_at_unix_ms, body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
-         AND +store_index<=?2 AND json_extract(body, '$.fields.incarnation_id')=?3
-         AND json_type(body, '$.fields.provider_auth') IN ('true','false')
-         ORDER BY CANONICAL_DESC(claims) LIMIT 1"))?.query_row(params![subject, at_index, incarnation_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
-        .optional()?;
+    let auth = if current_source.is_some() {
+        seat_status::current_auth_at(connection, subject, incarnation_id, at_index)?
+            .map(|claim| (claim.id, claim.accepted_at_unix_ms, claim.body))
+    } else {
+        connection.prepare_cached(&canonical_sql(
+            "SELECT id, accepted_at_unix_ms, body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
+             AND +store_index<=?2 AND json_extract(body, '$.fields.incarnation_id')=?3
+             AND json_type(body, '$.fields.provider_auth') IN ('true','false')
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1"))?.query_row(params![subject, at_index, incarnation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            .optional()?
+            .map(|(id, time, body)| Ok::<_, anyhow::Error>((id, time.parse::<u128>()?, serde_json::from_str::<Value>(&body)?)))
+            .transpose()?
+    };
     let mut auth_restored = false;
     if let Some((claim, time, body)) = auth {
-        let body: Value = serde_json::from_str(&body)?;
         let fields = &body["fields"];
         auth_restored = fields["provider_auth"] == true;
         if fields["provider_auth"] == false {
@@ -20125,11 +20182,19 @@ fn current_harness_fold_at(
                 reason: Some("providerAuth".into()),
                 blocked_on: Some("human".into()),
                 ask: None,
+                background_jobs: current_source.as_ref().map_or_else(
+                    || fields.get("background_jobs").and_then(Value::as_u64),
+                    |source| source.body.pointer("/fields/background_jobs").and_then(Value::as_u64),
+                ),
+                running_subagents: current_source.as_ref().map_or_else(
+                    || fields.get("running_subagents").and_then(Value::as_u64),
+                    |source| source.body.pointer("/fields/running_subagents").and_then(Value::as_u64),
+                ),
                 input_buffer: None,
                 exit: None,
                 claim,
-                since_unix_ms: time.parse()?,
-                observed_at_unix_ms: time.parse()?,
+                since_unix_ms: time,
+                observed_at_unix_ms: time,
             }));
         }
     }
@@ -20181,6 +20246,8 @@ fn current_harness_fold_at(
             reason: Some(reason.into()),
             blocked_on: Some("human".into()),
             ask: None,
+            background_jobs: None,
+            running_subagents: None,
             input_buffer: None,
             exit: None,
             claim,
@@ -20191,6 +20258,33 @@ fn current_harness_fold_at(
 
     if let Some(harness) = claude_attachment_fence(connection, subject, incarnation_id, at_index)? {
         return Ok(Some(harness));
+    }
+
+    // A categorical capture is a complete current snapshot, not a history patch.
+    // Receipt order, work progress and older sparse fields cannot overwrite its source winner.
+    if let Some(claim) = current_source {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        let text = |name: &str| fields.get(name).and_then(Value::as_str).map(str::to_owned);
+        let Some(state) = text("state") else {
+            return Ok(None);
+        };
+        let observed_at = seat_status::observation_time(&claim);
+        return Ok(Some(crate::model::CurrentHarnessView {
+            state,
+            driver: text("driver"),
+            incarnation_id: incarnation_id.to_owned(),
+            transport: text("transport"),
+            reason: text("reason").filter(|reason| !auth_restored || reason != "providerAuth"),
+            blocked_on: text("blocked_on"),
+            ask: text("ask"),
+            background_jobs: fields.get("background_jobs").and_then(Value::as_u64),
+            running_subagents: fields.get("running_subagents").and_then(Value::as_u64),
+            input_buffer: text("input_buffer"),
+            exit: text("exit"),
+            claim: claim.id,
+            since_unix_ms: observed_at,
+            observed_at_unix_ms: observed_at,
+        }));
     }
 
     // The observations of this runtime epoch, newest first in canonical order, so every node that
@@ -20217,6 +20311,8 @@ fn current_harness_fold_at(
     let mut named = statement.query_map(params![subject, at_index, incarnation_id], row)?;
     let mut next_named = None;
     let mut current = None;
+    let mut background_jobs = None;
+    let mut running_subagents = None;
     let mut optional = BTreeMap::<&'static str, Option<String>>::new();
     loop {
         if next_named.is_none() {
@@ -20253,6 +20349,8 @@ fn current_harness_fold_at(
             && let Some(state) = fields.get("state").and_then(Value::as_str)
         {
             current = Some((state.to_owned(), claim, observed_at_unix_ms, key));
+            background_jobs = fields.get("background_jobs").and_then(Value::as_u64);
+            running_subagents = fields.get("running_subagents").and_then(Value::as_u64);
         }
         for name in [
             "driver",
@@ -20316,6 +20414,8 @@ fn current_harness_fold_at(
             reason: None,
             blocked_on: None,
             ask: None,
+            background_jobs: None,
+            running_subagents: None,
             input_buffer: None,
             exit: None,
             claim,
@@ -20342,6 +20442,8 @@ fn current_harness_fold_at(
         reason: optional.remove("reason").flatten(),
         blocked_on: optional.remove("blocked_on").flatten(),
         ask: optional.remove("ask").flatten(),
+        background_jobs,
+        running_subagents,
         input_buffer: optional.remove("input_buffer").flatten(),
         exit: optional.remove("exit").flatten(),
         claim,
