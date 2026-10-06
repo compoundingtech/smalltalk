@@ -73,6 +73,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_glass_head_dirty",
         "local_custom_dirty",
         "graph_generation",
+        "fleet_generation",
         "projection_digest_state",
         "projection_digest_generation",
         "projection_digest_operation_rows",
