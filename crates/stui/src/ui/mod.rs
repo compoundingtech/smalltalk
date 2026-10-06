@@ -6822,7 +6822,7 @@ mod tests {
 
     #[test]
     fn voice_that_never_answers_cannot_hold_the_keys() {
-        // Nathan, 2026-10-06 (bluey): keys stopped working, Ctrl+Q did not quit, until the
+        // Nathan, 2026-10-06: keys stopped working, Ctrl+Q did not quit, until the
         // terminal tab was closed.
         let mut ui = Ui::new(demo::world());
         ui.switch_tab(1);
