@@ -16788,6 +16788,12 @@ async fn run_st2_native_driver(
                 argv,
                 &paths.session_dir.join("provider-sessions"),
                 session,
+                if st3::native_resume::requested().is_some() {
+                    std::env::var_os(st3::rollout::RESUME_PATH_ENV).map(PathBuf::from)
+                } else {
+                    None
+                }
+                .as_deref(),
             ),
             "opencode" => st3::native_resume::opencode_argv(
                 argv,

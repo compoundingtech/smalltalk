@@ -159,6 +159,40 @@ originating `CODEX_HOME`. Discovery currently reads `$HOME/.codex/sessions`, inc
 symlink to another home; sessions stored only in another home are not discovered yet
 ([#1495](https://github.com/compoundingtech/smalltalk/issues/1495)).
 
+OMP imports use the same strict resume handshake, with `ST3_NATIVE_RESUME_SESSION`
+holding the native session ID and `ST3_NATIVE_RESUME_PATH` pinning the absolute
+transcript path. The driver validates the transcript header, links its directory
+into the managed inventory without copying it, and launches OMP with that exact
+path. Missing or mismatched transcripts fail the launch rather than starting anew.
+
+### Repair an OMP import created before strict resume
+
+Upgrading st does not migrate stored declarations. Re-importing an already-declared
+seat does not replace its declaration. Stop the seat and export its current KDL:
+
+```sh
+st agents stop agent/import/omp/ID --as person/ada
+st subject show agent/import/omp/ID --kdl --show-env-values > imported.kdl
+```
+
+Keep the identity, workspace, and other settings. Remove the harness's
+`args "--resume=/absolute/transcript.jsonl"` selector and add:
+
+```kdl
+env {
+  ST3_NATIVE_RESUME_SESSION "NATIVE_SESSION_ID"
+  ST3_NATIVE_RESUME_PATH "/absolute/transcript.jsonl"
+}
+```
+
+The native ID must match the transcript's session header. Apply the repaired
+declaration and inspect the resulting seat:
+
+```sh
+st apply imported.kdl --as person/ada
+st agents show agent/import/omp/ID
+```
+
 ### Repair a Codex import created before strict resume
 
 Upgrading st does not rewrite an existing imported seat's stored declaration. A Codex import
