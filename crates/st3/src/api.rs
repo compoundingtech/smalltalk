@@ -2150,11 +2150,27 @@ fn client_agent_resources_selected(
     snapshot_index: u64,
     changed: Option<(&BTreeSet<String>, &[Value])>,
 ) -> anyhow::Result<Vec<Value>> {
+    client_agent_resources_with_raw_harness(store, history, snapshot_index, changed, true)
+}
+
+fn client_agent_resources_with_raw_harness(
+    store: &Store,
+    history: bool,
+    snapshot_index: u64,
+    changed: Option<(&BTreeSet<String>, &[Value])>,
+    use_raw_harness: bool,
+) -> anyhow::Result<Vec<Value>> {
     // Without history the store reduces only agents that can be current, including unhealthy
     // ones; the filters below keep the current layer either way.
     let status = match changed {
+        Some((subjects, _)) if use_raw_harness => {
+            store.agent_card_status_for_names_at(subjects.clone(), snapshot_index, history)?
+        }
         Some((subjects, _)) => {
             store.status_for_subject_names_at(subjects.clone(), snapshot_index, history)?
+        }
+        None if use_raw_harness => {
+            store.agent_card_status_for_prefix_at(snapshot_index, history)?
         }
         None => store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?,
     };
@@ -2237,7 +2253,11 @@ fn client_agent_resources_selected(
         })
         .filter(|subject| history || subject.projection.layer == "current")
         .map(|mut subject| -> anyhow::Result<(String, Value)> {
-            subject.harness = store.observed_harness_at(&subject.subject, snapshot_index)?;
+            subject.harness = if use_raw_harness {
+                store.observed_harness_for_card_at(&subject.subject, snapshot_index)?
+            } else {
+                store.observed_harness_at(&subject.subject, snapshot_index)?
+            };
             let fault = member_faults.get(&subject.subject);
             let fields = subject
                 .actual
@@ -19962,6 +19982,10 @@ mission "wake" state="ready" {
         assert_eq!(
             cached,
             client_agent_resources_uncached(store, history, index).unwrap()
+        );
+        assert_eq!(
+            cached,
+            client_agent_resources_with_raw_harness(store, history, index, None, false).unwrap()
         );
         cached
     }
