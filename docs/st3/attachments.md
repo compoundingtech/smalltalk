@@ -30,15 +30,28 @@ Standalone image blocks become typed `native_image_unavailable` timeline diagnos
 Their details use `{ "_tag": "OmpImage", "version": 1, "availability": "unavailable",
 "reason": "native_blob_not_fetchable", "native_ref": "blob:sha256:…", "mime_type": "image/webp" }`.
 Images inside message-level or nested tool results use the same descriptor in result content;
-other result content and call correlation remain unchanged.
+plain text and call correlation remain unchanged.
 
 Inline pixels, remote URLs and malformed references are never copied into these descriptors.
 They report `availability: withheld` and `reason: image_payload_not_authorized`. Unsupported
 MIME values report `mime_availability: unknown` rather than leaking free text.
-Unrecognized image-bearing blocks, including `input_image`, `image_url` and single-object message
-content, also produce typed placeholders instead of JSON excerpts. Tool-result blocks containing
-data URIs are replaced with the same withheld descriptor, regardless of their block type.
 No image is fetched or uploaded by native normalization, and no image bytes enter timeline claims.
+
+OMP content uses an explicit allow-list: plain text and `text` blocks contribute text, and
+`image` blocks contribute only the validated `OmpImage` descriptor. Extra fields on a text block
+are omitted. Arrays are processed recursively, and single-object content follows the same rule.
+Unknown entries and block types, including `input_image` and `image_url`, contribute no JSON
+excerpt, source, URL or body. They become `{ "_tag": "OmpWithheld", "version": 1,
+"reason": "unknown_block_type", "block_type": "future_media",
+"message": "withheld: unknown block type future_media" }`. Type names are limited to 64
+printable ASCII characters. Message-level markers use existing `error` timeline entries with
+code `native_block_withheld`; tool results carry the descriptor in their content.
+The existing withholding of data URIs in tool-result text is retained.
+
+Tool-call arguments must themselves be typed, bounded safe blocks; untyped objects, JSON
+strings and scalar values are withheld with the same marker. Calls retain their name and ID.
+The Pi reader is unchanged, and these descriptors use existing timeline fields, so clients
+do not need a schema update.
 
 ## Limits
 

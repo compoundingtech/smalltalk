@@ -2235,8 +2235,8 @@ fn push_unrecognized(
     kind: Option<&str>,
     value: &Value,
 ) {
-    if driver == "omp" && omp_has_image_payload(value) {
-        push_omp_image_unavailable(items, sequence, timestamp, value);
+    if driver == "omp" {
+        push_omp_withheld(items, sequence, timestamp, kind);
         return;
     }
     let label = match kind {
@@ -2562,8 +2562,14 @@ fn normalize_omp(
                 sequence + 1,
                 &timestamp,
                 message["toolCallId"].as_str().unwrap_or_default(),
-                omp_result_images(driver, message.get("content").cloned().unwrap_or(Value::Null)),
-                message.get("isError").and_then(Value::as_bool).unwrap_or(false),
+                omp_result_content(
+                    driver,
+                    message.get("content").cloned().unwrap_or(Value::Null),
+                ),
+                message
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             );
             return;
         }
@@ -2615,72 +2621,112 @@ fn push_omp_content(
     timestamp: &str,
     role: &str,
 ) {
-    let label = driver.as_str();
-    let timestamp = timestamp.to_owned();
     match content {
-        Value::String(text) => push_content(items, first_sequence, &timestamp, role, text),
+        Value::String(text) => push_content(items, first_sequence, timestamp, role, text),
         Value::Array(parts) => {
-            for (offset, part) in parts.iter().enumerate() {
-                let item_sequence = first_sequence + offset as u64;
-                match part.get("type").and_then(Value::as_str) {
-                    Some("text") | None if part.get("text").is_some_and(Value::is_string) => {
-                        push_content(
-                            items,
-                            item_sequence,
-                            &timestamp,
-                            role,
-                            part["text"].as_str().unwrap_or_default(),
-                        );
-                    }
-                    Some("toolCall" | "tool_call") => push_tool_call(
-                        items,
-                        item_sequence,
-                        &timestamp,
-                        part.get("id")
-                            .or_else(|| part.get("toolCallId"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("native-call"),
-                        part.get("name").and_then(Value::as_str).unwrap_or("tool"),
-                        part.get("arguments").cloned().unwrap_or_else(|| json!({})),
-                    ),
-                    Some("toolResult" | "tool_result") => push_tool_result(
-                        items,
-                        item_sequence,
-                        &timestamp,
-                        part.get("toolCallId")
-                            .or_else(|| part.get("call_id"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("native-call"),
-                        omp_result_images(driver, part.get("content").cloned().unwrap_or(Value::Null)),
-                    ),
-                    Some(kind) if HIDDEN_REASONING_BLOCKS.contains(&kind) => {}
-                    Some("image") if driver == ExternalDriver::Omp => {
-                        push_omp_image_unavailable(items, item_sequence, &timestamp, part);
-                    }
-                    Some("image") => {
-                        push_content(items, item_sequence, &timestamp, role, "[image]")
-                    }
-                    kind => push_unrecognized(
-                        items,
-                        item_sequence,
-                        &timestamp,
-                        label,
-                        "content block",
-                        kind,
-                        part,
-                    ),
+            let mut sequence = first_sequence;
+            for part in parts {
+                push_omp_block(driver, items, part, sequence, timestamp, role);
+                // Nested OMP arrays can emit several entries. Pi keeps its original offsets.
+                sequence += 1;
+                if driver == ExternalDriver::Omp
+                    && let Some(last) = items.last().and_then(|item| item["sequence"].as_u64())
+                {
+                    sequence = sequence.max(last + 1);
                 }
             }
         }
         Value::Null => {}
+        other if driver == ExternalDriver::Omp => {
+            push_omp_block(driver, items, other, first_sequence, timestamp, role);
+        }
         other => push_unrecognized(
             items,
             first_sequence,
-            &timestamp,
-            label,
+            timestamp,
+            driver.as_str(),
             "message content",
             Some(json_kind(other)),
             other,
+        ),
+    }
+}
+
+fn push_omp_block(
+    driver: ExternalDriver,
+    items: &mut Vec<Value>,
+    part: &Value,
+    sequence: u64,
+    timestamp: &str,
+    role: &str,
+) {
+    if driver == ExternalDriver::Omp
+        && matches!(part, Value::Array(_) | Value::String(_) | Value::Null)
+    {
+        push_omp_content(driver, items, part, sequence, timestamp, role);
+        return;
+    }
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") if part.get("text").is_some_and(Value::is_string) => {
+            push_content(
+                items,
+                sequence,
+                timestamp,
+                role,
+                part["text"].as_str().unwrap_or_default(),
+            );
+        }
+        None if driver == ExternalDriver::Pi && part.get("text").is_some_and(Value::is_string) => {
+            push_content(
+                items,
+                sequence,
+                timestamp,
+                role,
+                part["text"].as_str().unwrap_or_default(),
+            );
+        }
+        Some("toolCall" | "tool_call") => {
+            let arguments = part.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let arguments = if driver == ExternalDriver::Omp {
+                omp_safe_arguments(arguments)
+            } else {
+                arguments
+            };
+            push_tool_call(
+                items,
+                sequence,
+                timestamp,
+                part.get("id")
+                    .or_else(|| part.get("toolCallId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("native-call"),
+                part.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                arguments,
+            );
+        }
+        Some("toolResult" | "tool_result") => push_tool_result(
+            items,
+            sequence,
+            timestamp,
+            part.get("toolCallId")
+                .or_else(|| part.get("call_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("native-call"),
+            omp_result_content(driver, part.get("content").cloned().unwrap_or(Value::Null)),
+        ),
+        Some(kind) if HIDDEN_REASONING_BLOCKS.contains(&kind) => {}
+        Some("image") if driver == ExternalDriver::Omp => {
+            push_omp_image_unavailable(items, sequence, timestamp, part);
+        }
+        Some("image") => push_content(items, sequence, timestamp, role, "[image]"),
+        kind => push_unrecognized(
+            items,
+            sequence,
+            timestamp,
+            driver.as_str(),
+            "content block",
+            kind,
+            part,
         ),
     }
 }
@@ -2730,31 +2776,85 @@ fn push_omp_image_unavailable(
     })));
 }
 
-/// Unknown native shapes must not turn an image or a data URI into visible JSON text.
-fn omp_has_image_payload(value: &Value) -> bool {
-    match value {
-        Value::String(text) => text.trim_start().starts_with("data:"),
-        Value::Array(values) => values.iter().any(omp_has_image_payload),
-        Value::Object(fields) => {
-            fields.get("type").and_then(Value::as_str).is_some_and(|kind| {
-                matches!(kind, "image" | "input_image" | "image_url")
-            }) || fields.contains_key("image_url")
-                || fields.values().any(omp_has_image_payload)
-        }
-        _ => false,
-    }
+/// Only the block type is disclosed, never an excerpt of an unknown payload.
+fn omp_withheld(kind: Option<&str>) -> Value {
+    let kind: String = kind
+        .unwrap_or("missing")
+        .chars()
+        .take(64)
+        .map(|character| {
+            if character.is_ascii_graphic() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    json!({
+        "_tag":"OmpWithheld", "version":1, "reason":"unknown_block_type",
+        "block_type":kind, "message":format!("withheld: unknown block type {kind}"),
+    })
 }
 
-fn omp_result_images(driver: ExternalDriver, content: Value) -> Value {
+fn push_omp_withheld(items: &mut Vec<Value>, sequence: u64, timestamp: &str, kind: Option<&str>) {
+    let details = omp_withheld(kind);
+    items.push(timeline_item(
+        sequence,
+        timestamp,
+        "system",
+        "error",
+        json!({
+            "code":"native_block_withheld", "message":details["message"],
+            "retryable":false, "details":details,
+        }),
+    ));
+}
+
+/// The native OMP allow-list. Copy only fields whose meaning this reader knows;
+/// descriptors are constructed here, never accepted verbatim from native JSON.
+fn omp_result_content(driver: ExternalDriver, content: Value) -> Value {
     if driver != ExternalDriver::Omp {
         return content;
     }
     match content {
         Value::Array(parts) => Value::Array(
-            parts.into_iter().map(|part| omp_result_images(driver, part)).collect(),
+            parts
+                .into_iter()
+                .map(|part| omp_result_content(driver, part))
+                .collect(),
         ),
-        other if omp_has_image_payload(&other) => omp_image_availability(&other),
-        other => other,
+        // Preserve the existing withholding of bare data URIs in tool results as well.
+        Value::String(ref text) if text.trim_start().starts_with("data:") => {
+            omp_image_availability(&content)
+        }
+        Value::String(text) => Value::String(bounded_text(&text)),
+        Value::Null => Value::Null,
+        other => match other.get("type").and_then(Value::as_str) {
+            Some("text") if other.get("text").is_some_and(Value::is_string) => {
+                let text = other["text"].as_str().unwrap_or_default();
+                if text.trim_start().starts_with("data:") {
+                    omp_image_availability(&other)
+                } else {
+                    json!({"type":"text", "text":bounded_text(text)})
+                }
+            }
+            Some("image") => omp_image_availability(&other),
+            kind => omp_withheld(kind),
+        },
+    }
+}
+
+/// Tool arguments are not plain message text. Parse JSON strings before checking
+/// their type, and withhold all untyped values rather than copying arbitrary inputs.
+fn omp_safe_arguments(arguments: Value) -> Value {
+    let arguments = arguments
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or(arguments);
+    match arguments {
+        Value::Array(parts) => Value::Array(parts.into_iter().map(omp_safe_arguments).collect()),
+        Value::Object(_) => omp_result_content(ExternalDriver::Omp, arguments),
+        other => omp_withheld(Some(json_kind(&other))),
     }
 }
 
@@ -3461,6 +3561,298 @@ mod tests {
     }
 
     #[test]
+    fn omp_allowlist_withholds_unknown_base64_source() {
+        assert_omp_unknown_withheld(
+            json!({"type":"future_media","source":{
+                "type":"base64","data":"ZmFrZS1wYXlsb2Fk"
+            }}),
+            "ZmFrZS1wYXlsb2Fk",
+        );
+    }
+
+    #[test]
+    fn omp_allowlist_withholds_unknown_https_url() {
+        assert_omp_unknown_withheld(
+            json!({"type":"future_media",
+                "url":"https://invented:fake-token@example.invalid/media"
+            }),
+            "fake-token",
+        );
+    }
+
+    #[test]
+    fn omp_allowlist_withholds_unknown_data_uri() {
+        assert_omp_unknown_withheld(
+            json!({"type":"future_media",
+                "source":"data:image/png;base64,fake-pixels"
+            }),
+            "fake-pixels",
+        );
+    }
+
+    #[test]
+    fn omp_allowlist_withholds_unknown_text_and_untyped_objects() {
+        assert_omp_unknown_withheld(
+            json!({"type":"future_media","text":"fake-secret"}),
+            "fake-secret",
+        );
+        assert_omp_unknown_withheld(json!({"text":"fake-secret"}), "fake-secret");
+    }
+
+    // Exercise the native entry, message/custom message, modern result, and legacy result
+    // paths, including single objects and nested arrays. No daemon or live transcript is used.
+    fn assert_omp_unknown_withheld(block: Value, secret: &str) {
+        for content in [
+            block.clone(),
+            json!([block.clone()]),
+            json!([[block.clone()]]),
+        ] {
+            for entry in [
+                json!({"type":"message","id":"fake-message","message":{"role":"user","content":content}}),
+                json!({"type":"custom_message","content":content}),
+                json!({"type":"message","id":"fake-result","message":{
+                    "role":"toolResult","toolCallId":"fake-call","content":content
+                }}),
+                json!({"type":"message","id":"fake-legacy","message":{"role":"tool","content":[{
+                    "type":"toolResult","toolCallId":"fake-call","content":content
+                }]}}),
+            ] {
+                let mut items = Vec::new();
+                normalize_omp(ExternalDriver::Omp, &entry, 0, "", &mut items);
+                let encoded = serde_json::to_string(&items).unwrap();
+                assert!(!encoded.contains(secret));
+                assert!(encoded.contains("OmpWithheld"));
+                assert!(encoded.contains("withheld: unknown block type"));
+                assert_unique_ids(&items);
+            }
+        }
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &block, 0, "", &mut items);
+        let encoded = serde_json::to_string(&items).unwrap();
+        assert!(!encoded.contains(secret));
+        assert!(encoded.contains("OmpWithheld"));
+    }
+
+    #[test]
+    fn omp_allowlist_bounds_unknown_blocks_and_prints_only_the_type() {
+        let block = json!({"type":format!("future\n\u{1b}\u{202e}{}", "é".repeat(10_000)),
+            "body":"fake-secret".repeat(100_000)});
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &block, 0, "", &mut items);
+        let encoded = serde_json::to_string(&items).unwrap();
+        assert!(encoded.len() < 1024);
+        assert!(!encoded.contains("fake-secret"));
+        let details = &items[0]["body"]["details"];
+        let kind = details["block_type"].as_str().unwrap();
+        assert!(kind.len() <= 64);
+        assert!(kind.bytes().all(|byte| byte.is_ascii_graphic()));
+    }
+
+    #[test]
+    fn omp_allowlist_preserves_text() {
+        let text = json!({"type":"text","text":"safe text"});
+        let mut items = Vec::new();
+        normalize_omp(
+            ExternalDriver::Omp,
+            &json!({"type":"message","id":"fake-result",
+                "message":{"role":"toolResult","toolCallId":"fake-call","content":[text.clone()]}
+            }),
+            0,
+            "",
+            &mut items,
+        );
+        assert_eq!(items[1]["body"]["content"], json!([text.clone()]));
+        for content in [text.clone(), json!([[text.clone()], text.clone()])] {
+            items.clear();
+            normalize_omp(
+                ExternalDriver::Omp,
+                &json!({"type":"message","id":"fake-text",
+                    "message":{"role":"user","content":content}
+                }),
+                0,
+                "",
+                &mut items,
+            );
+            assert!(items.iter().any(|item| item["body"]["text"] == "safe text"));
+            assert_unique_ids(&items);
+        }
+    }
+
+    #[test]
+    fn omp_allowlist_withholds_untyped_tool_arguments() {
+        let mut items = Vec::new();
+        for arguments in [
+            json!({"credential":"fake-secret-token"}),
+            json!("{\"credential\":\"fake-secret-token\"}"),
+            json!("fake-secret-token"),
+            json!([{"type":"future_media","value":"fake-secret-token"}]),
+        ] {
+            items.clear();
+            normalize_omp(
+                ExternalDriver::Omp,
+                &json!({"type":"message","id":"fake-call-message",
+                    "message":{"role":"assistant","content":[{
+                        "type":"toolCall","id":"fake-call","name":"fake-tool","arguments":arguments
+                    }]}
+                }),
+                0,
+                "",
+                &mut items,
+            );
+            assert_eq!(items[1]["body"]["call_id"], "fake-call");
+            let encoded = serde_json::to_string(&items).unwrap();
+            assert!(!encoded.contains("fake-secret-token"));
+            assert!(encoded.contains("OmpWithheld"));
+        }
+    }
+
+    #[test]
+    fn omp_allowlist_drops_extra_fields_on_safe_text_blocks() {
+        let mut items = Vec::new();
+        normalize_omp(
+            ExternalDriver::Omp,
+            &json!({"type":"message","id":"fake-result",
+                "message":{"role":"toolResult","toolCallId":"fake-call","content":{
+                    "type":"text","text":"safe text","source":{"data":"fake-secret-token"}
+                }}
+            }),
+            0,
+            "",
+            &mut items,
+        );
+        assert_eq!(
+            items[1]["body"]["content"],
+            json!({"type":"text","text":"safe text"})
+        );
+    }
+
+    #[test]
+    fn omp_allowlist_preserves_existing_data_uri_withholding_in_text_results() {
+        let payload = "data:image/png;base64,fake-pixels";
+        for content in [json!(payload), json!({"type":"text","text":payload})] {
+            let mut items = Vec::new();
+            normalize_omp(
+                ExternalDriver::Omp,
+                &json!({"type":"message","id":"fake-result",
+                    "message":{"role":"toolResult","toolCallId":"fake-call","content":content}
+                }),
+                0,
+                "",
+                &mut items,
+            );
+            assert_eq!(items[1]["body"]["content"]["_tag"], "OmpImage");
+            assert!(
+                !serde_json::to_string(&items)
+                    .unwrap()
+                    .contains("fake-pixels")
+            );
+        }
+    }
+
+    #[test]
+    fn omp_allowlist_preserves_bounded_typed_arguments_and_image_descriptors() {
+        let text = json!({"type":"text","text":"safe argument"});
+        for arguments in [text.clone(), json!(text.to_string()), json!([text.clone()])] {
+            let mut items = Vec::new();
+            normalize_omp(
+                ExternalDriver::Omp,
+                &json!({"type":"message","id":"fake-message",
+                    "message":{"role":"assistant","content":[{
+                        "type":"tool_call","id":"fake-call","name":"fake-tool","arguments":arguments
+                    }]}
+                }),
+                0,
+                "",
+                &mut items,
+            );
+            assert!(
+                serde_json::to_string(&items[1]["body"]["arguments"])
+                    .unwrap()
+                    .contains("safe argument")
+            );
+        }
+        let large = omp_safe_arguments(
+            json!({"type":"text","text":"x".repeat(MAX_TIMELINE_VALUE_BYTES * 2)}),
+        );
+        assert!(large["text"].as_str().unwrap().len() < MAX_TIMELINE_VALUE_BYTES + 64);
+        let image = json!({"type":"image","data":format!("blob:sha256:{}", "a".repeat(64)),"mimeType":"image/png"});
+        assert_eq!(
+            omp_safe_arguments(image.clone()),
+            omp_image_availability(&image)
+        );
+        // A descriptor supplied by an unknown native shape is not trusted as our own output.
+        assert_omp_unknown_withheld(
+            json!({"_tag":"OmpImage","data":"fake-secret-token"}),
+            "fake-secret-token",
+        );
+    }
+
+    #[test]
+    fn omp_allowlist_nested_message_arrays_keep_unique_ids_after_hidden_parts() {
+        let mut items = Vec::new();
+        normalize_omp(
+            ExternalDriver::Omp,
+            &json!({"type":"message","id":"fake-message",
+                "message":{"role":"assistant","content":[
+                    [{"type":"thinking","thinking":"fake-private"},{"type":"text","text":"first"}],
+                    {"type":"text","text":"second"}
+                ]}
+            }),
+            0,
+            "",
+            &mut items,
+        );
+        assert_eq!(texts(&items), ["first", "second"]);
+        assert_unique_ids(&items);
+        assert!(
+            !serde_json::to_string(&items)
+                .unwrap()
+                .contains("fake-private")
+        );
+    }
+
+    #[test]
+    fn omp_allowlist_leaves_pi_arguments_results_and_unknown_entries_unchanged() {
+        let arguments = json!({"credential":"fake-token"});
+        let content = json!({"type":"future_media","url":"https://example.invalid/fake-media"});
+        let mut items = Vec::new();
+        normalize_omp(
+            ExternalDriver::Pi,
+            &json!({"type":"message","id":"fake-message",
+                "message":{"role":"assistant","content":[{
+                    "type":"toolCall","id":"fake-call","name":"fake-tool","arguments":arguments
+                }]}
+            }),
+            0,
+            "",
+            &mut items,
+        );
+        assert_eq!(items[1]["body"]["arguments"], arguments);
+        normalize_omp(
+            ExternalDriver::Pi,
+            &json!({"type":"message","id":"fake-result",
+                "message":{"role":"toolResult","toolCallId":"fake-call","content":content}
+            }),
+            16,
+            "",
+            &mut items,
+        );
+        assert_eq!(items[3]["body"]["content"], content);
+        normalize_omp(ExternalDriver::Pi, &content, 32, "", &mut items);
+        assert!(
+            items[4]["body"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("fake-media")
+        );
+        assert!(
+            !serde_json::to_string(&items)
+                .unwrap()
+                .contains("OmpWithheld")
+        );
+    }
+
+    #[test]
     fn omp_images_keep_safe_identity_and_typed_unavailability_without_pixels() {
         let reference = format!("blob:sha256:{}", "a".repeat(64));
         let image = json!({"type":"image","data":reference,"mimeType":"image/webp","width":640,"height":480});
@@ -3545,7 +3937,7 @@ mod tests {
     }
 
     #[test]
-    fn omp_images_withhold_unrecognized_and_single_object_payloads() {
+    fn omp_allowlist_withholds_unrecognized_and_single_object_payloads() {
         let payload = "data:image/png;base64,planted-pixels";
         for block in [
             json!({"type":"input_image","image_url":payload}),
@@ -3554,30 +3946,49 @@ mod tests {
         ] {
             for content in [json!([block.clone()]), block.clone()] {
                 let mut items = Vec::new();
-                normalize_omp(ExternalDriver::Omp, &json!({
-                    "type":"message","id":"unknown-image","message":{"role":"user","content":content}
-                }), 0, "", &mut items);
-                let details = &items.iter().find(|item| item["type"] == "error").unwrap()["body"]["details"];
-                assert_eq!(details["_tag"], "OmpImage");
-                assert_eq!(details["availability"], "withheld");
+                normalize_omp(
+                    ExternalDriver::Omp,
+                    &json!({
+                        "type":"message","id":"unknown-image","message":{"role":"user","content":content}
+                    }),
+                    0,
+                    "",
+                    &mut items,
+                );
+                let details =
+                    &items.iter().find(|item| item["type"] == "error").unwrap()["body"]["details"];
+                assert_eq!(details["_tag"], "OmpWithheld");
+                assert_eq!(details["reason"], "unknown_block_type");
                 assert!(!serde_json::to_string(&items).unwrap().contains(payload));
             }
-            for content in [json!([{"type":"text","text":"kept"},block.clone()]), block.clone()] {
+            for content in [
+                json!([{"type":"text","text":"kept"},block.clone()]),
+                block.clone(),
+            ] {
                 let mut items = Vec::new();
-                normalize_omp(ExternalDriver::Omp, &json!({
-                    "type":"message","id":"unknown-tool-image","message":{
-                        "role":"toolResult","toolCallId":"image-call","content":content
-                    }
-                }), 0, "", &mut items);
-                let result = &items.iter().find(|item| item["type"] == "tool_result").unwrap()["body"]["content"];
+                normalize_omp(
+                    ExternalDriver::Omp,
+                    &json!({
+                        "type":"message","id":"unknown-tool-image","message":{
+                            "role":"toolResult","toolCallId":"image-call","content":content
+                        }
+                    }),
+                    0,
+                    "",
+                    &mut items,
+                );
+                let result = &items
+                    .iter()
+                    .find(|item| item["type"] == "tool_result")
+                    .unwrap()["body"]["content"];
                 let placeholder = if result.is_array() {
                     assert_eq!(result[0]["text"], "kept");
                     &result[1]
                 } else {
                     result
                 };
-                assert_eq!(placeholder["_tag"], "OmpImage");
-                assert_eq!(placeholder["availability"], "withheld");
+                assert_eq!(placeholder["_tag"], "OmpWithheld");
+                assert_eq!(placeholder["reason"], "unknown_block_type");
                 assert!(!serde_json::to_string(&items).unwrap().contains(payload));
             }
         }
@@ -4469,10 +4880,14 @@ mod tests {
         let labels = texts(&items);
         assert_eq!(labels[0], "[omp compaction]\nearlier work");
         assert_eq!(labels[1], "$ ls\nfile");
-        assert!(labels[2].starts_with("[unrecognized omp entry `future_kind`]"));
-        assert!(labels[3].starts_with("[unrecognized omp content block `sparkle`]"));
-        assert_eq!(labels[4], "answer");
-        assert_eq!(labels.len(), 5);
+        assert_eq!(labels[2], "answer");
+        assert_eq!(labels.len(), 3);
+        let withheld = items
+            .iter()
+            .filter(|item| item["body"]["code"] == "native_block_withheld")
+            .map(|item| item["body"]["details"]["block_type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(withheld, ["future_kind", "sparkle"]);
         let shell = items
             .iter()
             .find(|item| item["body"]["text"] == "$ ls\nfile")
