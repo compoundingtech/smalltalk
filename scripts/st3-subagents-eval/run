@@ -359,8 +359,18 @@ def worker_scenarios(node, worker, run, checks):
                        and fields(claim)["outcome"] == "completed"]) == 20,
           90, "not every one of many subagents ended")
     checks["many"] = 20
-    expect("one of many" not in node.cli("agents", "show", worker.subject),
+    cleared = until(lambda: (card if (card := node.api("/v1/client/agents/" + worker.subject))
+                             and not card.get("subagents") else None),
+                    30, "completed children remain in the many-child API")
+    cleared_card = node.cli("agents", "show", worker.subject)
+    cleared_tree = node.cli("agents", "tree")
+    expect("one of many" not in cleared_card,
            "completed children remain on the many-child card")
+    expect("one of many" not in cleared_tree, "completed children remain in the tree")
+    checks["many_children_cleared"] = {
+        "parent_activity": cleared["harness_state"], "subagents": cleared.get("subagents"),
+        "card": cleared_card, "tree": cleared_tree,
+    }
 
     # A turn that ended without the subagent's stop, and a session that ended.
     worker.control("spawn", id="w2", description="cut short")
@@ -544,6 +554,17 @@ def restarted_scenarios(node, seat, checks):
     expect(ended.get("outcome") == "harness-exited", f"r1 end: {ended}")
     seat.ready(after=killed_at)
     checks["restart_closes"] = ended
+    cleared = until(lambda: (card if (card := node.api("/v1/client/agents/" + seat.subject))
+                             and not card.get("subagents") else None),
+                    30, "the restarted parent retained its predecessor's child")
+    card = node.cli("agents", "show", seat.subject)
+    tree = node.cli("agents", "tree")
+    expect("dies with its seat" not in card and "dies with its seat" not in tree,
+           "the restarted parent shows a phantom child")
+    checks["restart_has_no_phantom_child"] = {
+        "parent_activity": cleared["harness_state"], "subagents": cleared.get("subagents"),
+        "card": card, "tree": tree,
+    }
 
 
 def stopped_scenarios(node, seat, checks):
