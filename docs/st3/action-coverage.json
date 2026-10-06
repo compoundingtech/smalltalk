@@ -569,6 +569,14 @@
       "verification": "real CLI over private Unix socket; current source review and durable verdict"
     },
     {
+      "command": "st attention discuss",
+      "description": "Chat about an item: send a message to the agent involved, titled after the item, with a reference to what it is about. This is what \"Chat about this\" does in stui",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::attention_discuss_sends_the_message_stui_chat_about_this_sends"
+      ],
+      "verification": "real CLI over private Unix socket; the agent reads the message with the item named"
+    },
+    {
       "command": "st attention ls",
       "description": "List all current human attention items",
       "tests": [

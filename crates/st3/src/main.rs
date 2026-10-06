@@ -3570,6 +3570,9 @@ enum AttentionCommand {
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
     },
+    /// Chat about an item: send a message to the agent involved, titled after the item, with a
+    /// reference to what it is about. This is what "Chat about this" does in stui.
+    Discuss(AttentionDiscussArgs),
     /// Legacy mutation: returns attention-migrated. Use work ask or remedy the source.
     Request(AttentionRequestArgs),
     /// Legacy mutation: returns attention-migrated. Complete a person step with work done.
@@ -3582,6 +3585,26 @@ enum AttentionCommand {
     Reject(ReviewArgs),
     /// Ask a feedback-mode step to change its work and rerun.
     RequestChanges(FeedbackReviewArgs),
+}
+
+#[derive(Args)]
+struct AttentionDiscussArgs {
+    /// The item to talk about: its `attention/...` ID from `st attention ls`.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
+    subject: String,
+    /// What to say. The message also names the item, so the agent knows what it is about.
+    #[arg(short = 'm', long)]
+    body: String,
+    /// Who to talk to. By default the agent that asked for the item.
+    #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
+    to: Option<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: Option<String>,
+    /// Name this message for retries, as `conversations send --idempotency-key` does.
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -13955,6 +13978,62 @@ async fn run_review_decision(
     print_value(&response, json_output)
 }
 
+/// The attention item a person can act on now, found from an `attention/...` ID or its source, and
+/// the card ID when the subject was one. It must not read an update for the person.
+async fn actionable_attention_item(
+    client: &Client,
+    endpoint: &Endpoint,
+    subject: &str,
+    actor: &str,
+) -> Result<(AttentionItemView, Option<String>)> {
+    let normalized = resolve_member_subject(
+        endpoint,
+        subject,
+        "attention",
+        Entity::Attention,
+        completion::Matching::Fuzzy,
+    )
+    .await?;
+    // Public card IDs name a recipient and waiting episode, not just a work source.
+    // Resolve through the actor-scoped read projection; this must not read an update
+    // for the person or let a spent card open a later episode of the same source.
+    let alias = if normalized.starts_with("attention/") {
+        match generated_client(endpoint, Some(actor))?
+            .attention_get(&normalized)
+            .await
+        {
+            Ok(response) => match response.value {
+                ClientResource::Attention(card)
+                    if card.header.id == normalized && card.person_id == actor =>
+                {
+                    Some(card)
+                }
+                _ => None,
+            },
+            Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    let path = format!("/v1/attention?person={}", urlencoding::encode(actor));
+    let item = client
+        .get::<Vec<AttentionItemView>>(&path)
+        .await?
+        .into_iter()
+        .find(|item| {
+            alias.as_ref().map_or_else(
+                || item.subject == normalized,
+                |card| item.subject == card.source_id && item.episode == card.episode,
+            )
+        })
+        .with_context(|| {
+            format!("attention item `{normalized}` is not currently actionable")
+        })?;
+    let card_id = alias.map(|card| card.header.id);
+    Ok((item, card_id))
+}
+
 async fn run_attention(
     client: &Client,
     endpoint: &Endpoint,
@@ -14001,50 +14080,7 @@ async fn run_attention(
         }
         AttentionCommand::Show { subject, actor } => {
             let actor = configured_human(actor.as_deref(), configured_person, "attention")?;
-            let normalized = resolve_member_subject(
-                endpoint,
-                &subject,
-                "attention",
-                Entity::Attention,
-                completion::Matching::Fuzzy,
-            )
-            .await?;
-            // Public card IDs name a recipient and waiting episode, not just a work source.
-            // Resolve through the actor-scoped read projection; this must not read an update
-            // for the person or let a spent card open a later episode of the same source.
-            let alias = if normalized.starts_with("attention/") {
-                match generated_client(endpoint, Some(&actor))?
-                    .attention_get(&normalized)
-                    .await
-                {
-                    Ok(response) => match response.value {
-                        ClientResource::Attention(card)
-                            if card.header.id == normalized && card.person_id == actor =>
-                        {
-                            Some(card)
-                        }
-                        _ => None,
-                    },
-                    Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => None,
-                    Err(error) => return Err(error.into()),
-                }
-            } else {
-                None
-            };
-            let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
-            let item = client
-                .get::<Vec<AttentionItemView>>(&path)
-                .await?
-                .into_iter()
-                .find(|item| {
-                    alias.as_ref().map_or_else(
-                        || item.subject == normalized,
-                        |card| item.subject == card.source_id && item.episode == card.episode,
-                    )
-                })
-                .with_context(|| {
-                    format!("attention item `{normalized}` is not currently actionable")
-                })?;
+            let (item, _) = actionable_attention_item(client, endpoint, &subject, &actor).await?;
             if json_output {
                 print_value(&item, true)?;
             } else {
@@ -14078,6 +14114,54 @@ async fn run_attention(
                 }
             }
             Ok(())
+        }
+        AttentionCommand::Discuss(args) => {
+            let actor = configured_human(args.actor.as_deref(), configured_person, "attention")?;
+            let (item, card_id) =
+                actionable_attention_item(client, endpoint, &args.subject, &actor).await?;
+            let to = match args.to {
+                Some(to) => to,
+                None => item
+                    .requester_id
+                    .clone()
+                    .filter(|requester| requester.starts_with("agent/"))
+                    .context("this item names no agent to talk to; pass --to AGENT")?,
+            };
+            let id = card_id.unwrap_or_else(|| item.subject.clone());
+            // The same words stui's "Chat about this" sends.
+            let mut body = format!("{}\n\n---\nThis is about {} ({id}", args.body, item.title);
+            if let Some(mission) = &item.mission {
+                body.push_str(&format!(", mission {mission}"));
+            }
+            body.push(')');
+            let Some(receipt) = send_message(
+                client,
+                MessageSendArgs {
+                    to,
+                    body,
+                    subject: Some(format!("About: {}", item.title)),
+                    in_reply_to: None,
+                    tags: Vec::new(),
+                    from: actor,
+                    attach: Vec::new(),
+                    print_kdl: false,
+                    idempotency_key: args.idempotency_key,
+                },
+                Vec::new(),
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            if let Err(error) = sync_message_projection(client).await {
+                eprintln!(
+                    "st: {} was sent (idempotency key {}), but the message projection was not refreshed: {}",
+                    receipt.message.subject,
+                    receipt.idempotency_key,
+                    plain_error(&error)
+                );
+            }
+            print_message_receipt(&receipt, json_output)
         }
         AttentionCommand::Request(args) => {
             let actor = args
