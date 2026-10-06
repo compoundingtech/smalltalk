@@ -16918,10 +16918,12 @@ mission "orchid" state="ready" { goal "Expose a scheduler wait."; step "work" { 
         let detail = client_v0::mission_resources(&state.store, state.store.index().unwrap(), false, Some("mission/orchid")).unwrap();
         assert_eq!(detail[0]["state"], "blocked");
         assert_eq!(detail[0]["run_details"][0]["blocker"]["reason"], reason);
+        assert_eq!(detail[0]["run_details"][0]["blocker"]["scope"], crate::reconcile::FIRST_READINESS_FAULT_SCOPE);
         assert_eq!(detail[0]["run_details"][0]["steps"][0]["blocked_reason"], reason);
         let (_, cards) = get_request(router(state.clone()), "/v1/client/missions").await;
         assert_eq!(cards["items"][0]["state"], "blocked", "{cards}");
         assert_eq!(cards["items"][0]["run_details"][0]["blocker"]["reason"], reason);
+        assert_eq!(cards["items"][0]["run_details"][0]["blocker"]["scope"], crate::reconcile::FIRST_READINESS_FAULT_SCOPE);
         assert_eq!(cards["items"][0]["run_details"][0]["steps"][0]["blocked_reason"], reason);
         state.store.append_claim(&fault("recovered")).unwrap();
         assert_eq!(first_readiness_scheduler_check(&state.store, "node").status, "pass");

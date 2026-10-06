@@ -1719,6 +1719,14 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn append_fault(&self, subject: &str, scope: &str, status: &str, reason: &str) -> Result<()> {
+        if scope == FIRST_READINESS_FAULT_SCOPE
+            && let Some(error) = self
+                .fault_injection
+                .as_ref()
+                .and_then(|faults| faults.fault("first-readiness-fault-write", subject))
+        {
+            anyhow::bail!(error);
+        }
         self.store.append_claim(&ClaimInput {
             subject: subject.into(),
             kind: "reconcile.fault".into(),
@@ -6633,7 +6641,22 @@ impl<R: RuntimeControl> Reconciler<R> {
                         // From the view the evaluation started with: a write it makes changes subjects
                         // it read, so the next pass evaluates it again and takes the new times.
                         due = crate::incremental::run_due(&run, now_ms());
-                        self.evaluate_active_mission_run(&run)
+                        let evaluated = self.evaluate_active_mission_run(&run);
+                        // Recovery is diagnostic too: admission and execution writes come first.
+                        if (!first_readiness_pending(&run)
+                            || now_ms().saturating_sub(first_readiness_since(&run))
+                                < FIRST_READINESS_FAULT_AFTER_MS)
+                            && let Err(error) = self.close_fault(
+                                &run.subject,
+                                FIRST_READINESS_FAULT_SCOPE,
+                                "the run no longer has an overdue first-readiness wait",
+                            )
+                        {
+                            eprintln!(
+                                "st3: first-readiness recovery for {}: {error:#}", run.subject
+                            );
+                        }
+                        evaluated
                     })
                 })
             });
@@ -6686,7 +6709,14 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|((subject, scope), _)| (subject.clone(), scope.clone()))
             .collect::<Vec<_>>();
         for (subject, scope) in inactive {
-            self.close_fault(&subject, &scope, "it is no longer active")?;
+            let recovery = self.close_fault(&subject, &scope, "it is no longer active");
+            if scope == FIRST_READINESS_FAULT_SCOPE {
+                if let Err(error) = recovery {
+                    eprintln!("st3: first-readiness recovery for {subject}: {error:#}");
+                }
+            } else {
+                recovery?;
+            }
         }
         if changed {
             self.signal_changed();
@@ -6715,15 +6745,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn evaluate_active_mission_run(&self, run: &MissionRunView) -> Result<bool> {
-        if !first_readiness_pending(run)
-            || now_ms().saturating_sub(first_readiness_since(run)) < FIRST_READINESS_FAULT_AFTER_MS
-        {
-            self.close_fault(
-                &run.subject,
-                FIRST_READINESS_FAULT_SCOPE,
-                "the run no longer has an overdue first-readiness wait",
-            )?;
-        }
         if run.phase == "normal"
             && let Some(reason) = self.store.stale_subscription_pull_request_run(run)?
         {
@@ -7211,10 +7232,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                             )?;
                             return Ok(changed);
                         }
-                        // Use the actual admission predicates, including evaluated baselines.
-                        // Record the late first readiness without delaying its recovery.
-                        self.record_first_readiness_wait(run, now_ms())?;
+                        // Save readiness before diagnostic writes. A diagnostic failure must not
+                        // fail admission or become a step fault. Use the original pending view.
                         changed |= self.store.set_step_state(&view.subject, "ready", None)?;
+                        if let Err(error) = self.record_first_readiness_wait(run, now_ms()) {
+                            eprintln!(
+                                "st3: first-readiness diagnosis for {}: {error:#}", run.subject
+                            );
+                        }
                         return Ok(changed);
                     }
                     if !matches!(

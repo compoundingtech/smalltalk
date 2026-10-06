@@ -461,9 +461,11 @@ impl Store {
         }
         let mut items = Vec::new();
         for ((source, scope, _origin), claim) in latest {
-            let first_readiness = scope == crate::reconcile::FIRST_READINESS_FAULT_SCOPE;
-            if claim.body["fields"]["status"] != "faulted"
-                || (!first_readiness && as_of.saturating_sub(claim.accepted_at_unix_ms) < 120_000)
+            // A restart can diagnose many late admissions in one pass. Keep these visible in
+            // mission views and doctor without creating an operator item for each run.
+            if scope == crate::reconcile::FIRST_READINESS_FAULT_SCOPE
+                || claim.body["fields"]["status"] != "faulted"
+                || as_of.saturating_sub(claim.accepted_at_unix_ms) < 120_000
             {
                 continue;
             }
@@ -494,11 +496,7 @@ impl Store {
                 launch_id: None,
                 variant_id: None,
                 message_id: None,
-                title: if first_readiness {
-                    format!("First readiness was delayed for {source}")
-                } else {
-                    format!("st cannot reconcile {source}")
-                },
+                title: format!("st cannot reconcile {source}"),
                 detail: format!(
                     "{scope}: {}. Inspect with `st subject {source}`.",
                     claim.body["fields"]["reason"].as_str().unwrap_or_default()
