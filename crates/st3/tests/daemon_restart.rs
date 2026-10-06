@@ -1418,6 +1418,15 @@ async fn doctor_reports_starting_without_failing_an_answering_api() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let mut daemon = Daemon::new(root);
+    fn response(value: Value) -> axum::Json<st3::model::ApiResponse<Value>> {
+        axum::Json(st3::model::ApiResponse {
+            api_version: "st3.v1".into(),
+            request_id: "fixture-doctor-request".into(),
+            snapshot_host: "restart-node".into(),
+            store_index: 1,
+            value,
+        })
+    }
     let startup = st3::startup::Startup::begin(&daemon.socket).unwrap();
     startup.phase("bind");
     daemon
@@ -1426,12 +1435,12 @@ async fn doctor_reports_starting_without_failing_an_answering_api() {
                 .route(
                     "/v1/doctor",
                     axum::routing::get(|| async {
-                        axum::Json(json!({"status":"pass", "checks":[], "performance":{}}))
+                        response(json!({"status":"pass", "checks":[], "performance":{}}))
                     }),
                 )
                 .route(
                     "/v1/performance",
-                    axum::routing::get(|| async { axum::Json(json!({"fixture":"performance"})) }),
+                    axum::routing::get(|| async { response(json!({"fixture":"performance"})) }),
                 ),
         )
         .await;
