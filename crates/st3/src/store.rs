@@ -14,6 +14,9 @@ mod rollouts;
 mod seat_status;
 mod canonical;
 mod latest_values;
+pub mod numeric_readiness;
+mod numeric_values;
+pub use numeric_values::{NumericAccountLimit, NumericLimitSource};
 use latest_values::{current_sql, harness_sql};
 pub use latest_values::{CurrentObservationBoundary, is_current_input, is_current_value};
 
@@ -19706,6 +19709,17 @@ fn insert_event(
     subject: &str,
     body: &Value,
 ) -> Result<()> {
+    if kind == "harness.limits"
+        || (kind == "harness.usage"
+            && matches!(body.pointer("/fields/semantics").and_then(Value::as_str),
+                Some("session_cumulative" | "response_rollup")))
+    {
+        let claim = transaction.query_row(
+            &format!("SELECT {CLAIM_COLUMNS} FROM claims WHERE store_index=?1"),
+            [store_index], claim_from_row,
+        )?;
+        numeric_values::stage(transaction, &claim)?;
+    }
     if subject.starts_with("glass/") {
         return Ok(());
     }
@@ -26229,6 +26243,11 @@ fn replay_graph_from_nothing_with_progress_tx(
         })
     };
     stage("full-replay/clear");
+    // These are pre-cutover reader projections. Repair/replay must not leave an
+    // obsolete compatibility reading selected after its source claim is repaired.
+    transaction.execute("DELETE FROM numeric_values", []).map_err(internal)?;
+    transaction.execute("DELETE FROM numeric_account_windows", []).map_err(internal)?;
+    transaction.execute("DELETE FROM numeric_limit_seats", []).map_err(internal)?;
     for table in REPLAYED_GRAPH_TABLES {
         transaction
             .execute(&format!("DELETE FROM {table}"), [])
