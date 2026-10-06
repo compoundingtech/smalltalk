@@ -163,28 +163,28 @@ pub fn confirm_channel_binding(
     native_session_id: &str,
     resume_generation: Option<crate::residency::Generation>,
 ) -> Result<OmpSessionBinding> {
-    let mut binding = load_pending_binding(state_dir, agent, runtime_id)?
-        .context("OMP channel has no pending native session binding")?;
-    anyhow::ensure!(
-        binding.runtime_incarnation == runtime_incarnation
-            && binding.native_session_id == native_session_id
-            && binding.resume_generation == resume_generation,
-        "OMP channel readiness belongs to a different native session binding"
-    );
-    binding.ready = true;
     crate::harness_state::with_current_ownership(
         agent_dir,
         runtime_incarnation,
         ownership_seq,
         || {
+            let mut binding = load_pending_binding(state_dir, agent, runtime_id)?
+                .context("OMP channel has no pending native session binding")?;
+            anyhow::ensure!(
+                binding.runtime_incarnation == runtime_incarnation
+                    && binding.native_session_id == native_session_id
+                    && binding.resume_generation == resume_generation,
+                "OMP channel readiness belongs to a different native session binding"
+            );
+            binding.ready = true;
             crate::residency::atomic_json(&state_dir.join(BINDING_FILE), &binding)?;
-            Ok(())
+            #[cfg(test)]
+            tests::after_binding_promotion();
+            // Cleanup is ownership-fenced too: a predecessor must not remove a successor's candidate.
+            let _ = fs::remove_file(state_dir.join(PENDING_BINDING_FILE));
+            Ok(binding)
         },
-    )?;
-    // The candidate is non-authoritative after promotion. Leaving it behind is safer than
-    // invalidating a completed handshake because cleanup failed.
-    let _ = fs::remove_file(state_dir.join(PENDING_BINDING_FILE));
-    Ok(binding)
+    )
 }
 
 pub fn checkpoint_residency(
@@ -510,6 +510,19 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    thread_local! {
+        static AFTER_BINDING_PROMOTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_binding_promotion() {
+        AFTER_BINDING_PROMOTION.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+
     struct FakeExecutable {
         _directory: tempfile::TempDir,
         path: PathBuf,
@@ -548,6 +561,49 @@ mod tests {
 
     fn claim_omp(agent_dir: &Path, incarnation: &str) -> u64 {
         crate::harness_state::claim(agent_dir, "h.worker", "omp", incarnation).unwrap()
+    }
+
+    #[test]
+    fn confirmation_cleanup_cannot_delete_a_successor_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("observations");
+        let state_dir = root.path().join("sessions");
+        let first_seq = claim_omp(&agent_dir, "provider-first");
+        record_channel_binding(&state_dir, "h.worker", "h.worker", "provider-first",
+            "native-first", None, None).unwrap();
+        let successor_seq = std::rc::Rc::new(std::cell::Cell::new(None));
+        let captured_seq = successor_seq.clone();
+        let captured_agent = agent_dir.clone();
+        let captured_state = state_dir.clone();
+        AFTER_BINDING_PROMOTION.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            let file = crate::flock::open(&captured_agent.join(".harness-state.lock"),
+                crate::flock::Open::Existing).unwrap();
+            // Try the takeover exactly after promotion, without sleeps or scheduling assumptions.
+            if let Some(lock) = crate::flock::FileLock::hold(file, crate::flock::Mode::Exclusive,
+                crate::flock::Wait::Now).unwrap() {
+                drop(lock);
+                let seq = claim_omp(&captured_agent, "provider-next");
+                crate::harness_state::with_current_ownership(&captured_agent, "provider-next", seq, || {
+                    record_channel_binding(&captured_state, "h.worker", "h.worker", "provider-next",
+                        "native-next", None, None)
+                }).unwrap();
+                captured_seq.set(Some(seq));
+            }
+        })));
+        confirm_channel_binding(&state_dir, &agent_dir, "h.worker", "h.worker",
+            "provider-first", first_seq, "native-first", None).unwrap();
+        let next_seq = successor_seq.get().unwrap_or_else(|| {
+            let seq = claim_omp(&agent_dir, "provider-next");
+            crate::harness_state::with_current_ownership(&agent_dir, "provider-next", seq, || {
+                record_channel_binding(&state_dir, "h.worker", "h.worker", "provider-next",
+                    "native-next", None, None)
+            }).unwrap();
+            seq
+        });
+        confirm_channel_binding(&state_dir, &agent_dir, "h.worker", "h.worker",
+            "provider-next", next_seq, "native-next", None).unwrap();
+        assert_eq!(bound_native_session(&state_dir, "h.worker", "h.worker", "provider-next")
+            .unwrap().as_deref(), Some("native-next"));
     }
 
     #[test]

@@ -88,6 +88,11 @@ older than the field omits it; clients read a missing list as empty.
 `owner_host_id`, `session_id`, `native_session_id`, `runtime_incarnation`, and `collection`.
 Signed owner reads preserve the authenticated actor and every fence. A stale owner, managed/native
 session or incarnation is refused; evidence is checked again after the read.
+The managed OMP channel records a pending native binding from its `session` frame and confirms it
+only on a matching `ready` frame. Recording, confirmation, and pending-candidate cleanup respect
+the current provider ownership sequence; a predecessor cannot delete a successor's candidate.
+Until confirmation, or after a provider has a recorded terminal exit, inventory reads return
+`stale-fence`. A startup ownership placeholder without an exit is not a terminal provider.
 
 Collections are `files`, `skills`, `skill-commands`, and `slash-commands`. Responses distinguish
 `supported`, `unsupported`, and `unavailable`, with explicit `coverage`, `full_inventory`, reason,

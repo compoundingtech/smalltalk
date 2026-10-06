@@ -18646,6 +18646,7 @@ async fn run_pi_channel(
             .context("managed channel has no provider runtime")?;
         Some(st_drivers::pi_channel::EventObserver::new(
             &paths.agent_dir,
+            &paths.session_dir,
             identity,
             driver_name,
             &session,

@@ -530,6 +530,11 @@ pub struct EventObserver {
     timeline: crate::harness_timeline::Writer,
     last_heartbeat: std::time::Instant,
     agent_dir: std::path::PathBuf,
+    session_dir: std::path::PathBuf,
+    identity: String,
+    ownership_seq: u64,
+    resume_generation: Option<crate::residency::Generation>,
+    expected_native_session: Option<String>,
     owner: String,
     runtime: String,
     driver: &'static str,
@@ -538,6 +543,7 @@ pub struct EventObserver {
 impl EventObserver {
     pub fn new(
         agent_dir: &Path,
+        session_dir: &Path,
         identity: &str,
         driver: &'static str,
         session: &str,
@@ -549,6 +555,16 @@ impl EventObserver {
             "omp" => harness_context::Harness::Omp,
             _ => anyhow::bail!("unsupported managed channel"),
         };
+        let resume_generation = if driver == "omp" {
+            crate::contracts::env(crate::omp_session::CHANNEL_RESUME_GENERATION)
+                .map(|value| value.parse::<u64>().map(crate::residency::Generation)
+                    .context("OMP channel resume generation is invalid"))
+                .transpose()?
+        } else { None };
+        let expected_native_session = if driver == "omp" {
+            crate::contracts::env(crate::omp_session::CHANNEL_EXPECTED_NATIVE_SESSION)
+                .filter(|value| !value.is_empty())
+        } else { None };
         let mut state =
             harness_state::Writer::new(agent_dir, identity, driver, Some(runtime_id.into()))
                 .with_ownership(session, seq);
@@ -560,6 +576,11 @@ impl EventObserver {
             timeline: crate::harness_timeline::Writer::new(agent_dir, driver, session),
             last_heartbeat: std::time::Instant::now(),
             agent_dir: agent_dir.into(),
+            session_dir: session_dir.into(),
+            identity: identity.into(),
+            ownership_seq: seq,
+            resume_generation,
+            expected_native_session,
             owner: session.into(),
             runtime: runtime_id.into(),
             driver,
@@ -573,8 +594,22 @@ impl EventObserver {
     }
     pub fn observe(&mut self, frame: &Value) -> Result<()> {
         if matches!(frame["type"].as_str(), Some("session" | "ready")) {
-            self.native_session = frame["sessionId"].as_str()
-                .filter(|id| !id.is_empty()).map(str::to_owned);
+            let native = frame["sessionId"].as_str().filter(|id| !id.is_empty());
+            if self.driver == "omp" {
+                let native = native.context("OMP channel has no native session id")?;
+                if frame["type"] == "session" {
+                    harness_state::with_current_ownership(&self.agent_dir, &self.owner, self.ownership_seq, || {
+                        crate::omp_session::record_channel_binding(&self.session_dir, &self.identity,
+                            &self.runtime, &self.owner, native, self.resume_generation,
+                            self.expected_native_session.as_deref())
+                    })?;
+                } else {
+                    crate::omp_session::confirm_channel_binding(&self.session_dir, &self.agent_dir,
+                        &self.identity, &self.runtime, &self.owner, self.ownership_seq, native,
+                        self.resume_generation)?;
+                }
+            }
+            self.native_session = native.map(str::to_owned);
         }
         if let Some(inventory) = crate::harness_inventory::observation(
             frame, self.driver, self.native_session.as_deref(), &self.runtime,
@@ -1054,9 +1089,14 @@ mod tests {
         crate::harness_events::enable(root.path(), "runtime-a").unwrap();
         let seq = harness_state::claim(root.path(), "agent/example", "omp", "provider-a").unwrap();
         let mut observer = EventObserver::new(
-            root.path(), "agent/example", "omp", "provider-a", seq, "runtime-a",
+            root.path(), &root.path().join("sessions"), "agent/example", "omp", "provider-a", seq, "runtime-a",
         ).unwrap();
+        observer.observe(&serde_json::json!({"type":"session","sessionId":"native-a"})).unwrap();
+        assert_eq!(crate::omp_session::bound_native_session(&root.path().join("sessions"),
+            "agent/example", "runtime-a", "provider-a").unwrap(), None);
         observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-a"})).unwrap();
+        assert_eq!(crate::omp_session::bound_native_session(&root.path().join("sessions"),
+            "agent/example", "runtime-a", "provider-a").unwrap().as_deref(), Some("native-a"));
         observer.observe(&todo_frame()).unwrap();
         let events = crate::harness_events::pending(root.path(), 100).unwrap();
         let event = events.iter().find(|event| event.kind == "harness-todo").unwrap();
@@ -1069,9 +1109,22 @@ mod tests {
         assert_eq!(crate::harness_events::prepare_publication(
             root.path(), event.sequence, "harness.todo.observed:", &serde_json::json!({"changed":true}),
         ).unwrap(), prepared);
+        observer.observe(&serde_json::json!({"type":"session","sessionId":"native-b"})).unwrap();
+        assert_eq!(crate::omp_session::bound_native_session(&root.path().join("sessions"),
+            "agent/example", "runtime-a", "provider-a").unwrap(), None);
+        assert!(observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-a"})).is_err());
+        assert_eq!(crate::omp_session::bound_native_session(&root.path().join("sessions"),
+            "agent/example", "runtime-a", "provider-a").unwrap(), None);
+        observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-b"})).unwrap();
+        assert_eq!(crate::omp_session::bound_native_session(&root.path().join("sessions"),
+            "agent/example", "runtime-a", "provider-a").unwrap().as_deref(), Some("native-b"));
         crate::harness_events::enable(root.path(), "runtime-b").unwrap();
         harness_state::claim(root.path(), "agent/example", "omp", "provider-b").unwrap();
-        assert!(observer.observe(&todo_frame()).is_err());
+        assert!(observer.observe(&serde_json::json!({"type":"session","sessionId":"native-c"})).is_err());
+        assert!(observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-b"})).is_err());
+        let mut current_todo = todo_frame();
+        current_todo["session"] = "native-b".into();
+        assert!(observer.observe(&current_todo).is_err());
         assert_eq!(crate::harness_events::pending(root.path(), 100).unwrap()
             .iter().filter(|event| event.kind == "harness-todo").count(), 1);
     }

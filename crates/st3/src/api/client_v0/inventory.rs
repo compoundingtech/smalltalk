@@ -114,6 +114,9 @@ fn local_snapshot(state: &AppState, agent: &str, query: &HarnessInventoryQuery)
     if owner["incarnation"].as_str() != Some(provider) {
         return Err(stale("native inventory evidence belongs to a superseded provider"));
     }
+    if owner["state"] == "ended" && owner.get("exit").is_some_and(|exit| !exit.is_null()) {
+        return Err(stale("the native inventory provider has ended"));
+    }
     let native = st_drivers::omp_session::bound_native_session(
         &root.join("sessions/omp"), identity, identity, provider,
     ).map_err(|_| inventory_unavailable("native session binding is unreadable"))?;
@@ -248,12 +251,9 @@ mod tests {
         st_drivers::harness_events::enable(&observations, RUNTIME).unwrap();
         let seq = st_drivers::harness_state::claim(&observations, "example/inventory", "omp", "provider-one").unwrap();
         let mut observer = st_drivers::pi_channel::EventObserver::new(
-            &observations, "example/inventory", "omp", "provider-one", seq, "example/inventory",
+            &observations, &owner.join("sessions/omp"), "example/inventory", "omp", "provider-one", seq, "example/inventory",
         ).unwrap();
-        st_drivers::omp_session::record_channel_binding(&owner.join("sessions/omp"), "example/inventory",
-            "example/inventory", "provider-one", "native-one", None, None).unwrap();
-        st_drivers::omp_session::confirm_channel_binding(&owner.join("sessions/omp"), &observations,
-            "example/inventory", "example/inventory", "provider-one", seq, "native-one", None).unwrap();
+        observer.observe(&json!({"type":"session", "sessionId":"native-one"})).unwrap();
         observer.observe(&json!({"type":"ready", "sessionId":"native-one"})).unwrap();
         use std::os::unix::fs::MetadataExt as _;
         let metadata = workspace.metadata().unwrap();
@@ -337,11 +337,34 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let state = fixture(root.path(), workspace.path());
         let owner = root.path().join("drivers").join(&hex::encode(Sha256::digest(AGENT.as_bytes()))[..24]);
-        st_drivers::omp_session::record_channel_binding(&owner.join("sessions/omp"), "example/inventory",
-            "example/inventory", "provider-one", "native-two", None, None).unwrap();
+        let observations = owner.join("observations");
+        let seq = st_drivers::harness_state::read(&st_drivers::harness_state::harness_state_path(&observations), None)
+            .unwrap().ownership_sequence.unwrap();
+        let mut observer = st_drivers::pi_channel::EventObserver::new(
+            &observations, &owner.join("sessions/omp"), "example/inventory", "omp", "provider-one", seq,
+            "example/inventory").unwrap().with_native_session(Some("native-one".into()));
+        observer.observe(&json!({"type":"session", "sessionId":"native-two"})).unwrap();
         assert_eq!(call(&state, query("slash-commands")).await.unwrap_err().code, "stale-fence");
         st_drivers::harness_state::claim(&owner.join("observations"), "example/inventory", "omp", "provider-two").unwrap();
         assert_eq!(call(&state, query("files")).await.unwrap_err().code, "stale-fence");
+    }
+    #[tokio::test]
+    async fn an_ended_provider_cannot_serve_its_inventory_while_runtime_still_reports_running() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = fixture(root.path(), workspace.path());
+        // A fresh exitless ownership claim is not a terminal observation.
+        assert_eq!(call(&state, query("slash-commands")).await.unwrap()["items"],
+            json!([{"name":"inspect","kind":"slash-command","source":"extension"}]));
+        let observations = root.path().join("drivers")
+            .join(&hex::encode(Sha256::digest(AGENT.as_bytes()))[..24]).join("observations");
+        let seq = st_drivers::harness_state::read(&st_drivers::harness_state::harness_state_path(&observations), None)
+            .unwrap().ownership_sequence.unwrap();
+        st_drivers::harness_state::Writer::new(&observations, "example/inventory", "omp",
+            Some("example/inventory".into())).with_ownership("provider-one", seq).ended("exit 0").unwrap();
+        for collection in ["files", "slash-commands"] {
+            assert_eq!(call(&state, query(collection)).await.unwrap_err().code, "stale-fence");
+        }
     }
     #[tokio::test]
     async fn issued_cursor_cannot_be_renewed_or_rebound_by_editing_its_payload() {
