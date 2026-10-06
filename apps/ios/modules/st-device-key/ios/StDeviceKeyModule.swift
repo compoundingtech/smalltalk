@@ -18,19 +18,36 @@ public class StDeviceKeyModule: Module {
 
     // A new key, replacing any earlier one: each pairing enrolls its own key.
     AsyncFunction("create") { () -> [String: String] in
-      try DeviceKey.create().described
+      let handle = UUID().uuidString
+      var info = try DeviceKey.create(handle: handle).described
+      info["handle"] = handle
+      return info
     }
 
     // The raw r||s ECDSA P-256 SHA-256 signature over the UTF-8 bytes of `text`, base64url.
-    AsyncFunction("sign") { (text: String) -> String in
-      guard let key = try DeviceKey.load() else {
+    AsyncFunction("sign") { (text: String, handle: String?) -> String in
+      guard let key = try DeviceKey.load(handle: handle) else {
         throw Exception(name: "NoKey", description: "This phone has no signing key; pair it again")
       }
       return try key.sign(Data(text.utf8))
     }
 
-    AsyncFunction("remove") { () in
-      DeviceKey.remove()
+    AsyncFunction("remove") { (handle: String?) in
+      DeviceKey.remove(handle: handle)
+    }
+
+    AsyncFunction("verify") { (key: String, text: String, signature: String) -> Bool in
+      guard let signed = unbase64url(signature), signed.count == 64 else { return false }
+      let bytes = Data(text.utf8)
+      do {
+        if key.hasPrefix("p256:") {
+          guard let raw = unbase64url(String(key.dropFirst(5))) else { return false }
+          let publicKey = try P256.Signing.PublicKey(x963Representation: raw)
+          return publicKey.isValidSignature(try P256.Signing.ECDSASignature(rawRepresentation: signed), for: bytes)
+        }
+        guard let raw = unbase64url(key) else { return false }
+        return try Curve25519.Signing.PublicKey(rawRepresentation: raw).isValidSignature(signed, for: bytes)
+      } catch { return false }
     }
   }
 }
@@ -58,8 +75,7 @@ enum DeviceKey {
     }
   }
 
-  static func create() throws -> DeviceKey {
-    remove()
+  static func create(handle: String) throws -> DeviceKey {
     let key: DeviceKey
     let stored: Data
     if SecureEnclave.isAvailable {
@@ -74,7 +90,7 @@ enum DeviceKey {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
-      kSecAttrAccount as String: account,
+      kSecAttrAccount as String: handle,
       kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
       kSecValueData as String: stored,
     ]
@@ -85,11 +101,11 @@ enum DeviceKey {
     return key
   }
 
-  static func load() throws -> DeviceKey? {
+  static func load(handle: String? = nil) throws -> DeviceKey? {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
-      kSecAttrAccount as String: account,
+      kSecAttrAccount as String: handle ?? account,
       kSecReturnData as String: true,
       kSecMatchLimit as String: kSecMatchLimitOne,
     ]
@@ -106,11 +122,11 @@ enum DeviceKey {
     return .software(try P256.Signing.PrivateKey(rawRepresentation: body))
   }
 
-  static func remove() {
+  static func remove(handle: String? = nil) {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
-      kSecAttrAccount as String: account,
+      kSecAttrAccount as String: handle ?? account,
     ]
     SecItemDelete(query as CFDictionary)
   }
@@ -121,4 +137,10 @@ private func base64url(_ data: Data) -> String {
     .replacingOccurrences(of: "+", with: "-")
     .replacingOccurrences(of: "/", with: "_")
     .replacingOccurrences(of: "=", with: "")
+}
+
+private func unbase64url(_ text: String) -> Data? {
+  let raw = text.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+  guard let data = Data(base64Encoded: raw + String(repeating: "=", count: (4 - raw.count % 4) % 4)), base64url(data) == text else { return nil }
+  return data
 }

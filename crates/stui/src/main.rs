@@ -674,21 +674,45 @@ fn main() -> Result<()> {
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "stui [--client | --local] [--space NAME | --classic]\nstui pair MEMBER_URL PAIRING_ID [--allow-public-http]\n\nPairing reads the single-use code privately from the terminal (or stdin).\nPaired devices use the network automatically; --local selects the local daemon.\n--client requires a paired device. --demo opens invented data.\nstui opens spaces: splits with their own tabs, Ctrl+K to open anything and Ctrl+S for\nthe sidebar; --space NAME opens that space. --classic keeps the old layout for now; it\nis going away. --version names this build."
+            "stui [--client | --local] [--space NAME | --classic]\nstui pair MEMBER_URL PAIRING_ID --fingerprint SHA256 [--allow-public-http] (or explicitly --unpinned)\n\nPairing reads the single-use code privately from the terminal (or stdin).\nPaired devices use the network automatically; --local selects the local daemon.\n--client requires a paired device. --demo opens invented data.\nstui opens spaces: splits with their own tabs, Ctrl+K to open anything and Ctrl+S for\nthe sidebar; --space NAME opens that space. --classic keeps the old layout for now; it\nis going away. --version names this build."
         );
         return Ok(());
     }
     if args.get(1).is_some_and(|arg| arg == "pair") {
-        let allow_public_http = args.get(4).is_some_and(|arg| arg == "--allow-public-http");
         anyhow::ensure!(
-            args.len() == 4 || (args.len() == 5 && allow_public_http),
-            "Usage: stui pair MEMBER_URL PAIRING_ID [--allow-public-http]"
+            args.len() >= 4,
+            "Usage: stui pair MEMBER_URL PAIRING_ID --fingerprint SHA256 [--allow-public-http] (or explicitly --unpinned)"
         );
+        let mut options = st3_client::device::CompletionOptions::default();
+        let mut tail = args[4..].iter();
+        while let Some(flag) = tail.next() {
+            match flag.as_str() {
+                "--allow-public-http" => options.allow_public_http = true,
+                "--unpinned" => options.unpinned = true,
+                "--fingerprint" if options.fingerprint.is_none() => {
+                    options.fingerprint = Some(tail.next().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--fingerprint needs the fingerprint from the trusted machine"
+                        )
+                    })?)
+                }
+                _ => anyhow::bail!(
+                    "Usage: stui pair MEMBER_URL PAIRING_ID --fingerprint SHA256 [--allow-public-http] (or explicitly --unpinned)"
+                ),
+            }
+        }
+        options.validate()?;
         let path = connection::profile_path()?;
         let code = connection::read_code()?;
         let runtime = tokio::runtime::Runtime::new()?;
         let person = runtime.block_on(connection::pair(
-            &path, &args[2], &args[3], &code, allow_public_http,
+            &path,
+            &args[2],
+            &args[3],
+            &code,
+            options.allow_public_http,
+            options.fingerprint,
+            options.unpinned,
         ))?;
         println!("Paired as {person}. Run stui to connect; no local daemon is needed.");
         return Ok(());

@@ -1,6 +1,6 @@
 # Device pairing fingerprint design
 
-Proposed design for [#1410](https://github.com/compoundingtech/smalltalk/issues/1410), following [#1353](https://github.com/compoundingtech/smalltalk/pull/1353). Implementation waits for Nathan's answers on the phone input and existing pairing warnings.
+Agreed design for [#1410](https://github.com/compoundingtech/smalltalk/issues/1410), following [#1353](https://github.com/compoundingtech/smalltalk/pull/1353). Approved on 2026-10-06: the phone uses a separate fingerprint field, and existing devices receive a warning on re-pair.
 
 The current verifier checks grant hashes, signatures, issuer links, and the submitted device key. Its trust anchor comes from the same response: an attacker can replace the person and node keys and return a completely forged, internally valid chain. Pin the person's root public key using a fingerprint obtained from the trusted machine before completing enrollment. Keep the existing grant checks and additionally compare the verified root grant's key with that fingerprint before saving credentials.
 
@@ -10,19 +10,17 @@ The trusted Unix-only pairing begin operation returns an optional `person_root_f
 
 CLI and stui accept `--fingerprint`. Missing or malformed input fails before submitting the code. An explicit, mutually exclusive `--unpinned` override prints a prominent warning that an active attacker can forge the enrollment chain. It still checks grant hashes, signatures, links and the device key. The transport restrictions and encrypted-path notice remain applicable; a fingerprint does not encrypt pairing codes or bearer credentials or prevent an attacker from relaying traffic and stealing a bearer on an unencrypted path.
 
-## Phone input choice
+## Phone fingerprint input
 
-Recommendation: add a separate fingerprint field beside the phone's pairing ID and code. Paste it from the trusted machine; never populate it from the gateway. Show the same explicit unpinned warning and require a deliberate override when bypassing it.
+Add a separate fingerprint field beside the phone's pairing ID and code. Paste it from the trusted machine; never populate it from the gateway. Show the same explicit unpinned warning and require a deliberate override when bypassing it.
 
-Alternative: accept a separate trusted fingerprint link that prefills only this public fingerprint. The one-use pairing code remains a separate input, outside that link. This makes copying easier while keeping the pairing code alone insufficient to bypass verification. Existing debug pairing links must also require separate fingerprint input or a deliberate unpinned override; no automatic bypass.
+Debug pairing links open the pairing form with the code prefilled. Completion still requires separate fingerprint input or a deliberate unpinned override; no automatic bypass.
 
-The phone currently saves enrollment information without running the Rust proof verifier. Add equivalent hash, signature, issuer, submitted-key and root-fingerprint checks before saving its credential and signing metadata.
+The phone verifies grant hashes, signatures, issuer links, the submitted device key and the root fingerprint before saving credentials. One Keychain profile entry commits its bearer, verified pin and native signing-key handle together. Each candidate key is stored separately, so a failed re-pair does not destroy the previous signing key.
 
-## Existing pairing choice
+## Existing pairings
 
-Recommendation: existing saved profiles keep working without invented pins or forced revocation. On re-pair, explain that the old pairing was unpinned and require a trusted fingerprint or the explicit override. Save the verified fingerprint atomically with each new device profile, alongside its bearer and signing key. A different root requires a fresh pairing and explicit input; never replace a stored pin from a remote response.
-
-Alternative: keep existing profiles working, but also show an unpinned reminder when connecting until the device is re-paired. These alternatives differ only in when people see the migration warning; neither silently upgrades trust or disables existing clients.
+Existing saved profiles keep working without invented pins or forced revocation. On re-pair, explain that the old pairing was unpinned and require a trusted fingerprint or the explicit override. Save the verified fingerprint atomically with each new device profile, alongside its bearer and signing key. A different root requires a fresh pairing and explicit input; never replace a stored pin from a remote response.
 
 ## Contract and read only pairing
 

@@ -5686,9 +5686,16 @@ pub(super) async fn pairing_begin(
         })
         .map_err(ApiError::bad)?;
     signal_changed(&state);
-    Ok(Json(
-        json!({ "kind": "pairing-challenge", "pairing_id": pairing_id, "code": code, "expires_at": client_timestamp(expires_at) }),
-    ))
+    let mut challenge = json!({ "kind": "pairing-challenge", "pairing_id": pairing_id, "code": code, "expires_at": client_timestamp(expires_at) });
+    if let Some((key, _)) = state
+        .store
+        .person_root_grant(&session.authority_actor)
+        .map_err(ApiError::bad)?
+    {
+        challenge["person_root_fingerprint"] =
+            json!(st3_client::device::person_root_fingerprint(&key).map_err(ApiError::internal)?);
+    }
+    Ok(Json(challenge))
 }
 
 #[derive(Deserialize)]
@@ -5700,6 +5707,43 @@ pub(super) struct PairingComplete {
     /// Where the device keeps its signing key: `secure-enclave` or `software`.
     #[serde(default)]
     key_storage: Option<String>,
+}
+
+fn pairing_root_proof(state: &AppState, person: &str) -> Result<Option<Value>, ApiError> {
+    let Some((_, id)) = state
+        .store
+        .person_root_grant(person)
+        .map_err(ApiError::bad)?
+    else {
+        return Ok(None);
+    };
+    state
+        .store
+        .seal_local_batches()
+        .map_err(ApiError::internal)?;
+    let cannot_prove = || {
+        validation(
+            "the member cannot produce a verifiable person-root grant; the pairing code was not consumed. Inspect the member's signing history",
+        )
+    };
+    let grant = state
+        .store
+        .claim_by_id(&id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(cannot_prove)?;
+    let signature = state
+        .store
+        .claim_signature(&id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(cannot_prove)?;
+    let proof = json!({
+        "id": grant.id, "batch_id": grant.batch_id, "subject": grant.subject,
+        "kind": grant.kind, "origin": grant.origin, "actor": grant.actor,
+        "body": grant.body, "predecessors": grant.predecessors, "signature": signature,
+    });
+    st3_client::device::verify_person_root_key_proof(person, &proof, None)
+        .map_err(|_| cannot_prove())?;
+    Ok(Some(proof))
 }
 
 /// A device's signing key, when its public key is one: `p256:` and the base64url of an
@@ -5899,6 +5943,12 @@ pub(super) async fn pairing_complete(
         }
         None => None,
     };
+    // Observers receive only the existing public root receipt, never device signing authority.
+    let root_proof = if enrollment.is_none() {
+        pairing_root_proof(&state, &person_id)?
+    } else {
+        None
+    };
     let completed = state.store.append_claim(&ClaimInput {
         subject: begun.subject.clone(),
         kind: "custom.client.pairing-completed".into(),
@@ -5941,6 +5991,9 @@ pub(super) async fn pairing_complete(
     if let Some((chain, proofs)) = enrollment {
         session["device_key_chain"] = json!(chain);
         session["device_key_proofs"] = json!(proofs);
+    }
+    if let Some(proof) = root_proof {
+        session["person_root_key_proof"] = proof;
     }
     Ok(Json(session))
 }

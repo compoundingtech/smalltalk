@@ -1015,6 +1015,9 @@ export type PairedSession = {
   expires_at: Timestamp;
   kind: "paired-session";
   person_id: string;
+  person_root_key_proof?: {
+
+};
   scopes: Array<string>;
   session_actor: Id;
 };
@@ -1041,6 +1044,7 @@ export type PairingChallenge = {
   expires_at: Timestamp;
   kind: "pairing-challenge";
   pairing_id: Id;
+  person_root_fingerprint?: string;
 };
 
 export type PairingComplete = {

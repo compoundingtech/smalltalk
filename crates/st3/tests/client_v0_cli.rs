@@ -111,6 +111,8 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
                 profile.to_str().unwrap().into(),
                 "--algorithm".into(),
                 algorithm.into(),
+                "--fingerprint".into(),
+                challenge.person_root_fingerprint.clone().unwrap(),
             ];
             let key_file = root.path().join("import.der");
             let key_bytes = if import {
@@ -243,6 +245,8 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
         "complete".into(),
         base.replace("127.0.0.1", "localhost"),
         challenge.pairing_id,
+        "--fingerprint".into(),
+        challenge.person_root_fingerprint.unwrap(),
     ];
     let output = run(args, challenge.code).await.unwrap();
     assert!(

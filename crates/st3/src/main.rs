@@ -2347,6 +2347,12 @@ enum DevicesCommand {
         /// Allow a public HTTP address only when it is already an encrypted path.
         #[arg(long)]
         allow_public_http: bool,
+        /// Person-root fingerprint obtained separately from the trusted pairing machine.
+        #[arg(long, conflicts_with = "unpinned")]
+        fingerprint: Option<String>,
+        /// Explicitly bypass person-root identity verification (unsafe against active attackers).
+        #[arg(long)]
+        unpinned: bool,
     },
     /// Revoke one paired device.
     Revoke {
@@ -4507,6 +4513,8 @@ async fn run(cli: Cli) -> Result<()> {
                 key_file,
                 profile,
                 allow_public_http,
+                fingerprint,
+                unpinned,
             }),
         ..
     }) = &cli.command
@@ -4517,7 +4525,11 @@ async fn run(cli: Cli) -> Result<()> {
             algorithm,
             key_file.as_deref(),
             profile.as_deref(),
-            *allow_public_http,
+            st3_client::device::CompletionOptions {
+                allow_public_http: *allow_public_http,
+                fingerprint: fingerprint.as_deref(),
+                unpinned: *unpinned,
+            },
             cli.json,
         )
         .await;
@@ -7843,6 +7855,15 @@ async fn run_devices(
                 .await?;
             print_client_value(&response, json_output)?;
             if !json_output {
+                if let Some(fingerprint) = &response.value.person_root_fingerprint {
+                    println!(
+                        "Person-root fingerprint: {fingerprint}\nCopy this separately from the pairing code to the new device's fingerprint field or --fingerprint option."
+                    );
+                } else {
+                    eprintln!(
+                        "WARNING: This member has no person-root fingerprint; pinned pairing requires a signing-enabled member."
+                    );
+                }
                 print!("{}", cli_help::pairing_next_steps(&person));
             }
             Ok(())
@@ -7876,10 +7897,11 @@ async fn run_devices_complete(
     algorithm: &str,
     key_file: Option<&Path>,
     profile: Option<&Path>,
-    allow_public_http: bool,
+    options: st3_client::device::CompletionOptions<'_>,
     json_output: bool,
 ) -> Result<()> {
     use st3_client::device::{KeyAlgorithm, SigningKey};
+    options.validate()?;
     let algorithm = match algorithm {
         "ed25519" => KeyAlgorithm::Ed25519,
         "p256" => KeyAlgorithm::P256,
@@ -7894,8 +7916,8 @@ async fn run_devices_complete(
         .map(Ok)
         .unwrap_or_else(st3_client::device::profile_path)?;
     let code = st3_client::device::read_pairing_code()?;
-    let device = st3_client::device::complete_with_http_policy(
-        &path, member_url, pairing_id, &code, key, allow_public_http,
+    let device = st3_client::device::complete_with_options(
+        &path, member_url, pairing_id, &code, key, options,
     )
     .await?;
     // Always choose explicit safe fields, including --json. PairedSession contains a bearer.
@@ -7907,6 +7929,7 @@ async fn run_devices_complete(
                 "person_id": device.session.person_id, "scopes": device.session.scopes,
                 "expires_at": device.session.expires_at, "profile": path,
                 "signing_key": device.signing_key.as_ref().map(SigningKey::public_key).transpose()?,
+                "person_root_fingerprint": device.person_root_fingerprint,
             }))?
         );
     } else {

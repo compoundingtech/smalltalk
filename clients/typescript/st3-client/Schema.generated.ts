@@ -2025,6 +2025,7 @@ export const PairedSession = /*#__PURE__*/ (() => Schema.Struct({
   "expires_at": Timestamp,
   "kind": Schema.Literal("paired-session"),
   "person_id": Schema.String.check(Schema.isPattern(new RegExp("^person/[^/]+$", "u"))),
+  "person_root_key_proof": optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
   "scopes": Schema.Array(Schema.String).check(Schema.isUnique()),
   "session_actor": Id
 }).annotate({ identifier: "PairedSession" }))()
@@ -2035,7 +2036,8 @@ export const PairingChallenge = /*#__PURE__*/ (() => Schema.Struct({
   "code": Schema.String.check(Schema.isPattern(new RegExp("^[A-Z2-9]{8}$", "u"))),
   "expires_at": Timestamp,
   "kind": Schema.Literal("pairing-challenge"),
-  "pairing_id": Id
+  "pairing_id": Id,
+  "person_root_fingerprint": optionalKey(Schema.String.check(Schema.isPattern(new RegExp("^sha256:[A-Za-z0-9_-]{43}$", "u"))))
 }).annotate({ identifier: "PairingChallenge" }))()
 export type PairingChallenge = typeof PairingChallenge.Type
 export type PairingChallengeEncoded = typeof PairingChallenge.Encoded
