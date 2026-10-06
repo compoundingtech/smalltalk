@@ -90,7 +90,7 @@ depending on their seat, message subjects or recipient. Local binding commits wa
 owner/component directly. This routing state is disposable and never replicated.
 
 Streams subscribe before their first read and retain the durable changed-since and fencing
-checks. A full safety read every five seconds with a randomized per-binding phase recovers missing
+checks. A full safety read every thirty seconds with a randomized per-binding phase recovers missing
 dependencies, missed notifications and ownership changes. Initial dispatcher-cursor failures never replay from zero: they retry at
 the current head and resync subscribers once. Batch failures retain their cursor and retry every
 five seconds. A warning log and the `mailbox-wake-dispatcher` doctor check expose failures since
@@ -163,7 +163,7 @@ a full replay can also include claims admitted since that observation.
 ## Initial targeted mailbox wake comparison (2026-10-05)
 
 This comparison measured the initial implementation at `d9bcabb9b619895a73809038f2e429d599a580cd`
-with its original three-second timer; the revised five-second timer is measured separately below.
+with its original three-second timer; the later five- and thirty-second timers are measured separately below.
 The isolated fixture used 128 invented seats, 256 Unix mailbox streams, a fresh WAL store,
 3,000 writes (100 targeted messages), and 32 owner replacements. Both builds used Nix Rust
 1.97.0 / LLVM 21.1.8, release settings and profiling. The baseline commit
@@ -227,9 +227,9 @@ writes. CPU covers the daemon process, including safety reads and heartbeats; se
 are excluded. The payload is 352 bytes per message. Providers and the reconciler are absent.
 This is an explicit synthetic sizing probe, not an observed production unread distribution.
 
-## Revised five-second timer measurements (2026-10-06)
+## Five-second timer measurements, superseded by the thirty-second backstop (2026-10-06)
 
-The revised implementation uses a five-second period and randomized per-binding phase in
+The earlier revision used a five-second period and randomized per-binding phase in
 `[0,5)` seconds. The following probes used production sources at
 `019e34d4e742b37526cdfb00a433ea3bff93cf3b`, rebased onto
 `8b020f0aa94cd276bae57ae771e48605132b723c`. The earlier table is preserved as the
@@ -279,3 +279,60 @@ Raw evidence: [idle, 100 pending](profiles/targeted-mailbox-wakes-2026-10-06/idl
 The fixture saves idle results before doctor and gives only that request a 120-second budget
 because sealing a generated 32,000-message store exceeded the normal 15-second CLI deadline.
 Doctor runs outside the measured CPU phase; production request deadlines are unchanged.
+
+## Thirty-second backstop measurements (2026-10-06)
+
+Nathan chose a thirty-second per-stream safety interval for the initial rollout, retaining
+random per-binding phase in `[0,30)` seconds: "we like 30s better than 5s for a start".
+Only the interval, its diagnostic/documentation references and test timing margins changed
+from `30f73b727ae7a433fcb23467a5e99fe91af54c82`; dispatcher failure retry stays five seconds.
+These measurements use production sources at `5ba65431d949febfe56a5842c6dd4daef83f0021` on the same
+`8b020f0aa94cd276bae57ae771e48605132b723c` base. The reviewed design was subsequently
+integrated onto `e40e0b60b9f0a42ea8d81d5f8457ff9a833144d9` with documentation-only conflict
+resolutions. These measurements retain their earlier source and base identities.
+
+The same synthetic fixture uses 128 invented seats, 256 Unix mailbox streams, 352-byte
+messages, a fresh WAL store and separate daemon/load processes. Release Nix Rust 1.97.0 /
+LLVM 21.1.8, profiling enabled; providers and the reconciler absent. Idle CPU covers
+60 seconds without graph writes after every delivery stream has the complete mailbox,
+including safety reads and heartbeats, excluding setup and doctor. No observed production
+unread distribution was available.
+
+| Pending per seat / total | Idle wall / daemon CPU | Average CPU cores | Snapshot count / summed CPU | CPU vs five-second probe |
+| --- | ---: | ---: | ---: | ---: |
+| 100 / 12,800 | 60.00 s / 3.72 s | 0.062 | 512 / 3.21 s | 20.1% |
+| 250 / 32,000 | 60.00 s / 10.00 s | 0.167 | 512 / 9.24 s | 22.1% |
+
+Both idle runs made 512 full snapshots: two per stream over 60 seconds, exactly one sixth
+of the five-second timer's 3,072 snapshots. Both had zero dispatcher batches and changed-since
+checks, zero dispatcher failures and healthy routing. Counter deltas stay within the same
+rolling five-minute window. The CPU ratios compare independent synthetic runs on a shared
+host; shared host conditions affect scaling. Raw evidence retains each source identity.
+
+The 3,000-write workload delivered all 100 targeted messages amid 2,900 unrelated writes
+and fenced all 32 replaced owners. Latency includes each API write; write-phase CPU includes
+300 ms settle and excludes setup, doctor and owner replacements. Successful delivery and
+fencing still use targeted wakes. A deliberately missed dependency is recovered by the
+unconditional safety read within the longer 30-second backstop.
+
+| Measurement | Thirty-second timer |
+| --- | ---: |
+| 3,000-write elapsed / actual writes/s | 30.30 s / 99.02 |
+| Full-write-phase daemon CPU / average cores | 6.22 s / 0.205 |
+| Delivery p50 / p95 / max | 2.87 / 4.89 / 9.20 ms |
+| Owner fencing p50 / p95 / max | 0.99 / 1.13 / 1.49 ms |
+| Write API p95 | 2.45 ms |
+
+The final workload doctor sample covers 33 sampled seconds, including setup;
+these are rolling-window totals, not write-phase deltas.
+
+| Doctor task | Count | Summed wall / CPU |
+| --- | ---: | ---: |
+| `task mailbox-snapshot` | 739 | 414.59 / 392.83 ms |
+| `task mailbox-wake-dispatch` | 3,252 | 432.67 / 391.05 ms |
+| `task mailbox-change-check` | 200 | 34.43 / 30.22 ms |
+
+Raw evidence: [idle, 100 pending](profiles/targeted-mailbox-wakes-2026-10-06-30s/idle-100.json),
+[idle, 250 pending](profiles/targeted-mailbox-wakes-2026-10-06-30s/idle-250.json), and
+[thirty-second write workload](profiles/targeted-mailbox-wakes-2026-10-06-30s/targeted-wakes.json).
+The earlier three- and five-second measurements remain above for comparison.

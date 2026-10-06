@@ -198,7 +198,7 @@ impl Store {
             name: "mailbox-wake-dispatcher".into(),
             status: if degraded { "warn" } else { "pass" }.into(),
             message: format!(
-                "{failures} failures since startup; {}; five-second safety reads remain active",
+                "{failures} failures since startup; {}; thirty-second safety reads remain active",
                 if degraded {
                     "retrying; routing degraded"
                 } else {

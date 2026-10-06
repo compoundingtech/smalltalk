@@ -316,7 +316,7 @@ async fn many_streams() {
         if targeted {
             loop {
                 let (recipient, received, at) =
-                    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    tokio::time::timeout(MAILBOX_FULL_SNAPSHOT / 2, rx.recv())
                         .await
                         .unwrap()
                         .unwrap();
@@ -349,7 +349,7 @@ async fn many_streams() {
             .await
             .unwrap();
         loop {
-            let (_, received, at) = tokio::time::timeout(Duration::from_secs(12), rx.recv())
+            let (_, received, at) = tokio::time::timeout(MAILBOX_FULL_SNAPSHOT / 2, rx.recv())
                 .await
                 .unwrap()
                 .unwrap();

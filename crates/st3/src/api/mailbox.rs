@@ -250,7 +250,7 @@ fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
 }
 
 /// The longest a mailbox stream goes without reading its seat's mailbox in full.
-const MAILBOX_FULL_SNAPSHOT: Duration = Duration::from_secs(5);
+const MAILBOX_FULL_SNAPSHOT: Duration = Duration::from_secs(30);
 
 async fn stream(state: AppState, fence: Fence, socket: WebSocket) {
     stream_with_reader(state, fence, socket, snapshot).await;
@@ -259,7 +259,7 @@ async fn stream(state: AppState, fence: Fence, socket: WebSocket) {
 fn safety_delay(fence: &Fence) -> Duration {
     use std::hash::BuildHasher;
     // A random per-process seed and the binding spread reconnecting streams across the full
-    // period. Only the phase varies: the maximum gap stays five seconds.
+    // period. Only the phase varies: the maximum gap stays thirty seconds.
     static SEED: std::sync::OnceLock<std::collections::hash_map::RandomState> =
         std::sync::OnceLock::new();
     let phase = SEED.get_or_init(Default::default).hash_one((
@@ -560,7 +560,7 @@ mod tests {
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
     ) -> Frame {
         loop {
-            match tokio::time::timeout(Duration::from_secs(15), socket.next())
+            match tokio::time::timeout(MAILBOX_FULL_SNAPSHOT / 2, socket.next())
                 .await
                 .unwrap()
                 .unwrap()
@@ -1672,7 +1672,7 @@ mod tests {
         assert!(
             matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.is_empty())
         );
-        let frame = tokio::time::timeout(Duration::from_secs(15), next(&mut socket))
+        let frame = tokio::time::timeout(MAILBOX_FULL_SNAPSHOT / 2, next(&mut socket))
             .await
             .unwrap();
         assert!(
@@ -1842,7 +1842,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn safety_timer_staggers_streams_with_a_bounded_five_second_gap() {
+    async fn safety_timer_staggers_streams_with_a_bounded_interval() {
         let mut phases = std::collections::HashSet::new();
         for seat in 0..128 {
             let phase = safety_delay(&Fence::new(
@@ -1907,7 +1907,7 @@ mod tests {
                 .unwrap();
         }
         signal_changed(&state);
-        tokio::time::timeout(Duration::from_secs(15), barrier.changed.changed())
+        tokio::time::timeout(MAILBOX_FULL_SNAPSHOT / 2, barrier.changed.changed())
             .await
             .unwrap()
             .unwrap();
@@ -1951,7 +1951,7 @@ mod tests {
             .unwrap();
         assert_eq!(state.store.index().unwrap(), index);
         assert!(state.store.check_mailbox(&new).is_ok());
-        let frame = tokio::time::timeout(Duration::from_secs(15), next(&mut stream.socket))
+        let frame = tokio::time::timeout(MAILBOX_FULL_SNAPSHOT / 2, next(&mut stream.socket))
             .await
             .unwrap();
         assert!(matches!(frame, Frame::Fenced { .. }));
