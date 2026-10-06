@@ -1797,6 +1797,56 @@ fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
 }
 
 #[test]
+fn categorical_current_source_and_auth_winners_survive_checkpoint_proof_and_trim() {
+    let store = Store::open_memory("cedar").unwrap();
+    let append = |kind: &str, fields: Value| {
+        store.append_claim(&ClaimInput {
+            subject: "agent/cedar".into(), kind: kind.into(), actor: Some("agent/cedar".into()),
+            fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+            expected_subject: None, idempotency_key: None,
+        }).unwrap()
+    };
+    append("runtime.observed", json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}));
+    let at = now_ms() as u64 - 1_000;
+    let current = append("harness.current", json!({
+        "state":"idle", "incarnation_id":"one", "observed_at_ms":at + 5,
+        "observed_since_ms":at, "provider_auth":false, "running_subagents":3
+    }));
+    for index in 0..220 {
+        append("harness.observed", json!({
+            "state":"idle", "incarnation_id":"one", "observed_since_ms":at,
+            "observed_at_ms":at + if index == 2 {20} else if index == 3 {10} else {1},
+            "provider_auth": if index == 2 {Value::Null} else {json!(index == 3)},
+            "status_transition":false
+        }));
+    }
+    let cut = now_ms() + 1_000;
+    let before = store.observed_harness_at("agent/cedar", store.index().unwrap()).unwrap().unwrap();
+    assert_eq!(before.state, "idle", "the source-newest explicit auth success lifts the older refusal");
+    assert_eq!(before.observed_at_unix_ms, u128::from(at + 20));
+    let history = store.seat_status_history("agent/cedar", cut).unwrap()["items"].clone();
+    let sealed = store.checkpoint_sealed_set(cut).unwrap();
+    let plan = plan_drops(&sealed);
+    assert!(!plan.claims.is_empty());
+    assert!(!plan.claims.iter().any(|claim| claim.id == current.id));
+    let scratch = tempfile::tempdir().unwrap();
+    let copy = scratch.path().join("checkpoint.sqlite3");
+    store.copy_store_to(&copy).unwrap();
+    let proof = prove_on_copy(&copy, &sealed, &plan).unwrap();
+    assert!(proof.passed, "source witnesses must preserve all readers: {:?}", proof.mismatches);
+    {
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims).unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        transaction.commit().unwrap();
+    }
+    let after = store.observed_harness_at("agent/cedar", store.index().unwrap()).unwrap().unwrap();
+    assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(before).unwrap());
+    assert_eq!(store.seat_status_history("agent/cedar", cut).unwrap()["items"], history);
+}
+
+#[test]
 fn native_auth_history_survives_checkpoint_trimming_and_runtime_reset() {
     let store = Store::open_memory("cedar").unwrap();
     let append = |kind: &str, fields: Value| {

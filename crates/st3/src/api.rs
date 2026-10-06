@@ -2388,6 +2388,9 @@ fn client_agent_resources_selected(
                 .cloned()
                 .unwrap_or_default();
             let usage = usage_summaries.get(&subject.subject);
+            let history_gap = incarnation_id.as_deref()
+                .map(|incarnation| store.harness_history_gap_at(&subject.subject, incarnation, snapshot_index))
+                .transpose()?.flatten();
             let mut value = json!({
                 "id": subject.subject,
                 "kind": "agent",
@@ -2405,6 +2408,9 @@ fn client_agent_resources_selected(
                 "_status_source": subject.harness,
                 "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
                 "ask": subject.harness.as_ref().and_then(|harness| harness.ask.as_deref()),
+                "background_jobs": subject.harness.as_ref().and_then(|harness| harness.background_jobs),
+                "running_subagents": subject.harness.as_ref().and_then(|harness| harness.running_subagents),
+                "history_gap": history_gap,
                 "reason": subject.harness.as_ref().and_then(|harness| harness.reason.as_deref()),
                 "host_id": desired_hosts.get(&subject.subject),
                 "last_activity_at": last_activity_at.map(client_timestamp),

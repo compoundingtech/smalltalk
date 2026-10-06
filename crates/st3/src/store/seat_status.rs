@@ -15,6 +15,106 @@ pub(super) fn observation_time(claim: &ClaimRecord) -> u128 {
         .min(claim.accepted_at_unix_ms)
 }
 
+fn source_candidate(
+    connection: &Connection,
+    subject: &str,
+    incarnation: &str,
+    index: u64,
+    kind: &str,
+    auth_only: bool,
+) -> Result<Option<ClaimRecord>> {
+    let (source_index, auth) = if auth_only {
+        ("claims_harness_auth_source_index", "AND json_type(body, '$.fields.provider_auth') IN ('true','false')")
+    } else {
+        ("claims_harness_source_index", "")
+    };
+    let query = format!(
+        "SELECT {CLAIM_COLUMNS} FROM claims INDEXED BY {source_index}
+         WHERE subject=?1 AND {INCARNATION_OF_CLAIM}=?2 AND kind=?3
+           AND kind IN ('harness.current','harness.observed') AND +store_index<=?4 {auth}
+         ORDER BY {HARNESS_SOURCE_TIME} DESC, {CANONICAL_ORDER_DESC} LIMIT 1"
+    );
+    Ok(connection.prepare_cached(&query)?
+        .query_row(params![subject, incarnation, kind, index], claim_from_row)
+        .optional()?)
+}
+
+/// Once the independent current lane exists for this runtime, receipt time cannot replace a
+/// newer capture. Old writers retain the legacy observed fold when this lane is absent.
+pub(super) fn current_source_at(
+    connection: &Connection,
+    subject: &str,
+    incarnation: &str,
+    index: u64,
+) -> Result<Option<ClaimRecord>> {
+    let Some(current) = source_candidate(connection, subject, incarnation, index, "harness.current", false)? else {
+        return Ok(None);
+    };
+    let observed = source_candidate(connection, subject, incarnation, index, "harness.observed", false)?;
+    Ok(match observed {
+        Some(observed) if observation_time(&observed) > observation_time(&current) => Some(observed),
+        _ => Some(current),
+    })
+}
+
+pub(super) fn current_auth_at(
+    connection: &Connection,
+    subject: &str,
+    incarnation: &str,
+    index: u64,
+) -> Result<Option<ClaimRecord>> {
+    let current = source_candidate(connection, subject, incarnation, index, "harness.current", true)?;
+    let observed = source_candidate(connection, subject, incarnation, index, "harness.observed", true)?;
+    Ok(match (current, observed) {
+        (Some(current), Some(observed)) if observation_time(&observed) > observation_time(&current) => Some(observed),
+        (Some(current), _) => Some(current),
+        (None, observed) => observed,
+    })
+}
+
+fn history_gap(claim: &ClaimRecord) -> Option<crate::model::HarnessHistoryGap> {
+    let fields = claim.body.get("fields")?;
+    Some(crate::model::HarnessHistoryGap {
+        runtime_incarnation: fields.get("incarnation_id")?.as_str()?.to_owned(),
+        count: fields.get("history_gap_count")?.as_u64()?,
+        from_ms: fields.get("history_gap_from_ms")?.as_u64()?,
+        to_ms: fields.get("history_gap_to_ms")?.as_u64()?,
+        reason: fields.get("history_gap_reason")?.as_str()?.to_owned(),
+    })
+}
+
+fn history_gaps_at(
+    connection: &Connection,
+    subject: &str,
+    index: u64,
+    from: u128,
+    to: u128,
+) -> Result<Vec<crate::model::HarnessHistoryGap>> {
+    // Aggregate per source runtime, not the runtime currently selected for the Agent card.
+    // Older retained gaps must remain visible after a reset or a producer's nullable snapshot.
+    let query = format!(
+        "SELECT {INCARNATION_OF_CLAIM},
+            MAX(json_extract(body,'$.fields.history_gap_count')),
+            MIN(json_extract(body,'$.fields.history_gap_from_ms')),
+            MAX(json_extract(body,'$.fields.history_gap_to_ms'))
+         FROM claims INDEXED BY claims_harness_gap_index
+         WHERE subject=?1 AND +store_index<=?2 AND kind='harness.current'
+           AND json_type(body,'$.fields.history_gap_count')='integer'
+           AND json_extract(body,'$.fields.history_gap_count')>0
+         GROUP BY {INCARNATION_OF_CLAIM}
+         HAVING MAX(json_extract(body,'$.fields.history_gap_to_ms'))>=?3
+            AND MIN(json_extract(body,'$.fields.history_gap_from_ms'))<=?4
+         ORDER BY MIN(json_extract(body,'$.fields.history_gap_from_ms')), {INCARNATION_OF_CLAIM}"
+    );
+    let mut statement = connection.prepare_cached(&query)?;
+    Ok(statement.query_map(params![subject, index, from.min(i64::MAX as u128) as i64, to.min(i64::MAX as u128) as i64], |row| {
+        Ok(crate::model::HarnessHistoryGap {
+            runtime_incarnation: row.get(0)?, count: row.get(1)?,
+            from_ms: row.get(2)?, to_ms: row.get(3)?, reason: "cap-full".into(),
+        })
+    })?.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Canonical source positions of transitions and incarnation resets. Heartbeats and changes
 /// to display details do not become transitions. Shared by the read and checkpoint rules.
 pub(super) fn transition_positions(claims: &[&ClaimRecord]) -> Vec<usize> {
@@ -163,6 +263,13 @@ pub(super) fn enrich_harness(
         )?
         .unwrap_or(view.since_unix_ms);
     }
+    if let Some(claim) = claim.as_ref()
+        && claim.kind == "harness.current"
+    {
+        // Current captures carry their own source time, including for native auth fences.
+        // Ordered history is independent and cannot redefine the current state's since.
+        return Ok(());
+    }
     let has_prompt: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='harness.diagnostic'
          AND store_index<=?2 AND json_extract(body,'$.fields.incarnation_id')=?3
@@ -206,6 +313,17 @@ pub(super) fn enrich_harness(
 }
 
 impl Store {
+    pub(crate) fn harness_history_gap_at(
+        &self,
+        subject: &str,
+        incarnation: &str,
+        index: u64,
+    ) -> Result<Option<crate::model::HarnessHistoryGap>> {
+        let connection = self.readers.get();
+        Ok(source_candidate(&connection, subject, incarnation, index, "harness.current", false)?
+            .as_ref().and_then(history_gap))
+    }
+
     /// Client status describes harness evidence. Work progress can prove delivery readiness
     /// internally, but never substitutes for an observation in this contract.
     pub(crate) fn observed_harness_at(
@@ -297,6 +415,7 @@ pub(super) fn history_at(
     index: u64,
 ) -> Result<Value> {
     let cutoff = now.saturating_sub(WINDOW_MS);
+    let history_gaps = history_gaps_at(connection, subject, index, cutoff, now)?;
     // Seek each kind by acceptance time. Read a single older baseline per prompt channel, rather
     // than decoding a seat's lifetime observations on every history request.
     let mut keyed = Vec::new();
@@ -396,6 +515,7 @@ pub(super) fn history_at(
     let trimmed = legacy
         || older
         || tombstoned
+        || !history_gaps.is_empty()
         || eligible.len() < entries.len()
         || eligible.len() > MAX_TRANSITIONS;
     let start = eligible.len().saturating_sub(MAX_TRANSITIONS);
@@ -410,7 +530,7 @@ pub(super) fn history_at(
     Ok(json!({
         "kind": "status-history", "seat": subject, "items": items,
         "retained_from": items.first().map(|item| item["observed_at"].clone()).unwrap_or_else(|| json!(crate::api::client_timestamp(cutoff))),
-        "complete": !trimmed,
+        "complete": !trimmed, "history_gaps": history_gaps,
     }))
 }
 
@@ -786,5 +906,94 @@ mod tests {
             .filter_map(|entry| entry["state"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(states, ["idle", "unauthenticated", "idle"]);
+    }
+
+    #[test]
+    fn categorical_current_is_source_monotonic_clears_asks_and_preserves_native_counts() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms() as u64 - 1_000;
+        let publish = |time: u64, blocked: &str, ask: &str, count: Value| {
+            store.append_harness_current(&crate::harness_events::CurrentPublication {
+                runtime_incarnation: "one".into(),
+                claim: input("harness.current", json!({
+                    "incarnation_id":"one", "state":"working", "observed_at_ms":time,
+                    "observed_since_ms":at - 10, "blocked_on":blocked, "ask":ask,
+                    "running_subagents":count, "background_jobs":0
+                })),
+            }).unwrap().0
+        };
+        let history_before = store.seat_status_history("agent/cedar", now_ms()).unwrap()["items"].clone();
+        let blocked = publish(at, "human", "question", json!(3));
+        assert_eq!(store.seat_status_history("agent/cedar", now_ms()).unwrap()["items"], history_before);
+        store.append_claim(&input("harness.observed", json!({
+            "incarnation_id":"one", "state":"working", "observed_at_ms":at - 100,
+            "blocked_on":"none", "ask":"none", "reason":"old detail"
+        }))).unwrap();
+        let current = store.observed_harness_at("agent/cedar", store.index().unwrap()).unwrap().unwrap();
+        assert_eq!(current.claim, blocked.id);
+        assert_eq!(current.blocked_on.as_deref(), Some("human"));
+        assert_eq!(current.running_subagents, Some(3));
+        assert_eq!(current.background_jobs, Some(0));
+        assert_eq!(current.since_unix_ms, u128::from(at - 10));
+        let answered = publish(at + 1, "none", "none", json!(0));
+        publish(at - 1, "human", "question", json!(9));
+        let current = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(current.claim, answered.id);
+        assert_eq!(current.ask.as_deref(), Some("none"));
+        assert_eq!(current.reason, None);
+        assert_eq!(current.running_subagents, Some(0));
+        assert_eq!(current.since_unix_ms, u128::from(at - 10));
+        let tied = store.append_claim(&input("harness.observed", json!({
+            "incarnation_id":"one", "state":"working", "observed_at_ms":at + 1,
+            "blocked_on":"human", "ask":"question"
+        }))).unwrap();
+        assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().claim, answered.id);
+        let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
+        assert_eq!(history["items"].as_array().unwrap().iter().filter(|item| item["state"] == "working").count(), 1);
+        let newer = store.append_claim(&input("harness.observed", json!({
+            "incarnation_id":"one", "state":"idle", "observed_at_ms":at + 2,
+            "blocked_on":null, "ask":null
+        }))).unwrap();
+        assert_ne!(newer.id, tied.id);
+        let current = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(current.claim, newer.id);
+        assert_eq!(current.state, "idle");
+        assert_eq!(current.running_subagents, None);
+        assert_eq!(current.background_jobs, None);
+        runtime(&store, "two");
+        assert!(store.current_harness("agent/cedar").unwrap().is_none());
+    }
+
+    #[test]
+    fn categorical_current_native_auth_and_runtime_retry_fences_ignore_delayed_history() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms() as u64 - 1_000;
+        let publication = |auth: Value, time: u64| crate::harness_events::CurrentPublication {
+            runtime_incarnation: "one".into(),
+            claim: input("harness.current", json!({
+                "incarnation_id":"one", "state":"idle", "observed_at_ms":time,
+                "provider_auth":auth, "background_jobs":2, "running_subagents":null
+            })),
+        };
+        store.append_harness_current(&publication(json!(false), at)).unwrap();
+        store.append_harness_current(&publication(Value::Null, at + 1)).unwrap();
+        let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(blocked.state, "needs-login");
+        assert_eq!(blocked.background_jobs, Some(2));
+        let recovered = publication(json!(true), at + 2);
+        let (claim, first) = store.append_harness_current(&recovered).unwrap();
+        assert!(first);
+        let (retry, appended) = store.append_harness_current(&recovered).unwrap();
+        assert!(!appended);
+        assert_eq!(retry.id, claim.id);
+        store.append_claim(&input("harness.observed", json!({
+            "incarnation_id":"one", "state":"working", "observed_at_ms":at,
+            "provider_auth":false
+        }))).unwrap();
+        assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().state, "idle");
+        runtime(&store, "two");
+        assert!(store.append_harness_current(&recovered).is_err());
     }
 }

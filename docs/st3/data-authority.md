@@ -36,6 +36,24 @@ semantics, a compaction or model change, a reading at least five minutes after t
 one while the harness works, and any reading while it does not. The newest pending reading
 replicates when the harness stops working.
 
+`harness.current` is the categorical exception: each unique source capture is admitted immediately
+through `/v1/harness-state`, independently of the ordered `/v1/harness-events` history queue.
+The publishing runtime is checked in the same writer transaction as deduplication. For that
+incarnation, the current view selects the greatest source observation time across current and
+ordered observations, bounded by each claim's acceptance time; equal source times prefer the
+categorical capture, then canonical claim order. A delayed history receipt cannot roll back a
+newer ask, clear or native count. Without a current capture, old writers retain their observed
+projection. The closed current payload contains bounded categorical values, opaque identities,
+sequences and nullable counts, never prompt, transcript, reason, exit text or leased subagent names.
+Unknown counts remain null, not zero. `latest` retention does not itself permit checkpoint
+deletion: current claims remain retained, and rules v12 preserve ordered source/auth winners.
+
+Managed native drivers run a separate current publisher and `.st-harness-state-wake` pipe.
+It reads durable runtime/provider-bound latest state at startup and before retry, with its own
+15-second request deadline and source-time expiry timer. A full or stalled history queue cannot
+delay that task. Ordered sequence acknowledgement, retained history and normalized operations
+remain unchanged; current captures never add status-history transitions.
+
 A node can also send every local observation to an OpenTelemetry collector. The exporter is off
 unless the config names a collector:
 

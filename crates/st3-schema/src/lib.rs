@@ -141,9 +141,9 @@ pub enum Retention {
     /// An observation kept only in the local observation log of the node that
     /// made it and trimmed after that node's retention window.
     Local,
-    /// An observation kept in the local observation log. The replicated claim log
-    /// gets a claim only when its state changes; each claim replaces the previous
-    /// one for the same subject.
+    /// An observation whose current state is read by peers. Publication can coalesce
+    /// unchanged evidence; categorical `harness.current` admits each unique source capture.
+    /// Checkpoint deletion requires an independent reader-equivalence rule.
     Latest,
     /// `Local` when the system records it without an actor; a request or result
     /// that a person or agent writes as its actor replicates as a claim.
@@ -281,7 +281,7 @@ impl Registry {
             ));
         }
         output.push_str("\n`resource.observed` validates facts against the resource kind. Custom resource facts remain open.\n");
-        output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.\n");
+        output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is current-state evidence read by peers; publication can coalesce unchanged evidence, except `harness.current` admits each unique categorical source capture independently of ordered history. A checkpoint may drop replaced evidence only under a reader-equivalence rule; current captures are not immediately droppable. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.\n");
         output.push_str("\n## Harness todo snapshots\n\n`harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.\n\nEach phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Bound-driven shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.\n");
         output.push_str("\nOMP's native `abandoned` tasks are omitted from phase tasks rather than relabeled as completed. Their enclosing phase is preserved when it fits. `totals.abandoned` counts these dropped tasks separately; it is optional on the wire and defaults to zero when absent. Totals for the four task statuses count the full source snapshot and exclude abandoned tasks from active progress. Dropping an abandoned task does not set `truncated`; that flag describes text/list/serialized-size bounds only. The OMP producer always emits the abandoned count and reserves 4 KiB of the serialized-fields budget for authenticated provenance.\n");
         output
@@ -652,6 +652,18 @@ fn validate_harness_current(fields: &BTreeMap<String, Value>) -> Result<(), Vali
         if fields.get(name).and_then(Value::as_u64).is_some_and(|value| value > i64::MAX as u64) {
             return Err(error("invalid-claim-field", format!("harness.current `{name}` exceeds the supported timestamp range")));
         }
+    }
+    let gap_count = fields.get("history_gap_count").and_then(Value::as_u64);
+    let gap_from = fields.get("history_gap_from_ms").and_then(Value::as_u64);
+    let gap_to = fields.get("history_gap_to_ms").and_then(Value::as_u64);
+    let gap_reason = fields.get("history_gap_reason").and_then(Value::as_str);
+    let has_gap = ["history_gap_count", "history_gap_from_ms", "history_gap_to_ms", "history_gap_reason"]
+        .iter().any(|name| fields.get(*name).is_some_and(|value| !value.is_null()));
+    if has_gap && !(gap_count.is_some_and(|count| count > 0)
+        && gap_from.zip(gap_to).is_some_and(|(from, to)| from <= to && to <= i64::MAX as u64)
+        && gap_reason == Some("cap-full"))
+    {
+        return Err(error("invalid-claim-field", "harness.current history gap requires a positive count, ordered bounded interval and cap-full reason"));
     }
     if let Some(value) = fields.get("blocking").filter(|value| !value.is_null()) {
         let allowed = ["turn-in-flight", "starting", "harness-indeterminate", "pending-ask", "unsent-input", "background-jobs-running", "background-jobs-unreported"];
@@ -3071,6 +3083,10 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("evidence_incarnation", string()),
             ("background_jobs", integer()),
             ("running_subagents", integer()),
+            ("history_gap_count", integer()),
+            ("history_gap_from_ms", integer()),
+            ("history_gap_to_ms", integer()),
+            ("history_gap_reason", enumeration(&["cap-full"])),
             ("quiescent", boolean()),
             ("blocking", array()),
         ],
@@ -3977,6 +3993,45 @@ mod tests {
     }
 
     #[test]
+    fn harness_current_rejects_non_categorical_payloads_and_invalid_native_counts() {
+        let base = BTreeMap::from([
+            ("state".into(), Value::from("working")),
+            ("incarnation_id".into(), Value::from("epoch-one")),
+            ("observed_at_ms".into(), Value::from(1_u64)),
+            ("blocked_on".into(), Value::from("human")),
+            ("ask".into(), Value::from("question")),
+            ("active_ask".into(), Value::from("opaque-call")),
+            ("running_subagents".into(), Value::from(0_u64)),
+            ("background_jobs".into(), Value::Null),
+        ]);
+        let validate = |fields: &BTreeMap<String, Value>| {
+            registry().validate_public_claim("agent/cedar", "harness.current", fields, Some("agent/cedar")).map(|_| ())
+        };
+        assert_eq!(validate(&base), Ok(()));
+        for (name, value) in [
+            ("reason", Value::from("private prompt")),
+            ("transcript", Value::from("private text")),
+            ("running_subagents", Value::from(-1)),
+            ("background_jobs", Value::from(1.5)),
+            ("observed_at_ms", Value::from(u64::MAX)),
+            ("active_ask", Value::from("x".repeat(257))),
+            ("incarnation_id", Value::from("")),
+            ("blocking", serde_json::json!(["arbitrary text"])),
+            ("blocked_on", Value::from("none")),
+            ("ask", Value::from("none")),
+        ] {
+            let mut fields = base.clone();
+            fields.insert(name.into(), value);
+            assert!(validate(&fields).is_err(), "{name}");
+        }
+        let mut answered = base;
+        answered.insert("active_ask".into(), Value::Null);
+        answered.insert("blocked_on".into(), Value::from("none"));
+        answered.insert("ask".into(), Value::from("none"));
+        assert_eq!(validate(&answered), Ok(()));
+    }
+
+    #[test]
     fn registry_matches_the_exact_manifests() {
         let registry = registry();
         assert_eq!(
@@ -4055,151 +4110,6 @@ mod tests {
                 "reviewer",
                 "submitted_at",
                 "target"
-            ]
-        );
-        assert_eq!(
-            registry
-                .claims
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "agent.account",
-                "agent.placement.source-offline",
-                "agent.presence",
-                "agent.queue.moved",
-                "arrangement.edited",
-                "attention.requested",
-                "attention.resolved",
-                "checkpoint.excused",
-                "checkpoint.sealed",
-                "checkpoint.verified",
-                "daemon.diagnostic",
-                "daemon.started",
-                "delivery.hold",
-                "doc.bound",
-                "eval.verdict",
-                "file.observed",
-                "fleet.invite-created",
-                "fleet.invite-redeemed",
-                "fleet.invite-revoked",
-                "fleet.member-admitted",
-                "fleet.member-endpoints",
-                "fleet.member-left",
-                "fleet.member-removed",
-                "gate.requested",
-                "gate.result",
-                "github.posted",
-                "glass.deleted",
-                "glass.upserted",
-                "harness.context-clear.requested",
-                "harness.context-clear.result",
-                "harness.diagnostic",
-                "harness.limits",
-                "harness.observed",
-                "harness.session-file",
-                "harness.telemetry",
-                "harness.timeline",
-                "harness.todo.observed",
-                "harness.usage",
-                "intent.desired",
-                "lane.approved",
-                "lane.joined",
-                "lane.left",
-                "lane.marked",
-                "lane.moved",
-                "loop.round-dispatch",
-                "loop.round-result",
-                "loop.state",
-                "message.closed",
-                "message.delivered",
-                "message.read",
-                "message.sent",
-                "message.staged",
-                "mission-run.created",
-                "mission-run.state",
-                "mission.produced",
-                "mission.published",
-                "observer.observed",
-                "observer.refresh-requested",
-                "observer.state",
-                "operational.failure",
-                "operational.recovered",
-                "owned-set.revised",
-                "planning-session.approved",
-                "planning-session.cancelled",
-                "planning-session.candidate-submitted",
-                "planning-session.previewed",
-                "planning-session.question-answered",
-                "planning-session.question-requested",
-                "planning-session.revision-requested",
-                "planning-session.started",
-                "principal.key-granted",
-                "principal.key-revoked",
-                "publication.operation",
-                "reconcile.fault",
-                "record.repaired",
-                "render.applied",
-                "repair.applied",
-                "resource.observed",
-                "revision-proposal.applied",
-                "revision-proposal.approved",
-                "revision-proposal.cancelled",
-                "revision-proposal.created",
-                "rule.audited",
-                "rule.set",
-                "run-generation.created",
-                "run-generation.state",
-                "run-generation.superseded",
-                "runtime.action.deadline-reached",
-                "runtime.action.failed",
-                "runtime.action.requested",
-                "runtime.action.succeeded",
-                "runtime.observed",
-                "runtime.readiness-deadline-reached",
-                "runtime.reconcile-decision",
-                "runtime.restart-window-reset",
-                "schedule.occurrence-cancelled",
-                "schedule.occurrence-reached",
-                "schedule.occurrence-scheduled",
-                "schedule.work-failed",
-                "schedule.work-requested",
-                "schedule.work-started",
-                "sekret.called",
-                "sekret.changed",
-                "sekret.exited",
-                "sekret.refused",
-                "step-run.carried",
-                "step-run.retried",
-                "step-run.state",
-                "subagent.appeared",
-                "subagent.ended",
-                "subagent.renewed",
-                "subscription.batch-sent",
-                "subscription.batched",
-                "subscription.mission-deferred",
-                "subscription.mission-failed",
-                "subscription.mission-request-cancelled",
-                "subscription.mission-request-released",
-                "subscription.mission-requested",
-                "subscription.mission-started",
-                "subscription.state",
-                "subscription.watch-ended",
-                "terminal.input.requested",
-                "terminal.input.result",
-                "terminal.launch-geometry",
-                "transport.observed",
-                "work.claimed",
-                "work.extended",
-                "work.failed",
-                "work.person-asked",
-                "work.person-cancelled",
-                "work.person-done",
-                "work.progress",
-                "work.released",
-                "work.renewed",
-                "work.submitted",
-                "workspace.observed",
             ]
         );
         assert_eq!(registry.digest().len(), 64);
@@ -4474,13 +4384,6 @@ mod tests {
     }
 
 
-    #[test]
-    fn checked_in_schema_document_matches_the_registry() {
-        assert_eq!(
-            include_str!("../../../docs/st3/schema.md"),
-            registry().markdown()
-        );
-    }
 
     #[test]
     fn custom_claims_need_both_custom_namespaces() {

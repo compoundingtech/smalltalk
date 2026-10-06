@@ -72,6 +72,11 @@ a complete snapshot, including explicit null clearing for absent blocking metada
 and exit, so legacy optional-field backfill cannot resurrect an answered ask. A delayed observation
 from a previous runtime incarnation never changes the current agent.
 
+Managed native seats also publish a categorical current capture independently of their ordered
+history queue. For the current runtime, the newest source capture wins; delayed older history
+cannot erase a newer human block or resurrect an answered ask. Equal source times prefer the
+categorical current capture. Old writers without that lane retain their observed-state fallback.
+
 ### Subagents
 
 An agent's `subagents` lists the subagents its harness runs now, oldest first: each was recorded
@@ -81,6 +86,19 @@ own `id`, its `subagent_type`, a one-line `description`, its `driver` and `sessi
 subagent is part of its agent, not a resource of its own, and has no actions. The list is read
 per request, so a lease that runs out leaves it at the next read without a new claim. A daemon
 older than the field omits it; clients read a missing list as empty.
+
+`running_subagents` and `background_jobs` are independent optional nullable native counts for
+the current runtime incarnation. Missing or null means unknown; zero means a producer explicitly
+observed none running. They are not inferred from `subagents`: that existing leased metadata list
+keeps its own lifecycle and can differ from the native running count. A runtime replacement does
+not inherit either count from its predecessor.
+
+The model-free native count probe is
+`python3 crates/st3/fixtures/omp-resume/native-task-count-probe.py --omp "$OMP_BIN"`.
+It uses the active-ask probe's shared native PTY helper; `--native-support` selects that helper
+explicitly when it is outside this checkout. Only its disposable terminal receives input.
+It proves two real native task starts, a parent idle frame that still reports two detached
+children, and `/new` aborting both children before the successor frame reports zero.
 
 ## Boundary and transport
 
@@ -1427,6 +1445,9 @@ updates use the existing agents collection stream, including clock-driven stalen
 Same-state observations remain local except for a freshness publication at most once a minute.
 That publication preserves `since` and does not add a history transition. Freshness uses the
 source observation time, so replaying old evidence cannot make a stale seat current.
+
+Categorical `harness.current` captures refresh the current Agent projection independently of
+those ordered observations, preserving their source `since`. They do not become history entries.
 
 ## Exact terminal lookup
 
