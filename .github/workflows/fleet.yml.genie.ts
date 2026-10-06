@@ -218,6 +218,10 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
           run: 'npm test --prefix clients/typescript/st3-client\nnpm run typecheck --prefix clients/typescript/st3-client',
         },
         {
+          name: 'Exercise the shipped OMP hook lifecycle',
+          run: 'node --experimental-strip-types crates/st-drivers/hooks/typecheck/omp-smoke.mjs "$PWD/crates/st3/hooks/omp-channel.ts"',
+        },
+        {
           name: 'Install locked view dependencies',
           if: "steps.typescript-cache.outputs.cache-hit != 'true'",
           run: 'npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund',

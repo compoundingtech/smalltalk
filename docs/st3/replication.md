@@ -488,6 +488,30 @@ admission while normal claims and worker renewals write to a populated WAL datab
 
 An unknown claim kind or field can become valid after a schema upgrade. Admission retries unknown records on each wake and startup. Records that older builds classified as invalid solely because of an unknown field are also reconsidered, preserving and admitting the original signed claim when the upgraded schema recognizes it.
 
+This is whole-claim compatibility, not field-level stripping. In particular, a
+build whose `harness.observed` registry predates `active_ask` retains an observation
+carrying that field as unknown rather than projecting its other fields. Publishers
+omit the key entirely when no ask is confirmed, so no-ask OMP observations continue
+projecting on old readers, including the fresh observation after an ask clears.
+Only observations reporting a live ask are unknown to those readers; their previous
+recognized observation remains visible meanwhile. A build that recognizes
+`active_ask` accepts observations without it.
+The real-executable check is
+`fleet::active_ask_is_additive_across_real_builds`, run with `ST3_COMPAT_BIN` naming
+the immediately prefeature executable built from
+`00156543f28bc8e68d725adfdc32a54d50293873`. It also restarts that node with the
+candidate build to check that the original raw claim becomes projected. Do not
+interpret whole-claim deferral as an old reader receiving updated harness state
+with only the identifier omitted.
+
+The older messaging baseline from `scripts/messaging-compat-binary`
+(`678103d3e8ae873a158bb2cb951d3ffefdf698c4`) predates `status_transition`, so even
+a candidate observation without `active_ask` is unknown to it; it cannot isolate
+this field's compatibility. That executable also requires `/usr/bin/printf` and
+`/usr/bin/env` to capture its login environment. On NixOS, supply those paths only
+inside a private user/mount namespace, never by changing the host or historical
+executable. Missing prerequisites are failed checks, not skipped assertions.
+
 A projection fault keeps the last good projection. The daemon continues to serve status and repair commands.
 
 A valid claim can still fail to project, for example a body written by another build. That claim

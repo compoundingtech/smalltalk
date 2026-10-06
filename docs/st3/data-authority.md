@@ -36,6 +36,17 @@ semantics, a compaction or model change, a reading at least five minutes after t
 one while the harness works, and any reading while it does not. The newest pending reading
 replicates when the harness stops working.
 
+`harness.observed.active_ask` is the last reported native OMP ask `toolCallId`
+confirmed live in the claim's current `incarnation_id`. Publishers omit the field
+when no ask is confirmed; readers also accept legacy `null`. Identifiers are at
+most 256 bytes of printable ASCII and cannot be empty or whitespace-only. A
+historical transcript call is not evidence of a picker. Answer, cancel, timeout,
+harness exit, and an incarnation change clear the identifier; reconnect retains
+it only after native re-confirmation. If the channel drops before a picker closes,
+the last reported identifier remains until a new observation arrives. Concurrent
+asks collapse to one current identity, not a collection of pending asks. The
+`reason` field remains diagnostic and is not an ask identity.
+
 A node can also send every local observation to an OpenTelemetry collector. The exporter is off
 unless the config names a collector:
 

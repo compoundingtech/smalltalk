@@ -468,3 +468,28 @@ fn a_kind_this_client_does_not_know_reads_as_unknown_and_the_page_still_reads() 
         .is_err()
     );
 }
+
+#[test]
+fn agent_active_ask_accepts_older_responses_and_nullable_identifiers() {
+    let mut value = serde_json::json!({
+        "kind": "agent",
+        "id": "agent/node.fern",
+        "revision": "one",
+        "updated_at": "2026-10-05T08:00:00Z",
+        "name": "fern",
+        "state": "waiting",
+        "reachability": "local",
+        "runtime_ids": [],
+        "under": []
+    });
+    let older: Agent = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(older.active_ask, None);
+    value["active_ask"] = serde_json::Value::Null;
+    let cleared: Agent = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(cleared.active_ask, None);
+    value["active_ask"] = serde_json::json!("native-tool-call-1407");
+    let live: Agent = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(live.active_ask.as_deref(), Some("native-tool-call-1407"));
+    value["active_ask"] = serde_json::json!(1407);
+    assert!(serde_json::from_value::<Agent>(value).is_err());
+}

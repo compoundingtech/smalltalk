@@ -702,6 +702,8 @@ export type WorkLabel = typeof WorkLabel.Type
 export type WorkLabelEncoded = typeof WorkLabel.Encoded
 
 export const Agent = /*#__PURE__*/ (() => Schema.Struct({
+  /** Last reported native OMP ask toolCallId confirmed live in the current incarnation; at most 256 printable ASCII bytes, not empty or whitespace-only. Null or absent means no confirmed live ask; never inferred from transcript history. */
+  "active_ask": Schema.OptionFromOptionalNullOr(Schema.String.check(Schema.isPattern(new RegExp("^[ -~]*[!-~][ -~]*$(?![\\s\\S])", "u"))).check(Schema.isMaxLength(256)), NULL_NONE).annotate({ description: "Last reported native OMP ask toolCallId confirmed live in the current incarnation; at most 256 printable ASCII bytes, not empty or whitespace-only. Null or absent means no confirmed live ask; never inferred from transcript history." }),
   "active_work_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   /** Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human. */
   "ask": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." }),

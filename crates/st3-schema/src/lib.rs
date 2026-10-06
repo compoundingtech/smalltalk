@@ -440,6 +440,17 @@ impl Registry {
         if kind == "harness.todo.observed" {
             validate_harness_todo(fields)?;
         }
+        if kind == "harness.observed"
+            && let Some(id) = fields.get("active_ask").and_then(Value::as_str)
+            && (id.len() > 256
+                || id.trim().is_empty()
+                || !id.bytes().all(|byte| (0x20..=0x7e).contains(&byte)))
+        {
+            return Err(error(
+                "invalid-claim-field",
+                "claim field `active_ask` on `harness.observed` must be a nonblank printable ASCII identifier of at most 256 bytes",
+            ));
+        }
         if kind == "terminal.launch-geometry" {
             for name in ["rows", "columns"] {
                 if fields.get(name).and_then(terminal_dimension).is_none() {
@@ -3051,6 +3062,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("transport", string()),
             ("blocked_on", string()),
             ("ask", string()),
+            ("active_ask", string()),
             ("input_buffer", string()),
             ("exit", string()),
             ("observed_since_ms", integer()),
@@ -4498,6 +4510,41 @@ mod tests {
         registry()
             .validate_claim("gate-operation/run/step/gate", "gate.result", &fields)
             .unwrap();
+    }
+
+    #[test]
+    fn active_ask_is_an_optional_nullable_string() {
+        let mut fields = BTreeMap::from([("state".into(), Value::String("blocked".into()))]);
+        registry()
+            .validate_claim("agent/node.fern", "harness.observed", &fields)
+            .unwrap();
+        for active_ask in [
+            Value::Null,
+            Value::String("native-ask-123".into()),
+            Value::String("x".repeat(256)),
+            Value::String(" !~ ".into()),
+        ] {
+            fields.insert("active_ask".into(), active_ask);
+            registry()
+                .validate_claim("agent/node.fern", "harness.observed", &fields)
+                .unwrap();
+        }
+        for active_ask in [
+            Value::Bool(true), Value::from(123), serde_json::json!([]),
+            Value::String("x".repeat(257)), Value::String(String::new()),
+            Value::String("   ".into()), Value::String("\t".into()),
+            Value::String("ask\nid".into()), Value::String("ask\u{7f}".into()),
+            Value::String("aské".into()),
+        ] {
+            fields.insert("active_ask".into(), active_ask);
+            assert_eq!(
+                registry()
+                    .validate_claim("agent/node.fern", "harness.observed", &fields)
+                    .unwrap_err()
+                    .code,
+                "invalid-claim-field"
+            );
+        }
     }
 
     #[test]

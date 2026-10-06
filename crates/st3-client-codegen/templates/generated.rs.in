@@ -1073,6 +1073,8 @@ pub struct Agent {
     #[serde(default)]
     pub ask: Option<String>,
     #[serde(default)]
+    pub active_ask: Option<String>,
+    #[serde(default)]
     pub reason: Option<String>,
     pub host_id: Option<String>,
     pub last_activity_at: Option<String>,

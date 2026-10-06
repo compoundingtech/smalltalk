@@ -1526,6 +1526,8 @@ pub struct CurrentHarnessView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_ask: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_buffer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<String>,
@@ -1555,6 +1557,7 @@ mod current_harness_view_tests {
             reason: reason.map(str::to_owned),
             blocked_on: None,
             ask: None,
+            active_ask: None,
             input_buffer: None,
             exit: None,
             claim: "claim/one".into(),

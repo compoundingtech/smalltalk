@@ -2409,6 +2409,7 @@ fn client_agent_resources_selected(
                 "_status_source": subject.harness,
                 "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
                 "ask": subject.harness.as_ref().and_then(|harness| harness.ask.as_deref()),
+                "active_ask": subject.harness.as_ref().and_then(|harness| harness.active_ask.as_deref()),
                 "reason": subject.harness.as_ref().and_then(|harness| harness.reason.as_deref()),
                 "host_id": desired_hosts.get(&subject.subject),
                 "last_activity_at": last_activity_at.map(client_timestamp),
@@ -20576,6 +20577,19 @@ mission "agent-human" state="ready" {
         }
         append("harness.observed", json!({
             "state": "working", "driver": "omp", "incarnation_id": "human-1",
+            "blocked_on": "human", "ask": "question", "active_ask": "native-ask",
+        }));
+        let live: st3_client::Agent = serde_json::from_value(agent()).unwrap();
+        assert_eq!(live.active_ask.as_deref(), Some("native-ask"));
+        // A legacy producer's absent field must not backfill a former live picker.
+        append("harness.observed", json!({
+            "state": "working", "driver": "omp", "incarnation_id": "human-1",
+            "blocked_on": "human", "ask": "question",
+        }));
+        let legacy: st3_client::Agent = serde_json::from_value(agent()).unwrap();
+        assert!(legacy.active_ask.is_none());
+        append("harness.observed", json!({
+            "state": "working", "driver": "omp", "incarnation_id": "human-1",
             "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
         }));
         let answered: st3_client::Agent = serde_json::from_value(agent()).unwrap();
@@ -20584,6 +20598,7 @@ mission "agent-human" state="ready" {
         assert!(answered.blocked_on.is_none());
         assert!(answered.ask.is_none());
         assert!(answered.reason.is_none());
+        assert!(answered.active_ask.is_none());
         // The harness schema's terminal activity keeps precedence over a stale ask.
         observe_harness("ended");
         assert_eq!(agent()["state"], "failed");
@@ -20611,6 +20626,7 @@ mission "agent-human" state="ready" {
         // Before a new incarnation's first observation, the previous ask is fenced out.
         assert_eq!(agent()["state"], "starting", "{}", agent());
         assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["active_ask"].is_null());
         append("harness.observed", json!({
             "state": "idle", "driver": "omp", "incarnation_id": "human-2",
             "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
@@ -20623,6 +20639,7 @@ mission "agent-human" state="ready" {
         assert!(resumed.blocked_on.is_none());
         assert!(resumed.ask.is_none());
         assert!(resumed.reason.is_none());
+        assert!(resumed.active_ask.is_none());
     }
 
     #[test]

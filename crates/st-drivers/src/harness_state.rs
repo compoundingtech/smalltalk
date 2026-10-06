@@ -157,6 +157,9 @@ struct Record {
     /// Absent in records from writers predating the axis, which defaults to `none`.
     #[serde(default)]
     ask: Ask,
+    /// Live native ask identifier; never populated from a historical transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_ask: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     background_jobs: Option<u64>,
     /// Diagnostic only. No consumer branches on it.
@@ -212,6 +215,7 @@ pub struct Observation {
     pub blocked_on: BlockedOn,
     pub input_buffer: InputBuffer,
     pub ask: Ask,
+    pub active_ask: Option<String>,
     pub background_jobs: Option<u64>,
     pub provider_auth: Option<bool>,
     pub reason: Option<String>,
@@ -225,6 +229,7 @@ impl Observation {
             blocked_on,
             input_buffer,
             ask: Ask::None,
+            active_ask: None,
             background_jobs: None,
             provider_auth: None,
             reason: None,
@@ -371,6 +376,14 @@ impl Writer {
             observation.ask == Ask::None || observation.blocked_on == BlockedOn::Human,
             "an ask kind is meaningful only while blocked on a human"
         );
+        anyhow::ensure!(
+            observation.active_ask.is_none()
+                || (self.harness == "omp"
+                    && observation.state == Activity::Active
+                    && observation.blocked_on == BlockedOn::Human
+                    && observation.ask == Ask::Question),
+            "a live ask identifier requires an active OMP question"
+        );
         let _lock = self.locked()?;
         let on_disk = match read_stored(&self.path) {
             StoredRecord::Parsed(record) => Some(record),
@@ -462,6 +475,7 @@ impl Writer {
                     && current.blocked_on == observation.blocked_on
                     && current.input_buffer == observation.input_buffer
                     && current.ask == observation.ask
+                    && current.active_ask == observation.active_ask
                     && current.background_jobs == observation.background_jobs
                     && current.reason == observation.reason
                     && current.exit == observation.exit
@@ -504,6 +518,7 @@ impl Writer {
             blocked_on: observation.blocked_on,
             input_buffer: observation.input_buffer,
             ask: observation.ask,
+            active_ask: observation.active_ask,
             background_jobs: observation.background_jobs,
             provider_auth,
             provider_auth_sequence,
@@ -575,6 +590,7 @@ pub struct Observed {
     pub blocked_on: BlockedOn,
     pub input_buffer: InputBuffer,
     pub ask: Ask,
+    pub active_ask: Option<String>,
     pub background_jobs: Option<u64>,
     pub harness: Option<String>,
     pub since_ms: Option<u64>,
@@ -601,6 +617,7 @@ impl Observed {
             blocked_on: BlockedOn::Unknown,
             input_buffer: InputBuffer::Unknown,
             ask: Ask::Unknown,
+            active_ask: None,
             background_jobs: None,
             harness,
             since_ms: None,
@@ -706,6 +723,7 @@ pub fn read_raw_at(
         blocked_on: record.blocked_on,
         input_buffer: record.input_buffer,
         ask: record.ask,
+        active_ask: record.active_ask,
         background_jobs: record.background_jobs,
         harness,
         since_ms: Some(record.since_ms),
@@ -903,6 +921,7 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
         blocked_on: BlockedOn::None,
         input_buffer: InputBuffer::Unknown,
         ask: Ask::None,
+        active_ask: None,
         background_jobs: None,
         provider_auth: None,
         provider_auth_sequence: 0,
@@ -1361,6 +1380,7 @@ mod tests {
                 blocked_on: BlockedOn::None,
                 input_buffer: InputBuffer::Unknown,
                 ask: Ask::None,
+                active_ask: None,
                 background_jobs: None,
                 provider_auth: None,
                 provider_auth_sequence: 0,
@@ -1570,6 +1590,7 @@ mod tests {
             blocked_on: BlockedOn::None,
             input_buffer: InputBuffer::Unknown,
             ask: Ask::None,
+            active_ask: None,
             background_jobs: None,
             provider_auth: None,
             provider_auth_sequence: 0,
@@ -1801,6 +1822,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read(&path, None).unwrap().ask, Ask::Unknown);
+    }
+
+    #[test]
+    fn active_ask_clears_on_settle_exit_and_incarnation_takeover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut current = takeover(tmp.path(), "omp");
+        let mut question =
+            Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
+                .with_ask(Ask::Question);
+        question.active_ask = Some("native-ask".into());
+        current.observe(question.clone()).unwrap();
+        assert_eq!(read(&path, None).unwrap().active_ask.as_deref(), Some("native-ask"));
+        current.observe(Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown)).unwrap();
+        assert_eq!(read(&path, None).unwrap().active_ask, None);
+        current.observe(question.clone()).unwrap();
+        current.ended("exit 0").unwrap();
+        assert_eq!(read(&path, None).unwrap().active_ask, None);
+        let mut current = takeover(tmp.path(), "omp");
+        current.observe(question.clone()).unwrap();
+        let _successor = takeover(tmp.path(), "omp");
+        assert_eq!(read(&path, None).unwrap().active_ask, None);
+        current.observe(question).unwrap();
+        assert_eq!(read(&path, None).unwrap().active_ask, None);
     }
 
     #[test]

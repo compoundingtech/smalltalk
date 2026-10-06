@@ -120,6 +120,12 @@ type Stash = {
 
   /** The structured `ask` tool call currently waiting for its matching result. */
   pendingAskToolCallId?: string;
+  /** Confirmed by native execution, not the pre-execution tool_call or transcript. */
+  activeAskToolCallId?: string;
+  /** An unsettled native picker promise is reconnect evidence, unlike a cached state frame. */
+  liveAskPicker?: { toolCallId?: string; nativeSession: string };
+  askPickerUis?: WeakSet<object>;
+  askPickerContext?: ExtensionContext;
   /** An approval modal currently waiting for the operator. */
   pendingApproval?: boolean;
   /** Generation fencing every settle poll against newer activity. */
@@ -145,6 +151,10 @@ const finiteOrNull = (value: unknown): number | null =>
   typeof value === "number" && Number.isFinite(value) ? value : null;
 
 const REASON_MAX_CHARS = 240;
+
+/** Native ask identities are opaque printable ASCII, never normalized or truncated. */
+const validAskId = (value: unknown): value is string =>
+  typeof value === "string" && value.length <= 256 && !/[^\x20-\x7e]/.test(value) && value.trim() !== "";
 
 /** Keep diagnostic state bounded and stable across multiline/model-authored input. */
 const boundedReason = (value: unknown): string | undefined => {
@@ -420,6 +430,42 @@ export default function (pi: ExtensionAPI) {
   const { bin, identity, runtimeId, session, seq } = state;
   let expectedNativeSession = state.expectedNativeSession;
   let resumeGeneration = state.resumeGeneration;
+  // OMP shares this UI object between extension contexts and the built-in ask tool.
+  // Observe the native promise without replacing its result, timeout or cancellation policy.
+  const observeNativePicker = (ctx: ExtensionContext) => {
+    // The UI object can outlive a session switch; never retain its predecessor's context.
+    state.askPickerContext = ctx;
+    const ui = ctx.ui as ExtensionContext["ui"] & {
+      askDialog?: (...args: unknown[]) => Promise<unknown>;
+    };
+    if (!ui || typeof ui.askDialog !== "function") return;
+    const installed = state.askPickerUis ??= new WeakSet();
+    if (installed.has(ui)) return;
+    installed.add(ui);
+    const native = ui.askDialog.bind(ui);
+    ui.askDialog = (...args) => {
+      const context = state.askPickerContext;
+      const result = native(...args);
+      if (!context) return result;
+      // Native OMP opens the dialog just before emitting tool_execution_start.
+      // Keep the promise now; only that later native event grants active_ask authority.
+      const picker = {
+        toolCallId: state.pendingAskToolCallId,
+        nativeSession: context.sessionManager.getSessionId(),
+      };
+      state.liveAskPicker = picker;
+      return result.finally(() => {
+        if (state.liveAskPicker !== picker) return;
+        state.liveAskPicker = undefined;
+        const toolCallId = picker.toolCallId;
+        if (!toolCallId || state.pendingAskToolCallId !== toolCallId) return;
+        state.pendingAskToolCallId = undefined;
+        state.activeAskToolCallId = undefined;
+        sendFrame({ type: "state", state: idleProof(context) ? "idle" : "active" });
+        watchSettle(context);
+      });
+    };
+  };
 
   const cancelSettle = () => {
     state.settleGeneration = (state.settleGeneration ?? 0) + 1;
@@ -467,6 +513,7 @@ export default function (pi: ExtensionAPI) {
       return Promise.resolve("");
     }
     state.shuttingDown = false;
+    observeNativePicker(ctx);
     if (state.reconnectTimer !== undefined) clearTimeout(state.reconnectTimer);
     state.reconnectTimer = undefined;
     // Close the PREVIOUS session's channel and wait (bounded) before spawning: the successor
@@ -479,11 +526,19 @@ export default function (pi: ExtensionAPI) {
     // by design, so without this a replacement session's first frames would restate the old
     // session's cost as their own.
     if (reconnecting) {
+      // Only the native harness's still-unsettled same picker re-confirms this ask.
+      state.activeAskToolCallId =
+        state.liveAskPicker?.nativeSession === nativeSessionId
+          && validAskId(state.liveAskPicker.toolCallId)
+          && state.liveAskPicker.toolCallId === state.pendingAskToolCallId
+          ? state.liveAskPicker.toolCallId : undefined;
       dropHeldForChannel();
     } else {
       state.reconnectAttempt = 0;
       state.lastCostUsd = undefined;
       state.pendingAskToolCallId = undefined;
+      state.activeAskToolCallId = undefined;
+      state.liveAskPicker = undefined;
       state.pendingApproval = false;
       resetHold();
       lastStateFrame = undefined;
@@ -616,6 +671,11 @@ export default function (pi: ExtensionAPI) {
           // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
           // Every fresh channel needs the provider's idle proof, including reconnects
           // during an idle session where no further turn boundary will arrive.
+          if (reconnecting && state.pendingAskToolCallId) {
+            sendFrame({ type: "state", state: "active", blockedOn: "human", ask: "question" });
+          } else if (reconnecting && !state.pendingApproval) {
+            sendFrame({ type: "state", state: idleProof(ctx) ? "idle" : "active" });
+          }
           watchSettle(ctx);
           // The fence proves only the first session restored by this cold launch. A later explicit
           // in-process session switch becomes the current binding and must not inherit the old ID.
@@ -700,7 +760,8 @@ export default function (pi: ExtensionAPI) {
     if (frame.type === "state") {
       lastStateFrame = frame;
       lastBackgroundJobs = backgroundJobs();
-      frame = { ...frame, backgroundJobs: lastBackgroundJobs };
+      frame = { ...frame, backgroundJobs: lastBackgroundJobs,
+        ...(state.activeAskToolCallId === undefined ? {} : { activeAsk: state.activeAskToolCallId }) };
     }
     child.stdin.write(JSON.stringify(frame) + "\n");
   };
@@ -971,7 +1032,7 @@ export default function (pi: ExtensionAPI) {
   };
   const observePendingAsk = (event: { toolName?: unknown; toolCallId?: unknown }) => {
     const pending = state.restoringAsk;
-    if (!pending || event.toolName !== "ask" || event.toolCallId !== pending.toolCallId) return;
+    if (!pending || event.toolName !== "ask" || event.toolCallId !== pending.toolCallId) return false;
     clearTimeout(pending.timer);
     state.restoringAsk = undefined;
     state.pendingAskToolCallId = pending.toolCallId;
@@ -980,6 +1041,7 @@ export default function (pi: ExtensionAPI) {
     sendFrame({ type: "state", state: "active", blockedOn: "human", ask: "question" });
     sendFrame({ type: "delivery_ready" });
     armHoldCap();
+    return true;
   };
   // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 
@@ -1174,6 +1236,7 @@ export default function (pi: ExtensionAPI) {
     toolName?: unknown;
     toolCallId?: unknown;
     input?: unknown;
+    args?: unknown;
   };
   type ToolResultFrame = { toolCallId?: unknown };
   const firstAskQuestion = (event: ToolCallFrame): string | undefined => {
@@ -1184,10 +1247,11 @@ export default function (pi: ExtensionAPI) {
     ) {
       return undefined;
     }
-    if (!event.input || typeof event.input !== "object" || !("questions" in event.input)) {
+    const input = event.input ?? event.args;
+    if (!input || typeof input !== "object" || !("questions" in input)) {
       return undefined;
     }
-    const questions = event.input.questions;
+    const questions = input.questions;
     if (!Array.isArray(questions)) return undefined;
     for (const question of questions) {
       if (!question || typeof question !== "object" || !("question" in question)) continue;
@@ -1200,9 +1264,6 @@ export default function (pi: ExtensionAPI) {
   onWidened("tool_call", async (rawEvent) => {
     // Pinned pi declarations do not know OMP's tool events; the handler validates fields below.
     const event = rawEvent as ToolCallFrame;
-    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
-    observePendingAsk(event);
-    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     sendTimeline("tool_call", rawEvent);
     if (typeof event.toolCallId === "string") {
       toolCallsInFlight().add(event.toolCallId);
@@ -1220,11 +1281,22 @@ export default function (pi: ExtensionAPI) {
       reason: question,
     });
   });
-  // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
-  onWidened("tool_execution_start", async (rawEvent) => {
-    observePendingAsk(rawEvent as ToolCallFrame);
+  onWidened("tool_execution_start", async (rawEvent, ctx) => {
+    const event = rawEvent as ToolCallFrame;
+    if (event.toolName !== "ask" || !validAskId(event.toolCallId)) return;
+    state.pendingAskToolCallId = event.toolCallId;
+    state.activeAskToolCallId = event.toolCallId;
+    const picker = state.liveAskPicker;
+    if (picker?.nativeSession === ctx.sessionManager.getSessionId()
+      && (picker.toolCallId === undefined || picker.toolCallId === event.toolCallId)) {
+      picker.toolCallId = event.toolCallId;
+    }
+    cancelSettle();
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    if (observePendingAsk(event)) return;
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+    sendFrame({ type: "state", state: "active", blockedOn: "human", ask: "question", reason: firstAskQuestion(event) });
   });
-  // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
   onWidened("tool_result", async (rawEvent, ctx) => {
     const event = rawEvent as ToolResultFrame;
     sendTimeline("tool_result", rawEvent);
@@ -1242,6 +1314,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     state.pendingAskToolCallId = undefined;
+    state.activeAskToolCallId = undefined;
     if (idleProof(ctx)) {
       sendFrame({ type: "state", state: "idle" });
       return;
@@ -1252,6 +1325,12 @@ export default function (pi: ExtensionAPI) {
 
   onWidened("tool_execution_end", async (rawEvent, ctx) => {
     const event = record(rawEvent);
+    if (event?.toolName === "ask" && event.toolCallId === state.pendingAskToolCallId) {
+      state.pendingAskToolCallId = undefined;
+      state.activeAskToolCallId = undefined;
+      sendFrame({ type: "state", state: idleProof(ctx) ? "idle" : "active" });
+      watchSettle(ctx);
+    }
     if (event?.toolName !== "todo") {
       // Eval's native bridge persists successful nested todo calls as user_todo_edit entries.
       // This is also the human-edit path; neither needs result-text parsing.
@@ -1366,8 +1445,12 @@ export default function (pi: ExtensionAPI) {
     state.reconnectTimer = undefined;
     cancelSettle();
     state.pendingAskToolCallId = undefined;
+    state.activeAskToolCallId = undefined;
+    state.liveAskPicker = undefined;
+    state.askPickerContext = undefined;
     state.pendingApproval = false;
     resetHold();
+    sendFrame({ type: "state", state: "ended" });
     closeChild(state.child);
   });
 }

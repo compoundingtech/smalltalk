@@ -2599,6 +2599,163 @@ async fn a_member_switches_between_listening_and_dial_out() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ST3_COMPAT_BIN: a real st3 build immediately before active_ask"]
+async fn active_ask_is_additive_across_real_builds() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let old_binary = PathBuf::from(
+        std::env::var("ST3_COMPAT_BIN").expect("ST3_COMPAT_BIN names the pre-active_ask st3"),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let secret = root.path().join("fleet.secret");
+    fs::write(&secret, hex::encode([17_u8; 32])).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let fleet_id = "57041007-4350-4144-8370-948545399388";
+    let mut old = Node::new(root.path(), "old");
+    old.binary = old_binary;
+    let mut new = Node::new(root.path(), "new");
+    old.legacy_config(fleet_id, &secret, &[("new", new.port)]);
+    new.legacy_config(fleet_id, &secret, &[("old", old.port)]);
+    old.start().await;
+    new.start().await;
+
+    let publish = |subject: &str, fields| ClaimInput {
+        subject: subject.into(),
+        kind: "harness.observed".into(),
+        actor: Some(subject.into()),
+        fields,
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: None,
+    };
+    let legacy: Value = old
+        .client()
+        .post(
+            "/v1/claims",
+            &publish(
+                "agent/old.fern",
+                [("state".into(), json!("idle")), ("incarnation_id".into(), json!("old-incarnation"))]
+                    .into_iter()
+                    .collect(),
+            ),
+        )
+        .await
+        .unwrap();
+    wait_until("new build accepts harness observation without active_ask", 60, || async {
+        new.claims().await.iter().any(|claim| claim["id"] == legacy["id"])
+    })
+    .await;
+
+    let prior: Value = new
+        .client()
+        .post(
+            "/v1/claims",
+            &publish(
+                "agent/new.orchid",
+                [
+                    ("state".into(), json!("idle")),
+                    ("incarnation_id".into(), json!("new-incarnation")),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if old.claims().await.iter().any(|claim| claim["id"] == prior["id"]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "old build did not project prior observation {prior}; old status={}; {}",
+            old.st_json(&["replication", "status"]),
+            old.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let current: Value = new
+        .client()
+        .post(
+            "/v1/claims",
+            &publish(
+                "agent/new.orchid",
+                [
+                    ("state".into(), json!("blocked")),
+                    ("incarnation_id".into(), json!("new-incarnation")),
+                    ("active_ask".into(), json!("native-tool-call-1407")),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )
+        .await
+        .unwrap();
+    old.note("after-active-ask").await;
+    new.note("after-active-ask-new").await;
+    let notes = BTreeSet::from([
+        "custom/fleet-test/after-active-ask".into(),
+        "custom/fleet-test/after-active-ask-new".into(),
+    ]);
+    for node in [&old, &new] {
+        wait_for_notes(node, &notes, 60, &[&old, &new]).await;
+    }
+    wait_until("old build keeps the unknown active_ask claim retryable", 60, || async {
+        old.st_json(&["replication", "status"])["unknown_records"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    })
+    .await;
+    let old_status = old.st_json(&["replication", "status"]);
+    let new_status = new.st_json(&["replication", "status"]);
+    assert_eq!(old_status["invalid_records"], 0, "{old_status}");
+    assert_eq!(new_status["invalid_records"], 0, "{new_status}");
+    assert!(old.claims().await.iter().any(|claim| claim["id"] == prior["id"]));
+    assert!(!old.claims().await.iter().any(|claim| claim["id"] == current["id"]));
+    assert!(new.claims().await.iter().any(|claim| claim["id"] == current["id"]));
+    let connection = rusqlite::Connection::open_with_flags(
+        old.state_dir().join("claims.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let (state, error_code, raw): (String, String, Vec<u8>) = connection
+        .query_row(
+            "SELECT state, error_code, raw FROM replica_records WHERE claim_id = ?1",
+            [current["id"].as_str().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "unknown");
+    assert_eq!(error_code, "unknown-claim-field");
+    let identifier = b"native-tool-call-1407";
+    assert!(raw.windows(identifier.len()).any(|window| window == identifier));
+    println!(
+        "active_ask mixed-build: old={} retained the entire new observation as unknown (prior idle observation remains projected), invalid_records=0; new={} accepted absence; later claims replicated both ways",
+        old.binary.display(),
+        new.binary.display()
+    );
+    drop(connection);
+    old.stop();
+    old.binary = new.binary.clone();
+    old.start().await;
+    wait_until("upgraded build admits the original active_ask observation", 60, || async {
+        old.claims().await.iter().any(|claim| {
+            claim["id"] == current["id"]
+                && claim["body"]["fields"]["active_ask"] == "native-tool-call-1407"
+        })
+    })
+    .await;
+    let upgraded_status = old.st_json(&["replication", "status"]);
+    assert_eq!(upgraded_status["invalid_records"], 0, "{upgraded_status}");
+    assert_eq!(upgraded_status["unknown_records"], 0, "{upgraded_status}");
+    println!("active_ask upgrade: original claim and native identifier projected; unknown_records=0; invalid_records=0");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs ST3_COMPAT_BIN: the st3 of the pinned baseline release"]
 async fn an_old_build_config_peer_replicates_with_new_members() {
     if st3::test_support::supervise_test() {
