@@ -163,40 +163,226 @@ fn reading(origin: &str, body: &Value) -> Option<(AccountLimit, String)> {
     ))
 }
 
+// Account limits are a projection of the `harness.limits` claims, kept as two small tables that
+// each claim updates as it arrives. Seats publish a limits claim every few seconds and the kind is
+// never trimmed (101,000 claims on one real store), so folding all of them on every read, twice
+// every two minutes, cost seconds of reading and parsing. A reading now costs the rows it touches.
+//
+// `account_limit_readings` holds, per account and per weekly or partial (five-hour only)
+// reading, the readings within an hour of that account's newest: all the answer can still depend
+// on, since the newest only moves forward and a weekly reading anywhere hides every partial one.
+// `account_limit_seats` holds each seat's newest reading by acceptance time and the account it
+// names. A claim's store index only grows, so a cursor in `meta` says which claims are folded.
+const LIMITS_PROJECTION_VERSION: &str = "1";
+const LIMITS_CURSOR: &str = "account_limits_through_index";
+const LIMITS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS account_limit_readings (
+    driver TEXT NOT NULL,
+    account TEXT NOT NULL,
+    account_ref TEXT NOT NULL,
+    weekly INTEGER NOT NULL CHECK(weekly IN (0,1)),
+    measured_at_unix_ms INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    store_index INTEGER NOT NULL,
+    origin TEXT NOT NULL,
+    body TEXT NOT NULL,
+    PRIMARY KEY (driver, account, account_ref, weekly, measured_at_unix_ms, subject, store_index)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS account_limit_seats (
+    subject TEXT PRIMARY KEY,
+    driver TEXT NOT NULL,
+    account TEXT NOT NULL,
+    account_ref TEXT NOT NULL,
+    accepted_at_unix_ms INTEGER NOT NULL,
+    store_index INTEGER NOT NULL
+) WITHOUT ROWID;
+"#;
+
+pub(super) fn create_limits_schema(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(LIMITS_SCHEMA)
+        .context("creating the account limits projection")
+}
+
+/// Catch the projection up when a store opens: all of history the first time, then only what
+/// arrived while the daemon was down.
+pub(super) fn open_limits(transaction: &Transaction<'_>) -> Result<()> {
+    let version: Option<String> = transaction
+        .query_row(
+            "SELECT value FROM meta WHERE key='account_limits_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if version.as_deref() != Some(LIMITS_PROJECTION_VERSION) {
+        transaction.execute("DELETE FROM account_limit_readings", [])?;
+        transaction.execute("DELETE FROM account_limit_seats", [])?;
+        transaction.execute("DELETE FROM meta WHERE key=?1", [LIMITS_CURSOR])?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('account_limits_version',?1)",
+            [LIMITS_PROJECTION_VERSION],
+        )?;
+    }
+    flush_limits(transaction).map(|_| ())
+}
+
+/// Fold the `harness.limits` claims after the cursor into the tables, and return how many.
+pub(super) fn flush_limits(transaction: &Transaction<'_>) -> Result<usize> {
+    let through: u64 = transaction
+        .query_row("SELECT value FROM meta WHERE key=?1", [LIMITS_CURSOR], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let claims = transaction
+        .prepare_cached(
+            "SELECT subject, origin, body, accepted_at_unix_ms, store_index FROM claims
+             WHERE kind='harness.limits' AND store_index>?1 ORDER BY store_index",
+        )?
+        .query_map([through], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, u64>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut newest_index = through;
+    let mut touched = BTreeSet::<(String, String, String, bool)>::new();
+    for (subject, origin, body, accepted_at, store_index) in &claims {
+        newest_index = newest_index.max(*store_index);
+        let value: Value = serde_json::from_str(body)?;
+        let Some((limit, _)) = reading(origin, &value) else {
+            continue;
+        };
+        let account_ref = limit.account_ref.clone().unwrap_or_default();
+        let weekly = limit.weekly_percent.is_some();
+        transaction
+            .prepare_cached(
+                "INSERT OR REPLACE INTO account_limit_readings
+                 (driver, account, account_ref, weekly, measured_at_unix_ms, subject, store_index, origin, body)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            )?
+            .execute(params![
+                limit.driver,
+                limit.account,
+                account_ref,
+                weekly,
+                limit.measured_at_unix_ms as i64,
+                subject,
+                *store_index as i64,
+                origin,
+                body
+            ])?;
+        // The seat's newest reading by acceptance time, ties by arrival.
+        transaction
+            .prepare_cached(
+                "INSERT INTO account_limit_seats
+                 (subject, driver, account, account_ref, accepted_at_unix_ms, store_index)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(subject) DO UPDATE SET driver=excluded.driver,
+                    account=excluded.account, account_ref=excluded.account_ref,
+                    accepted_at_unix_ms=excluded.accepted_at_unix_ms,
+                    store_index=excluded.store_index
+                 WHERE (excluded.accepted_at_unix_ms, excluded.store_index)
+                    >= (accepted_at_unix_ms, store_index)",
+            )?
+            .execute(params![
+                subject,
+                limit.driver,
+                limit.account,
+                account_ref,
+                accepted_at.parse::<u64>().unwrap_or(0) as i64,
+                *store_index as i64
+            ])?;
+        touched.insert((limit.driver, limit.account, account_ref, weekly));
+    }
+    // Readings more than an hour older than their group's newest can no longer decide anything.
+    for (driver, account, account_ref, weekly) in touched {
+        transaction
+            .prepare_cached(
+                "DELETE FROM account_limit_readings
+                 WHERE driver=?1 AND account=?2 AND account_ref=?3 AND weekly=?4
+                   AND measured_at_unix_ms < (
+                       SELECT MAX(measured_at_unix_ms) FROM account_limit_readings
+                       WHERE driver=?1 AND account=?2 AND account_ref=?3 AND weekly=?4) - ?5",
+            )?
+            .execute(params![
+                driver,
+                account,
+                account_ref,
+                weekly,
+                ACCOUNT_READING_WINDOW_MS as i64
+            ])?;
+    }
+    if newest_index > through {
+        transaction.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+            params![LIMITS_CURSOR, newest_index.to_string()],
+        )?;
+    }
+    Ok(claims.len())
+}
+
 pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLimit>> {
-    let mut statement = connection.prepare_cached(&canonical_sql(
-        "SELECT subject, origin, body FROM claims WHERE kind='harness.limits'
-         ORDER BY CANONICAL_ASC(claims)",
-    ))?;
-    let mut newest = BTreeMap::<String, (String, String, Option<String>)>::new();
-    let mut readings = BTreeMap::<(String, String, Option<String>), Vec<AccountLimit>>::new();
+    type Key = (String, String, Option<String>);
+    let mut weekly = BTreeMap::<Key, Vec<AccountLimit>>::new();
+    let mut partial = BTreeMap::<Key, Vec<AccountLimit>>::new();
+    let mut statement = connection.prepare_cached(
+        "SELECT driver, account, account_ref, weekly, origin, subject, body
+         FROM account_limit_readings",
+    )?;
     for row in statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
         ))
     })? {
-        let (subject, origin, body) = row?;
+        let (driver, account, account_ref, is_weekly, origin, subject, body) = row?;
         let body: Value = serde_json::from_str(&body)?;
-        if let Some((mut limit, _)) = reading(&origin, &body) {
-            limit.measured_by = subject.clone();
-            let key = (
-                limit.driver.clone(),
-                limit.account.clone(),
-                limit.account_ref.clone(),
-            );
-            newest.insert(subject, key.clone());
-            // Keep the last reading even after the account's last seat switches away. Otherwise
-            // the exhausted account would immediately look unused to the next pool choice.
-            readings.entry(key).or_default().push(limit);
+        let Some((mut limit, _)) = reading(&origin, &body) else {
+            continue;
+        };
+        limit.measured_by = subject;
+        let key = (driver, account, (!account_ref.is_empty()).then_some(account_ref));
+        if is_weekly {
+            weekly.entry(key).or_default().push(limit);
+        } else {
+            partial.entry(key).or_default().push(limit);
         }
     }
-    let mut accounts = readings
-        .into_iter()
-        .map(|(key, readings)| (key, select_account_reading(readings)))
-        .collect::<BTreeMap<_, _>>();
-    for (seat, key) in newest {
+    let mut accounts = BTreeMap::<Key, AccountLimit>::new();
+    // A partial snapshot after a relaunch can know only the five-hour window. It is not a weekly
+    // observation and must neither erase nor freshen the last weekly evidence.
+    for (key, readings) in partial {
+        if !weekly.contains_key(&key) {
+            accounts.insert(key, select_account_reading(readings));
+        }
+    }
+    for (key, readings) in weekly {
+        accounts.insert(key, select_account_reading(readings));
+    }
+    let mut seats = connection.prepare_cached(
+        "SELECT subject, driver, account, account_ref FROM account_limit_seats ORDER BY subject",
+    )?;
+    for row in seats.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })? {
+        let (seat, driver, account, account_ref) = row?;
+        let key = (driver, account, (!account_ref.is_empty()).then_some(account_ref));
         accounts
             .get_mut(&key)
             .expect("the seat reported an account")
@@ -743,6 +929,51 @@ mod tests {
         let limit = &store.account_limits().unwrap()[0];
         assert_eq!(limit.weekly_percent, Some(2.0));
         assert_eq!(limit.measured_by, busy);
+    }
+
+    #[test]
+    fn account_limits_keep_only_what_the_newest_hour_can_still_decide() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        let now = now_ms();
+        let seat = "agent/alder.busy";
+        let count = |store: &Store| -> i64 {
+            store
+                .readers
+                .get()
+                .query_row("SELECT COUNT(*) FROM account_limit_readings", [], |row| row.get(0))
+                .unwrap()
+        };
+        {
+            let store = Store::open(&path, "alder").unwrap();
+            // A reading every two hours for a week: each makes the previous one irrelevant.
+            for beat in 0..84_u128 {
+                read(&store, seat, Some("claude/aaaa"), 40.0 + (beat % 50) as f64, now + beat * 2 * HOUR);
+            }
+            assert_eq!(count(&store), 1);
+            let limit = store.account_limits().unwrap().remove(0);
+            assert_eq!(limit.weekly_percent, Some(40.0 + (83 % 50) as f64));
+            assert_eq!(limit.seats, [seat]);
+            // Several inside the newest hour stay, so the highest of the hour still decides.
+            read(&store, seat, Some("claude/aaaa"), 90.0, now + 167 * HOUR + 10);
+            read(&store, seat, Some("claude/aaaa"), 60.0, now + 167 * HOUR + 20);
+            // The reading two hours earlier fell out of the newest's hour; the two inside stay.
+            assert_eq!(count(&store), 2);
+            assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(90.0));
+        }
+        // A store opened again, and one whose projection is lost, answer the same.
+        let store = Store::open(&path, "alder").unwrap();
+        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(90.0));
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute("UPDATE meta SET value='0' WHERE key='account_limits_version'", [])
+                .unwrap();
+        }
+        drop(store);
+        let store = Store::open(&path, "alder").unwrap();
+        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(90.0));
+        assert_eq!(store.account_limits().unwrap()[0].seats, [seat]);
     }
 
     #[test]

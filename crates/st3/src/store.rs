@@ -19353,6 +19353,9 @@ pub(crate) fn append_claim_tx(
     if kind == "message.sent" {
         agent_messages::flush(transaction)?;
     }
+    if kind == "harness.limits" {
+        limits::flush_limits(transaction)?;
+    }
     if kind == "arrangement.edited" {
         arrangements::project(transaction, &record)?;
     }
