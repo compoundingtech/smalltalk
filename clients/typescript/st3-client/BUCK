@@ -1,0 +1,40 @@
+# Generated file - DO NOT EDIT
+# Source: BUCK.genie.ts
+
+load("@rules//buck2:materialization.bzl", "package_view")
+load("@rules//buck2:typescript.bzl", "tsgo_typecheck")
+
+package_view(
+    name = "package_tree",
+    dependency_view = "//buck2/dependencies:view_clients_typescript_st3_client_418fd70e574e",
+    files = {
+        "errors.ts": "errors.ts",
+        "index.ts": "index.ts",
+        "Schema.generated.ts": "Schema.generated.ts",
+        "types.test.ts": "types.test.ts",
+        "fetch-receiver.test.ts": "fetch-receiver.test.ts",
+        "tsconfig.schema.json": "tsconfig.schema.json",
+        "tsconfig.json": "tsconfig.json",
+        "Models.generated.ts": "Models.generated.ts",
+        "Client.generated.ts": "Client.generated.ts",
+        "package.json": "package.json",
+    },
+    strip_project_references = True,
+    runtime = "//:package_tree_runtime",
+    runtime_entry = "package-tree.ts",
+    visibility = ["PUBLIC"],
+)
+
+tsgo_typecheck(
+    name = "typecheck",
+    package_tree = ":package_tree",
+    project = "tsconfig.json",
+    visibility = ["PUBLIC"],
+)
+
+tsgo_typecheck(
+    name = "typecheck_schema",
+    package_tree = ":package_tree",
+    project = "tsconfig.schema.json",
+    visibility = ["PUBLIC"],
+)

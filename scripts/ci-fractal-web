@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# The fractal-web execution lanes, run inside `nix develop .#web`. Each lane is timed into the
+# job summary. Packages that join the workspace add their lanes here.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+summary=${GITHUB_STEP_SUMMARY:-/dev/null}
+printf '| Lane | Elapsed |\n| --- | --- |\n' >> "$summary"
+lane() {
+  local name=$1 start=$SECONDS
+  shift
+  echo "::group::$name"
+  "$@"
+  echo "::endgroup::"
+  printf '| %s | %ss |\n' "$name" "$((SECONDS - start))" >> "$summary"
+}
+
+toolchain() {
+  [ "$(pnpm --version)" = 12.7.0 ] || { echo "pnpm $(pnpm --version) is not 12.7.0" >&2; return 1; }
+  [ "$(node --version)" = v24.20.0 ] || { echo "Node $(node --version) is not 24.20.0" >&2; return 1; }
+  grep -q '"packageManager": "pnpm@12.7.0"' package.json || { echo 'package.json must declare pnpm@12.7.0' >&2; return 1; }
+  # The checked-in Buck root is the Nix-rendered consumer root below Genie's three-line header.
+  [ -n "${FRACTAL_WEB_BUCK_ROOT:-}" ] || { echo 'run inside nix develop .#web' >&2; return 1; }
+  [ ! -s .buckroot ] || { echo '.buckroot must be empty' >&2; return 1; }
+  local file expected
+  for file in .buckconfig BUCK buck2/toolchains/BUCK; do
+    expected="$FRACTAL_WEB_BUCK_ROOT/$file"
+    if ! tail -n +4 "$file" | head -c "$(wc -c < "$expected")" | cmp -s - "$expected"; then
+      echo "$file no longer starts with the mkConsumerBuckRoot rendering; regenerate buck2/root.ts from $expected" >&2
+      return 1
+    fi
+  done
+  pnpm --version && node --version && buck2 --version
+}
+
+lane "Toolchain and Buck root" toolchain
+lane "Frozen install" pnpm install --frozen-lockfile
+lane "Buck typecheck" buck2 build //:typecheck

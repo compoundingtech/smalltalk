@@ -46,19 +46,19 @@ There is no App Store or TestFlight build; build it yourself on a Mac with full 
 mkdir -p ~/src
 git clone https://github.com/compoundingtech/smalltalk.git ~/src/smalltalk
 cd ~/src/smalltalk
-npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund
+corepack enable
+pnpm install --frozen-lockfile
 cd apps/ios
-npm ci
-npx expo prebuild --platform ios --clean --no-install
-npm run pods
-npm run export:ios
+pnpm exec expo prebuild --platform ios --clean --no-install
+pnpm run pods
+pnpm run export:ios
 open ios/smalltalk.xcworkspace
 ```
 
 In Xcode, select the **smalltalk** scheme and your connected iPhone. Under **Signing & Capabilities**, choose your own Apple Development team and automatic provisioning; use a unique bundle identifier if your team cannot register the default. Enable Developer Mode on the phone when asked. From `apps/ios`, [build and install](https://docs.expo.dev/guides/local-app-development/) onto the phone:
 
 ```sh
-npx expo run:ios --device --configuration Release
+pnpm exec expo run:ios --device --configuration Release
 ```
 
 Choose your iPhone when prompted. Release embeds the JavaScript so you can use the app without Metro.
