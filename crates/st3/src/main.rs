@@ -55,8 +55,6 @@ use completion::{Complete, Entity, WorkFilter};
 
 mod cli_help;
 mod completion;
-#[cfg(test)]
-mod follow_tests;
 mod presentation;
 
 use presentation::{
@@ -115,10 +113,6 @@ enum Command {
     /// Show token spend over a period, with the largest spenders first.
     Usage(UsageArgs),
     /// Inspect and control missions.
-    ///
-    /// A mission records an authorized goal, its plan, owners, verification and result.
-    /// Use work start for a small independent job; use a finite mission for dependencies,
-    /// distinct owners, gates or review. st skill explains the agent workflow.
     Missions {
         #[command(subcommand)]
         command: MissionViewCommand,
@@ -156,10 +150,6 @@ enum Command {
     /// stui, the phone and st itself, with their builds as they report them.
     Clients,
     /// Claim and update durable mission work.
-    ///
-    /// Claim existing work first. work start records a small independent authorized job;
-    /// missions record a plan with dependencies and review. Complete work with evidence,
-    /// then turn review feedback into the next authorized iteration. See st skill.
     Work {
         #[command(subcommand)]
         command: WorkCommand,
@@ -1668,9 +1658,6 @@ enum MissionViewCommand {
     /// `depends-on` orders steps; `missions start --after` orders runs without reports.
     /// A final step assigned to the author, depending on the last real step, reaches the
     /// author once when work is done. Review gates mark decisions only a person can make.
-    /// Preview with --dry-run before publication; it runs no exec gates unless --check is set.
-    /// Actual publication normally runs gates once and refuses broken answers, allowing valid
-    /// "not yet" answers. See st skill for goals, evidence, review and feedback loops.
     Publish(MissionPublishArgs),
     /// Run each exec gate in a mission file once, now, the way a run would, and report its
     /// answer: pass (exit 0), not yet (exit 1), broken (anything else), or unchecked.
@@ -1681,8 +1668,6 @@ enum MissionViewCommand {
     /// `depends-on` orders steps; `--after` orders runs without reports.
     /// A final step assigned to the author, depending on the last real step, reaches the
     /// author once when work is done. Review gates mark decisions only a person can make.
-    /// Publication and preview do not start a run. Claim its ready steps, verify the result
-    /// and record evidence before review. Recording work does not widen its authorization.
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
     Cancel(MissionCancelArgs),
@@ -1714,7 +1699,6 @@ enum MissionViewCommand {
 struct MissionShowArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionOrRun)))]
     mission_or_run: String,
-    /// Follow until finished or stopped; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(long)]
     follow: bool,
 }
@@ -1817,7 +1801,6 @@ struct MissionRunStartArgs {
     #[arg(long, value_name = "RUN")]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     after: Option<String>,
-    /// Follow until finished or stopped; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(long)]
     follow: bool,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
@@ -2239,7 +2222,6 @@ struct TraceArgs {
     limit: usize,
     #[arg(long)]
     after_index: Option<u64>,
-    /// Follow from the last index; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(short = 'f', long)]
     follow: bool,
 }
@@ -2383,12 +2365,6 @@ enum DevicesCommand {
         /// Allow a public HTTP address only when it is already an encrypted path.
         #[arg(long)]
         allow_public_http: bool,
-        /// Person-root fingerprint obtained separately from the trusted pairing machine.
-        #[arg(long, conflicts_with = "unpinned")]
-        fingerprint: Option<String>,
-        /// Explicitly bypass person-root identity verification (unsafe against active attackers).
-        #[arg(long)]
-        unpinned: bool,
     },
     /// Revoke one paired device.
     Revoke {
@@ -3697,10 +3673,6 @@ struct AttentionWithdrawArgs {
 #[derive(Subcommand)]
 enum WorkCommand {
     /// Open a one-step run for this seat without authoring a mission; then use claim.
-    ///
-    /// For a small independent authorized job: describe the result, use the returned claim
-    /// command, perform the work and complete it with durable evidence. Finish or release
-    /// other independent claimed work first. See st skill for the full workflow.
     Start(WorkStartArgs),
     /// Release claimed work to another seat or person with a note they acknowledge.
     Handoff(WorkHandoffArgs),
@@ -3755,16 +3727,12 @@ enum WorkCommand {
     Renew(WorkActionArgs),
     /// Record a material progress update without changing ownership.
     ///
-    /// Records progress in the graph without messaging another agent; people read it in stui.
+    /// Records progress in the graph at no cost to anyone; people read it in stui.
     #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Progress(WorkActionArgs),
     /// Add time to the execution budget of claimed work that ran out of it.
     Extend(WorkExtendArgs),
     /// Finish claimed work and attach its durable evidence.
-    ///
-    /// Include the result, exact revision, verification and material limits. Gates can keep
-    /// the step verifying after submission. A dependent review step becomes ready when it
-    /// completes; review feedback can become the next authorized step or run. See st skill.
     #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Complete(WorkActionArgs),
     /// Fail claimed work with an actionable reason and evidence.
@@ -4742,8 +4710,6 @@ async fn run(cli: Cli) -> Result<()> {
                 key_file,
                 profile,
                 allow_public_http,
-                fingerprint,
-                unpinned,
             }),
         ..
     }) = &cli.command
@@ -4754,11 +4720,7 @@ async fn run(cli: Cli) -> Result<()> {
             algorithm,
             key_file.as_deref(),
             profile.as_deref(),
-            st3_client::device::CompletionOptions {
-                allow_public_http: *allow_public_http,
-                fingerprint: fingerprint.as_deref(),
-                unpinned: *unpinned,
-            },
+            *allow_public_http,
             cli.json,
         )
         .await;
@@ -6217,12 +6179,6 @@ async fn run_mission_view(
             )
         }
         MissionViewCommand::Show(args) => {
-            let client = if args.follow {
-                client.clone().with_follow_retry()
-            } else {
-                client.clone()
-            };
-            let client = &client;
             let mut selected = args.mission_or_run;
             if !selected.starts_with("mission-run/") {
                 let overview: Value = client
@@ -6877,51 +6833,34 @@ fn started_revision_note(
 
 async fn follow_mission_run(
     client: &Client,
-    run: MissionRunView,
+    mut run: MissionRunView,
     _cursor: u64,
     json_output: bool,
 ) -> Result<()> {
+    let mut prior = String::new();
     let interactive = std::io::stdout().is_terminal();
     let _screen = if !json_output && interactive {
         Some(TerminalScreen::open()?)
     } else {
         None
     };
-    follow_mission_run_to(
-        client, run, json_output, interactive, OutputStyle::stdout(), &mut std::io::stdout(),
-    ).await
-}
-
-async fn follow_mission_run_to(
-    client: &Client,
-    mut run: MissionRunView,
-    json_output: bool,
-    interactive: bool,
-    style: OutputStyle,
-    output: &mut impl std::io::Write,
-) -> Result<()> {
-    let client = client.clone().with_follow_retry();
-    let client = &client;
-    let mut prior = String::new();
+    let style = OutputStyle::stdout();
     loop {
         let runs = load_mission_run_tree(client, &run).await?;
         let summary = mission_run_signature(&runs)?;
         if summary != prior && !json_output {
             let frame = render_mission_run(&run, &runs, style, current_unix_ms()?);
-            write!(
-                output,
+            print!(
                 "{}",
                 follow_snapshot(&frame, interactive, !prior.is_empty())
-            )?;
-            output.flush()?;
+            );
+            std::io::stdout().flush()?;
             prior = summary;
         }
-        client.follow_recovered();
         match run.status.as_str() {
             status if mission_run_follow_succeeded(status) => {
                 return if json_output {
-                    writeln!(output, "{}", serde_json::to_string_pretty(&run)?)?;
-                    Ok(())
+                    print_value(&run, true)
                 } else {
                     Ok(())
                 };
@@ -7788,43 +7727,25 @@ async fn run_inspect(client: &Client, args: InspectArgs, json_output: bool) -> R
 }
 
 async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Result<()> {
-    run_trace_to(client, args, json_output, &mut std::io::stdout()).await
-}
-
-async fn run_trace_to(
-    client: &Client,
-    args: TraceArgs,
-    json_output: bool,
-    output: &mut impl std::io::Write,
-) -> Result<()> {
     anyhow::ensure!(
         args.limit > 0 && args.limit <= 500,
         "the trace limit must be 1 through 500"
     );
-    let client = if args.follow {
-        client.clone().with_follow_retry()
-    } else {
-        client.clone()
-    };
-    let client = &client;
     let claims = trace_claims(client, &args).await?;
     let mut cursor = args.after_index.unwrap_or_default();
     for claim in claims {
         cursor = cursor.max(claim.store_index);
         if json_output {
-            writeln!(output, "{}", serde_json::to_string(&claim)?)?;
+            println!("{}", serde_json::to_string(&claim)?);
         } else {
-            write_trace_claim(output, &claim)?;
+            print_trace_claim(&claim);
         }
     }
     if !args.follow {
         return Ok(());
     }
-    client.follow_recovered();
     loop {
-        let mut event_query = vec![
-            format!("after={cursor}"), "wait=true".into(), "timeout_ms=30000".into(),
-        ];
+        let mut event_query = vec![format!("after={cursor}")];
         if let Some(subject) = &args.subject {
             event_query.push(format!("subject={}", urlencoding::encode(subject)));
         }
@@ -7835,8 +7756,9 @@ async fn run_trace_to(
             .get(&format!("/v1/events?{}", event_query.join("&")))
             .await?;
         for event in events {
+            cursor = cursor.max(event.store_index);
             if json_output {
-                writeln!(output, "{}", serde_json::to_string(&event)?)?;
+                println!("{}", serde_json::to_string(&event)?);
             } else {
                 let claims: ClaimsPage = client
                     .get(&format!(
@@ -7850,18 +7772,15 @@ async fn run_trace_to(
                     .into_iter()
                     .find(|claim| claim.store_index == event.store_index)
                 {
-                    write_trace_claim(output, &claim)?;
+                    print_trace_claim(&claim);
                 } else {
-                    writeln!(
-                        output,
+                    println!(
                         "{}\t{}\t{}\t(no claim details)",
                         event.store_index, event.kind, event.subject
-                    )?;
+                    );
                 }
             }
-            cursor = cursor.max(event.store_index);
         }
-        client.follow_recovered();
     }
 }
 
@@ -7891,7 +7810,7 @@ async fn trace_claims(client: &Client, args: &TraceArgs) -> Result<Vec<ClaimReco
     Ok(claims)
 }
 
-fn write_trace_claim(output: &mut impl std::io::Write, claim: &ClaimRecord) -> Result<()> {
+fn print_trace_claim(claim: &ClaimRecord) {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
     let summary = ["state", "status", "verdict", "action", "reason"]
         .into_iter()
@@ -7909,19 +7828,16 @@ fn write_trace_claim(output: &mut impl std::io::Write, claim: &ClaimRecord) -> R
     .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
     .unwrap_or_else(|| claim.accepted_at_unix_ms.to_string());
     if summary.is_empty() {
-        writeln!(
-            output,
+        println!(
             "{}\t{}\t{}\t{}",
             claim.store_index, timestamp, claim.kind, claim.subject
-        )?;
+        );
     } else {
-        writeln!(
-            output,
+        println!(
             "{}\t{}\t{}\t{}\t{}",
             claim.store_index, timestamp, claim.kind, claim.subject, summary
-        )?;
+        );
     }
-    Ok(())
 }
 
 fn trace_scalar(value: &Value) -> String {
@@ -8173,15 +8089,6 @@ async fn run_devices(
                 .await?;
             print_client_value(&response, json_output)?;
             if !json_output {
-                if let Some(fingerprint) = &response.value.person_root_fingerprint {
-                    println!(
-                        "Person-root fingerprint: {fingerprint}\nCopy this separately from the pairing code to the new device's fingerprint field or --fingerprint option."
-                    );
-                } else {
-                    eprintln!(
-                        "WARNING: This member has no person-root fingerprint; pinned pairing requires a signing-enabled member."
-                    );
-                }
                 print!("{}", cli_help::pairing_next_steps(&person));
             }
             Ok(())
@@ -8215,11 +8122,10 @@ async fn run_devices_complete(
     algorithm: &str,
     key_file: Option<&Path>,
     profile: Option<&Path>,
-    options: st3_client::device::CompletionOptions<'_>,
+    allow_public_http: bool,
     json_output: bool,
 ) -> Result<()> {
     use st3_client::device::{KeyAlgorithm, SigningKey};
-    options.validate()?;
     let algorithm = match algorithm {
         "ed25519" => KeyAlgorithm::Ed25519,
         "p256" => KeyAlgorithm::P256,
@@ -8234,8 +8140,8 @@ async fn run_devices_complete(
         .map(Ok)
         .unwrap_or_else(st3_client::device::profile_path)?;
     let code = st3_client::device::read_pairing_code()?;
-    let device = st3_client::device::complete_with_options(
-        &path, member_url, pairing_id, &code, key, options,
+    let device = st3_client::device::complete_with_http_policy(
+        &path, member_url, pairing_id, &code, key, allow_public_http,
     )
     .await?;
     // Always choose explicit safe fields, including --json. PairedSession contains a bearer.
@@ -8247,7 +8153,6 @@ async fn run_devices_complete(
                 "person_id": device.session.person_id, "scopes": device.session.scopes,
                 "expires_at": device.session.expires_at, "profile": path,
                 "signing_key": device.signing_key.as_ref().map(SigningKey::public_key).transpose()?,
-                "person_root_fingerprint": device.person_root_fingerprint,
             }))?
         );
     } else {

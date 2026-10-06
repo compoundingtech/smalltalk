@@ -72,7 +72,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_skill_is_gated_on_st_agent_and_keeps_guidance_within_st_work() {
+    fn the_skill_is_gated_on_st_agent_and_describes_st_without_prescribing_conduct() {
         let (frontmatter, body) = SKILL
             .strip_prefix("---\n")
             .and_then(|rest| rest.split_once("\n---\n"))
@@ -86,7 +86,7 @@ mod tests {
         assert!(description.len() <= 1024);
         for usage in [
             "`printenv ST_AGENT` prints this seat's identity. When it prints nothing",
-            "`[PING from st3] message/ID from SENDER: TITLE` or inside `<smalltalk-message>`",
+            "`[PING from st3] message/ID from SENDER: TITLE` or inside\n`<smalltalk-message>`",
             "`\"$ST3_BIN\" conversations read message/ID --as \"$ST_AGENT\"`",
             "`\"$ST3_BIN\" conversations reply message/ID --from \"$ST_AGENT\" --body TEXT`",
             "`\"$ST3_BIN\" conversations archive message/ID --as \"$ST_AGENT\"`",
@@ -106,7 +106,7 @@ mod tests {
         ] {
             assert!(body.contains(usage), "{usage}");
         }
-        // Work guidance belongs here; unrelated turn and harness rules do not.
+        // The skill describes st. It sets no rules of conduct, which the old boot document did.
         for rule in [
             "end the turn",
             "finish this turn",
@@ -119,7 +119,7 @@ mod tests {
         ] {
             assert!(
                 !SKILL.contains(rule),
-                "the skill includes an unrelated turn or harness rule: {rule}"
+                "the skill prescribes conduct: {rule}"
             );
         }
         assert!(SKILL.lines().count() <= 60, "the skill stays short");

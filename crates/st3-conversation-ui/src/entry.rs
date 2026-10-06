@@ -12,21 +12,6 @@ pub fn bundle_id(first: &str) -> String {
     format!("bundle:{first}")
 }
 
-/// How many rows the person sees in the simplified conversation: each entry is one, and a run of
-/// tool calls is one for the whole run.
-pub fn display_rows(entries: &[Entry]) -> usize {
-    let mut rows = 0;
-    let mut in_run = false;
-    for entry in entries {
-        let tool = matches!(entry.body, Body::Tool { .. });
-        if !(tool && in_run) {
-            rows += 1;
-        }
-        in_run = tool;
-    }
-    rows
-}
-
 /// Whether an entry folds until opened: tool calls, and mail the person is not part of.
 pub fn folds(body: &Body) -> bool {
     match body {

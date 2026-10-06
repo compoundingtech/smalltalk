@@ -9,21 +9,15 @@ pub async fn pair(
     pairing_id: &str,
     code: &str,
     allow_public_http: bool,
-    fingerprint: Option<&str>,
-    unpinned: bool,
 ) -> Result<String> {
     let key = st3_client::device::SigningKey::generate(st3_client::device::KeyAlgorithm::P256)?;
-    let device = st3_client::device::complete_with_options(
+    let device = st3_client::device::complete_with_http_policy(
         path,
         endpoint,
         pairing_id,
         code,
         key,
-        st3_client::device::CompletionOptions {
-            allow_public_http,
-            fingerprint,
-            unpinned,
-        },
+        allow_public_http,
     )
     .await?;
     Ok(device.session.person_id)
@@ -46,7 +40,6 @@ mod tests {
             devices: vec![Device {
                 endpoint: "https://member.example".into(),
                 allow_public_http: false,
-                person_root_fingerprint: None,
                 signing_key: None,
                 session: PairedSession {
                     kind: "paired-session".into(),
@@ -58,7 +51,6 @@ mod tests {
                     expires_at: "2026-10-30T12:00:00Z".into(),
                     device_key_chain: Vec::new(),
                     device_key_proofs: Vec::new(),
-                    person_root_key_proof: None,
                 },
             }],
         }

@@ -9,7 +9,8 @@ This applies only to a session st started: `printenv ST_AGENT` prints this seat'
 
 ## Messages
 
-An st message arrives as `[PING from st3] message/ID from SENDER: TITLE` or inside `<smalltalk-message>`, followed by a bounded preview. The message ID identifies it:
+An st message arrives as `[PING from st3] message/ID from SENDER: TITLE` or inside
+`<smalltalk-message>`, followed by a bounded preview. The message ID identifies it:
 
 - `"$ST3_BIN" conversations read message/ID --as "$ST_AGENT"` shows the whole message.
 - `"$ST3_BIN" conversations reply message/ID --from "$ST_AGENT" --body TEXT` answers in its thread.
@@ -23,19 +24,16 @@ A message is a direct connection: it wakes the recipient agent for a full turn, 
 ## Mission work
 
 `"$ST3_BIN" work ls --as "$ST_AGENT"` lists the steps available to this seat, and `work claim STEP --as "$ST_AGENT"` takes one and prints its goals, its constraints, and this machine's host facts.
-
-Status lives in the graph: `work progress` records progress; `work complete` records the result, each with `--as "$ST_AGENT"`. Message a person or agent for a question, a blocker or an action they need to take. Send progress or completion messages only when asked. To learn when something finishes, watch it instead of asking to be told: `st gh watch` watches PRs today; `st watch` for any subject is planned.
-
+`work progress` records progress in the graph at no cost to anyone; people read it in stui. `work complete`, `work fail`, and `work release` record what happened to a claimed step, each with `--as "$ST_AGENT"`.
 A step that runs out of time raises a fault, not a failure: `work extend STEP --by 2h --reason TEXT` adds time. The seat's driver renews the claim's lease while the seat runs. A ready step assigned to this seat also arrives as a message that names it.
 
 A mission's goals, constraints and named documents encode every known rule and decision. `depends-on` orders steps; `missions start --after` orders runs without reports. A final step assigned to the author, depending on the last real step, reaches the author once when work is done. Review gates mark decisions only a person can make. `apply FILE...` publishes seats, missions and schedules together; `--dry-run` (alias `--preview`) validates and prints the resolved preview without publishing or running exec gates. Add `--check` to run exec gates during the preview, with `--workspace DIR` and repeated `--input NAME=VALUE` as needed; answers appear on stderr. Publication checks for broken gates by default; `--no-gate-check` skips them. `missions check FILE` checks gates alone. `apply --set NAME` retains complete owned-set publication and requires its repository, ref, SHA, source sequence and expected-set flags. `agents apply` and `missions publish` still work and log a legacy notice naming `apply`. `work revise RUN FILE` proposes a revision.
 
-Turn authorized requests into durable work: claim an existing step first, open a small independent job with `work start`, or write a finite mission for a plan with distinct owners, dependencies, gates or review. Say what should change and what would prove it; pin important documents and give each step an owner, an outcome and evidence. Use the fewest steps that preserve verification and downstream actions. Recording work does not grant permission to merge, publish externally, deploy or widen its scope.
+## Spontaneous work and handoff
 
-Preview a mission with `apply FILE --dry-run --as "$ST_AGENT"`; inspect gate commands before executing them. Publication checks for broken answers, allowing valid "not yet" answers, and does not start a run. Start it with `missions start MISSION --id RUN --workspace PATH --as "$ST_AGENT"`. `depends-on { step "build" completed }` makes verification or review ready after build completes; a final normal review step gives its owner real work once, while `finally` runs cleanup after success or failure. Completion evidence contains the result, exact revision, checks and material limits; gates can keep a submitted result verifying. Inspect `work show` and `missions show` when their state matters. Compare evidence with the goal and turn review feedback into another authorized step or run. `work revise RUN FILE --reason TEXT --as "$ST_AGENT"` proposes a revision; `work retry STEP --reason TEXT` retries a failed step whose goal still fits. `work fail` and `work release` record failure or return claimed work, each with `--as "$ST_AGENT"`.
-
-`"$ST3_BIN" work start TITLE --as "$ST_AGENT" --idempotency-key KEY` opens a one-step run without a mission file and prints its `work claim` command. Reusing the key recovers the same run after a timeout. Finish or release independent claimed work before starting another run. Claim it, record checkpoints with `work progress STEP --summary TEXT --evidence REF`, and close with `work complete STEP --summary TEXT --evidence REF`, each with `--as "$ST_AGENT"`. Spontaneous work requires evidence to close; `documents put RESULT_FILE --as doc/example/result` stores a result and returns its immutable reference.
-`work handoff STEP --to agent/example/reviewer --note TEXT --as "$ST_AGENT"` releases this incarnation's lease and assigns the leaf step to that exact agent or person. `--idempotency-key KEY` recovers the same transfer. The durable note goes to the recipient's conversations; a person's step appears on their home. `work show STEP` shows the note, message ID and acknowledgment. The recipient reads the note and runs `work acknowledge STEP --message MESSAGE --as RECIPIENT` before claiming or closing it. This records a read receipt and progress without a worker lease. An agent then uses `work claim`; a person closes with `work done STEP --summary TEXT --evidence REF --as RECIPIENT`. Each later transfer needs its own acknowledgment.
+`"$ST3_BIN" work start TITLE --as "$ST_AGENT" --idempotency-key KEY` opens a one-step run without a mission file and prints its `work claim` command. Reusing the key recovers the same run after a timeout. Finish or release independent claimed work before starting another run. Claim it, record checkpoints with `work progress STEP --summary TEXT --evidence REF`, and close with `work complete STEP --summary TEXT --evidence REF`, each with `--as "$ST_AGENT"`. Spontaneous work requires evidence to close.
+`work handoff STEP --to agent/example/reviewer --note TEXT --as "$ST_AGENT"` releases this incarnation's lease and assigns the leaf step to that exact agent or person. `--idempotency-key KEY` recovers the same transfer. The durable note goes to the recipient's conversations; a person's step appears on their home. `work show STEP` shows the note, message ID and acknowledgment.
+The recipient reads the note and runs `work acknowledge STEP --message MESSAGE --as RECIPIENT` before claiming or closing it. This records a read receipt and progress without a worker lease. An agent then uses `work claim`; a person closes with `work done STEP --summary TEXT --evidence REF --as RECIPIENT`. Each later transfer needs its own acknowledgment.
 
 ## Person work
 
@@ -57,4 +55,6 @@ st reaches every seat through its harness's own channel. Keys typed into another
 
 ## Upstream feedback
 
-Issues and suggestions are welcome at https://github.com/compoundingtech/smalltalk. File an upstream issue with `gh issue create --repo compoundingtech/smalltalk`. Pull requests are welcome too.
+Issues and suggestions are welcome at https://github.com/compoundingtech/smalltalk.
+File an upstream issue with `gh issue create --repo compoundingtech/smalltalk`.
+Pull requests are welcome too.

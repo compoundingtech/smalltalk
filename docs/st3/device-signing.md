@@ -21,7 +21,7 @@ Every client's tests check against that file.
 ## Enrollment
 
 1. On a trusted machine, the person runs `st devices pair` (or the equivalent client-API call).
-   It returns a pairing code and a separate person-root fingerprint. Copy the fingerprint from this trusted machine independently of the code.
+   It returns a pairing code.
 2. The device sends `POST /v1/client/pairings/{id}/complete` with three fields:
    - `device_public_key`: the device's public key.
    - `key_storage`: `secure-enclave` or `software`. Optional.
@@ -38,11 +38,9 @@ Every client's tests check against that file.
      subject, kind, origin, actor, body, predecessors and existing claim signature. These public
      receipts let a completing client check content hashes, signatures and issuer/role links,
      including that the device grant binds the public key it submitted. They provide no new
-     authority. The completing client compares the verified person-root key with the fingerprint
-     supplied separately from the trusted machine. A completely forged, self-consistent chain
-     fails that comparison. A read-only pairing returns `person_root_key_proof` without enrolling
-     a signing device. That receipt verifies the root key but does not bind the bearer or scopes.
-     Use an encrypted path for the code and bearer even when the fingerprint is pinned.
+     authority. Without independently pinning a trusted node or person-root key, an active
+     attacker can return an entirely forged, self-consistent chain and defeat this check.
+     Use a trusted encrypted path; returned proofs alone do not authenticate the gateway.
    - A `device_public_key` that is not a signing key pairs the device as before. That device has
      no grant and cannot sign.
 4. Revoking the pairing (`pairing.revoke`) also writes `principal.key-revoked` for the key.
@@ -61,7 +59,7 @@ On the device, complete it using the member gateway's HTTP or HTTPS origin and t
 pairing ID. The command prompts privately for the single-use code, or reads it from stdin:
 
 ```sh
-st devices complete https://member.example pairing/PAIRING_ID --fingerprint sha256:FINGERPRINT
+st devices complete https://member.example pairing/PAIRING_ID
 ```
 
 HTTP is allowed by default for loopback, private addresses and tailnet addresses, including
@@ -96,7 +94,7 @@ If a connection fails before an answer arrives, inspect the trusted device list 
 client cannot know whether the member consumed the code.
 Neither ordinary output nor `--json` prints the bearer or private key.
 
-`stui pair https://member.example pairing/PAIRING_ID --fingerprint sha256:FINGERPRINT` uses the same key generation and
+`stui pair https://member.example pairing/PAIRING_ID` uses the same key generation and
 persistence, and paired stui messages are signed using the saved key and chain. Existing legacy
 profiles remain readable. A pairing without `control.messages`, including `--read-only`,
 enrolls no signing key and persists no private signing material.
@@ -116,27 +114,8 @@ that revocation. This withdraws signing authority without rewriting the original
 a fresh signing key. A process crash or a storage failure can prevent cleanup and leave an unused
 signing grant; inspect principal grant and revocation history on the trusted member in that case.
 There is no completed device record for such a grant in `st devices ls`; pairing revocation only
-covers completed devices. The trusted begin response carries optional `person_root_fingerprint`.
-The anonymous advertisement never supplies a fingerprint or key.
-New completions require a full person-root fingerprint (`sha256:` plus the 43-character
-base64url SHA-256 digest of the canonical public-key string). Obtain it from the trusted machine
-and pass `--fingerprint`; do not copy a key or fingerprint from the completing gateway. Missing
-or malformed fingerprints fail before the code is submitted. `--unpinned` explicitly bypasses
-this identity check and prints a loud warning that an active attacker can forge the chain;
-hashes, signatures, issuer links and submitted-key binding are still checked. The two options
-are mutually exclusive. The verified pin is saved atomically with the bearer and key.
-Existing profiles keep working. Re-pairing an unpinned profile prints a migration warning;
-ordinary connections do not. A new root requires fresh pairing with explicit trusted input.
-
-The phone has a separate fingerprint field and a deliberate, warned unpinned override. Debug
-pairing links prefill the pairing form and never submit the code automatically. The phone
-verifies the same public grants before committing a single Keychain profile containing the
-bearer, pin and reference to a separate native signing key; failure preserves its previous
-profile and key. Older clients ignore the optional response fields and continue to work.
-A new client can pin a messaging pairing against a member that already supplies v1 device
-proofs. Pinned read-only pairing needs the added root-proof response; an older member's reply
-is refused with the orphan/revoke guidance above, unless `--unpinned` was explicitly selected.
-
+covers completed devices. Node/person-root fingerprint pinning remains a pending design decision;
+these proofs do not authenticate a gateway against an active attacker.
 Before committing a messaging profile it verifies the returned device and person-root grant
 proofs, their content hashes and signatures, the device-to-root-to-node issuer/role links, and
 the first grant's binding to its submitted public key. A member that does not return those

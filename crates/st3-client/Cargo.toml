@@ -36,5 +36,5 @@ hex = "0.4"
 ring = "0.17"
 sha2 = "0.10"
 smallclaims = { path = "../smallclaims" }
-st3 = { path = "../st3", features = ["test-support"] }
+st3 = { path = "../st3" }
 tempfile = "3"

@@ -1,7 +1,6 @@
 use std::fmt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -49,98 +48,6 @@ pub struct Client {
     person: Option<String>,
     outage_wait: Duration,
     announce_outage_wait: bool,
-    follow_retry: Option<Arc<Mutex<FollowRetry>>>,
-    #[cfg(any(test, feature = "test-support"))]
-    follow_test: Option<Arc<Mutex<FollowTest>>>,
-}
-
-/// A client seam for follow-loop tests with Tokio's injected clock, without a live daemon.
-#[cfg(any(test, feature = "test-support"))]
-pub enum FollowTestReply {
-    Value(serde_json::Value),
-    Delayed(serde_json::Value, Duration),
-    Timeout,
-    Disconnect,
-    Error(u16),
-}
-
-#[cfg(any(test, feature = "test-support"))]
-struct FollowTest {
-    replies: std::collections::VecDeque<(String, FollowTestReply)>,
-    requests: Vec<(String, tokio::time::Instant)>,
-    messages: Vec<String>,
-}
-
-const FOLLOW_OUTAGE_LIMIT: Duration = Duration::from_secs(5 * 60);
-const FOLLOW_DEADLINE_PAUSE: Duration = Duration::from_secs(10);
-const FOLLOW_DEADLINE_CAP: Duration = Duration::from_secs(60);
-
-/// One viewer owns this state across every read and healthy polling iteration. In particular,
-/// a successful read does not undo the deadline backoff: timed-out server work may still run.
-struct FollowRetry {
-    interrupted_since: Option<tokio::time::Instant>,
-    unreachable_since: Option<tokio::time::Instant>,
-    connect_pause: Duration,
-    deadline_pause: Duration,
-}
-
-impl Default for FollowRetry {
-    fn default() -> Self {
-        Self {
-            interrupted_since: None,
-            unreachable_since: None,
-            connect_pause: Duration::from_millis(100),
-            deadline_pause: FOLLOW_DEADLINE_PAUSE,
-        }
-    }
-}
-
-impl FollowRetry {
-    fn failed(
-        &mut self,
-        error: &anyhow::Error,
-        attempt_started: tokio::time::Instant,
-    ) -> Result<(Duration, Option<String>)> {
-        let (pause, reason) = if let Some(outage) = daemon_unreachable(error) {
-            let since = *self.unreachable_since.get_or_insert(attempt_started);
-            let elapsed = since.elapsed();
-            if elapsed >= FOLLOW_OUTAGE_LIMIT {
-                return Err(outage.clone().after(elapsed).into());
-            }
-            let pause = jittered(self.connect_pause)
-                .min(Duration::from_secs(5))
-                .min(FOLLOW_OUTAGE_LIMIT - elapsed);
-            self.connect_pause = (self.connect_pause * 2).min(Duration::from_secs(5));
-            (pause, outage.summary())
-        } else {
-            let deadline = error.chain()
-                .find_map(|cause| cause.downcast_ref::<DaemonDeadline>())
-                .expect("a retryable follow error has a typed reason");
-            self.unreachable_since = None;
-            let pause = jittered(self.deadline_pause).min(FOLLOW_DEADLINE_CAP);
-            self.deadline_pause = (self.deadline_pause * 2).min(FOLLOW_DEADLINE_CAP);
-            (pause, deadline.summary())
-        };
-        let message = if self.interrupted_since.is_none() {
-            self.interrupted_since = Some(attempt_started);
-            Some(format!(
-                "st: follow gap: {reason}; interrupted for {:.1}s, retrying in {:.1}s",
-                attempt_started.elapsed().as_secs_f64(), pause.as_secs_f64()
-            ))
-        } else {
-            None
-        };
-        Ok((pause, message))
-    }
-
-    fn recovered(&mut self) -> Option<String> {
-        let since = self.interrupted_since.take()?;
-        self.unreachable_since = None;
-        self.connect_pause = Duration::from_millis(100);
-        Some(format!(
-            "st: follow recovered after {:.1}s", since.elapsed().as_secs_f64()
-        ))
-    }
 }
 
 /// Where a request stood when the daemon went away.
@@ -289,9 +196,6 @@ impl Client {
             person: None,
             outage_wait: Duration::ZERO,
             announce_outage_wait: false,
-            follow_retry: None,
-            #[cfg(any(test, feature = "test-support"))]
-            follow_test: None,
         }
     }
 
@@ -302,50 +206,6 @@ impl Client {
         self.outage_wait = wait;
         self.announce_outage_wait = announce;
         self
-    }
-
-    /// Give one viewer a persistent retry policy. Deadlines wait 5–15s initially, then double
-    /// up to 60s; this backoff survives successful reads. Unreachable daemons stop after 5min.
-    /// Call `follow_recovered` only after the viewer delivers a complete page or snapshot.
-    pub fn with_follow_retry(mut self) -> Self {
-        self.follow_retry
-            .get_or_insert_with(|| Arc::new(Mutex::new(FollowRetry::default())));
-        self
-    }
-
-    pub fn follow_recovered(&self) {
-        if let Some(retry) = &self.follow_retry {
-            let message = retry.lock().expect("follow retry lock").recovered();
-            if let Some(message) = message {
-                self.follow_message(&message);
-            }
-        }
-    }
-
-    fn follow_message(&self, message: &str) {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(test) = &self.follow_test {
-            test.lock().expect("follow test lock").messages.push(message.to_owned());
-        }
-        eprintln!("{message}");
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn scripted_follow_test(replies: Vec<(String, FollowTestReply)>) -> Self {
-        let mut client = Self::unix("/tmp/follow-fixture.sock");
-        client.follow_test = Some(Arc::new(Mutex::new(FollowTest {
-            replies: replies.into(),
-            requests: Vec::new(),
-            messages: Vec::new(),
-        })));
-        client
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn follow_test_result(&self) -> (Vec<(String, tokio::time::Instant)>, Vec<String>) {
-        let test = self.follow_test.as_ref().expect("scripted follow client").lock().unwrap();
-        assert!(test.replies.is_empty(), "the viewer exited before consuming the script");
-        (test.requests.clone(), test.messages.clone())
     }
 
     pub fn unix(path: impl Into<PathBuf>) -> Self {
@@ -466,28 +326,10 @@ impl Client {
         let mut pause = Duration::from_millis(100);
         let mut announced = false;
         loop {
-            let attempt_started = tokio::time::Instant::now();
             let error = match self.request_once(method, path, &bytes).await {
-                Ok(response) => {
-                    if let Some(retry) = &self.follow_retry {
-                        retry.lock().expect("follow retry lock").unreachable_since = None;
-                    }
-                    return decode_api_response(&response);
-                }
+                Ok(response) => return decode_api_response(&response),
                 Err(error) => error,
             };
-            if let Some(retry) = &self.follow_retry
-                && method == "GET"
-                && daemon_did_not_answer(&error)
-            {
-                let (pause, message) = retry.lock().expect("follow retry lock")
-                    .failed(&error, attempt_started)?;
-                if let Some(message) = message {
-                    self.follow_message(&message);
-                }
-                tokio::time::sleep(pause).await;
-                continue;
-            }
             let Some(outage) = daemon_unreachable(&error) else {
                 return Err(error);
             };
@@ -513,30 +355,6 @@ impl Client {
     }
 
     async fn request_once(&self, method: &str, path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(test) = &self.follow_test {
-            let reply = {
-                let mut test = test.lock().expect("follow test lock");
-                test.requests.push((path.to_owned(), tokio::time::Instant::now()));
-                let (expected, reply) = test.replies.pop_front().expect("unexpected follow request");
-                assert_eq!(path, expected);
-                reply
-            };
-            let deadline = request_deadline(path, self.deadlines);
-            let (value, delay) = match reply {
-                FollowTestReply::Value(value) => (value, Duration::ZERO),
-                FollowTestReply::Delayed(value, delay) => (value, delay),
-                FollowTestReply::Timeout => (serde_json::Value::Null, deadline * 2),
-                FollowTestReply::Disconnect => return Err(DaemonUnreachable::response("fixture", "no response").into()),
-                FollowTestReply::Error(status) => return Err(api_error(status, br#"{"code":"fixture-refusal","message":"fixture read refused"}"#)),
-            };
-            if !delay.is_zero() {
-                tokio::time::timeout(deadline, tokio::time::sleep(delay)).await
-                    .map_err(|_| deadline_error("fixture", "request and response", deadline))?;
-            }
-            return serde_json::to_vec(&serde_json::json!({"api_version":"st3.v1", "value":value}))
-                .map_err(Into::into);
-        }
         let deadline = request_deadline(path, self.deadlines);
         let response = match &self.endpoint {
             Endpoint::Unix(socket) => {
@@ -1272,21 +1090,14 @@ struct DaemonDeadline {
     deadline: Duration,
 }
 
-impl DaemonDeadline {
-    fn summary(&self) -> String {
-        format!(
-            "st API endpoint `{}` exceeded the {} limit of {} ms",
-            self.endpoint, self.phase, self.deadline.as_millis()
-        )
-    }
-}
-
 impl fmt::Display for DaemonDeadline {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{}; the service may be busy or unavailable, retry the command",
-            self.summary()
+            "st API endpoint `{}` exceeded the {} limit of {} ms; the service may be busy or unavailable, retry the command",
+            self.endpoint,
+            self.phase,
+            self.deadline.as_millis()
         )
     }
 }
@@ -1524,8 +1335,6 @@ mod tests {
             person: None,
             outage_wait: Duration::ZERO,
             announce_outage_wait: false,
-            follow_retry: None,
-            follow_test: None,
         }
     }
 
@@ -1708,63 +1517,6 @@ mod tests {
         assert!(message.contains("st daemon"), "{message}");
         assert!(message.contains("restarting"), "{message}");
         assert!(!message.contains("st up"), "{message}");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn follow_connect_outages_stop_after_five_minutes() {
-        let mut retry = FollowRetry::default();
-        let error = DaemonUnreachable::connect("fixture", "connection refused").into();
-        let (pause, message) = retry.failed(&error, tokio::time::Instant::now()).unwrap();
-        assert!((Duration::from_millis(50)..=Duration::from_millis(150)).contains(&pause));
-        assert!(message.unwrap().contains("follow gap"));
-        tokio::time::advance(FOLLOW_OUTAGE_LIMIT).await;
-        let error = retry.failed(&error, tokio::time::Instant::now()).unwrap_err();
-        assert!(error.to_string().contains("was not reachable for 300s"));
-    }
-
-    #[tokio::test]
-    async fn follow_reads_wait_for_a_typed_connect_outage_with_daemon_wait_zero() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("st3.sock");
-        let client = fast_client(Endpoint::Unix(socket.clone())).with_follow_retry();
-        let read = tokio::spawn(async move { client.get::<Value>("/v1/test").await });
-        // Leave the socket absent through several backoff attempts, then bring it up.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !read.is_finished(),
-            "the follow read exited during the outage"
-        );
-        let server = tokio::spawn(async move {
-            crate::api::serve_unix(&socket, test_api()).await.unwrap();
-        });
-        let value = tokio::time::timeout(Duration::from_secs(10), read)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(value, json!({"method": "get"}));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn follow_retry_does_not_repeat_a_write_that_times_out() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("st3.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        });
-        let client = fast_client(Endpoint::Unix(socket)).with_follow_retry();
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
-            client.post::<_, Value>("/v1/test", &json!({"mutation": true})),
-        )
-        .await
-        .expect("follow retry repeated a write")
-        .unwrap_err();
-        assert!(daemon_did_not_answer(&error));
-        server.abort();
     }
 
     #[tokio::test]

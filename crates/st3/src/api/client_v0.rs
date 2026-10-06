@@ -5851,16 +5851,9 @@ pub(super) async fn pairing_begin(
         })
         .map_err(ApiError::bad)?;
     signal_changed(&state);
-    let mut challenge = json!({ "kind": "pairing-challenge", "pairing_id": pairing_id, "code": code, "expires_at": client_timestamp(expires_at) });
-    if let Some((key, _)) = state
-        .store
-        .person_root_grant(&session.authority_actor)
-        .map_err(ApiError::bad)?
-    {
-        challenge["person_root_fingerprint"] =
-            json!(st3_client::device::person_root_fingerprint(&key).map_err(ApiError::internal)?);
-    }
-    Ok(Json(challenge))
+    Ok(Json(
+        json!({ "kind": "pairing-challenge", "pairing_id": pairing_id, "code": code, "expires_at": client_timestamp(expires_at) }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -5872,43 +5865,6 @@ pub(super) struct PairingComplete {
     /// Where the device keeps its signing key: `secure-enclave` or `software`.
     #[serde(default)]
     key_storage: Option<String>,
-}
-
-fn pairing_root_proof(state: &AppState, person: &str) -> Result<Option<Value>, ApiError> {
-    let Some((_, id)) = state
-        .store
-        .person_root_grant(person)
-        .map_err(ApiError::bad)?
-    else {
-        return Ok(None);
-    };
-    state
-        .store
-        .seal_local_batches()
-        .map_err(ApiError::internal)?;
-    let cannot_prove = || {
-        validation(
-            "the member cannot produce a verifiable person-root grant; the pairing code was not consumed. Inspect the member's signing history",
-        )
-    };
-    let grant = state
-        .store
-        .claim_by_id(&id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(cannot_prove)?;
-    let signature = state
-        .store
-        .claim_signature(&id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(cannot_prove)?;
-    let proof = json!({
-        "id": grant.id, "batch_id": grant.batch_id, "subject": grant.subject,
-        "kind": grant.kind, "origin": grant.origin, "actor": grant.actor,
-        "body": grant.body, "predecessors": grant.predecessors, "signature": signature,
-    });
-    st3_client::device::verify_person_root_key_proof(person, &proof, None)
-        .map_err(|_| cannot_prove())?;
-    Ok(Some(proof))
 }
 
 /// A device's signing key, when its public key is one: `p256:` and the base64url of an
@@ -6108,12 +6064,6 @@ pub(super) async fn pairing_complete(
         }
         None => None,
     };
-    // Observers receive only the existing public root receipt, never device signing authority.
-    let root_proof = if enrollment.is_none() {
-        pairing_root_proof(&state, &person_id)?
-    } else {
-        None
-    };
     let completed = state.store.append_claim(&ClaimInput {
         subject: begun.subject.clone(),
         kind: "custom.client.pairing-completed".into(),
@@ -6156,9 +6106,6 @@ pub(super) async fn pairing_complete(
     if let Some((chain, proofs)) = enrollment {
         session["device_key_chain"] = json!(chain);
         session["device_key_proofs"] = json!(proofs);
-    }
-    if let Some(proof) = root_proof {
-        session["person_root_key_proof"] = proof;
     }
     Ok(Json(session))
 }
@@ -7066,6 +7013,7 @@ fn consume_terminal_attachment(
     capability: Option<&str>,
 ) -> Result<(), ApiError> {
     consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None)
+        .map(|_| ())
 }
 
 fn consume_terminal_attachment_mode(
@@ -7075,7 +7023,7 @@ fn consume_terminal_attachment_mode(
     incarnation: &str,
     capability: Option<&str>,
     raw_mode: Option<&str>,
-) -> Result<(), ApiError> {
+) -> Result<Option<String>, ApiError> {
     let lookup_span = crate::profile::span("terminal/capability-lookup");
     let capability = capability
         .filter(|value| !value.is_empty())
@@ -7098,6 +7046,9 @@ fn consume_terminal_attachment_mode(
         && raw_mode.is_none_or(|_| {
             field("person_id").and_then(Value::as_str) == Some(session.authority_actor.as_str())
         })
+        && (raw_mode != Some("peek")
+            || field("raw_authorization_epoch").and_then(Value::as_str)
+                == Some(raw_terminal::authorization_epoch(state, session)?.as_str()))
         && raw_live.as_ref().is_none_or(|live| {
             field("owner_host_id").and_then(Value::as_str) == Some(live.owner_host_id.as_str())
                 && field("runtime_id").and_then(Value::as_str) == Some(live.runtime_id.as_str())
@@ -7124,7 +7075,7 @@ fn consume_terminal_attachment_mode(
     }
     if raw_mode.is_none() {
         // A projected-screen capability is a lease and stays valid for more streams.
-        return Ok(());
+        return Ok(None);
     }
     let _span = crate::profile::span("terminal/capability-consume");
     state
@@ -7145,7 +7096,9 @@ fn consume_terminal_attachment_mode(
         })
         .map_err(|_| forbidden("the terminal stream capability was already consumed"))?;
     signal_changed(state);
-    Ok(())
+    Ok(field("raw_authorization_epoch")
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 fn detach_terminal_attachment(
@@ -8979,6 +8932,20 @@ async fn dispatch_action(
                 .ok_or_else(|| {
                     ApiError::not_found(format!("paired device `{device}` does not exist"))
                 })?;
+            if paired.origin != state.node {
+                let issuer = client_host_id(&paired.origin);
+                return Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    code: "issuer-required".into(),
+                    message: format!(
+                        "pairing revocation must run on its authoritative issuer {issuer}"
+                    ),
+                    details: Box::new(serde_json::Map::from_iter([(
+                        "issuer_host_id".into(),
+                        Value::String(issuer),
+                    )])),
+                });
+            }
             state
                 .store
                 .append_claim(&ClaimInput {

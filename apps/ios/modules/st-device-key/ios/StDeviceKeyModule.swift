@@ -12,42 +12,25 @@ public class StDeviceKeyModule: Module {
     Name("StDeviceKey")
 
     // The key this phone has, or null: {key: "p256:…", storage}.
-    AsyncFunction("current") { (handle: String?) -> [String: String]? in
-      try DeviceKey.load(handle: handle).map { $0.described }
+    AsyncFunction("current") { () -> [String: String]? in
+      try DeviceKey.load().map { $0.described }
     }
 
-    // A separate candidate key: committing the pairing selects its handle.
+    // A new key, replacing any earlier one: each pairing enrolls its own key.
     AsyncFunction("create") { () -> [String: String] in
-      let handle = UUID().uuidString
-      var info = try DeviceKey.create(handle: handle).described
-      info["handle"] = handle
-      return info
+      try DeviceKey.create().described
     }
 
     // The raw r||s ECDSA P-256 SHA-256 signature over the UTF-8 bytes of `text`, base64url.
-    AsyncFunction("sign") { (text: String, handle: String?) -> String in
-      guard let key = try DeviceKey.load(handle: handle) else {
+    AsyncFunction("sign") { (text: String) -> String in
+      guard let key = try DeviceKey.load() else {
         throw Exception(name: "NoKey", description: "This phone has no signing key; pair it again")
       }
       return try key.sign(Data(text.utf8))
     }
 
-    AsyncFunction("remove") { (handle: String?) in
-      DeviceKey.remove(handle: handle)
-    }
-
-    AsyncFunction("verify") { (key: String, text: String, signature: String) -> Bool in
-      guard let signed = unbase64url(signature), signed.count == 64 else { return false }
-      let bytes = Data(text.utf8)
-      do {
-        if key.hasPrefix("p256:") {
-          guard let raw = unbase64url(String(key.dropFirst(5))) else { return false }
-          let publicKey = try P256.Signing.PublicKey(x963Representation: raw)
-          return publicKey.isValidSignature(try P256.Signing.ECDSASignature(rawRepresentation: signed), for: bytes)
-        }
-        guard let raw = unbase64url(key) else { return false }
-        return try Curve25519.Signing.PublicKey(rawRepresentation: raw).isValidSignature(signed, for: bytes)
-      } catch { return false }
+    AsyncFunction("remove") { () in
+      DeviceKey.remove()
     }
   }
 }
@@ -75,7 +58,8 @@ enum DeviceKey {
     }
   }
 
-  static func create(handle: String) throws -> DeviceKey {
+  static func create() throws -> DeviceKey {
+    remove()
     let key: DeviceKey
     let stored: Data
     if SecureEnclave.isAvailable {
@@ -90,7 +74,7 @@ enum DeviceKey {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
-      kSecAttrAccount as String: handle,
+      kSecAttrAccount as String: account,
       kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
       kSecValueData as String: stored,
     ]
@@ -101,11 +85,11 @@ enum DeviceKey {
     return key
   }
 
-  static func load(handle: String? = nil) throws -> DeviceKey? {
+  static func load() throws -> DeviceKey? {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
-      kSecAttrAccount as String: handle ?? account,
+      kSecAttrAccount as String: account,
       kSecReturnData as String: true,
       kSecMatchLimit as String: kSecMatchLimitOne,
     ]
@@ -122,11 +106,11 @@ enum DeviceKey {
     return .software(try P256.Signing.PrivateKey(rawRepresentation: body))
   }
 
-  static func remove(handle: String? = nil) {
+  static func remove() {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
-      kSecAttrAccount as String: handle ?? account,
+      kSecAttrAccount as String: account,
     ]
     SecItemDelete(query as CFDictionary)
   }
@@ -137,10 +121,4 @@ private func base64url(_ data: Data) -> String {
     .replacingOccurrences(of: "+", with: "-")
     .replacingOccurrences(of: "/", with: "_")
     .replacingOccurrences(of: "=", with: "")
-}
-
-private func unbase64url(_ text: String) -> Data? {
-  let raw = text.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
-  guard let data = Data(base64Encoded: raw + String(repeating: "=", count: (4 - raw.count % 4) % 4)), base64url(data) == text else { return nil }
-  return data
 }

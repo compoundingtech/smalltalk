@@ -327,16 +327,6 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     .map(|items| format!(", {items} items"))
                     .unwrap_or_default()
             )),
-            // st reads only the newest part of a long native transcript. That is how it works, not
-            // a fault, so it is said in plain words with no sequence numbers (Nathan, 2026-10-06).
-            (_, TimelineBody::Truncation(truncation))
-                if truncation.reason.contains("native transcript prefix") =>
-            {
-                Body::Event(
-                    "Earlier history is not shown: st reads only the newest part of this agent's transcript"
-                        .into(),
-                )
-            }
             (_, TimelineBody::Truncation(truncation)) => Body::Event(format!(
                 "history omitted: {} (sequences {}–{}{})",
                 truncation.reason,

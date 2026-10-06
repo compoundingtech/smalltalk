@@ -3431,8 +3431,6 @@ pub struct PairingChallenge {
     pub pairing_id: String,
     pub code: String,
     pub expires_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub person_root_fingerprint: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PairingComplete {
@@ -3459,8 +3457,6 @@ pub struct PairedSession {
     /// Public grant content and signatures, in the same order as device_key_chain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_key_proofs: Vec<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub person_root_key_proof: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

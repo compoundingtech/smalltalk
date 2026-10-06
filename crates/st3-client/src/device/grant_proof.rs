@@ -179,33 +179,3 @@ pub(super) fn verify(
     );
     Ok(())
 }
-
-pub(super) fn verify_root(person: &str, proof: &Value, fingerprint: Option<&str>) -> Result<()> {
-    ensure!(
-        serde_json::to_vec(proof)?.len() <= 64 * 1024,
-        "Enrollment proof is too large"
-    );
-    let root: Grant = serde_json::from_value(proof.clone())
-        .map_err(|_| anyhow::anyhow!("Incomplete enrollment grant proof"))?;
-    root.verify(&root.id, person)?;
-    ensure!(
-        root.field("role") == Some("root")
-            && root
-                .field("issuer")
-                .is_some_and(|issuer| issuer.starts_with("host/") && issuer.len() > 5)
-            && root.field("issuer") == Some(root.signature.signer.as_str())
-            && root.field("issuer_key") == Some(root.signature.key.as_str())
-            && root.signature.chain.is_empty(),
-        "Returned person root grant is not issued by the node authority"
-    );
-    let actual =
-        person_root_fingerprint(root.field("key").context("Person root grant has no key")?)?;
-    if let Some(expected) = fingerprint {
-        validate_fingerprint(expected)?;
-        ensure!(
-            actual == expected,
-            "Person-root fingerprint mismatch; do not trust this pairing response. Obtain the fingerprint separately from the trusted machine"
-        );
-    }
-    Ok(())
-}

@@ -151,9 +151,6 @@ pub struct Device {
     /// Explicit HTTP public-address override, retained as private profile configuration.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_public_http: bool,
-    /// Trust supplied separately from the code on the trusted pairing machine.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub person_root_fingerprint: Option<String>,
     pub session: PairedSession,
     /// Old observer and legacy stui profiles have no signing key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,9 +305,6 @@ impl Profile {
         let mut profile: Self = serde_json::from_reader(file).context("Read device profile")?;
         profile.person()?;
         for device in &mut profile.devices {
-            if let Some(fingerprint) = &device.person_root_fingerprint {
-                validate_fingerprint(fingerprint)?;
-            }
             device.endpoint =
                 validate_endpoint_with_http_policy(&device.endpoint, device.allow_public_http)?;
             ensure!(
@@ -474,8 +468,6 @@ fn random_nonce() -> Result<String> {
 /// Consume the existing single-use challenge and atomically retain the returned bearer,
 /// delegation chain and private key together. An observer retains no private signing key.
 /// Network/server failures or local failures before the commit preserve the previous profile.
-/// Supply independent trust with `complete_with_options`; this legacy entry point has no pin
-/// and therefore refuses before submitting the code.
 pub async fn complete(
     path: &Path,
     endpoint: &str,
@@ -486,8 +478,7 @@ pub async fn complete(
     complete_with_http_policy(path, endpoint, pairing_id, code, key, false).await
 }
 
-/// Legacy HTTP policy entry point. Use `complete_with_options` to also supply identity trust.
-/// An HTTP override alone cannot bypass the required fingerprint.
+/// Explicitly allow public HTTP only when its address is already an encrypted path.
 pub async fn complete_with_http_policy(
     path: &Path,
     endpoint: &str,
@@ -496,96 +487,6 @@ pub async fn complete_with_http_policy(
     key: SigningKey,
     allow_public_http: bool,
 ) -> Result<Device> {
-    complete_with_options(
-        path,
-        endpoint,
-        pairing_id,
-        code,
-        key,
-        CompletionOptions {
-            allow_public_http,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-/// An out-of-band pin is required unless the caller explicitly chooses unpinned enrollment.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CompletionOptions<'a> {
-    pub allow_public_http: bool,
-    pub fingerprint: Option<&'a str>,
-    pub unpinned: bool,
-}
-
-impl CompletionOptions<'_> {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            !(self.unpinned && self.fingerprint.is_some()),
-            "Choose --fingerprint or --unpinned, never both"
-        );
-        if let Some(fingerprint) = self.fingerprint {
-            validate_fingerprint(fingerprint)?;
-        } else {
-            ensure!(
-                self.unpinned,
-                "A person-root --fingerprint from the trusted machine is required; use --unpinned only to explicitly bypass identity verification"
-            );
-        }
-        Ok(())
-    }
-}
-
-/// SHA-256 of the canonical public-key string, retaining the full digest.
-pub fn person_root_fingerprint(key: &str) -> Result<String> {
-    let raw = key.strip_prefix("p256:").unwrap_or(key);
-    let bytes = URL_SAFE_NO_PAD
-        .decode(raw)
-        .context("Invalid person-root public key")?;
-    ensure!(
-        URL_SAFE_NO_PAD.encode(&bytes) == raw
-            && if key.starts_with("p256:") {
-                bytes.len() == 65 && bytes[0] == 4
-            } else {
-                bytes.len() == 32
-            },
-        "Invalid person-root public key"
-    );
-    Ok(format!(
-        "sha256:{}",
-        URL_SAFE_NO_PAD.encode(Sha256::digest(key.as_bytes()))
-    ))
-}
-
-pub fn validate_fingerprint(fingerprint: &str) -> Result<()> {
-    let raw = fingerprint
-        .strip_prefix("sha256:")
-        .context("Use the full sha256: person-root fingerprint printed on the trusted machine")?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(raw)
-        .context("Invalid person-root fingerprint")?;
-    ensure!(
-        bytes.len() == 32 && URL_SAFE_NO_PAD.encode(bytes) == raw,
-        "Use the full sha256: person-root fingerprint printed on the trusted machine"
-    );
-    Ok(())
-}
-
-pub async fn complete_with_options(
-    path: &Path,
-    endpoint: &str,
-    pairing_id: &str,
-    code: &str,
-    key: SigningKey,
-    options: CompletionOptions<'_>,
-) -> Result<Device> {
-    options.validate()?;
-    let allow_public_http = options.allow_public_http;
-    if options.unpinned {
-        eprintln!(
-            "WARNING: UNPINNED PAIRING. An active attacker can forge the identity-key chain. Obtain --fingerprint separately from the trusted machine to verify the person's root key."
-        );
-    }
     let endpoint = validate_endpoint_with_http_policy(endpoint, allow_public_http)?;
     let mut client = Client::fabric_pairing(&endpoint);
     client.http = transport::client(&endpoint, allow_public_http)?;
@@ -594,15 +495,6 @@ pub async fn complete_with_options(
     let public = key.public_key()?;
     let (parent, _lock) = prepare(path)?;
     let mut profile = Profile::load(path)?.unwrap_or_default();
-    if profile
-        .devices
-        .iter()
-        .any(|device| device.endpoint == endpoint && device.person_root_fingerprint.is_none())
-    {
-        eprintln!(
-            "WARNING: This existing pairing has no trusted person-root pin. Re-pair with the fingerprint from the trusted machine; --unpinned explicitly keeps this risk."
-        );
-    }
     let capabilities: serde_json::Value = client.get("/v1/client/capabilities").await
         .context("Member cannot advertise pairing proof support; upgrade the member before retrying. The pairing code was not submitted")?;
     ensure!(
@@ -654,29 +546,11 @@ pub async fn complete_with_options(
             "Read-only pairing unexpectedly enrolled a signing key"
         );
         if signs {
-            if let Some(fingerprint) = options.fingerprint {
-                verify_device_key_proofs_pinned(
-                    &session.person_id,
-                    &session.device_key_chain,
-                    &session.device_key_proofs,
-                    &public,
-                    fingerprint,
-                )?;
-            } else {
-                grant_proof::validate(&session, &public)?;
-            }
-        } else if let Some(proof) = &session.person_root_key_proof {
-            verify_person_root_key_proof(&session.person_id, proof, options.fingerprint)?;
-        } else {
-            ensure!(
-                options.unpinned,
-                "Member did not return a verifiable person-root grant for read-only pairing; upgrade the member or explicitly use --unpinned"
-            );
+            grant_proof::validate(&session, &public)?;
         }
         let device = Device {
             endpoint,
             allow_public_http,
-            person_root_fingerprint: options.fingerprint.map(str::to_owned),
             session,
             signing_key: signs.then_some(key),
         };
@@ -707,28 +581,6 @@ pub fn verify_device_key_proofs(
     expected_key: &str,
 ) -> Result<()> {
     grant_proof::verify(person, chain, proofs, expected_key)
-}
-
-/// Verify the chain and bind its person-root key to independently supplied trust.
-pub fn verify_device_key_proofs_pinned(
-    person: &str,
-    chain: &[String],
-    proofs: &[serde_json::Value],
-    expected_key: &str,
-    fingerprint: &str,
-) -> Result<()> {
-    validate_fingerprint(fingerprint)?;
-    grant_proof::verify(person, chain, proofs, expected_key)?;
-    verify_person_root_key_proof(person, &proofs[1], Some(fingerprint))
-}
-
-/// A read-only device gets the root receipt without a grant to sign as the person.
-pub fn verify_person_root_key_proof(
-    person: &str,
-    proof: &serde_json::Value,
-    fingerprint: Option<&str>,
-) -> Result<()> {
-    grant_proof::verify_root(person, proof, fingerprint)
 }
 
 pub fn read_pairing_code() -> Result<String> {
@@ -812,7 +664,6 @@ mod tests {
             let device = Device {
                 endpoint: "https://member.example".into(),
                 allow_public_http: false,
-                person_root_fingerprint: None,
                 session: PairedSession {
                     kind: "paired-session".into(),
                     device_id: "device/vector".into(),
@@ -823,7 +674,6 @@ mod tests {
                     expires_at: "2026-11-01T00:00:00Z".into(),
                     device_key_chain: serde_json::from_value(case["chain"].clone()).unwrap(),
                     device_key_proofs: Vec::new(),
-                    person_root_key_proof: None,
                 },
                 signing_key: Some(key.clone()),
             };

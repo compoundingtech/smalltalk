@@ -44,6 +44,7 @@ use crate::store::{
     CheckpointAction, CheckpointManifest, CheckpointManifestNeed, CheckpointManifestPage,
     CheckpointManifestRequest,
 };
+mod raw_lease;
 
 /// The peer listener's shared state, with this node's daemon as the store.
 type PeerState = smallclaims::sync::PeerState<MainBackend>;
@@ -259,6 +260,26 @@ impl ClientRelay {
     pub fn with_links(mut self, store: Arc<Store>) -> Self {
         self.links = Some(store);
         self
+    }
+
+    pub(crate) fn legacy_authority(&self) -> bool {
+        self.legacy
+    }
+
+    fn accept_raw_watcher(&self, sender: &crate::fleet::Sender) -> Result<()> {
+        let view = self
+            .links
+            .as_ref()
+            .context("raw watch membership authority unavailable")?
+            .fleet_view_for_client()?;
+        crate::fleet::accept(
+            &view,
+            sender,
+            self.peers.iter().any(|peer| peer.name == sender.name),
+            self.legacy,
+        )
+        .map_err(|refusal| anyhow::anyhow!("raw watcher refused: {refusal:?}"))?;
+        Ok(())
     }
 
     /// Whether a read for this host has somewhere to go: the host itself, or a peer that can
@@ -707,21 +728,33 @@ impl ClientRelay {
 
     /// Open a persistent authenticated byte route to the terminal's owning member.
     /// Unlike screen reads this never polls or creates a temporary geometry writer.
-    pub async fn raw_terminal(
+    pub(crate) async fn raw_terminal(
         &self,
         host: &str,
         person: &str,
         terminal_id: &str,
         incarnation: &str,
         mode: st3_client::RawTerminalMode,
-    ) -> Result<tokio::net::UnixStream> {
+        lease: Option<Arc<crate::api::RawTerminalLease>>,
+    ) -> Result<(tokio::net::UnixStream, tokio::sync::mpsc::Sender<Value>)> {
         let target = host.strip_prefix("host/").context("invalid owner host")?;
         let mode = match mode {
             st3_client::RawTerminalMode::Attach => "attach",
             st3_client::RawTerminalMode::Peek => "peek",
         };
-        let path = format!("{RAW_TERMINAL_PATH}?person={}&terminal={}&incarnation={}&mode={mode}",
-            urlencoding::encode(person), urlencoding::encode(terminal_id), urlencoding::encode(incarnation));
+        let mut path = format!(
+            "{RAW_TERMINAL_PATH}?person={}&terminal={}&incarnation={}&mode={mode}",
+            urlencoding::encode(person),
+            urlencoding::encode(terminal_id),
+            urlencoding::encode(incarnation)
+        );
+        if let Some(lease) = &lease {
+            lease.revalidate()?;
+            path.push_str("&binding=");
+            path.push_str(&urlencoding::encode(&serde_json::to_string(
+                &lease.binding,
+            )?));
+        }
         let mut last = None;
         let profile = crate::profile::current();
         let route_span = profile.as_ref().map(|op| op.wall_span("raw/route"));
@@ -761,50 +794,7 @@ impl ClientRelay {
                 crate::fleet::accept(&view, &sender, self.peers.iter().any(|peer| peer.name == sender.name), self.legacy)
                     .map_err(|refusal| anyhow::anyhow!("raw terminal member refused: {refusal:?}"))?;
                 drop(verify_span);
-                let (client, bridge) = tokio::net::UnixStream::pair()?;
-                let bridge = bridge.into_std()?;
-                let monitor = tokio::io::unix::AsyncFd::new(bridge.try_clone()?)?;
-                let bridge = tokio::net::UnixStream::from_std(bridge)?;
-                tokio::spawn(async move {
-                    let (mut sink, mut source) = socket.split();
-                    let (mut reader, mut writer) = bridge.into_split();
-                    let flush = tokio::sync::Notify::new();
-                    let upload = async {
-                        let mut bytes = [0_u8; 16 * 1024];
-                        loop {
-                            tokio::select! {
-                                read = reader.read(&mut bytes) => {
-                                    let Ok(count) = read else { break; };
-                                    if count == 0 || sink.send(tokio_tungstenite::tungstenite::Message::Binary(bytes[..count].to_vec().into())).await.is_err() { break; }
-                                }
-                                () = flush.notified() => {
-                                    if sink.flush().await.is_err() { break; }
-                                }
-                            }
-                        }
-                    };
-                    let download = async {
-                        while let Some(Ok(message)) = source.next().await {
-                            match message {
-                                tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
-                                    if writer.write_all(&bytes).await.is_err() { break; }
-                                }
-                                tokio_tungstenite::tungstenite::Message::Ping(_) => flush.notify_one(),
-                                tokio_tungstenite::tungstenite::Message::Pong(_) => {}
-                                _ => break,
-                            }
-                        }
-                    };
-                    let closed = async {
-                        loop {
-                            let Ok(mut ready) = monitor.readable().await else { break; };
-                            if ready.ready().is_read_closed() || ready.ready().is_error() { break; }
-                            ready.clear_ready();
-                        }
-                    };
-                    tokio::select! { () = upload => {}, () = download => {}, () = closed => {} }
-                });
-                Ok::<_, anyhow::Error>(client)
+                raw_lease::gateway_bridge(socket, lease.clone(), self.clone(), peer.name.clone(), sender.member_key)
             }.await;
             match result {
                 Ok(stream) => return Ok(stream),
@@ -900,6 +890,7 @@ struct RawTerminalQuery {
     terminal: String,
     incarnation: String,
     mode: st3_client::RawTerminalMode,
+    binding: Option<String>,
 }
 
 async fn receive_raw_terminal(
@@ -920,6 +911,41 @@ async fn receive_raw_terminal(
         _ => return (StatusCode::UNAUTHORIZED, "untrusted raw terminal member").into_response(),
     };
     drop(auth_span);
+    if query.mode == st3_client::RawTerminalMode::Peek {
+        let binding: crate::api::RawTerminalLeaseBinding = match query
+            .binding
+            .as_deref()
+            .and_then(|binding| serde_json::from_str(binding).ok())
+        {
+            Some(binding) => binding,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "PEEK route requires original lease binding",
+                )
+                    .into_response();
+            }
+        };
+        if binding.gateway_member_key != _sender.member_key
+            || binding.owner_member_key.as_deref() != state.auth().member_key()
+            || binding.gateway != format!("host/{}", _sender.name)
+            || binding.owner != format!("host/{}", state.node())
+            || binding.person != query.person
+            || binding.terminal != query.terminal
+            || binding.incarnation != query.incarnation
+            || binding.mode != "peek"
+        {
+            return (StatusCode::FORBIDDEN, "raw lease route binding differs").into_response();
+        }
+        return raw_lease::receive_owner(
+            websocket,
+            state,
+            path.to_owned(),
+            binding,
+            _sender.member_key,
+        )
+        .await;
+    }
     // The owner daemon validates its current graph incarnation and person authority, then
     // connects once. The peer worker carries that one connection, not synthetic screens.
     let client = st3_client::Client::unix_as(state.backend().socket(), &query.person);
@@ -948,7 +974,7 @@ async fn receive_raw_terminal(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "raw terminal signature failed").into_response(),
     };
     let mut response = websocket.max_message_size(64 * 1024).max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| crate::api::raw_terminal_splice(socket, transport, None));
+        .on_upgrade(move |socket| crate::api::raw_terminal_splice(socket, transport, None, None, None));
     response.headers_mut().extend(signed);
     response
 }
@@ -1558,6 +1584,7 @@ mod tests {
     }
 
     include!("peer/raw_terminal_tests.rs");
+    include!("peer/raw_lease_tests.rs");
 
     #[tokio::test]
     async fn a_gateway_streams_a_remote_terminal_through_owner_long_polls() {
