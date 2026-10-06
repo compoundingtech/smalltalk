@@ -633,6 +633,8 @@ pub fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
     STATEMENTS_RUN.with(|run| run.set(run.get() + 1));
     crate::profile::sql(statement, duration);
     crate::performance::record_query(statement, duration);
+    #[cfg(any(test, feature = "test-support"))]
+    histogram::record(statement, duration);
     SQLITE_NANOS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
     if statement == "COMMIT" {
         SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -646,6 +648,40 @@ pub fn observe(connection: &mut Connection) {
     #[cfg(any(test, feature = "test-support"))]
     work::count(connection);
     connection.profile(Some(record_sqlite_time));
+}
+
+/// Every statement this process ran since the last [`histogram::take`], by normalized text, so an
+/// audit can say which statement shapes a request ran and how many times each.
+#[cfg(any(test, feature = "test-support"))]
+pub mod histogram {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
+
+    /// Count, total nanoseconds and the slowest single run of one statement shape.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Shape {
+        pub count: u64,
+        pub total_ns: u64,
+        pub max_ns: u64,
+    }
+
+    static SHAPES: Mutex<BTreeMap<String, Shape>> = Mutex::new(BTreeMap::new());
+
+    pub fn record(statement: &str, duration: Duration) {
+        let shape = crate::performance::normalize_query(statement);
+        let mut shapes = SHAPES.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = shapes.entry(shape).or_default();
+        let ns = duration.as_nanos() as u64;
+        entry.count += 1;
+        entry.total_ns += ns;
+        entry.max_ns = entry.max_ns.max(ns);
+    }
+
+    /// The shapes recorded so far, emptying the table.
+    pub fn take() -> BTreeMap<String, Shape> {
+        std::mem::take(&mut *SHAPES.lock().unwrap_or_else(PoisonError::into_inner))
+    }
 }
 
 /// The work SQLite did for every statement this process ran, read from each statement's own

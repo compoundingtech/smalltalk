@@ -49,6 +49,7 @@ mod placement_handoff;
 mod reconcile_pass_perf;
 mod recorder_report;
 mod seat_queue_perf;
+mod sql_audit;
 mod startup_readiness;
 mod subagent_publisher;
 mod subagents_seat;
