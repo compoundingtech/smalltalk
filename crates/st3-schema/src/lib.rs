@@ -436,6 +436,14 @@ impl Registry {
         if kind == "harness.current" {
             validate_harness_current(fields)?;
         }
+        if kind == "harness.history.gap" {
+            if !fields.get("runtime_incarnation").and_then(Value::as_str).is_some_and(|value| {
+                !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+            }) {
+                return Err(error("invalid-claim-field", "harness.history.gap runtime_incarnation must be a bounded opaque identity"));
+            }
+            validate_history_gap(fields, kind)?;
+        }
         if kind == "harness.todo.observed" {
             validate_harness_todo(fields)?;
         }
@@ -653,18 +661,7 @@ fn validate_harness_current(fields: &BTreeMap<String, Value>) -> Result<(), Vali
             return Err(error("invalid-claim-field", format!("harness.current `{name}` exceeds the supported timestamp range")));
         }
     }
-    let gap_count = fields.get("history_gap_count").and_then(Value::as_u64);
-    let gap_from = fields.get("history_gap_from_ms").and_then(Value::as_u64);
-    let gap_to = fields.get("history_gap_to_ms").and_then(Value::as_u64);
-    let gap_reason = fields.get("history_gap_reason").and_then(Value::as_str);
-    let has_gap = ["history_gap_count", "history_gap_from_ms", "history_gap_to_ms", "history_gap_reason"]
-        .iter().any(|name| fields.get(*name).is_some_and(|value| !value.is_null()));
-    if has_gap && !(gap_count.is_some_and(|count| count > 0)
-        && gap_from.zip(gap_to).is_some_and(|(from, to)| from <= to && to <= i64::MAX as u64)
-        && gap_reason == Some("cap-full"))
-    {
-        return Err(error("invalid-claim-field", "harness.current history gap requires a positive count, ordered bounded interval and cap-full reason"));
-    }
+    validate_history_gap(fields, "harness.current")?;
     if let Some(value) = fields.get("blocking").filter(|value| !value.is_null()) {
         let allowed = ["turn-in-flight", "starting", "harness-indeterminate", "pending-ask", "unsent-input", "background-jobs-running", "background-jobs-unreported"];
         if !value.as_array().is_some_and(|items| items.len() <= allowed.len()
@@ -682,6 +679,23 @@ fn validate_harness_current(fields: &BTreeMap<String, Value>) -> Result<(), Vali
     }
     Ok(())
 }
+fn validate_history_gap(fields: &BTreeMap<String, Value>, kind: &str) -> Result<(), ValidationError> {
+    let gap_count = fields.get("history_gap_count").and_then(Value::as_u64);
+    let gap_from = fields.get("history_gap_from_ms").and_then(Value::as_u64);
+    let gap_to = fields.get("history_gap_to_ms").and_then(Value::as_u64);
+    let gap_reason = fields.get("history_gap_reason").and_then(Value::as_str);
+    let has_gap = kind == "harness.history.gap"
+        || ["history_gap_count", "history_gap_from_ms", "history_gap_to_ms", "history_gap_reason"]
+            .iter().any(|name| fields.get(*name).is_some_and(|value| !value.is_null()));
+    if has_gap && !(gap_count.is_some_and(|count| count > 0 && count <= i64::MAX as u64)
+        && gap_from.zip(gap_to).is_some_and(|(from, to)| from <= to && to <= i64::MAX as u64)
+        && gap_reason == Some("cap-full"))
+    {
+        return Err(error("invalid-claim-field", format!("{kind} history gap requires a positive count, ordered bounded interval and cap-full reason")));
+    }
+    Ok(())
+}
+
 
 fn validate_value(
     kind: &str,
@@ -1772,6 +1786,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         ),
         (
             "harness.current",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            Some("harnesses"),
+            true,
+            &[],
+        ),
+        (
+            "harness.history.gap",
             &["agent"],
             WritePolicy::SameSubjectActor,
             Cardinality::Append,
@@ -3090,6 +3113,13 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("quiescent", boolean()),
             ("blocking", array()),
         ],
+        "harness.history.gap" => &[
+            ("runtime_incarnation", required_string()),
+            ("history_gap_count", required_integer()),
+            ("history_gap_from_ms", required_integer()),
+            ("history_gap_to_ms", required_integer()),
+            ("history_gap_reason", required_enum(&["cap-full"])),
+        ],
         "harness.observed" => &[
             (
                 "state",
@@ -4029,6 +4059,62 @@ mod tests {
         answered.insert("blocked_on".into(), Value::from("none"));
         answered.insert("ask".into(), Value::from("none"));
         assert_eq!(validate(&answered), Ok(()));
+        for name in ["history_gap_count", "history_gap_from_ms", "history_gap_to_ms", "history_gap_reason"] {
+            answered.insert(name.into(), Value::Null);
+        }
+        assert_eq!(validate(&answered), Ok(()));
+        answered.insert("history_gap_count".into(), Value::from(2));
+        answered.insert("history_gap_from_ms".into(), Value::from(10));
+        answered.insert("history_gap_to_ms".into(), Value::from(20));
+        answered.insert("history_gap_reason".into(), Value::from("cap-full"));
+        assert_eq!(validate(&answered), Ok(()));
+        for (name, value) in [
+            ("history_gap_count", Value::from(0)),
+            ("history_gap_count", Value::from(-1)),
+            ("history_gap_from_ms", Value::from(21)),
+            ("history_gap_to_ms", Value::from(u64::MAX)),
+            ("history_gap_reason", Value::from("unbounded private text")),
+            ("history_gap_reason", Value::Null),
+        ] {
+            let mut gap = answered.clone();
+            gap.insert(name.into(), value);
+            assert!(validate(&gap).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn harness_history_gap_requires_bounded_nonnull_metadata_and_source_identity() {
+        let fields = BTreeMap::from([
+            ("runtime_incarnation".into(), Value::from("prior-runtime")),
+            ("history_gap_count".into(), Value::from(3)),
+            ("history_gap_from_ms".into(), Value::from(10)),
+            ("history_gap_to_ms".into(), Value::from(20)),
+            ("history_gap_reason".into(), Value::from("cap-full")),
+        ]);
+        let validate = |fields: &BTreeMap<String, Value>| registry()
+            .validate_public_claim("agent/cedar", "harness.history.gap", fields, Some("agent/cedar")).map(|_| ());
+        assert_eq!(validate(&fields), Ok(()));
+        for name in fields.keys() {
+            let mut missing = fields.clone();
+            missing.remove(name);
+            assert!(validate(&missing).is_err(), "{name}");
+            let mut null = fields.clone();
+            null.insert(name.clone(), Value::Null);
+            assert!(validate(&null).is_err(), "{name}");
+        }
+        for (name, value) in [
+            ("history_gap_count", Value::from(0)),
+            ("history_gap_count", Value::from(u64::MAX)),
+            ("history_gap_from_ms", Value::from(21)),
+            ("history_gap_to_ms", Value::from(u64::MAX)),
+            ("runtime_incarnation", Value::from("x".repeat(257))),
+            ("history_gap_reason", Value::from("private reason")),
+            ("reason", Value::from("private reason")),
+        ] {
+            let mut invalid = fields.clone();
+            invalid.insert(name.into(), value);
+            assert!(validate(&invalid).is_err(), "{name}");
+        }
     }
 
     #[test]

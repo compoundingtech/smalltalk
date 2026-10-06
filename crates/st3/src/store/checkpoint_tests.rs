@@ -1810,7 +1810,13 @@ fn categorical_current_source_and_auth_winners_survive_checkpoint_proof_and_trim
     let at = now_ms() as u64 - 1_000;
     let current = append("harness.current", json!({
         "state":"idle", "incarnation_id":"one", "observed_at_ms":at + 5,
-        "observed_since_ms":at, "provider_auth":false, "running_subagents":3
+        "observed_since_ms":at, "provider_auth":false, "running_subagents":3,
+        "history_gap_count":1, "history_gap_from_ms":at, "history_gap_to_ms":at + 5,
+        "history_gap_reason":"cap-full"
+    }));
+    append("harness.history.gap", json!({
+        "runtime_incarnation":"one", "history_gap_count":2,
+        "history_gap_from_ms":at, "history_gap_to_ms":at + 6, "history_gap_reason":"cap-full"
     }));
     for index in 0..220 {
         append("harness.observed", json!({

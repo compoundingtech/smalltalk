@@ -711,6 +711,8 @@ authentication observation for each runtime incarnation. This keeps a newer capt
 when older history was accepted later. `harness.current` is never dropped by these rules: its
 source ordering differs from canonical receipt ordering, so a future drop rule requires an explicit
 reader-equivalence proof. Declaring that kind `latest` does not enable immediate trimming.
+Durable `harness.history.gap` segments also remain retained. The checkpoint reader proof includes
+the visible merged history gaps, independently of deliberate completeness changes after trimming.
 
 Every model response also goes to OpenTelemetry when `[observations.otlp]` is set: an
 `st.usage.response` log with its agent, mission run, step, model, account, tokens and cost, and

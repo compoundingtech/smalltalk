@@ -315,6 +315,9 @@ ON claims(subject,
 WHERE kind='harness.current'
     AND json_type(body, '$.fields.history_gap_count')='integer'
     AND json_extract(body, '$.fields.history_gap_count')>0;
+CREATE INDEX IF NOT EXISTS claims_harness_durable_gap_index
+ON claims(subject, store_index)
+WHERE kind='harness.history.gap';
 
 -- Attachment checks must not walk a quiet seat's accumulated hook and work history.
 -- Only phase transitions publish these diagnostics, so a current-runtime lookup stays small.
@@ -20157,7 +20160,10 @@ fn current_harness_fold_at(
     // A native credential refusal is independent of activity, and work claims cannot erase it.
     let auth = if current_source.is_some() {
         seat_status::current_auth_at(connection, subject, incarnation_id, at_index)?
-            .map(|claim| (claim.id, claim.accepted_at_unix_ms, claim.body))
+            .map(|claim| {
+                let observed = seat_status::observation_time(&claim);
+                (claim.id, observed, claim.body)
+            })
     } else {
         connection.prepare_cached(&canonical_sql(
             "SELECT id, accepted_at_unix_ms, body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
@@ -20192,9 +20198,9 @@ fn current_harness_fold_at(
                 ),
                 input_buffer: None,
                 exit: None,
-                claim,
+                claim: current_source.as_ref().map_or_else(|| claim, |source| source.id.clone()),
                 since_unix_ms: time,
-                observed_at_unix_ms: time,
+                observed_at_unix_ms: current_source.as_ref().map_or(time, seat_status::observation_time),
             }));
         }
     }

@@ -1184,9 +1184,9 @@
       "required": ["runtime_incarnation", "count", "from_ms", "to_ms", "reason"],
       "properties": {
         "runtime_incarnation": { "type": "string", "minLength": 1, "maxLength": 256 },
-        "count": { "type": "integer", "minimum": 1 },
-        "from_ms": { "type": "integer", "minimum": 0 },
-        "to_ms": { "type": "integer", "minimum": 0 },
+        "count": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+        "from_ms": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "to_ms": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
         "reason": { "const": "cap-full" }
       }
     },

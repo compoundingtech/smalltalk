@@ -100,6 +100,11 @@ explicitly when it is outside this checkout. Only its disposable terminal receiv
 It proves two real native task starts, a parent idle frame that still reports two detached
 children, and `/new` aborting both children before the successor frame reports zero.
 
+An optional nullable `history_gap` exposes explicit aggregate native history loss for this runtime:
+`runtime_incarnation`, positive `count`, source `from_ms` / `to_ms`, and `reason: "cap-full"`.
+It is read from categorical current evidence independently of the current activity winner.
+Missing or null does not prove that historical observations are complete.
+
 ## Boundary and transport
 
 The client API is a projection and command gateway, not a graph replica. Its version is
@@ -1441,6 +1446,13 @@ The read retains at most 200 transitions/reset entries and only the last 7 days.
 prevent proving completeness. Absence from incomplete history never proves continuity.
 The paired gateway uses the same endpoint and `read.projections` scope. Current status
 updates use the existing agents collection stream, including clock-driven staleness updates.
+
+`history_gaps` is an optional array of explicit aggregate loss intervals intersecting that
+history window. Any such interval makes `complete: false`, even when it belongs to a former
+runtime incarnation. The current lane does not invent transitions to fill the gap; counts and
+activity can remain current while ordered historical evidence is incomplete.
+The count is the greater of the cumulative current gap and the sum of distinct durable gap
+segments for that runtime, not their sum. Retried prepared segments do not count twice.
 
 Same-state observations remain local except for a freshness publication at most once a minute.
 That publication preserves `since` and does not add a history transition. Freshness uses the

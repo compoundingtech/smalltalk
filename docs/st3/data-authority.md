@@ -107,8 +107,20 @@ The outbox is transport recovery state, not graph authority. The daemon retains 
 observation under its existing local/latest/durable policy. Producer snapshots remain local
 coalescing and ownership evidence; timeline producers read only the previous matching entry and
 latest status instead of parsing/replacing a retained JSON log. That auxiliary timeline history
-is bounded to 4,096 operations and 2 MiB, independently of unacknowledged events. An outbox with 64 MiB of pending payload
-rejects a producer transaction and reports the failure rather than dropping queued events.
+is bounded to 4,096 operations and 2 MiB, independently of unacknowledged events. At the outbox's
+64 MiB pending-history cap, the producer still persists its categorical latest snapshot. Historical
+events that cannot be queued contribute to a durable per-runtime aggregate gap: positive lost-event
+count, earliest/latest source times and the bounded reason `cap-full`. Current publication carries
+that gap without capturing text. Agent cards expose it independently of the activity winner;
+status-history exposes intersecting gaps and sets `complete: false`, including across runtime
+replacement. No missing historical event or transition is fabricated.
+The journal records a `harness-gap` segment outside the normal payload budget after the admitted
+FIFO prefix. Only an unprepared segment can coalesce; preparation freezes its payload and retry
+identity, and later drops create another segment. The publisher submits that immutable segment
+as durable `harness.history.gap` through `/v1/claims`, so failure of the current lane or replacement
+of the source runtime cannot lose the marker. Readers count each distinct segment once and take
+the greater of the segment total and cumulative current count, rather than adding the same loss
+twice. Current capture timestamps remain activity evidence; gap source intervals describe history loss.
 An evidence deadline queues derived unknown once after fifteen minutes without fresh state;
 a concurrent heartbeat supersedes that deadline. Native transcripts and session bindings retain
 their existing source paths.
