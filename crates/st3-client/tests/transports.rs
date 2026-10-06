@@ -356,16 +356,27 @@ async fn raw_terminal_bytes_capability_replay_and_close_over_unix() {
 }
 
 #[tokio::test]
-async fn dropping_a_raw_connector_closes_a_backpressured_attachment() {
+async fn dropping_a_controlled_raw_connector_closes_a_backpressured_attachment() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let (_root, state, pty, client, server) =
         serve_terminal_state("raw-client-drop", 24, 80).await;
     let incarnation = format!("{}:2026-09-30T00:00:00.000Z", std::process::id());
     publish_terminal(&state, &incarnation);
     let attachment = client
-        .raw_terminal_attachment("terminal/agent/terminal-demo", &incarnation, RawTerminalMode::Peek)
-        .await.unwrap();
-    let mut stream = client.raw_terminal_stream(&attachment).await.unwrap();
+        .raw_terminal_attachment(
+            "terminal/agent/terminal-demo",
+            &incarnation,
+            RawTerminalMode::Peek,
+        )
+        .await
+        .unwrap();
+    let controlled = client
+        .raw_terminal_stream_controlled(&attachment)
+        .await
+        .unwrap();
+    let activity = controlled.activity;
+    let retained_activity = activity.clone();
+    let mut stream = controlled.stream;
     stream.write_all(&pty_packet(6, &[0])).await.unwrap();
     let replay = [pty_packet(10, &[0, 24, 0, 80]), pty_packet(5, b"terminal ready\r\n$ ")].concat();
     let mut received = vec![0_u8; replay.len()];
@@ -379,7 +390,22 @@ async fn dropping_a_raw_connector_closes_a_backpressured_attachment() {
     assert_eq!(first, [0]);
     drop(stream);
     tokio::time::timeout(Duration::from_secs(5), pty.closed.notified())
-        .await.expect("dropping a slow consumer must release the PTY connection");
+        .await
+        .expect("dropping a slow consumer must release the PTY connection");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), activity.selected_use())
+            .await
+            .unwrap()
+            .is_err(),
+        "dropping the byte connector must close renewal even when activity handles survive",
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), retained_activity.selected_use())
+            .await
+            .unwrap()
+            .is_err(),
+        "activity clones must not retain the bridge",
+    );
     server.abort();
 }
 
