@@ -3,6 +3,8 @@
 use super::*;
 use crate::mailbox::{Fence, Frame, Receipt};
 
+mod startup;
+
 pub(super) async fn subscribe(
     State(state): State<AppState>,
     Query(fence): Query<Fence>,
@@ -25,7 +27,24 @@ pub(super) async fn bind(
 ) -> Result<Json<Fence>, ApiError> {
     authorize(&request, peer.as_ref().map(|p| &p.0))?;
     let store = state.store.clone();
-    let bound = blocking_action(move || store.bind_mailbox(&request)).await?;
+    let pty_root = state.pty_root.clone();
+    let peer = peer.map(|Extension(peer)| peer);
+    let bound = blocking_action(move || match store.bind_mailbox(&request) {
+        Err(error)
+            if error.code == "stale-mailbox-session"
+                && store.mailbox_bootstrap_pending(&request)?
+                && peer.as_ref().is_some_and(|peer| {
+                    startup::live_native_incarnation(&pty_root, peer, &request)
+                }) =>
+        {
+            Err(St3Error::new(
+                "mailbox-session-starting",
+                "waiting for the seat's running incarnation",
+            ))
+        }
+        result => result,
+    })
+    .await?;
     signal_local_change(&state);
     Ok(Json(bound))
 }

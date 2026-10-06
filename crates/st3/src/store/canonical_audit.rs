@@ -70,6 +70,12 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_latest_slots",
         "latest_values",
         "latest_readiness",
+        // Pre-cutover numeric reader indexes derive from admitted compatibility claims.
+        // Their source facts remain covered by graph digests; a future numeric wire
+        // cutover needs its own authenticated source completeness contract.
+        "numeric_values",
+        "numeric_account_windows",
+        "numeric_limit_seats",
         "local_resource_projection_pending",
         "local_glass_head_pending",
         "local_glass_head_dirty",

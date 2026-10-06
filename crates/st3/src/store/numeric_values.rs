@@ -452,7 +452,9 @@ mod tests {
             idempotency_key: Some("numeric-source:one".into()),
         };
         let connection = store.readers.get();
-        connection
+        store
+            .connection
+            .write()
             .execute_batch(
                 "CREATE TRIGGER fail_numeric_staging BEFORE INSERT ON numeric_values
             BEGIN SELECT RAISE(ABORT,'injected numeric value failure'); END",
@@ -472,7 +474,9 @@ mod tests {
                 .unwrap(),
             0
         );
-        connection
+        store
+            .connection
+            .write()
             .execute_batch("DROP TRIGGER fail_numeric_staging")
             .unwrap();
         let accepted = store.append_claim(&input).unwrap();

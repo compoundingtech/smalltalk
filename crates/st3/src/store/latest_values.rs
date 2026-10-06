@@ -562,38 +562,80 @@ impl Store {
         reason: Option<&str>,
         last_success_at: Option<u128>,
     ) -> Result<()> {
-        let status = if matches!(status, "down" | "refused") {
-            "unknown"
-        } else {
-            status
-        };
-        let mut fields = BTreeMap::from([
-            ("status".into(), json!(status)),
-            ("protocol".into(), json!("http-replication")),
-        ]);
-        if status != "unknown"
-            && let Some(reason) = reason
-        {
-            fields.insert("reason".into(), json!(reason));
-        }
-        if let Some(at) = last_success_at.or_else(|| (status == "up").then(now_ms)) {
-            fields.insert(
-                "last_success_at".into(),
-                json!(at.min(u64::MAX as u128) as u64),
-            );
-        }
-        let input = ClaimInput {
-            subject: format!("host/{peer}"),
-            kind: "transport.observed".into(),
-            actor: None,
-            fields,
-            evidence: vec![],
-            expected_subject: None,
-            idempotency_key: None,
-        };
+        // Use the graph's observer-scoped refresh and clock-skew rules. Its runtime
+        // routes current observations to the same zero-wait register writer, so an
+        // unchanged success keeps its original source time and identity until refresh.
         // A busy daemon drops connectivity just like a driver drops status.
-        let _ = append(&self.graph, &input, now_ms(), None);
+        let _ = self
+            .graph
+            .record_transport_observation(peer, status, reason, last_success_at);
         Ok(())
+    }
+
+    /// A read-only lifecycle check for a kernel-bound native launch awaiting publication.
+    /// The API additionally requires matching live PTY ancestry. This grants no ownership.
+    pub(crate) fn mailbox_bootstrap_pending(
+        &self,
+        request: &crate::mailbox::Fence,
+    ) -> Result<bool, St3Error> {
+        if request.epoch != 0 || request.token.is_empty() || request.token.len() > 128 {
+            return Ok(false);
+        }
+        self.read_snapshot(|_| {
+            let connection = self.readers.get();
+            let prior: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_mailbox_bindings WHERE token=?1)",
+                [&request.token],
+                |row| row.get(0),
+            )?;
+            if prior {
+                return Ok(false);
+            }
+            let runtime: Option<String> = connection
+                .query_row(
+                    &format!(
+                        "{} LIMIT 1",
+                        newest_claims_of_kind_query("claims.body", "runtime.observed")
+                    ),
+                    params![request.subject, i64::MAX],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(runtime) = runtime {
+                let body: Value = serde_json::from_str(&runtime)?;
+                let fields = body.get("fields").unwrap_or(&body);
+                if fields["incarnation_id"].as_str() == Some(request.incarnation.as_str())
+                    && !matches!(fields["status"].as_str(), None | Some("starting"))
+                {
+                    return Ok(false);
+                }
+            }
+            let harness: Option<String> = connection
+                .query_row(
+                    &harness_sql(
+                        &connection,
+                        &request.subject,
+                        &format!(
+                            "{} LIMIT 1",
+                            newest_claims_of_kind_query("claims.body", "harness.observed")
+                        ),
+                    )?,
+                    params![request.subject, i64::MAX],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(harness) = harness {
+                let body: Value = serde_json::from_str(&harness)?;
+                let fields = body.get("fields").unwrap_or(&body);
+                if fields["incarnation_id"].as_str() == Some(request.incarnation.as_str())
+                    && fields["state"] == "ended"
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+        .map_err(internal)
     }
 
     pub fn transport_links(&self) -> Result<Vec<(String, String)>> {
