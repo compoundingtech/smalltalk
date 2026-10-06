@@ -27,6 +27,8 @@ export const typescriptPackageBuck = ({
         (name.endsWith('.ts') && name.endsWith('.genie.ts') === false) ||
         /^tsconfig.*\.json$/.test(name),
     )
+    // Byte order, independent of the filesystem's directory order.
+    .toSorted((left, right) => (left < right ? -1 : left > right ? 1 : 0))
   for (const project of Object.values(projects)) {
     if (files.includes(project) === false) throw new Error(`${packagePath} has no ${project}`)
   }
