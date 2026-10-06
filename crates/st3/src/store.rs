@@ -18151,6 +18151,16 @@ fn insert_local_observation_tx(
     ))
 }
 
+// The planner otherwise prefers arrival order and sorts every claim of this kind.
+// Acceptance-time order lets LIMIT 1 stop after the newest canonical tie group.
+fn latest_claim_of_kind_query() -> String {
+    format!(
+        "SELECT {CLAIM_COLUMNS} FROM claims INDEXED BY claims_subject_kind_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind=?2 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    )
+}
+
 fn latest_claim_of_kind_tx(
     transaction: &Transaction<'_>,
     subject: &str,
@@ -18158,10 +18168,7 @@ fn latest_claim_of_kind_tx(
 ) -> Result<Option<ClaimRecord>, St3Error> {
     transaction
         .query_row(
-            &format!(
-                "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
-                 WHERE claims.subject=?1 AND claims.kind=?2 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
-            ),
+            &latest_claim_of_kind_query(),
             params![subject, kind],
             claim_from_row,
         )
@@ -43875,6 +43882,65 @@ mission "nested-work" state="ready" {
             3
         );
         assert!(replica.local_observations_after(0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn harness_query_publication_uses_canonical_ties_and_exact_incarnation() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.worker";
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let input = harness_state(subject, "working", 10);
+        let append = |origin: &str, state: &str, incarnation: &str, at: &str| {
+            let mut fields = input.fields.clone();
+            fields.insert("state".into(), json!(state));
+            fields.insert("incarnation_id".into(), json!(incarnation));
+            let claim = append_claim_tx(
+                &transaction, origin, subject, "harness.observed", Some(subject),
+                &json!({ "fields": fields, "evidence": [] }), &[], None,
+            ).unwrap();
+            transaction.execute(
+                "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                params![at, claim.id],
+            ).unwrap();
+            claim.id
+        };
+        let winner = append("z", "working", "inc-1", "10");
+        append("a", "idle", "inc-1", "10");
+        append("zz", "blocked", "inc-1", "9");
+        let plan = transaction.prepare(
+            &format!("EXPLAIN QUERY PLAN {}", latest_claim_of_kind_query()),
+        ).unwrap().query_map(params![subject, "harness.observed"], |row| {
+            row.get::<_, String>(3)
+        }).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert!(plan.iter().any(|detail| detail.contains(
+            "USING INDEX claims_subject_kind_accepted_index",
+        )), "{plan:?}");
+        assert!(!plan.iter().any(|detail| detail == "USE TEMP B-TREE FOR ORDER BY"),
+            "only canonical acceptance-time ties may be sorted: {plan:?}");
+        assert_eq!(
+            latest_harness_of_incarnation_tx(&transaction, subject, Some("inc-1"))
+                .unwrap().unwrap().id,
+            winner,
+            "canonical origin breaks acceptance-time ties, not arrival order",
+        );
+        let replacement = append("a", "idle", "inc-2", "11");
+        assert_eq!(
+            latest_harness_of_incarnation_tx(&transaction, subject, Some("inc-2"))
+                .unwrap().unwrap().id,
+            replacement,
+        );
+        assert_eq!(
+            latest_harness_of_incarnation_tx(&transaction, subject, Some("inc-1"))
+                .unwrap().unwrap().id,
+            winner,
+            "a newer incarnation does not change the earlier incarnation's state",
+        );
+        assert!(
+            publish_changed_harness_state_tx(&transaction, "node", &input, 20)
+                .unwrap().is_none(),
+            "an unchanged canonical state stays local",
+        );
     }
 
     #[test]
