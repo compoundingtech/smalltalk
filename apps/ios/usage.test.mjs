@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { accounts, byOf, cost, groups, label, limitLine, money, nextBy, periodName, tokens, totalOf } from './usage.ts';
+import { accounts, byOf, cost, groups, label, limitLine, mix, money, nextBy, periodName, tokenShare, tokens, totalOf } from './usage.ts';
 
 // The same day of invented spend stui's demo shows (crates/stui/src/ui/demo.rs).
 const row = (agent, run, step, model, host, account, total, output, cost) => ({
@@ -55,3 +55,15 @@ assert.deepEqual(line.weekly, { text: '92%', tone: 'fault' });
 assert.equal(line.resets, 'resets in 3d');
 assert.equal(line.measured, 'measured 3m ago');
 assert.deepEqual(limitLine(limits[1], now).fiveHour, { text: '?', tone: 'quiet' });
+
+// Shares: whole numbers rounded down, a decimal for small ones, and a sliver is never none.
+assert.equal(tokenShare(0, 100), '0%');
+assert.equal(tokenShare(5, 0), '0%');
+assert.equal(tokenShare(98_260, 100_000), '98%');
+assert.equal(tokenShare(99_600, 100_000), '99%');
+assert.equal(tokenShare(890, 100_000), '0.9%');
+assert.equal(tokenShare(40, 100_000), '<0.1%');
+assert.equal(
+  mix({ tokens: 100_000, cached: 98_260, cacheWrite: 890, input: 630, output: 210, costMicrousd: 0, unpriced: 0 }),
+  '98% cached · 0.9% written to cache · 0.6% fresh input · 0.2% output',
+);
