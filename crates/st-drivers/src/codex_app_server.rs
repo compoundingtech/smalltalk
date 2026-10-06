@@ -2716,7 +2716,6 @@ fn run_controlled_with_required_resume(
         delivery,
         resume_thread,
         required_incarnation,
-        true,
         &mut diagnostics,
     );
     match result {
@@ -2808,7 +2807,6 @@ pub fn run_controlled_paths(
         delivery,
         resume_thread,
         None,
-        false,
         &mut diagnostics,
     );
     match result {
@@ -3038,7 +3036,6 @@ fn run_controlled_owned(
     mut delivery: CodexDeliveryConfig,
     resume_thread: Option<String>,
     required_incarnation: Option<String>,
-    allow_safe_fallback: bool,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
     delivery.model = declared_codex_model(&codex_argv[1..]);
@@ -3051,17 +3048,8 @@ fn run_controlled_owned(
 
     let endpoint = format!("unix://{}", socket_path.display());
     let prepared =
-        prepare_controlled_launch_args(&endpoint, &codex_argv[1..], resume_thread.as_deref());
-    strict_launch_preflight(&prepared, allow_safe_fallback)?;
+        prepare_controlled_launch_args(&endpoint, &codex_argv[1..], resume_thread.as_deref())?;
     let safe_fallback_active = Arc::new(AtomicBool::new(false));
-    if prepared.safe_fallback {
-        record_safe_fallback(
-            diagnostics,
-            &safe_fallback_active,
-            "declaredArgumentsRejectedBeforeSpawn",
-            &prepared.declared_options,
-        )?;
-    }
 
     // Publish the host-owned incarnation for a residency attempt only after this process holds
     // the owner lock. Ordinary launches continue to mint their incarnation at this boundary.
@@ -3084,10 +3072,7 @@ fn run_controlled_owned(
         .mode(0o600)
         .open(state_dir.join("app-server.log"))?;
     let mut server_args = prepared.server_args;
-    if !prepared.safe_fallback
-        && resume_thread.is_some()
-        && authored_bypasses_hook_trust(&codex_argv[1..])?
-    {
+    if resume_thread.is_some() && authored_bypasses_hook_trust(&codex_argv[1..])? {
         let hook_cwd = controlled_hook_cwd(&codex_argv[1..])?;
         if let Some(projection) = preflight_hook_trust(
             &codex_argv[0],
@@ -3100,12 +3085,9 @@ fn run_controlled_owned(
             insert_app_server_config_override(&mut server_args, projection.override_value)?;
         }
     }
-    diagnostics.record(
-        "appServerStarting",
-        json!({ "safeFallback": prepared.safe_fallback }),
-    )?;
+    diagnostics.record("appServerStarting", json!({ "safeFallback": false }))?;
     let mut server = spawn_controlled_app_server(&codex_argv[0], &server_args, &socket_path, &log)?;
-    let mut result = diagnostics
+    let result = diagnostics
         .record("appServerStarted", json!({ "pid": server.id() }))
         .and_then(|_| {
             run_connected(
@@ -3114,64 +3096,14 @@ fn run_controlled_owned(
                 state_dir,
                 &runtime,
                 &codex_argv,
-                prepared.tui_args.clone(),
-                prepared.safe_tui_args.clone(),
-                prepared.expected_resume.clone(),
-                prepared.resume_permissions.clone(),
+                prepared.tui_args,
+                prepared.expected_resume,
+                prepared.resume_permissions,
                 safe_fallback_active.clone(),
-                prepared.declared_options.clone(),
-                delivery.clone(),
-                allow_safe_fallback,
+                delivery,
                 diagnostics,
             )
         });
-    if allow_safe_fallback
-        && !prepared.safe_fallback
-        && result.as_ref().is_err_and(|error| {
-            error
-                .downcast_ref::<AppServerExitedBeforeControl>()
-                .is_some()
-        })
-    {
-        server.terminate();
-        prepare_socket_for_launch(&socket_path)?;
-        record_safe_fallback(
-            diagnostics,
-            &safe_fallback_active,
-            "declaredAppServerExitedBeforeControl",
-            &prepared.declared_options,
-        )?;
-        diagnostics.record("safeFallbackAppServerStarting", json!({}))?;
-        server = spawn_controlled_app_server(
-            &codex_argv[0],
-            &safe_controlled_app_server_args(&endpoint),
-            &socket_path,
-            &log,
-        )?;
-        result = diagnostics
-            .record(
-                "safeFallbackAppServerStarted",
-                json!({ "pid": server.id() }),
-            )
-            .and_then(|_| {
-                run_connected(
-                    server.child_mut(),
-                    &socket_path,
-                    state_dir,
-                    &runtime,
-                    &codex_argv,
-                    prepared.safe_tui_args.clone(),
-                    prepared.safe_tui_args.clone(),
-                    resume_thread.clone(),
-                    None,
-                    safe_fallback_active.clone(),
-                    prepared.declared_options.clone(),
-                    delivery,
-                    allow_safe_fallback,
-                    diagnostics,
-                )
-            });
-    }
     if let Err(error) = &result
         && let Some(detached) = error.downcast_ref::<TuiDetached>()
     {
@@ -3209,6 +3141,10 @@ fn declared_codex_model(args: &[String]) -> Option<String> {
             continue;
         }
         if let Some(value) = args[index].strip_prefix("--model=") {
+            selected = Some(value.to_owned());
+        } else if let Some(value) = args[index].strip_prefix("-m")
+            && !value.is_empty()
+        {
             selected = Some(value.to_owned());
         }
         index += 1;
@@ -3293,28 +3229,17 @@ fn spawn_controlled_tui(codex: &str, args: &[String]) -> std::io::Result<Provide
         .map(ProviderProcess::Spawned)
 }
 
-fn claim_safe_fallback_attempt(attempted: &mut bool) -> bool {
-    if *attempted {
-        return false;
-    }
-    *attempted = true;
-    true
-}
-
 fn run_connected(
     server: &mut ProviderProcess,
     socket_path: &Path,
     state_dir: &Path,
     runtime: &CodexRuntime,
     codex_argv: &[String],
-    mut tui_args: Vec<String>,
-    safe_tui_args: Vec<String>,
+    tui_args: Vec<String>,
     expected_resume: Option<String>,
     resume_permissions: Option<ResumePermissionOverrides>,
     safe_fallback_active: Arc<AtomicBool>,
-    declared_options: Vec<String>,
     delivery: CodexDeliveryConfig,
-    allow_safe_fallback: bool,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
     // The stop handler is installed by the launch entry point before any spawn (the preflight's
@@ -3448,7 +3373,6 @@ fn run_connected(
         }
     };
     let result = (|| -> Result<TuiEnd> {
-        let mut fallback_attempted = safe_fallback_active.load(Ordering::SeqCst);
         loop {
             diagnostics.record(
                 "tuiStarted",
@@ -3471,25 +3395,6 @@ fn run_connected(
                 BindingWait::Stopped => {
                     terminate_child(&mut tui);
                     return Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()));
-                }
-                BindingWait::TuiExited(status)
-                    if allow_safe_fallback
-                        && claim_safe_fallback_attempt(&mut fallback_attempted) =>
-                {
-                    record_safe_fallback(
-                        diagnostics,
-                        &safe_fallback_active,
-                        "declaredTuiExitedBeforeThreadBinding",
-                        &declared_options,
-                    )?;
-                    diagnostics.record(
-                        "safeFallbackRetryStarting",
-                        json!({ "previousExit": status.to_string() }),
-                    )?;
-                    tui_args.clone_from(&safe_tui_args);
-                    tui = spawn_controlled_tui(&codex_argv[0], &tui_args).with_context(|| {
-                        format!("starting known-safe fallback {} TUI", codex_argv[0])
-                    })?;
                 }
                 BindingWait::TuiExited(status) => {
                     anyhow::bail!("controlled Codex TUI exited before thread binding: {status}");
@@ -3614,11 +3519,8 @@ fn describe_tui_exit(status: Option<ExitStatus>) -> String {
 struct PreparedControlledLaunch {
     server_args: Vec<String>,
     tui_args: Vec<String>,
-    safe_tui_args: Vec<String>,
     expected_resume: Option<String>,
     resume_permissions: Option<ResumePermissionOverrides>,
-    declared_options: Vec<String>,
-    safe_fallback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3681,8 +3583,7 @@ fn prepare_controlled_launch_args(
     endpoint: &str,
     authored_args: &[String],
     resume_thread: Option<&str>,
-) -> PreparedControlledLaunch {
-    let declared_options = declared_option_names(authored_args);
+) -> Result<PreparedControlledLaunch> {
     let exact = controlled_app_server_args(endpoint, authored_args).and_then(|mut server_args| {
         let resume_permissions =
             automatic_resume_permission_overrides(authored_args, resume_thread)?;
@@ -3712,40 +3613,21 @@ fn prepare_controlled_launch_args(
             resume_permissions,
         ))
     });
-    match exact {
-        Ok((server_args, tui_args, expected_resume, resume_permissions)) => {
-            PreparedControlledLaunch {
-                server_args,
-                tui_args,
-                safe_tui_args: safe_controlled_tui_args(endpoint, resume_thread),
-                expected_resume,
-                resume_permissions,
-                declared_options,
-                safe_fallback: false,
-            }
-        }
-        Err(_) => PreparedControlledLaunch {
-            server_args: safe_controlled_app_server_args(endpoint),
-            tui_args: safe_controlled_tui_args(endpoint, resume_thread),
-            safe_tui_args: safe_controlled_tui_args(endpoint, resume_thread),
-            expected_resume: resume_thread.map(str::to_owned),
-            resume_permissions: None,
-            declared_options,
-            safe_fallback: true,
-        },
-    }
-}
-
-fn strict_launch_preflight(
-    prepared: &PreparedControlledLaunch,
-    allow_safe_fallback: bool,
-) -> Result<()> {
-    anyhow::ensure!(
-        allow_safe_fallback || !prepared.safe_fallback,
-        "declared Codex options were rejected before launch: {}",
-        prepared.declared_options.join(", ")
-    );
-    Ok(())
+    let (server_args, tui_args, expected_resume, resume_permissions) = exact.map_err(|_| {
+        let options = declared_option_names(authored_args);
+        let cause = if options.is_empty() {
+            "automatic resume settings".to_string()
+        } else {
+            options.join(", ")
+        };
+        anyhow::anyhow!("declared Codex options rejected before launch: {cause}")
+    })?;
+    Ok(PreparedControlledLaunch {
+        server_args,
+        tui_args,
+        expected_resume,
+        resume_permissions,
+    })
 }
 
 fn automatic_resume_permission_overrides(
@@ -3797,10 +3679,12 @@ fn automatic_resume_permission_overrides(
                 index += 2;
             }
             "-m" | "--model" => {
-                overrides.model = Some(authored_args
-                    .get(index + 1)
-                    .context("Codex model option has no value")?
-                    .clone());
+                overrides.model = Some(
+                    authored_args
+                        .get(index + 1)
+                        .context("Codex model option has no value")?
+                        .clone(),
+                );
                 index += 2;
             }
             "-c" | "--config" => {
@@ -3811,7 +3695,10 @@ fn automatic_resume_permission_overrides(
                 index += 2;
             }
             _ if argument.starts_with("--config=") => {
-                apply_resume_config_override(&mut overrides, argument.trim_start_matches("--config="))?;
+                apply_resume_config_override(
+                    &mut overrides,
+                    argument.trim_start_matches("--config="),
+                )?;
                 index += 1;
             }
             _ if argument.starts_with("-c") && argument.len() > 2 => {
@@ -3820,6 +3707,10 @@ fn automatic_resume_permission_overrides(
             }
             _ if argument.starts_with("--model=") => {
                 overrides.model = Some(argument.trim_start_matches("--model=").into());
+                index += 1;
+            }
+            _ if argument.starts_with("-m") && argument.len() > 2 => {
+                overrides.model = Some(argument[2..].into());
                 index += 1;
             }
             _ if argument.starts_with("--sandbox=") => {
@@ -3985,22 +3876,6 @@ fn validate_resume_approval_policy(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn safe_controlled_app_server_args(endpoint: &str) -> Vec<String> {
-    vec![
-        "app-server".to_string(),
-        "--listen".to_string(),
-        endpoint.to_string(),
-    ]
-}
-
-fn safe_controlled_tui_args(endpoint: &str, resume_thread: Option<&str>) -> Vec<String> {
-    let mut args = vec!["--remote".to_string(), endpoint.to_string()];
-    if let Some(thread_id) = resume_thread {
-        args.extend(["resume".to_string(), thread_id.to_string()]);
-    }
-    args
-}
-
 fn declared_option_names(authored_args: &[String]) -> Vec<String> {
     let mut options = Vec::new();
     let mut index = 0;
@@ -4063,35 +3938,6 @@ fn declared_option_names(authored_args: &[String]) -> Vec<String> {
         }
     }
     options
-}
-
-fn record_safe_fallback(
-    diagnostics: &mut WrapperDiagnostics,
-    active: &AtomicBool,
-    cause: &str,
-    declared_options: &[String],
-) -> Result<()> {
-    if active.swap(true, Ordering::SeqCst) {
-        return Ok(());
-    }
-    diagnostics.record(
-        "safeFallbackActivated",
-        json!({
-            "cause": cause,
-            "declaredOptions": declared_options,
-            "mode": "minimalRemoteTui",
-            "requestedPolicyApplied": false,
-        }),
-    )?;
-    tracing::warn!(
-        "st codex: declared launch arguments were rejected; booting once with known-safe flags (declared options: {})",
-        if declared_options.is_empty() {
-            "none".to_string()
-        } else {
-            declared_options.join(", ")
-        }
-    );
-    Ok(())
 }
 
 fn controlled_app_server_args(endpoint: &str, authored_args: &[String]) -> Result<Vec<String>> {
@@ -5035,13 +4881,22 @@ fn pump_control(
                         "Codex control received an unexpected initial thread/resume response"
                     );
                     if message.pointer("/error/code").and_then(Value::as_i64) == Some(-32600)
-                        && message.pointer("/error/message").and_then(Value::as_str)
-                            .is_some_and(|detail| detail.starts_with("no rollout found for thread id "))
+                        && message
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .is_some_and(|detail| {
+                                detail.starts_with("no rollout found for thread id ")
+                            })
                     {
-                        anyhow::bail!("saved Codex resume binding has no persisted rollout for thread {thread_id}");
+                        anyhow::bail!(
+                            "saved Codex resume binding has no persisted rollout for thread {thread_id}"
+                        );
                     }
-                    anyhow::ensure!(message.get("error").is_none(),
-                        "Codex rejected declared resume settings: {}", message["error"]);
+                    anyhow::ensure!(
+                        message.get("error").is_none(),
+                        "Codex rejected declared resume settings: {}",
+                        message["error"]
+                    );
                     subscription_pending = false;
                     if let Some(expected_permissions) = resume_permissions.take() {
                         anyhow::ensure!(
