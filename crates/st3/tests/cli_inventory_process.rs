@@ -201,7 +201,6 @@ fn literal_inventory_names_after_terminator_reach_ordinary_dispatch() {
 #[test]
 fn literal_inventory_argument_after_terminator_reaches_a_benign_provider() {
     use std::os::unix::fs::PermissionsExt as _;
-    use std::os::unix::process::CommandExt as _;
 
     let root = tempfile::tempdir().unwrap();
     let script = root.path().join("fake-provider");
@@ -214,33 +213,24 @@ fn literal_inventory_argument_after_terminator_reaches_a_benign_provider() {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let literal = "--read-contract-inventory-json=true";
     let mut provider = command(root.path());
-    provider.process_group(0);
-    let mut child = provider
-        .args([
-            "driver",
-            "exec",
-            "--subject",
-            "test/cli-inventory",
-            "--",
-            script.to_str().unwrap(),
-            marker.to_str().unwrap(),
-            literal,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !marker.exists() {
-        if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
-            stop_tree(&mut child);
-            panic!("the fake provider never received its argv");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    // The missing daemon cannot acknowledge runtime.observed; stop only this isolated process.
-    stop_tree(&mut child);
+    provider.args([
+        "driver",
+        "exec",
+        "--subject",
+        "test/cli-inventory",
+        "--",
+        script.to_str().unwrap(),
+        marker.to_str().unwrap(),
+        literal,
+    ]);
+    // The missing daemon cannot acknowledge runtime.observed. The shared bounded
+    // helper stops this isolated process group at its deadline.
+    assert!(
+        bounded_output(provider, Duration::from_secs(5))
+            .unwrap_err()
+            .contains("process deadline")
+    );
+    assert!(marker.exists(), "the fake provider never received its argv");
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap(),
         format!("{literal}\n")
