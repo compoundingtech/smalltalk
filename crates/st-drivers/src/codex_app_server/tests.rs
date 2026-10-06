@@ -6626,6 +6626,12 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
 
 #[test]
 fn unattended_codex_defaults_only_after_provider_reports_no_policy() {
+    assert!(!mission_run_is_unattended(None));
+    assert!(!mission_run_is_unattended(Some("")));
+    assert!(!mission_run_is_unattended(Some("  \n")));
+    assert!(mission_run_is_unattended(Some("mission-run/example")));
+    assert!(validate_resume_approval_policy("untrusted").is_ok());
+    assert!(validate_resume_approval_policy("on-failure").is_err());
     let endpoint = "unix:///server.sock";
     let plain = vec!["--model".into(), "gpt-6.1-sol".into(), "boot".into()];
     let mut fresh = prepare_controlled_launch_args(endpoint, &plain, None).unwrap();
@@ -6635,7 +6641,7 @@ fn unattended_codex_defaults_only_after_provider_reports_no_policy() {
             .iter()
             .any(|v| v == "approval_policy=\"never\"")
     );
-    project_effective_approval(
+    let resolved = project_effective_approval(
         &mut fresh.tui_args,
         &mut fresh.resume_permissions,
         &plain,
@@ -6645,7 +6651,10 @@ fn unattended_codex_defaults_only_after_provider_reports_no_policy() {
         None,
         None,
     )
+    .unwrap()
     .unwrap();
+    assert_eq!(resolved.policy, "never");
+    assert_eq!(resolved.origin, "missionDefault");
     assert_eq!(
         &fresh.tui_args[..4],
         ["--remote", endpoint, "--ask-for-approval", "never"]
@@ -6769,7 +6778,15 @@ fn attended_and_provider_configured_policies_do_not_get_an_implicit_never() {
     assert!(!attended.tui_args.iter().any(|v| v == "--ask-for-approval"));
     assert!(attended.resume_permissions.is_none());
 
-    for origin in ["project", "system", "managed", "user"] {
+    for origin in [
+        "project",
+        "system",
+        "mdm",
+        "enterpriseManaged",
+        "legacyManagedConfigTomlFromFile",
+        "legacyManagedConfigTomlFromMdm",
+        "user",
+    ] {
         let mut fresh = prepare_controlled_launch_args(endpoint, &plain, None).unwrap();
         project_effective_approval(
             &mut fresh.tui_args,
@@ -6838,7 +6855,7 @@ fn attended_and_provider_configured_policies_do_not_get_an_implicit_never() {
             .as_deref(),
         Some("never")
     );
-    project_effective_approval(
+    let conflict = project_effective_approval(
         &mut resumed.tui_args,
         &mut resumed.resume_permissions,
         &profile,
@@ -6846,18 +6863,35 @@ fn attended_and_provider_configured_policies_do_not_get_an_implicit_never() {
         true,
         Some("on-request".into()),
         Some("project"),
-        profile_policy,
-    )
-    .unwrap();
-    assert_eq!(
-        resumed
-            .resume_permissions
-            .as_ref()
-            .unwrap()
-            .approval_policy
-            .as_deref(),
-        Some("on-request")
+        profile_policy.clone(),
     );
+    assert!(
+        conflict
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting approval policies")
+    );
+    for origin in [
+        "system",
+        "mdm",
+        "enterpriseManaged",
+        "legacyManagedConfigTomlFromFile",
+    ] {
+        let resolved = project_effective_approval(
+            &mut resumed.tui_args,
+            &mut resumed.resume_permissions,
+            &profile,
+            Some("thread-prior"),
+            true,
+            Some("on-request".into()),
+            Some(origin),
+            profile_policy.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.policy, "on-request");
+        assert_eq!(resolved.origin, origin);
+    }
 
     let profile_path = temp.path().join("review.config.toml");
     std::fs::write(&profile_path, "approval_policy = [\n").unwrap();
@@ -6877,7 +6911,7 @@ fn config_read_uses_the_selected_cwd_and_reports_provider_policy_origin() {
         (None, None),
         (Some("on-request"), Some("project")),
         (Some("never"), Some("system")),
-        (Some("on-request"), Some("managed")),
+        (Some("on-request"), Some("legacyManagedConfigTomlFromFile")),
         (Some("on-request"), None),
     ] {
         let temp = tempfile::tempdir().unwrap();
@@ -6926,7 +6960,12 @@ fn config_read_uses_the_selected_cwd_and_reports_provider_policy_origin() {
         let mut websocket = initialize_control(stream).unwrap().unwrap();
         let found = read_codex_config_approval(&mut websocket, &cwd);
         if policy.is_some() && origin.is_none() {
-            assert!(found.unwrap_err().to_string().contains("without its origin"));
+            assert!(
+                found
+                    .unwrap_err()
+                    .to_string()
+                    .contains("without its origin")
+            );
         } else {
             let found = found.unwrap();
             assert_eq!(found.0.as_deref(), policy);

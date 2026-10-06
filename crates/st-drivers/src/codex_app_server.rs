@@ -3049,7 +3049,8 @@ fn run_controlled_owned(
     prepare_socket_for_launch(&socket_path)?;
 
     let endpoint = format!("unix://{}", socket_path.display());
-    let unattended = std::env::var("ST_MISSION_RUN").is_ok_and(|run| !run.trim().is_empty());
+    let mission_run = std::env::var("ST_MISSION_RUN").ok();
+    let unattended = mission_run_is_unattended(mission_run.as_deref());
     let explicit_approval = authored_approval_policy(&codex_argv[1..])?;
     let prepared =
         prepare_controlled_launch_args(&endpoint, &codex_argv[1..], resume_thread.as_deref())?;
@@ -3303,7 +3304,7 @@ fn run_connected(
         let cwd = controlled_hook_cwd(&codex_argv[1..])?;
         let (provider_policy, provider_origin) = read_codex_config_approval(&mut websocket, &cwd)?;
         let profile_policy = selected_codex_profile_policy(&codex_argv[1..])?;
-        project_effective_approval(
+        let resolved = project_effective_approval(
             &mut tui_args,
             &mut resume_permissions,
             &codex_argv[1..],
@@ -3312,6 +3313,11 @@ fn run_connected(
             provider_policy,
             provider_origin.as_deref(),
             profile_policy,
+        )?;
+        diagnostics.record(
+            "approvalPolicyResolved",
+            json!({"policy": resolved.as_ref().map(|value| &value.policy),
+                "origin": resolved.as_ref().map(|value| value.origin.as_str())}),
         )?;
     }
     let (events_tx, events_rx) = mpsc::channel();
@@ -3458,6 +3464,16 @@ fn run_connected(
     )
 }
 
+fn mission_run_is_unattended(value: Option<&str>) -> bool {
+    value.is_some_and(|run| !run.trim().is_empty())
+}
+
+#[derive(Debug)]
+struct ResolvedApproval {
+    policy: String,
+    origin: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_effective_approval(
     tui_args: &mut Vec<String>,
@@ -3468,24 +3484,46 @@ fn project_effective_approval(
     provider_policy: Option<String>,
     provider_origin: Option<&str>,
     profile_policy: Option<String>,
-) -> Result<()> {
-    let policy = if provider_origin == Some("project") {
-        provider_policy
-    } else {
-        profile_policy.or(provider_policy)
+) -> Result<Option<ResolvedApproval>> {
+    if provider_origin == Some("project")
+        && let (Some(provider), Some(profile)) = (&provider_policy, &profile_policy)
+    {
+        anyhow::ensure!(
+            provider == profile,
+            "Codex project and named profile select conflicting approval policies"
+        );
+    }
+    let resolved = match (provider_policy, provider_origin, profile_policy) {
+        (Some(_provider), Some("user"), Some(profile)) => Some(ResolvedApproval {
+            policy: profile,
+            origin: "profile".into(),
+        }),
+        (Some(provider), origin, _) => Some(ResolvedApproval {
+            policy: provider,
+            origin: origin.unwrap_or("provider").into(),
+        }),
+        (None, _, Some(profile)) => Some(ResolvedApproval {
+            policy: profile,
+            origin: "profile".into(),
+        }),
+        (None, _, None) if unattended => Some(ResolvedApproval {
+            policy: "never".into(),
+            origin: "missionDefault".into(),
+        }),
+        (None, _, None) => None,
     };
-    let implicit_default = policy.is_none() && unattended;
-    let selected = policy.or_else(|| implicit_default.then(|| "never".into()));
-    if let Some(selected) = selected {
+    if let Some(selected) = resolved.as_ref() {
         if expected_resume.is_some() {
             resume_permissions
                 .get_or_insert_with(ResumePermissionOverrides::empty)
-                .approval_policy = Some(selected);
-        } else if implicit_default && resume_insertion_index(authored_args)?.is_some() {
+                .approval_policy = Some(selected.policy.clone());
+        } else if selected.origin == "missionDefault"
+            && resume_insertion_index(authored_args)?.is_some()
+        {
             tui_args.splice(2..2, ["--ask-for-approval".into(), "never".into()]);
         }
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// End one controlled TUI session after its monitor returned: stop the control pump, then publish
@@ -4091,7 +4129,7 @@ fn validate_resume_sandbox(value: &str) -> Result<()> {
 
 fn validate_resume_approval_policy(value: &str) -> Result<()> {
     anyhow::ensure!(
-        matches!(value, "on-request" | "never"),
+        matches!(value, "untrusted" | "on-request" | "never"),
         "unsupported Codex approval policy '{value}'"
     );
     Ok(())
