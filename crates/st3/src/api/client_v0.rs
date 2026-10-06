@@ -15777,7 +15777,7 @@ mission "example/zero-run" state="ready" {
         assert_eq!(indeterminate["operational"]["actionable"], false);
     }
     #[test]
-    fn status_freshness_refreshes_after_the_agent_cache_without_resetting_since() {
+    fn status_freshness_uses_cached_card_time_without_resetting_since() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "status-cache");
         let subject = "agent/cedar";
@@ -15793,9 +15793,19 @@ mission "example/zero-run" state="ready" {
         let index = state.store.index().unwrap();
         let before = client_agent_resources(&state.store, false, "", index).unwrap();
         let before = before.iter().find(|item| item["id"] == subject).unwrap();
-        assert_eq!(before["observation"], "stale");
-        assert_eq!(before["harness_state"], "indeterminate");
+        // The quick read uses the cached card's receipt time. The backdated payload time is
+        // deliberately no longer recovered by a separate per-request history query.
+        assert_eq!(before["observation"], "current");
+        assert_eq!(before["harness_state"], "idle");
         assert!(before.get("_status_source").is_none());
+        let mut aged = vec![before.clone()];
+        let mut cached_harness = state.store.observed_harness_at(subject, index).unwrap().unwrap();
+        cached_harness.observed_at_unix_ms = client_now_ms() - 91_000;
+        aged[0]["_status_source"] = json!(cached_harness);
+        overlay_agent_resources(&state.store, &mut aged, "").unwrap();
+        assert_eq!(aged[0]["observation"], "stale");
+        assert_eq!(aged[0]["harness_state"], "indeterminate");
+        assert_eq!(aged[0]["since"], before["since"]);
         append("harness.observed", json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "observed_at_ms":client_now_ms() as u64}));
         assert_eq!(state.store.index().unwrap(), index, "same state stays local within the publish interval");
         let after = client_agent_resources(&state.store, false, "", index).unwrap();
