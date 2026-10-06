@@ -45,7 +45,7 @@ fn enrich_gap(connection: &Connection, runtime: &str, state: &mut Value) -> Resu
 fn write_current_snapshot(connection: &Connection, runtime: &str, state: &Value) -> Result<()> {
     let mut current = serde_json::Map::new();
     for key in ["schema", "agent", "harness", "state", "blockedOn", "inputBuffer", "ask",
-        "active_ask", "backgroundJobs", "runningSubagents", "providerAuth", "providerAuthSequence",
+        "activeAsk", "backgroundJobs", "runningSubagents", "providerAuth", "providerAuthSequence",
         "ptySession", "incarnation", "seq", "sinceMs", "writtenAtMs", "transitions", "exit"] {
         if let Some(value) = state.get(key) { current.insert(key.into(), value.clone()); }
     }
@@ -502,7 +502,9 @@ pub fn expire_state(agent_dir: &Path, expected: &Value) -> Result<()> {
             |r| r.get(0),
         )
         .optional()?;
-    let identity = serde_json::to_string(expected)?;
+    let identity = serde_json::to_string(&serde_json::json!([
+        expected["incarnation"], expected["seq"], expected["writtenAtMs"]
+    ]))?;
     if expired.as_deref() != Some(&identity) {
         append_event(&tx, "harness-state-expired", expected)?;
         tx.execute(
@@ -971,6 +973,7 @@ mod protocol_tests {
         state["state"] = json!("active");
         state["blockedOn"] = json!("human");
         state["ask"] = json!("question");
+        state["activeAsk"] = json!("native-pending");
         state["reason"] = json!("private native question");
         state["writtenAtMs"] = json!(state["writtenAtMs"].as_u64().unwrap() + 1);
         (root, state)
@@ -986,6 +989,7 @@ mod protocol_tests {
             &read_runtime_state(root.path(), "runtime").unwrap().unwrap(),
         ).unwrap();
         assert_eq!(current["state"], "active");
+        assert_eq!(current["activeAsk"], "native-pending");
         assert_eq!(current["blockedOn"], "human");
         assert_eq!(current["ask"], "question");
         assert!(current.get("reason").is_none());
@@ -1002,6 +1006,7 @@ mod protocol_tests {
         }});
         state["blockedOn"] = json!("none");
         state["ask"] = json!("none");
+        state["activeAsk"] = Value::Null;
         state["runningSubagents"] = json!(2);
         state["writtenAtMs"] = json!(state["writtenAtMs"].as_u64().unwrap() + 1);
         write_snapshot_with_limit(root.path(), "harness-state", &serde_json::to_vec(&state).unwrap(), 0).unwrap();
@@ -1010,6 +1015,7 @@ mod protocol_tests {
         ).unwrap();
         assert_eq!(current["blockedOn"], "none", "a full FIFO cannot retain an answered ask");
         assert_eq!(current["ask"], "none");
+        assert!(current["activeAsk"].is_null(), "an answer clears the canonical native ask identity");
         assert_eq!(current["runningSubagents"], 2);
         assert_eq!(current["history_gap_count"], 2);
         let prepared = prepare_publication(root.path(), first_sequence, "harness.history.gap:", &stale_candidate).unwrap();
@@ -1047,6 +1053,7 @@ mod protocol_tests {
         write_snapshot_with_limit(root.path(), "harness-state", &serde_json::to_vec(&state).unwrap(), budget).unwrap();
         state["blockedOn"] = json!("none");
         state["ask"] = json!("none");
+        state["activeAsk"] = Value::Null;
         state["writtenAtMs"] = json!(state["writtenAtMs"].as_u64().unwrap() + 1);
         write_snapshot_with_limit(root.path(), "harness-state", &serde_json::to_vec(&state).unwrap(), budget).unwrap();
         let events = pending(root.path(), 100).unwrap();
@@ -1091,6 +1098,10 @@ mod protocol_tests {
         .unwrap();
         expire_state(root.path(), &state).unwrap();
         expire_state(root.path(), &state).unwrap();
+        let enriched: Value = serde_json::from_slice(
+            &read_runtime_state(root.path(), "runtime").unwrap().unwrap(),
+        ).unwrap();
+        expire_state(root.path(), &enriched).unwrap();
         assert_eq!(pending(root.path(), 100).unwrap().len(), 2);
         let mut writer = Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
             .with_ownership("provider", seq);
