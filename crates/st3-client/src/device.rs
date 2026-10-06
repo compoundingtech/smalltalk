@@ -474,6 +474,8 @@ fn random_nonce() -> Result<String> {
 /// Consume the existing single-use challenge and atomically retain the returned bearer,
 /// delegation chain and private key together. An observer retains no private signing key.
 /// Network/server failures or local failures before the commit preserve the previous profile.
+/// Supply independent trust with `complete_with_options`; this legacy entry point has no pin
+/// and therefore refuses before submitting the code.
 pub async fn complete(
     path: &Path,
     endpoint: &str,
@@ -484,7 +486,8 @@ pub async fn complete(
     complete_with_http_policy(path, endpoint, pairing_id, code, key, false).await
 }
 
-/// Explicitly allow public HTTP only when its address is already an encrypted path.
+/// Legacy HTTP policy entry point. Use `complete_with_options` to also supply identity trust.
+/// An HTTP override alone cannot bypass the required fingerprint.
 pub async fn complete_with_http_policy(
     path: &Path,
     endpoint: &str,
