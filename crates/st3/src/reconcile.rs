@@ -12298,6 +12298,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             .cloned()
             .unwrap_or_default();
         if spec.stopped {
+            let prefix = format!("{}:", observer.subject);
+            self.armed_observers.lock().unwrap_or_else(PoisonError::into_inner)
+                .retain(|operation| !operation.starts_with(&prefix));
             let is_stopped = self
                 .store
                 .latest_actual_value(&observer.subject)?
@@ -12406,6 +12409,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         let notify = self.notify.clone();
         let event_notify = self.event_notify.clone();
         let armed = self.armed_observers.clone();
+        #[cfg(test)]
+        let completion_fault = self.fault_injection.clone();
         let deadlines = self.observer_deadlines.clone();
         let cursors = self.observer_cursors.clone();
         let observer_subject = observer.subject.clone();
@@ -12467,13 +12472,23 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let observed =
                     crate::resource::spend_as(observer_subject.clone(), provider.observe(request))
                         .await;
-                let mut active = armed.lock().unwrap_or_else(PoisonError::into_inner);
-                if !active.contains(&operation)
+                // This UUID is the arm generation. The writer checks it inside the
+                // transaction; never keep the scheduler lock while waiting for Store I/O.
+                let current = || {
+                    #[cfg(test)]
+                    if let Some(injection) = &completion_fault {
+                        injection.fault("observer-completion-write", &observer_subject);
+                    }
+                    armed.lock().unwrap_or_else(PoisonError::into_inner).contains(&operation)
+                };
+                if !current()
                     || store.selected_desired_revision(&observer_subject).ok().flatten().as_deref() != Some(revision.as_str()) {
-                    active.remove(&operation);
+                    armed.lock().unwrap_or_else(PoisonError::into_inner).remove(&operation);
                     signal_changed(&notify, &event_notify);
                     return;
                 }
+                let mut completed_deadline = None;
+                let mut completed_cursor = None;
                 match observed {
                     Ok(mut observation) => {
                         if spec.provider == "github.repository" {
@@ -12508,23 +12523,16 @@ impl<R: RuntimeControl> Reconciler<R> {
                             &observation.facts,
                             observation.next_check_unix_ms,
                             &selected,
+                            Some(&current),
                         ) {
                             Ok(_) => {
-                                deadlines
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .insert(deadline_key.clone(), observation.next_check_unix_ms);
-                                cursors
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .insert(deadline_key.clone(), observation.cursor);
+                                completed_deadline = Some(observation.next_check_unix_ms);
+                                completed_cursor = Some(observation.cursor);
                             }
+                            Err(error) if error.code == "observer-operation-retired" => {}
                             Err(error) => {
                                 let retry_at = now_ms().saturating_add(60_000);
-                                deadlines
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .insert(deadline_key.clone(), retry_at);
+                                completed_deadline = Some(retry_at);
                                 let reason = error.to_string();
                                 let failure_hash = hex::encode(sha2::Sha256::digest(
                                     format!("{revision}:{}:{reason}", error.code).as_bytes(),
@@ -12547,7 +12555,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     ),
                                     None => format!("observer-rejected:{}", &failure_hash[..20]),
                                 };
-                                let _ = store.append_claim(&ClaimInput {
+                                let _ = store.append_observer_state(&ClaimInput {
                                     subject: observer_subject.clone(),
                                     kind: "observer.state".into(),
                                     actor: None,
@@ -12555,7 +12563,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     evidence: Vec::new(),
                                     expected_subject: None,
                                     idempotency_key: Some(key),
-                                });
+                                }, &revision, &current);
                             }
                         }
                     }
@@ -12566,10 +12574,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             |limit| limit.retry_at_unix_ms.max(now_ms().saturating_add(1_000)),
                         );
                         let reason = error.to_string();
-                        deadlines
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .insert(deadline_key.clone(), retry_at);
+                        completed_deadline = Some(retry_at);
                         let previous = store.latest_actual_value(&observer_subject).ok().flatten();
                         let condition = ObserverCondition::of(&error, previous.as_ref());
                         let unchanged_failure = previous.as_ref().is_some_and(|actual| {
@@ -12604,7 +12609,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             if let Some(attempt) = &refresh_attempt {
                                 fields.insert("attempt".into(), Value::String(attempt.clone()));
                             }
-                            let _ = store.append_claim(&ClaimInput {
+                            let _ = store.append_observer_state(&ClaimInput {
                                 subject: observer_subject.clone(),
                                 kind: "observer.state".into(),
                                 actor: None,
@@ -12615,12 +12620,31 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     "observer-failure:{}",
                                     &failure_hash[..20]
                                 )),
-                            });
+                            }, &revision, &current);
                         }
+                    }
+                }
+                // A cadence change or cancellation may retire this arm while its
+                // writer job waits. Publish only this still-current generation.
+                let revision_current = store.selected_desired_revision(&observer_subject)
+                    .ok().flatten().as_deref() == Some(revision.as_str());
+                let mut active = armed.lock().unwrap_or_else(PoisonError::into_inner);
+                if active.contains(&operation) && revision_current {
+                    if let Some(next_check) = completed_deadline {
+                        deadlines.lock().unwrap_or_else(PoisonError::into_inner)
+                            .insert(deadline_key.clone(), next_check);
+                    }
+                    if let Some(cursor) = completed_cursor {
+                        cursors.lock().unwrap_or_else(PoisonError::into_inner)
+                            .insert(deadline_key.clone(), cursor);
                     }
                 }
                 active.remove(&operation);
                 drop(active);
+                #[cfg(test)]
+                if let Some(injection) = &completion_fault {
+                    injection.fault("observer-completion-finished", &observer_subject);
+                }
                 signal_changed(&notify, &event_notify);
             });
         } else {
@@ -28586,20 +28610,10 @@ subscription "b" {{
 }}"#
         );
         apply_source(&store, &source, "shared-discovery-watch");
-        store
-            .record_resource_observation(
-                "observer/a",
-                &store
-                    .selected_desired_revision("observer/a")
-                    .unwrap()
-                    .unwrap(),
-                None,
-                "resource/repo",
-                Some("baseline"),
-                &serde_json::json!({"issues": []}),
-                now_ms() + 60_000,
-                &[],
-            )
+        store.record_resource_observation("observer/a", &store
+            .selected_desired_revision("observer/a")
+            .unwrap()
+            .unwrap(), None, "resource/repo", Some("baseline"), &serde_json::json!({"issues": []}), now_ms() + 60_000, &[], None)
             .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let reconciler = Reconciler::new(
@@ -29054,20 +29068,10 @@ subscription "reviews" {{
             .unwrap();
         let spec = crate::graph::subscription_spec(&subscription.desired).unwrap();
         let subscriptions = vec![(subscription.subject.clone(), spec)];
-        let baseline = store
-            .record_resource_observation(
-                "observer/repo",
-                &store
-                    .selected_desired_revision("observer/repo")
-                    .unwrap()
-                    .unwrap(),
-                None,
-                "resource/repo",
-                Some("one"),
-                &serde_json::json!({"pull_requests": []}),
-                now_ms() + 60_000,
-                &subscriptions,
-            )
+        let baseline = store.record_resource_observation("observer/repo", &store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap(), None, "resource/repo", Some("one"), &serde_json::json!({"pull_requests": []}), now_ms() + 60_000, &subscriptions, None)
             .unwrap();
         let baseline_claim = baseline
             .observation_claim
@@ -29086,20 +29090,10 @@ subscription "reviews" {{
                 idempotency_key: "occupied-review".into(),
             })
             .unwrap();
-        let changed = store
-            .record_resource_observation(
-                "observer/repo",
-                &store
-                    .selected_desired_revision("observer/repo")
-                    .unwrap()
-                    .unwrap(),
-                None,
-                "resource/repo",
-                Some("two"),
-                &serde_json::json!({"pull_requests": [{"number": 7, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}),
-                now_ms() + 60_000,
-                &subscriptions,
-            )
+        let changed = store.record_resource_observation("observer/repo", &store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap(), None, "resource/repo", Some("two"), &serde_json::json!({"pull_requests": [{"number": 7, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}), now_ms() + 60_000, &subscriptions, None)
             .unwrap();
         // The repository's own facts did not change; only the new item records a claim.
         assert!(changed.observation_claim.is_none());
@@ -29243,17 +29237,7 @@ subscription "reviews" {{
                        head: Option<&str>,
                        state: &str| {
             let pulls = head.map(|head| serde_json::json!([{"number": 4, "head": head, "state": state, "draft": false}])).unwrap_or_else(|| serde_json::json!([]));
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    observer_revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    subscriptions,
-                )
+            store.record_resource_observation("observer/repo", observer_revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls}), now_ms() + 60_000, subscriptions, None)
                 .unwrap();
         };
         let a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -29347,17 +29331,7 @@ subscription "run/{run}/reviews" {{
         let observe = |revision: &str,
                        subscriptions: &Vec<(String, crate::model::SubscriptionSpec)>,
                        pulls: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    subscriptions,
-                )
+            store.record_resource_observation("observer/repo", revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls}), now_ms() + 60_000, subscriptions, None)
                 .unwrap()
         };
         let requested = |subject: &str| {
@@ -29599,17 +29573,7 @@ subscription "run/{run}/reviews" {{
                        head: Option<&str>,
                        state: &str| {
             let pulls = head.map(|head| serde_json::json!([{"number": 4, "head": head, "state": state, "draft": false}])).unwrap_or_else(|| serde_json::json!([]));
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    subscriptions,
-                )
+            store.record_resource_observation("observer/repo", revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls}), now_ms() + 60_000, subscriptions, None)
                 .unwrap();
         };
         let a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -29695,8 +29659,7 @@ subscription "triage" {{
             let issues = issue_title
                 .map(|title| serde_json::json!([{"number": 5, "title": title}]))
                 .unwrap_or_else(|| serde_json::json!([]));
-            store.record_resource_observation("observer/repo", revision, None, "resource/repo", None,
-                &serde_json::json!({"repository_id": 17, "pull_requests": pulls, "issues": issues}), now_ms() + 60_000, subscriptions).unwrap();
+            store.record_resource_observation("observer/repo", revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls, "issues": issues}), now_ms() + 60_000, subscriptions, None).unwrap();
         };
         {
             let store = Store::open(&path, "node").unwrap();
@@ -29834,17 +29797,7 @@ subscription "reviews" {
             .unwrap()
             .unwrap();
         let observe = |pulls: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &observer_revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &observer_revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls}), now_ms() + 60_000, &subscriptions, None)
                 .unwrap();
         };
         observe(serde_json::json!([]));
@@ -29988,17 +29941,7 @@ subscription "reviews" {
                 "state": "open", "draft": false
             }]),
         ] {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &observer_revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &observer_revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls}), now_ms() + 60_000, &subscriptions, None)
                 .unwrap();
         }
         assert_eq!(
@@ -30080,20 +30023,10 @@ subscription "triage" {{
         facts: &Value,
         subscriptions: &[(String, crate::model::SubscriptionSpec)],
     ) {
-        store
-            .record_resource_observation(
-                "observer/repo",
-                &store
-                    .selected_desired_revision("observer/repo")
-                    .unwrap()
-                    .unwrap(),
-                None,
-                "resource/repo",
-                None,
-                facts,
-                now_ms() + 60_000,
-                subscriptions,
-            )
+        store.record_resource_observation("observer/repo", &store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap(), None, "resource/repo", None, facts, now_ms() + 60_000, subscriptions, None)
             .unwrap();
     }
 
@@ -30155,17 +30088,7 @@ subscription "mentions" { observer "observer/repo"; on "mentions"; to "agent/exa
             .unwrap()
             .unwrap();
         let observe = |facts: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &facts,
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &revision, None, "resource/repo", None, &facts, now_ms() + 60_000, &subscriptions, None)
                 .unwrap()
         };
         let facts_of =
@@ -30317,17 +30240,7 @@ subscription "pulls" { observer "observer/repo"; on "pull_requests"; to "agent/e
             .unwrap()
             .unwrap();
         let observe = |facts: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &facts,
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &revision, None, "resource/repo", None, &facts, now_ms() + 60_000, &subscriptions, None)
                 .unwrap()
         };
         let recent = |number: u64| {
@@ -30476,17 +30389,7 @@ agent "example.reviewer" { workspace "/tmp"; command "true" }"#,
                 .selected_desired_revision(&self.observer)
                 .unwrap()
                 .unwrap();
-            self.store
-                .record_resource_observation(
-                    &self.observer,
-                    &revision,
-                    None,
-                    &self.resource,
-                    None,
-                    &facts,
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            self.store.record_resource_observation(&self.observer, &revision, None, &self.resource, None, &facts, now_ms() + 60_000, &subscriptions, None)
                 .unwrap()
         }
 
@@ -31004,17 +30907,7 @@ mission "intake" state="ready" {{
                     .then(|| (item.subject.clone(), spec))
                 })
                 .collect::<Vec<_>>();
-            store
-                .record_resource_observation(
-                    observer_subject,
-                    &store.selected_desired_revision(observer_subject).unwrap().unwrap(),
-                    None,
-                    resource,
-                    Some(cursor),
-                    &serde_json::json!({"repository_id": 41, "pull_requests": pulls, "issues": issues}),
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation(observer_subject, &store.selected_desired_revision(observer_subject).unwrap().unwrap(), None, resource, Some(cursor), &serde_json::json!({"repository_id": 41, "pull_requests": pulls, "issues": issues}), now_ms() + 60_000, &subscriptions, None)
                 .unwrap();
         };
         let requested = |subscription: &str| {
@@ -31221,17 +31114,7 @@ subscription "mentions" {{
             .unwrap()
             .unwrap();
         let observe = |pulls: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 7, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 7, "pull_requests": pulls}), now_ms() + 60_000, &subscriptions, None)
                 .unwrap()
         };
         let requests = |subscription: &str| {
@@ -31474,17 +31357,7 @@ subscription "curate" {
             .unwrap()
             .unwrap();
         let observe = |facts: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &facts,
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &revision, None, "resource/repo", None, &facts, now_ms() + 60_000, &subscriptions, None)
                 .unwrap()
         };
         let reconciler = Reconciler::new(
@@ -31847,17 +31720,7 @@ subscription "reviews" {
             .unwrap()
             .unwrap();
         let observe = |pulls, deliveries: &[(String, crate::model::SubscriptionSpec)]| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &observer_revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 7, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    deliveries,
-                )
+            store.record_resource_observation("observer/repo", &observer_revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 7, "pull_requests": pulls}), now_ms() + 60_000, deliveries, None)
                 .unwrap()
         };
         observe(serde_json::json!([]), &[]);

@@ -1107,22 +1107,12 @@ async fn stop_then_start_keeps_a_github_watch_and_its_queued_wake() {
             })
             .collect::<Vec<_>>();
         fixture
+            .store.record_resource_observation(&thread.observer(), &fixture
             .store
-            .record_resource_observation(
-                &thread.observer(),
-                &fixture
-                    .store
-                    .selected_desired_revision(&thread.observer())
-                    .unwrap()
-                    .unwrap(),
-                None,
-                &thread.resource(),
-                None,
-                &json!({"repository_id": 7, "issues": [{"number": 12, "new": false,
-                "state": "open", "title": "Example thread", "recent_comments": comments}]}),
-                0,
-                &subscriptions,
-            )
+            .selected_desired_revision(&thread.observer())
+            .unwrap()
+            .unwrap(), None, &thread.resource(), None, &json!({"repository_id": 7, "issues": [{"number": 12, "new": false,
+        "state": "open", "title": "Example thread", "recent_comments": comments}]}), 0, &subscriptions, None)
             .unwrap();
     };
     observe(json!([]));
