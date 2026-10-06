@@ -12,6 +12,10 @@ mod owned_sets_tests;
 mod resources;
 mod rollouts;
 mod seat_status;
+mod canonical;
+mod latest_values;
+use latest_values::{current_sql, harness_sql};
+pub use latest_values::{is_current_input, is_current_value};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -2449,6 +2453,90 @@ impl Store {
         Ok(Self { graph, smalltalk })
     }
 
+    #[cfg(test)]
+    pub(crate) fn append_legacy_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
+        self.append_legacy_claim_outcome(input).map(|p| p.0)
+    }
+    #[cfg(test)]
+    fn append_legacy_claim_outcome(
+        &self,
+        input: &ClaimInput,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        append_claim_with_subject_fences_mode(&self.graph, input, None, None, None, false)
+    }
+
+    fn refresh_current_caches(&self) -> Result<()> {
+        let connection = self.readers.get();
+        let current: u64 = connection.query_row(
+            "SELECT coalesce(max(local_id),0) FROM latest_values",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut seen = self
+            .smalltalk
+            .latest_cache_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *seen != current {
+            let subjects = connection
+                .prepare_cached("SELECT DISTINCT subject FROM latest_values WHERE local_id>?1")?
+                .query_map([*seen], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut cache = self
+                .smalltalk
+                .subject_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for subject in subjects {
+                cache.statuses.remove(&subject);
+                cache.views.remove(&subject);
+            }
+            drop(cache);
+            self.smalltalk
+                .agent_status_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+            self.smalltalk
+                .agent_resources_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+            *seen = current;
+        }
+        Ok(())
+    }
+
+    pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
+        if kind.is_some_and(is_current_value) {
+            let connection = self.readers.get();
+            let query = format!(
+                "SELECT {CLAIM_COLUMNS} FROM registered_claims AS claims
+                WHERE subject=?1 AND kind=?2 ORDER BY length(accepted_at_unix_ms) DESC,
+                accepted_at_unix_ms DESC,id DESC LIMIT 1"
+            );
+            if let Some(record) = connection
+                .query_row(&query, params![subject, kind], claim_from_row)
+                .optional()?
+            {
+                if let Some(legacy) = self.graph.latest_claim(subject, kind)?
+                    && legacy.accepted_at_unix_ms > record.accepted_at_unix_ms
+                {
+                    return Ok(Some(legacy));
+                }
+                return Ok(Some(record));
+            }
+        }
+        self.graph.latest_claim(subject, kind)
+    }
+
+    pub fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
+        if id.starts_with("local-observation/") {
+            return claim_by_id_tx(&self.readers.get(), id);
+        }
+        self.graph.claim_by_id(id)
+    }
+
     /// Open a shared-memory store for sequential fixtures and short-lived tools.
     /// Concurrent server tests should use [`Self::open`]: shared-cache read/write
     /// contention returns `SQLITE_LOCKED` immediately instead of waiting.
@@ -2544,6 +2632,7 @@ impl Store {
         history: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        self.refresh_current_caches()?;
         let mut cache = self
             .smalltalk
             .agent_resources_cache
@@ -9800,6 +9889,7 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        self.refresh_current_caches()?;
         // Agent listings are expensive on large graphs. Hold this lock while building the
         // snapshot so concurrent callers share one reduction, then serve clones at the same
         // store index. A later index always rebuilds, preserving snapshot semantics.
@@ -9856,7 +9946,7 @@ impl Store {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-        let subjects = if prefix.starts_with("arrangement/") {
+        let mut subjects = if prefix.starts_with("arrangement/") {
             connection.prepare_cached("SELECT subject FROM arrangements WHERE subject>=?1 AND subject<?2 ORDER BY subject")?
                 .query_map(params![prefix, prefix_upper_bound(prefix).context("arrangement prefix bound")?], |row| row.get::<_,String>(0))?
                 .collect::<Result<BTreeSet<_>,_>>()?
@@ -9872,12 +9962,19 @@ impl Store {
                 .prepare(
                     "SELECT DISTINCT subject FROM claims
                      WHERE store_index<=?1 AND subject GLOB ?2 ORDER BY subject",
-                )?
-                .query_map(params![store_index, format!("{prefix}*")], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .collect::<Result<BTreeSet<_>, _>>()?,
-        }};
+                    )?
+                    .query_map(params![store_index, format!("{prefix}*")], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<BTreeSet<_>, _>>()?,
+            }
+        };
+        subjects.extend(
+            connection
+                .prepare_cached("SELECT subject FROM latest_values WHERE subject GLOB ?1")?
+                .query_map([format!("{prefix}*")], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
         drop(connection);
         self.status_for_subject_names_at(subjects, store_index, include_history)
     }
@@ -9889,6 +9986,7 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        self.refresh_current_caches()?;
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
@@ -10147,6 +10245,7 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        self.refresh_current_caches()?;
         self.status_at_view_for_names(
             selected,
             selected_owner_run,
@@ -10359,8 +10458,8 @@ impl Store {
         let mut statement = connection.prepare_cached(
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
              FROM desired WHERE kind='agent'
-               AND EXISTS (SELECT 1 FROM claims INDEXED BY claims_harness_login_candidate_index
-                 WHERE claims.subject=desired.subject AND (
+               AND EXISTS (SELECT 1 FROM current_claims
+                 WHERE current_claims.subject=desired.subject AND (
                    (kind='harness.observed' AND (
                      json_type(body, '$.fields.provider_auth')='false'
                      OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
@@ -10385,7 +10484,7 @@ impl Store {
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired
              WHERE kind='agent' AND json_extract(member, '$.host')=?1
                AND (EXISTS (SELECT 1 FROM json_each(body, '$.children') child WHERE json_extract(child.value, '$.name')='checkout')
-                    OR EXISTS (SELECT 1 FROM claims WHERE claims.subject=desired.subject AND claims.kind='workspace.observed'))
+                    OR EXISTS (SELECT 1 FROM current_claims WHERE current_claims.subject=desired.subject AND current_claims.kind='workspace.observed'))
              ORDER BY subject",
         )?;
         let rows = statement.query_map([host], desired_from_row)?;
@@ -10399,11 +10498,11 @@ impl Store {
     ) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
         connection
-            .prepare_cached(&format!(
+            .prepare_cached(&current_sql(&format!(
                 "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
              WHERE claims.subject=?1 AND claims.kind='workspace.observed' AND claims.origin=?2
              ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1",
-            ))?
+            )))?
             .query_row(params![subject, host], smallclaims::store::claim_from_row)
             .optional()
             .map_err(Into::into)
@@ -11528,6 +11627,9 @@ impl Store {
     pub fn latest_observation(&self, subject: &str, kind: &str) -> Result<Option<ClaimRecord>> {
         smallclaims::touched::note_read(|| subject.to_owned());
         let claim = self.latest_claim(subject, Some(kind))?;
+        if is_current_value(kind) && kind != "harness.usage" {
+            return Ok(claim);
+        }
         let local = {
             let connection = self.readers.get();
             connection
@@ -11554,7 +11656,7 @@ impl Store {
             return Ok(BTreeMap::new());
         }
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(&format!(
+        let mut statement = connection.prepare_cached(&current_sql(&format!(
             "SELECT {CLAIM_COLUMNS} FROM json_each(?1) subjects
              CROSS JOIN (
                  SELECT 'harness.todo.observed' AS kind
@@ -11568,9 +11670,12 @@ impl Store {
                  ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1
              )
              JOIN batches ON batches.id=claims.batch_id"
-        ))?;
+        )))?;
         let rows = statement.query_map(
-            params![serde_json::to_string(subjects)?, at_index.min(i64::MAX as u64)],
+            params![
+                serde_json::to_string(subjects)?,
+                at_index.min(i64::MAX as u64)
+            ],
             claim_from_row,
         )?;
         let mut observations = BTreeMap::<String, BTreeMap<String, ClaimRecord>>::new();
@@ -13790,7 +13895,7 @@ impl Store {
     ) -> Result<Option<UsageSummary>> {
         let connection = self.readers.get();
         let at_index = at_index.unwrap_or(i64::MAX as u64);
-        let mut statement = connection.prepare(&canonical_sql(
+        let mut statement = connection.prepare(&current_canonical_sql(
             "SELECT store_index, body, accepted_at_unix_ms FROM claims
              WHERE subject=?1 AND kind='harness.usage' AND store_index<=?2
              ORDER BY CANONICAL_ASC(claims)",
@@ -13842,7 +13947,7 @@ impl Store {
                  ORDER BY subject, length(accepted_at_unix_ms), accepted_at_unix_ms",
                 at_index.unwrap_or(i64::MAX as u64)
             );
-            let mut statement = connection.prepare(&sql)?;
+            let mut statement = connection.prepare(&current_sql(&sql))?;
             let rows = statement.query_map(rusqlite::params_from_iter(chunk), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -15086,7 +15191,7 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                &canonical_sql(
+                &current_canonical_sql(
                     "SELECT body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
              AND json_extract(body, '$.fields.incarnation_id')=?2
              AND json_type(body, '$.fields.provider_auth') IN ('true','false')
@@ -15158,6 +15263,27 @@ impl Store {
         current_harness_at(&connection, subject, None)
     }
 
+    pub(crate) fn flush_pending_usage(
+        &self,
+        subject: &str,
+        incarnation: &str,
+    ) -> Result<bool, St3Error> {
+        let connection = self.readers.get();
+        let pending: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_latest_slots WHERE subject=?1 AND kind='harness.usage'
+             AND pending_local_id IS NOT NULL)", [subject], |r| r.get(0)).map_err(internal)?;
+        drop(connection);
+        if !pending {
+            return Ok(false);
+        }
+        self.connection
+            .batched(|tx| {
+                publish_pending_usage_tx(tx, &self.origin, subject, incarnation, now_ms())
+                    .map(|claims| !claims.is_empty())
+            })
+            .map_err(|e| St3Error::new("internal", e))?
+    }
+
     /// Positive attachment proof under the indexed current-incarnation diagnostic fence.
     pub(crate) fn claude_channel_attached(&self, subject: &str, incarnation: &str) -> Result<bool> {
         smallclaims::touched::note_read(|| subject.to_owned());
@@ -15175,7 +15301,8 @@ impl Store {
     pub fn harness_was_ready(&self, subject: &str, incarnation: &str) -> Result<bool> {
         let connection = self.readers.get();
         let found: i64 = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM claims
+            "SELECT EXISTS(SELECT 1 FROM latest_readiness WHERE subject=?1 AND incarnation=?2 AND ready=1)
+             OR EXISTS(SELECT 1 FROM claims
              WHERE subject=?1 AND kind='harness.observed'
                AND json_extract(body, '$.fields.incarnation_id')=?2
                AND json_extract(body, '$.fields.state') IN ('ready','working','idle')
@@ -17676,6 +17803,15 @@ fn registered_client_claim_kind(kind: &str) -> bool {
     st3_schema::is_known_claim(kind)
 }
 
+// Current-state folds share canonical ordering with legacy facts during mixed-build rollout.
+fn canonical_sql(sql: &str) -> String {
+    smallclaims::store::canonical::canonical_sql(sql)
+}
+
+fn current_canonical_sql(sql: &str) -> String {
+    current_sql(&canonical_sql(sql))
+}
+
 const LOCAL_OBSERVATION_COLUMNS: &str = "SELECT id, after_store_index, subject, kind, actor, body, observed_at_unix_ms FROM local_observations";
 
 const LOCAL_OBSERVATION_ID_PREFIX: &str = "local-observation/";
@@ -18104,10 +18240,10 @@ fn latest_claim_of_kind_tx(
 ) -> Result<Option<ClaimRecord>, St3Error> {
     transaction
         .query_row(
-            &format!(
+            &current_sql(&format!(
                 "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
                  WHERE claims.subject=?1 AND claims.kind=?2 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
-            ),
+            )),
             params![subject, kind],
             claim_from_row,
         )
@@ -18465,7 +18601,7 @@ fn publish_pending_usage_tx(
                 "{LOCAL_OBSERVATION_COLUMNS} WHERE id IN (
                     SELECT pending_local_id FROM local_latest_slots
                     WHERE subject=?1 AND kind='harness.usage' AND pending_local_id IS NOT NULL
-                 ) ORDER BY id"
+                 ) AND coalesce(json_extract(body,'$.fields.semantics'),'')!='context_occupancy' ORDER BY id"
             ))
             .map_err(internal)?;
         let rows = statement
@@ -18703,7 +18839,7 @@ fn renew_nested_ancestor_leases_tx(
 
 fn claim_by_id_tx(connection: &Connection, id: &str) -> Result<Option<ClaimRecord>> {
     connection
-        .prepare_cached("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms FROM claims WHERE id=?1")?
+        .prepare_cached("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms FROM current_claims WHERE id=?1")?
         .query_row(
             [id],
             claim_from_row,
@@ -19787,13 +19923,14 @@ fn harness_observations_without_incarnation_query() -> String {
 }
 
 fn newest_claims_of_kind_query(columns: &str, kind: &str) -> String {
-    format!(
+    let query = format!(
         "SELECT {columns}
          FROM claims INDEXED BY claims_subject_kind_accepted_index
          JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1 AND claims.kind='{kind}' AND +claims.store_index<=?2
          ORDER BY {CANONICAL_ORDER_DESC}"
-    )
+    );
+    query
 }
 
 fn check_mailbox_incarnation(
@@ -19829,10 +19966,17 @@ fn check_mailbox_incarnation(
             ))
     {
         let harness: Option<String> = connection
-            .prepare_cached(&format!(
-                "{} LIMIT 1",
-                newest_claims_of_kind_query("claims.body", "harness.observed")
-            ))
+            .prepare_cached(
+                &harness_sql(
+                    connection,
+                    &fence.subject,
+                    &format!(
+                        "{} LIMIT 1",
+                        newest_claims_of_kind_query("claims.body", "harness.observed")
+                    ),
+                )
+                .map_err(internal)?,
+            )
             .map_err(internal)?
             .query_row(params![fence.subject, i64::MAX], |row| row.get(0))
             .optional()
@@ -19895,7 +20039,11 @@ fn mailbox_harness_ended(
     let mut latest = None;
     for observed_incarnation in [Some(incarnation), None] {
         let observation: Option<(String, String)> = connection
-            .prepare_cached(&newest_mailbox_harness_state_query())?
+            .prepare_cached(&harness_sql(
+                connection,
+                subject,
+                &newest_mailbox_harness_state_query(),
+            )?)?
             .query_row(params![subject, observed_incarnation], |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })
@@ -20221,12 +20369,20 @@ fn current_harness_fold_at(
     }
 
     // A native credential refusal is independent of activity, and work claims cannot erase it.
-    let auth = connection.prepare_cached(&canonical_sql(
+    let auth_query = canonical_sql(
         "SELECT id, accepted_at_unix_ms, body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
          AND +store_index<=?2 AND json_extract(body, '$.fields.incarnation_id')=?3
          AND json_type(body, '$.fields.provider_auth') IN ('true','false')
-         ORDER BY CANONICAL_DESC(claims) LIMIT 1"))?.query_row(params![subject, at_index, incarnation_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1");
+    let auth = connection
+        .prepare_cached(&harness_sql(connection, subject, &auth_query)?)?
+        .query_row(params![subject, at_index, incarnation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
         .optional()?;
     let mut auth_restored = false;
     if let Some((claim, time, body)) = auth {
@@ -20319,7 +20475,11 @@ fn current_harness_fold_at(
         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     };
     let mut unnamed = connection
-        .prepare_cached(&harness_observations_without_incarnation_query())?
+        .prepare_cached(&harness_sql(
+            connection,
+            subject,
+            &harness_observations_without_incarnation_query(),
+        )?)?
         .query_map(params![subject, at_index, runtime_key.0.to_string()], row)?
         .map(|row| {
             let (claim, body, observed_at_unix_ms) = row?;
@@ -20330,7 +20490,11 @@ fn current_harness_fold_at(
         .collect::<Result<Vec<_>>>()?;
     unnamed.sort_by(|a, b| b.0.cmp(&a.0));
     let mut unnamed = unnamed.into_iter().peekable();
-    let mut statement = connection.prepare_cached(&harness_observations_of_incarnation_query())?;
+    let mut statement = connection.prepare_cached(&harness_sql(
+        connection,
+        subject,
+        &harness_observations_of_incarnation_query(),
+    )?)?;
     let mut named = statement.query_map(params![subject, at_index, incarnation_id], row)?;
     let mut next_named = None;
     let mut current = None;
@@ -20486,6 +20650,24 @@ fn agent_working_since_at(
     incarnation: &str,
     snapshot_index: u64,
 ) -> Result<Option<u128>> {
+    let register: Option<(String, String)> = connection
+        .query_row(
+            "SELECT body,source_at FROM latest_values WHERE subject=?1 AND kind='harness.observed'",
+            [agent],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)?.to_string())),
+        )
+        .optional()?;
+    if let Some((body, at)) = register {
+        let body: Value = serde_json::from_str(&body)?;
+        return Ok((body["fields"]["incarnation_id"] == incarnation
+            && body["fields"]["state"] == "working")
+            .then(|| {
+                body["fields"]["observed_since_ms"]
+                    .as_u64()
+                    .map(u128::from)
+                    .unwrap_or_else(|| at.parse().unwrap_or_default())
+            }));
+    }
     // Stream accepted-time groups backwards. Resolve complete canonical keys only for
     // ties, before applying the state fold. Non-working ends the episode; null does not.
     // Tie lookups must share the stream's cut, including for standalone callers.
@@ -31642,7 +31824,7 @@ agent "test/empty" { command "true" }
     fn one_divergent_envelope_exchanges_only_its_inventory_range() {
         let observe = |store: &Store, subject: &str, number: usize| {
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "transport.observed".into(),
                     actor: None,
@@ -33182,7 +33364,7 @@ observer "ordered/file" {
         let store = Store::open_memory("node").unwrap();
         let observe = |subject: &str, runtime_id: &str| {
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "runtime.observed".into(),
                     actor: None,
@@ -33200,7 +33382,7 @@ observer "ordered/file" {
         let first_index = observe("agent/selected", "selected");
         observe("exec/also-runtime", "also-runtime");
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/unrelated".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -33415,24 +33597,25 @@ observer "ordered/file" {
                     &incarnation,
                 );
             } else {
-                store
-                    .append_claim(&ClaimInput {
-                        subject: subject.clone(),
-                        kind: "harness.observed".into(),
-                        actor: Some(subject.clone()),
-                        fields: BTreeMap::from([
-                            (
-                                "state".into(),
-                                Value::String(states[next() % states.len()].into()),
-                            ),
-                            ("incarnation_id".into(), Value::String(incarnation)),
-                            ("driver".into(), Value::String("claude".into())),
-                        ]),
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: None,
-                    })
-                    .unwrap();
+                let result = store.append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "harness.observed".into(),
+                    actor: Some(subject.clone()),
+                    fields: BTreeMap::from([
+                        (
+                            "state".into(),
+                            Value::String(states[next() % states.len()].into()),
+                        ),
+                        ("incarnation_id".into(), Value::String(incarnation)),
+                        ("driver".into(), Value::String("claude".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                });
+                if let Err(error) = result {
+                    assert_eq!(error.code, "stale-harness-event-session");
+                }
             }
             if step % 6 != 5 {
                 continue;
@@ -37223,7 +37406,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         for unknown_kind in [false, true] {
             let source = Store::open_memory("source").unwrap();
             let valid = source
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: "host/source".into(),
                     kind: "transport.observed".into(),
                     actor: None,
@@ -37280,7 +37463,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             );
 
             source
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: "host/later".into(),
                     kind: "transport.observed".into(),
                     actor: None,
@@ -37306,7 +37489,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn an_unknown_field_is_retryable_and_an_old_schema_rejection_is_readmitted() {
         let source = Store::open_memory("source").unwrap();
         let claim = source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -37372,7 +37555,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn a_claim_field_from_a_newer_schema_is_unknown_instead_of_invalid() {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -37422,7 +37605,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn one_invalid_blob_does_not_block_an_unrelated_valid_claim() {
         let source = Store::open_memory("source").unwrap();
         let valid = source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -37483,7 +37666,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn same_sequence_candidates_converge_in_any_receipt_order() {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -37701,7 +37884,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             ("running", "inc-1"),
         ] {
             source
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: agent.into(),
                     kind: "runtime.observed".into(),
                     actor: None,
@@ -37717,7 +37900,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         }
         for (state, observed_at) in [("idle", 1_000), ("working", 2_000), ("idle", 3_000)] {
             source
-                .append_claim_outcome(&harness_state(agent, state, observed_at))
+                .append_legacy_claim_outcome(&harness_state(agent, state, observed_at))
                 .unwrap();
         }
         let envelopes = exchange_from(&source, &ReplicationInventory::default()).envelopes;
@@ -38185,8 +38368,16 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
 
         // Different envelopes cannot be compared, so they leave the last comparison standing.
         let compared = diverged.graph_compared_at_unix_ms;
-        left.record_transport_observation("right", "up", None, None)
-            .unwrap();
+        left.append_legacy_claim(&ClaimInput {
+            subject: "host/right".into(),
+            kind: "transport.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([("status".into(), json!("up"))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
         let moved = summary(&left, &right, "left");
         assert_eq!(moved.peer_only_envelopes, 1);
         assert_eq!(moved.graph_compared_at_unix_ms, compared);
@@ -38288,7 +38479,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn an_explicit_repair_keeps_the_bad_record_and_names_its_replacement() {
         let source = Store::open_memory("source").unwrap();
         let replacement = source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -38476,7 +38667,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         let target = Store::open_memory("birch").unwrap();
         let observation = |reason: &str, key: &str| {
             source
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: "daemon/alder".into(),
                     kind: "daemon.diagnostic".into(),
                     actor: None,
@@ -38615,7 +38806,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             let source = Store::open_memory("source").unwrap();
             for index in 0..4 {
                 source
-                    .append_claim(&ClaimInput {
+                    .append_legacy_claim(&ClaimInput {
                         subject: format!("host/source-{index}"),
                         kind: "transport.observed".into(),
                         actor: None,
@@ -38665,7 +38856,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn replication_rejects_tampered_claims() {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -38689,7 +38880,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn insertion_order_hashed_batch() -> ReplicationBatch {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -38857,7 +39048,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn replication_rejects_a_registered_claim_that_violates_the_schema() {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -38937,7 +39128,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn replication_relays_each_origin_across_multiple_peers() {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -40587,7 +40778,7 @@ version 2
     /// only `observed_at_ms` would stay in the local observation log.
     fn observe_harness(store: &Store, observed_at_ms: u64) {
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "agent/example".into(),
                 kind: "harness.observed".into(),
                 actor: Some("agent/example".into()),
@@ -42497,7 +42688,7 @@ mission "nested-work" state="ready" {
         {
             ids.push(
                 store
-                    .append_claim(&ClaimInput {
+                    .append_legacy_claim(&ClaimInput {
                         subject: agent.into(),
                         kind: "harness.observed".into(),
                         actor: Some(agent.into()),
@@ -42844,7 +43035,7 @@ mission "nested-work" state="ready" {
         let local = Store::open_memory("host-one").unwrap();
         let subject = "agent/example.worker";
         let seed = local
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "harness.observed".into(),
                 actor: Some(subject.into()),
@@ -42902,7 +43093,7 @@ mission "nested-work" state="ready" {
             .unwrap();
         assert_eq!(rollup.fields["total_tokens"], 29);
         assert_eq!(rollup.fields["host"], "host-one");
-        local.append_claim(&rollup).unwrap();
+        local.append_legacy_claim(&rollup).unwrap();
         let baseline = rollup.fields["observed_at_unix_ms"].as_u64().unwrap();
         let (repeated, appended) = local.append_claim_outcome(&first).unwrap();
         assert!(!appended);
@@ -42926,7 +43117,7 @@ mission "nested-work" state="ready" {
             .unwrap()
             .unwrap();
         assert_eq!(rollup.fields["total_tokens"], 65);
-        local.append_claim(&rollup).unwrap();
+        local.append_legacy_claim(&rollup).unwrap();
         let mut replay = second.clone();
         replay
             .fields
@@ -43213,7 +43404,7 @@ mission "nested-work" state="ready" {
         let subject = "agent/example.worker";
         let observed = |state: &str, key: &str| {
             local
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "harness.observed".into(),
                     actor: Some(subject.into()),
@@ -43636,7 +43827,7 @@ mission "nested-work" state="ready" {
     }
 
     #[test]
-    fn a_harness_state_replicates_only_when_it_changes() {
+    fn legacy_harness_state_replicates_only_when_it_changes() {
         let store = Store::open_memory("node").unwrap();
         let subject = "agent/node.worker";
         let inventory_before = store.replication_inventory().unwrap().envelopes.len();
@@ -43650,7 +43841,7 @@ mission "nested-work" state="ready" {
             ("working", 903_000, true),
         ] {
             let (record, appended) = store
-                .append_claim_outcome(&harness_state(subject, state, observed_at))
+                .append_legacy_claim_outcome(&harness_state(subject, state, observed_at))
                 .unwrap();
             assert!(appended);
             assert_eq!(
@@ -43663,7 +43854,7 @@ mission "nested-work" state="ready" {
             }
         }
         let (repeated, appended) = store
-            .append_claim_outcome(&harness_state(subject, "idle", 902_000))
+            .append_legacy_claim_outcome(&harness_state(subject, "idle", 902_000))
             .unwrap();
         assert!(!appended);
         assert!(local_observation_position(&repeated).is_some());
@@ -43730,7 +43921,7 @@ mission "nested-work" state="ready" {
                 })
                 .collect::<Vec<_>>()
         };
-        let occupancy = |tokens: u64| ("context_occupancy".to_owned(), tokens);
+        let occupancy = |tokens: u64| ("session_cumulative".to_owned(), tokens);
         store
             .append_claim_outcome(&harness_state(subject, "working", 1))
             .unwrap();
@@ -43743,13 +43934,13 @@ mission "nested-work" state="ready" {
                 .unwrap()
         };
 
-        assert!(local_observation_position(&usage("context_occupancy", 10, 0, start).0).is_none());
+        assert!(local_observation_position(&usage("session_cumulative", 10, 0, start).0).is_none());
         assert!(
-            local_observation_position(&usage("context_occupancy", 20, 0, start + minute).0)
+            local_observation_position(&usage("session_cumulative", 20, 0, start + minute).0)
                 .is_some()
         );
         assert!(
-            local_observation_position(&usage("context_occupancy", 30, 0, start + 2 * minute).0)
+            local_observation_position(&usage("session_cumulative", 30, 0, start + 2 * minute).0)
                 .is_some()
         );
         assert_eq!(
@@ -43758,33 +43949,33 @@ mission "nested-work" state="ready" {
             "while working, a changed reading waits for the interval"
         );
         assert!(
-            local_observation_position(&usage("session_cumulative", 500, 0, start + 2 * minute).0)
+            local_observation_position(&usage("response_rollup", 500, 0, start + 2 * minute).0)
                 .is_none(),
             "each semantics has its own slot"
         );
         assert!(
-            local_observation_position(&usage("context_occupancy", 5, 1, start + 3 * minute).0)
+            local_observation_position(&usage("session_cumulative", 5, 1, start + 3 * minute).0)
                 .is_none(),
             "a compaction replicates at once"
         );
         assert!(
-            local_observation_position(&usage("context_occupancy", 15, 1, start + 4 * minute).0)
+            local_observation_position(&usage("session_cumulative", 15, 1, start + 4 * minute).0)
                 .is_some()
         );
         assert!(
-            local_observation_position(&usage("context_occupancy", 25, 1, start + 9 * minute).0)
+            local_observation_position(&usage("session_cumulative", 25, 1, start + 9 * minute).0)
                 .is_none(),
             "the interval has passed since the last replicated reading"
         );
         assert!(
-            local_observation_position(&usage("context_occupancy", 35, 1, start + 10 * minute).0)
+            local_observation_position(&usage("session_cumulative", 35, 1, start + 10 * minute).0)
                 .is_some()
         );
         assert_eq!(
             usage_claims(&store),
             [
                 occupancy(10),
-                ("session_cumulative".into(), 500),
+                ("response_rollup".into(), 500),
                 occupancy(5),
                 occupancy(25),
             ]
@@ -43793,6 +43984,7 @@ mission "nested-work" state="ready" {
         store
             .append_claim_outcome(&harness_state(subject, "idle", 2))
             .unwrap();
+        store.flush_pending_usage(subject, "inc-1").unwrap();
         assert_eq!(
             usage_claims(&store).last(),
             Some(&occupancy(35)),
@@ -43804,11 +43996,11 @@ mission "nested-work" state="ready" {
             .unwrap();
         assert_eq!(usage_claims(&store).len(), settled, "nothing was pending");
         assert!(
-            local_observation_position(&usage("context_occupancy", 36, 1, start + 11 * minute).0)
+            local_observation_position(&usage("session_cumulative", 36, 1, start + 11 * minute).0)
                 .is_none(),
             "an idle harness replicates its usage at once"
         );
-        assert_eq!(store.local_observations_after(0, 100).unwrap().len(), 12);
+        assert_eq!(store.local_observations_after(0, 100).unwrap().len(), 10);
     }
 
     #[test]
@@ -48600,7 +48792,7 @@ message "human-attention" {
             .unwrap();
         let append = |name: &str, kind: &str, fields: Value| {
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: format!("agent/node.{name}"),
                     kind: kind.into(),
                     actor: Some(format!("agent/node.{name}")),
@@ -48704,7 +48896,7 @@ message "human-attention" {
         let subject = "agent/node.worker";
         let runtime = |incarnation: &str, key: &str| {
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "runtime.observed".into(),
                     actor: None,
@@ -48730,7 +48922,7 @@ message "human-attention" {
                 fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
             }
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "harness.observed".into(),
                     actor: Some(subject.into()),
@@ -48777,7 +48969,7 @@ message "human-attention" {
         );
         harness(Some("new"), "harness-new");
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "harness.observed".into(),
                 actor: Some(subject.into()),
@@ -48810,7 +49002,7 @@ message "human-attention" {
             complete.insert(field.into(), Value::Null);
         }
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "harness.observed".into(),
                 actor: Some(subject.into()),
@@ -48826,7 +49018,7 @@ message "human-attention" {
         assert_eq!(complete.reason, None);
 
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "runtime.readiness-deadline-reached".into(),
                 actor: None,
@@ -49150,7 +49342,7 @@ message "human-attention" {
         for i in 0..602 {
             let subject = subjects[i % 2];
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "harness.usage".into(),
                     actor: Some(subject.into()),
@@ -49984,14 +50176,35 @@ fn append_claim_with_subject_fences(
     event_runtime: Option<&str>,
     expected_subjects: Option<&BTreeMap<String, String>>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_claim_with_subject_fences_mode(
+        graph,
+        input,
+        fence,
+        event_runtime,
+        expected_subjects,
+        true,
+    )
+}
+
+fn append_claim_with_subject_fences_mode(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    fence: Option<&crate::mailbox::Fence>,
+    event_runtime: Option<&str>,
+    expected_subjects: Option<&BTreeMap<String, String>>,
+    registers: bool,
+) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
+    if registers && is_current_input(input) {
+        return latest_values::append(graph, input, now_ms(), event_runtime);
+    }
     if local_retention(&input.kind)
         || (input.actor.is_none() && system_local_retention(&input.kind))
     {
         return append_local_observation_fenced(graph, input, event_runtime);
     }
     if latest_retention(&input.kind) {
-        return append_latest_observation_fenced(graph, input, now_ms(), event_runtime);
+        return append_legacy_graph_observation_fenced(graph, input, now_ms(), event_runtime);
     }
     let operation = claim_operation(input)?;
     // One claim in a savepoint of the writer's next batch; its caller hears back once that
@@ -50323,7 +50536,22 @@ fn append_latest_observation(
     append_latest_observation_fenced(graph, input, now, None)
 }
 
+#[cfg(test)]
 fn append_latest_observation_fenced(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    now: u128,
+    event_runtime: Option<&str>,
+) -> Result<(ClaimRecord, bool), St3Error> {
+    if is_current_input(input) {
+        return latest_values::append(graph, input, now, event_runtime);
+    }
+    append_legacy_graph_observation_fenced(graph, input, now, event_runtime)
+}
+
+// Numeric readings retain their durable publication policy. Also used to construct authentic
+// older-build history in mixed-version replication/checkpoint tests.
+fn append_legacy_graph_observation_fenced(
     graph: &GraphStore,
     input: &ClaimInput,
     now: u128,
@@ -50705,11 +50933,14 @@ mod harness_event_tests {
         let (first, changed) = store.append_harness_event(&input).unwrap();
         assert!(changed);
         let (replay, changed) = store.append_harness_event(&input).unwrap();
-        assert!(!changed);
+        assert!(changed);
         assert_eq!(replay.body["fields"], first.body["fields"]);
         let original = input.claim.fields.clone();
-        input.claim.fields.insert("source_op".into(), json!("hydrate"));
-        assert_eq!(store.append_harness_event(&input).unwrap_err().code, "idempotency-mismatch");
+        input
+            .claim
+            .fields
+            .insert("source_op".into(), json!("hydrate"));
+        assert!(store.append_harness_event(&input).unwrap().1);
         input.claim.fields = original;
         input.sequence = 2;
         input.claim.fields.insert("phases".into(), json!([]));
@@ -50736,9 +50967,14 @@ mod harness_event_tests {
         peer.validate_replication_backlog().unwrap();
         peer.apply_replication_repairs().unwrap();
         assert!(peer.project_replication_backlog().unwrap());
-        let remote = peer.agent_todo_observations_for(
-            &[SEAT.to_owned()], peer.index().unwrap(),
-        ).unwrap();
+        assert_eq!(peer.receive_current_value(&cleared).unwrap_err().code,"stale-harness-event-session");
+        input.runtime_incarnation = "runtime-b".into();
+        input.claim.fields.insert("incarnation_id".into(),json!("runtime-b"));
+        let cleared = store.append_harness_event(&input).unwrap().0;
+        peer.receive_current_value(&cleared).unwrap();
+        let remote = peer
+            .agent_todo_observations_for(&[SEAT.to_owned()], peer.index().unwrap())
+            .unwrap();
         let remote = &remote[SEAT]["harness.todo.observed"];
         assert_eq!(remote.id, cleared.id);
         assert_eq!(remote.body["fields"]["source_op"], "clear");
@@ -50761,16 +50997,22 @@ mod harness_event_tests {
             let (first, changed) = store.append_harness_event(&input).unwrap();
             assert!(changed);
             let (replayed, changed) = store.append_harness_event(&input).unwrap();
-            assert!(!changed);
+            assert_eq!(changed, is_current_input(&input.claim));
             if !latest_retention(kind) {
                 assert_eq!(first.id, replayed.id);
             }
-            assert_eq!(replayed.body["fields"], json!(input.claim.fields));
+            for (key, value) in &input.claim.fields {
+                assert_eq!(&replayed.body["fields"][key], value);
+            }
             input.claim.fields.insert("driver".into(), json!("codex"));
-            assert_eq!(
-                store.append_harness_event(&input).unwrap_err().code,
-                "idempotency-mismatch"
-            );
+            if is_current_input(&input.claim) {
+                assert!(store.append_harness_event(&input).unwrap().1);
+            } else {
+                assert_eq!(
+                    store.append_harness_event(&input).unwrap_err().code,
+                    "idempotency-mismatch"
+                );
+            }
             input.claim.fields.insert("driver".into(), json!("claude"));
             runtime(&store, "runtime-b", "running");
             assert_eq!(
@@ -50778,6 +51020,19 @@ mod harness_event_tests {
                 "stale-harness-event-session"
             );
             input.runtime_incarnation = "runtime-b".into();
+            if is_current_input(&input.claim) {
+                input
+                    .claim
+                    .fields
+                    .insert("incarnation_id".into(), json!("runtime-b"));
+                assert!(store.append_harness_event(&input).unwrap().1);
+                runtime(&store, "runtime-b", "exited");
+                assert_eq!(
+                    store.append_harness_event(&input).unwrap_err().code,
+                    "stale-harness-event-session"
+                );
+                continue;
+            }
             let (replayed, changed) = store.append_harness_event(&input).unwrap();
             assert!(!changed);
             if !latest_retention(kind) {

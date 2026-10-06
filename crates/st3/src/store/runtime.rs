@@ -22,6 +22,7 @@ pub struct SmalltalkRuntime {
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
     pub(crate) agent_resources_cache: Mutex<VecDeque<(u64, bool, Arc<Vec<Value>>)>>,
+    pub(crate) latest_cache_id: Mutex<u64>,
 }
 
 impl SmalltalkRuntime {
@@ -41,6 +42,7 @@ impl Runtime for SmalltalkRuntime {
 
     fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(latest_values::SCHEMA)?;
         connection.execute_batch(arrangements::SCHEMA)?;
         migrate_local_usage_seen(connection)?;
         backfill_message_index(connection)?;

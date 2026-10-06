@@ -27,14 +27,38 @@ where the stop fence, restart windows and adoption read them. A person's signal 
 requester and replicates with its result. A local observation may cite another local observation
 of the same node as evidence; a claim can cite only claims.
 
-A kind of `latest` retention is an observation that other nodes read only in its latest state. The
-local log keeps every observation. The claim log gets an ordinary claim of the same kind only when
-the state changes, so every node reads the current state from the latest claim, and a checkpoint
-may drop the claims each newer one replaced. `harness.observed` replicates when any field other
-than `observed_at_ms` changes. `harness.usage` replicates the first reading of each incarnation and
-semantics, a compaction or model change, a reading at least five minutes after the last replicated
-one while the harness works, and any reading while it does not. The newest pending reading
-replicates when the harness stops working.
+Current categorical status, context occupancy, todo, workspace availability and peer connectivity
+are replaceable values in `latest_values`. There is one row per subject and kind (per observing
+host for connectivity). A separate SQLite connection uses a zero busy timeout and an immediate
+transaction; contention drops the attempt without entering the ordered graph writer. A new
+sample replaces the previous value and its local feed row. Status keeps the current episode's
+start time and a current-incarnation readiness bit; it retains no transition history.
+
+Native producers replace their local snapshots without creating publication jobs. Each fresh
+snapshot gets one HTTP attempt with a 100 ms deadline. Failure leaves no retry obligation; only
+a subsequent source snapshot triggers another attempt. The source account is captured with
+context evidence, so delayed reads cannot attribute it to a successor's account. Authenticated
+fleet peers receive current values over `/v1/peer/current-value`, once per peer with the same
+100 ms bound, independently of signed graph inventories. Owner/incarnation binding and source
+revision order reject stale deliveries. There is no peer retry, acknowledgement ledger or
+fallback to durable replication for these values. Current status reports source observation
+time and freshness, so an offline owner or dropped heartbeat ages visibly.
+
+Numeric `harness.usage` readings and account limits remain durable accounting facts for
+`st usage` and the 95% stop. Their existing first-reading, compaction/model-change, five-minute
+working cadence and stop flush remain in place. `context_occupancy` is exclusively a current
+value and never enters that flush. Messages, work ownership, runtime launch/stop proofs and
+replication inventories retain their durable contracts.
+
+Current readers accept the old claim kinds and read legacy graph observations until a register
+is present; a newer legacy observation remains visible if a source rolls back. Existing graph
+history is retained for mixed-build replay and checkpoint compatibility in this slice. No claim
+kind, schema version or client protocol version is removed here. Older peers that lack the
+current-value endpoint receive no new categorical observations through graph replication; their
+last observation ages until upgrade. The client status object keeps its existing fields. For a
+seat using the new register, `status-history` keeps its existing response shape and returns an
+empty `items` list with `complete=false`: replaced transitions cannot be reconstructed. Current
+values are read at request time even when the request has a pinned durable graph index.
 
 A node can also send every local observation to an OpenTelemetry collector. The exporter is off
 unless the config names a collector:
@@ -73,36 +97,15 @@ identities appear only in logs and spans. Span IDs are stable when a batch is re
 configuration lives in `[observations.otlp]`; `OTEL_EXPORTER_OTLP_*` in a native seat no longer
 controls an exporter in its hooks. The legacy st2 product's exporter remains separately testable.
 
-Fresh native seats publish activity, context, account limits and normalized timeline operations
-through an st-owned observation outbox, `st-harness-events.sqlite`, in their explicit observation
-directory. Matching producers commit a snapshot or timeline operation and its queued event in
-one SQLite transaction with full synchronization. A pipe wake notifies the native driver;
-it publishes the ordered events to `/v1/harness-events` and deletes only the acknowledged prefix.
-Daemon outages, a lost acknowledgement and driver re-execution leave unacknowledged events for
-replay. The source runtime and driver remain attached to historical events when a successor
-publishes a backlog. Admission binds the Unix peer to its seat and checks the publishing runtime
-inside the daemon's writer transaction. Source runtime, spool sequence, claim kind and usage
-semantics identify an exact retry; changed input is rejected. Graph-derived claim fields are
-persisted in the spool before the first HTTP attempt so retries preserve their original attribution.
-
-The outbox is transport recovery state, not graph authority. The daemon retains each admitted
-observation under its existing local/latest/durable policy. Producer snapshots remain local
-coalescing and ownership evidence; timeline producers read only the previous matching entry and
-latest status instead of parsing/replacing a retained JSON log. That auxiliary timeline history
-is bounded to 4,096 operations and 2 MiB, independently of unacknowledged events. An outbox with 64 MiB of pending payload
-rejects a producer transaction and reports the failure rather than dropping queued events.
-An evidence deadline queues derived unknown once after fifteen minutes without fresh state;
-a concurrent heartbeat supersedes that deadline. Native transcripts and session bindings retain
-their existing source paths.
-
-The outbox is enabled only before a fresh provider launch. An already-running provider adopted
-by a replacement binary retains the polled record transport until ordinary restart, and the
-separately maintained st2 product keeps its record transport. Deploy the matching daemon before
-restarting providers into event publication. Rollback to a binary without event-outbox support
-requires an operations-coordinated provider restart, recovery of any unacknowledged outbox,
-and archiving the drained outbox before starting the old producer;
-an old binary cannot adopt an event-producing provider. This work does not restart shared
-services or seats automatically.
+Fresh native seats retain the existing ordered timeline outbox in `st-harness-events.sqlite`
+for the subsequent owner-native conversation cutover. Activity, context, account-limit sampling
+and todo snapshots use the current-attempt path above and do not append outbox events. The
+matching driver discards queued categorical events from predecessor builds, then attempts the
+latest owner-bound snapshots once. Evidence expiry replaces the snapshot with unknown; a
+concurrent heartbeat supersedes it. The remaining timeline outbox preserves source runtime,
+source account and prepared attribution across replay until that separately reviewed removal.
+Its 64 MiB limit cannot block a current-value write. Native transcripts and session bindings
+keep their existing source paths. This change does not restart shared services or seats.
 
 The exporter keeps its cursor in `meta` and moves it only after the collector accepts a batch of
 at most 512 observations, including every log/metric/trace request that batch needs. Delivery is
@@ -175,8 +178,10 @@ order from the same admitted claims.
 | `run_generations` | Projection | `run-generation.*` claims |
 | `step_runs` | Projection | `step-run.*` and `work.*` claims |
 | `local_work_lease_renewals` | Local operational fact | Recent quiet lease renewals; replayed over replicated claim projections and bounded by periodic `work.renewed` anchors |
-| `local_observations` | Local observation log | Observations of `local` and `latest` retention made on this node; never replicated, trimmed after `[observations] retention` |
-| `local_latest_slots` | Local observation log | For each `latest` slot this node writes: its last replicated observation and time, and the newest local observation no claim carries yet |
+| `local_observations` | Local observations and current feed | Local evidence and numeric usage retain their existing policy; current values retain only their newest feed row |
+| `local_latest_slots` | Numeric accounting cadence | Last published numeric usage and pending stop flush; categorical values and context occupancy use registers |
+| `latest_values` | Current value | Owner/source time and revision, current body and newest local feed position; never part of graph inventory |
+| `latest_readiness` | Current readiness | Sticky readiness for the one current incarnation; replaced on incarnation change |
 | `local_usage_seen` | Local deduplication index | Stable provider response IDs from local timeline observations; never replicated |
 | `local_usage_totals` | Local cumulative observation projection | Token buckets from accepted local response observations; never replicated and retained across log trimming |
 | `local_seat_accounts` | Local operational fact | The account chosen for each pooled seat on this node; retained across restarts, never replicated |
@@ -238,7 +243,7 @@ A cleanup residue produces `eval.verdict` with `verdict=fail`.
 
 A cleanup infrastructure error produces `eval.verdict` with `verdict=void`.
 
-`workspace.observed` is a latest-only replicated observation written by the owning host during
+`workspace.observed` is a replaceable current observation written by the owning host during
 agent workspace reconciliation. It carries `host`, `workspace`, and an optional `repository`.
 The reconciler writes only changed values. Repository suggestions combine those observations
 with current checkout declarations; a gateway reads graph evidence and never scans host disks.

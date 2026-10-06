@@ -1,6 +1,6 @@
 //! st-owned observation outbox. Opt-in is per directory, never process-global: an adopted
 //! provider keeps its transport while a fresh st seat initializes this database before spawn.
-//! A snapshot and its event commit together. The driver removes only acknowledged events;
+//! Current snapshots replace in place without publication jobs. Timeline events remain ordered;
 //! readers of provider-local evidence do not depend on the daemon being reachable.
 use std::io;
 use std::path::{Path, PathBuf};
@@ -259,7 +259,14 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
         matches!(kind, "harness-state" | "harness-context" | "harness-todo"),
         "unsupported observation kind"
     );
-    let value: Value = serde_json::from_slice(body)?;
+    let mut value: Value = serde_json::from_slice(body)?;
+    if kind == "harness-context" {
+        value["account_ref"] = std::env::var("ST3_ACCOUNT")
+            .ok()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+    }
+    let body = serde_json::to_vec(&value)?;
     anyhow::ensure!(
         value["incarnation"]
             .as_str()
@@ -267,6 +274,7 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
         "observation needs an owner"
     );
     let mut connection = open(agent_dir)?;
+    connection.busy_timeout(Duration::ZERO)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if kind == "harness-state" {
         let token = value["incarnation"].as_str().unwrap();
@@ -279,7 +287,7 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
         }
     }
     // Context writers used to have no ownership fence. Refuse a delayed predecessor now that
-    // its snapshot and event are admitted in the same transaction as the ownership check.
+    // its snapshot is replaced in the same transaction as the ownership check.
     if matches!(kind, "harness-context" | "harness-todo") {
         anyhow::ensure!(
             current_token(&tx)?.as_deref() == value["incarnation"].as_str(),
@@ -291,7 +299,7 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
         ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
         params![kind, body],
     )?;
-    append_event(&tx, kind, &value)?;
+    // Snapshots are current values. Their wake never appends an ordered publication job.
     tx.commit()?;
     signal_wake(agent_dir);
     Ok(())
@@ -303,6 +311,7 @@ pub fn write_channel_todo(agent_dir: &Path, runtime: &str, fields: &Value) -> Re
     let mut value = fields.clone();
     value["incarnation"] = runtime.into();
     let mut connection = open(agent_dir)?;
+    connection.busy_timeout(Duration::ZERO)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let bound: String = tx.query_row(
         "SELECT value FROM metadata WHERE key='runtime'", [], |row| row.get(0),
@@ -312,7 +321,6 @@ pub fn write_channel_todo(agent_dir: &Path, runtime: &str, fields: &Value) -> Re
         "INSERT OR IGNORE INTO metadata(key,value) VALUES (?1,?2)",
         params![format!("provider-runtime:{runtime}"), runtime],
     )?;
-    append_event(&tx, "harness-todo", &value)?;
     tx.execute(
         "INSERT INTO snapshots VALUES ('harness-todo',?1)
         ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
@@ -323,10 +331,11 @@ pub fn write_channel_todo(agent_dir: &Path, runtime: &str, fields: &Value) -> Re
     Ok(())
 }
 
-/// At a known evidence deadline, queue the derived unknown once. Compare in the same
+/// At a known evidence deadline, wake a best-effort derived unknown observation once. Compare in the same
 /// transaction so an observer's concurrent heartbeat always supersedes this deadline.
 pub fn expire_state(agent_dir: &Path, expected: &Value) -> Result<()> {
     let mut connection = open(agent_dir)?;
+    connection.busy_timeout(Duration::ZERO)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let current: Option<Vec<u8>> = tx
         .query_row(
@@ -351,7 +360,6 @@ pub fn expire_state(agent_dir: &Path, expected: &Value) -> Result<()> {
         .optional()?;
     let identity = serde_json::to_string(expected)?;
     if expired.as_deref() != Some(&identity) {
-        append_event(&tx, "harness-state-expired", expected)?;
         tx.execute(
             "INSERT INTO metadata VALUES ('expired-state',?1)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -585,7 +593,7 @@ mod tests {
     use super::*;
     use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer, claim};
     #[test]
-    fn committed_events_survive_reopen_and_acknowledgement() {
+    fn current_snapshots_replace_without_publication_jobs() {
         let root = tempfile::tempdir().unwrap();
         enable(root.path(), "runtime-a").unwrap();
         let seq = claim(root.path(), "agent/example", "claude", "provider-a").unwrap();
@@ -596,33 +604,40 @@ mod tests {
             Some("fixture".into()),
         )
         .with_ownership("provider-a", seq);
-        writer
-            .observe(Observation::new(
-                Activity::Active,
-                BlockedOn::None,
-                InputBuffer::Unknown,
-            ))
+        for _ in 0..100 {
+            writer
+                .observe(Observation::new(
+                    Activity::Active,
+                    BlockedOn::None,
+                    InputBuffer::Unknown,
+                ))
+                .unwrap();
+            writer
+                .observe(Observation::new(
+                    Activity::Idle,
+                    BlockedOn::None,
+                    InputBuffer::Unknown,
+                ))
+                .unwrap();
+        }
+        assert!(pending(root.path(), 100).unwrap().is_empty());
+        let snapshot = read_runtime_state(root.path(), "runtime-a")
+            .unwrap()
             .unwrap();
-        assert!(!root.path().join("harness-state").exists());
-        let before = pending(root.path(), 100).unwrap();
-        assert_eq!(before.len(), 2);
         enable(root.path(), "runtime-a").unwrap();
         assert_eq!(
-            pending(root.path(), 100).unwrap()[1].sequence,
-            before[1].sequence
+            read_runtime_state(root.path(), "runtime-a")
+                .unwrap()
+                .unwrap(),
+            snapshot
         );
-        acknowledge(root.path(), before[0].sequence).unwrap();
-        assert_eq!(pending(root.path(), 100).unwrap().len(), 1);
-        acknowledge(root.path(), before[1].sequence).unwrap();
-        assert!(pending(root.path(), 100).unwrap().is_empty());
-        writer
-            .observe(Observation::new(
-                Activity::Idle,
-                BlockedOn::None,
-                InputBuffer::Unknown,
-            ))
-            .unwrap();
-        assert!(pending(root.path(), 100).unwrap()[0].sequence > before[1].sequence);
+        assert_eq!(
+            open(root.path())
+                .unwrap()
+                .query_row("SELECT count(*) FROM snapshots", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
     }
 }
 
@@ -792,7 +807,7 @@ mod protocol_tests {
         );
     }
     #[test]
-    fn full_spool_rolls_back_snapshot_and_timeline_changes() {
+    fn a_full_timeline_spool_does_not_block_current_snapshots() {
         let root = tempfile::tempdir().unwrap();
         enable(root.path(), "runtime").unwrap();
         let seq = claim(root.path(), "example/seat", "claude", "provider").unwrap();
@@ -806,8 +821,8 @@ mod protocol_tests {
             .unwrap();
         let mut writer = Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
             .with_ownership("provider", seq);
-        assert!(writer.observe(active()).is_err());
-        assert_eq!(read_snapshot(root.path(), "harness-state").unwrap(), before);
+        assert!(writer.observe(active()).is_ok());
+        assert_ne!(read_snapshot(root.path(), "harness-state").unwrap(), before);
         let mut timeline = crate::harness_timeline::Writer::new(root.path(), "claude", "provider");
         assert!(
             timeline
@@ -821,7 +836,7 @@ mod protocol_tests {
                 .is_err()
         );
         assert!(read_timeline(root.path()).unwrap().is_none());
-        assert_eq!(pending(root.path(), 100).unwrap().len(), 1);
+        assert!(pending(root.path(), 100).unwrap().is_empty());
     }
     #[test]
     fn deadlines_are_once_only_and_cannot_expire_concurrent_evidence() {
@@ -836,12 +851,12 @@ mod protocol_tests {
         .unwrap();
         expire_state(root.path(), &state).unwrap();
         expire_state(root.path(), &state).unwrap();
-        assert_eq!(pending(root.path(), 100).unwrap().len(), 2);
+        assert!(pending(root.path(), 100).unwrap().is_empty());
         let mut writer = Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
             .with_ownership("provider", seq);
         writer.observe(active()).unwrap();
         expire_state(root.path(), &state).unwrap();
-        assert_eq!(pending(root.path(), 100).unwrap().len(), 3);
+        assert!(pending(root.path(), 100).unwrap().is_empty());
     }
     #[test]
     fn replacement_pipe_receives_commits_without_database_read_wakeups() {
@@ -857,6 +872,17 @@ mod protocol_tests {
             old.read(&mut byte).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+        assert!(pending(root.path(), 100).unwrap().is_empty());
+        crate::harness_timeline::Writer::new(root.path(), "claude", "provider")
+            .append(
+                "source",
+                Role::Assistant,
+                EntryType::Content,
+                json!({"text":"hello"}),
+                true,
+            )
+            .unwrap();
+        assert_eq!(current.read(&mut byte).unwrap(), 1);
         let events = pending(root.path(), 100).unwrap();
         read_snapshot(root.path(), "harness-state").unwrap();
         let sequence = events[0].sequence;
@@ -891,6 +917,35 @@ mod protocol_tests {
         let directory = Path::new(&directory);
         enable(directory, &runtime).unwrap();
         claim(directory, "example/seat", "claude", &runtime).unwrap();
+        write_snapshot(
+            directory,
+            "harness-context",
+            &serde_json::to_vec(&json!({
+                "schema":"st.harness-context.v1","incarnation":runtime,
+                "writtenAtMs":crate::message::now_ms(),"harness":"claude","totalTokens":10
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let snapshot: Value = serde_json::from_slice(
+            &read_snapshot(directory, "harness-context")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot["account_ref"],
+            std::env::var("ST3_ACCOUNT").unwrap()
+        );
+        crate::harness_timeline::Writer::new(directory, "claude", &runtime)
+            .append(
+                "usage",
+                Role::System,
+                EntryType::Usage,
+                json!({"total_tokens":10}),
+                true,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -923,16 +978,33 @@ mod protocol_tests {
         let root = tempfile::tempdir().unwrap();
         enable(root.path(), "runtime-old").unwrap();
         let old_seq = claim(root.path(), "example/seat", "claude", "old").unwrap();
+        crate::harness_timeline::Writer::new(root.path(), "claude", "old")
+            .append(
+                "old-source",
+                Role::Assistant,
+                EntryType::Content,
+                json!({"text":"old"}),
+                true,
+            )
+            .unwrap();
         enable(root.path(), "runtime-new").unwrap();
         Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
             .with_ownership("old", old_seq)
             .observe(active())
             .unwrap();
         claim(root.path(), "example/seat", "claude", "new").unwrap();
+        crate::harness_timeline::Writer::new(root.path(), "claude", "new")
+            .append(
+                "new-source",
+                Role::Assistant,
+                EntryType::Content,
+                json!({"text":"new"}),
+                true,
+            )
+            .unwrap();
         let events = pending(root.path(), 100).unwrap();
         assert_eq!(events[0].runtime_incarnation, "runtime-old");
-        assert_eq!(events[1].runtime_incarnation, "runtime-old");
-        assert_eq!(events[2].runtime_incarnation, "runtime-new");
+        assert_eq!(events[1].runtime_incarnation, "runtime-new");
         open(root.path())
             .unwrap()
             .pragma_update(None, "user_version", 2)

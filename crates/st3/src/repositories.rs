@@ -175,6 +175,14 @@ mod tests {
         gateway
             .import_replication("other", &store.export_replication(0).unwrap())
             .unwrap();
+        gateway
+            .receive_current_value(
+                &store
+                    .latest_claim("agent/example/plain", Some("workspace.observed"))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
         assert_eq!(
             host_repositories(&gateway, "other").unwrap(),
             host_repositories(&store, "other").unwrap()

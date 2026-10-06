@@ -49,6 +49,7 @@ use crate::store::{
 type PeerState = smallclaims::sync::PeerState<MainBackend>;
 
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
+const CURRENT_VALUE_PATH: &str = "/v1/peer/current-value";
 const RAW_TERMINAL_PATH: &str = "/v1/peer/raw-terminal";
 const MAX_CLIENT_READ_BYTES: usize = 1_048_576;
 /// A relayed long poll must answer well inside the relay's 15-second request timeout.
@@ -255,6 +256,69 @@ pub struct ClientReadProvenance {
 }
 
 impl ClientRelay {
+    /// One bounded attempt per reachable peer, with no queue, replay or fallback to claims.
+    pub(crate) async fn publish_current_value(&self, record: crate::model::ClaimRecord) {
+        let Ok(body) = serde_json::to_vec(&record) else {
+            return;
+        };
+        if body.len() > MAX_CLIENT_READ_BYTES {
+            return;
+        }
+        let Ok(headers) = self
+            .auth
+            .request_headers_for(CURRENT_VALUE_PATH, &self.node, &body)
+        else {
+            return;
+        };
+        let view = self
+            .links
+            .as_ref()
+            .and_then(|s| s.fleet_view().ok())
+            .unwrap_or_default();
+        let targets = dial_targets(
+            &view,
+            &self.node,
+            &self.peers,
+            LocalTransports {
+                fabric: self.fabric.is_some(),
+                tailscale: local_addresses()
+                    .iter()
+                    .any(crate::fleet::transport::is_tailnet_address),
+            },
+        );
+        let attempts = targets
+            .into_values()
+            .filter_map(|routes| routes.into_iter().next())
+            .map(|route| {
+                let body = body.clone();
+                let headers = headers.clone();
+                async move {
+                    let attempt = async {
+                        let url = match route {
+                            Route::Http(url) => url,
+                            Route::Fabric { node, protocol } => {
+                                let Some(fabric) = &self.fabric else { return };
+                                let Ok(address) = fabric.dial(&node, &protocol).await else {
+                                    return;
+                                };
+                                format!("http://{address}")
+                            }
+                        };
+                        let _ = self
+                            .http
+                            .post(format!("{}{CURRENT_VALUE_PATH}", url.trim_end_matches('/')))
+                            .headers(headers)
+                            .header("content-type", "application/json")
+                            .body(body)
+                            .send()
+                            .await;
+                    };
+                    let _ =
+                        tokio::time::timeout(crate::client::LATEST_VALUE_TIMEOUT, attempt).await;
+                }
+            });
+        futures_util::future::join_all(attempts).await;
+    }
     /// Choose routes by the transport observations in this store.
     pub fn with_links(mut self, store: Arc<Store>) -> Self {
         self.links = Some(store);
@@ -1453,17 +1517,18 @@ impl Backend for MainBackend {
     }
 
     async fn record_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
-        let _: serde_json::Value = self
-            .client
-            .post(
+        let _ = tokio::time::timeout(
+            crate::client::LATEST_VALUE_TIMEOUT,
+            self.client.post::<_, serde_json::Value>(
                 "/v1/internal/replication/peer-failure",
                 &ReplicationPeerFailureRequest {
                     peer: peer.to_owned(),
                     status: status.to_owned(),
                     error: error.to_owned(),
                 },
-            )
-            .await?;
+            ),
+        )
+        .await;
         Ok(())
     }
 
@@ -1486,6 +1551,48 @@ fn smalltalk_routes() -> Router<PeerState> {
             post(receive_client_read).layer(DefaultBodyLimit::max(16_384)),
         )
         .route(RAW_TERMINAL_PATH, get(receive_raw_terminal))
+        .route(
+            CURRENT_VALUE_PATH,
+            post(receive_current_value).layer(DefaultBodyLimit::max(MAX_CLIENT_READ_BYTES)),
+        )
+}
+
+async fn receive_current_value(
+    State(state): State<PeerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let sender =
+        match state
+            .auth()
+            .verify_sender(&headers, "POST", CURRENT_VALUE_PATH, &body, None, None)
+        {
+            Ok(sender) if state.accept(&sender).is_ok() => sender.name,
+            _ => return (StatusCode::UNAUTHORIZED, "untrusted current value").into_response(),
+        };
+    let Ok(record) = serde_json::from_slice::<crate::model::ClaimRecord>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if record.origin != sender || !crate::store::is_current_value(&record.kind) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let client = Client::unix(state.backend().socket());
+    let result = tokio::time::timeout(
+        crate::client::LATEST_VALUE_TIMEOUT,
+        client.post::<_, Value>("/v1/internal/current-value", &record),
+    )
+    .await;
+    match result {
+        Ok(Ok(value)) => signed_response_for(
+            &state,
+            CURRENT_VALUE_PATH,
+            &FleetAuth::body_digest(&body),
+            0,
+            value,
+        )
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 /// Run the replication worker: sync this node's store, through its daemon, with the fleet.
@@ -3595,7 +3702,7 @@ mod tests {
         let source = Store::open_memory("source").unwrap();
         source.bind_fleet(fleet).unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -3656,7 +3763,7 @@ mod tests {
                 .claims_for("host/source", Some("transport.observed"))
                 .unwrap()
                 .len(),
-            before + 1
+            before
         );
         backend
             .receive("source", fleet, &exchange, None)
@@ -3743,16 +3850,12 @@ mod tests {
         let backend = MainBackend::new(sockets[0].to_path_buf());
         let context = FleetContext::legacy(BTreeSet::from(["target".into()]));
         let http = replication_http_client();
-        exchange(
-            &http,
-            &backend,
-            "source",
-            &peer,
-            &auth,
-            &context,
-        )
-        .await
-        .unwrap();
+        exchange(&http, &backend, "source", &peer, &auth, &context)
+            .await
+            .unwrap();
+        target
+            .receive_current_value(&source.own_transport_value("target").unwrap().unwrap())
+            .unwrap();
         assert!(
             target
                 .latest_claim("host/target", Some("transport.observed"))
@@ -3762,16 +3865,12 @@ mod tests {
         target
             .record_transport_observation("source", "up", None, None)
             .unwrap();
-        exchange(
-            &http,
-            &backend,
-            "source",
-            &peer,
-            &auth,
-            &context,
-        )
-        .await
-        .unwrap();
+        exchange(&http, &backend, "source", &peer, &auth, &context)
+            .await
+            .unwrap();
+        source
+            .receive_current_value(&target.own_transport_value("source").unwrap().unwrap())
+            .unwrap();
         assert!(
             source
                 .latest_claim("host/source", Some("transport.observed"))

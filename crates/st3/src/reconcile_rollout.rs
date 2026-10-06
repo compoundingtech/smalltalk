@@ -485,9 +485,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 ("incarnation_id".into(), serde_json::json!(incarnation)),
                                 ("rollout_operation".into(), serde_json::json!(operation.id)),
                             ]),
-                            evidence: std::iter::once(operation.id.clone())
-                                .chain(report.map(|r| r.id))
-                                .collect(),
+                            // The matching incarnation and operation marker are copied into this
+                            // durable launch receipt. A replaceable status ID is never evidence.
+                            evidence: vec![operation.id.clone()],
                             expected_subject: None,
                             idempotency_key: Some(format!(
                                 "seat-rollout-start-recovered:{}",

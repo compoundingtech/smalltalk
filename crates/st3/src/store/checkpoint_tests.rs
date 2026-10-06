@@ -346,7 +346,7 @@ fn limits_keep_source_observations_even_when_the_same_seat_publishes_again() {
 fn a_usage_trim_keeps_lifetime_usage_and_the_proof_guards_it() {
     let store = Store::open_memory("alder").unwrap();
     store
-        .append_claim_outcome(&input(
+        .append_legacy_claim_outcome(&input(
             AGENT,
             "harness.observed",
             Some(AGENT),
@@ -357,7 +357,7 @@ fn a_usage_trim_keeps_lifetime_usage_and_the_proof_guards_it() {
     let old = now_ms() - 9 * DAY_MS;
     for (n, offset) in [0, 1, 2].into_iter().enumerate() {
         store
-            .append_claim(&input(
+            .append_legacy_claim(&input(
                 AGENT,
                 "harness.usage",
                 Some(AGENT),
@@ -1113,7 +1113,7 @@ const AGENT: &str = "agent/alder.worker";
 /// Claims of several rules' kinds, with some that a checkpoint drops.
 fn write_history(store: &Store) {
     store
-        .append_claim(&input(
+        .append_legacy_claim(&input(
             AGENT,
             "runtime.observed",
             None,
@@ -1126,7 +1126,7 @@ fn write_history(store: &Store) {
         .enumerate()
     {
         store
-            .append_claim_outcome(&input(
+            .append_legacy_claim_outcome(&input(
                 AGENT,
                 "harness.observed",
                 Some(AGENT),
@@ -1137,7 +1137,7 @@ fn write_history(store: &Store) {
     }
     for n in 0..4 {
         store
-            .append_claim(&input(
+            .append_legacy_claim(&input(
                 "daemon/alder",
                 "daemon.diagnostic",
                 None,
@@ -1318,7 +1318,7 @@ fn a_trimmed_node_seals_and_digests_like_an_untrimmed_one() {
 fn ancestry_walks_through_a_dropped_claim() {
     let birch = Store::open_memory("birch").unwrap();
     let older = birch
-        .append_claim(&input(
+        .append_legacy_claim(&input(
             AGENT,
             "runtime.observed",
             None,
@@ -1336,7 +1336,7 @@ fn ancestry_walks_through_a_dropped_claim() {
             .unwrap(),
     );
     let middle = alder
-        .append_claim(&input(
+        .append_legacy_claim(&input(
             AGENT,
             "harness.observed",
             Some(AGENT),
@@ -1345,7 +1345,7 @@ fn ancestry_walks_through_a_dropped_claim() {
         ))
         .unwrap();
     let newest = alder
-        .append_claim(&input(
+        .append_legacy_claim(&input(
             AGENT,
             "runtime.observed",
             None,
@@ -1521,7 +1521,7 @@ fn an_observed_item_keeps_its_latest_state_and_every_version_still_read_by_id() 
 fn checkpoint_reads_of_sealed_batches_do_not_wait_for_the_writer() {
     let store = Arc::new(Store::open_memory("checkpoint-writer-test").unwrap());
     store
-        .append_claim(&input(
+        .append_legacy_claim(&input(
             "agent/checkpoint-reader",
             "harness.observed",
             Some("agent/checkpoint-reader"),
@@ -1567,7 +1567,7 @@ fn a_write_queued_during_sealing_runs_before_the_backlog_finishes() {
     store.seal_local_batches().unwrap();
     for n in 0..200 {
         store
-            .append_claim(&input(
+            .append_legacy_claim(&input(
                 "agent/seal-queue",
                 "harness.observed",
                 Some("agent/seal-queue"),
@@ -1761,11 +1761,17 @@ fn status_history_checkpoint_drops_old_transitions_but_keeps_current_state_start
 fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
     let store = Store::open_memory("cedar").unwrap();
     let append = |kind: &str, fields: Value| {
-        store.append_claim(&ClaimInput {
-            subject:"agent/cedar".into(), kind:kind.into(), actor:Some("agent/cedar".into()),
-            fields:serde_json::from_value(fields).unwrap(), evidence:Vec::new(),
-            expected_subject:None, idempotency_key:None,
-        }).unwrap()
+        store
+            .append_legacy_claim(&ClaimInput {
+                subject: "agent/cedar".into(),
+                kind: kind.into(),
+                actor: Some("agent/cedar".into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap()
     };
     append("runtime.observed", json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}));
     for index in 0..220 {
@@ -1801,7 +1807,7 @@ fn native_auth_history_survives_checkpoint_trimming_and_runtime_reset() {
     let store = Store::open_memory("cedar").unwrap();
     let append = |kind: &str, fields: Value| {
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "agent/cedar".into(),
                 kind: kind.into(),
                 actor: Some("agent/cedar".into()),
