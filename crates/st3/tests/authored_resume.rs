@@ -128,14 +128,7 @@ agent "garden/worker" {{
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let hooks = root.path().join("hooks");
-    std::fs::create_dir(&hooks).unwrap();
-    std::fs::write(hooks.join(st_drivers::hooks::ST3_SET_MARKER), "fixture").unwrap();
-    std::fs::write(
-        hooks.join("omp-channel.ts"),
-        include_bytes!("../hooks/omp-channel.ts"),
-    )
-    .unwrap();
+    let hooks = st3::hooks::ensure_installed(&root.path().join("hooks")).unwrap();
     let mut command = st3::test_support::async_command(env!("CARGO_BIN_EXE_st3-fixture"));
     let stop = root.path().join("provider-stop");
     command

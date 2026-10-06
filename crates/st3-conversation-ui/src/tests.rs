@@ -43,14 +43,14 @@ fn frame_updates_revise_by_id_and_replacements_remove_old_history() {
     let mut timeline = Timeline::default();
     timeline.apply(Frame {
         replace: true,
-        has_more: true,
+        has_more: Some(true),
         items: vec![item("a", 1, 1, "old")],
         ..Frame::default()
     });
     assert!(timeline.replace && timeline.has_more);
     timeline.apply(Frame {
         replace: false,
-        has_more: true,
+        has_more: Some(true),
         items: vec![item("b", 2, 1, "next"), item("a", 1, 2, "revised")],
         ..Frame::default()
     });
@@ -66,7 +66,7 @@ fn frame_updates_revise_by_id_and_replacements_remove_old_history() {
     assert!(matches!(&entries[0].body, Body::Assistant(text) if text == "revised"));
     timeline.apply(Frame {
         replace: true,
-        has_more: false,
+        has_more: Some(false),
         items: vec![],
         ..Frame::default()
     });
@@ -83,10 +83,73 @@ fn ids(timeline: &Timeline) -> Vec<&str> {
 }
 
 #[test]
+fn delta_preserves_older_history_until_an_older_page_reaches_the_start() {
+    let mut timeline = Timeline::default();
+    timeline.apply(Frame {
+        replace: true,
+        has_more: Some(true),
+        items: vec![item("c", 3, 1, "c")],
+        session_id: Some("session/a".into()),
+    });
+    timeline.apply(Frame {
+        items: vec![item("d", 4, 1, "d")],
+        session_id: Some("session/a".into()),
+        ..Frame::default()
+    });
+    assert!(timeline.more_before(), "a delta must not hide older history");
+    timeline.older_page("session/a", vec![item("b", 2, 1, "b")], true, Some("older".into()));
+    assert_eq!(ids(&timeline), ["b", "c", "d"]);
+    assert!(timeline.more_before());
+    timeline.apply(Frame {
+        items: vec![item("d", 4, 2, "revised")],
+        ..Frame::default()
+    });
+    timeline.older_page("session/a", vec![item("a", 1, 1, "a")], false, None);
+    assert_eq!(ids(&timeline), ["a", "b", "c", "d"]);
+    assert_eq!(timeline.items[3].revision, 2);
+    assert!(!timeline.more_before());
+}
+
+#[test]
+fn explicit_availability_updates_and_new_windows_do_not_inherit_old_history() {
+    let mut timeline = Timeline::default();
+    timeline.apply(Frame {
+        replace: true,
+        has_more: Some(true),
+        session_id: Some("session/a".into()),
+        ..Frame::default()
+    });
+    timeline.apply(Frame {
+        has_more: Some(false),
+        ..Frame::default()
+    });
+    assert!(!timeline.more_before());
+    timeline.apply(Frame {
+        has_more: Some(true),
+        ..Frame::default()
+    });
+    assert!(timeline.more_before());
+    timeline.apply(Frame {
+        replace: true,
+        ..Frame::default()
+    });
+    assert!(!timeline.more_before(), "a replacement without metadata starts fresh");
+    timeline.apply(Frame {
+        has_more: Some(true),
+        ..Frame::default()
+    });
+    timeline.apply(Frame {
+        session_id: Some("session/b".into()),
+        ..Frame::default()
+    });
+    assert!(!timeline.more_before(), "another session cannot inherit availability");
+}
+
+#[test]
 fn earlier_pages_go_above_the_window_and_survive_a_new_window_that_meets_them() {
     let window = |items: Vec<st3_client::TimelineEntry>, has_more: bool| Frame {
         replace: true,
-        has_more,
+        has_more: Some(has_more),
         items,
         session_id: Some("session/a".into()),
     };
@@ -139,7 +202,7 @@ fn projection_notices_do_not_connect_disconnected_history_windows() {
     };
     let window = |items| Frame {
         replace: true,
-        has_more: true,
+        has_more: Some(true),
         items,
         session_id: Some("session/a".into()),
     };
@@ -193,7 +256,7 @@ fn projection_notice_is_removed_from_preserved_older_prefix() {
         }
     })).unwrap();
     let window = |items| Frame {
-        replace: true, has_more: true, items, session_id: Some("session/a".into()),
+        replace: true, has_more: Some(true), items, session_id: Some("session/a".into()),
     };
     let mut timeline = Timeline::default();
     timeline.apply(window(vec![
@@ -220,7 +283,7 @@ fn an_earlier_page_from_another_session_is_dropped_and_a_new_session_starts_over
     let mut timeline = Timeline::default();
     timeline.apply(Frame {
         replace: true,
-        has_more: true,
+        has_more: Some(true),
         items: vec![item("c", 3, 1, "c")],
         session_id: Some("session/a".into()),
     });
@@ -232,7 +295,7 @@ fn an_earlier_page_from_another_session_is_dropped_and_a_new_session_starts_over
     assert_eq!(timeline.older.failed.as_deref(), Some("st did not answer"));
     timeline.apply(Frame {
         replace: true,
-        has_more: false,
+        has_more: Some(false),
         items: vec![item("n", 1, 1, "n")],
         session_id: Some("session/b".into()),
     });

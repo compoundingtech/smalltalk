@@ -112,7 +112,8 @@ pub enum Update {
         /// The session the entries belong to: earlier pages are read from its timeline.
         session_id: String,
         replace: bool,
-        has_more: bool,
+        /// Availability before the live window; absent on deltas means unchanged.
+        has_more: Option<bool>,
         items: Vec<TimelineEntry>,
     },
     /// st could not show the open conversation; the feed asks again after a backoff, unless
