@@ -10136,8 +10136,33 @@ async fn post_delivery_hold(
 }
 async fn post_claim(
     State(state): State<AppState>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
     Json(request): Json<ClaimInput>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
+    if crate::store::is_current_input(&request)
+        && matches!(
+            request.kind.as_str(),
+            "harness.observed" | "harness.usage" | "harness.todo.observed"
+        )
+        && request.subject.starts_with("agent/")
+    {
+        let runtime_incarnation = request
+            .fields
+            .get("incarnation_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        return harness_events::publish(
+            State(state),
+            peer,
+            Json(crate::harness_events::Publication {
+                runtime_incarnation,
+                sequence: 0,
+                claim: request,
+            }),
+        )
+        .await;
+    }
     // A write can wait for the store's writer. It waits on the blocking pool, so the API's
     // workers keep answering other requests meanwhile.
     let store = state.store.clone();
@@ -15454,12 +15479,100 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
     }
 
     #[tokio::test]
+    async fn current_status_requires_kernel_seat_identity_and_running_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let input = ClaimInput {
+            subject: "agent/example/seat".into(),
+            kind: "harness.observed".into(),
+            actor: Some("agent/example/seat".into()),
+            fields: serde_json::from_value(
+                json!({"state":"working","driver":"codex","incarnation_id":"one"}),
+            )
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        assert!(
+            post_claim(State(state.clone()), None, Json(input.clone()))
+                .await
+                .is_err()
+        );
+        let peer = |agent: &str| {
+            Some(Extension(NativeDeliveryPeer {
+                agent: agent.into(),
+                transport: "app-server",
+                pid: 1,
+                archives_inbox: true,
+            }))
+        };
+        assert!(
+            post_claim(
+                State(state.clone()),
+                peer("agent/example/other"),
+                Json(input.clone())
+            )
+            .await
+            .is_err()
+        );
+        let mut starting = input.clone();
+        starting.fields.insert("state".into(), json!("starting"));
+        let _ = post_claim(State(state.clone()), peer(&input.subject), Json(starting))
+            .await
+            .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: input.subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: input.actor.clone(),
+                fields: serde_json::from_value(
+                    json!({"status":"running","runtime_id":"example/seat","incarnation_id":"two"}),
+                )
+                .unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(
+            post_claim(
+                State(state.clone()),
+                peer(&input.subject),
+                Json(input.clone())
+            )
+            .await
+            .is_err()
+        );
+        let mut live = input.clone();
+        live.fields.insert("incarnation_id".into(), json!("two"));
+        let _ = post_claim(State(state.clone()), peer(&input.subject), Json(live))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .store
+                .current_harness(&input.subject)
+                .unwrap()
+                .unwrap()
+                .incarnation_id,
+            "two"
+        );
+    }
+
+    #[tokio::test]
     async fn a_local_only_harness_observation_wakes_only_the_client_feed() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let wake_file = root.path().join("replication.wake");
         let mut client_feed = state.event_notify.subscribe();
         let subject = "agent/node.worker";
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running","runtime_id":"node.worker","incarnation_id":"inc-1"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
         let observed = |state_name: &str, observed_at_ms: u64| ClaimInput {
             subject: subject.into(),
             kind: "harness.observed".into(),
@@ -15490,7 +15603,18 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             expected_subject: None,
             idempotency_key: Some(format!("wake-usage-{tokens}")),
         };
-        let post = |input: ClaimInput| post_claim(State(state.clone()), Json(input));
+        let post = |input: ClaimInput| {
+            post_claim(
+                State(state.clone()),
+                Some(Extension(NativeDeliveryPeer {
+                    agent: subject.into(),
+                    transport: "app-server",
+                    pid: 1,
+                    archives_inbox: true,
+                })),
+                Json(input),
+            )
+        };
         let reconciler_woke = || async {
             tokio::time::timeout(Duration::from_millis(20), state.notify.notified())
                 .await

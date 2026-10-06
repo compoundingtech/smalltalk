@@ -35,12 +35,25 @@ sample replaces the previous value and its local feed row. Status keeps the curr
 start time and a current-incarnation readiness bit; it retains no transition history.
 
 Native producers replace their local snapshots without creating publication jobs. Each fresh
-snapshot gets one HTTP attempt with a 100 ms deadline. Failure leaves no retry obligation; only
+snapshot gets one HTTP attempt. All current snapshots in one wake share a 100 ms deadline.
+An independent publisher reads the newest source snapshots while durable accounting or timeline
+publication waits. Its own wake pipe prevents the ordered drain from consuming current wakes.
+Failure leaves no retry obligation; only
 a subsequent source snapshot triggers another attempt. The source account is captured with
 context evidence, so delayed reads cannot attribute it to a successor's account. Authenticated
-fleet peers receive current values over `/v1/peer/current-value`, once per peer with the same
-100 ms bound, independently of signed graph inventories. Owner/incarnation binding and source
-revision order reject stale deliveries. There is no peer retry, acknowledgement ledger or
+fleet peers receive current values over `/v1/peer/current-value`, once per peer with a 250 ms
+whole-hop bound, including the receiver's 100 ms local hop, independently of signed graph inventories.
+The relay reuses Fabric listeners and HTTP connections; failed attempts discard the listener address
+and leave no retry job. Current samples aimed at a peer in offline/overload backoff or with existing failed connectivity
+evidence are dropped, including while its worker checks that route again; worker recovery does not
+replay them. Native current writes require the same kernel Unix-peer seat identity and
+running incarnation as `/v1/harness-events`. A kernel-bound `starting` hint may precede the durable
+runtime record; it only makes mailbox startup wait and grants no delivery or readiness authority.
+Owner/incarnation binding and source revision order
+reject stale deliveries. A persistent database generation orders source counters after a database
+reset; ordinary reopen keeps that generation. Generation birth requires the owner's clock to advance
+across resets. Restoring an older database while native producers continue running requires restarting
+those producers with new incarnations before current publication resumes. There is no peer retry, acknowledgement ledger or
 fallback to durable replication for these values. Current status reports source observation
 time and freshness, so an offline owner or dropped heartbeat ages visibly.
 
@@ -98,12 +111,20 @@ configuration lives in `[observations.otlp]`; `OTEL_EXPORTER_OTLP_*` in a native
 controls an exporter in its hooks. The legacy st2 product's exporter remains separately testable.
 
 Fresh native seats retain the existing ordered timeline outbox in `st-harness-events.sqlite`
-for the subsequent owner-native conversation cutover. Activity, context, account-limit sampling
-and todo snapshots use the current-attempt path above and do not append outbox events. The
-matching driver discards queued categorical events from predecessor builds, then attempts the
-latest owner-bound snapshots once. Evidence expiry replaces the snapshot with unknown; a
+for the subsequent owner-native conversation cutover. Activity, context occupancy and todo use
+the current-attempt path above without outbox events. Context producers retain numeric session
+usage and account-limit samples in separate `harness-accounting` events without occupancy fields;
+these durable facts keep the normal request timeout, prepared attribution and retry path, and
+publication fingerprints advance only after success. At the source, unchanged accounting does
+not append another event merely because context occupancy or its record timestamps changed. The
+comparison includes the owner, account, numeric values, resets and actual limit-source timestamp;
+a new account-window measurement still provides fresh evidence for the 95% stop. This guard commits
+atomically with the durable event and survives driver re-exec. A busy or full accounting spool cannot
+advance the guard or roll back a committed current snapshot. The matching driver discards queued categorical events from
+predecessor builds while retaining numeric usage and limits from older context events. Evidence expiry replaces the snapshot with unknown; a
 concurrent heartbeat supersedes it. The remaining timeline outbox preserves source runtime,
 source account and prepared attribution across replay until that separately reviewed removal.
+Accounting durability remains required after that removal.
 Its 64 MiB limit cannot block a current-value write. Native transcripts and session bindings
 keep their existing source paths. This change does not restart shared services or seats.
 

@@ -434,10 +434,14 @@ impl Client {
             let value = serde_json::to_value(body)?;
             if value.get("kind").and_then(serde_json::Value::as_str)
                 .is_some_and(crate::store::is_current_value)
-                && (value["kind"] != "harness.usage" || value["fields"]["semantics"] == "context_occupancy") {
+                && (value["kind"] != "harness.usage"
+                    || value["fields"]["semantics"] == "context_occupancy")
+            {
                 return tokio::time::timeout(
                     LATEST_VALUE_TIMEOUT,
-                    self.request("POST", path, Some(body)),
+                    self.clone()
+                        .with_outage_wait(Duration::ZERO, false)
+                        .request("POST", path, Some(body)),
                 )
                 .await
                 .context("current value POST timed out")?;

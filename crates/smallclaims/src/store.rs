@@ -6338,6 +6338,18 @@ impl Store {
             .worker = Some(worker);
     }
 
+    /// Read the current host-local worker state without scanning inventories or writing a retry.
+    pub fn replication_worker(
+        &self,
+        peer: &str,
+    ) -> Option<crate::replication::ReplicationWorkerStatus> {
+        self.replication_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(peer)
+            .and_then(|progress| progress.worker.clone())
+    }
+
     /// The latest sync measurement for each configured peer that has one.
     pub fn replication_peer_sync(
         &self,

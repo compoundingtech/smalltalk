@@ -234,6 +234,8 @@ pub struct ClientRelay {
     /// The links last read from that store, and when, so a busy gateway reads them rarely.
     observed: Arc<std::sync::Mutex<Option<ObservedLinks>>>,
     fabric: Option<Fabric>,
+    // Reuse Fabric listeners and reqwest connections; retain no publication bytes or retry jobs.
+    current_connections: Arc<std::sync::Mutex<BTreeMap<(String, String), String>>>,
     legacy: bool,
     /// When each owner last refused this node's reads as stale, for provenance.
     fence_conflicts:
@@ -287,24 +289,60 @@ impl ClientRelay {
             },
         );
         let attempts = targets
-            .into_values()
-            .filter_map(|routes| routes.into_iter().next())
+            .into_iter()
+            .filter(|(peer, _)| {
+                // A current sample never opens connections around the durable worker's
+                // offline/overload backoff. Drop it; recovery sends no saved current bytes.
+                let Some(store) = &self.links else { return true; };
+                if store.replication_worker(peer).is_some_and(|worker| {
+                    matches!(worker.phase.as_str(), "backoff" | "overload")
+                }) {
+                    return false;
+                }
+                // The worker briefly leaves backoff while checking a still-offline route.
+                // Its existing, indexed connectivity evidence remains down until a successful
+                // exchange. Current samples must not create their own probes during that check.
+                !matches!(store.replication_peer_up(peer), Ok((false, Some(_))) | Err(_))
+            })
+            .filter_map(|(_, routes)| routes.into_iter().next())
             .map(|route| {
                 let body = body.clone();
                 let headers = headers.clone();
                 async move {
+                    let connection_key = match &route {
+                        Route::Fabric { node, protocol } => Some((node.clone(), protocol.clone())),
+                        Route::Http(_) => None,
+                    };
                     let attempt = async {
                         let url = match route {
                             Route::Http(url) => url,
                             Route::Fabric { node, protocol } => {
-                                let Some(fabric) = &self.fabric else { return };
-                                let Ok(address) = fabric.dial(&node, &protocol).await else {
-                                    return;
-                                };
-                                format!("http://{address}")
+                                let key = (node.clone(), protocol.clone());
+                                let cached = self
+                                    .current_connections
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .get(&key)
+                                    .cloned();
+                                if let Some(url) = cached {
+                                    url
+                                } else {
+                                    let Some(fabric) = &self.fabric else {
+                                        return false;
+                                    };
+                                    let Ok(address) = fabric.dial(&node, &protocol).await else {
+                                        return false;
+                                    };
+                                    let url = format!("http://{address}");
+                                    self.current_connections
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .insert(key, url.clone());
+                                    url
+                                }
                             }
                         };
-                        let _ = self
+                        let response = self
                             .http
                             .post(format!("{}{CURRENT_VALUE_PATH}", url.trim_end_matches('/')))
                             .headers(headers)
@@ -312,9 +350,24 @@ impl ClientRelay {
                             .body(body)
                             .send()
                             .await;
+                        match response {
+                            Ok(response) => {
+                                let accepted = response.status().is_success();
+                                accepted && response.bytes().await.is_ok()
+                            }
+                            Err(_) => false,
+                        }
                     };
-                    let _ =
-                        tokio::time::timeout(crate::client::LATEST_VALUE_TIMEOUT, attempt).await;
+                    // Fleet budget covers both network legs plus the receiver's 100 ms local hop.
+                    let accepted = tokio::time::timeout(Duration::from_millis(250), attempt)
+                        .await
+                        .unwrap_or(false);
+                    if !accepted && let Some(key) = connection_key {
+                        self.current_connections
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&key);
+                    }
                 }
             });
         futures_util::future::join_all(attempts).await;
@@ -435,6 +488,7 @@ impl ClientRelay {
             links: None,
             legacy: config.fleet.as_ref().is_none_or(|file| file.legacy_peers),
             observed: Arc::default(),
+            current_connections: Arc::default(),
             fence_conflicts: Arc::default(),
             fabric: resolve_tool(
                 config
@@ -1657,6 +1711,111 @@ mod tests {
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt as _;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn current_fleet_attempt_reuses_fabric_connection_and_bounds_the_whole_hop() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let delay = Arc::new(AtomicU64::new(120));
+        let app = axum::Router::new().route(
+            CURRENT_VALUE_PATH,
+            axum::routing::post({
+                let (calls, delay) = (calls.clone(), delay.clone());
+                move || {
+                    let (calls, delay) = (calls.clone(), delay.clone());
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(delay.load(Ordering::SeqCst)))
+                            .await;
+                        axum::Json(serde_json::json!({"changed":true}))
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dial_log = root.path().join("dials");
+        let fabric = root.path().join("fabric");
+        fs::write(
+            &fabric,
+            format!(
+                "#!/bin/sh\nprintf 'dial\\n' >> '{}'\nprintf '{}\\n'\n",
+                dial_log.display(),
+                address
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fabric, fs::Permissions::from_mode(0o700)).unwrap();
+        let secret = root.path().join("secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut relay = ClientRelay::from_config(&Config {
+            node: "owner".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "peer".into(),
+                url: "fabric://peer-node/current-tests".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        relay.fabric = Some(Fabric::new(fabric));
+        let source = Arc::new(Store::open_memory("owner").unwrap());
+        relay = relay.with_links(source.clone());
+        let record = source
+            .append_claim(&ClaimInput {
+                subject: "agent/example/seat".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/example/seat".into()),
+                fields: serde_json::from_value(
+                    serde_json::json!({"state":"working","driver":"codex","incarnation_id":"one"}),
+                )
+                .unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        for _ in 0..2 {
+            relay.publish_current_value(record.clone()).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fs::read_to_string(&dial_log).unwrap().lines().count(), 1);
+        assert_eq!(relay.current_connections.lock().unwrap().len(), 1);
+        delay.store(500, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        relay.publish_current_value(record.clone()).await;
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "no retry inside one fleet attempt"
+        );
+        assert!(relay.current_connections.lock().unwrap().is_empty());
+        delay.store(0, Ordering::SeqCst);
+        relay.publish_current_value(record.clone()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(fs::read_to_string(&dial_log).unwrap().lines().count(), 2);
+        source.record_replication_worker("peer", smallclaims::replication::ReplicationWorkerStatus {
+            phase: "backoff".into(), last_attempt_at_unix_ms: u128::from(st_drivers::message::now_ms()),
+            next_retry_at_unix_ms: Some(u128::from(st_drivers::message::now_ms()) + 30_000),
+        });
+        relay.publish_current_value(record.clone()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "current hints respect offline backoff");
+        source.record_replication_worker("peer", smallclaims::replication::ReplicationWorkerStatus {
+            phase: "idle".into(), ..Default::default()
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "recovery does not replay a dropped hint");
+        relay.publish_current_value(record).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        server.abort();
+    }
 
     fn fleet_claim(store: &Store, kind: &str, subject: &str, fields: Value) {
         store

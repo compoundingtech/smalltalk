@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::harness_timeline::{Operation, Record};
 
+pub const CURRENT_WAKE_PIPE: &str = ".st-harness-current-wake";
 pub const WAKE_PIPE: &str = ".st-harness-events-wake";
 pub const DATABASE: &str = "st-harness-events.sqlite";
 const MAX_PENDING_BYTES: u64 = 64 * 1024 * 1024;
@@ -55,11 +56,19 @@ fn open(agent_dir: &Path) -> Result<Connection> {
 /// Bind a fresh pipe inode before exposing its name. A predecessor retains its old descriptor
 /// and cannot steal its successor's wakeups. Pipe bytes are hints; startup always replays SQLite.
 pub fn bind_wake_pipe(agent_dir: &Path) -> Result<std::fs::File> {
+    bind_named_wake_pipe(agent_dir, WAKE_PIPE)
+}
+
+pub fn bind_current_wake_pipe(agent_dir: &Path) -> Result<std::fs::File> {
+    bind_named_wake_pipe(agent_dir, CURRENT_WAKE_PIPE)
+}
+
+fn bind_named_wake_pipe(agent_dir: &Path, pipe: &str) -> Result<std::fs::File> {
     use std::os::unix::{
         ffi::OsStrExt as _,
         fs::{FileTypeExt as _, OpenOptionsExt as _},
     };
-    let path = agent_dir.join(WAKE_PIPE);
+    let path = agent_dir.join(pipe);
     if let Ok(metadata) = path.symlink_metadata() {
         anyhow::ensure!(
             metadata.file_type().is_fifo(),
@@ -91,13 +100,18 @@ pub fn bind_wake_pipe(agent_dir: &Path) -> Result<std::fs::File> {
 }
 
 fn signal_wake(agent_dir: &Path) {
+    signal_named_wake(agent_dir, WAKE_PIPE);
+    signal_named_wake(agent_dir, CURRENT_WAKE_PIPE);
+}
+
+fn signal_named_wake(agent_dir: &Path, pipe: &str) {
     use std::io::Write as _;
     use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
     let signal = (|| -> io::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(agent_dir.join(WAKE_PIPE))?;
+            .open(agent_dir.join(pipe))?;
         if !file.metadata()?.file_type().is_fifo() {
             return Err(io::Error::other("event wake path is not a pipe"));
         }
@@ -274,35 +288,83 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
         "observation needs an owner"
     );
     let mut connection = open(agent_dir)?;
-    connection.busy_timeout(Duration::ZERO)?;
-    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    if kind == "harness-state" {
-        let token = value["incarnation"].as_str().unwrap();
-        if current_token(&tx)?.as_deref() != Some(token) {
-            tx.execute("DELETE FROM metadata WHERE key LIKE 'provider-runtime:%' OR key LIKE 'timeline-next:%'", [])?;
-            tx.execute(
+    let current_result = (|| -> Result<()> {
+        connection.busy_timeout(Duration::ZERO)?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if kind == "harness-state" {
+            let token = value["incarnation"].as_str().unwrap();
+            if current_token(&tx)?.as_deref() != Some(token) {
+                tx.execute("DELETE FROM metadata WHERE key LIKE 'provider-runtime:%' OR key LIKE 'timeline-next:%'", [])?;
+                tx.execute(
                 "INSERT INTO metadata(key,value) SELECT ?1,value FROM metadata WHERE key='runtime'",
                 [format!("provider-runtime:{token}")],
             )?;
+            }
+        }
+        // Context writers used to have no ownership fence. Refuse a delayed predecessor now that
+        // its snapshot is replaced in the same transaction as the ownership check.
+        if matches!(kind, "harness-context" | "harness-todo") {
+            anyhow::ensure!(
+                current_token(&tx)?.as_deref() == value["incarnation"].as_str(),
+                "harness observation owner was superseded"
+            );
+        }
+        tx.execute(
+            "INSERT INTO snapshots VALUES (?1,?2)
+        ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
+            params![kind, body],
+        )?;
+        // Snapshots are current values. Their wake never appends an ordered publication job.
+        tx.commit()?;
+        signal_wake(agent_dir);
+        Ok(())
+    })();
+    if kind == "harness-context"
+        && (value["sessionTotalTokens"].is_number()
+            || value["rateLimits"]["fiveHour"].is_number()
+            || value["rateLimits"]["sevenDay"].is_number())
+    {
+        // Accounting survives outages. It carries no context occupancy or categorical state.
+        let mut accounting = value;
+        for key in [
+            "usedTokens",
+            "windowTokens",
+            "usedPercent",
+            "compactions",
+            "lastCompactionMs",
+            "lastCompactionTrigger",
+        ] {
+            accounting.as_object_mut().unwrap().remove(key);
+        }
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Re-stamping context occupancy is not new accounting. Keep the source limit timestamp:
+        // a genuinely new account-window measurement is evidence used by the 95% stop. Commit
+        // this guard with the durable event, so a full spool or failed transaction cannot lose
+        // the next attempt. Pending accounting keeps its existing durable delivery and retry.
+        let mut comparison = accounting.clone();
+        comparison.as_object_mut().unwrap().remove("observedAtMs");
+        comparison.as_object_mut().unwrap().remove("writtenAtMs");
+        let fingerprint = serde_json::to_string(&comparison)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key='accounting-fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() != Some(fingerprint.as_str()) {
+            append_event(&tx, "harness-accounting", &accounting)?;
+            tx.execute(
+                "INSERT INTO metadata(key,value) VALUES ('accounting-fingerprint',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [&fingerprint],
+            )?;
+            tx.commit()?;
+            signal_wake(agent_dir);
         }
     }
-    // Context writers used to have no ownership fence. Refuse a delayed predecessor now that
-    // its snapshot is replaced in the same transaction as the ownership check.
-    if matches!(kind, "harness-context" | "harness-todo") {
-        anyhow::ensure!(
-            current_token(&tx)?.as_deref() == value["incarnation"].as_str(),
-            "harness observation owner was superseded"
-        );
-    }
-    tx.execute(
-        "INSERT INTO snapshots VALUES (?1,?2)
-        ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
-        params![kind, body],
-    )?;
-    // Snapshots are current values. Their wake never appends an ordered publication job.
-    tx.commit()?;
-    signal_wake(agent_dir);
-    Ok(())
+    current_result
 }
 
 /// Graph-native channels have no provider record writer. Their spool is scoped to one
@@ -314,7 +376,9 @@ pub fn write_channel_todo(agent_dir: &Path, runtime: &str, fields: &Value) -> Re
     connection.busy_timeout(Duration::ZERO)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let bound: String = tx.query_row(
-        "SELECT value FROM metadata WHERE key='runtime'", [], |row| row.get(0),
+        "SELECT value FROM metadata WHERE key='runtime'",
+        [],
+        |row| row.get(0),
     )?;
     anyhow::ensure!(bound == runtime, "channel todo runtime was superseded");
     tx.execute(
@@ -909,6 +973,83 @@ mod protocol_tests {
         );
     }
     #[test]
+    fn accounting_dedupes_refreshes_and_only_remembers_committed_events() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime").unwrap();
+        claim(root.path(), "agent/example", "claude", "provider").unwrap();
+        let mut reading = json!({
+            "schema":"st.harness-context.v1", "incarnation":"provider", "harness":"claude",
+            "observedAtMs":100, "writtenAtMs":100, "usedTokens":10, "windowTokens":100,
+            "sessionTotalTokens":20, "costUsd":0.1,
+            "rateLimits":{"fiveHour":94,"observedAtMs":100}
+        });
+        let write = |value: &Value| {
+            write_snapshot(
+                root.path(),
+                "harness-context",
+                &serde_json::to_vec(value).unwrap(),
+            )
+        };
+        write(&reading).unwrap();
+        acknowledge(root.path(), pending(root.path(), 10).unwrap()[0].sequence).unwrap();
+        enable(root.path(), "runtime").unwrap(); // A driver restart preserves the committed guard.
+        for stamp in 101..201 {
+            reading["observedAtMs"] = stamp.into();
+            reading["writtenAtMs"] = stamp.into();
+            reading["usedTokens"] = stamp.into();
+            write(&reading).unwrap();
+        }
+        assert!(pending(root.path(), 100).unwrap().is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &read_snapshot(root.path(), "harness-context")
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap()["usedTokens"],
+            200
+        );
+        reading["sessionTotalTokens"] = 21.into();
+        open(root.path())
+            .unwrap()
+            .execute(
+                "UPDATE metadata SET value=?1 WHERE key='pending-bytes'",
+                [MAX_PENDING_BYTES],
+            )
+            .unwrap();
+        assert!(write(&reading).is_err());
+        open(root.path())
+            .unwrap()
+            .execute("UPDATE metadata SET value=0 WHERE key='pending-bytes'", [])
+            .unwrap();
+        write(&reading).unwrap();
+        let events = pending(root.path(), 10).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "failed durable append cannot advance the guard"
+        );
+        assert_eq!(events[0].payload["sessionTotalTokens"], 21);
+        acknowledge(root.path(), events[0].sequence).unwrap();
+        reading["rateLimits"]["fiveHour"] = 95.into();
+        write(&reading).unwrap();
+        let events = pending(root.path(), 10).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "the stop threshold is durable even when spend is unchanged"
+        );
+        acknowledge(root.path(), events[0].sequence).unwrap();
+        reading["rateLimits"]["observedAtMs"] = 201.into();
+        write(&reading).unwrap();
+        assert_eq!(
+            pending(root.path(), 10).unwrap().len(),
+            1,
+            "new limit-source evidence preserves freshness"
+        );
+    }
+
+    #[test]
     fn account_capture_child() {
         let Some(directory) = std::env::var_os("ST_ACCOUNT_TEST_DIRECTORY") else {
             return;
@@ -953,7 +1094,10 @@ mod protocol_tests {
         let root = tempfile::tempdir().unwrap();
         for (runtime, account) in [("runtime-one", "ada/one"), ("runtime-two", "ada/two")] {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "harness_events::protocol_tests::account_capture_child"])
+                .args([
+                    "--exact",
+                    "harness_events::protocol_tests::account_capture_child",
+                ])
                 .env("ST_ACCOUNT_TEST_DIRECTORY", root.path())
                 .env("ST_ACCOUNT_TEST_RUNTIME", runtime)
                 .env("ST3_ACCOUNT", account)

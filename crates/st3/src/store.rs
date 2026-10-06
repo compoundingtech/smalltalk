@@ -1143,7 +1143,7 @@ pub struct EndedDeclaration {
 
 /// A kept agent status: the snapshot it answers, the agent projection index it was reduced at,
 /// whether it includes history, and the status.
-type AgentStatusEntry = (u64, u64, bool, Arc<StatusResponse>);
+type AgentStatusEntry = (u64, u64, u64, bool, Arc<StatusResponse>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MissionGateRunner {
@@ -2492,19 +2492,23 @@ impl Store {
                 cache.views.remove(&subject);
             }
             drop(cache);
-            self.smalltalk
-                .agent_status_cache
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clear();
-            self.smalltalk
-                .agent_resources_cache
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clear();
             *seen = current;
         }
         Ok(())
+    }
+
+    fn current_cache_revision(&self) -> Result<u64> {
+        Ok(self.readers.get().query_row(
+            "SELECT coalesce(max(local_id),0) FROM latest_values",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn changed_current_agents(&self, since: u64) -> Result<BTreeSet<String>> {
+        Ok(self.readers.get().prepare_cached(
+            "SELECT DISTINCT subject FROM latest_values WHERE local_id>?1 AND subject LIKE 'agent/%'",
+        )?.query_map([since], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
@@ -2633,23 +2637,31 @@ impl Store {
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
         self.refresh_current_caches()?;
+        let revision = self.current_cache_revision()?;
         let mut cache = self
             .smalltalk
             .agent_resources_cache
             .lock()
             .expect("agent resources cache poisoned");
-        if let Some((_, _, items)) = cache
+        if let Some((_, _, _, items)) = cache
             .iter()
-            .find(|(at, all, _)| *at == index && *all == history)
+            .find(|(at, current, all, _)| *at == index && *current == revision && *all == history)
         {
             return Ok((**items).clone());
         }
         let previous = cache
             .iter()
-            .filter(|(at, all, _)| *at < index && *all == history)
-            .max_by_key(|(at, _, _)| *at);
-        let items = if let Some((at, _, previous)) = previous {
-            match self.changed_agent_resources(*at, index)? {
+            .filter(|(at, _, all, _)| *at <= index && *all == history)
+            .max_by_key(|(at, current, _, _)| (*at, *current));
+        let items = if let Some((at, prior_revision, _, previous)) = previous {
+            let changed = self
+                .changed_agent_resources(*at, index)?
+                .map(|mut changed| {
+                    changed.extend(self.changed_current_agents(*prior_revision)?);
+                    Ok::<_, anyhow::Error>(changed)
+                })
+                .transpose()?;
+            match changed {
                 Some(changed) if changed.is_empty() => (**previous).clone(),
                 Some(changed) => {
                     let fresh = build(Some((&changed, previous)))?;
@@ -2672,7 +2684,7 @@ impl Store {
         } else {
             build(None)?
         };
-        cache.push_back((index, history, Arc::new(items.clone())));
+        cache.push_back((index, revision, history, Arc::new(items.clone())));
         if cache.len() > 8 {
             cache.pop_front();
         }
@@ -9159,6 +9171,29 @@ impl Store {
             .map_err(|error| St3Error::new("internal", error))?
     }
 
+    /// Kernel-bound native publication of a current register; it has no event sequence/receipt.
+    pub(crate) fn append_bound_current(
+        &self,
+        input: &ClaimInput,
+        runtime: &str,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        if !is_current_input(input) || runtime.is_empty() {
+            return Err(St3Error::new(
+                "invalid-harness-event",
+                "invalid current observation",
+            ));
+        }
+        st3_schema::registry()
+            .validate_public_claim(
+                &input.subject,
+                &input.kind,
+                &input.fields,
+                input.actor.as_deref(),
+            )
+            .map_err(|error| St3Error::new(error.code, error.message))?;
+        latest_values::append(&self.graph, input, now_ms(), Some(runtime))
+    }
+
     /// Append a native driver's observation, as `POST /v1/harness-events` does once it has
     /// bound the caller to its seat. The daemon tests call it directly, without a driver.
     pub fn append_harness_event(
@@ -9896,6 +9931,7 @@ impl Store {
         if prefix == "agent/" {
             // What this thread's reads can see, as every snapshot read checks: a read pinned to
             // a snapshot can see a commit a moment before the writer publishes its index.
+            let revision = self.current_cache_revision()?;
             let current = current_index(&self.readers.get())?;
             let index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
             let mut cache = self
@@ -9903,18 +9939,24 @@ impl Store {
                 .agent_status_cache
                 .lock()
                 .expect("agent status cache poisoned");
-            if let Some((_, _, _, status)) = cache.iter().find(|(cached_index, _, history, _)| {
-                *cached_index == index && *history == include_history
-            }) {
+            if let Some((_, _, _, _, status)) =
+                cache.iter().find(|(cached_index, _, current, history, _)| {
+                    *cached_index == index && *current == revision && *history == include_history
+                })
+            {
                 let mut result = (**status).clone();
                 result.store_index = index;
                 return Ok(result);
             }
             let projection_index = self.agent_status_index(index)?;
-            if let Some((cached_index, _, _, status)) =
-                cache.iter_mut().find(|(_, cached_projection, history, _)| {
-                    *cached_projection == projection_index && *history == include_history
-                })
+            if let Some((cached_index, _, _, _, status)) =
+                cache
+                    .iter_mut()
+                    .find(|(_, cached_projection, current, history, _)| {
+                        *cached_projection == projection_index
+                            && *current == revision
+                            && *history == include_history
+                    })
             {
                 *cached_index = index;
                 let mut result = (**status).clone();
@@ -9926,6 +9968,7 @@ impl Store {
             cache.push_back((
                 index,
                 projection_index,
+                revision,
                 include_history,
                 Arc::new(status.clone()),
             ));
@@ -11656,7 +11699,7 @@ impl Store {
             return Ok(BTreeMap::new());
         }
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(&current_sql(&format!(
+        let mut statement = connection.prepare_cached(&format!(
             "SELECT {CLAIM_COLUMNS} FROM json_each(?1) subjects
              CROSS JOIN (
                  SELECT 'harness.todo.observed' AS kind
@@ -11670,7 +11713,7 @@ impl Store {
                  ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1
              )
              JOIN batches ON batches.id=claims.batch_id"
-        )))?;
+        ))?;
         let rows = statement.query_map(
             params![
                 serde_json::to_string(subjects)?,
@@ -11683,6 +11726,22 @@ impl Store {
             let claim = claim?;
             observations.entry(claim.subject.clone()).or_default()
                 .insert(claim.kind.clone(), claim);
+        }
+        // Keep the historical bulk seek on its indexes. Joining the UNION view by a
+        // correlated source ID materializes the fleet; overlay only the selected registers.
+        let mut current = connection.prepare_cached(&format!(
+            "SELECT {CLAIM_COLUMNS} FROM registered_claims AS claims
+             WHERE claims.subject IN (SELECT value FROM json_each(?1))
+               AND claims.kind='harness.todo.observed'"
+        ))?;
+        let rows = current.query_map([serde_json::to_string(subjects)?], claim_from_row)?;
+        for claim in rows {
+            let claim = claim?;
+            let kinds = observations.entry(claim.subject.clone()).or_default();
+            if kinds.get(&claim.kind).is_none_or(|legacy|
+                legacy.accepted_at_unix_ms <= claim.accepted_at_unix_ms) {
+                kinds.insert(claim.kind.clone(), claim);
+            }
         }
         Ok(observations)
     }
@@ -15263,11 +15322,8 @@ impl Store {
         current_harness_at(&connection, subject, None)
     }
 
-    pub(crate) fn flush_pending_usage(
-        &self,
-        subject: &str,
-        incarnation: &str,
-    ) -> Result<bool, St3Error> {
+    /// Flush retained numeric accounting at a provider stop independently of current status.
+    pub fn flush_pending_usage(&self, subject: &str, incarnation: &str) -> Result<bool, St3Error> {
         let connection = self.readers.get();
         let pending: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM local_latest_slots WHERE subject=?1 AND kind='harness.usage'

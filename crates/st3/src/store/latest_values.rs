@@ -37,6 +37,19 @@ SELECT source_id AS id, origin, source_at AS replica_sequence, NULL AS actor,
     '' AS idempotency_key, CAST(source_at AS TEXT) AS accepted_at_unix_ms FROM latest_values;
 "#;
 
+/// A database generation fences sequence numbers after a reset. Ordinary reopen retains it.
+/// Generation birth uses the owner clock; restore/reset requires that clock to move forward.
+pub(super) fn initialize_epoch(connection: &Connection) -> Result<()> {
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    connection.execute(
+        "INSERT OR IGNORE INTO meta(key,value) VALUES ('current-value-epoch',?1)",
+        [epoch.to_string()],
+    )?;
+    Ok(())
+}
+
 pub fn is_current_value(kind: &str) -> bool {
     matches!(
         kind,
@@ -155,13 +168,18 @@ pub(super) fn append(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(internal)?;
+    smallclaims::sqlite::observe(&mut connection);
     connection
         .busy_timeout(std::time::Duration::ZERO)
         .map_err(internal)?;
     let tx = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(internal)?;
-    check_harness_event_runtime(&tx, &input.subject, event_runtime)?;
+    // A bound driver announces starting before reconciliation records runtime.running.
+    // This hint only permits mailbox startup to wait; it grants no delivery or ready authority.
+    if input.fields.get("state").and_then(Value::as_str) != Some("starting") {
+        check_harness_event_runtime(&tx, &input.subject, event_runtime)?;
+    }
     if let Some(runtime) = event_runtime
         && input.fields.get("incarnation_id").and_then(Value::as_str) != Some(runtime)
     {
@@ -290,7 +308,28 @@ pub(super) fn append(
             .fields
             .insert("status_transition".into(), json!(transition));
     }
-    let (local, _) = insert_local_observation_tx(&tx, &graph.origin, &input, now)?;
+    let (mut local, _) = insert_local_observation_tx(&tx, &graph.origin, &input, now)?;
+    let epoch: String = tx
+        .query_row(
+            "SELECT value FROM meta WHERE key='current-value-epoch'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
+    local.body["_source_epoch"] = json!(epoch);
+    let sequence = local_observation_position(&local).unwrap();
+    local.id = format!(
+        "{LOCAL_OBSERVATION_ID_PREFIX}{}/{epoch}/{sequence}",
+        graph.origin
+    );
+    tx.execute(
+        "UPDATE local_observations SET body=?1 WHERE id=?2",
+        params![
+            canonical_json_text(&local.body).map_err(internal)?,
+            sequence
+        ],
+    )
+    .map_err(internal)?;
     // Retire the old current-value retry slots and local history at the first modern sample.
     // Numeric usage series keep their slots and observations.
     if input.kind == "harness.usage" {
@@ -382,6 +421,7 @@ impl Store {
             &self.path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
+        smallclaims::sqlite::observe(&mut connection);
         connection.busy_timeout(std::time::Duration::ZERO)?;
         let Ok(tx) = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         else {
@@ -477,7 +517,7 @@ impl Store {
 
     /// A signed fleet sender supplies its own current observation. Imported registers never
     /// enter replication inventories, and an older delivery cannot overwrite a newer value.
-    pub(crate) fn receive_current_value(&self, record: &ClaimRecord) -> Result<bool, St3Error> {
+    pub fn receive_current_value(&self, record: &ClaimRecord) -> Result<bool, St3Error> {
         if !is_current_value(&record.kind)
             || (record.kind == "harness.usage"
                 && record.body["fields"]["semantics"] != "context_occupancy")
@@ -501,12 +541,14 @@ impl Store {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )
         .map_err(internal)?;
+        smallclaims::sqlite::observe(&mut connection);
         connection
             .busy_timeout(std::time::Duration::ZERO)
             .map_err(internal)?;
         let tx = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(internal)?;
+        let mut incarnation_bound = false;
         if record.subject.starts_with("agent/") {
             let runtime: Option<(String, String)> = tx
                 .query_row(
@@ -524,7 +566,8 @@ impl Store {
                 .map_err(internal)?;
             if let Some((owner, body)) = runtime {
                 let body: Value = serde_json::from_str(&body).map_err(internal)?;
-                if body["fields"]["status"] == "running"
+                incarnation_bound = body["fields"]["status"] == "running";
+                if incarnation_bound
                     && (owner != record.origin
                         || body["fields"]["incarnation_id"]
                             != record.body["fields"]["incarnation_id"])
@@ -536,9 +579,9 @@ impl Store {
                 }
             }
         }
-        let previous: Option<(u64, String, i64, String)> = tx.query_row(
-            "SELECT source_at,source_id,local_id,origin FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3",
-            params![record.subject,record.kind,slot], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+        let previous: Option<(u64, String, i64, String, String)> = tx.query_row(
+            "SELECT source_at,source_id,local_id,origin,body FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3",
+            params![record.subject,record.kind,slot], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))
             .optional().map_err(internal)?;
         let source_sequence = |id: &str| {
             id.rsplit('/')
@@ -546,12 +589,28 @@ impl Store {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or_default()
         };
-        if previous.as_ref().is_some_and(|(at, id, _, origin)| {
+        if previous.as_ref().is_some_and(|(at, id, _, origin, body)| {
             if origin == &record.origin
                 && id.starts_with(LOCAL_OBSERVATION_ID_PREFIX)
                 && record.id.starts_with(LOCAL_OBSERVATION_ID_PREFIX)
             {
-                return source_sequence(id) >= source_sequence(&record.id);
+                let previous: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                // A restored database may rewind its generation and counter. A newly running
+                // incarnation, already validated against durable owner evidence above, cuts over.
+                if incarnation_bound
+                    && previous["fields"]["incarnation_id"]
+                        != record.body["fields"]["incarnation_id"]
+                {
+                    return false;
+                }
+                let epoch = |body: &Value| {
+                    body["_source_epoch"]
+                        .as_str()
+                        .and_then(|value| value.parse::<u128>().ok())
+                        .unwrap_or(0)
+                };
+                return (epoch(&previous), source_sequence(id))
+                    >= (epoch(&record.body), source_sequence(&record.id));
             }
             (*at, source_sequence(id), id.as_str())
                 >= (
@@ -573,7 +632,7 @@ impl Store {
         };
         let (local, _) =
             insert_local_observation_tx(&tx, &self.origin, &input, record.accepted_at_unix_ms)?;
-        if let Some((_, _, old_id, _)) = previous {
+        if let Some((_, _, old_id, _, _)) = previous {
             tx.execute("DELETE FROM local_observations WHERE id=?1", [old_id])
                 .map_err(internal)?;
         }
@@ -608,6 +667,42 @@ mod tests {
             expected_subject: None,
             idempotency_key: None,
         }
+    }
+
+    #[test]
+    fn a_current_seat_lookup_seeks_its_register_without_scanning_the_fleet() {
+        let store = Store::open_memory("node").unwrap();
+        store
+            .append_claim(&state("idle", "one", now_ms() as u64))
+            .unwrap();
+        let connection = store.readers.get();
+        let query = harness_sql(
+            &connection,
+            "agent/cedar",
+            &format!(
+                "{} LIMIT 1",
+                newest_claims_of_kind_query("claims.body", "harness.observed")
+            ),
+        )
+        .unwrap();
+        let plan: Vec<String> = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap()
+            .query_map(params!["agent/cedar", i64::MAX], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("SEARCH latest_values") && step.contains("subject=?")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(
+                |step| step.contains("SCAN latest_values") || step.contains("SCAN main.claims")
+            ),
+            "{plan:?}"
+        );
     }
 
     #[test]
@@ -792,6 +887,92 @@ mod tests {
         );
         report.body["fields"]["incarnation_id"] = "one".into();
         assert!(peer.receive_current_value(&report).unwrap());
+    }
+
+    #[test]
+    fn database_reset_starts_a_new_generation_without_accepting_old_replays() {
+        let old = Store::open_memory("owner").unwrap();
+        let peer = Store::open_memory("peer").unwrap();
+        let stamp = now_ms() as u64;
+        let mut latest = old.append_claim(&state("working", "one", stamp)).unwrap();
+        for n in 1..20 {
+            latest = old
+                .append_claim(&state("working", "one", stamp + n))
+                .unwrap();
+        }
+        assert!(peer.receive_current_value(&latest).unwrap());
+        let reset = Store::open_memory("owner").unwrap();
+        let fresh = reset
+            .append_claim(&state("idle", "one", stamp + 21))
+            .unwrap();
+        assert!(
+            local_observation_position(&fresh).unwrap()
+                < local_observation_position(&latest).unwrap()
+        );
+        assert!(peer.receive_current_value(&fresh).unwrap());
+        assert!(!peer.receive_current_value(&latest).unwrap());
+        assert_eq!(
+            peer.latest_claim("agent/cedar", Some("harness.observed"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["state"],
+            "idle"
+        );
+    }
+
+    #[test]
+    fn restore_recovery_requires_a_new_durably_bound_incarnation() {
+        let source = Store::open_memory("owner").unwrap();
+        let peer = Store::open_memory("owner").unwrap();
+        let runtime = |incarnation| ClaimInput {
+            subject: "agent/cedar".into(),
+            kind: "runtime.observed".into(),
+            actor: None,
+            fields: serde_json::from_value(
+                json!({"status":"running","runtime_id":"cedar","incarnation_id":incarnation}),
+            )
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        peer.append_claim(&runtime("one")).unwrap();
+        let stamp = now_ms() as u64;
+        let mut old = source
+            .append_claim(&state("working", "one", stamp))
+            .unwrap();
+        for n in 1..20 {
+            old = source
+                .append_claim(&state("working", "one", stamp + n))
+                .unwrap();
+        }
+        assert!(peer.receive_current_value(&old).unwrap());
+        let restored = Store::open_memory("owner").unwrap();
+        restored
+            .connection
+            .write()
+            .execute(
+                "UPDATE meta SET value=?1 WHERE key='current-value-epoch'",
+                [old.body["_source_epoch"].as_str().unwrap()],
+            )
+            .unwrap();
+        let fresh = restored
+            .append_claim(&state("idle", "two", stamp + 21))
+            .unwrap();
+        assert!(
+            peer.receive_current_value(&fresh).is_err(),
+            "a self-declared new incarnation is insufficient"
+        );
+        peer.append_claim(&runtime("two")).unwrap();
+        assert!(peer.receive_current_value(&fresh).unwrap());
+        assert!(peer.receive_current_value(&old).is_err());
+        assert_eq!(
+            peer.latest_claim("agent/cedar", Some("harness.observed"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["incarnation_id"],
+            "two"
+        );
     }
 
     #[test]

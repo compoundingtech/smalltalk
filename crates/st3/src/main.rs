@@ -57,6 +57,7 @@ use completion::{Complete, Entity, WorkFilter};
 
 mod cli_help;
 mod completion;
+mod current_harness_publisher;
 #[cfg(test)]
 mod follow_tests;
 mod presentation;
@@ -17358,9 +17359,19 @@ async fn drive_st2_native(
             client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
         ).await
     {
-        let _ = write_driver_log(subject, &format!("Claude attachment check will retry: {error:#}"));
+        let _ = write_driver_log(
+            subject,
+            &format!("Claude attachment check will retry: {error:#}"),
+        );
     }
     let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
+    observations.current_publisher = current_harness_publisher::Publisher::start(
+        client,
+        subject,
+        driver,
+        &agent_dir,
+        &incarnation,
+    )?;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
@@ -17372,7 +17383,7 @@ async fn drive_st2_native(
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
     let mut last_activity_fingerprint = None;
-    let mut last_usage_fingerprint = None;
+    let mut last_usage_fingerprint = UsageFingerprints::default();
     let mut last_limits_fingerprint = None;
     let mut last_control_warning = None;
     let mut last_admission_fingerprint = None;
@@ -17904,15 +17915,21 @@ struct NativeObservations {
     retry_pending: bool,
     initial_wake: bool,
     latest_attempted: BTreeMap<String, String>,
+    current_publisher: Option<current_harness_publisher::Publisher>,
     pipe: Option<tokio::io::unix::AsyncFd<std::fs::File>>,
 }
 impl NativeObservations {
     fn start(dir: &Path, runtime: &str) -> Result<Self> {
+        Self::start_with_pipe(dir, runtime, false)
+    }
+    fn start_with_pipe(dir: &Path, runtime: &str, current: bool) -> Result<Self> {
         let enabled = st_drivers::harness_events::enabled(dir);
         let pipe = if enabled {
-            Some(tokio::io::unix::AsyncFd::new(
-                st_drivers::harness_events::bind_wake_pipe(dir)?,
-            )?)
+            Some(tokio::io::unix::AsyncFd::new(if current {
+                st_drivers::harness_events::bind_current_wake_pipe(dir)?
+            } else {
+                st_drivers::harness_events::bind_wake_pipe(dir)?
+            })?)
         } else {
             None
         };
@@ -17940,6 +17957,7 @@ impl NativeObservations {
             retry_pending: enabled,
             initial_wake: enabled,
             latest_attempted: BTreeMap::new(),
+            current_publisher: None,
             pipe,
         })
     }
@@ -17997,6 +18015,7 @@ impl NativeObservations {
             event: None,
             source_account: None,
         };
+        let mut snapshots = Vec::new();
         for kind in ["harness-state", "harness-context", "harness-todo"] {
             let raw = if kind == "harness-state" {
                 state.clone()
@@ -18023,129 +18042,131 @@ impl NativeObservations {
             }
             // Mark the attempt before HTTP. Failure is dropped, never a retry obligation.
             self.latest_attempted.insert(kind.into(), fingerprint);
-            match kind {
-                "harness-state" => {
-                    let observed = st_drivers::harness_state::read_raw_at(
-                        &raw,
-                        None,
-                        st_drivers::message::now_ms(),
-                    );
-                    self.provider_incarnation = observed.evidence_incarnation.clone();
-                    self.evidence_deadline = (!expired).then_some(payload);
-                    if matches!(driver, "omp" | "opencode") {
-                        let _ = tokio::time::timeout(
-                            st3::client::LATEST_VALUE_TIMEOUT,
-                            publish_admission_diagnostic(
-                                client,
-                                subject,
-                                &self.runtime,
-                                &self.dir,
-                                &mut None,
-                            ),
-                        )
-                        .await;
-                    }
-                    if observed.reason.as_deref() == Some("providerCapacity") {
-                        let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
-                            driver,
-                            observed.since_ms,
-                            observed.reason.as_deref(),
-                        ))?));
-                        let _ = tokio::time::timeout(
-                            st3::client::LATEST_VALUE_TIMEOUT,
-                            publish_provider_capacity_diagnostic(
-                                client,
-                                subject,
-                                &self.runtime,
-                                observed.since_ms,
-                                &fingerprint,
-                            ),
-                        )
-                        .await;
-                    }
-                    if observed.reason.as_deref() == Some("claimed") {
-                        continue;
-                    }
-                    if driver != "codex"
-                        && !matches!(
-                            observed.state,
-                            st_drivers::harness_state::Activity::Unknown
-                                | st_drivers::harness_state::Activity::Ended
-                        )
-                    {
-                        *ready = true;
-                    }
-                    let _ = publish_harness_activity(
-                        &publisher,
-                        subject,
-                        driver,
-                        match driver {
-                            "claude" => "claude-channel",
-                            "codex" => "app-server",
-                            "pi" => "pi-channel",
-                            "omp" => "omp-channel",
-                            _ => "native",
-                        },
-                        Some(&self.runtime),
-                        &observed,
-                        &mut None,
-                    )
-                    .await;
-                }
-                "harness-context" => {
-                    let publisher = ObservationClient {
-                        client,
-                        event: None,
-                        source_account: payload.get("account_ref").map(Value::as_str),
-                    };
-                    if let Some(observed) = st_drivers::harness_context::read_raw_at(
-                        &raw,
-                        st_drivers::message::now_ms(),
-                    ) {
-                        let _ = publish_harness_usage(
-                            &publisher,
-                            subject,
-                            driver,
-                            &self.runtime,
-                            &observed,
-                            &mut None,
-                        )
-                        .await;
-                        let _ = publish_harness_limits(
-                            &publisher,
-                            subject,
-                            driver,
-                            &self.runtime,
-                            &observed,
-                            &mut None,
-                        )
-                        .await;
-                    }
-                }
-                "harness-todo" => {
-                    let mut fields: BTreeMap<String, Value> = serde_json::from_value(payload)?;
-                    fields.remove("incarnation");
-                    fields.insert("incarnation_id".into(), self.runtime.clone().into());
-                    let _: Result<ClaimRecord> = publisher
-                        .post(
-                            "/v1/claims",
-                            &ClaimInput {
-                                subject: subject.into(),
-                                kind: "harness.todo.observed".into(),
-                                actor: Some(subject.into()),
-                                fields,
-                                evidence: Vec::new(),
-                                expected_subject: None,
-                                idempotency_key: None,
-                            },
-                        )
-                        .await;
-                }
-                _ => unreachable!(),
-            }
+            snapshots.push((kind, raw, payload, expired));
         }
+        // One budget for the entire wake. Canceled samples are dropped, not retried later.
+        let _ = tokio::time::timeout(st3::client::LATEST_VALUE_TIMEOUT, async {
+            for (kind, raw, payload, expired) in snapshots {
+                match kind {
+                    "harness-state" => {
+                        let observed = st_drivers::harness_state::read_raw_at(
+                            &raw,
+                            None,
+                            st_drivers::message::now_ms(),
+                        );
+                        self.provider_incarnation = observed.evidence_incarnation.clone();
+                        self.evidence_deadline = (!expired).then_some(payload);
+                        let claimed = observed.reason.as_deref() == Some("claimed");
+                        if driver != "codex"
+                            && !claimed
+                            && !matches!(
+                                observed.state,
+                                st_drivers::harness_state::Activity::Unknown
+                                    | st_drivers::harness_state::Activity::Ended
+                            )
+                        {
+                            *ready = true;
+                        }
+                        if !claimed {
+                            let _ = publish_harness_activity(
+                                &publisher,
+                                subject,
+                                driver,
+                                match driver {
+                                    "claude" => "claude-channel",
+                                    "codex" => "app-server",
+                                    "pi" => "pi-channel",
+                                    "omp" => "omp-channel",
+                                    _ => "native",
+                                },
+                                Some(&self.runtime),
+                                &observed,
+                                &mut None,
+                            )
+                            .await;
+                        }
+                        if matches!(driver, "omp" | "opencode") {
+                            let _ = tokio::time::timeout(
+                                st3::client::LATEST_VALUE_TIMEOUT,
+                                publish_admission_diagnostic(
+                                    client,
+                                    subject,
+                                    &self.runtime,
+                                    &self.dir,
+                                    &mut None,
+                                ),
+                            )
+                            .await;
+                        }
+                        if observed.reason.as_deref() == Some("providerCapacity") {
+                            let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
+                                driver,
+                                observed.since_ms,
+                                observed.reason.as_deref(),
+                            ))?));
+                            let _ = tokio::time::timeout(
+                                st3::client::LATEST_VALUE_TIMEOUT,
+                                publish_provider_capacity_diagnostic(
+                                    client,
+                                    subject,
+                                    &self.runtime,
+                                    observed.since_ms,
+                                    &fingerprint,
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                    "harness-context" => {
+                        let publisher = ObservationClient {
+                            client,
+                            event: None,
+                            source_account: payload.get("account_ref").map(Value::as_str),
+                        };
+                        if let Some(mut observed) = st_drivers::harness_context::read_raw_at(
+                            &raw,
+                            st_drivers::message::now_ms(),
+                        ) {
+                            observed.session_total_tokens = None;
+                            let _ = publish_harness_usage(
+                                &publisher,
+                                subject,
+                                driver,
+                                &self.runtime,
+                                &observed,
+                                &mut UsageFingerprints::default(),
+                            )
+                            .await;
+                        }
+                    }
+                    "harness-todo" => {
+                        let mut fields: BTreeMap<String, Value> = serde_json::from_value(payload)?;
+                        fields.remove("incarnation");
+                        fields.insert("incarnation_id".into(), self.runtime.clone().into());
+                        let _: Result<ClaimRecord> = publisher
+                            .post(
+                                "/v1/claims",
+                                &ClaimInput {
+                                    subject: subject.into(),
+                                    kind: "harness.todo.observed".into(),
+                                    actor: Some(subject.into()),
+                                    fields,
+                                    evidence: Vec::new(),
+                                    expected_subject: None,
+                                    idempotency_key: None,
+                                },
+                            )
+                            .await;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
         Ok(())
     }
+
     async fn drain(
         &mut self,
         client: &Client,
@@ -18156,8 +18177,27 @@ impl NativeObservations {
         if !self.enabled {
             return Ok(());
         }
-        self.publish_snapshots(client, subject, driver, ready)
-            .await?;
+        if self.current_publisher.is_none() {
+            self.publish_snapshots(client, subject, driver, ready)
+                .await?;
+        } else if let Some(raw) =
+            st_drivers::harness_events::read_runtime_state(&self.dir, &self.runtime)?
+        {
+            let observed =
+                st_drivers::harness_state::read_raw_at(&raw, None, st_drivers::message::now_ms());
+            self.provider_incarnation = observed.evidence_incarnation;
+            self.evidence_deadline = serde_json::from_slice(&raw).ok();
+            if driver != "codex"
+                && !matches!(
+                    observed.state,
+                    st_drivers::harness_state::Activity::Unknown
+                        | st_drivers::harness_state::Activity::Ended
+                )
+                && observed.reason.as_deref() != Some("claimed")
+            {
+                *ready = true;
+            }
+        }
         self.retry_pending = true;
         // Bound a wake's work so a backlog does not hold back native delivery.
         let mut events = st_drivers::harness_events::pending(&self.dir, 64)?;
@@ -18165,7 +18205,7 @@ impl NativeObservations {
             // Discard predecessor builds' queued current values. Their latest snapshot is above.
             if matches!(
                 event.kind.as_str(),
-                "harness-state" | "harness-state-expired" | "harness-context" | "harness-todo"
+                "harness-state" | "harness-state-expired" | "harness-todo"
             ) {
                 st_drivers::harness_events::acknowledge(&self.dir, event.sequence)?;
                 continue;
@@ -18197,6 +18237,31 @@ impl NativeObservations {
                 "unknown event driver"
             );
             match event.kind.as_str() {
+                "harness-context" | "harness-accounting" => {
+                    if let Some(observed) = st_drivers::harness_context::read_raw_at(
+                        &raw,
+                        st_drivers::message::now_ms(),
+                    ) {
+                        publish_harness_usage(
+                            &publisher,
+                            subject,
+                            source_driver,
+                            &event.runtime_incarnation,
+                            &observed,
+                            &mut UsageFingerprints::default(),
+                        )
+                        .await?;
+                        publish_harness_limits(
+                            &publisher,
+                            subject,
+                            source_driver,
+                            &event.runtime_incarnation,
+                            &observed,
+                            &mut None,
+                        )
+                        .await?;
+                    }
+                }
                 "harness-timeline" => {
                     let operation: st_drivers::harness_timeline::Operation =
                         serde_json::from_slice(&raw)?;
@@ -18278,26 +18343,18 @@ impl ObservationClient<'_> {
                 &slot,
                 &serde_json::to_value(&claim)?,
             )?)?;
-            tokio::time::timeout(
-                st3::client::LATEST_VALUE_TIMEOUT,
-                self.client.post(
+            self.client
+                .post(
                     "/v1/harness-events",
                     &st3::harness_events::Publication {
                         runtime_incarnation: runtime.into(),
                         sequence,
                         claim,
                     },
-                ),
-            )
-            .await
-            .context("observation timed out")?
+                )
+                .await
         } else {
-            tokio::time::timeout(
-                st3::client::LATEST_VALUE_TIMEOUT,
-                self.client.post(path, &claim),
-            )
-            .await
-            .context("observation timed out")?
+            self.client.post(path, &claim).await
         }
     }
 }
@@ -18499,8 +18556,7 @@ async fn publish_harness_limits(
     if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
         return Ok(());
     }
-    *last_fingerprint = Some(fingerprint.clone());
-    let _: Result<ClaimRecord> = client
+    let _: ClaimRecord = client
         .post(
             "/v1/claims",
             &ClaimInput {
@@ -18513,9 +18569,15 @@ async fn publish_harness_limits(
                 idempotency_key: Some(format!("harness-limits:{subject}:{fingerprint}")),
             },
         )
-        .await;
+        .await?;
     *last_fingerprint = Some(fingerprint);
     Ok(())
+}
+
+#[derive(Default)]
+struct UsageFingerprints {
+    current: Option<String>,
+    numeric: Option<String>,
 }
 
 async fn publish_harness_usage(
@@ -18524,17 +18586,29 @@ async fn publish_harness_usage(
     driver: &str,
     incarnation: &str,
     observed: &st_drivers::harness_context::Observed,
-    last_fingerprint: &mut Option<String>,
+    fingerprints: &mut UsageFingerprints,
 ) -> Result<()> {
     // A context-window occupancy reading and cumulative session spend are
-    // different measurements. Publish them as distinct durable records; never
+    // different measurements. Publish current occupancy separately from durable spend; never
     // manufacture response-token buckets from occupancy.
+    let current_fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
+        observed.observed_at_ms,
+        observed.used_tokens,
+        observed.window_tokens,
+        observed.used_percent,
+        observed.compactions,
+        observed.last_compaction_ms,
+        &observed.model,
+    ))?));
     let mut readings = Vec::new();
-    if observed.used_tokens.is_some()
-        || observed.window_tokens.is_some()
-        || observed.used_percent.is_some()
-        || observed.compactions != 0
+    if client.event.is_none()
+        && fingerprints.current.as_deref() != Some(current_fingerprint.as_str())
+        && (observed.used_tokens.is_some()
+            || observed.window_tokens.is_some()
+            || observed.used_percent.is_some()
+            || observed.compactions != 0)
     {
+        fingerprints.current = Some(current_fingerprint);
         let mut fields = BTreeMap::from([
             (
                 "semantics".into(),
@@ -18609,14 +18683,18 @@ async fn publish_harness_usage(
     if readings.is_empty() {
         return Ok(());
     }
-    let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&readings)?));
-    if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
-        return Ok(());
-    }
-    *last_fingerprint = Some(fingerprint.clone());
+    let numeric: Vec<_> = readings
+        .iter()
+        .filter(|fields| fields["semantics"] != "context_occupancy")
+        .collect();
+    let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&numeric)?));
+    let unchanged_numeric = fingerprints.numeric.as_deref() == Some(fingerprint.as_str());
     for fields in readings {
         let semantics = fields["semantics"].as_str().unwrap_or("unknown").to_owned();
-        let _: Result<ClaimRecord> = client
+        if semantics != "context_occupancy" && unchanged_numeric {
+            continue;
+        }
+        let result: Result<ClaimRecord> = client
             .post(
                 "/v1/claims",
                 &ClaimInput {
@@ -18632,8 +18710,11 @@ async fn publish_harness_usage(
                 },
             )
             .await;
+        if semantics != "context_occupancy" {
+            result?;
+        }
     }
-    *last_fingerprint = Some(fingerprint);
+    fingerprints.numeric = Some(fingerprint);
     Ok(())
 }
 
@@ -19336,6 +19417,20 @@ async fn run_pi_channel(
                     Some(st_drivers::reexec::StdinChunk::Bytes(bytes)) => {
                         state.lines.push(&bytes);
                         while let Some(line) = state.lines.next_line() {
+                            // A fresh todo frame can activate its current-value source once the
+                            // runtime catches up. Do not retain the failed frame for a retry tick.
+                            if driver == "omp" && observer.is_none() && todo_observations.is_none()
+                                && serde_json::from_str::<Value>(&line).ok()
+                                    .is_some_and(|frame| frame["type"] == "todo")
+                                && tokio::time::timeout(st3::client::LATEST_VALUE_TIMEOUT,
+                                    current_agent_incarnation(client, subject)).await.ok()
+                                    .and_then(Result::ok).flatten().as_deref() == Some(&incarnation)
+                            {
+                                match activate_channel_todo_observations(catalog, subject, &mut state) {
+                                    Ok(observations) => todo_observations = Some(observations),
+                                    Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                                }
+                            }
                             match accept_managed_channel_frame(
                                 &mut state, &mut observer, &line,
                                 // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
@@ -20402,6 +20497,13 @@ async fn drive_codex_native(
     let mut mailbox =
         NativeMailbox::start(client, subject, &incarnation, "codex", &mut loop_state).await?;
     let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
+    observations.current_publisher = current_harness_publisher::Publisher::start(
+        client,
+        subject,
+        "codex",
+        &agent_dir,
+        &incarnation,
+    )?;
     if push_mailbox_enabled() {
         st_drivers::push_mailbox::register(&agent_dir);
     }
@@ -20433,7 +20535,7 @@ async fn drive_codex_native(
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
     let mut last_activity_fingerprint = None;
-    let mut last_usage_fingerprint = None;
+    let mut last_usage_fingerprint = UsageFingerprints::default();
     let mut last_limits_fingerprint = None;
     let mut last_control_warning = None;
     let mut last_capacity_fingerprint = None;
@@ -28227,6 +28329,223 @@ mission "review" state="ready" {
         );
         server.abort();
     }
+    #[tokio::test]
+    async fn current_wake_has_one_hundred_ms_total_budget_and_no_retry() {
+        use axum::{http::StatusCode, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
+        let seq =
+            st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-a")
+                .unwrap();
+        let mut writer = st_drivers::harness_state::Writer::new(
+            root.path(),
+            "example/seat",
+            "claude",
+            Some("pty".into()),
+        )
+        .with_ownership("provider-a", seq);
+        writer
+            .observe(st_drivers::harness_state::Observation::new(
+                st_drivers::harness_state::Activity::Active,
+                st_drivers::harness_state::BlockedOn::None,
+                st_drivers::harness_state::InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let mut context = st_drivers::harness_context::Writer::new_paths(
+            root.path(),
+            "example/seat",
+            st_drivers::harness_context::Harness::Claude,
+        )
+        .unwrap()
+        .with_session("provider-a");
+        context
+            .observe(st_drivers::harness_context::Reading {
+                used_tokens: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        st_drivers::harness_events::write_channel_todo(
+            root.path(),
+            "runtime-a",
+            &json!({"driver":"claude","items":[]}),
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/v1/claims",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(Endpoint::Http(format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut observations = NativeObservations::start(root.path(), "runtime-a").unwrap();
+        let start = Instant::now();
+        observations
+            .publish_snapshots(&client, "agent/example/seat", "claude", &mut false)
+            .await
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(80));
+        assert!(
+            start.elapsed() < Duration::from_millis(300),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observations.latest_attempted.len(), 3);
+        observations
+            .publish_snapshots(&client, "agent/example/seat", "claude", &mut false)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "timed-out samples are never retried"
+        );
+        assert!(
+            st_drivers::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .is_empty()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn numeric_usage_and_limits_wait_past_current_budget_and_retry_failures() {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = st_drivers::harness_context::Writer::new_paths(
+            root.path(),
+            "example/seat",
+            st_drivers::harness_context::Harness::Claude,
+        )
+        .unwrap()
+        .with_session("provider-a");
+        writer
+            .observe(st_drivers::harness_context::Reading {
+                used_tokens: Some(100),
+                window_tokens: Some(200),
+                session_total_tokens: Some(123),
+                rate_limits: st_drivers::harness_context::RateLimits {
+                    five_hour: Some(96.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        let observed = st_drivers::harness_context::read(
+            &st_drivers::harness_context::harness_context_path(root.path()),
+        )
+        .unwrap();
+        let store = Arc::new(Store::open_memory("example").unwrap());
+        let fail = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route("/v1/claims", post({
+            let (store, fail, calls) = (store.clone(), fail.clone(), calls.clone());
+            move |Json(claim): Json<ClaimInput>| {
+                let (store, fail, calls) = (store.clone(), fail.clone(), calls.clone());
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    if fail.load(Ordering::SeqCst) { StatusCode::SERVICE_UNAVAILABLE.into_response() }
+                    else { Json(json!({"api_version":"st3.v1", "value":store.append_claim(&claim).unwrap()})).into_response() }
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(Endpoint::Http(format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let publisher = ObservationClient {
+            client: &client,
+            event: None,
+            source_account: None,
+        };
+        let mut usage = UsageFingerprints::default();
+        let mut limits = None;
+        assert!(
+            publish_harness_usage(
+                &publisher,
+                "agent/example/seat",
+                "claude",
+                "runtime-a",
+                &observed,
+                &mut usage,
+            )
+            .await
+            .is_err()
+        );
+        assert!(usage.numeric.is_none());
+        assert!(
+            publish_harness_limits(
+                &publisher,
+                "agent/example/seat",
+                "claude",
+                "runtime-a",
+                &observed,
+                &mut limits
+            )
+            .await
+            .is_err()
+        );
+        assert!(limits.is_none());
+        fail.store(false, Ordering::SeqCst);
+        publish_harness_usage(
+            &publisher,
+            "agent/example/seat",
+            "claude",
+            "runtime-a",
+            &observed,
+            &mut usage,
+        )
+        .await
+        .unwrap();
+        publish_harness_limits(
+            &publisher,
+            "agent/example/seat",
+            "claude",
+            "runtime-a",
+            &observed,
+            &mut limits,
+        )
+        .await
+        .unwrap();
+        assert!(usage.numeric.is_some() && limits.is_some() && usage.current.is_some());
+        // One failed occupancy attempt, plus two attempts for each durable fact.
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            store
+                .claims_for("agent/example/seat", Some("harness.usage"))
+                .unwrap()[0]
+                .body["fields"]["total_tokens"],
+            123
+        );
+        assert_eq!(
+            store
+                .claims_for("agent/example/seat", Some("harness.limits"))
+                .unwrap()[0]
+                .body["fields"]["five_hour_percent"],
+            96.0
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn current_observations_drop_failed_posts_and_send_only_the_next_snapshot() {
         use axum::{Json, Router, http::StatusCode, routing::post};
