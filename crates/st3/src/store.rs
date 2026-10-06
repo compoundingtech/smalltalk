@@ -13799,9 +13799,17 @@ impl Store {
         Self::usage_summary_from_rows(rows, incarnation)
     }
 
-    /// Fetch usage for a bounded resource page with one SQL read per SQLite
-    /// parameter chunk, then apply the same reduction as a detail read.
+    /// Fetch usage for the selected subjects, preserving the detail reduction and one
+    /// SQLite cut across timestamp streaming and canonical tie resolution.
     pub fn usage_summaries_at(
+        &self,
+        subjects: &[String],
+        at_index: Option<u64>,
+    ) -> Result<BTreeMap<String, UsageSummary>> {
+        self.read_snapshot(|_| self.usage_summaries_pinned(subjects, at_index))
+    }
+
+    fn usage_summaries_pinned(
         &self,
         subjects: &[String],
         at_index: Option<u64>,
@@ -13818,27 +13826,55 @@ impl Store {
                 continue;
             }
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = canonical_sql(&format!(
-                "SELECT subject, store_index, body, accepted_at_unix_ms FROM claims
+            // The accepted-time index supplies the first two canonical components without
+            // a wide-body temporary sorter. Resolve the remaining components only inside
+            // equal-timestamp groups, where they can actually decide the reduction order.
+            let sql = format!(
+                "SELECT subject, id, store_index, body, accepted_at_unix_ms
+                 FROM claims INDEXED BY claims_subject_kind_accepted_index
                  WHERE kind='harness.usage' AND store_index<={} AND subject IN ({placeholders})
-                 ORDER BY subject, CANONICAL_ASC(claims)",
+                 ORDER BY subject, length(accepted_at_unix_ms), accepted_at_unix_ms",
                 at_index.unwrap_or(i64::MAX as u64)
-            ));
+            );
             let mut statement = connection.prepare(&sql)?;
-            for row in statement.query_map(rusqlite::params_from_iter(chunk), |row| {
+            let rows = statement.query_map(rusqlite::params_from_iter(chunk), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
-            })? {
-                let (subject, index, body, accepted) = row?;
-                grouped
-                    .entry(subject)
-                    .or_default()
-                    .push(Ok((index, body, accepted)));
+            })?;
+            let mut ties = Vec::<(String, String, u64, String, String)>::new();
+            let mut flush = |ties: &mut Vec<(String, String, u64, String, String)>| -> Result<()> {
+                if ties.len() > 1 {
+                    let mut keyed = ties
+                        .drain(..)
+                        .map(|row| Ok((canonical::claim_key(&connection, &row.1)?, row)))
+                        .collect::<Result<Vec<_>>>()?;
+                    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                    ties.extend(keyed.into_iter().map(|(_, row)| row));
+                }
+                for (subject, _, index, body, accepted) in ties.drain(..) {
+                    grouped
+                        .entry(subject)
+                        .or_default()
+                        .push(Ok((index, body, accepted)));
+                }
+                Ok(())
+            };
+            for row in rows {
+                let row = row?;
+                if ties
+                    .last()
+                    .is_some_and(|previous| previous.0 != row.0 || previous.4 != row.4)
+                {
+                    flush(&mut ties)?;
+                }
+                ties.push(row);
             }
+            flush(&mut ties)?;
         }
         let mut summaries = BTreeMap::new();
         for (subject, rows) in grouped {
@@ -14592,29 +14628,7 @@ impl Store {
         snapshot_index: u64,
     ) -> Result<Option<u128>> {
         let connection = self.readers.get();
-        // The first `working` observation after the incarnation's last other state, in canonical
-        // order, so every node that holds the same claims agrees.
-        let mut statement = connection.prepare_cached(&format!(
-            "SELECT json_extract(claims.body, '$.fields.state'), claims.accepted_at_unix_ms
-             FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE claims.subject=?1 AND claims.kind='harness.observed'
-               AND json_extract(claims.body, '$.fields.incarnation_id')=?2
-               AND claims.store_index<=?3
-             ORDER BY {CANONICAL_ORDER}"
-        ))?;
-        let states = statement
-            .query_map(params![agent, incarnation, snapshot_index], |row| {
-                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let after = states
-            .iter()
-            .rposition(|(state, _)| state.as_deref().is_some_and(|state| state != "working"))
-            .map_or(0, |position| position + 1);
-        Ok(states[after..]
-            .iter()
-            .find(|(state, _)| state.as_deref() == Some("working"))
-            .and_then(|(_, time)| time.parse().ok()))
+        agent_working_since_at(&connection, agent, incarnation, snapshot_index)
     }
 
     fn timeline_claim_rows_for_incarnation_at(
@@ -20447,17 +20461,144 @@ fn current_harness_fold_at(
     }))
 }
 
+fn working_episode_query() -> String {
+    format!(
+        "SELECT claims.id, json_extract(claims.body, '$.fields.state'), claims.accepted_at_unix_ms
+         FROM claims INDEXED BY claims_incarnation_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.observed'
+           AND {INCARNATION_OF_CLAIM}=?2
+           AND json_extract(claims.body, '$.fields.incarnation_id')=?2
+           AND +claims.store_index<=?3
+         ORDER BY length(claims.accepted_at_unix_ms) DESC, claims.accepted_at_unix_ms DESC"
+    )
+}
+
+fn agent_working_since_at(
+    connection: &Connection,
+    agent: &str,
+    incarnation: &str,
+    snapshot_index: u64,
+) -> Result<Option<u128>> {
+    // Stream accepted-time groups backwards. Resolve complete canonical keys only for
+    // ties, before applying the state fold. Non-working ends the episode; null does not.
+    // Tie lookups must share the stream's cut, including for standalone callers.
+    let snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let since = (|| -> Result<Option<String>> {
+        let mut statement = connection.prepare_cached(&working_episode_query())?;
+        let mut rows = statement.query_map(params![agent, incarnation, snapshot_index], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut group = Vec::<(String, Option<String>, String)>::new();
+        let mut since = None;
+        let fold_group = |group: &mut Vec<(String, Option<String>, String)>,
+                          since: &mut Option<String>|
+         -> Result<bool> {
+            if group.len() > 1 {
+                let mut keyed = group
+                    .drain(..)
+                    .map(|row| Ok((canonical::claim_key(connection, &row.0)?, row)))
+                    .collect::<Result<Vec<_>>>()?;
+                keyed.sort_by(|a, b| b.0.cmp(&a.0));
+                group.extend(keyed.into_iter().map(|(_, row)| row));
+            }
+            for (_, state, time) in group.drain(..) {
+                match state.as_deref() {
+                    Some("working") => *since = Some(time),
+                    Some(_) => return Ok(true),
+                    None => {}
+                }
+            }
+            Ok(false)
+        };
+        for row in &mut rows {
+            let row = row?;
+            if group.last().is_some_and(|previous| previous.2 != row.2)
+                && fold_group(&mut group, &mut since)?
+            {
+                return Ok(since);
+            }
+            group.push(row);
+        }
+        fold_group(&mut group, &mut since)?;
+        Ok(since)
+    })()?;
+    if let Some(snapshot) = snapshot {
+        snapshot.commit()?;
+    }
+    Ok(since.and_then(|time| time.parse().ok()))
+}
+
 fn claim_ids_at(
     connection: &Connection,
     subject: &str,
     at_index: Option<u64>,
 ) -> Result<Vec<String>> {
+    claim_ids_at_after_first_row(connection, subject, at_index, || {})
+}
+
+fn claim_ids_at_after_first_row(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    after_first_row: impl FnOnce(),
+) -> Result<Vec<String>> {
+    // The old single statement held one cut. Tie lookups must retain that cut too,
+    // while writer and pinned-read callers keep ownership of their transaction.
+    let snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
     let at_index = at_index.unwrap_or(i64::MAX as u64);
-    let mut statement = connection.prepare_cached(&canonical_sql(
-        "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2 ORDER BY CANONICAL_ASC(claims)",
-    ))?;
-    let rows = statement.query_map(params![subject, at_index], |row| row.get(0))?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    let mut ids = Vec::new();
+    {
+        let mut statement = connection.prepare_cached(
+            "SELECT id, accepted_at_unix_ms FROM claims INDEXED BY claims_subject_accepted_index
+             WHERE subject=?1 AND store_index<=?2
+             ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms",
+        )?;
+        let mut rows = statement.query_map(params![subject, at_index], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let first = rows.next().transpose()?;
+        if first.is_some() {
+            after_first_row();
+        }
+        let mut ties = Vec::<(String, String)>::new();
+        let mut flush = |ties: &mut Vec<(String, String)>| -> Result<()> {
+            if ties.len() > 1 {
+                let mut keyed = ties
+                    .drain(..)
+                    .map(|row| Ok((canonical::claim_key(connection, &row.0)?, row)))
+                    .collect::<Result<Vec<_>>>()?;
+                keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                ties.extend(keyed.into_iter().map(|(_, row)| row));
+            }
+            ids.extend(ties.drain(..).map(|(id, _)| id));
+            Ok(())
+        };
+        for row in first.into_iter().map(Ok).chain(rows) {
+            let row = row?;
+            if ties.last().is_some_and(|previous| previous.1 != row.1) {
+                flush(&mut ties)?;
+            }
+            ties.push(row);
+        }
+        flush(&mut ties)?;
+    }
+    if let Some(snapshot) = snapshot {
+        snapshot.commit()?;
+    }
+    Ok(ids)
 }
 
 fn desired_conflicts_at(
@@ -42284,6 +42425,232 @@ mission "nested-work" state="ready" {
         );
     }
 
+    #[test]
+    fn working_episode_reverse_fold_matches_full_canonical_history() {
+        let store = Store::open_memory("working-episode").unwrap();
+        let agent = "agent/working-episode";
+        let mut ids = Vec::new();
+        for (i, state) in ["working", "idle", "working", "working", "idle", "working"]
+            .into_iter()
+            .enumerate()
+        {
+            ids.push(
+                store
+                    .append_claim(&ClaimInput {
+                        subject: agent.into(),
+                        kind: "harness.observed".into(),
+                        actor: Some(agent.into()),
+                        fields: BTreeMap::from([
+                            ("state".into(), json!(state)),
+                            ("driver".into(), json!("codex")),
+                            ("incarnation_id".into(), json!("inc-1")),
+                            ("reason".into(), json!(format!("episode-observation-{i}"))),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("working-episode-{i}")),
+                    })
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            ids.iter()
+                .map(|claim| &claim.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            6
+        );
+        // Invented timestamp ties and reversed times deliberately disagree with arrival.
+        // Keep actual Store admission and the independent old SQL fold as separate oracles.
+        {
+            let connection = store.connection.write();
+            for (claim, time) in ids.iter().zip(["9", "10", "10", "12", "11", "11"]) {
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                            params![time, claim.id],
+                        )
+                        .unwrap(),
+                    1,
+                    "each observation ID must name one persisted claim"
+                );
+            }
+        }
+        let connection = store.readers.get();
+        let oracle = |cut| {
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT json_extract(claims.body, '$.fields.state'), claims.accepted_at_unix_ms
+                 FROM claims JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=?1 AND claims.kind='harness.observed'
+                   AND json_extract(claims.body, '$.fields.incarnation_id')=?2
+                   AND claims.store_index<=?3 ORDER BY {CANONICAL_ORDER}"
+                ))
+                .unwrap();
+            let states = statement
+                .query_map(params![agent, "inc-1", cut], |row| {
+                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let after = states
+                .iter()
+                .rposition(|(state, _)| state.as_deref().is_some_and(|state| state != "working"))
+                .map_or(0, |p| p + 1);
+            states[after..]
+                .iter()
+                .find(|(state, _)| state.as_deref() == Some("working"))
+                .and_then(|(_, time)| time.parse::<u128>().ok())
+        };
+        for claim in &ids {
+            assert_eq!(
+                agent_working_since_at(&connection, agent, "inc-1", claim.store_index).unwrap(),
+                oracle(claim.store_index)
+            );
+        }
+        assert_eq!(
+            agent_working_since_at(&connection, agent, "other-incarnation", u64::MAX >> 1).unwrap(),
+            None
+        );
+        assert_eq!(
+            agent_working_since_at(&connection, "agent/missing", "inc-1", u64::MAX >> 1).unwrap(),
+            None
+        );
+        drop(connection);
+        {
+            let writer = store.connection.write();
+            writer
+                .execute(
+                    "UPDATE claims SET body=json_remove(body,'$.fields.state') WHERE id=?1",
+                    [&ids[5].id],
+                )
+                .unwrap();
+        }
+        let connection = store.readers.get();
+        assert_eq!(
+            agent_working_since_at(&connection, agent, "inc-1", ids[5].store_index).unwrap(),
+            Some(12)
+        );
+        drop(connection);
+        {
+            let writer = store.connection.write();
+            writer
+                .execute(
+                    "UPDATE claims SET body=json_extract(body,'$.fields') WHERE id=?1",
+                    [&ids[3].id],
+                )
+                .unwrap();
+        }
+        // The incarnation index contains this flat observation, but the old fields-only
+        // predicate must still exclude it. Null state does not restart a prior episode.
+        let connection = store.readers.get();
+        assert_eq!(
+            agent_working_since_at(&connection, agent, "inc-1", ids[5].store_index).unwrap(),
+            None
+        );
+        assert!(connection.is_autocommit());
+        connection
+            .execute_batch("PRAGMA query_only=ON; BEGIN")
+            .unwrap();
+        assert_eq!(
+            agent_working_since_at(&connection, agent, "inc-1", ids[5].store_index).unwrap(),
+            None
+        );
+        assert!(!connection.is_autocommit());
+        connection
+            .execute_batch(
+                "ROLLBACK; PRAGMA query_only=OFF; DROP INDEX claims_incarnation_accepted_index",
+            )
+            .unwrap();
+        assert!(agent_working_since_at(&connection, agent, "inc-1", ids[5].store_index).is_err());
+        assert!(connection.is_autocommit());
+        connection
+            .execute_batch("PRAGMA query_only=ON; BEGIN")
+            .unwrap();
+        assert!(agent_working_since_at(&connection, agent, "inc-1", ids[5].store_index).is_err());
+        assert!(!connection.is_autocommit());
+        connection
+            .execute_batch("ROLLBACK; PRAGMA query_only=OFF")
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "process-wide SQL counters: run alone with --exact --ignored --test-threads=1"]
+    fn working_episode_reverse_seek_ignores_completed_history_growth() {
+        use smallclaims::sqlite::work;
+        let measure = |old_count: u64, completed_episode: bool, tied_tail: bool| {
+            let store = Store::open_memory("episode-growth").unwrap();
+            let mut connection = store.connection.write();
+            let tx = connection.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                VALUES ('episode-batch','episode-growth',1,'synthetic','1')",
+                [],
+            )
+            .unwrap();
+            for index in (1..=old_count).chain(100000..=100003) {
+                let state = match index {
+                    100001 | 100003 => json!("working"),
+                    100002 => Value::Null,
+                    100000 if !completed_episode => Value::Null,
+                    _ if !completed_episode => json!("working"),
+                    _ => json!("idle"),
+                };
+                let body =
+                    json!({"fields":{"state":state,"driver":"codex","incarnation_id":"inc-1"}});
+                tx.execute("INSERT INTO claims(store_index,id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                    VALUES (?1,?2,'episode-batch','agent/episode-growth','harness.observed','episode-growth',?3,'[]',?4)",
+                    params![index, format!("synthetic-episode-{index}"), body.to_string(), if tied_tail && index==100003 {"100001".to_owned()} else {index.to_string()}]).unwrap();
+            }
+            tx.commit().unwrap();
+            let query = working_episode_query();
+            let plans = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap()
+                .query_map(params!["agent/episode-growth", "inc-1", 100003], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(plans.iter().any(|p| p.contains("SEARCH claims USING INDEX claims_incarnation_accepted_index (subject=? AND <expr>=?)")), "{plans:?}");
+            let before = work::total();
+            assert_eq!(
+                agent_working_since_at(&connection, "agent/episode-growth", "inc-1", 100003)
+                    .unwrap(),
+                Some(if completed_episode { 100001 } else { 1 })
+            );
+            let work = work::total() - before;
+            assert!(work.statements > 0 && work.vm_steps > 0);
+            println!(
+                "working episode synthetic production-schema old_count={old_count} completed_episode={completed_episode} tied_tail={tied_tail} work={work:?} plan={plans:?}"
+            );
+            work
+        };
+        let small = measure(1000, true, false);
+        let large = measure(10000, true, false);
+        assert!(
+            small.vm_steps > 0 && large.vm_steps <= small.vm_steps + 100,
+            "small={small:?} large={large:?}"
+        );
+        assert_eq!(small.fullscan_steps, 0);
+        assert_eq!(large.fullscan_steps, 0);
+        let long_small = measure(1000, false, false);
+        let long_large = measure(10000, false, false);
+        assert!(
+            long_large.vm_steps > long_small.vm_steps * 5,
+            "an uninterrupted episode still grows: {long_small:?} {long_large:?}"
+        );
+        let tie_small = measure(1000, true, true);
+        let tie_large = measure(10000, true, true);
+        assert!(
+            tie_large.vm_steps > tie_small.vm_steps * 5,
+            "recordless canonical ties still read batch rank history: {tie_small:?} {tie_large:?}"
+        );
+    }
+
     fn timeline_entries(page: &ClaimsPage) -> Vec<String> {
         page.claims
             .iter()
@@ -48712,6 +49079,309 @@ message "human-attention" {
                 .total_tokens,
             150
         );
+    }
+
+    #[test]
+    fn batched_usage_preserves_canonical_ties_and_snapshot_bound() {
+        let store = Store::open_memory("usage-node").unwrap();
+        let subjects = ["agent/usage-a", "agent/usage-b"];
+        let mut middle = 0;
+        for i in 0..602 {
+            let subject = subjects[i % 2];
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.usage".into(),
+                    actor: Some(subject.into()),
+                    fields: BTreeMap::from([
+                        ("driver".into(), json!("codex")),
+                        ("incarnation_id".into(), json!("same-incarnation")),
+                        (
+                            "semantics".into(),
+                            json!(if i % 4 < 2 {
+                                "session_cumulative"
+                            } else {
+                                "context_occupancy"
+                            }),
+                        ),
+                        ("total_tokens".into(), json!(100)),
+                        ("cost".into(), json!(i as f64)),
+                        ("context_used_tokens".into(), json!(i)),
+                        ("model".into(), json!("fixture-model-".repeat(320))),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            if i == 299 {
+                middle = store.index().unwrap();
+            }
+        }
+        // Reverse timestamps and batch order: tied canonical winners differ from index row order.
+        {
+            let mut connection = store.connection.write();
+            let tx = connection.transaction().unwrap();
+            tx.execute(
+                "UPDATE claims SET accepted_at_unix_ms=CAST(1000000-(store_index/8) AS TEXT)
+                        WHERE kind='harness.usage'",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE batches SET replica_sequence=10000-(SELECT MIN(store_index)
+                        FROM claims WHERE claims.batch_id=batches.id)",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let selected = [
+            subjects[1].into(),
+            subjects[0].into(),
+            subjects[1].into(),
+            "agent/missing".into(),
+        ];
+        for at in [None, Some(middle)] {
+            let batch = store.usage_summaries_at(&selected, at).unwrap();
+            assert_eq!(batch.len(), 2);
+            assert_eq!(batch[subjects[0]].cost, Some(0.0));
+            assert_eq!(batch[subjects[1]].cost, Some(1.0));
+            assert_eq!(
+                batch[subjects[0]].context.as_ref().unwrap().used_tokens,
+                Some(2)
+            );
+            for subject in subjects {
+                assert_eq!(
+                    batch.get(subject),
+                    store.usage_summary_at(subject, None, at).unwrap().as_ref()
+                );
+            }
+        }
+    }
+
+    fn claim_id_order_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE batches(id TEXT PRIMARY KEY, origin TEXT, replica_sequence INTEGER);
+             CREATE TABLE claims(id TEXT PRIMARY KEY, subject TEXT, kind TEXT, batch_id TEXT,
+                                 store_index INTEGER, accepted_at_unix_ms TEXT);
+             CREATE INDEX claims_subject_accepted_index ON claims
+                 (subject, length(accepted_at_unix_ms), accepted_at_unix_ms);
+             CREATE TABLE replica_records(claim_id TEXT, position INTEGER);
+             INSERT INTO batches VALUES ('x','writer-a',4),('y','writer-a',3),('z','writer-b',1);
+             INSERT INTO claims VALUES
+               ('early','agent/target','runtime.observed','x',1,'9'),
+               ('legacy','agent/target','harness.usage','x',2,'10'),
+               ('record-a','agent/target','work.renewed','x',3,'10'),
+               ('other-subject','agent/other','daemon.diagnostic','x',4,'10'),
+               ('record-b','agent/target','intent.desired','x',5,'10'),
+               ('cross-batch','agent/target','harness.observed','y',6,'10'),
+               ('other-writer','agent/target','runtime.observed','z',7,'10'),
+               ('u128-time','agent/target','harness.usage','z',8,
+                '340282366920938463463374607431768211455');
+             INSERT INTO replica_records VALUES ('record-a',7),('record-a',3),('record-b',0);",
+            )
+            .unwrap();
+    }
+
+    fn full_canonical_claim_id_oracle(
+        connection: &Connection,
+        subject: &str,
+        at: Option<u64>,
+    ) -> Vec<String> {
+        connection
+            .prepare(&canonical_sql(
+                "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
+             ORDER BY CANONICAL_ASC(claims)",
+            ))
+            .unwrap()
+            .query_map(params![subject, at.unwrap_or(i64::MAX as u64)], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn claim_ids_stream_preserves_full_order_historical_bounds_and_transaction_ownership() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        claim_id_order_fixture(&connection);
+        assert_eq!(
+            full_canonical_claim_id_oracle(&connection, "agent/target", None),
+            [
+                "early",
+                "cross-batch",
+                "record-b",
+                "legacy",
+                "record-a",
+                "other-writer",
+                "u128-time"
+            ]
+        );
+        for at in [None, Some(2), Some(5), Some(6)] {
+            let expected = full_canonical_claim_id_oracle(&connection, "agent/target", at);
+            let actual = claim_ids_at(&connection, "agent/target", at).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                actual.last(),
+                expected.last(),
+                "the planning revision stays exact"
+            );
+            assert!(connection.is_autocommit());
+        }
+        assert!(
+            claim_ids_at(&connection, "agent/missing", None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(connection.is_autocommit());
+        let tx = connection.transaction().unwrap();
+        tx.execute(
+            "UPDATE replica_records SET position=0 WHERE claim_id='record-a'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            claim_ids_at(&tx, "agent/target", None).unwrap(),
+            full_canonical_claim_id_oracle(&tx, "agent/target", None)
+        );
+        assert!(
+            !tx.is_autocommit(),
+            "the caller retains its in-flight writer transaction"
+        );
+        tx.rollback().unwrap();
+        assert!(connection.is_autocommit());
+        connection
+            .execute_batch("PRAGMA query_only=ON; BEGIN")
+            .unwrap();
+        assert_eq!(
+            claim_ids_at(&connection, "agent/target", None).unwrap(),
+            full_canonical_claim_id_oracle(&connection, "agent/target", None)
+        );
+        assert!(
+            !connection.is_autocommit(),
+            "the caller retains its read transaction"
+        );
+        connection
+            .execute_batch("ROLLBACK; PRAGMA query_only=OFF")
+            .unwrap();
+        connection
+            .execute_batch("DROP TABLE replica_records")
+            .unwrap();
+        assert!(claim_ids_at(&connection, "agent/target", None).is_err());
+        assert!(
+            connection.is_autocommit(),
+            "a failed owned read must roll back"
+        );
+        let tx = connection.transaction().unwrap();
+        assert!(claim_ids_at(&tx, "agent/target", None).is_err());
+        assert!(
+            !tx.is_autocommit(),
+            "a failed nested read must not roll back its caller"
+        );
+        tx.rollback().unwrap();
+        connection
+            .execute_batch("PRAGMA query_only=ON; BEGIN")
+            .unwrap();
+        assert!(claim_ids_at(&connection, "agent/target", None).is_err());
+        assert!(
+            !connection.is_autocommit(),
+            "a failed read must not close its caller"
+        );
+        connection
+            .execute_batch("ROLLBACK; PRAGMA query_only=OFF")
+            .unwrap();
+    }
+
+    #[test]
+    fn claim_ids_stream_pins_tie_lookups_across_a_wal_writer_and_unwind() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        claim_id_order_fixture(&connection);
+        let old = full_canonical_claim_id_oracle(&connection, "agent/target", None);
+        let actual = claim_ids_at_after_first_row(&connection, "agent/target", None, || {
+            let writer = Connection::open(&path).unwrap();
+            writer
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                 UPDATE replica_records SET position=0 WHERE claim_id='record-a';
+                 UPDATE replica_records SET position=99 WHERE claim_id='record-b';
+                 COMMIT;",
+                )
+                .unwrap();
+        })
+        .unwrap();
+        assert_eq!(
+            actual, old,
+            "the first stream row and later tie keys share one cut"
+        );
+        assert!(connection.is_autocommit());
+        let new = full_canonical_claim_id_oracle(&connection, "agent/target", None);
+        assert_ne!(
+            new, old,
+            "the concurrent commit really changed the canonical order"
+        );
+        assert_eq!(
+            claim_ids_at(&connection, "agent/target", None).unwrap(),
+            new
+        );
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            claim_ids_at_after_first_row(&connection, "agent/target", None, || {
+                panic!("injected after stream pin")
+            })
+        }));
+        assert!(unwind.is_err());
+        assert!(
+            connection.is_autocommit(),
+            "unwind must release the locally owned read"
+        );
+        assert_eq!(
+            claim_ids_at(&connection, "agent/target", None).unwrap(),
+            new
+        );
+    }
+    #[test]
+    fn claim_ids_stream_keeps_real_store_status_claims_at_current_and_historical_cuts() {
+        let store = Store::open_memory("claim-id-node").unwrap();
+        let subject = "resource/claim-id-order";
+        let mut historical = 0;
+        for i in 0..4 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "resource.observed".into(),
+                    actor: Some("person/avery".into()),
+                    fields: BTreeMap::from([
+                        ("kind".into(), json!("human.review")),
+                        ("reason".into(), json!(format!("change {i}"))),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            if i == 1 {
+                historical = store.index().unwrap();
+            }
+        }
+        for cut in [historical, store.index().unwrap()] {
+            let status = store
+                .status_for_subject_names_at(BTreeSet::from([subject.into()]), cut, true)
+                .unwrap();
+            let actual = &status
+                .subjects
+                .iter()
+                .find(|row| row.subject == subject)
+                .unwrap()
+                .claims;
+            let expected = full_canonical_claim_id_oracle(&store.readers.get(), subject, Some(cut));
+            assert_eq!(actual, &expected);
+            assert_eq!(actual.last(), expected.last());
+        }
     }
 
     #[test]
