@@ -4,6 +4,33 @@ import json
 import os
 
 
+class SuspendCliEvidence:
+    """Keep first/last already-returned results; never issue a diagnostic CLI call."""
+    def __init__(self):
+        self.attempts = 0
+        self.first = self.last = None
+
+    def observe(self, command, result):
+        def tail(text):
+            data = text.encode()
+            retained = data[-2048:]
+            return {"tail": retained.decode(errors="replace"), "bytes": len(data),
+                    "omitted_bytes": len(data) - len(retained)}
+        self.attempts += 1
+        row = {"attempt": self.attempts, "command": command, "exit": result.returncode,
+               "stdout": tail(result.stdout), "stderr": tail(result.stderr)}
+        if self.first is None:
+            self.first = row
+        self.last = row
+
+    def write(self, evidence):
+        if self.attempts:
+            rows = [self.first] if self.attempts == 1 else [self.first, self.last]
+            (evidence / "suspend-cli-results.json").write_text(json.dumps(
+                {"attempts": self.attempts, "omitted_attempts": max(0, self.attempts - 2),
+                 "results": rows}) + "\n")
+
+
 def emit_failure_files(evidence):
     """Bound reads and raw retained bytes; JSON escaping can expand the output.
 
@@ -11,7 +38,7 @@ def emit_failure_files(evidence):
     the final stdout copy, after judging and cleanup, and performs no live queries.
     """
     # Keep the hook exit/stderr and observation seam before verbose driver logs.
-    patterns = ("receipts*.jsonl", "*.receipts.jsonl", "observation-outboxes.json",
+    patterns = ("suspend-cli-results.json", "receipts*.jsonl", "*.receipts.jsonl", "observation-outboxes.json",
                 "harness-state-*.json", "trace*.json*", "*.claims.json",
                 "driver-*.log", "daemon.log", "terminal*.txt")
     budget = 256 * 1024

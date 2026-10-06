@@ -6,7 +6,9 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
+from unittest import mock
 
 loader = importlib.machinery.SourceFileLoader(
     "failure_evidence", str(Path(__file__).resolve().parent.parent / "st3_failure_evidence.py"))
@@ -16,6 +18,50 @@ loader.exec_module(module)
 
 
 class FailureEvidenceTests(unittest.TestCase):
+    def test_suspend_results_keep_refusals_with_bounded_first_and_last_attempts(self):
+        capture = module.SuspendCliEvidence()
+        command = ["st3", "agents", "suspend", "agent/eval/a"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for i in range(3):
+                capture.observe(command, subprocess.CompletedProcess(
+                    command, 2, "", "refused-" + str(i) + "é" * 3000))
+            self.assertEqual([], list(root.iterdir()))
+            capture.write(root)
+            record = json.loads((root / "suspend-cli-results.json").read_text())
+            self.assertEqual(3, record["attempts"])
+            self.assertEqual(1, record["omitted_attempts"])
+            self.assertEqual([1, 3], [row["attempt"] for row in record["results"]])
+            for row in record["results"]:
+                self.assertEqual(2, row["exit"])
+                self.assertEqual(command, row["command"])
+                self.assertEqual(2048, row["stderr"]["bytes"] - row["stderr"]["omitted_bytes"])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                module.emit_failure_files(root)
+            self.assertEqual("suspend-cli-results.json", json.loads(
+                output.getvalue())["native_failure_evidence"])
+
+    def test_boot_cli_preserves_unchecked_stdout_and_checked_failure(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "boot_failure_capture", str(Path(__file__).resolve().parent.parent / "st3-boot-canaries/run"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        boot = importlib.util.module_from_spec(spec)
+        loader.exec_module(boot)
+        node = boot.Node.__new__(boot.Node)
+        node.binary, node.endpoint, node.env = Path("st3"), Path("st.sock"), {}
+        node.suspend_cli_evidence = module.SuspendCliEvidence()
+        result = subprocess.CompletedProcess([], 2, "invalid stdout", "seat busy")
+        with mock.patch.object(boot.subprocess, "run", return_value=result) as call:
+            self.assertEqual("invalid stdout", node.cli("agents", "show", "a", check=False))
+            self.assertEqual(0, node.suspend_cli_evidence.attempts)
+            self.assertEqual("invalid stdout", node.cli("agents", "suspend", "a", check=False))
+            with self.assertRaisesRegex(boot.Failure, "seat busy invalid stdout"):
+                node.cli("agents", "suspend", "a")
+            self.assertEqual(3, call.call_count)
+            self.assertEqual(2, node.suspend_cli_evidence.attempts)
+            self.assertEqual("seat busy", node.suspend_cli_evidence.first["stderr"]["tail"])
+
     def test_hook_receipts_and_sparse_log_tail_survive_with_explicit_omission(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
