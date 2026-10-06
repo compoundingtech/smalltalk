@@ -1,0 +1,48 @@
+# Generated file - DO NOT EDIT
+# Source: pnpm-workspace.yaml.genie.ts
+
+packages: [apps/ios, clients/typescript/st3-client, clients/typescript/st3-views]
+
+peerDependencyRules:
+  allowedVersions:
+    typescript: ">=6.0.0"
+    vitest: ">=4.0.0"
+    unplugin: ">=3.0.0"
+
+minimumReleaseAgeExclude:
+  - "@types/node"
+  - effect
+  - "@effect/ai-openai-compat"
+  - "@effect/ai-typesafe"
+  - "@effect/platform-node"
+  - "@effect/vitest"
+  - "@effect/opentelemetry"
+  - "@effect/atom-react"
+  - "@effect/platform-node-shared"
+
+supportedArchitectures:
+  os: [linux, darwin]
+  cpu: [x64, arm64]
+  libc: [glibc, musl]
+
+dedupePeerDependents: true
+
+strictPeerDependencies: true
+
+nodeLinker: hoisted
+
+packageImportMethod: auto
+
+optimisticRepeatInstall: false
+
+verifyDepsBeforeRun: false
+
+ignoreScripts: true
+
+sideEffectsCache: false
+
+verifyStoreIntegrity: true
+
+strictStorePkgContentCheck: true
+
+pmOnFail: ignore

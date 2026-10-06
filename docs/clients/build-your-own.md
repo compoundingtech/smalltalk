@@ -60,17 +60,19 @@ together; they use relative path dependencies. The model's default features have
 dependency. Enable `features = ["ratatui"]` only when drawing with ratatui, whose version must
 match the workspace. The example uses ratatui 0.30 and crossterm 0.29.
 
-TypeScript packages export source. Install the linked views package's dependencies first, then
-your app's dependencies; npm does not install dependencies inside a linked file package:
+TypeScript packages export source and share the root pnpm workspace. With Node 24
+and Corepack (or `nix develop .#web`), install from the repository root:
 
 ```sh
-npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund
+corepack enable # Outside the Nix web shell
+pnpm install --frozen-lockfile
 ```
 
-Use `file:../../clients/typescript/st3-views` from an app two directories below the repository
-root, as the phone does. Keep the generated client alongside it. Use a TypeScript-aware bundler
-or Node 24's TypeScript loader. For no-emit checks of `.ts` imports, enable
-`allowImportingTsExtensions`; for JavaScript output use `rewriteRelativeImportExtensions`.
+Use `workspace:*` for `@smalltalk/st3-views` in a workspace app, as the phone does.
+The views package also depends on the generated client through `workspace:*`.
+Use a TypeScript-aware bundler or Node 24's TypeScript loader. For no-emit checks of
+`.ts` imports, enable `allowImportingTsExtensions`; for JavaScript output use
+`rewriteRelativeImportExtensions`.
 The shared views have no React, React Native, Expo or native key-store dependency. Home rows
 return `person`/`green` color tokens; map them through your palette. Pass your product name,
 version and build to `clientName`, and a device label to `signatureRefusal` if desired.
@@ -180,8 +182,8 @@ sides passing. Each rendered client still owns its layout, keyboard/touch behavi
 cargo test --locked -p st3-client-tui
 cargo test --locked -p st3-conversation-ui --no-default-features
 cargo test --locked -p st3-conversation-ui --features ratatui
-npm test --prefix clients/typescript/st3-views
-npm run typecheck --prefix clients/typescript/st3-views
+pnpm --filter @smalltalk/st3-views test
+pnpm --filter @smalltalk/st3-views typecheck
 ```
 
 The example tests use a terminal test backend and a loopback test gateway with the real client
