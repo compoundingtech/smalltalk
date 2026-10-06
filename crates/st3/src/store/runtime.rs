@@ -150,7 +150,7 @@ impl Runtime for SmalltalkRuntime {
         transaction: &Transaction<'_>,
         origin: &str,
         through: u64,
-    ) -> Result<bool, St3Error> {
+    ) -> Result<IncrementalProjection, St3Error> {
         try_project_simple_replication_tx(transaction, origin, through)
     }
 

@@ -130,3 +130,12 @@ The bundled SQLite build uses `SQLITE_DEFAULT_MEMSTATUS=0` through the workspace
 configuration, including Cargo-based Nix builds. SQLite's process-wide allocation statistics
 are disabled by default, removing their shared allocator mutex; statement, process CPU and
 I/O accounting remain available.
+
+A full replication projection fallback always writes one bounded line to daemon stderr before
+replay starts, even without `ST3_PROFILE_DIR`. It names the phase, reason, previous frontier and
+entry target, for example `st: projection full replay phase=startup/project-replication-backlog
+reason=missing-health frontier=0 target=1200` (one physical log line). Reasons distinguish missing
+or unhealthy health, a frontier ahead of the log, a non-incremental kind, a work operation,
+malformed operation metadata, an operation conflict, and `incremental-error:CODE`. Healthy
+incremental chunks produce no fallback log. The target is the admitted index observed at entry;
+a full replay can also include claims admitted since that observation.
