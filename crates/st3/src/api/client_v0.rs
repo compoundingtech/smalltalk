@@ -1298,6 +1298,9 @@ pub(super) struct ClientSession {
     pub(super) actor: String,
     /// The concrete graph person whose explicitly delegated authority is exercised.
     pub(super) authority_actor: String,
+    /// The exact pairing grant that authenticated this session. Two pairings of the same
+    /// person and device key share an actor, so only this subject names the exact grant.
+    pub(super) pairing_grant: Option<String>,
     pub(super) transport: &'static str,
     pub(super) custom_forms: bool,
     scopes: std::collections::BTreeSet<String>,
@@ -1309,6 +1312,7 @@ impl ClientSession {
         Self {
             actor: actor.into(),
             authority_actor: authority_actor.into(),
+            pairing_grant: None,
             transport,
             custom_forms: true,
             scopes: std::collections::BTreeSet::new(),
@@ -1329,6 +1333,7 @@ impl ClientSession {
             return Ok(Self {
                 actor: "client/local/read-only".into(),
                 authority_actor: "client/local/read-only".into(),
+                pairing_grant: None,
                 transport: "unix",
                 custom_forms,
                 scopes: ["read.projections", "terminal.read"]
@@ -1342,6 +1347,7 @@ impl ClientSession {
         Ok(Self {
             actor: person.into(),
             authority_actor: person.into(),
+            pairing_grant: None,
             transport: "unix",
             custom_forms,
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
@@ -1352,6 +1358,7 @@ impl ClientSession {
         Self {
             actor: "client/pairing/completion".into(),
             authority_actor: "client/pairing/completion".into(),
+            pairing_grant: None,
             transport: "fabric-loopback",
             custom_forms: false,
             scopes: std::collections::BTreeSet::new(),
@@ -1542,7 +1549,8 @@ fn paired_client_session(
         .ok_or_else(|| ApiError::internal("a paired client has no concrete delegated person"))?;
     let scopes = paired.body.pointer("/fields/scopes").and_then(Value::as_array)
         .into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
-    Ok(ClientSession { actor: actor.into(), authority_actor: authority_actor.into(), transport, custom_forms, scopes })
+    Ok(ClientSession { actor: actor.into(), authority_actor: authority_actor.into(),
+        pairing_grant: Some(paired.subject.clone()), transport, custom_forms, scopes })
 }
 
 /// Held collection sockets carry no bearer secret. Re-resolve their session grant at each
@@ -1554,8 +1562,9 @@ fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<Clien
     let pairings = state.store.claims_for_kind_at(
         "custom.client.pairing-completed", None, true, 10_000,
     ).map_err(ApiError::internal)?;
-    let paired = pairings.claims.iter().find(|claim| {
-        claim.body.pointer("/fields/session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
+    let paired = pairings.claims.iter().find(|claim| match session.pairing_grant.as_deref() {
+        Some(subject) => claim.subject.as_str() == subject,
+        None => claim.body.pointer("/fields/session_actor").and_then(Value::as_str) == Some(session.actor.as_str()),
     }).ok_or_else(|| forbidden("the client session grant is absent"))?;
     let current = paired_client_session(state, paired, session.transport, session.custom_forms)?;
     if current.authority_actor != session.authority_actor {
@@ -15700,6 +15709,7 @@ mission "example/zero-run" state="ready" {
         let paired = ClientSession {
             actor: "person/alex/session/device-one".into(),
             authority_actor: "person/alex".into(),
+            pairing_grant: None,
             transport: "paired",
             custom_forms: false,
             scopes: ["terminal.read".into()].into_iter().collect(),

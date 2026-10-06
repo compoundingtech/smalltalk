@@ -44,19 +44,24 @@ fn principal_epoch(connection: &Connection, person: &str) -> anyhow::Result<Valu
     Ok(json!({"daemon_epoch":epoch(), "person":person, "revision":revision, "keys":keys}))
 }
 
-fn authority(connection: &Connection, actor: &str, person: &str) -> anyhow::Result<Value> {
+fn authority(connection: &Connection, session: &ClientSession) -> anyhow::Result<Value> {
+    let person = session.authority_actor.as_str();
     let principal = principal_epoch(connection, person)?;
-    if actor == person {
+    if session.actor == person {
         return Ok(json!({"local_principal_epoch":principal}));
     }
-    let query = smallclaims::store::canonical_sql(
-        "SELECT subject,body,origin FROM claims WHERE kind='custom.client.pairing-completed' AND json_extract(body,'$.fields.session_actor')=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+    // Two pairings of one person and device key derive the same session actor, so the
+    // authenticated session carries the exact grant subject instead of searching by actor.
+    let subject = session.pairing_grant.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("the paired client session has no exact grant"))?;
+    let Some((issuer, paired)) = latest(connection, subject, "custom.client.pairing-completed")?
+    else {
+        anyhow::bail!("the paired session grant is absent");
+    };
+    anyhow::ensure!(
+        paired.pointer("/fields/session_actor").and_then(Value::as_str) == Some(session.actor.as_str()),
+        "session actor changed"
     );
-    let (subject, body, issuer): (String, String, String) =
-        connection.query_row(&query, [actor], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
-    let paired: Value = serde_json::from_str(&body)?;
     anyhow::ensure!(
         paired.pointer("/fields/person_id").and_then(Value::as_str) == Some(person),
         "person changed"
@@ -78,9 +83,9 @@ fn authority(connection: &Connection, actor: &str, person: &str) -> anyhow::Resu
                 .any(|scope| scope.as_str() == Some("terminal.read"))),
         "terminal.read revoked"
     );
-    // A revoked pairing is never reused; a replacement has a new session actor.
+    // A revoked exact grant is never reused, whatever other pairings share its actor.
     anyhow::ensure!(
-        latest(connection, &subject, "custom.client.pairing-revoked")?.is_none(),
+        latest(connection, subject, "custom.client.pairing-revoked")?.is_none(),
         "pairing revoked"
     );
     Ok(
@@ -93,7 +98,7 @@ pub(super) fn authorization_epoch(
     session: &ClientSession,
 ) -> Result<String, ApiError> {
     let connection = state.store.readers.get();
-    let authority = authority(&connection, &session.actor, &session.authority_actor)
+    let authority = authority(&connection, session)
         .map_err(|error| forbidden(error.to_string()))?;
     if authority
         .get("issuer")
@@ -160,6 +165,68 @@ mod tests {
                 idempotency_key: None,
             })
             .unwrap();
+    }
+
+    fn pairing(state: &AppState, subject: &str, credential: &str, scopes: Value) {
+        claim(state, subject, "custom.client.pairing-completed", json!({
+            "person_id":"person/alex",
+            "session_actor":"person/alex/session/same-key",
+            "credential_hash":credential_digest(credential),
+            "scopes":scopes,
+            "expires_at_unix_ms":client_now_ms()+600_000
+        }));
+    }
+
+    fn authenticated(state: &AppState, credential: &str) -> ClientSession {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/client/terminals/agent/shell/attachments")
+            .header(AUTHORIZATION, format!("Bearer {credential}"))
+            .body(Body::empty()).unwrap();
+        authenticate(state, &request, "fabric-loopback").unwrap()
+    }
+
+    #[tokio::test]
+    async fn same_key_pairings_keep_the_authenticated_grant() {
+        let (_root, state, _) = fixture();
+        pairing(&state, "custom/client/first", "first", json!(["terminal.read"]));
+        let first = authenticated(&state, "first");
+        let epoch = authorization_epoch(&state, &first).unwrap();
+        pairing(&state, "custom/client/second", "second", json!(["read.projections"]));
+        let first = authenticated(&state, "first");
+        assert_eq!(authorization_epoch(&state, &first).unwrap(), epoch);
+        assert!(revalidate_session(&state, &first).unwrap().allows("terminal.read"));
+        let response = super::super::attachment(
+            State(state.clone()), Extension(first.clone()),
+            AxumPath("agent/shell".into()),
+            Json(super::super::AttachmentRequest {
+                runtime_incarnation: "incarnation-one".into(),
+                mode: st3_client::RawTerminalMode::Peek,
+            }),
+        ).await.unwrap();
+        assert_eq!(response.0["mode"], "peek");
+        claim(&state, "custom/client/second", "custom.client.pairing-revoked", json!({}));
+        assert_eq!(authorization_epoch(&state, &first).unwrap(), epoch);
+        claim(&state, "custom/client/first", "custom.client.pairing-revoked", json!({}));
+        assert_eq!(authorization_epoch(&state, &first).unwrap_err().code, "forbidden");
+        assert!(revalidate_session(&state, &first).is_err());
+    }
+
+    #[test]
+    fn same_key_pairings_do_not_borrow_another_issuer() {
+        let (_root, issuer, _) = fixture();
+        pairing(&issuer, "custom/client/issuer-first", "first", json!(["terminal.read"]));
+        let (_other_root, mut gateway, _) = fixture();
+        gateway.store = Arc::new(Store::open_memory("other-member").unwrap());
+        gateway.node = "other-member".into();
+        gateway.store.import_replication(
+            "lease-owner", &issuer.store.export_replication(0).unwrap(),
+        ).unwrap();
+        pairing(&gateway, "custom/client/gateway-second", "second", json!(["terminal.read"]));
+        let first = authenticated(&gateway, "first");
+        assert_eq!(authorization_epoch(&gateway, &first).unwrap_err().code, "forbidden");
+        let second = authenticated(&gateway, "second");
+        authorization_epoch(&gateway, &second).unwrap();
     }
 
     #[tokio::test]
