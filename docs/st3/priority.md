@@ -15,6 +15,26 @@ on the session as the `st3.scope-unit` tag. The PTY server starts there and fork
 Once the session is published, st moves the PTY server alone into a scope of its own. The harness
 stays behind.
 
+Seat scopes have the fixed description `st seat`, never the launch command. They inherit the
+environment of the `systemd-run` child process; `EnvironmentFile` is a service property and is
+not supported by scopes. st does not pass environment assignments in either `systemd-run` or
+`pty run` arguments.
+
+The PTY's persisted harness command restores the managed overlay from a private file. On
+Linux the file lives in `$XDG_RUNTIME_DIR/st3/seat-env`; without a user runtime directory it
+lives in the seat's spawn-state directory. The directory is created with mode 0700, and each
+file is exclusively created with mode 0600 before any values are written. Shell values are
+single-quoted, including embedded apostrophes, substitutions and newlines. Each new launch
+atomically replaces the seat's file. The file remains after a harness exits so a manual
+`pty restart` can restore its environment; it is replaced on the next st launch rather than
+deleted when the scope ends. A user runtime directory is also removed at logout/reboot.
+
+This protects environment values from command lines and unit descriptions, not from the user
+who owns the seat: that user can still read its private file or process environment. Existing
+scopes must be restarted to use the new launcher. Historical journal entries are not rewritten;
+journal rotation and vacuuming (`journalctl --rotate` / `journalctl --vacuum-time=...`) are
+operational cleanup, not part of launching seats.
+
 | What | Unit | CPU weight | IO weight |
 | --- | --- | --- | --- |
 | st daemon | `st3.service` | 1000 | 1000 |

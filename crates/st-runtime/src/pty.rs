@@ -136,7 +136,7 @@ impl PtyRuntime {
         self
     }
 
-    /// Environment for the PTY CLI itself, in addition to the target's explicit --env.
+    /// Environment for the PTY CLI itself, in addition to the target's private overlay.
     pub fn with_environment(mut self, environment: BTreeMap<String, String>) -> Self {
         self.command_environment = Some(environment);
         self
@@ -325,8 +325,6 @@ impl PtyRuntime {
             guard()?;
         }
         let previous_incarnation = before.as_ref().and_then(observation_incarnation);
-        std::fs::write(&fence, previous_incarnation.as_deref().unwrap_or_default())
-            .with_context(|| format!("write PTY publication fence {}", fence.display()))?;
         let mut arguments = vec![
             OsString::from("run"),
             OsString::from("-d"),
@@ -345,12 +343,24 @@ impl PtyRuntime {
         terminal_env
             .entry("TERM".into())
             .or_insert_with(|| "xterm-256color".into());
-        for (key, value) in &terminal_env {
-            arguments.extend([
-                OsString::from("--env"),
-                OsString::from(format!("{key}={value}")),
-            ]);
-        }
+        // Scopes inherit the launcher's environment; EnvironmentFile is a service-only
+        // property. The private file also restores the overlay on manual PTY restart.
+        let runtime_directory = self
+            .command_environment
+            .as_ref()
+            .and_then(|environment| environment.get("XDG_RUNTIME_DIR"))
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
+            .map(|directory| directory.join("st3/seat-env"))
+            .unwrap_or_else(|| self.spawn_state_directory().join("seat-env"));
+        let identity = Sha256::digest(format!("{}:{id}", self.root.display()).as_bytes());
+        let environment_file = crate::seat_environment::write_environment(
+            &runtime_directory,
+            &format!("{identity:x}"),
+            &terminal_env,
+        )?;
+        std::fs::write(&fence, previous_incarnation.as_deref().unwrap_or_default())
+            .with_context(|| format!("write PTY publication fence {}", fence.display()))?;
         let mut effective_tags = tags.clone();
         if let Some((_, operation)) = cutover {
             effective_tags.insert("st3.rollout".into(), operation.into());
@@ -378,6 +388,13 @@ impl PtyRuntime {
             ]);
         }
         arguments.push(OsString::from("--"));
+        arguments.extend([
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from(crate::seat_environment::RESTORE_ENVIRONMENT),
+            OsString::from("st seat"),
+            environment_file.into_os_string(),
+        ]);
         arguments.extend(crate::work_prefix().into_iter().map(OsString::from));
         match launch {
             Launch::Shell(source) => {
@@ -397,6 +414,7 @@ impl PtyRuntime {
             if let Some(environment) = &self.command_environment {
                 command.env_clear().envs(environment);
             }
+            command.envs(&terminal_env);
             command.env("PTY_ROOT", &self.root);
             let output = match output_within(command, self.command_timeout) {
                 Ok(output) => output,
@@ -1435,7 +1453,6 @@ exit 0
             .unwrap();
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
         assert!(arguments.contains("st3.isolation="));
-        assert!(arguments.contains("TERM=xterm-256color"));
         assert!(arguments.contains("--force"));
         if crate::isolation_mode() == crate::Isolation::Scope {
             assert!(arguments.contains("st3.scope-unit=st3-work-"));
@@ -1445,7 +1462,7 @@ exit 0
     #[test]
     fn spawn_preserves_an_explicit_terminal_type() {
         let root = tempfile::tempdir().unwrap();
-        let binary = fake_pty(root.path(), "fake-pty-term", "  publish new");
+        let binary = fake_pty(root.path(), "fake-pty-term", "  printf '%s' \"$TERM\" > \"$0.term\"\n  publish new");
         let runtime =
             PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
 
@@ -1457,8 +1474,50 @@ exit 0
         .unwrap();
 
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
-        assert!(arguments.contains("TERM=screen-256color"));
-        assert!(!arguments.contains("TERM=xterm-256color"));
+        assert!(!arguments.contains("--env"));
+        assert!(!arguments.contains("screen-256color"));
+        assert_eq!(fs::read_to_string(binary.with_extension("term")).unwrap(), "screen-256color");
+    }
+
+    #[test]
+    fn spawn_and_persisted_restart_restore_private_environment_without_values_in_argv() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(root.path(), "private-environment-pty",
+            "  publish new\n  while [ \"$1\" != -- ]; do shift; done\n  shift\n  \"$@\"");
+        let runtime = PtyRuntime::new(root.path().join("registry"))
+            .with_binary(binary.to_string_lossy())
+            .with_environment(["PATH", "HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
+                .into_iter()
+                .filter_map(|key| Some((key.to_owned(), std::env::var(key).ok()?)))
+                .collect());
+        let value = "$(touch injected) `touch injected` '\\\" $HOME\nlast line  ";
+        let output_path = root.path().join("roundtrip");
+        let environment = BTreeMap::from([
+            ("SEAT_MARKER".into(), value.into()),
+            ("ROUNDTRIP_OUTPUT".into(), output_path.display().to_string()),
+        ]);
+        runtime.spawn("work", &Launch::Argv(vec![
+            "sh".into(), "-c".into(),
+            "printf '%s' \"$SEAT_MARKER\" > \"$ROUNDTRIP_OUTPUT\"".into(),
+        ]), root.path(), &environment, None, &BTreeMap::new(), None).unwrap();
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), value);
+        assert!(!root.path().join("injected").exists());
+        let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
+        assert!(!arguments.contains(value));
+        assert!(!arguments.lines().any(|argument| argument == "--env"));
+        let persisted = arguments.lines().skip_while(|argument| *argument != "--")
+            .skip(1).collect::<Vec<_>>();
+        let mut restart = Command::new(persisted[0]);
+        restart.args(&persisted[1..]).env_clear()
+            .env("PATH", std::env::var("PATH").unwrap())
+            .current_dir(root.path());
+        fs::remove_file(&output_path).unwrap();
+        assert!(restart.status().unwrap().success());
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), value);
+        let environment_file = Path::new(persisted[4]);
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(environment_file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        fs::remove_file(environment_file).unwrap();
     }
 
     #[test]

@@ -142,7 +142,11 @@ pub(crate) fn sanitize(value: &str) -> String {
 }
 
 pub fn wrap(unit: &str, program: &OsStr, arguments: &[&OsStr]) -> Command {
-    match mode() {
+    wrap_for_mode(mode(), unit, program, arguments)
+}
+
+fn wrap_for_mode(isolation: Isolation, unit: &str, program: &OsStr, arguments: &[&OsStr]) -> Command {
+    match isolation {
         Isolation::Scope => {
             let mut command = Command::new("systemd-run");
             command
@@ -154,6 +158,7 @@ pub fn wrap(unit: &str, program: &OsStr, arguments: &[&OsStr]) -> Command {
                     "--expand-environment=no",
                 ])
                 .arg(format!("--unit={unit}"))
+                .arg("--description=st seat")
                 .arg("--")
                 .arg(program)
                 .args(arguments);
@@ -472,5 +477,25 @@ mod tests {
                 assert_eq!(arguments, ["-c", "true"]);
             }
         }
+    }
+
+    #[test]
+    fn scope_keeps_environment_values_out_of_argv_and_description() {
+        let mut command = wrap_for_mode(
+            Isolation::Scope,
+            "st3-work.scope",
+            OsStr::new("sh"),
+            &[OsStr::new("-c"), OsStr::new("test \"$SEAT_MARKER\" = \"$EXPECTED\"")],
+        );
+        command.env("SEAT_MARKER", "synthetic-marker");
+        command.env("EXPECTED", "synthetic-marker");
+        let arguments = command.get_args().collect::<Vec<_>>();
+        let separator = arguments.iter().position(|argument| *argument == "--").unwrap();
+        assert!(arguments.iter().all(|argument| {
+            let argument = argument.to_string_lossy();
+            !argument.contains("synthetic-marker") && !argument.contains("--env")
+                && !argument.contains("EnvironmentFile")
+        }));
+        assert!(arguments[..separator].contains(&OsStr::new("--description=st seat")));
     }
 }
