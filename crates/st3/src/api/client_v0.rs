@@ -176,7 +176,6 @@ async fn collection_items(
         }
         store.read_snapshot(|index| {
             let snapshot = client_snapshot_at(&state, index);
-            let at = snapshot.created_at.clone();
             let mut items = match collection.as_str() {
                 "missions" => {
                     let mut ids =
