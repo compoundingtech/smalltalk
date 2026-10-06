@@ -188,8 +188,8 @@ fn unknown_kind_and_schema_mismatch_fall_back_to_full_projection() {
     let store = &state.store;
     declare(store, &["amber", "birch"]);
     checked_cards(store, false);
-    let mut fills = store.agent_resources_full_fills();
-    for invalidate_schema in [false, true] {
+    let fills = store.agent_resources_full_fills();
+    for (offset, invalidate_schema) in [false, true].into_iter().enumerate() {
         if invalidate_schema {
             store.invalidate_agent_resources_schema();
         } else {
@@ -212,8 +212,7 @@ fn unknown_kind_and_schema_mismatch_fall_back_to_full_projection() {
             project(store, false, index, changed)
         }).unwrap();
         assert_eq!(calls, 1);
-        assert_eq!(store.agent_resources_full_fills(), fills + 1);
-        fills += 1;
+        assert_eq!(store.agent_resources_full_fills(), fills + offset + 1);
         assert_eq!(serde_json::to_vec(&cards).unwrap(), serde_json::to_vec(&project(store, false, index, None).unwrap()).unwrap());
     }
 }
