@@ -56,6 +56,22 @@ pub fn max_idle_read_connections() -> usize {
 /// for every subject.
 pub const STATEMENT_CACHE_CAPACITY: usize = 128;
 
+/// Recycle a fully backfilled WAL using a dedicated checkpoint connection, never the writer.
+/// PASSIVE does page copying without taking the writer lock. TRUNCATE is attempted only after
+/// that copy completes, with no busy wait: an active reader or writer defers recycling.
+pub fn checkpoint_idle_wal(connection: &Connection) -> Result<bool> {
+    connection.busy_timeout(std::time::Duration::ZERO)?;
+    let (_, frames, backfilled): (i32, i32, i32) =
+        connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if frames < 0 || frames != backfilled {
+        return Ok(false);
+    }
+    let busy: i32 = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    Ok(busy == 0)
+}
+
 /// The store's only write connection, owned by one writer thread. Writes queue in front of it in
 /// arrival order: a batched write runs on the writer thread with the others queued behind it, each
 /// in a savepoint of one transaction that commits once for all of them, and its caller hears back
@@ -787,6 +803,29 @@ thread_local! {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn idle_checkpoint_recycles_the_wal_after_a_reader_releases_its_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE payload(value BLOB); INSERT INTO payload VALUES (zeroblob(4096));").unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN; SELECT value FROM payload;").unwrap();
+        writer.execute_batch("UPDATE payload SET value=zeroblob(8192);").unwrap();
+        let checkpoint = Connection::open(&path).unwrap();
+        let wal = path.with_extension("sqlite3-wal");
+        assert!(!checkpoint_idle_wal(&checkpoint).unwrap());
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        // A failed recycle cannot block or lose a write while the old snapshot lives.
+        writer.execute_batch("INSERT INTO payload VALUES (zeroblob(4096));").unwrap();
+        reader.execute_batch("COMMIT").unwrap();
+        assert!(checkpoint_idle_wal(&checkpoint).unwrap());
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+        assert_eq!(reader.query_row("SELECT sum(length(value)) FROM payload", [],
+            |row| row.get::<_, i64>(0)).unwrap(), 12288);
+    }
     #[test]
     fn repeated_bursts_of_reads_reuse_connections_instead_of_opening_new_ones() {
         let directory = tempfile::tempdir().unwrap();
