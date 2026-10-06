@@ -72,6 +72,10 @@ mod owned_sets;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
+pub(crate) use client_v0::raw_terminal::{
+    Lease as RawTerminalLease, LeaseBinding as RawTerminalLeaseBinding,
+    ORIGIN_HEADER as RAW_ORIGIN_HEADER,
+};
 
 /// Recheck the initialized live delivery owner before replacing an unattached seat.
 pub(crate) fn claude_channel_attached(store: &Store, subject: &str, incarnation: &str) -> bool {
