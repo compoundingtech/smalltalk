@@ -46,6 +46,8 @@ impl Runtime for SmalltalkRuntime {
         resources::create_schema(connection)?;
         custom::create_schema(connection)?;
         agent_messages::create_schema(connection)?;
+        harness_control::create_schema(connection)?;
+        harness_model::create_schema(connection)?;
         glass_heads::create_schema(connection)
     }
 

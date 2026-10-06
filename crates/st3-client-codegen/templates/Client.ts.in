@@ -6,6 +6,7 @@ import type {
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
+    HarnessQueueView, HarnessModelCatalogPage, HarnessControlOperationReceipt,
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };

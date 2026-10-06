@@ -257,6 +257,17 @@ fn seat_command(root: &Path, socket: &Path) -> Command {
     command
 }
 
+fn pi_family_channel_command(root: &Path, socket: &Path, identity: &str) -> Command {
+    let paths = st_drivers::driver_paths::Paths {
+        root: root.join("pi-family-driver"),
+        agent_dir: root.join("pi-family-driver/observations"),
+        session_dir: root.join("pi-family-driver/sessions").join(identity),
+    };
+    let mut command = seat_command(root, socket);
+    command.envs(paths.environment(identity));
+    command
+}
+
 fn driver_log(root: &Path) -> String {
     std::fs::read_to_string(root.join("state/st3/driver-api-warnings.log")).unwrap_or_default()
 }
@@ -947,7 +958,7 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
     daemon.observe_running(seat, incarnation);
     daemon.start().await;
 
-    let mut channel = seat_command(root, &daemon.socket)
+    let mut channel = pi_family_channel_command(root, &daemon.socket, "restart-omp")
         .arg("--catalog")
         .arg(root.join("catalog"))
         .args(["driver", "omp-channel", "--identity", "restart-omp"])
@@ -1050,7 +1061,7 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
     }).to_string()).unwrap();
     let incarnation = format!("{}:{started}", std::process::id());
     use sha2::Digest as _;
-    let dir = root.join("catalog/.st3-channel-outbox")
+    let dir = root.join("pi-family-driver/.st3-channel-outbox")
         .join(hex::encode(sha2::Sha256::digest(seat.as_bytes())))
         .join(hex::encode(sha2::Sha256::digest(incarnation.as_bytes())));
     let todo = json!({"type":"todo", "session":"native", "observed_at":"2026-10-03T20:00:01Z",
@@ -1072,7 +1083,7 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
     };
     st_drivers::harness_events::prepare_publication(&dir, event.sequence,
         "harness.todo.observed:", &serde_json::to_value(rejected).unwrap()).unwrap();
-    let mut channel = seat_command(root, &daemon.socket)
+    let mut channel = pi_family_channel_command(root, &daemon.socket, "restart-todo")
         .env("PTY_ROOT", &registry)
         .env("ST_AGENT", seat)
         .env("ST3_ACCOUNT", std::env::var("ST3_ACCOUNT").unwrap_or_default())
@@ -1151,13 +1162,13 @@ async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribu
     daemon.store = Arc::new(Store::open(&root.join("graph.sqlite"), "restart-node").unwrap());
     daemon.observe_running(seat, incarnation);
     daemon.start_with_binding(true).await;
-    let mut channel = seat_command(root, &daemon.socket)
+    let mut channel = pi_family_channel_command(root, &daemon.socket, "drain-accounts")
         .env("ST_AGENT", seat).env("ST3_ACCOUNT", "successor/different-account")
         .arg("--catalog").arg(root.join("catalog"))
         .args(["driver", "omp-channel", "--identity", "drain-accounts"])
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped())
         .spawn().unwrap();
-    let dir = root.join("catalog/.st3-channel-outbox")
+    let dir = root.join("pi-family-driver/.st3-channel-outbox")
         .join(hex::encode(sha2::Sha256::digest(seat.as_bytes())))
         .join(hex::encode(sha2::Sha256::digest(incarnation.as_bytes())));
     wait_until("the native drain binds its spool", Duration::from_secs(10), || {
@@ -1229,7 +1240,7 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
     daemon.observe_running(seat, incarnation);
     daemon.start().await;
     let client = st3::client::Client::unix(&daemon.socket);
-    let mut channel = seat_command(root, &daemon.socket)
+    let mut channel = pi_family_channel_command(root, &daemon.socket, "human-omp")
         .arg("--catalog").arg(root.join("catalog"))
         .args(["driver", "omp-channel", "--identity", "human-omp"])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
@@ -1383,7 +1394,7 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
                 }).unwrap();
             }
             let open_channel = || async {
-                let mut channel = seat_command(root, &socket)
+                let mut channel = pi_family_channel_command(root, &socket, "receipt-worker")
                     .env("ST_AGENT", seat)
                     .env("ST3_MAILBOX_TRANSPORT", transport)
                     .arg("--catalog")
@@ -1557,7 +1568,7 @@ async fn delivered_unread_mail_stays_in_the_mailbox_after_seat_restart() {
             }));
             daemon.observe_running(seat, "replacement");
             daemon.start_with_binding(true).await;
-            let mut channel = seat_command(root, &daemon.socket)
+            let mut channel = pi_family_channel_command(root, &daemon.socket, "replay-worker")
                 .env("ST_AGENT", seat)
                 .env("ST3_MAILBOX_TRANSPORT", transport)
                 .env(st_drivers::omp_session::CHANNEL_SESSION, "same-native-parent")

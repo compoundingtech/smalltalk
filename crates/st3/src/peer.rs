@@ -105,6 +105,19 @@ pub enum ClientReadOperation {
     },
     /// A portable suspended seat payload, read only for the exact fenced resume request.
     SeatSnapshot { subject: String, suspend_operation: String, resume_operation: String, offset: u64 },
+    HarnessQueue {
+        subject: String,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    },
+    HarnessQueueMutation {
+        action_id: String,
+        idempotency_key: String,
+        parameters: Value,
+    },
+    HarnessModelMutation { action_id: String, idempotency_key: String, parameters: Value },
+    HarnessModels { subject: String, cursor: Option<String>, limit: Option<usize> },
+    HarnessControlReceipt { subject: String, operation_id: String },
     /// The directory this host gives a new agent that names no workspace.
     AgentWorkspace {
         identity: String,
@@ -159,6 +172,14 @@ impl ClientReadOperation {
                 Duration::from_millis((*wait_ms).min(CLIENT_READ_MAX_WAIT_MS))
             }
             _ => Duration::ZERO,
+        }
+    }
+
+    // The queue accepts 64 KiB of UTF-8; JSON control escaping can expand it sixfold.
+    fn request_byte_limit(&self) -> usize {
+        match self {
+            Self::HarnessQueueMutation { .. } => 512 * 1024,
+            _ => 16_384,
         }
     }
 }
@@ -613,7 +634,7 @@ impl ClientRelay {
             });
         let body = serde_json::to_vec(request)?;
         anyhow::ensure!(
-            body.len() <= 16_384,
+            body.len() <= request.request.request_byte_limit(),
             "the client read request exceeds its bound"
         );
         let digest = FleetAuth::body_digest(&body);
@@ -992,10 +1013,14 @@ async fn receive_client_read(
     let request_digest = FleetAuth::body_digest(&body);
     let result: Result<serde_json::Value> = async {
         anyhow::ensure!(
-            body.len() <= 16_384,
+            body.len() <= 512 * 1024,
             "the client read request exceeds its bound"
         );
         let request: ClientReadRequest = serde_json::from_slice(&body)?;
+        anyhow::ensure!(
+            body.len() <= request.request.request_byte_limit(),
+            "the client read request exceeds its operation bound"
+        );
         // Free mode: a member relays a read for a person or for one of the fleet's agents.
         anyhow::ensure!(
             request.authority_actor.starts_with("person/")
@@ -1015,7 +1040,32 @@ async fn receive_client_read(
             }
         }
         let client = st3_client::Client::unix_as(state.backend().socket(), &request.authority_actor);
+        let queue_read = matches!(&request.request, ClientReadOperation::HarnessQueue { .. });
+        let queue_mutation = matches!(&request.request, ClientReadOperation::HarnessQueueMutation { .. });
         match request.request {
+            ClientReadOperation::HarnessQueue { subject, cursor, limit } | ClientReadOperation::HarnessModels { subject, cursor, limit } => {
+                let collection = if queue_read { "harness-queue" } else { "harness-models" };
+                let mut path = format!("/v1/client/{collection}/{}", urlencoding::encode(&subject));
+                let mut query = Vec::new();
+                if let Some(cursor) = cursor { query.push(format!("cursor={}", urlencoding::encode(&cursor))); }
+                if let Some(limit) = limit { query.push(format!("limit={limit}")); }
+                if !query.is_empty() { path.push('?'); path.push_str(&query.join("&")); }
+                let native = Client::unix_as(state.backend().socket(), &request.authority_actor)?;
+                native.get(&path).await
+            }
+            ClientReadOperation::HarnessQueueMutation { action_id, idempotency_key, parameters } | ClientReadOperation::HarnessModelMutation { action_id, idempotency_key, parameters } => {
+                let snapshot = client.capabilities().await?.snapshot;
+                let incarnation = parameters.pointer("/binding/incarnation_id").and_then(Value::as_str).context("harness binding requires incarnation")?;
+                let desired = parameters.pointer("/binding/desired_revision").and_then(Value::as_str).context("harness binding requires desired revision")?;
+                let action_type = if queue_mutation { "harness.queue.mutate" } else { "harness.model.set" };
+                let action = serde_json::json!({"api_version":st3_client::API_VERSION,"id":action_id,"type":action_type,"idempotency_key":idempotency_key,"fence":{"snapshot_id":snapshot.id,"runtime_incarnation":incarnation,"runtime_desired_revision":desired},"parameters":parameters});
+                let native = Client::unix_as(state.backend().socket(), &request.authority_actor)?;
+                native.post("/v1/client/actions", &action).await
+            }
+            ClientReadOperation::HarnessControlReceipt { subject, operation_id } => {
+                let native = Client::unix_as(state.backend().socket(), &request.authority_actor)?;
+                native.get(&format!("/v1/client/harness-control-receipts/{}?subject={}", urlencoding::encode(&operation_id), urlencoding::encode(&subject))).await
+            }
             ClientReadOperation::ConversationChanges {
                 session_id,
                 after,
@@ -1465,7 +1515,7 @@ fn smalltalk_routes() -> Router<PeerState> {
     Router::new()
         .route(
             CLIENT_READ_PATH,
-            post(receive_client_read).layer(DefaultBodyLimit::max(16_384)),
+            post(receive_client_read).layer(DefaultBodyLimit::max(512 * 1024)),
         )
         .route(RAW_TERMINAL_PATH, get(receive_raw_terminal))
 }
@@ -2622,6 +2672,108 @@ mod tests {
             .unwrap()
             .value;
         assert!(page.replicated.is_none());
+    }
+
+    #[tokio::test]
+    async fn owner_queue_relay_preserves_large_and_maximally_escaped_content() {
+        use st3_schema::harness_control::{Approval, Binding, Models, NativeState};
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_memory("queue-owner").unwrap());
+        let intent = crate::graph::parse_intent(
+            "version 2\nagent \"queue-worker\" { workspace \"/tmp\"; command \"true\" }",
+            "queue-owner",
+        ).unwrap();
+        let planned = store.mission(&intent, crate::model::IntentInput { kdl: String::new(), source_name: None }).unwrap();
+        store.apply_as(&intent, &planned.subject_tokens, "queue-relay-declaration", Some("person/operator")).unwrap();
+        store.append_claim(&ClaimInput {
+            subject: "agent/queue-owner.queue-worker".into(), kind: "runtime.observed".into(),
+            actor: Some("agent/queue-owner.queue-worker".into()),
+            fields: BTreeMap::from([
+                ("runtime_id".into(), serde_json::json!("native-runtime")),
+                ("incarnation_id".into(), serde_json::json!("incarnation-one")),
+                ("status".into(), serde_json::json!("running")),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let fence = store.bind_mailbox(&crate::mailbox::Fence::new(
+            "agent/queue-owner.queue-worker", "incarnation-one", "delivery",
+        )).unwrap();
+        let binding = Binding {
+            desired_revision: store.harness_control_desired_revision(&fence).unwrap(),
+            incarnation_id: "incarnation-one".into(), session_id: "native-one".into(), turn_id: None,
+        };
+        store.observe_harness_control(&NativeState {
+            subject: "agent/queue-owner.queue-worker".into(), binding: binding.clone(), idle: false,
+            input_supported: true,
+            steer: Default::default(),
+            models: Models {
+                choices: Vec::new(), selected: None, atomic_model_effort: false,
+                revision: "models-one".into(), available: false, complete: true,
+                source: "native-extension-model-registry".into(),
+            },
+            approval: Approval { supported: false, reason: "unsupported".into() }, reason: None,
+        }, &fence).unwrap();
+        let socket = root.path().join("st3.sock");
+        let app = crate::api::AppState {
+            store: store.clone(), notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0, node: "queue-owner".into(),
+            state_dir: root.path().into(), pty_root: root.path().join("pty"),
+            pty_binary: PathBuf::from("pty"), fleet_id: None, configured_peers: Vec::new(),
+            client_relay: None, native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let served = socket.clone();
+        let daemon = tokio::spawn(async move {
+            crate::api::serve_unix(&served, crate::api::router(app)).await
+        });
+        for _ in 0..200 {
+            if tokio::net::UnixStream::connect(&socket).await.is_ok() { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let auth = FleetAuth::test("fleet-test", &[7; 32]);
+        let peer = PeerState::new(MainBackend::new(socket), "queue-owner".into(), auth,
+            FleetContext::legacy(BTreeSet::from(["queue-gateway".into()])));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = tokio::spawn(async move {
+            axum::serve(listener, peer_router(peer, smalltalk_routes())).await
+        });
+        let secret = root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let relay = ClientRelay::from_config(&Config {
+            node: "queue-gateway".into(), fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig { name: "queue-owner".into(), url: format!("http://{address}") }],
+            ..Default::default()
+        }).unwrap().unwrap();
+        let content = "a".repeat(20 * 1024);
+        let accepted = relay.read("host/queue-owner", &ClientReadRequest {
+            authority_actor: "person/operator".into(), relay: None,
+            request: ClientReadOperation::HarnessQueueMutation {
+                action_id: "action/large-enqueue".into(), idempotency_key: "queue-relay-large-enqueue".into(),
+                parameters: serde_json::json!({"subject":"agent/queue-owner.queue-worker","binding":binding,
+                    "queue_revision":0,"mutation":{"type":"enqueue","content":content,"lane":"follow_up"}}),
+            },
+        }).await.unwrap();
+        assert_eq!(accepted["status"], "accepted");
+        let entry_id = accepted["harness_control"]["entry_id"].as_str().unwrap();
+        assert_eq!(store.harness_control_queue("agent/queue-owner.queue-worker").unwrap().entries[0].content, content);
+        let escaped = "\u{1}".repeat(64 * 1024);
+        let replaced = relay.read("host/queue-owner", &ClientReadRequest {
+            authority_actor: "person/operator".into(), relay: None,
+            request: ClientReadOperation::HarnessQueueMutation {
+                action_id: "action/escaped-replace".into(), idempotency_key: "queue-relay-escaped-replace".into(),
+                parameters: serde_json::json!({"subject":"agent/queue-owner.queue-worker","binding":binding,
+                    "queue_revision":1,"mutation":{"type":"replace","entry_id":entry_id,"content":escaped}}),
+            },
+        }).await.unwrap();
+        assert_eq!(replaced["status"], "applied");
+        let queue = store.harness_control_queue("agent/queue-owner.queue-worker").unwrap();
+        assert_eq!(queue.entries[0].id, entry_id);
+        assert_eq!(queue.entries[0].content, escaped);
+        worker.abort();
+        daemon.abort();
     }
 
     #[tokio::test]

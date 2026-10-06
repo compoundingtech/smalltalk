@@ -24,6 +24,7 @@ sha2 = "0.10"
 signal-hook = "0.3"
 tempfile = "3"
 thiserror = "2"
+st3-schema = { path = "../st3-schema" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite = "0.27"
 toml = "0.9"

@@ -262,6 +262,26 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "reports a live harness session",
     ),
     (
+        "GET /v1/client/harness-control-receipts/{*id}",
+        "requires a previously admitted native operation; both owner ledgers are read by operation primary key",
+    ),
+    (
+        "POST /v1/harness-control/state",
+        "reports a source-fenced live native control binding",
+    ),
+    (
+        "POST /v1/harness-control/next",
+        "dispatches only through a live source-fenced native control binding",
+    ),
+    (
+        "POST /v1/harness-control/receipts",
+        "settles an admitted operation from its exact live native binding",
+    ),
+    (
+        "POST /v1/harness-control/close",
+        "closes a live native binding and settles uncertain dispatches",
+    ),
+    (
         "POST /v1/repair/apply",
         "applies an operational repair plan",
     ),
@@ -534,6 +554,14 @@ const PROBES: &[Probe] = &[
     get(
         "GET /v1/client/publication-definition",
         "/v1/client/publication-definition?subject={seat}",
+    ),
+    get(
+        "GET /v1/client/harness-queue/{*id}",
+        "/v1/client/harness-queue/{seat}",
+    ),
+    get(
+        "GET /v1/client/harness-models/{*id}",
+        "/v1/client/harness-models/{seat}",
     ),
     get("GET /v1/client/now", "/v1/client/now"),
     get("GET /v1/client/machines", "/v1/client/machines"),
@@ -1490,12 +1518,73 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         let seat = subjects.seats[0].clone();
         let mut running = claim_input("runtime.observed", "cost-seat-0-running", 0, "");
         running.subject = seat.clone();
-        running.actor = Some(seat);
+        running.actor = Some(seat.clone());
         running.fields.insert("status".into(), json!("running"));
         running
             .fields
             .insert("incarnation_id".into(), json!(SEAT_RUNTIME));
         store.append_claim(&running).unwrap();
+        // Fleet work assigns this seat but does not declare a native runtime.
+        // Give the catalogue fixture a real selected declaration before seeding its projection.
+        let kdl = format!(
+            "version 2\nagent {:?} {{ workspace {:?}; command \"true\"; }}\n",
+            seat.strip_prefix("agent/").unwrap(),
+            root,
+        );
+        let intent = st3::parse_intent(&kdl, NODE).unwrap();
+        let planned = store
+            .mission(&intent, st3::model::IntentInput { kdl, source_name: None })
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &planned.subject_tokens,
+                "cost-native-catalogue-declaration",
+                Some("person/bench-operator"),
+            )
+            .unwrap();
+        // Measure the bounded catalogue response, not the unsupported-runtime error path.
+        use st3_schema::harness_control::{Approval, Binding, ModelChoice, Models, NativeState};
+        let native = NativeState {
+            binding: Binding {
+                desired_revision: store.selected_desired_token(&seat).unwrap().unwrap(),
+                incarnation_id: SEAT_RUNTIME.into(),
+                session_id: "cost-native-session".into(),
+                turn_id: None,
+            },
+            subject: seat,
+            idle: true,
+            input_supported: true,
+            steer: Default::default(),
+            models: Models {
+                choices: vec![ModelChoice {
+                    provider: "cost-native".into(),
+                    id: "bounded-model".into(),
+                    reasoning: true,
+                    supported_efforts: vec!["off".into(), "high".into()],
+                }],
+                selected: None,
+                atomic_model_effort: false,
+                revision: "cost-models".into(),
+                available: true,
+                complete: true,
+                source: "native-extension-model-registry".into(),
+            },
+            approval: Approval {
+                supported: false,
+                reason: "native-live-approval-api-unavailable".into(),
+            },
+            reason: None,
+        };
+        // Cost-fixture setup only: native-driver authentication is exercised separately.
+        // Seed this local projection before counting; the measured probe still uses HTTP.
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute(
+                "INSERT INTO local_harness_control_state(subject,state) VALUES(?1,?2)",
+                rusqlite::params![native.subject, serde_json::to_string(&native).unwrap()],
+            )
+            .unwrap();
     }
     let mut fixture = fixture(&person, &client, subjects).await;
     // An offline source needs no live runtime: publish its exact departure before measuring

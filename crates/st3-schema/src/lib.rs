@@ -2,6 +2,7 @@
 
 pub mod custom;
 pub mod glasses;
+pub mod harness_control;
 pub mod owned_terminals;
 
 use std::collections::BTreeMap;

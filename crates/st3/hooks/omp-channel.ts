@@ -18,6 +18,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { createHarnessControl } from "./omp-harness-control.ts";
 
 const PROTOCOL = 2;
 
@@ -561,6 +562,7 @@ export default function (pi: ExtensionAPI) {
         if (lastStateFrame && backgroundJobs() !== lastBackgroundJobs) sendFrame(lastStateFrame);
         if (legacyChannel) send({ type: "keepalive" });
         if (state.todoReady) observeTodoBranch(ctx, false, true);
+        harnessControl.observe();
       }, 1000);
       keepalive.unref?.();
 
@@ -572,6 +574,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         if (state.child !== child) return;
+        if (harnessControl.handle(frame, ctx)) return;
         if (frame.type === "settled" && typeof frame.meta?.messageId === "string") {
           // The daemon acknowledged read; the graph can no longer replay this native handoff.
           state.accepted?.delete(frame.meta.messageId);
@@ -606,6 +609,8 @@ export default function (pi: ExtensionAPI) {
             if (accepted.read) send({ type: "read", meta: accepted.meta });
           }
           send({ type: "ready", sessionId: nativeSessionId });
+          // A replacement driver has no baseline or pending receipts from the old pipe.
+          harnessControl.replay();
           state.todoReady = true;
           observeTodoBranch(ctx, true);
           // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
@@ -704,6 +709,7 @@ export default function (pi: ExtensionAPI) {
     }
     child.stdin.write(JSON.stringify(frame) + "\n");
   };
+  const harnessControl = createHarnessControl(pi, sendFrame);
   const emitTodo = (ctx: ExtensionContext, snapshot: TodoSnapshot, observedAt: string, sourceOp: string, force = false) => {
     if (!state.todoReady || !state.child || state.child.stdin?.destroyed) return;
     const nativeSession = ctx.sessionManager.getSessionId();

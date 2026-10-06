@@ -4,6 +4,8 @@ use axum::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use std::collections::BTreeSet;
 
 pub(super) mod raw_terminal;
+pub(super) mod harness_control;
+pub(super) mod harness_model;
 pub(super) mod resources;
 pub(super) mod search;
 
@@ -1141,6 +1143,8 @@ const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "control.launches",
 ];
 const ACTIONS: &[&str] = &[
+    "harness.model.set",
+    "harness.queue.mutate",
     "attention.resolve",
     "review.approve",
     "review.reject",
@@ -1197,6 +1201,8 @@ const ACTIONS: &[&str] = &[
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
     "custom.reply",
+    "harness.model.set",
+    "harness.queue.mutate",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -7260,6 +7266,10 @@ pub(super) struct ActionRequest {
 }
 
 fn action_scope(action: &str) -> Option<&'static str> {
+    if action == "harness.model.set" { return Some("control.runtimes"); }
+    if action == "harness.queue.mutate" {
+        return Some("control.runtimes");
+    }
     if matches!(
         action,
         "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume"
@@ -8948,6 +8958,14 @@ pub(super) async fn action(
     let scope = action_scope(&request.action_type)
         .ok_or_else(|| validation("the action type is unknown"))?;
     require_scope(&session, scope)?;
+    if request.action_type == "harness.queue.mutate" {
+        validate_fence(&state, &request.fence)?;
+        return Ok(Json(harness_control::mutate(&state, &session, &request).await?));
+    }
+    if request.action_type == "harness.model.set" {
+        validate_fence(&state, &request.fence)?;
+        return Ok(Json(harness_model::mutate(&state, &session, &request).await?));
+    }
     // Snapshot provenance is checked, while freshness belongs to the action's own
     // revision, generation, incarnation, or screen checks.
     let read_only_terminal_lifecycle = matches!(

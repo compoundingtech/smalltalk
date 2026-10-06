@@ -46,6 +46,69 @@ It keeps sampling through slow final unwind rather than abandoning the idle edge
 timeout. New activity, session replacement, or channel replacement retires the old sampler;
 an outstanding human ask or approval keeps its blocking observation, including on reconnect.
 
+## Native control adapter
+
+The channel's control helper accepts only the current driver's desired revision and incarnation,
+the exact native session, and its observed turn binding. The turn is initially `null`; a new
+identifier is minted only on the native `agent_start` event.
+OMP channel callers carry the complete resolved driver-path contract: absolute `ST_DRIVER_ROOT`,
+`ST_DRIVER_AGENT_DIR`, `ST_DRIVER_SESSION_DIR`, and the matching `ST_DRIVER_IDENTITY`.
+Native controls persist their outbox in that session directory; a catalog alone is not a substitute.
+The resolved `ST_DRIVER_ROOT` takes precedence over `--catalog`; standalone todo spools are under
+that root's `.st3-channel-outbox/<subject-hash>/<incarnation-hash>`, not under the observations directory.
+The Rust and Swift clients retain the schema's queue/model error codes as typed values.
+The control lease activates only after an actual native control observation and survives channel
+re-exec. It does not enable push-mail subscriptions on legacy OMP channels: their existing delivery
+and graph-lag behavior remains unchanged. Controls without an accepted lease cannot publish or
+dispatch; a legacy channel without control observations does not acquire a control lease.
+On reconnect, accepting the replayed native baseline acquires that lease before the channel consumes
+the following settlement receipts; it does not wait for a heartbeat or discard those receipts.
+
+Input uses a displayable, user-attributed native custom message with an operation ID, actor, and
+entry ID in its details. Smalltalk retains follow-ups while native input is busy and dispatches
+only after a positive native idle observation. Steering is unsupported:
+`native-pre-dequeue-api-unavailable` identifies the missing public consumption fence; enqueue
+with the steer lane and promote leave the owner queue unchanged. Neither the void extension
+return nor matching text proves acceptance: only the exact
+native `message_start` or `message_end` details settle the operation. Identical text with distinct
+operation IDs remains distinct.
+
+Native session switch, branch, and tree transitions are refused while an input admission or model
+mutation remains unresolved. There is no timeout that releases this fence. If another extension
+cancels a transition after its before-event, controls stay unavailable until a native after-event
+proves the current binding. Shutdown without a settled operation reports `indeterminate`.
+
+Model selection awaits native `setModel`, then observes the effective model and effort. Model and
+effort changes are **not atomic**. Unsupported effort choices are rejected before mutation; configured
+effort remains explicitly unknown when the extension API exposes only the effective value. Live
+approval response is unsupported because there is no native extension approval-resolution API.
+
+The model descriptor includes native source, availability, completeness, and a content revision
+covering the available registry, selected model, and effective effort. Model commands require that
+revision; a fresh native read rejects a stale selection, including a change made outside the
+channel. The channel samples native selection changes on its keepalive; the extension API has no
+model/effort change hook. This is a pre-invocation fence, not a compare-and-swap guarantee across the
+native asynchronous setter.
+
+Receipt replay is process-local channel recovery, not durable native deduplication. The driver must
+not blindly replay an operation after a process replacement or an indeterminate result.
+
+The isolated native smoke uses a local zero-cost provider and the actual native RPC executable:
+
+```sh
+OMP_NATIVE_BIN=/path/to/native/omp bun scripts/st3-omp-harness-control-smoke/main.ts
+```
+
+It covers effective effort changes, exact receipts for identical input text with different IDs,
+stale session and turn refusal, real branch/switch cancellation during admission, receipt loss
+and replay, stale bindings after a completed branch, and a pending model's native shutdown result.
+Before injecting each follow-up, the smoke positively observes `ctx.isIdle()`; native turn
+completion or `waitForIdle()` alone does not establish the admission precondition.
+The owner-HTTP smoke uses the declaration's scoped identity `agent/queue-smoke.control-smoke`
+consistently for desired state, runtime claims, channel binding, and control requests.
+This proof was exercised with OMP 18.4.10. It does not use the managed-seat launcher or a remote
+provider account.
+
 ## Channel telemetry
 
 The managed channel forwards `timeline` and `context` frames to the shared pi-family

@@ -5,6 +5,18 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+pub use st3_schema::harness_control::{
+    Approval as HarnessApproval, Binding as HarnessBinding, ControlState as HarnessControlState,
+    ControlOperationReceipt as HarnessControlOperationReceipt,
+    InputResult as HarnessInputResult, Lane as HarnessLane, ModelCatalogPage as HarnessModelCatalogPage,
+    ModelChoice as HarnessModelChoice, ModelParameters as HarnessModelParameters,
+    ModelReceipt as HarnessModelReceipt, ModelResult as HarnessModelResult,
+    ModelsSummary as HarnessModelsSummary, NativeResult as HarnessNativeResult,
+    Outcome as HarnessOutcome, Queue as HarnessQueue, QueueEntry as HarnessQueueEntry,
+    QueueMutation as HarnessQueueMutation, QueueParameters as HarnessQueueParameters,
+    QueueView as HarnessQueueView, Receipt as HarnessControlReceipt, SelectedModel as HarnessSelectedModel,
+    SteerCapability as HarnessSteerCapability, SteerUnsupportedReason as HarnessSteerUnsupportedReason,
+};
 
 pub const API_VERSION: &str = "st3.client.v0";
 pub const ERROR_VERSION: &str = "st3.client.error.v0";
@@ -56,6 +68,25 @@ pub enum ErrorCode {
     RateLimited,
     RuntimeNotLocal,
     RuntimeAuthorityIndeterminate,
+    NativePreDequeueApiUnavailable,
+    StaleHarnessControl,
+    UnsupportedHarnessControl,
+    MissingQueueEntry,
+    AlreadyDispatched,
+    InvalidQueueContent,
+    InvalidIdempotencyKey,
+    StaleQueue,
+    QueueFull,
+    InvalidQueueMove,
+    QueueRevisionExhausted,
+    StaleQueueCursor,
+    QueueMetadataTooLarge,
+    QueueEntryTooLarge,
+    UnsupportedHarnessModel,
+    StaleHarnessModel,
+    UnavailableHarnessModel,
+    UnsupportedHarnessEffort,
+    HarnessControlBusy,
     RemoteUnavailable,
     TerminalUnavailable,
     TerminalEnded,
@@ -2083,6 +2114,10 @@ pub struct Fence {
 pub enum ActionType {
     #[serde(rename="custom.reply")]
     CustomReply,
+    #[serde(rename = "harness.queue.mutate")]
+    HarnessQueueMutate,
+    #[serde(rename = "harness.model.set")]
+    HarnessModelSet,
     #[serde(rename = "attention.resolve")]
     AttentionResolve,
     #[serde(rename = "review.approve")]
@@ -2592,6 +2627,10 @@ pub struct ActionResult {
     pub snapshot_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_attachment: Option<TerminalAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_control: Option<HarnessControlReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_model: Option<HarnessModelReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -2622,6 +2661,10 @@ pub enum ActionStatus {
     Accepted,
     Completed,
     Rejected,
+    Dispatched,
+    Applied,
+    Indeterminate,
+    Cancelled,
     #[serde(other)]
     Unknown,
 }

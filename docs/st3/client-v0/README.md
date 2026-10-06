@@ -82,6 +82,49 @@ subagent is part of its agent, not a resource of its own, and has no actions. Th
 per request, so a lease that runs out leaves it at the next read without a new claim. A daemon
 older than the field omits it; clients read a missing list as empty.
 
+### Owner-held harness controls
+
+`harness.queue.mutate` edits the runtime owner's input queue by stable entry ID,
+with a queue revision and exact desired-revision, incarnation, native-session,
+and activity-generation binding. Enqueue acceptance is not native admission:
+the durable receipt advances only when the supported OMP extension observes the
+matching native event. Lost native settlement is indeterminate, not permission
+to resend. Queue mutations and `harness.model.set` require `control.runtimes` and
+a concrete person; client request bodies cannot choose an actor.
+Follow-up inputs remain in Smalltalk until the native extension positively reports
+idle. Pending inputs support list, move, replace, and cancel without native queue
+ownership or text-addressed identity. OMP 18.4.10 has no public pre-dequeue
+consumption fence, so the native summary explicitly reports
+`steer: { state: "unsupported", reason: "native-pre-dequeue-api-unavailable" }`.
+Enqueue with `lane: "steer"` and promote return that machine-readable error code
+without changing the owner queue. Clients must disable steering controls rather
+than silently substituting a follow-up or using private native core hooks.
+
+`GET /v1/client/harness-queue/{subject}` returns a bounded queue page and native
+control summary. `GET /v1/client/harness-models/{subject}` returns the observed
+model catalogue, selected model, and model revision. Both support opaque cursors
+and limits from 1 to 100 (defaults: queue 20, models 100). Cursors are owner-bound
+and expire when their queue or native model revision changes. Opaque subject IDs
+are encoded whole as one path segment, including `agent/`.
+
+`harness.model.set` selects an observed provider/model and optionally an effort.
+It fences both native binding and model revision; its receipt records the actual
+native selection and effective effort. Omitted effort retains the current effective
+value when the target supports it, rather than substituting a model default.
+Otherwise the native target's observed effective value is returned; configured
+selectors unavailable through the native API remain unknown. The current extension
+does not promise atomic model-and-effort updates. Approval policy is an observed
+unsupported capability, not a remote setter.
+
+`GET /v1/client/harness-control-receipts/{id}?subject=...` reads either ledger's
+durable operation receipt. Its untagged queue/model union retains the original
+wire shape, exact binding, terminal outcome, and native proof. It requires
+`read.projections`, routes to the observed runtime owner, and never returns a
+receipt for another subject.
+The signed peer relay carries the requested receipt as `operation_id`, separate
+from its `operation` read-kind discriminator.
+
+
 ## Boundary and transport
 
 The client API is a projection and command gateway, not a graph replica. Its version is

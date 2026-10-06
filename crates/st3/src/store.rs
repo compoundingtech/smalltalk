@@ -92,6 +92,8 @@ mod accounts;
 mod attention_snapshot;
 mod backup;
 mod checkpoint_rules;
+mod harness_control;
+mod harness_model;
 mod limits;
 mod person_work;
 mod adhoc_work;
