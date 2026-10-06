@@ -550,3 +550,51 @@ fn message_reference_to_absent_agent_does_not_create_history_card() {
     }
     assert_eq!(store.agent_resources_full_fills(), fills);
 }
+
+#[test]
+fn message_after_work_lease_expiry_matches_full_queue_reduction() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let store = &state.store;
+    let source = r#"
+version 2
+agent "amber" { command "true" }
+mission "lease-expiry" state="ready" {
+  goal "Exercise time-derived queue invalidation."
+  step "build" { assigned-to "agent/node.amber" }
+}
+"#;
+    let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+    let planned = store.mission(&intent, crate::model::IntentInput {
+        kdl: source.into(), source_name: None,
+    }).unwrap();
+    store.apply(&intent, &planned.subject_tokens, "lease-expiry-source").unwrap();
+    let run = store.create_mission_run(&MissionRunRequest {
+        mission: "lease-expiry".into(), revision: None,
+        workspace: root.path().display().to_string(), requester: Some("person/test".into()),
+        mode: Some("run".into()), inputs: BTreeMap::new(), idempotency_key: "lease-expiry-run".into(),
+    }).unwrap();
+    let step = &run.steps[0].subject;
+    store.set_step_state(step, "ready", None).unwrap();
+    store.project_replication_backlog().unwrap();
+    let expiry = client_now_ms() + 2_000;
+    append(store, step, "work.claimed", json!({
+        "status": "claimed", "attempt": 1, "claimant": "agent/node.amber",
+        "claim_incarnation": "one", "claim_expires_at_unix_ms": expiry
+    }));
+    let before = check_both_histories(store);
+    assert_eq!(card(&before, "agent/node.amber")["current_work_ids"], json!([step]));
+    let fills = store.agent_resources_full_fills();
+    // Wait for the actual reducer clock boundary, not an assumed scheduling delay.
+    while client_now_ms() < expiry {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    append(store, "message/after-lease-expiry", "message.sent", json!({
+        "from": "agent/node.amber", "to": "person/test", "status": "sent",
+        "content": "The lease expired without a work claim."
+    }));
+    let after = check_both_histories(store);
+    assert_eq!(card(&after, "agent/node.amber")["current_work_ids"], json!([]));
+    assert_eq!(card(&after, "agent/node.amber")["next_work_id"], *step);
+    assert_eq!(store.agent_resources_full_fills(), fills + 2);
+}

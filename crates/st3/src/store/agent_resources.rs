@@ -24,6 +24,7 @@ struct AgentResourcesEntry {
     local_observation_index: u64,
     reducer_version: usize,
     history: bool,
+    valid_until_unix_ms: Option<u128>,
     rows: BTreeMap<String, Arc<Value>>,
     order: BTreeSet<(String, String)>,
 }
@@ -322,6 +323,7 @@ impl Store {
         build: impl FnOnce(Option<AgentResourceDelta<'_>>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
         let version = self.agent_resources_reducer_version();
+        let reduced_at = now_ms();
         let local_index = self.readers.get().query_row(
             "SELECT COALESCE(MAX(id), 0) FROM local_observations WHERE after_store_index<=?1",
             [index], |row| row.get::<_, u64>(0),
@@ -330,7 +332,8 @@ impl Store {
             let cache = self.smalltalk.agent_resources_cache.lock().expect("agent resources cache poisoned");
             (cache.entries.iter().filter(|entry|
                 entry.store_index <= index && entry.local_observation_index <= local_index
-                    && entry.history == history && entry.reducer_version == version)
+                    && entry.history == history && entry.reducer_version == version
+                    && entry.valid_until_unix_ms.is_none_or(|expiry| reduced_at < expiry))
                 .max_by_key(|entry| (entry.store_index, entry.local_observation_index)).cloned(), cache.epoch)
         };
         if let Some(entry) = previous.as_ref().filter(|entry|
@@ -341,9 +344,21 @@ impl Store {
         let changes = previous.as_ref().map(|previous| self.changed_agent_resources(previous, index, local_index))
             .transpose()?.flatten().filter(|changes| !changes.subjects.is_empty()
                 || previous.as_ref().is_some_and(|previous| previous.agent_status_index == status_index));
+        // Queue fields depend on time even without a claim. Keep the earliest future
+        // transition for the entire snapshot so no activity-only patch (or cache hit)
+        // can carry a row across a lease/deadline boundary without a full reduction.
+        let valid_until_unix_ms = self.readers.get().query_row(
+            "SELECT MIN(instant) FROM (
+                SELECT CAST(lease_expires_at_unix_ms AS INTEGER) AS instant FROM step_runs
+                UNION ALL SELECT CAST(not_before_unix_ms AS INTEGER) FROM step_runs
+                UNION ALL SELECT CAST(deadline_at_unix_ms AS INTEGER) FROM mission_run_deadlines
+             ) WHERE instant>?1",
+            [u64::try_from(reduced_at)?], |row| row.get::<_, Option<u64>>(0),
+        )?.map(u128::from);
         let mut entry = AgentResourcesEntry {
             store_index: index, agent_status_index: status_index, local_observation_index: local_index,
             reducer_version: version, history,
+            valid_until_unix_ms,
             rows: BTreeMap::new(), order: BTreeSet::new(),
         };
         if let (Some(previous), Some(changes)) = (previous, changes) {
