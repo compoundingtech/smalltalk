@@ -1,14 +1,18 @@
 //! Process telemetry uses blocking OTLP/HTTP-JSON exporters on SDK-owned threads.
+//! Sampling is the collector's decision, not an in-process one: every unit exports
+//! all spans with AlwaysOn (never parent-based, so an unsampled remote parent
+//! cannot suppress export) and one sampling policy covers all producers
+//! (Nathan's decision on #1607).
 //! Hooks and timer-driven driver commands retain their daemon-mediated telemetry path.
 //! Agent shells export OTEL_* settings, including OTEL_SERVICE_NAME=oh-my-pi:
 //! respect per-signal opt-outs and retain correlation attributes, but always use
-//! the st3 unit's service name and explicit resource identity.
+//! the st unit's service name and explicit resource identity.
 
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use opentelemetry::KeyValue;
@@ -17,11 +21,9 @@ use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
-use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider};
+use opentelemetry_sdk::trace::{BatchSpanProcessor, Sampler, SdkTracerProvider};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::{Layer as _, SubscriberExt};
-
-use crate::otel_sampler::{LocalRootTailSampler, TailSamplingConfig};
 
 static EXPORT_ENABLED: AtomicBool = AtomicBool::new(false);
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
@@ -44,9 +46,9 @@ pub enum Unit {
 impl Unit {
     fn service_name(&self) -> &'static str {
         match self {
-            Self::Daemon => "st3-daemon",
-            Self::ReplicationWorker => "st3-replication-worker",
-            Self::Cli => "st3-cli",
+            Self::Daemon => "st-daemon",
+            Self::ReplicationWorker => "st-replication-worker",
+            Self::Cli => "st-cli",
         }
     }
 
@@ -194,7 +196,6 @@ pub struct Telemetry {
     shutdown_timeout: Duration,
     cli: bool,
     cli_backoff: Option<PathBuf>,
-    forwarded: Option<Arc<AtomicU64>>,
 }
 
 impl Telemetry {
@@ -206,7 +207,6 @@ impl Telemetry {
             shutdown_timeout: unit.shutdown_timeout(),
             cli: matches!(unit, Unit::Cli),
             cli_backoff: None,
-            forwarded: None,
         };
         // These units previously installed no subscriber. Preserve that behavior when
         // export is disabled; only Driver and hook entrypoints own local diagnostics.
@@ -245,15 +245,9 @@ impl Telemetry {
                 .build()
             {
                 Ok(exporter) => {
-                    let config = TailSamplingConfig::default();
-                    let processor = LocalRootTailSampler::new(
-                        BatchSpanProcessor::builder(exporter).build(),
-                        config.clone(),
-                    );
-                    telemetry.forwarded = Some(processor.forwarded_count());
                     let provider = SdkTracerProvider::builder()
-                        .with_sampler(crate::otel_sampler::head_sampler(&config))
-                        .with_span_processor(processor)
+                        .with_sampler(Sampler::AlwaysOn)
+                        .with_span_processor(BatchSpanProcessor::builder(exporter).build())
                         .with_resource(resource.clone())
                         .build();
                     opentelemetry::global::set_tracer_provider(provider.clone());
@@ -360,23 +354,14 @@ impl Telemetry {
         if tracer.is_none() && meter.is_none() && logger.is_none() {
             return;
         }
-        let kept = self
-            .forwarded
-            .as_ref()
-            .is_some_and(|count| count.load(Ordering::Relaxed) > 0);
-        let wait = !self.cli || kept;
-        let deadline = Instant::now()
-            + if wait {
-                self.shutdown_timeout
-            } else {
-                Duration::ZERO
-            };
-        let backoff = self.cli_backoff.clone().filter(|_| kept);
+        let deadline = Instant::now() + self.shutdown_timeout;
+        let backoff = self.cli_backoff.clone();
         let helper_backoff = backoff.clone();
         let (done, waiting) = std::sync::mpsc::sync_channel(1);
         // SDK 0.30 returns OTelSdkResult from provider shutdown. BatchSpanProcessor
         // forwards the final export result; meter shutdown may ignore its timeout.
-        // Keep shutdown AND destruction off the caller, including when nothing was kept.
+        // Keep shutdown AND destruction off the caller; a CLI export now always
+        // has a root span, so its 50 ms bound applies to every flush.
         let _ = std::thread::spawn(move || {
             let mut failed = false;
             if let Some(provider) = tracer {
@@ -398,10 +383,9 @@ impl Telemetry {
             }
             let _ = done.send(());
         });
-        if wait
-            && waiting
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .is_err()
+        if waiting
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_err()
             && let Some(path) = backoff
         {
             // The process can exit before the detached exporter wakes up.

@@ -68,9 +68,10 @@ pipeline as one more producer; it does not invent its own.
 ### st3
 
 - **O11Y-R10 Process signals:** The st3 daemon, replication worker, and CLI use the OpenTelemetry
-  SDK to produce traces, metrics, and logs. Each process unit has a distinct `service.name`.
-  Hooks send signals through the daemon and never export directly. Harness-timer statusline
-  commands remain exempt from telemetry initialization.
+  SDK to produce traces, metrics, and logs. Their `service.name` values are `st-daemon`,
+  `st-replication-worker`, and `st-cli`. Hooks send signals through the daemon and never export
+  directly; hook spans and invocation metrics emitted by the observations exporter use
+  `st-hook`. Harness-timer statusline commands remain exempt from telemetry initialization.
 - **O11Y-R11 No-op when unset:** When `OTEL_EXPORTER_OTLP_ENDPOINT` is unset, st3 builds no
   exporter or SDK provider, makes no telemetry network calls, and incurs no measurable telemetry
   overhead. Exporter configuration uses standard `OTEL_*` variables.
@@ -84,10 +85,10 @@ pipeline as one more producer; it does not invent its own.
 - **O11Y-R15 Trace propagation:** W3C `traceparent` and `tracestate` propagate end to end across
   st3 HTTP and WebSocket upgrades, Rust, TypeScript, and Swift clients, and the signed peer
   protocol. Peer trace context is covered by the peer signature.
-- **O11Y-R16 Sampling:** Within bounded trace buffers, st3 keeps all traces with an error or a
-  local root longer than 1 second, plus a deterministic 1% of the rest. A sampled incoming
-  parent also keeps the trace, subject to a limit of 20 parent-forced keeps per second per
-  daemon. Buffer overflow drops are counted. Sampling does not affect metrics.
+- **O11Y-R16 Sampling:** st3 exports every span when traces are enabled and performs no
+  in-process sampling. The local collector applies the fleet sampling policy: keep traces
+  with an error, a local root longer than 1 second, a sampled caller, and a deterministic
+  1% of the rest. Sampling never affects metrics.
 - **O11Y-R17 Bounded shutdown:** Telemetry flush and shutdown take at most 250 milliseconds
   for a CLI process and at most 5 seconds for a daemon or replication worker, including when
   the collector is unreachable.

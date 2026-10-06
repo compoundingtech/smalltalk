@@ -276,7 +276,7 @@ This section specifies the st3 core mechanism (O11Y-R10–R18). The st2 sections
 their own process model. The design source is [#1580](https://github.com/compoundingtech/smalltalk/issues/1580).
 
 ```text
-process tracing ── local-root buffer ── batch span processor ──┐
+process tracing ── AlwaysOn ── batch span processor ───────────┐
 metric instruments ── periodic reader ────────────────────────┼── SDK threads ── OTLP/HTTP JSON
 tracing events ── correlated log bridge ── batch processor ───┘
 hook signals ── daemon observations exporter ────────────────────────────────── OTLP/HTTP JSON
@@ -285,8 +285,10 @@ hook signals ── daemon observations exporter ──────────�
 ### Pipeline and identity
 
 `crates/st3/src/otel.rs` owns SDK initialization, resource construction, and shutdown.
-`crates/st3/src/otel_sampler.rs` owns head decisions and the local-root tail processor.
-The pipeline uses the crate versions and blocking-only OTLP feature set listed above.
+The tracer provider uses `Sampler::AlwaysOn` and a plain SDK `BatchSpanProcessor` to export
+every span, including spans with an unsampled remote parent. There is no in-process sampler
+or span buffer beyond the SDK batch queue. The pipeline uses the crate versions and
+blocking-only OTLP feature set listed above.
 Trace, metric, and log exporters use SDK-owned threads; none export on the daemon's
 `new_current_thread` request reactor. The log bridge uses
 `experimental_use_tracing_span_context` to attach the active trace and span ids.
@@ -299,29 +301,30 @@ unit. `ST3_CLI_OTEL=off` selects it for the CLI only.
 
 | Process unit | `service.name` | Shutdown budget |
 | --- | --- | --- |
-| `st up` daemon | `st3-daemon` | 5 s |
-| `peer::run_worker` replication worker | `st3-replication-worker` | 5 s |
-| One-shot CLI | `st3-cli` | 50 ms if a trace was kept; no exporter wait otherwise |
-| Driver hook | No direct SDK export; daemon-mediated | No collector flush in the hook |
+| `st up` daemon | `st-daemon` | 5 s |
+| `peer::run_worker` replication worker | `st-replication-worker` | 5 s |
+| One-shot CLI | `st-cli` | 50 ms when export is enabled |
+| Driver hook | `st-hook` via daemon observations exporter; no direct SDK export | No collector flush in the hook |
 | `driver claude-statusline` | None; `telemetry::local_only()` | No pipeline |
 
 `crates/st3/src/telemetry.rs` remains the hook path. Hooks hand signals to the daemon and
-never contact a collector. The statusline cadence exemption remains the DQ-C13 rule above;
-there is no `st3-hook` exporter.
+never contact a collector. The observations exporter emits hook spans and hook invocation
+metrics as `st-hook`; observation logs and usage metrics retain `st-daemon`. The statusline
+cadence exemption remains the DQ-C13 rule above.
 
 The shared resource contains `service.name`, `service.version` from
 `st_drivers::version::machine_version()`, a random per-process `service.instance.id`,
 `host.name`, and `st3.node`. The observations exporter in `crates/st3/src/otlp.rs` uses this
-resource builder, including the version. The platform edge supplies fleet-owned attributes.
+resource builder, including the version: hook spans and invocation metrics are `st-hook`,
+observation logs and usage metrics are `st-daemon`. The bare `st` service name is retired.
+The platform edge supplies fleet-owned attributes.
 Flush and shutdown share one process-unit deadline across all three providers; an unreachable
 collector cannot extend it.
 
 Agent shells export the endpoint globally, and agent loops call the CLI thousands of times
-per hour. A hung collector must not delay each call. After the CLI root ends, `Telemetry`
-reads the tail sampler's shared kept count. If it is zero, CLI shutdown does not wait for the
-exporter. If it is positive, the CLI waits at most 50 ms for a detached helper to flush and
-shut down all providers. This is one hard deadline, not a separate budget per provider.
-The keep rules are errors, duration above 1 s, an admitted sampled parent, and the 1% ratio.
+per hour. A hung collector must not delay each call. After the CLI root ends, when export is
+enabled, the CLI always waits at most 50 ms for a detached helper to flush and shut down all
+providers. This is one hard deadline, not a separate budget per provider.
 The daemon and replication worker retain their 5 s deadline.
 
 A CLI flush timeout or an export error returned by provider `force_flush` or `shutdown`
@@ -334,32 +337,19 @@ files do not disable telemetry. Writers use a temporary file and atomic rename; 
 tolerate concurrent writers. This negative cache does not affect the daemon or replication
 worker.
 
-### Local-root sampling
+### Collector sampling policy
 
-```text
-span start ── record context + local-root membership ── span end ── bounded buffer
-                                                                    │
-local root ends ── error OR slow OR ratio OR admitted sampled parent ─┤
-                                                   keep → batch; drop → discard
-```
+The local collector applies tail sampling keyed by trace id (O11Y-R16), keeping a trace if
+any span has status `ERROR`, a local root lasts more than 1 second, or the root came from a
+sampled caller. It keeps a deterministic trace-id ratio of 1% of the remaining traces.
 
-The head sampler records spans even when the sampled bit is clear. It sets the sampled bit
-only for an admitted sampled parent or a deterministic trace-id ratio decision, both known
-at start. The default ratio is 0.01. Outbound context carries that decision; a downstream
-process makes its own error and duration decision.
-
-`LocalRootTailSampler` wraps the SDK `BatchSpanProcessor`. It buffers finished spans by
-trace and local root, records error status across the group, and decides when the local root
-ends. It keeps the group if any span has status `ERROR`, the local root lasts more than 1 s,
-the trace id meets the ratio, or a sampled incoming parent passes the rate bound. The
-parent-keep token bucket permits 20 traces/s per daemon. Exhausting that allowance does not
-remove an error, slow, or ratio keep.
-
-Defaults bound each trace to 512 buffered spans and the process to approximately 20,000
-buffered spans. Overflow drops are counted. Processor statistics expose kept, dropped,
-overflow-dropped, and parent-keep-throttled counts. No collector tail-sampling point is
-required. If only an upstream local root is slow, a fast downstream group can be absent.
-Metric instruments record independently of span sampling.
+The sampled-caller signal is `st.parent.sampled`: because st3 exports every span with
+AlwaysOn, every exported span carries the sampled flag, and the collector cannot recover the
+caller's decision from trace flags. Server root spans set `st.parent.sampled` to the remote
+parent's sampled flag whenever a remote parent exists; the collector policy keys on that
+attribute. The decision wait must be long enough for the daemon's SDK batch delay and
+delivery of the completed root and its spans. RED metrics are exported independently and
+are never sampled.
 
 ### Metric naming and cardinality
 
@@ -401,12 +391,12 @@ specified by this core are recorded in [open questions](open-questions.md#st3).
 ### Proof and overhead
 
 The core receiver proof uses `otelite` to inspect trace, metric, and correlated log export,
-process identity and version, and the unset-endpoint no-export control. Sampler proofs cover
-fast-drop, slow/error/parent/ratio keeps, parent throttling, buffer overflow, and independent
-metric recording. Shutdown proof uses an unreachable collector and the table's deadlines.
+process identity and version, and the unset-endpoint no-export control. Trace proofs cover
+export of fast roots and spans with unsampled remote parents; metrics record independently.
+Shutdown proof uses an unreachable collector and the table's deadlines.
 
 Copied-store measurements compare endpoint-unset execution with an enabled `otelite` sink.
-They cover daemon CPU, p99 request latency, RSS, and sampled export rate against O11Y-R18.
+They cover daemon CPU, p99 request latency, RSS, and collector-sampled export rate against O11Y-R18.
 The core mechanism does not claim request-tree or client/peer round-trip coverage until
 those instrumentation surfaces exist.
 

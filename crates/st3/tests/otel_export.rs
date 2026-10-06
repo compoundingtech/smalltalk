@@ -56,7 +56,7 @@ fn missing_daemon(command: &mut Command, root: &Path) {
         .args(["--daemon-wait", "0", "agents", "ls"]);
 }
 
-fn capture(collector: &Path, root: &Path, export: bool) -> Output {
+fn capture(collector: &Path, root: &Path, export: bool, success: bool) -> Output {
     let mut command = isolated_command(collector, root);
     command
         .args(["run", "--out"])
@@ -67,12 +67,11 @@ fn capture(collector: &Path, root: &Path, export: bool) -> Output {
         command.args(["env", "-u", "OTEL_EXPORTER_OTLP_ENDPOINT"]);
     }
     command.arg(st3());
-    if export {
-        // ERROR retention makes this proof independent of the default 1% success sampling.
-        missing_daemon(&mut command, root);
-    } else {
-        // Unlike --version, skill goes through run_cli and the telemetry initialization gate.
+    if success {
+        // `skill` is a fast offline success through run_cli and the telemetry gate.
         command.arg("skill");
+    } else {
+        missing_daemon(&mut command, root);
     }
     command.output().expect("run st3 under otelite")
 }
@@ -85,42 +84,44 @@ fn string_attribute<'a>(record: &'a Value, name: &str) -> Option<&'a str> {
         .as_str()
 }
 
+fn command_roots(traces: &str) -> Vec<(Value, Value)> {
+    let mut roots = Vec::new();
+    for line in traces.lines() {
+        let request: Value = serde_json::from_str(line).expect("valid OTLP trace request");
+        for batch in request["resourceSpans"].as_array().expect("resourceSpans") {
+            for scope in batch["scopeSpans"].as_array().expect("scopeSpans") {
+                for span in scope["spans"].as_array().expect("spans") {
+                    if span["name"].as_str() == Some("st3.cli.command") {
+                        roots.push((batch["resource"].clone(), span.clone()));
+                    }
+                }
+            }
+        }
+    }
+    roots
+}
+
 #[test]
 fn cli_error_exports_root_span_and_process_identity() {
     let Some(collector) = otelite("cli_error_exports_root_span_and_process_identity") else {
         return;
     };
     let root = tempfile::tempdir().unwrap();
-    let output = capture(&collector, root.path(), true);
+    let output = capture(&collector, root.path(), true, false);
     assert!(
         !output.status.success(),
         "missing daemon must fail: {output:?}"
     );
     let traces = std::fs::read_to_string(root.path().join("capture/traces.ndjson"))
         .expect("otelite writes the exported traces");
-    let requests: Vec<Value> = traces
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("valid OTLP trace request"))
-        .collect();
-    let mut roots = Vec::new();
-    for request in &requests {
-        for batch in request["resourceSpans"].as_array().expect("resourceSpans") {
-            for scope in batch["scopeSpans"].as_array().expect("scopeSpans") {
-                for span in scope["spans"].as_array().expect("spans") {
-                    if span["name"].as_str() == Some("st3.cli.command") {
-                        roots.push((&batch["resource"], span));
-                    }
-                }
-            }
-        }
-    }
+    let roots = command_roots(&traces);
     assert_eq!(
         roots.len(),
         1,
         "one CLI invocation must export exactly one command root:\n{traces}\n{output:?}"
     );
-    let (resource, span) = roots[0];
-    assert_eq!(string_attribute(resource, "service.name"), Some("st3-cli"));
+    let (resource, span) = &roots[0];
+    assert_eq!(string_attribute(resource, "service.name"), Some("st-cli"));
     for name in ["service.version", "service.instance.id"] {
         assert!(
             string_attribute(resource, name).is_some_and(|value| !value.is_empty()),
@@ -142,12 +143,45 @@ fn cli_error_exports_root_span_and_process_identity() {
 }
 
 #[test]
+fn cli_success_exports_root_span() {
+    let Some(collector) = otelite("cli_success_exports_root_span") else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let output = capture(&collector, root.path(), true, true);
+    assert!(output.status.success(), "skill must succeed: {output:?}");
+    let traces = std::fs::read_to_string(root.path().join("capture/traces.ndjson"))
+        .expect("otelite writes the exported traces");
+    let roots = command_roots(&traces);
+    assert_eq!(
+        roots.len(),
+        1,
+        "one successful CLI invocation must export exactly one command root:\n{traces}\n{output:?}"
+    );
+    let (resource, span) = &roots[0];
+    assert_eq!(string_attribute(resource, "service.name"), Some("st-cli"));
+    assert_eq!(string_attribute(span, "span.label"), Some("skill"));
+    assert!(
+        span["parentSpanId"]
+            .as_str()
+            .is_none_or(|id| { id.is_empty() || id == "0000000000000000" }),
+        "CLI command must be a root: {span}"
+    );
+    // Instrumentation records status only on error; success stays UNSET (0 or absent).
+    assert_ne!(
+        span["status"]["code"].as_u64(),
+        Some(2),
+        "successful command must not carry ERROR status: {span}"
+    );
+}
+
+#[test]
 fn cli_without_endpoint_succeeds_without_export() {
     let Some(collector) = otelite("cli_without_endpoint_succeeds_without_export") else {
         return;
     };
     let root = tempfile::tempdir().unwrap();
-    let output = capture(&collector, root.path(), false);
+    let output = capture(&collector, root.path(), false, true);
     assert!(output.status.success(), "skill must succeed: {output:?}");
     for signal in ["traces.ndjson", "metrics.ndjson", "logs.ndjson"] {
         let path = root.path().join("capture").join(signal);
@@ -207,57 +241,39 @@ fn cli_black_hole_collector_adds_at_most_50ms_then_backs_off() {
     // Bound but never accept: TCP connects while HTTP cannot complete.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let mut disabled = Vec::new();
-    let mut first = Vec::new();
-    let mut second = Vec::new();
-    for _ in 0..9 {
-        let root = tempfile::tempdir().unwrap();
-        // Warm the exact binary before collecting paired measurements.
-        timed_cli(root.path(), &endpoint, true, false);
-        disabled.push(timed_cli(root.path(), &endpoint, true, false));
-        first.push(timed_cli(root.path(), &endpoint, false, false));
+    // Error and success commands both export a root span, so both must honor the
+    // hard flush deadline and then the negative cache instead of unbounded teardown.
+    for success in [false, true] {
+        let mut disabled = Vec::new();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for _ in 0..9 {
+            let root = tempfile::tempdir().unwrap();
+            // Warm the exact binary before collecting paired measurements.
+            timed_cli(root.path(), &endpoint, true, success);
+            disabled.push(timed_cli(root.path(), &endpoint, true, success));
+            first.push(timed_cli(root.path(), &endpoint, false, success));
+            assert!(
+                root.path().join("run/st3/otel-cli-backoff").is_file(),
+                "success={success}: first stalled flush must establish the negative cache"
+            );
+            second.push(timed_cli(root.path(), &endpoint, false, success));
+        }
+        let baseline = median(disabled);
+        let first_delta = median(first).saturating_sub(baseline);
+        let second_delta = median(second).saturating_sub(baseline);
+        // Nine-run medians reject isolated shared-host scheduling outliers. The flush
+        // deadline contributes 50 ms; allow 15 ms more for startup/provider
+        // initialization, atomic cache writes, and scheduler noise.
         assert!(
-            root.path().join("run/st3/otel-cli-backoff").is_file(),
-            "first stalled flush must establish the negative cache"
+            first_delta <= Duration::from_millis(65),
+            "success={success}: first delta {first_delta:?}"
         );
-        second.push(timed_cli(root.path(), &endpoint, false, false));
+        assert!(
+            second_delta <= Duration::from_millis(15),
+            "success={success}: backoff delta {second_delta:?}"
+        );
     }
-    let baseline = median(disabled);
-    let first_delta = median(first).saturating_sub(baseline);
-    let second_delta = median(second).saturating_sub(baseline);
-    // Nine-run medians reject isolated shared-host scheduling outliers. Allow 15 ms
-    // for startup/provider initialization, atomic cache writes, and scheduler noise.
-    assert!(
-        first_delta <= Duration::from_millis(65),
-        "first delta {first_delta:?}"
-    );
-    assert!(
-        second_delta <= Duration::from_millis(15),
-        "backoff delta {second_delta:?}"
-    );
-}
-
-#[test]
-fn cli_kept_nothing_does_not_wait() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let mut disabled = Vec::new();
-    let mut enabled = Vec::new();
-    for _ in 0..9 {
-        // Each sample gets a private cache: an occasional 1% kept trace must not
-        // hide an unconditional flush in subsequent runs via negative caching.
-        let root = tempfile::tempdir().unwrap();
-        timed_cli(root.path(), &endpoint, true, true);
-        disabled.push(timed_cli(root.path(), &endpoint, true, true));
-        enabled.push(timed_cli(root.path(), &endpoint, false, true));
-    }
-    // No sampling test hook: the median tolerates up to four legitimately retained
-    // successes under the default 1% ratio. The same 15 ms noise allowance applies.
-    let delta = median(enabled).saturating_sub(median(disabled));
-    assert!(
-        delta <= Duration::from_millis(15),
-        "dropped-success delta {delta:?}"
-    );
 }
 
 #[test]
