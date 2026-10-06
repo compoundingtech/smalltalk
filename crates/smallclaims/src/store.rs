@@ -393,6 +393,9 @@ pub struct Store {
     pub replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
     /// Held while replicated envelopes are admitted; see `validate_replication_backlog`.
     pub admission: Mutex<()>,
+    /// The membership last folded and the fleet claims, signatures and anchor it was folded from,
+    /// so reading it again costs one statement unless one of them changed.
+    pub membership_cache: Mutex<Option<(String, crate::fleet::Membership)>>,
     /// Serializes projection passes while they lend the writer back between chunks.
     pub projection: Mutex<()>,
     pub replication_timers: ReplicationTimers,
@@ -573,6 +576,7 @@ impl Store {
             replication_snapshot_build: Mutex::new(()),
             replication_sync: Mutex::new(BTreeMap::new()),
             admission: Mutex::new(()),
+            membership_cache: Mutex::new(None),
             projection: Mutex::new(()),
             replication_timers: ReplicationTimers::default(),
             replication_projection_state: AtomicU64::new(0),
@@ -1429,7 +1433,46 @@ impl Store {
         // A local claim counts only once its batch is an envelope with this node's signature.
         self.replication_snapshot()?;
         let connection = self.readers.get();
-        fleet_membership_tx(&connection)
+        // The fold reads every fleet claim, with its envelope's signatures: hundreds of
+        // statements, and callers ask on every graph change. It is a function of those claims,
+        // their signatures and the anchor, so one statement says whether any of them changed.
+        let version = connection.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(MAX(claims.store_index),0), COUNT(envelopes.envelope_hash),
+                        COUNT(signatures.member_key), COALESCE(MAX(signatures.rowid),0),
+                        (SELECT COALESCE(value,'') FROM meta WHERE key='fleet_anchor_key')
+                 FROM claims
+                 LEFT JOIN replica_envelopes AS envelopes ON envelopes.batch_id=claims.batch_id
+                 LEFT JOIN replica_envelope_signatures AS signatures
+                   ON signatures.writer=envelopes.writer AND signatures.sequence=envelopes.sequence
+                  AND signatures.envelope_hash=envelopes.envelope_hash
+                 WHERE claims.kind IN ({FLEET_CLAIM_KINDS})"
+            ),
+            [],
+            |row| {
+                Ok(format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?
+                ))
+            },
+        )?;
+        let mut cache = self
+            .membership_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached, membership)) = cache.as_ref()
+            && *cached == version
+        {
+            return Ok(membership.clone());
+        }
+        let membership = fleet_membership_tx(&connection)?;
+        *cache = Some((version, membership.clone()));
+        Ok(membership)
     }
 
     /// Whether transport observations about `peer` belong in the graph. A dial-out member is
