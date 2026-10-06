@@ -1031,43 +1031,40 @@ async fn response_envelope_unbounded(
         let admission_queue = profile.as_ref().map(|op| op.wall_span("admission/queue"));
         let mut diagnostic_queue =
             crate::relay_trace::span(crate::relay_trace::Phase::AdmissionQueue);
-        let admission_trace = otel.as_ref().map(|server| {
-            let _parent = server.enter();
-            tracing::info_span!(target: "st3::http", "admission.queue")
-        });
+        let admission_enqueued = Instant::now();
         let server_trace = otel.clone();
         let admitted = crate::api::read_deadline::spawn_blocking(move || {
             diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
             drop(admission_queue);
-            drop(admission_trace);
+            let queue_ms = admission_enqueued.elapsed().as_millis() as i64;
             let _server = server_trace.as_ref().map(|span| span.enter());
             let _entered = crate::profile::enter(auth_profile.as_ref());
             let authentication_span = crate::profile::span("admission/authenticate");
-            let authenticate_trace = server_trace
-                .as_ref()
-                .map(|_| tracing::info_span!(target: "st3::http", "admission.authenticate"));
-            let _authenticate = authenticate_trace.as_ref().map(|span| span.enter());
+            let authenticate_started = Instant::now();
             let authentication =
                 crate::relay_trace::result(crate::relay_trace::Phase::Authenticate, || {
                     client_v0::authenticate(&auth_state, &auth_request, transport)
                 });
-            drop(_authenticate);
-            drop(authenticate_trace);
+            let authenticate_ms = authenticate_started.elapsed().as_millis() as i64;
             drop(authentication_span);
             let snapshot = (!defer_detail_snapshot).then(|| {
                 let snapshot_span = crate::profile::span("admission/snapshot");
-                let snapshot_trace = server_trace
-                    .as_ref()
-                    .map(|_| tracing::info_span!(target: "st3::http", "admission.snapshot"));
-                let _snapshot = snapshot_trace.as_ref().map(|span| span.enter());
+                let snapshot_started = Instant::now();
                 let snapshot = crate::relay_trace::work(crate::relay_trace::Phase::Snapshot, || {
                     client_request_snapshot(&auth_state, cursor_snapshot.flatten())
                 });
-                drop(_snapshot);
-                drop(snapshot_trace);
+                let snapshot_ms = snapshot_started.elapsed().as_millis() as i64;
                 drop(snapshot_span);
-                snapshot
+                (snapshot, snapshot_ms)
             });
+            let (snapshot, snapshot_ms) = snapshot.unzip();
+            if let Some(server) = server_trace.as_ref() {
+                server.record("st.admission.queue_ms", queue_ms);
+                server.record("st.admission.authenticate_ms", authenticate_ms);
+                if let Some(snapshot_ms) = snapshot_ms {
+                    server.record("st.admission.snapshot_ms", snapshot_ms);
+                }
+            }
             (authentication, snapshot)
         })
         .await;
@@ -1092,7 +1089,17 @@ async fn response_envelope_unbounded(
         // handler on a blocking thread so a busy projection or replication pass cannot
         // occupy an async worker needed to accept another call. Read workers are admitted
         // before taking store locks; nested work reuses the handler's reader.
-        (None, Ok(_)) if request_path == "/v1/health" => next.run(request).await,
+        (None, Ok(_)) if request_path == "/v1/health" => {
+            let handler_started = Instant::now();
+            let response = next.run(request).await;
+            if let Some(server) = otel.as_ref() {
+                server.record(
+                    "st.handler.duration_ms",
+                    handler_started.elapsed().as_millis() as i64,
+                );
+            }
+            response
+        }
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
             let handler_profile = profile.clone();
@@ -1101,27 +1108,22 @@ async fn response_envelope_unbounded(
             let handler_queue = profile.as_ref().map(|op| op.wall_span("handler/queue"));
             let mut diagnostic_queue =
                 crate::relay_trace::span(crate::relay_trace::Phase::HandlerQueue);
-            let handler_queue_trace = otel.as_ref().map(|server| {
-                let _parent = server.enter();
-                tracing::info_span!(target: "st3::http", "handler.queue")
-            });
+            let handler_enqueued = Instant::now();
             let server_trace = otel.clone();
             let forwarded_handler = request_path == crate::peer::CLIENT_READ_FORWARD_PATH;
             let remote = served_remote.clone();
             match crate::api::read_deadline::spawn_handler(move || {
                 diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
                 drop(handler_queue);
-                drop(handler_queue_trace);
+                let queue_ms = handler_enqueued.elapsed().as_millis() as i64;
                 let _server = server_trace.as_ref().map(|span| span.enter());
-                let handler_trace = server_trace
-                    .as_ref()
-                    .map(|_| tracing::info_span!(target: "st3::http", "handler"));
-                let _handler = handler_trace.as_ref().map(|span| span.enter());
                 if let Some(profile) = &handler_profile {
                     profile.queued();
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
-                crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
+                let handler_started = Instant::now();
+                let response =
+                    crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
                     let mut diagnostic_handler =
                         crate::relay_trace::span(crate::relay_trace::Phase::Handler);
                     let response = runtime.block_on(track_remote_reads(remote, crate::api::read_deadline::handler(async move {
@@ -1148,7 +1150,15 @@ async fn response_envelope_unbounded(
                         crate::relay_trace::Outcome::Failed
                     });
                     response
-                })
+                });
+                if let Some(server) = server_trace.as_ref() {
+                    server.record("st.handler.queue_ms", queue_ms);
+                    server.record(
+                        "st.handler.duration_ms",
+                        handler_started.elapsed().as_millis() as i64,
+                    );
+                }
+                response
             })
             .await
             {
@@ -1299,9 +1309,11 @@ static REQUEST_LATENCY: OnceLock<Mutex<request_latency::Meter>> = OnceLock::new(
 /// The request's OTel server span: named `METHOD {route}`, a local root unless the caller
 /// sent a valid W3C `traceparent`/`tracestate`, which HTTP requests and WebSocket
 /// upgrades carry alike. `None` whenever trace export is off, so that path allocates
-/// nothing. Children (`admission.queue`, `admission.authenticate`, `admission.snapshot`,
-/// `handler.queue`, `handler`) are created while this span is entered, so they parent to
-/// it across the `spawn_blocking` boundary through cloned handles.
+/// nothing. Phase durations land on this one span as numeric attributes
+/// (`st.admission.queue_ms`, `st.admission.authenticate_ms`, `st.admission.snapshot_ms`,
+/// `st.handler.queue_ms`, `st.handler.duration_ms`) instead of child spans: at
+/// saturation five children per request priced in well above the O11Y-R18 CPU budget,
+/// and a single span keeps the same phase visibility.
 fn request_trace(
     method: &axum::http::Method,
     route: &str,
@@ -1325,6 +1337,11 @@ fn request_trace(
         "st3.client.class" = client_class.as_str(),
         "http.response.status_code" = tracing::field::Empty,
         "st.parent.sampled" = tracing::field::Empty,
+        "st.admission.queue_ms" = tracing::field::Empty,
+        "st.admission.authenticate_ms" = tracing::field::Empty,
+        "st.admission.snapshot_ms" = tracing::field::Empty,
+        "st.handler.queue_ms" = tracing::field::Empty,
+        "st.handler.duration_ms" = tracing::field::Empty,
     );
     let remote = crate::otel::extract_remote_context(headers);
     let parent = remote.span();

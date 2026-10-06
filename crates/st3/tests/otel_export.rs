@@ -84,6 +84,21 @@ fn string_attribute<'a>(record: &'a Value, name: &str) -> Option<&'a str> {
         .as_str()
 }
 
+fn int_attribute(record: &Value, name: &str) -> Option<i64> {
+    record["attributes"]
+        .as_array()?
+        .iter()
+        .find_map(|attribute| {
+            if attribute["key"] != name {
+                return None;
+            }
+            let value = &attribute["value"]["intValue"];
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+}
+
 fn command_roots(traces: &str) -> Vec<(Value, Value)> {
     let mut roots = Vec::new();
     for line in traces.lines() {
@@ -343,8 +358,9 @@ impl ExportDaemon {
         // Own a process group so failed startup also cannot orphan otelite's child.
         command.process_group(0);
         command
-            // SDK 0.30 reads both intervals in milliseconds from the environment.
+            // SDK 0.30 reads all three intervals in milliseconds from the environment.
             .env("OTEL_BSP_SCHEDULE_DELAY", "100")
+            .env("OTEL_BLRP_SCHEDULE_DELAY", "100")
             .env("OTEL_METRIC_EXPORT_INTERVAL", "250")
             .args(["run", "--out"])
             .arg(root.join("capture"))
@@ -508,6 +524,10 @@ fn daemon_request_span_continues_caller_trace() {
                                                     })
                                                 },
                                             )
+                                            // One server span per request: phase durations
+                                            // are attributes, child spans must not exist.
+                                            && int_attribute(span, "st.handler.duration_ms")
+                                                .is_some()
                                     })
                                 })
                             })
@@ -515,6 +535,35 @@ fn daemon_request_span_continues_caller_trace() {
                 })
             })
         });
+        // The single-span shape exports no admission/handler child spans.
+        let request = daemon.await_export(&root.path().join("capture/traces.ndjson"), |r| {
+            r["resourceSpans"].as_array().is_some_and(|batches| {
+                batches.iter().any(|batch| {
+                    string_attribute(&batch["resource"], "service.name") == Some("st-daemon")
+                })
+            })
+        });
+        let span_names: Vec<&str> = request["resourceSpans"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|batch| batch["scopeSpans"].as_array().into_iter().flatten())
+            .flat_map(|scope| scope["spans"].as_array().into_iter().flatten())
+            .filter_map(|span| span["name"].as_str())
+            .collect();
+        assert!(
+            span_names.iter().all(|name| {
+                !matches!(
+                    *name,
+                    "admission.queue"
+                        | "admission.authenticate"
+                        | "admission.snapshot"
+                        | "handler.queue"
+                        | "handler"
+                )
+            }),
+            "child spans leaked into the export: {span_names:?}"
+        );
     }
 }
 
@@ -573,4 +622,67 @@ fn daemon_request_metric_recorded_without_trace_sampling() {
                 })
             })
     });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_normal_request_exports_no_log_stream() {
+    let Some(collector) = otelite("daemon_normal_request_exports_no_log_stream") else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    daemon.health(None);
+    // The request's span reaching the collector proves the export path ran; the log
+    // bridge's 100 ms batch delay (set above) flushes any queued log record long
+    // before this returns, so the grace period below closes the race.
+    daemon.await_export(&root.path().join("capture/traces.ndjson"), |request| {
+        request["resourceSpans"].as_array().is_some_and(|batches| {
+            batches.iter().any(|batch| {
+                string_attribute(&batch["resource"], "service.name") == Some("st-daemon")
+                    && batch["scopeSpans"].as_array().is_some_and(|scopes| {
+                        scopes.iter().any(|scope| {
+                            scope["spans"].as_array().is_some_and(|spans| {
+                                spans
+                                    .iter()
+                                    .any(|span| span["name"].as_str() == Some("GET /v1/health"))
+                            })
+                        })
+                    })
+            })
+        })
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let logs = std::fs::read_to_string(root.path().join("capture/logs.ndjson")).unwrap_or_default();
+    // resourceLogs -> scopeLogs -> logRecords; WARN starts at severityNumber 13.
+    // A healthy request must export no below-WARN record: per-request framework
+    // events are DEBUG and stay on stderr.
+    for line in logs
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+    {
+        let record: Value = serde_json::from_str(line).expect("valid OTLP JSON log request");
+        let below_warn = record["resourceLogs"].as_array().is_some_and(|resources| {
+            resources.iter().any(|resource| {
+                resource["scopeLogs"].as_array().is_some_and(|scopes| {
+                    scopes.iter().any(|scope| {
+                        scope["logRecords"].as_array().is_some_and(|entries| {
+                            entries.iter().any(|entry| {
+                                let severity = entry["severityNumber"].as_u64().or_else(|| {
+                                    entry["severityNumber"]
+                                        .as_str()
+                                        .and_then(|value| value.parse().ok())
+                                });
+                                severity.is_some_and(|severity| severity < 13)
+                            })
+                        })
+                    })
+                })
+            })
+        });
+        assert!(
+            !below_warn,
+            "a non-diagnostic (below-WARN) log record was exported:\n{line}"
+        );
+    }
 }

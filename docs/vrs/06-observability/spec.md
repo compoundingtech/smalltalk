@@ -370,16 +370,21 @@ are never sampled.
 
 `response_envelope` constructs one local root span per request only when trace export is
 enabled. Its name is `"{METHOD} {route}"`, where `route` is the matched route template or
-`/unmatched`, never the raw path.
+`/unmatched`, never the raw path. The request is a single span: at saturation five child
+spans per request priced in well above the O11Y-R18 CPU budget, so the phases are numeric
+attributes on the root instead.
 
-```text
-{METHOD} {route}
-├── admission.queue
-├── admission.authenticate
-├── admission.snapshot
-├── handler.queue
-└── handler
-```
+| Attribute | Meaning |
+| --- | --- |
+| `st.admission.queue_ms` | Wait for the admission `spawn_blocking` slot (client requests) |
+| `st.admission.authenticate_ms` | `authenticate` duration (client requests) |
+| `st.admission.snapshot_ms` | Cursor snapshot duration (client requests) |
+| `st.handler.queue_ms` | Wait for the handler `spawn_blocking` slot (non-health routes) |
+| `st.handler.duration_ms` | Handler duration, including `/v1/health` |
+
+Each is an integer count of milliseconds recorded when its phase ends; an attribute is
+absent when the phase did not run for that request. The collector's slow-request and
+error policies key on the root span's duration and status, which the single span preserves.
 
 The root attributes are `http.request.method`, `http.route`, `http.response.status_code`,
 `st3.client.class`, and `span.label` equal to the route. A 5xx response or a handler error
@@ -461,7 +466,10 @@ The core receiver proof uses `otelite` to inspect trace, metric, and correlated 
 process identity and version, and the unset-endpoint no-export control. Trace proofs cover
 export of fast roots and spans with unsampled remote parents; metrics record independently.
 The daemon request proof checks caller trace continuity, `service.name=st-daemon`, and
-`st.parent.sampled=true`/`false` for sampled and unsampled remote parents respectively.
+`st.parent.sampled=true`/`false` for sampled and unsampled remote parents respectively,
+the single-span shape (phase attributes present, no admission/handler child spans), and
+that a healthy request exports no below-WARN log record. A unit test pins the batch queue
+bounds.
 The CLI shutdown helper is tested with an exporter that never returns from shutdown:
 the caller reports a receive timeout and writes the negative cache within the 50 ms
 deadline plus 200 ms of scheduling/filesystem tolerance. The process-level black-hole
@@ -471,7 +479,7 @@ call within the backoff window. It does not compare whole-process timing medians
 
 Copied-store measurements compare endpoint-unset execution with an enabled `otelite` sink.
 They cover daemon CPU, p99 request latency, RSS, and collector-sampled export rate against O11Y-R18.
-The server request tree is specified above. The core does not claim client/peer round-trip
+The server request span shape is specified above. The core does not claim client/peer round-trip
 coverage until those instrumentation surfaces exist.
 
 ### Design questions
