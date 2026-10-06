@@ -3,6 +3,7 @@ use super::*;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 mod lease;
+mod peek_capability;
 pub(crate) use lease::{Binding as LeaseBinding, Lease, ORIGIN_HEADER};
 
 const SUBPROTOCOL: &str = "st3.client.pty.v0";
@@ -63,6 +64,16 @@ pub(crate) async fn attachment(
     {
         return Err(remote_unavailable_for_owner(&state, &live.owner_host_id));
     }
+    if request.mode == st3_client::RawTerminalMode::Peek {
+        let capability = peek_capability::issue(&state, &session, &terminal_id, &live)?;
+        return Ok(Json(json!({
+            "terminal_id": terminal_id,
+            "runtime_incarnation": live.incarnation_id,
+            "owner_host_id": live.owner_host_id,
+            "mode": "peek",
+            "stream_capability": capability,
+        })));
+    }
     let attachment_id = format!("terminal-attachment/{}", new_request_id());
     let capability =
         derive_terminal_capability(&state, &session.actor, &attachment_id, &live.owner_host_id)?;
@@ -83,11 +94,7 @@ pub(crate) async fn attachment(
                 ("raw_mode".into(), json!(mode_name(request.mode))),
                 (
                     "raw_authorization_epoch".into(),
-                    if request.mode == st3_client::RawTerminalMode::Peek {
-                        json!(authorization_epoch(&state, &session)?)
-                    } else {
-                        Value::Null
-                    },
+                    Value::Null,
                 ),
                 (
                     "capability_hash".into(),
@@ -136,13 +143,14 @@ pub(crate) async fn stream(
         .iter()
         .filter_map(|protocol| protocol.strip_prefix(TERMINAL_CAPABILITY_PROTOCOL_PREFIX))
         .collect::<Vec<_>>();
-    if protocols.len() != 2
-        || protocols
-            .iter()
-            .filter(|protocol| **protocol == SUBPROTOCOL)
-            .count()
-            != 1
-        || capabilities.len() != 1
+    // The upgrade is already authenticated. Native PEEK clients need no capability;
+    // browsers may continue using their capability and ATTACH still requires one.
+    let direct_peek = query.mode == st3_client::RawTerminalMode::Peek
+        && protocols == [SUBPROTOCOL];
+    if !direct_peek
+        && (protocols.len() != 2
+            || protocols.iter().filter(|protocol| **protocol == SUBPROTOCOL).count() != 1
+            || capabilities.len() != 1)
     {
         return Err(validation(
             "raw terminal requires st3.client.pty.v0 plus one st3.cap.* protocol",
@@ -152,14 +160,23 @@ pub(crate) async fn stream(
     if !live.terminal {
         return Err(validation("raw attachment requires a terminal runtime"));
     }
-    let acquisition_epoch = consume_terminal_attachment_mode(
-        &state,
-        &session,
-        &client_detail_id("terminal", &id),
-        &query.incarnation,
-        Some(capabilities[0]),
-        Some(mode_name(query.mode)),
-    )?;
+    let acquisition_epoch = if direct_peek {
+        Some(authorization_epoch(&state, &session)?)
+    } else if query.mode == st3_client::RawTerminalMode::Peek {
+        Some(peek_capability::consume(
+            &state, &session, &client_detail_id("terminal", &id), &live, capabilities[0],
+        )?)
+    } else {
+        consume_terminal_attachment_mode(
+            &state,
+            &session,
+            &client_detail_id("terminal", &id),
+            &query.incarnation,
+            Some(capabilities[0]),
+            Some(mode_name(query.mode)),
+        )?;
+        None
+    };
     let origin = headers
         .get(ORIGIN_HEADER)
         .map(|header| {
@@ -223,6 +240,16 @@ pub(crate) async fn stream(
         lease
             .revalidate()
             .map_err(|error| stale(error.to_string()))?;
+    }
+    if query.mode == st3_client::RawTerminalMode::Peek {
+        tracing::info!(
+            person = %session.authority_actor,
+            session = %session.actor,
+            terminal = %id,
+            owner = %live.owner_host_id,
+            incarnation = %query.incarnation,
+            "raw PEEK open authorized"
+        );
     }
     Ok(websocket
         .protocols([SUBPROTOCOL])

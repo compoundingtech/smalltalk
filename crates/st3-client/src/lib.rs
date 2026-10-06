@@ -2503,6 +2503,23 @@ impl Client {
             .stream)
     }
 
+    /// Open read-only PTY observation directly on an authenticated upgrade, without issuing
+    /// a capability or durable attachment. The caller sends PEEK and renews foreground use
+    /// explicitly with `activity.selected_use()`; normal lease deadlines and revocation apply.
+    pub async fn raw_terminal_peek(
+        &self,
+        terminal_id: &str,
+        runtime_incarnation: &str,
+    ) -> Result<RawTerminalStream, ClientError> {
+        self.open_raw_terminal(
+            terminal_id,
+            runtime_incarnation,
+            RawTerminalMode::Peek,
+            None,
+        )
+        .await
+    }
+
     /// Consume a capability and return unchanged PTY bytes plus explicit selected-use control.
     ///
     /// Renewal is WebSocket text, never injected into the PTY byte stream. There is no
@@ -2512,11 +2529,27 @@ impl Client {
         &self,
         attachment: &RawTerminalAttachment,
     ) -> Result<RawTerminalStream, ClientError> {
+        self.open_raw_terminal(
+            &attachment.terminal_id,
+            &attachment.runtime_incarnation,
+            attachment.mode,
+            Some(&attachment.stream_capability),
+        )
+        .await
+    }
+
+    async fn open_raw_terminal(
+        &self,
+        terminal_id: &str,
+        runtime_incarnation: &str,
+        mode: RawTerminalMode,
+        capability: Option<&str>,
+    ) -> Result<RawTerminalStream, ClientError> {
         let path = format!(
             "/v1/client/terminals/{}/raw-stream?incarnation={}&mode={}",
-            percent_encode_segment(attachment.terminal_id.trim_start_matches("terminal/")),
-            percent_encode(&attachment.runtime_incarnation),
-            attachment.mode.as_str(),
+            percent_encode_segment(terminal_id.trim_start_matches("terminal/")),
+            percent_encode(runtime_incarnation),
+            mode.as_str(),
         );
         let request_for = |base: &str| -> Result<Request<()>, ClientError> {
             let mut request = websocket_request(
@@ -2525,13 +2558,14 @@ impl Client {
                 self.local_person.as_deref(),
                 None,
             )?;
+            let protocols = capability.map_or_else(
+                || RAW_TERMINAL_SUBPROTOCOL.to_owned(),
+                |capability| format!("{RAW_TERMINAL_SUBPROTOCOL}, st3.cap.{capability}"),
+            );
             request.headers_mut().insert(
                 hyper::header::SEC_WEBSOCKET_PROTOCOL,
-                hyper::header::HeaderValue::from_str(&format!(
-                    "{RAW_TERMINAL_SUBPROTOCOL}, st3.cap.{}",
-                    attachment.stream_capability
-                ))
-                .map_err(|error| ClientError::Protocol(error.to_string()))?,
+                hyper::header::HeaderValue::from_str(&protocols)
+                    .map_err(|error| ClientError::Protocol(error.to_string()))?,
             );
             Ok(request)
         };

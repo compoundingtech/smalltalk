@@ -1023,11 +1023,22 @@ and can open exactly one transport. It is bound to the gateway's authenticated s
 terminal, owner host, runtime ID and incarnation, and access mode. Projected-screen capabilities
 cannot open raw streams, and raw capabilities cannot open projected streams.
 
+PEEK capabilities live only in daemon memory: expiry, single-use consumption and session/person/
+terminal/runtime binding are retained, but restarting the gateway invalidates outstanding PEEK
+capabilities. Neither issuing nor consuming PEEK creates store claims. ATTACH keeps its durable
+attachment and consumption claims.
+
 Open `/v1/client/terminals/{id}/raw-stream?incarnation=...&mode=attach` using WebSocket subprotocol
 `st3.client.pty.v0` and secondary `st3.cap.CAPABILITY`. The credential and capability never appear
 in the URL. Authentication, mode checking, single-use consumption, owner graph fencing and the
 owner's kernel/registry incarnation proof all precede upgrade. Both modes require a concrete
 person and `terminal.read`; `attach` also requires `terminal.control`.
+
+Authenticated native clients can instead open `mode=peek` with only `st3.client.pty.v0`,
+without a preceding POST or capability. Authentication, the concrete person and `terminal.read`
+scope, live seat/incarnation fencing and revocable lease registration are still checked for every
+open. Browser clients may keep the capability flow above. Who opened which PEEK is recorded in
+observability logs/spans, not the durable claim graph.
 
 Binary WebSocket messages are consecutive bytes of the original PTY protocol, not JSON screens.
 Message boundaries have no PTY meaning. The client sends ATTACH (or PEEK) itself, and receives the
@@ -1043,6 +1054,12 @@ Bounded chunks and socket backpressure preserve every byte; slow consumers do no
 parser, mode-aware paste, and geometry negotiation over it without learning about the fleet.
 Each reconnect obtains a fresh capability for the same explicitly chosen incarnation; the
 transport does not silently reselect a replacement runtime or replay input.
+
+Rust `Client::raw_terminal_peek(terminal_id, runtime_incarnation)` opens this direct PEEK path and
+returns `RawTerminalStream` with `.stream` and `.activity`. The caller sends its own PTY PEEK frame;
+foreground use is explicitly renewed with `.activity.selected_use()`. There is no automatic
+renewal: the existing 60-second idle and 300-second absolute deadlines, issuer/owner revocation and
+fail-closed watch rules apply. Reconnect using the same chosen incarnation; no capability is needed.
 
 Remote raw transport chooses the owner's currently advertised direct member route, over signed
 HTTP/WebSocket replication transport or optional Fabric. Modern membership-only fleets do not need
