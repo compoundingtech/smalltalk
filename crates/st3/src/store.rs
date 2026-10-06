@@ -1,3 +1,5 @@
+mod agent_resources;
+pub(crate) use agent_resources::AgentResourceDelta;
 pub mod custom;
 pub mod declarations;
 mod glass_heads;
@@ -2482,45 +2484,6 @@ impl Store {
         append_latest_observation(&self.graph, input, now)
     }
 
-    /// Agent-local observations change only their subject's card. Other claims can change
-    /// membership, owners, queues or labels and conservatively require a full rebuild.
-    fn changed_agent_resources(
-        &self,
-        after: u64,
-        through: u64,
-    ) -> Result<Option<BTreeSet<String>>> {
-        let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(
-            "SELECT subject, kind FROM claims WHERE store_index>?1 AND store_index<=?2",
-        )?;
-        let mut subjects = BTreeSet::new();
-        for row in statement.query_map(params![after, through], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })? {
-            let (subject, kind) = row?;
-            if kind == "daemon.diagnostic" {
-                continue;
-            }
-            if subject.starts_with("agent/")
-                && matches!(
-                    kind.as_str(),
-                    "runtime.observed"
-                        | "harness.observed"
-                        | "harness.diagnostic"
-                        | "harness.timeline"
-                        | "harness.todo.observed"
-                        | "harness.session-file"
-                        | "harness.usage"
-                )
-            {
-                subjects.insert(subject);
-            } else {
-                return Ok(None);
-            }
-        }
-        Ok(Some(subjects))
-    }
-
     /// The last claim that can change an agent's status: one about an agent, or about the run
     /// or generation that owns it, whose row decides the agent's projection layer. Steps,
     /// gates, subscriptions and diagnostics commit far more often and change no agent status.
@@ -2534,60 +2497,6 @@ impl Store {
             .query_row(AGENT_STATUS_INDEX_QUERY, [snapshot_index], |row| row.get(0))
             .optional()?
             .unwrap_or_default())
-    }
-
-    /// Keep bounded immutable snapshots. Advance the nearest older snapshot by rebuilding
-    /// only cards whose local observations changed; historical reads never advance backwards.
-    pub(crate) fn cached_agent_resources(
-        &self,
-        index: u64,
-        history: bool,
-        build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
-    ) -> Result<Vec<Value>> {
-        let mut cache = self
-            .smalltalk
-            .agent_resources_cache
-            .lock()
-            .expect("agent resources cache poisoned");
-        if let Some((_, _, items)) = cache
-            .iter()
-            .find(|(at, all, _)| *at == index && *all == history)
-        {
-            return Ok((**items).clone());
-        }
-        let previous = cache
-            .iter()
-            .filter(|(at, all, _)| *at < index && *all == history)
-            .max_by_key(|(at, _, _)| *at);
-        let items = if let Some((at, _, previous)) = previous {
-            match self.changed_agent_resources(*at, index)? {
-                Some(changed) if changed.is_empty() => (**previous).clone(),
-                Some(changed) => {
-                    let fresh = build(Some((&changed, previous)))?;
-                    let mut items = previous
-                        .iter()
-                        .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    items.extend(fresh);
-                    items.sort_by(|a, b| {
-                        a["name"]
-                            .as_str()
-                            .cmp(&b["name"].as_str())
-                            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
-                    });
-                    items
-                }
-                None => build(None)?,
-            }
-        } else {
-            build(None)?
-        };
-        cache.push_back((index, history, Arc::new(items.clone())));
-        if cache.len() > 8 {
-            cache.pop_front();
-        }
-        Ok(items)
     }
 
     /// Rebuild the operation projection when it no longer matches the claim log, and say

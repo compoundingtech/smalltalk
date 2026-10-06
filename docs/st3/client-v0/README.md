@@ -56,6 +56,27 @@ Loop and wake enrichment is detail-only and bounded to open runs plus the latest
 null timing fields on lists or older finished runs are not proof of no loop or wake.
 Clients can render `round N/M · wakes in …` without reading claim envelopes.
 
+### Agent roster projection cache
+
+The daemon maintains bounded, immutable agent-card snapshots in memory, keyed by the claim
+index, local-observation position, history mode, and reducer version. Stable card rows are shared
+by agent ID and kept in `(name, id)` order. Known seat-local, message-activity, owner-run,
+generation, and work-queue changes reduce only their affected seats; unknown kinds or
+unclassifiable dependencies conservatively fill the full roster. Repair and replay invalidate
+the cache. Card reduction happens outside the cache mutex.
+
+Observation freshness, delivery presence, and running-subagent leases remain request-time
+overlays. The first page still hashes and pins the complete overlaid roster, so continuation
+cursors preserve their frozen card values and ordering even after later commits. This cache
+does not change routes, card fields, cursor semantics, or persist a separate projection database.
+
+The ignored `api::agent_resources_bench::copied_store_agent_resources_benchmark` test exercises
+the production HTTP route against a disposable copy of a standalone SQLite backup. Set
+`ST3_AGENT_RESOURCES_BENCH_STORE` to that backup and, optionally,
+`ST3_AGENT_RESOURCES_BENCH_NODE`, `ST3_AGENT_RESOURCES_BENCH_COMMITS`, and
+`ST3_AGENT_RESOURCES_BENCH_WARM_REQUESTS`. It reports cold and warm `limit=1` timings and the
+process-local full-fill counter; it refuses an input with outstanding WAL data.
+
 ### Agent activity and human blocking
 
 An agent's `harness_state` describes activity independently of its optional `blocked_on`, `ask`,
