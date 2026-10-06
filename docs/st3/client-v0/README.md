@@ -375,8 +375,11 @@ The optional `agent_messages` field adds a **daily estimate**, also shown by `st
 stui. It counts distinct agent-to-agent message subjects, excluding people, daemon sends and
 explicit delivery-probe/test tags, probe/soak seats and the audit's named test-title prefixes.
 Receipts and duplicate send claims add no messages. Bodies are never classified. Counts are
-maintained in the writer transaction and backfilled once on upgrade. Full UTC days use daily
-recipient counters; the first and last partial days use an indexed send-time range.
+backfilled atomically on the first usage-estimate request after upgrade, not during daemon
+startup. That first request can take longer; it never returns partially backfilled counts.
+Until then, changed subjects accumulate in the local pending queue. Once initialized, counts
+are maintained in each writer transaction. Full UTC days use daily recipient counters; the
+first and last partial days use an indexed send-time range.
 
 `AgentMessageEstimate.days` contains at most the latest 31 UTC calendar days intersecting the
 period, including zero-message days. Each row names `day_start_ms`, the clipped `since_ms` and
