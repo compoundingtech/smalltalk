@@ -18912,6 +18912,18 @@ fn replica_record_bears_authority(state: &str, kind: Option<&str>) -> bool {
         })
 }
 
+// Start with the sparse conflict set, then seek each operation's claims. Unary `+` removes
+// the TEXT column affinity so SQLite can use the JSON-expression index; operation IDs are
+// strings (`smallclaims::store::operation_parts`), so their comparison is unchanged.
+const CONFLICT_CLAIM_QUERY: &str =
+    "SELECT operations.id FROM operations CROSS JOIN claims INDEXED BY claims_operation_index
+     -- Remove TEXT affinity to allow a seek of the JSON-expression index.
+     ON +operations.id=json_extract(claims.body, '$._operation.id')
+     WHERE operations.state='conflict'
+       AND json_extract(claims.body, '$._operation.id') IS NOT NULL
+       AND claims.subject=?1 AND claims.store_index<=?2
+     ORDER BY operations.id LIMIT 1";
+
 fn has_unknown_claim_at(
     connection: &Connection,
     subject: &str,
@@ -18935,25 +18947,10 @@ fn has_unknown_claim_at(
         }
     }
     let through = at_index.unwrap_or(i64::MAX as u64);
-    // Operations almost never conflict. Look for one of this subject's only when some does,
-    // since the lookup reads every claim of the subject.
-    let any_conflict = connection
-        .prepare_cached("SELECT EXISTS(SELECT 1 FROM operations WHERE state='conflict')")?
-        .query_row([], |row| row.get::<_, bool>(0))?;
-    let conflict = if any_conflict {
-        connection
-            .query_row(
-                "SELECT operations.id FROM claims JOIN operations
-                 ON operations.id=json_extract(claims.body, '$._operation.id')
-                 WHERE claims.subject=?1 AND claims.store_index<=?2 AND operations.state='conflict'
-                 ORDER BY operations.id LIMIT 1",
-                params![subject, through],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-    } else {
-        None
-    };
+    let conflict = connection
+        .prepare_cached(CONFLICT_CLAIM_QUERY)?
+        .query_row(params![subject, through], |row| row.get::<_, String>(0))
+        .optional()?;
     if let Some(operation) = conflict {
         return Ok(Some(format!("idempotency-conflict:{operation}")));
     }
@@ -22670,6 +22667,92 @@ mod fleet_admission_tests {
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("runtime.restart-window-reset"))
+        );
+    }
+
+    #[test]
+    fn conflict_lookup_seeks_operations_without_scanning_subject_history() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE claims(store_index INTEGER PRIMARY KEY, subject TEXT, kind TEXT, body TEXT);
+                 CREATE INDEX claims_subject_index ON claims(subject,store_index);
+                 CREATE INDEX claims_subject_kind_index ON claims(subject,kind,store_index);
+                 CREATE INDEX claims_operation_index ON claims(json_extract(body,'$._operation.id'))
+                   WHERE json_extract(body,'$._operation.id') IS NOT NULL;
+                 CREATE TABLE operations(id TEXT PRIMARY KEY,state TEXT);
+                 CREATE INDEX operations_conflict_index ON operations(id) WHERE state='conflict';",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        for n in 0..18 {
+            transaction
+                .execute(
+                    "INSERT INTO operations VALUES (?1,'conflict')",
+                    [format!("op/{n:02}")],
+                )
+                .unwrap();
+        }
+        for n in 1..=10_000 {
+            transaction
+                .execute(
+                    "INSERT INTO claims VALUES (?1,'agent/worker','runtime.observed','{}')",
+                    [n],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute_batch(
+                "INSERT INTO claims VALUES
+                   (10001,'agent/other','runtime.observed','{\"_operation\":{\"id\":\"op/00\"}}'),
+                   (10002,'agent/worker','runtime.observed','{\"_operation\":{\"id\":\"op/17\"}}'),
+                   (10003,'agent/worker','runtime.observed','{\"_operation\":{\"id\":\"op/01\"}}');",
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {CONFLICT_CLAIM_QUERY}"))
+            .unwrap()
+            .query_map(params!["agent/worker", 10001], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ");
+        assert!(plan.contains("operations_conflict_index"), "{plan}");
+        assert!(
+            plan.contains("SEARCH claims USING INDEX claims_operation_index"),
+            "{plan}"
+        );
+        connection
+            .prepare_cached(CONFLICT_CLAIM_QUERY)
+            .unwrap()
+            .reset_status(rusqlite::StatementStatus::VmStep);
+        assert_eq!(
+            has_unknown_claim_at(&connection, "agent/worker", Some(10001)).unwrap(),
+            None
+        );
+        let cost = connection
+            .prepare_cached(CONFLICT_CLAIM_QUERY)
+            .unwrap()
+            .get_status(rusqlite::StatementStatus::VmStep);
+        assert!(
+            cost < 1_000,
+            "unrelated history must not dominate the conflict check: {cost}"
+        );
+        assert_eq!(
+            has_unknown_claim_at(&connection, "agent/worker", Some(10002)).unwrap(),
+            Some("idempotency-conflict:op/17".into())
+        );
+        assert_eq!(
+            has_unknown_claim_at(&connection, "agent/worker", Some(10003)).unwrap(),
+            Some("idempotency-conflict:op/01".into())
+        );
+        connection
+            .execute("UPDATE operations SET state='active'", [])
+            .unwrap();
+        assert_eq!(
+            has_unknown_claim_at(&connection, "agent/worker", Some(10003)).unwrap(),
+            None
         );
     }
 
