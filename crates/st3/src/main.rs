@@ -3217,11 +3217,19 @@ async fn run_owned_set_apply(
         .await?;
     }
     if args.dry_run {
+        anyhow::ensure!(preview.deferred.is_empty(),
+            "owned set has suspended launch changes deferred; unaffected members may still publish");
         return Ok(());
     }
     request.options.expected_subjects = preview.expected_subjects;
     let response: Value = client.post("/v1/sets/apply", &request).await?;
-    print_value(&response, json_output)
+    print_value(&response, json_output)?;
+    anyhow::ensure!(
+        response.pointer("/set/deferred").and_then(Value::as_object)
+            .is_none_or(serde_json::Map::is_empty),
+        "owned set partially published: suspended launch changes deferred; resume and republish"
+    );
+    Ok(())
 }
 
 async fn run_owned_sets(
@@ -5640,7 +5648,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         fields: BTreeMap::from([
             (
                 "features".into(),
-                serde_json::json!({"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1}),
+                serde_json::json!({"owned_sets":1,"owned_set_suspension_guard":1,"seat_rollout":1,"seat_rollout_manual":1}),
             ),
             ("status".into(), Value::String("running".into())),
             ("pid".into(), Value::from(std::process::id())),

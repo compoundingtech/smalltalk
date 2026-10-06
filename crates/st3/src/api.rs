@@ -5411,7 +5411,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
-        "features": {"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1},
+        "features": {"owned_sets":1,"owned_set_suspension_guard":1,"seat_rollout":1,"seat_rollout_manual":1},
     })))
 }
 

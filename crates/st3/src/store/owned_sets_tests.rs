@@ -602,7 +602,7 @@ fn signed_fleet() -> Vec<Store> {
                 kind: "daemon.started".into(),
                 actor: None,
                 fields: serde_json::from_value(
-                    json!({"status":"running","features":{"owned_sets":1}}),
+                    json!({"status":"running","features":{"owned_sets":1,"owned_set_suspension_guard":1}}),
                 )
                 .unwrap(),
                 evidence: vec![],
@@ -650,7 +650,7 @@ fn rollout_policy_preserves_legacy_hashes_and_requires_every_active_daemon() {
             kind: "daemon.started".into(),
             actor: None,
             fields: serde_json::from_value(
-                json!({"status":"running","features":{"owned_sets":1,"seat_rollout":1}}),
+                json!({"status":"running","features":{"owned_sets":1,"owned_set_suspension_guard":1,"seat_rollout":1}}),
             )
             .unwrap(),
             evidence: Vec::new(),
@@ -1077,7 +1077,7 @@ fn rollout_signed_partition_heal_keeps_the_winning_owner_operation_and_status() 
     for from in &stores {
         from.append_claim(&ClaimInput {
             subject: format!("daemon/{}", from.origin), kind: "daemon.started".into(), actor: None,
-            fields: serde_json::from_value(json!({"status":"running","features":{"owned_sets":1,"seat_rollout":1}})).unwrap(),
+            fields: serde_json::from_value(json!({"status":"running","features":{"owned_sets":1,"owned_set_suspension_guard":1,"seat_rollout":1}})).unwrap(),
             evidence: Vec::new(), expected_subject: None, idempotency_key: None,
         }).unwrap();
         for to in &stores { signed_share(from, to); }
@@ -1138,7 +1138,7 @@ fn manual_rollout_policy_requires_each_active_daemon_and_is_in_the_receipt_diges
     for from in &stores {
         from.append_claim(&ClaimInput {
             subject: format!("daemon/{}", from.origin), kind:"daemon.started".into(), actor:None,
-            fields:serde_json::from_value(json!({"status":"running","features":{"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1}})).unwrap(),
+            fields:serde_json::from_value(json!({"status":"running","features":{"owned_sets":1,"owned_set_suspension_guard":1,"seat_rollout":1,"seat_rollout_manual":1}})).unwrap(),
             evidence:vec![],expected_subject:None,idempotency_key:None,
         }).unwrap();
         for to in &stores {
@@ -1187,4 +1187,227 @@ fn manual_rollout_policy_requires_each_active_daemon_and_is_in_the_receipt_diges
         "{:?}",
         preview.blockers
     );
+}
+
+fn suspend_for_apply_guard(store: &Store, token: String) -> ClaimRecord {
+    store.append_claim(&ClaimInput {
+        subject: "agent/garden/orchard".into(),
+        kind: "runtime.action.requested".into(),
+        actor: Some("person/operator".into()),
+        fields: BTreeMap::from([("action".into(), json!("suspend")),
+            ("reason".into(), json!("Paused for the winter"))]),
+        evidence: vec![token],
+        expected_subject: None,
+        idempotency_key: None,
+    }).unwrap()
+}
+
+fn suspended_guard_store() -> Store {
+    let store = Store::open_memory("amber").unwrap();
+    apply(&store, &bundle("first", true), 1);
+    suspend_for_apply_guard(&store, store.selected_desired_token("agent/garden/orchard").unwrap().unwrap());
+    store
+}
+
+#[test]
+fn suspended_apply_guard_reports_deferred_without_changing_launch() {
+    let store = suspended_guard_store();
+    let subject = "agent/garden/orchard";
+    let before = store.selected_desired_token(subject).unwrap();
+    apply(&store, &bundle("second", true), 2);
+    assert_eq!(store.selected_desired_token(subject).unwrap(), before);
+    assert!(crate::suspension::current(&store, subject).unwrap().unwrap().holds_seat());
+    let receipt = &store.owned_sets().unwrap()[0].receipt;
+    assert_eq!(receipt.deferred[subject]["reason"], "Paused for the winter");
+    assert_eq!(receipt.deferred[subject]["proposed"], serde_json::to_value(&bundle("second", true).subjects[subject]).unwrap());
+}
+
+#[test]
+fn suspended_apply_guard_fences_both_publication_orders() {
+    let store = Store::open_memory("amber").unwrap();
+    apply(&store, &bundle("first", true), 1);
+    let stale = store.selected_desired_token("agent/garden/orchard").unwrap().unwrap();
+    let mut opts = options(&store, 2);
+    let input = bundle("second", true);
+    opts.expected_subjects = store.owned_set_preview(&input, &opts).unwrap().expected_subjects;
+    suspend_for_apply_guard(&store, stale.clone());
+    store.apply_owned_set(&input, &opts, "racing-apply", "person/operator").unwrap();
+    assert_eq!(store.selected_desired_token("agent/garden/orchard").unwrap(), Some(stale));
+    let other = Store::open_memory("amber").unwrap();
+    apply(&other, &bundle("first", true), 1);
+    let stale = other.selected_desired_token("agent/garden/orchard").unwrap().unwrap();
+    apply(&other, &bundle("second", true), 2);
+    let error = other.append_claim(&ClaimInput {
+        subject: "agent/garden/orchard".into(), kind: "runtime.action.requested".into(),
+        actor: Some("person/operator".into()),
+        fields: BTreeMap::from([("action".into(), json!("suspend"))]),
+        evidence: vec![stale], expected_subject: None, idempotency_key: None,
+    }).unwrap_err();
+    assert_eq!(error.code, "stale-fence");
+}
+
+#[test]
+fn suspended_apply_guard_allows_identical_and_label_only_publications() {
+    let store = suspended_guard_store();
+    let operation = crate::suspension::current(&store, "agent/garden/orchard").unwrap().unwrap().operation_id;
+    apply(&store, &bundle("first", true), 2);
+    let labelled = parse_intent("version 2\nagent \"garden/orchard\" { command \"first\"; name \"Orchard\" }\nagent \"garden/meadow\" { command \"true\" }", "amber").unwrap();
+    apply(&store, &labelled, 3);
+    assert!(store.owned_sets().unwrap()[0].receipt.deferred.is_empty());
+    let current = crate::suspension::current(&store, "agent/garden/orchard").unwrap().unwrap();
+    assert_eq!(current.operation_id, operation);
+    assert!(current.holds_seat());
+}
+
+#[test]
+fn suspended_apply_guard_publishes_other_members() {
+    let store = suspended_guard_store();
+    let input = parse_intent("version 2\nagent \"garden/orchard\" { command \"second\" }\nagent \"garden/meadow\" { command \"updated\" }", "amber").unwrap();
+    apply(&store, &input, 2);
+    let selected = store.selected_desired_token("agent/garden/meadow").unwrap().unwrap();
+    let claim = store.claim_by_id(&selected).unwrap().unwrap();
+    let desired: DesiredSubject = serde_json::from_value(claim.body).unwrap();
+    assert_eq!(desired, input.subjects["agent/garden/meadow"]);
+    assert_eq!(store.owned_sets().unwrap()[0].receipt.deferred.len(), 1);
+}
+
+#[test]
+fn suspended_apply_guard_keeps_change_pending_until_republication_after_resume() {
+    let store = suspended_guard_store();
+    let subject = "agent/garden/orchard";
+    let suspension = crate::suspension::current(&store, subject).unwrap().unwrap();
+    store.append_claim(&ClaimInput {
+        subject: subject.into(), kind: "runtime.action.succeeded".into(),
+        actor: Some("person/operator".into()),
+        fields: BTreeMap::from([("action".into(), json!("suspend"))]),
+        evidence: vec![suspension.operation_id.clone()], expected_subject: None,
+        idempotency_key: Some(crate::suspension::suspend_completed_key(&suspension.operation_id)),
+    }).unwrap();
+    apply(&store, &bundle("second", true), 2);
+    let token = store.selected_desired_token(subject).unwrap().unwrap();
+    let resume = store.append_claim(&ClaimInput {
+        subject: subject.into(), kind: "runtime.action.requested".into(),
+        actor: Some("person/operator".into()),
+        fields: BTreeMap::from([("action".into(), json!("resume"))]),
+        evidence: vec![token, suspension.operation_id], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    store.append_claim(&ClaimInput {
+        subject: subject.into(), kind: "runtime.action.succeeded".into(),
+        actor: Some("person/operator".into()),
+        fields: BTreeMap::from([("action".into(), json!("resume"))]),
+        evidence: vec![resume.id.clone()], expected_subject: None,
+        idempotency_key: Some(crate::suspension::resume_completed_key(&resume.id)),
+    }).unwrap();
+    assert!(!crate::suspension::current(&store, subject).unwrap().unwrap().holds_seat());
+    assert!(store.owned_sets().unwrap()[0].receipt.deferred.contains_key(subject));
+    apply(&store, &bundle("second", true), 3);
+    assert!(store.owned_sets().unwrap()[0].receipt.deferred.is_empty());
+    let claim = store.claim_by_id(&store.selected_desired_token(subject).unwrap().unwrap()).unwrap().unwrap();
+    let desired: DesiredSubject = serde_json::from_value(claim.body).unwrap();
+    assert_eq!(desired, bundle("second", true).subjects[subject]);
+}
+
+#[test]
+fn suspended_apply_guard_retirement_remains_live_and_owned() {
+    let store = suspended_guard_store();
+    let input = parse_intent("version 2\nagent \"garden/meadow\" { command \"updated\" }", "amber").unwrap();
+    apply(&store, &input, 2);
+    let view = &store.owned_sets().unwrap()[0];
+    assert!(view.receipt.members.contains_key("agent/garden/orchard"));
+    assert!(!view.receipt.retired.contains_key("agent/garden/orchard"));
+    assert_eq!(view.receipt.deferred["agent/garden/orchard"]["proposed"]["kind"], "stop");
+    assert_eq!(store.selected_desired_kind("agent/garden/orchard").unwrap().as_deref(), Some("agent"));
+}
+
+#[test]
+fn suspended_apply_guard_refuses_unowned_launch_changes_with_context() {
+    let store = Store::open_memory("amber").unwrap();
+    direct(&store, &bundle("first", false), "first").unwrap();
+    suspend_for_apply_guard(&store, store.selected_desired_token("agent/garden/orchard").unwrap().unwrap());
+    let error = direct(&store, &bundle("second", false), "second").unwrap_err();
+    assert_eq!(error.code, "suspended-seat");
+    assert_eq!(error.details["blocker"]["reason"], "Paused for the winter");
+    assert!(crate::suspension::current(&store, "agent/garden/orchard").unwrap().unwrap().holds_seat());
+}
+
+#[test]
+fn suspended_apply_guard_fences_a_suspend_on_an_unreplicated_peer() {
+    let publisher = Store::open_memory("amber").unwrap();
+    let owner = Store::open_memory("cobalt").unwrap();
+    apply(&publisher, &bundle("first", true), 1);
+    share(&publisher, &owner);
+    let subject = "agent/garden/orchard";
+    let token = owner.selected_desired_token(subject).unwrap().unwrap();
+    let suspend = suspend_for_apply_guard(&owner, token.clone());
+    let changed = parse_intent("version 2\nagent \"garden/orchard\" { command \"second\" }\nagent \"garden/meadow\" { command \"updated\" }", "amber").unwrap();
+    // Neither writer knows the other's concurrent action at acceptance.
+    apply(&publisher, &changed, 2);
+    share(&publisher, &owner);
+    share(&owner, &publisher);
+    for store in [&owner, &publisher] {
+        assert_eq!(store.selected_desired_token(subject).unwrap(), Some(token.clone()));
+        assert!(crate::suspension::current(store, subject).unwrap().unwrap().holds_seat());
+        let view = &store.owned_sets().unwrap()[0];
+        assert_eq!(view.deferred[subject]["reason"], "Paused for the winter");
+        let member = store.selected_desired_token("agent/garden/meadow").unwrap().unwrap();
+        let desired: DesiredSubject = serde_json::from_value(store.claim_by_id(&member).unwrap().unwrap().body).unwrap();
+        assert_eq!(desired, changed.subjects["agent/garden/meadow"]);
+    }
+    owner.append_claim(&ClaimInput {
+        subject: subject.into(), kind: "runtime.action.succeeded".into(), actor: Some("person/operator".into()),
+        fields: BTreeMap::from([("action".into(), json!("suspend"))]),
+        evidence: vec![suspend.id.clone()], expected_subject: None,
+        idempotency_key: Some(crate::suspension::suspend_completed_key(&suspend.id)),
+    }).unwrap();
+    let resume = owner.append_claim(&ClaimInput {
+        subject: subject.into(), kind: "runtime.action.requested".into(), actor: Some("person/operator".into()),
+        fields: BTreeMap::from([("action".into(), json!("resume"))]),
+        evidence: vec![token.clone(), suspend.id], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    owner.append_claim(&ClaimInput {
+        subject: subject.into(), kind: "runtime.action.succeeded".into(), actor: Some("person/operator".into()),
+        fields: BTreeMap::from([("action".into(), json!("resume"))]),
+        evidence: vec![resume.id.clone()], expected_subject: None,
+        idempotency_key: Some(crate::suspension::resume_completed_key(&resume.id)),
+    }).unwrap();
+    share(&owner, &publisher);
+    assert_eq!(publisher.selected_desired_token(subject).unwrap(), Some(token));
+    assert!(publisher.owned_sets().unwrap()[0].deferred.contains_key(subject));
+    apply(&publisher, &changed, 3);
+    share(&publisher, &owner);
+    for store in [&owner, &publisher] {
+        assert!(store.owned_sets().unwrap()[0].deferred.is_empty());
+        let claim = store.claim_by_id(&store.selected_desired_token(subject).unwrap().unwrap()).unwrap().unwrap();
+        let desired: DesiredSubject = serde_json::from_value(claim.body).unwrap();
+        assert_eq!(desired, changed.subjects[subject]);
+    }
+}
+
+#[test]
+fn suspended_apply_guard_requires_all_active_hosts_to_upgrade() {
+    let stores = signed_fleet();
+    let old_host = &stores[1];
+    old_host.append_claim(&ClaimInput {
+        subject: format!("daemon/{}", old_host.origin), kind: "daemon.started".into(), actor: None,
+        fields: serde_json::from_value(json!({"status":"running","features":{"owned_sets":1}})).unwrap(),
+        evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    signed_share(old_host, &stores[0]);
+    let input = bundle("first", true);
+    let mut opts = options(&stores[0], 1);
+    let preview = stores[0].owned_set_preview(&input, &opts).unwrap();
+    assert!(preview.blockers.iter().any(|blocker| blocker.contains("host/cobalt")
+        && blocker.contains("suspension guard")));
+    opts.expected_subjects = preview.expected_subjects;
+    assert_eq!(stores[0].apply_owned_set(&input, &opts, "mixed-fleet", "person/operator").unwrap_err().code,
+        "owned-set-refused");
+    assert!(stores[0].owned_sets().unwrap().is_empty());
+    old_host.append_claim(&ClaimInput {
+        subject: format!("daemon/{}", old_host.origin), kind: "daemon.started".into(), actor: None,
+        fields: serde_json::from_value(json!({"status":"running","features":{"owned_sets":1,"owned_set_suspension_guard":1}})).unwrap(),
+        evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    signed_share(old_host, &stores[0]);
+    apply(&stores[0], &input, 1);
+    assert!(stores[0].owned_sets().unwrap()[0].receipt.suspension_guard);
 }

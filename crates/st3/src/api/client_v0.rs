@@ -1358,7 +1358,7 @@ impl ClientSession {
         }
     }
 
-    fn allows(&self, scope: &str) -> bool {
+    pub(super) fn allows(&self, scope: &str) -> bool {
         self.scopes.contains(scope)
     }
 }

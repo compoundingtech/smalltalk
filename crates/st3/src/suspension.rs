@@ -26,6 +26,32 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub(crate) trait SuspensionReader {
+    fn suspension_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>>;
+    fn operation_claim(&self, key: &str) -> Result<Option<ClaimRecord>>;
+    fn selected_desired_kind(&self, subject: &str) -> Result<Option<String>>;
+    fn launch_lineage(&self, subject: &str) -> Result<Vec<String>>;
+    fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>>;
+}
+
+impl SuspensionReader for Store {
+    fn suspension_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
+        std::ops::Deref::deref(self).claims_for(subject, Some("runtime.action.requested"))
+    }
+    fn operation_claim(&self, key: &str) -> Result<Option<ClaimRecord>> {
+        Store::operation_claim(self, key)
+    }
+    fn selected_desired_kind(&self, subject: &str) -> Result<Option<String>> {
+        Store::selected_desired_kind(self, subject)
+    }
+    fn launch_lineage(&self, subject: &str) -> Result<Vec<String>> {
+        Store::launch_lineage(self, subject)
+    }
+    fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
+        std::ops::Deref::deref(self).claim_by_id(id)
+    }
+}
+
 /// The environment variable that names the native session a resumed driver must relaunch.
 pub const RESUME_ENV: &str = "ST3_NATIVE_RESUME_SESSION";
 /// The diagnostic code a driver records when it cannot relaunch the named native session.
@@ -134,8 +160,8 @@ fn evidence(claim: &ClaimRecord, index: usize) -> Option<&str> {
 }
 
 /// The seat's requester-authored suspends and resumes, oldest first.
-fn requests(store: &Store, subject: &str) -> Result<Vec<ClaimRecord>> {
-    let mut requests = store.claims_for(subject, Some("runtime.action.requested"))?;
+fn requests(store: &impl SuspensionReader, subject: &str) -> Result<Vec<ClaimRecord>> {
+    let mut requests = store.suspension_requests(subject)?;
     requests.retain(|claim| {
         claim.actor.is_some() && matches!(action(claim), Some("suspend" | "resume"))
     });
@@ -161,7 +187,7 @@ fn apply_failure(state: &mut Suspension, claim: &ClaimRecord) {
 }
 
 /// The phase of the suspend request `request`.
-fn suspend_state(store: &Store, request: &ClaimRecord) -> Result<Suspension> {
+fn suspend_state(store: &impl SuspensionReader, request: &ClaimRecord) -> Result<Suspension> {
     let mut state = Suspension {
         action: "suspend".into(),
         phase: "quiescing".into(),
@@ -198,6 +224,10 @@ fn suspend_state(store: &Store, request: &ClaimRecord) -> Result<Suspension> {
 /// applies. A suspension belongs to the launch it was taken under: a stop, or a declaration that
 /// changes how the seat launches, ends it, and the seat then starts by the usual rules.
 pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
+    current_from(store, subject)
+}
+
+pub(crate) fn current_from(store: &impl SuspensionReader, subject: &str) -> Result<Option<Suspension>> {
     let requests = requests(store, subject)?;
     let Some(request) = requests.last() else {
         return Ok(None);

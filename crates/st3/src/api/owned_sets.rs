@@ -61,13 +61,19 @@ pub(super) async fn apply(
         )
         .map_err(ApiError::bad)?;
     signal_changed(&state);
-    Ok(Json(
-        json!({"publication":response,"set":state.store.owned_sets().map_err(ApiError::bad)?.into_iter().find(|v|v.id==sets::subject(&request.options.set).unwrap())}),
-    ))
+    let set = state.store.owned_sets().map_err(ApiError::bad)?.into_iter()
+        .find(|view| view.id == sets::subject(&request.options.set).unwrap())
+        .map(|view| resource(&state, view)).transpose().map_err(ApiError::internal)?;
+    Ok(Json(json!({"publication":response,"set":set})))
 }
 
 fn resource(state: &AppState, view: sets::View) -> anyhow::Result<Value> {
     let mut value = serde_json::to_value(&view)?;
+    for (subject, blocker) in &view.deferred {
+        value["blockers"].as_array_mut().unwrap().push(json!(format!(
+            "{subject}: suspended ({}) — launch change deferred; republish after resume",
+            blocker["reason"].as_str().unwrap_or("no reason provided"))));
+    }
     let mut statuses = Vec::new();
     for (subject, member, retired) in state.store.owned_set_effective_members(&view)? {
         let status = state
@@ -115,7 +121,9 @@ fn resource(state: &AppState, view: sets::View) -> anyhow::Result<Value> {
             .is_some_and(|s| s["mode"] == "manual" && s["phase"] == "pending");
         let verified = operation.as_ref().is_none_or(|o| o.phase == "running");
         let running = actual == Some("running") && launch_current && verified;
-        let phase = if !view.blockers.is_empty() {
+        let phase = if view.deferred.contains_key(&subject) {
+            "deferred"
+        } else if !view.blockers.is_empty() {
             "blocked"
         } else if manual_pending {
             "pending"
@@ -136,6 +144,7 @@ fn resource(state: &AppState, view: sets::View) -> anyhow::Result<Value> {
         };
         statuses.push(json!({"subject":subject,"desired_token":member.claim,"launched_token":launched,"incarnation":incarnation,
             "retired":retired,"launch_current":launch_current,"rollout":phase,"operation":operation,
+            "blocker":view.deferred.get(&subject),
             "rollout_mode":if manual_pending {Some("manual")} else {None},
             "publication_status":if manual_pending {Some("published, rollout pending (manual)")} else {None}}));
     }
@@ -154,6 +163,34 @@ fn resource(state: &AppState, view: sets::View) -> anyhow::Result<Value> {
     Ok(value)
 }
 
+// Match subject.definition: projection readers may inspect launch changes, but
+// environment values require declaration scope. Proposals occur in three readback
+// locations, including the receipt itself.
+fn redact_proposals(value: &mut Value) {
+    let redact = |blocker: &mut Value| {
+        if let Some(desired) = blocker.pointer_mut("/proposed/desired") {
+            crate::graph::redact_agent_env_values(desired);
+        }
+        if let Some(environment) = blocker.pointer_mut("/proposed/member/environment")
+            .and_then(Value::as_object_mut)
+        {
+            for value in environment.values_mut() {
+                *value = json!("<redacted>");
+            }
+        }
+    };
+    for path in ["/deferred", "/receipt/deferred"] {
+        if let Some(blockers) = value.pointer_mut(path).and_then(Value::as_object_mut) {
+            for blocker in blockers.values_mut() { redact(blocker); }
+        }
+    }
+    if let Some(members) = value["members_status"].as_array_mut() {
+        for member in members {
+            if let Some(blocker) = member.get_mut("blocker") { redact(blocker); }
+        }
+    }
+}
+
 pub(super) async fn list(
     State(state): State<AppState>,
     Extension(session): Extension<client_v0::ClientSession>,
@@ -161,12 +198,17 @@ pub(super) async fn list(
     Query(query): Query<ClientListQuery>,
 ) -> Result<ClientPageResponse, ApiError> {
     client_v0::require_scope(&session, "read.projections")?;
-    client_snapshot_page(&state, snapshot, "sets", &query, |state, _| {
+    let show_env_values = session.allows("read.declarations");
+    client_snapshot_page(&state, snapshot, "sets", &query, move |state, _| {
         state
             .store
             .owned_sets()?
             .into_iter()
-            .map(|v| resource(state, v))
+            .map(|v| {
+                let mut value = resource(state, v)?;
+                if !show_env_values { redact_proposals(&mut value); }
+                Ok(value)
+            })
             .collect()
     })
     .await
@@ -193,7 +235,9 @@ pub(super) async fn get(
         })
     })
     .await?;
-    Ok((Extension(snapshot), Json(value?)))
+    let mut value = value?;
+    if !session.allows("read.declarations") { redact_proposals(&mut value); }
+    Ok((Extension(snapshot), Json(value)))
 }
 
 fn detail(state: &AppState, id: &str, sha: Option<String>) -> Result<Value, ApiError> {
@@ -245,4 +289,25 @@ fn detail(state: &AppState, id: &str, sha: Option<String>) -> Result<Value, ApiE
         return Ok(value);
     }
     resource(state, selected).map_err(ApiError::internal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suspended_apply_guard_readback_redacts_every_environment_copy() {
+        let proposed = json!({"desired":{"name":"agent","children":[
+            {"name":"env","children":[{"name":"EXAMPLE_TOKEN","arguments":["example-private-value"]}]}]},
+            "member":{"environment":{"EXAMPLE_TOKEN":"example-private-value"}}});
+        let blocker = json!({"reason":"Paused for the winter","proposed":proposed});
+        let mut value = json!({"deferred":{"agent/garden/orchard":blocker},
+            "receipt":{"deferred":{"agent/garden/orchard":blocker}},
+            "members_status":[{"blocker":blocker}]});
+        redact_proposals(&mut value);
+        assert!(!value.to_string().contains("example-private-value"));
+        assert_eq!(value["deferred"]["agent/garden/orchard"]["reason"], "Paused for the winter");
+        assert_eq!(value["members_status"][0]["blocker"]["proposed"]["member"]["environment"]["EXAMPLE_TOKEN"], "<redacted>");
+        assert_eq!(value["receipt"]["deferred"]["agent/garden/orchard"]["proposed"]["desired"]["children"][0]["children"][0]["arguments"][0], "<redacted>");
+    }
 }
