@@ -39,7 +39,7 @@ async fn daemon(root: &Path, name: &str, key: Arc<MemberKey>, anchor: &MemberKey
         &store,
         &format!("daemon/{name}"),
         "daemon.started",
-        json!({"status":"running","features":{"owned_sets":1}}),
+        json!({"status":"running","features":{"owned_sets":1,"owned_set_suspension_guard":1}}),
     );
     let socket = root.join("st3.sock");
     let state = AppState {
@@ -615,7 +615,7 @@ async fn manual_rollout_publishes_with_automatic_member_and_only_moves_on_explic
         &d.store,
         "daemon/amber",
         "daemon.started",
-        json!({"status":"running", "features":{"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1}}),
+        json!({"status":"running", "features":{"owned_sets":1,"owned_set_suspension_guard":1,"seat_rollout":1,"seat_rollout_manual":1}}),
     );
     let runtime = Arc::new(RolloutRuntime::default());
     let reconciler = Reconciler::new(
@@ -1088,4 +1088,48 @@ async fn adoption_diff_reads_existing_unmanaged_definition_and_invalid_actors_ar
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn suspended_apply_guard_daemon_smoke_reports_blocker_and_never_requests_start() {
+    let root = tempfile::tempdir().unwrap();
+    let key = Arc::new(MemberKey::generate());
+    let d = daemon(root.path(), "amber", key.clone(), &key).await;
+    let subject = "agent/garden/orchard";
+    let mut initial = request(&d, 1, bundle("first", false)).await;
+    preview(&d, &mut initial).await;
+    d.client.post::<_, Value>("/v1/sets/apply", &initial).await.unwrap();
+    let token = d.store.selected_desired_token(subject).unwrap().unwrap();
+    let suspend = d.store.append_claim(&ClaimInput {
+        subject: subject.into(), kind: "runtime.action.requested".into(),
+        actor: Some("person/operator".into()),
+        fields: serde_json::from_value(json!({"action":"suspend","reason":"Paused for the winter"})).unwrap(),
+        evidence: vec![token.clone()], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    d.store.append_claim(&ClaimInput {
+        subject: subject.into(), kind: "runtime.action.succeeded".into(),
+        actor: Some("person/operator".into()),
+        fields: serde_json::from_value(json!({"action":"suspend"})).unwrap(),
+        evidence: vec![suspend.id.clone()], expected_subject: None,
+        idempotency_key: Some(st3::suspension::suspend_completed_key(&suspend.id)),
+    }).unwrap();
+    let mut changed = request(&d, 2, bundle("changed", false).replace("command \"true\"", "command \"false\"")).await;
+    let plan = preview(&d, &mut changed).await;
+    assert_eq!(plan.deferred[subject]["reason"], "Paused for the winter");
+    let applied: Value = d.client.post("/v1/sets/apply", &changed).await.unwrap();
+    assert_eq!(applied["set"]["members_status"][0]["rollout"], "deferred");
+    assert_eq!(applied["set"]["members_status"][0]["blocker"]["reason"], "Paused for the winter");
+    let status: Value = d.client.get(&format!("/v1/client/sets/garden?sha={:040x}", 2)).await.unwrap();
+    assert_eq!(status["members_status"][0]["rollout"], "deferred");
+    assert_eq!(status["commit_status"]["satisfied"], false);
+    assert_eq!(status["commit_status"]["running"], false);
+    let reconciler = st3::reconcile::Reconciler::native(
+        d.store.clone(), &root.path().join("amber"), None, Path::new("pty"),
+        "amber".into(), "unused".into(), Arc::new(Notify::new()), watch::channel(0).0, None,
+    ).unwrap();
+    reconciler.reconcile_once().unwrap();
+    assert_eq!(d.store.selected_desired_token(subject).unwrap(), Some(token));
+    assert!(st3::suspension::current(&d.store, subject).unwrap().unwrap().holds_seat());
+    assert!(!d.store.claims_for(subject, Some("runtime.action.requested")).unwrap()
+        .iter().any(|claim| claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("start")));
 }

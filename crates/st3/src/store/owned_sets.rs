@@ -66,6 +66,12 @@ pub struct Revision {
     pub members: BTreeMap<String, Member>,
     pub retired: BTreeMap<String, Member>,
     pub adoptions: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deferred: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub suspension_guard: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub suspension_operations: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -112,6 +118,8 @@ pub struct Preview {
     pub mass_retirement: bool,
     pub empty: bool,
     pub blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deferred: BTreeMap<String, Value>,
     pub noop: bool,
 }
 
@@ -124,6 +132,10 @@ pub struct View {
     pub updated_at: String,
     pub receipt: Revision,
     pub blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deferred: BTreeMap<String, Value>,
+    #[serde(skip)]
+    held_members: BTreeMap<String, Member>,
 }
 
 pub(super) struct Plan {
@@ -133,6 +145,7 @@ pub(super) struct Plan {
     pub adoptions: BTreeMap<String, Vec<String>>,
     bundle_digest: String,
     pub materialize: BTreeSet<String>,
+    suspension_operations: BTreeMap<String, String>,
 }
 
 pub(super) fn manual_member(connection: &Connection, member: &Member) -> Result<bool, St3Error> {
@@ -207,6 +220,8 @@ fn rows(connection: &Connection, at: Option<u64>) -> Result<Vec<View>, St3Error>
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             receipt,
             blockers: Vec::new(),
+            deferred: BTreeMap::new(),
+            held_members: BTreeMap::new(),
         });
     }
     SNAPSHOT_ROWS.with(|slot| {
@@ -317,6 +332,9 @@ pub(super) fn effective_members(
             .iter()
             .map(|(s, m)| (s.clone(), (m.clone(), true, false))),
     );
+    for (subject, member) in &view.held_members {
+        members.insert(subject.clone(), (member.clone(), false, false));
+    }
     Ok(members)
 }
 
@@ -483,6 +501,35 @@ pub(super) fn selected(connection: &Connection, at: Option<u64>) -> Result<Vec<V
         }
         view.blockers.sort();
         view.blockers.dedup();
+        view.deferred.clone_from(&view.receipt.deferred);
+        if view.receipt.suspension_guard && view.blockers.is_empty() {
+            for (subject, (member, retired, _)) in effective_members(connection, view, at)? {
+                if member.kind != "agent" { continue; }
+                let Some((suspension, anchor, reason)) =
+                    publication_suspension_tx(connection, &subject, at).map_err(internal)?
+                else { continue; };
+                if suspension.phase == "failed" { continue; }
+                let anchored: DesiredSubject = serde_json::from_value(anchor.body.clone()).map_err(internal)?;
+                if anchored.kind != "agent" { continue; }
+                let proposed = if retired {
+                    stop_declaration(&subject)?
+                } else {
+                    serde_json::from_value(claim(connection, &member.claim, at)?
+                        .ok_or_else(|| St3Error::new("missing-set-member", subject.clone()))?.body).map_err(internal)?
+                };
+                if presentation_only_change(&anchor.body, &json!(proposed))
+                    || (!suspension.holds_seat()
+                        && view.receipt.suspension_operations.get(&subject) == Some(&suspension.operation_id))
+                { continue; }
+                view.deferred.insert(subject.clone(), json!({"code":"suspended-seat",
+                    "subject":subject,"reason":reason,"suspension":suspension,"proposed":proposed}));
+                view.held_members.insert(subject, Member {
+                    kind: "agent".into(), claim: anchor.id, revision: desired_revision(&anchored),
+                    one_shot: anchored.member.as_ref().is_some_and(|member| member.one_shot),
+                    manual_rollout: crate::rollout::manual(&anchored),
+                });
+            }
+        }
     }
     Ok(winners.into_values().collect())
 }
@@ -670,6 +717,14 @@ pub(super) fn plan_tx(
     }
     let membership = fleet_membership_tx(transaction).map_err(internal)?;
     for member in membership.incarnations().filter(|m| m.end.is_none()) {
+        let guarded: Option<bool> = transaction.query_row(&canonical_sql(
+            "SELECT json_extract(body,'$.fields.features.owned_set_suspension_guard')=1 FROM claims
+             WHERE subject=?1 AND kind='daemon.started' AND origin=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+            params![format!("daemon/{}", member.name), member.name], |row| row.get(0))
+            .optional().map_err(internal)?.flatten();
+        if guarded != Some(true) {
+            blockers.push(format!("host/{} has not advertised owned-set suspension guard support; upgrade before publication", member.name));
+        }
         let supported: Option<bool> = transaction.query_row(&canonical_sql(
             "SELECT json_extract(body,'$.fields.features.owned_sets')=1 FROM claims
              WHERE subject=?1 AND kind='daemon.started' AND origin=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
@@ -922,6 +977,27 @@ pub(super) fn plan_tx(
             retired.insert(s.clone(), retiring_member);
         }
     }
+    // Recheck suspension on the writer's snapshot, not on the client's preview. Keep
+    // the selected member reference while publishing all unaffected members.
+    let mut deferred = BTreeMap::new();
+    let mut suspension_operations = BTreeMap::new();
+    for desired in intent.subjects.values() {
+        if let Some((state, _, _)) = publication_suspension_tx(transaction, &desired.subject, None).map_err(internal)? {
+            suspension_operations.insert(desired.subject.clone(), state.operation_id);
+        }
+        if let Some(blocker) = suspended_change_tx(transaction, desired).map_err(internal)? {
+            deferred.insert(desired.subject.clone(), blocker);
+        }
+    }
+    for subject in deferred.keys() {
+        changes.insert(subject.clone(), "deferred".into());
+        effects.insert(subject.clone(), "suspended; launch change deferred".into());
+        intent.subjects.remove(subject);
+        retired.remove(subject);
+        materialize.remove(subject);
+        let prefix = format!("{subject}:");
+        blockers.retain(|blocker| !blocker.starts_with(&prefix));
+    }
     let retiring = changes
         .values()
         .filter(|v| v.as_str() == "retiring")
@@ -961,6 +1037,7 @@ pub(super) fn plan_tx(
         mass_retirement: mass,
         empty: live.is_empty(),
         blockers,
+        deferred,
         noop,
     };
     Ok(Plan {
@@ -970,6 +1047,7 @@ pub(super) fn plan_tx(
         adoptions,
         bundle_digest,
         materialize,
+        suspension_operations,
     })
 }
 
@@ -1018,6 +1096,19 @@ pub(super) fn commit_tx(
     let mut members = BTreeMap::new();
     let mut retired = plan.retired.clone();
     for (s, change) in &plan.preview.changes {
+        if change == "deferred" {
+            let row = current_desired_row_tx(transaction, s).map_err(internal)?
+                .ok_or_else(|| St3Error::new("missing-set-member", s.clone()))?;
+            let desired: DesiredSubject = serde_json::from_value(
+                claim(transaction, &row.claim_id, None)?.unwrap().body).map_err(internal)?;
+            let prior = Member {
+                kind: desired.kind.clone(), claim: row.claim_id, revision: row.revision,
+                one_shot: desired.member.as_ref().is_some_and(|member| member.one_shot),
+                manual_rollout: crate::rollout::manual(&desired),
+            };
+            members.insert(s.clone(), prior);
+            continue;
+        }
         let member = if s.starts_with("mission/") {
             transaction
                 .query_row(
@@ -1077,6 +1168,9 @@ pub(super) fn commit_tx(
         members,
         retired,
         adoptions: plan.adoptions.clone(),
+        deferred: plan.preview.deferred.clone(),
+        suspension_guard: true,
+        suspension_operations: plan.suspension_operations.clone(),
     };
     let hash = canonical_hash(&revision).map_err(internal)?;
     let predecessors = rows(transaction, None)?

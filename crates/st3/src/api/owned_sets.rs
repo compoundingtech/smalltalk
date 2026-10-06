@@ -61,13 +61,19 @@ pub(super) async fn apply(
         )
         .map_err(ApiError::bad)?;
     signal_changed(&state);
-    Ok(Json(
-        json!({"publication":response,"set":state.store.owned_sets().map_err(ApiError::bad)?.into_iter().find(|v|v.id==sets::subject(&request.options.set).unwrap())}),
-    ))
+    let set = state.store.owned_sets().map_err(ApiError::bad)?.into_iter()
+        .find(|view| view.id == sets::subject(&request.options.set).unwrap())
+        .map(|view| resource(&state, view)).transpose().map_err(ApiError::internal)?;
+    Ok(Json(json!({"publication":response,"set":set})))
 }
 
 fn resource(state: &AppState, view: sets::View) -> anyhow::Result<Value> {
     let mut value = serde_json::to_value(&view)?;
+    for (subject, blocker) in &view.deferred {
+        value["blockers"].as_array_mut().unwrap().push(json!(format!(
+            "{subject}: suspended ({}) — launch change deferred; republish after resume",
+            blocker["reason"].as_str().unwrap_or("no reason provided"))));
+    }
     let mut statuses = Vec::new();
     for (subject, member, retired) in state.store.owned_set_effective_members(&view)? {
         let status = state
@@ -115,7 +121,9 @@ fn resource(state: &AppState, view: sets::View) -> anyhow::Result<Value> {
             .is_some_and(|s| s["mode"] == "manual" && s["phase"] == "pending");
         let verified = operation.as_ref().is_none_or(|o| o.phase == "running");
         let running = actual == Some("running") && launch_current && verified;
-        let phase = if !view.blockers.is_empty() {
+        let phase = if view.deferred.contains_key(&subject) {
+            "deferred"
+        } else if !view.blockers.is_empty() {
             "blocked"
         } else if manual_pending {
             "pending"
@@ -136,6 +144,7 @@ fn resource(state: &AppState, view: sets::View) -> anyhow::Result<Value> {
         };
         statuses.push(json!({"subject":subject,"desired_token":member.claim,"launched_token":launched,"incarnation":incarnation,
             "retired":retired,"launch_current":launch_current,"rollout":phase,"operation":operation,
+            "blocker":view.deferred.get(&subject),
             "rollout_mode":if manual_pending {Some("manual")} else {None},
             "publication_status":if manual_pending {Some("published, rollout pending (manual)")} else {None}}));
     }

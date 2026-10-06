@@ -8265,6 +8265,15 @@ impl Store {
                     }
                 }
                 let intent = owned_plan.as_ref().map_or(intent, |p| &p.intent);
+                if owned_plan.is_none() {
+                    for desired in intent.subjects.values() {
+                        if let Some(blocker) = suspended_change_tx(transaction, desired).map_err(internal)? {
+                            return Err(St3Error::new("suspended-seat",
+                                format!("{}: suspended; launch change refused", desired.subject))
+                                .with_detail("blocker", blocker));
+                        }
+                    }
+                }
                 let expected = owned_plan.as_ref().map_or(expected, |p| &p.preview.expected_subjects);
                 validate_documents(transaction, &intent.document_refs)?;
                 for desired in intent
@@ -18684,6 +18693,87 @@ fn claim_by_id_tx(connection: &Connection, id: &str) -> Result<Option<ClaimRecor
         )
         .optional()
         .map_err(Into::into)
+}
+
+struct SuspensionRead<'a>(&'a Connection, Option<&'a str>, Option<u64>);
+
+impl crate::suspension::SuspensionReader for SuspensionRead<'_> {
+    fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>> {
+        let mut statement = self.0.prepare(&canonical_sql(
+            "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND (?2 IS NULL OR kind=?2) AND store_index<=?3
+             ORDER BY CANONICAL_ASC(claims)"))?;
+        Ok(statement.query_map(params![subject, kind, self.2.unwrap_or(i64::MAX as u64)], claim_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    fn operation_claim(&self, key: &str) -> Result<Option<ClaimRecord>> {
+        Ok(self.0.query_row(
+            "SELECT claims.id,claims.store_index,claims.batch_id,claims.subject,claims.kind,
+             claims.origin,claims.actor,claims.body,claims.predecessors,claims.accepted_at_unix_ms
+             FROM operations JOIN claims ON claims.id=operations.canonical_claim_id
+             WHERE operations.id=?1 AND operations.state='active' AND claims.store_index<=?2",
+            params![operation_id_for_key(key), self.2.unwrap_or(i64::MAX as u64)], claim_from_row).optional()?)
+    }
+    fn selected_desired_kind(&self, subject: &str) -> Result<Option<String>> {
+        if self.1.is_some() { return Ok(Some("agent".into())); }
+        Ok(current_desired_row(self.0, subject)?.map(|row| row.kind))
+    }
+    fn launch_lineage(&self, subject: &str) -> Result<Vec<String>> {
+        if let Some(token) = self.1 { return Ok(vec![token.to_owned()]); }
+        launch_lineage_tx(self.0, subject)
+    }
+    fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
+        Ok(claim_by_id_tx(self.0, id)?.filter(|claim| self.2.is_none_or(|at| claim.store_index <= at)))
+    }
+}
+
+fn publication_suspension_tx(
+    connection: &Connection, subject: &str, at: Option<u64>,
+) -> Result<Option<(crate::suspension::Suspension, ClaimRecord, Option<Value>)>> {
+    use crate::suspension::SuspensionReader;
+    let reader = SuspensionRead(connection, None, at);
+    let request = connection.query_row(&canonical_sql(
+        "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
+         FROM claims WHERE subject=?1 AND kind='runtime.action.requested' AND actor IS NOT NULL
+         AND json_extract(body,'$.fields.action') IN ('suspend','resume') AND store_index<=?2
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+        params![subject, at.unwrap_or(i64::MAX as u64)], claim_from_row).optional()?;
+    let Some(request) = request else { return Ok(None); };
+    let reason = if request.body.pointer("/fields/action").and_then(Value::as_str) == Some("suspend") {
+        request.body.pointer("/fields/reason").cloned()
+    } else {
+        let Some(id) = request.body.pointer("/evidence/1").and_then(Value::as_str) else { return Ok(None); };
+        let Some(suspend) = reader.claim_by_id(id)? else { return Ok(None); };
+        suspend.body.pointer("/fields/reason").cloned()
+    };
+    let Some(token) = request.body.pointer("/evidence/0").and_then(Value::as_str) else { return Ok(None); };
+    let Some(anchor) = reader.claim_by_id(token)? else { return Ok(None); };
+    let Some(state) = crate::suspension::current_from(&SuspensionRead(connection, Some(token), at), subject)?
+    else { return Ok(None); };
+    Ok(Some((state, anchor, reason)))
+}
+
+fn suspended_change_tx(connection: &Connection, desired: &DesiredSubject) -> Result<Option<Value>> {
+    let Some(previous) = current_desired_row(connection, &desired.subject)? else {
+        return Ok(None);
+    };
+    let Some(claim) = claim_by_id_tx(connection, &previous.claim_id)? else {
+        return Ok(None);
+    };
+    let proposed = serde_json::to_value(desired)?;
+    if claim.body == proposed || presentation_only_change(&claim.body, &proposed)
+    {
+        return Ok(None);
+    }
+    let Some(suspension) = crate::suspension::current_from(&SuspensionRead(connection, None, None), &desired.subject)?
+        .filter(crate::suspension::Suspension::holds_seat) else {
+        return Ok(None);
+    };
+    let request = claim_by_id_tx(connection, suspension.suspend_operation_id.as_deref()
+        .unwrap_or(&suspension.operation_id))?;
+    let reason = request.as_ref().and_then(|claim| claim.body.pointer("/fields/reason"));
+    Ok(Some(json!({"code":"suspended-seat","subject":desired.subject,
+        "reason":reason,"suspension":suspension,"proposed":desired})))
 }
 
 fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<String>> {
@@ -49164,6 +49254,16 @@ fn append_claim_with_subject_fences(
             }
             if let Some((operation_id, request_digest)) = &operation {
                 checkpointed_operation_outcome(transaction, operation_id, request_digest)?;
+            }
+            if input.kind == "runtime.action.requested"
+                && input.fields.get("action").and_then(Value::as_str) == Some("suspend")
+                && input.actor.is_some()
+            {
+                let lineage = launch_lineage_tx(transaction, &input.subject).map_err(internal)?;
+                if !input.evidence.first().is_some_and(|token| lineage.contains(token)) {
+                    return Err(St3Error::new("stale-fence",
+                        "the seat launch changed before suspension publication"));
+                }
             }
             if let Some(expected_subjects) = expected_subjects {
                 for (subject, expected) in expected_subjects {

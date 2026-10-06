@@ -76,9 +76,13 @@ resume:  restoring -> verifying   -> resumed
 move:    fencing-source -> transferring -> restoring -> verifying -> resumed        (failed: back to suspended, with a code)
 ```
 
-A suspension belongs to the launch it was taken under. Stopping the seat, or applying a
-declaration that changes how it launches, ends the suspension, and the next start follows the
-usual rules. A label change does not end it.
+A suspension belongs to the launch it was taken under. Ordinary apply refuses launch-changing
+declarations while that suspension holds; owned-set publication defers only the affected seat,
+with its reason and proposed declaration visible in preview and set status. Byte-identical and
+label-only publication preserve the hold. Resume still verifies the original native session;
+deferred intent remains pending until a new owned-set publication after successful resume.
+See [owned sets](owned-sets.md#suspended-seats). Stop and retirement declarations are guarded too;
+they are not an implicit substitute for ending a suspension.
 
 ## Cross-host continuation
 

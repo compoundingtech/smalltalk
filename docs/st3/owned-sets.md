@@ -80,6 +80,47 @@ can include environment values and embedded mission declarations. It returns 404
 definition and rejects unsupported subject kinds or an oversized response without truncation.
 The existing redacted agent `subject.definition` operation remains available.
 
+## Suspended seats
+
+Publication rechecks suspension within the writer transaction. A launch-changing update or
+omission of a suspended seat is deferred for **that seat only**: its previous declaration and
+ownership remain selected, and the rest of the set publishes. Byte-identical and label-only
+updates publish normally without ending the hold. A suspend accepted after preview is included
+in this check; a suspend using a launch token superseded by publication fails `stale-fence`.
+Guarded receipts also capture `suspension_operations[subject]`, the latest suspension operation
+known to the publisher. Member selection rechecks those fences on each daemon: a suspension
+accepted on a peer before a concurrent publication arrives retains its original declaration,
+even if the publisher had not replicated the suspension yet. Other members remain selected.
+An incompatible declaration stays pending after resume until a publication acknowledges that
+resume operation, so delayed replication cannot silently release the deferred launch.
+
+Preview exposes `deferred[subject]` and classifies the member change as `deferred`. The additive
+blocker has `code: "suspended-seat"`, `subject`, the original suspension `reason` (nullable),
+`suspension` phase/operation details, and `proposed`, the normalized proposed declaration.
+Applied receipts retain locally observed deferrals at `receipt.deferred`; set readback merges
+replication-race deferrals into top-level `deferred`, includes human-readable `blockers`, and
+reports member status `rollout: "deferred"` with that `blocker`. Commit status cannot
+report `satisfied` or `running` while these entries remain. CLI apply prints the partial publication
+then exits nonzero, so automation must inspect readback instead of treating it as an atomic failure.
+Dry-run also exits nonzero for deferrals. Ordinary unowned apply refuses launch changes with
+`suspended-seat` and the blocker detail.
+
+Resume continues the **previous** launch through the existing verified native-session protocol.
+It does not automatically publish a deferred declaration: the receipt clearly remains pending.
+After successful resume, publish the desired bundle with a new source sequence and exact current
+set revision. Replaying the same request/sequence remains idempotent, including its deferral.
+Stop and retirement declarations are not suspension and are guarded while the hold is active;
+automation cannot use set omission to end a hold. No authored suspended desired-state field
+is introduced.
+
+The receipt fields are additive. Existing unguarded receipt hashes remain unchanged; new
+receipts carry `suspension_guard: true` and optional operation/deferral maps. Older builds reject
+guarded receipt hashes instead of projecting their members. New publishers require every active
+fleet daemon to advertise `features.owned_set_suspension_guard: 1`; upgrade all publishers and
+readers before publication. An old publisher still lacks the guard. Guard-aware builds use new
+shared projection layout and checkpoint rules identities; unlike builds exchange claim authority
+without comparing incompatible projection proofs.
+
 ## Retirement
 
 Omitting a seat declares a stop while keeping its conversations and history. Omitting a mission
@@ -126,7 +167,8 @@ of a higher sequence. This protocol provides convergence after healing; it does 
 exclusive leadership during a partition. Keep the existing serial applier.
 
 Before activating owned sets, upgrade every active fleet member. Publication refuses activation
-unless each admitted member's latest own `daemon.started` advertises `features.owned_sets=1`.
+unless each admitted member's latest own `daemon.started` advertises both `features.owned_sets=1`
+and `features.owned_set_suspension_guard=1`.
 Ordinary publication and existing clients remain usable during the upgrade. An older daemon must
 not be introduced into a fleet after set activation.
 
