@@ -31,6 +31,7 @@ export type Agent = ResourceHeader & {
   active_work_count?: number;
   ask?: string | null;
   blocked_on?: string | null;
+  checkout?: (AgentCheckout | null);
   current_session_id?: string | null;
   current_work?: Array<WorkLabel>;
   current_work_ids?: Array<StepRunId>;
@@ -67,6 +68,13 @@ export type Agent = ResourceHeader & {
   upcoming_work?: Array<WorkLabel>;
   upcoming_work_ids?: Array<Id>;
   usage?: (UsageSummary | null);
+  workspace?: string | null;
+};
+
+export type AgentCheckout = {
+  base: string;
+  branch: string;
+  repository: string;
 };
 
 export type AgentCreateParameters = {

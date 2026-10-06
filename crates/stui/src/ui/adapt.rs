@@ -628,7 +628,7 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                 harness: harness(agent.driver.as_deref()),
                 state,
                 host,
-                worktree: None,
+                worktree: agent.checkout.as_ref().map(st3_client::checkout_label),
                 mission: work.map(|work| work.mission_id.clone()),
                 step: work.map(|work| work.path.clone()),
                 activity: age(&agent.header.updated_at),
@@ -1812,6 +1812,7 @@ mod tests {
             "updated_at": "2026-09-29T09:59:00Z", "name": "fleet/harbor/keeper",
             "state": "running", "reachability": "local", "harness_state": "working",
             "host_id": "host/lighthouse", "runtime_ids": ["runtime/keeper"],
+            "checkout": {"repository":"/srv/example/atlas", "base":"origin/main", "branch":"keeper"},
             "current_work_ids": ["step-run/audit-1/scan"],
             "next_work_id": "step-run/audit-1/report",
             "upcoming_work_ids": ["step-run/audit-1/report"], "queued_work_count": 1,
@@ -1828,6 +1829,10 @@ mod tests {
         };
         let agent = &agents[0];
         assert_eq!(agent.host, "lighthouse");
+        assert_eq!(
+            agent.worktree.as_deref(),
+            Some("worktree · branch keeper · /srv/example/atlas")
+        );
         assert!(agent.terminal);
         assert_eq!(agent.mission.as_deref(), Some("mission/fleet/harbor/audit"));
         assert_eq!(agent.step.as_deref(), Some("scan"));

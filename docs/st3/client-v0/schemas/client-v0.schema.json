@@ -1045,11 +1045,14 @@
             "subagents": { "type": "array", "items": { "$ref": "#/$defs/AgentSubagent" }, "description": "The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field." },
             "handoff": {"oneOf": [{"$ref": "#/$defs/AgentHandoff"}, {"type": "null"}], "description": "Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes."},
             "rollout": { "type": ["object", "null"], "description": "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." },
+            "workspace": { "type": ["string", "null"], "description": "The declared workspace on the owning host." },
+            "checkout": { "oneOf": [{ "$ref": "#/$defs/AgentCheckout" }, { "type": "null" }], "description": "The requested Git worktree repository, base and branch. Present before launch; it does not assert that checkout succeeded." },
             "suspension": { "oneOf": [{ "$ref": "#/$defs/AgentSuspension" }, { "type": "null" }], "description": "The seat's latest suspend or resume and its phase. An older daemon omits the field." }
           }
         }
       ]
     },
+    "AgentCheckout": { "type": "object", "additionalProperties": false, "required": ["repository", "base", "branch"], "properties": { "repository": { "type": "string" }, "base": { "type": "string" }, "branch": { "type": "string" } } },
     "AgentTodo": {
       "type": "object",
       "additionalProperties": false,

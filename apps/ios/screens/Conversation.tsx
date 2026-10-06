@@ -6,6 +6,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
+import { checkoutLabel } from '../launcher';
 import { agentGlyph, agentModel, agentName, agentState, agentWord, harnessColor, harnessName, loginGuidance } from '../agentsView';
 import { Banners } from '../chrome';
 import rules from '../../../fixtures/clients/conversation-style.json';
@@ -375,6 +376,7 @@ function AgentStrip({ agent, onMission }: { agent: NonNullable<ReturnType<typeof
       <T color={harnessColor(harness)}>{harness}</T><T dim>{agentModel(agent) ? ` · ${agentModel(agent)}` : ''} · {agent.host_id?.replace(/^host\//, '') ?? '?'}</T>
     </View>
     <T dim numberOfLines={1}>{agent.id}</T>
+    {agent.checkout ? <T soft>{checkoutLabel(agent.checkout)}</T> : null}
     {state === 'needs-login' ? <T color={theme.person}>⚿ {loginGuidance(agent)}</T> : null}
     {work ? <Pressable onPress={() => onMission(work.mission_id, work.title || work.path)}><T numberOfLines={1}><T dim>mission </T><T color={theme.accent}>{work.mission_id.replace(/^mission\//, '')} › {work.path}</T></T></Pressable> : null}
   </View>;

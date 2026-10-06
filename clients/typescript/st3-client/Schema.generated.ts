@@ -496,6 +496,14 @@ export const ActorRef = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:agent|da
 export type ActorRef = typeof ActorRef.Type
 export type ActorRefEncoded = typeof ActorRef.Encoded
 
+export const AgentCheckout = /*#__PURE__*/ (() => Schema.Struct({
+  "base": Schema.String,
+  "branch": Schema.String,
+  "repository": Schema.String
+}).annotate({ identifier: "AgentCheckout" }))()
+export type AgentCheckout = typeof AgentCheckout.Type
+export type AgentCheckoutEncoded = typeof AgentCheckout.Encoded
+
 export const AgentDelivery = /*#__PURE__*/ (() => Schema.Struct({
   "polled_seconds_ago": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
   "reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -707,6 +715,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "ask": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." }),
   /** Current incarnation's harness blocking axis; human means a person must answer before it continues. */
   "blocked_on": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Current incarnation's harness blocking axis; human means a person must answer before it continues." }),
+  /** The requested Git worktree repository, base and branch. Present before launch; it does not assert that checkout succeeded. */
+  "checkout": Schema.OptionFromOptionalNullOr(AgentCheckout, NULL_NONE).annotate({ description: "The requested Git worktree repository, base and branch. Present before launch; it does not assert that checkout succeeded." }),
   "current_session_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   /** current_work_ids named for display, in the same order. */
   "current_work": optionalKey(Schema.Array(WorkLabel)).annotate({ description: "current_work_ids named for display, in the same order." }),
@@ -756,7 +766,9 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "upcoming_work": optionalKey(Schema.Array(WorkLabel)),
   "upcoming_work_ids": optionalKey(Schema.Array(Id)),
   "updated_at": Timestamp,
-  "usage": Schema.OptionFromOptionalNullOr(UsageSummary, NULL_NONE)
+  "usage": Schema.OptionFromOptionalNullOr(UsageSummary, NULL_NONE),
+  /** The declared workspace on the owning host. */
+  "workspace": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "The declared workspace on the owning host." })
 }).annotate({ identifier: "Agent" }))()
 export type Agent = typeof Agent.Type
 export type AgentEncoded = typeof Agent.Encoded

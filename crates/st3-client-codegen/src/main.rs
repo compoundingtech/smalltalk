@@ -632,6 +632,7 @@ fn validate_surfaces(
         "StatusHistory",
         "StatusTransition",
         "AgentRepository",
+        "AgentCheckout",
         "HostRepositories",
         "CanonicalNode",
         "SubjectDefinition",
