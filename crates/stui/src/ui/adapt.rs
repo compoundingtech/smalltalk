@@ -1108,6 +1108,32 @@ mod tests {
     }
 
     #[test]
+    fn a_delivery_by_the_current_channel_plugin_leaves_no_empty_shell_behind() {
+        // Nathan, 2026-10-05: "I see xml in stui tonight": plugin:st-channel:st was not a name
+        // the delivery recognised, so its envelope was taken out and `<channel …></channel>` stayed.
+        let delivery = "<channel source=\"plugin:st-channel:st\" from=\"person/example\" messageId=\"message/c4\" threadId=\"message/c4\" identity=\"fleet/example/quay\">\n<smalltalk-message id=\"c4\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/c4\">\nhow is it going?\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session.\n</channel>";
+        let shown = BTreeSet::from(["message/c4".to_owned()]);
+        let bodies = from_harness(true, delivery, &shown);
+        assert!(bodies.is_empty(), "{bodies:?}");
+        let bodies = from_harness(true, delivery, &BTreeSet::new());
+        assert!(
+            matches!(&bodies[..], [Body::Mail { body, .. }] if body == "how is it going?"),
+            "{bodies:?}"
+        );
+        // Every name the plugin has had, and no other, is st's.
+        for source in [
+            "plugin:st-channel:st",
+            "plugin:st3-channel:st3",
+            "plugin:st2-channel:st2",
+        ] {
+            assert!(st3_conversation_ui::adapt::channel_source(source), "{source}");
+        }
+        for source in ["plugin:slack-channel:slack", "plugin:st-channel", "st-channel:st", ""] {
+            assert!(!st3_conversation_ui::adapt::channel_source(source), "{source}");
+        }
+    }
+
+    #[test]
     fn the_persons_mail_says_when_the_agent_has_it_and_its_delivery_is_not_a_line() {
         let timeline: Vec<TimelineEntry> = serde_json::from_value(json!([
             {"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,

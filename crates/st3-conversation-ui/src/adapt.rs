@@ -660,12 +660,8 @@ fn take_deliveries(text: &mut String, tag: &str) -> Vec<(String, String)> {
                         .is_some_and(|id| attribute(head, "graph") == Some(format!("message/{id}")))
             }
             "channel" => {
-                attribute(head, "source").is_some_and(|source| {
-                    matches!(
-                        source.as_str(),
-                        "plugin:st3-channel:st3" | "plugin:st2-channel:st2"
-                    )
-                }) && attribute(head, "from").is_some()
+                attribute(head, "source").is_some_and(|source| channel_source(&source))
+                    && attribute(head, "from").is_some()
             }
             _ => false,
         };
@@ -692,6 +688,19 @@ fn take_deliveries(text: &mut String, tag: &str) -> Vec<(String, String)> {
         text.replace_range(start..end, "");
     }
     found
+}
+
+/// Whether a `<channel source=…>` is st's own plugin, under any of the names it has had:
+/// `plugin:st-channel:st` now, `st3-channel:st3` and `st2-channel:st2` before. Only the name
+/// changes; an unrecognised one would leave an empty `<channel>` shell on screen after its
+/// message was taken out (Nathan, 2026-10-05).
+pub fn channel_source(source: &str) -> bool {
+    source
+        .strip_prefix("plugin:")
+        .and_then(|name| name.split_once("-channel:"))
+        .is_some_and(|(left, right)| {
+            matches!(left, "st" | "st2" | "st3") && matches!(right, "st" | "st2" | "st3")
+        })
 }
 
 /// Claude's skill expansion starts with its base directory, whose basename is the skill name.
