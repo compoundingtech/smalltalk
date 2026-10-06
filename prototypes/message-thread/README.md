@@ -51,6 +51,27 @@ before using the order-equivalent key. If a mixed batch is possible, use an
 indexed exact rank source or keep the projection unready until it is repaired;
 never silently publish this model's key for that batch.
 
+`mixed_rank_oracle.py` is the follow-up exact-rank model. It puts recorded and
+legacy assignments in separate indexed head lanes for each child. The recorded
+head uses the minimum replica-record position; the legacy head uses the newest
+store index. A 63-level per-batch count trie computes the legacy head's current
+COUNT rank using indexed point seeks, so the two heads can be compared by the
+same canonical tuple. The independent slow COUNT fold stays outside writer
+measurements. Its fixture first proves the preceding `store_index` shortcut
+returns the wrong parent, then checks the two-lane answer under record identity
+and position changes, repaired state, a claim store-index move, insertion of
+an earlier unrelated claim, and deletion. `--growth` builds 1,000/10,000
+mixed children and counts deletion VM steps with full-fold spot checks after
+measurement.
+
+The current affected-key enumerator intentionally revisits **all** message
+children in a changed batch. It is complete but unbounded; one unrelated
+predecessor deletion can actually flip every child's selected parent in the
+invented cohort. This is a failing writer-cost design row, not a production
+solution. The rank trie also copies 63 count nodes per insert/delete and needs
+real-schema transaction, durability, replay, and byte-cost proof. No shared
+Store or API method uses this model.
+
 Before production integration, use current-main `store.rs` schema near
 `message_reply_edges`, its open/backfill path and runtime projection hook;
 classify the new table as a rebuildable local cache in canonical audit.
