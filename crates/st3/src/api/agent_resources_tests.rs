@@ -526,3 +526,24 @@ fn handoff_beyond_queue_preview_refreshes_initial_assignee_total() {
     assert_eq!(card(&after, "agent/node.birch")["next_work_id"], omitted.subject);
     assert_eq!(store.agent_resources_full_fills(), fills);
 }
+
+#[test]
+fn message_reference_to_absent_agent_does_not_create_history_card() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let store = &state.store;
+    declare(store, &["amber"]);
+    check_both_histories(store);
+    let fills = store.agent_resources_full_fills();
+    append(store, "message/absent-recipient", "message.sent", json!({
+        "from": "agent/node.amber", "to": "agent/absent",
+        "status": "sent", "content": "A party reference is not an agent observation."
+    }));
+    for history in [false, true] {
+        let cards = checked_cards(store, history);
+        assert_eq!(cards.iter().map(|card| card["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["agent/node.amber"]);
+        assert!(card(&cards, "agent/node.amber")["last_activity_at"].is_string());
+        assert!(cards.iter().all(|card| card["id"] != "agent/absent"));
+    }
+    assert_eq!(store.agent_resources_full_fills(), fills);
+}

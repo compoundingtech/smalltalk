@@ -287,6 +287,19 @@ impl Store {
             }
             return Ok(None);
         }
+        // A party or assignment is a reference, not a seat declaration. Full roster
+        // discovery visits claim subjects, so never create phantom historical cards.
+        let mut known = connection.prepare_cached(
+            "SELECT 1 FROM claims WHERE subject=?1 AND store_index<=?2 LIMIT 1",
+        )?;
+        for subject in std::mem::take(&mut changes.subjects) {
+            if previous.rows.contains_key(&subject)
+                || known.query_row(params![subject, through], |_| Ok(()))
+                    .optional()?.is_some()
+            {
+                changes.subjects.insert(subject);
+            }
+        }
         Ok(Some(changes))
     }
 
