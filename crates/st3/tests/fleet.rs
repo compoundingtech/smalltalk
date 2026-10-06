@@ -472,14 +472,22 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
+    assert!(wait_until_result(seconds, &mut check).await, "timed out waiting until {what}");
+}
+
+async fn wait_until_result<F, Fut>(seconds: u64, mut check: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let deadline = Instant::now() + Duration::from_secs(seconds);
     while Instant::now() < deadline {
         if check().await {
-            return;
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    panic!("timed out waiting until {what}");
+    false
 }
 
 async fn wait_for_notes(node: &Node, expected: &BTreeSet<String>, seconds: u64, nodes: &[&Node]) {
@@ -3875,10 +3883,79 @@ async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_convers
     let transcript = st3::native_resume::pi_family_transcript(&source_sessions, &native).unwrap();
     let before = fs::read(&transcript).unwrap();
     assert!(String::from_utf8_lossy(&before).contains("Remember the copper orchard"));
-    wait_until("suspension replicates to target", 60, || async {
+    let suspension_replicated = wait_until_result(60, || async {
         jade.st_json(&["agents", "show", seat])["value"]["suspension"]["phase"] == "suspended"
     })
     .await;
+    if !suspension_replicated {
+        // Diagnose only after the original deadline. Each live read is bounded and attempted
+        // once, then freeze the isolated nodes before examining the exact operation leaves.
+        eprintln!("source suspension receipt: {suspended}");
+        for node in [&amber, &jade] {
+            for route in [format!("/v1/client/agents/{seat}"), "/v1/replication/status".into()] {
+                let client = node.client();
+                let answer = tokio::time::timeout(Duration::from_secs(3), client.get::<Value>(&route)).await;
+                eprintln!("{} {route}: {answer:?}", node.name);
+            }
+            eprintln!("{}", node.logs());
+        }
+        amber.stop();
+        jade.stop();
+        let request = suspended["suspension"]["operation_id"].as_str().unwrap().to_owned();
+        let completion_key = format!("agent-suspend-completed:{request}");
+        let source_path = amber.state_dir().join("claims.sqlite3");
+        let target_path = jade.state_dir().join("claims.sqlite3");
+        let leaves = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            use rusqlite::OptionalExtension as _;
+            // Capture the original rows read-only before Store::open can run startup
+            // projection initialization. The later Store views are supplemental evidence.
+            let completion_operation = smallclaims::store::operation_id_for_key(&completion_key);
+            let read_only = |path: &Path| {
+                let connection = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                connection.busy_timeout(Duration::from_secs(1))?;
+                Ok::<_, rusqlite::Error>(connection)
+            };
+            let source_rows = read_only(&source_path)?;
+            let completion_id = source_rows.query_row(
+                "SELECT canonical_claim_id FROM operations WHERE id=?1 AND state='active'",
+                [&completion_operation], |row| row.get::<_, String>(0),
+            ).optional()?;
+            for (name, path) in [("source", &source_path), ("target", &target_path)] {
+                let rows = read_only(path)?;
+                eprintln!("{name} original operation row: {:?}", rows.query_row(
+                    "SELECT json_object('id',id,'canonical_claim_id',canonical_claim_id,'state',state) FROM operations WHERE id=?1",
+                    [&completion_operation], |row| row.get::<_, String>(0),
+                ).optional());
+                eprintln!("{name} original selected declaration: {:?}", rows.query_row(
+                    "SELECT json_object('kind',kind,'revision',revision,'claim_id',claim_id,'body',body) FROM desired WHERE subject=?1",
+                    [seat], |row| row.get::<_, String>(0),
+                ).optional());
+                for id in std::iter::once(&request).chain(completion_id.iter()) {
+                    eprintln!("{name} original raw claim {id}: {:?}", rows.query_row(
+                        "SELECT json_object('id',id,'kind',kind,'body',body,'predecessors',predecessors,'accepted_at_unix_ms',accepted_at_unix_ms) FROM claims WHERE id=?1",
+                        [id], |row| row.get::<_, String>(0),
+                    ).optional());
+                }
+            }
+            let source = st3::store::Store::open(&source_path, "fixture-diagnostic")?;
+            let target = st3::store::Store::open(&target_path, "fixture-diagnostic")?;
+            let completed = source.operation_claim(&completion_key)?;
+            eprintln!("source completion after diagnostic Store::open: {completed:?}");
+            for (name, store) in [("source", &source), ("target", &target)] {
+                eprintln!("{name} request: {:?}", store.claim_by_id(&request));
+                eprintln!("{name} projected completion: {:?}", store.operation_claim(&completion_key));
+                if let Some(completed) = &completed {
+                    eprintln!("{name} raw completion: {:?}", store.claim_by_id(&completed.id));
+                }
+                eprintln!("{name} desired kind: {:?}", store.selected_desired_kind(seat));
+                eprintln!("{name} launch lineage: {:?}", store.launch_lineage(seat));
+                eprintln!("{name} selected suspension: {:?}", st3::suspension::current(store, seat));
+            }
+            Ok(())
+        });
+        eprintln!("operation leaf diagnostics: {:?}", tokio::time::timeout(Duration::from_secs(3), leaves).await);
+        panic!("timed out waiting until suspension replicates to target");
+    }
     // Both daemons share this test's filesystem. An existing path represents an occupied target,
     // and must refuse even when it happens to be the source's checkout.
     let occupied = jade.st(&[

@@ -81,6 +81,23 @@ with tempfile.TemporaryDirectory() as temporary:
     exists = subprocess.run(['nix', 'path-info', uncached], capture_output=True)
     assert exists.returncode != 0, 'cache verification unexpectedly built an uncached output'
 
+    # Preserve real Nix failure diagnostics and status without turning tee into a pass
+    # or retaining the successful proof from the previous attempt.
+    flake.write_text(flake.read_text().replace(
+        'echo example-check > $out', 'echo fixture-node-diagnostic >&2; exit 7'))
+    log = root / 'nix-release-build.log'
+    failed = subprocess.run(
+        ['bash', '-o', 'pipefail', '-c', '"$1" build 2>&1 | tee "$2"',
+         'nix-failure-fixture', str(script), str(log)],
+        cwd=fixture, env=env, capture_output=True, text=True)
+    assert failed.returncode != 0, failed
+    assert 'fixture-node-diagnostic' in log.read_text(), log.read_text()
+    attempt = json.loads((root / 'nix-release-attempt.json').read_text())
+    assert attempt['status'] == 'failed' and attempt['exit_code'] != 0, attempt
+    assert attempt['source'] == report['source'] and len(attempt['targets']) == 7, attempt
+    assert attempt['missing_before_build'], attempt
+    assert not (root / 'nix-release-build.json').exists(), 'failed build retained a stale success proof'
+
     env.pop('CI_LOCAL_CARGO_HOME')
     no_cache = subprocess.run([str(script), 'build'], cwd=fixture, env=env, capture_output=True)
     assert no_cache.returncode != 0 and b'persistent' in no_cache.stderr, no_cache

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 
 def output(*args):
@@ -25,7 +26,10 @@ def main():
     source = output('git', 'rev-parse', 'HEAD')
 
     if sys.argv[1] == 'build':
+        # Never leave a previous successful proof attached to a failed attempt.
+        report.unlink(missing_ok=True)
         system = output('nix', 'eval', '--impure', '--raw', '--expr', 'builtins.currentSystem')
+        print(f'Nix release source: {source}; system: {system}.', flush=True)
         checks = json.loads(output('nix', 'eval', '--json', '--no-update-lock-file',
                                    f'.#checks.{system}', '--apply', 'builtins.attrNames'))
         if not checks:
@@ -70,9 +74,23 @@ def main():
         # temporary directory disappear. Each runner retains its latest successful outputs.
         roots = Path(cache_home) / 'smalltalk-nix-release'
         roots.mkdir(exist_ok=True)
-        results = json.loads(output('nix', 'build', '--no-update-lock-file', '--json',
-                                    '--print-build-logs', '--cores', '4', '--max-jobs', '1',
-                                    '--out-link', str(roots / 'result'), *targets))
+        attempt_report = report.with_name('nix-release-attempt.json')
+        attempt = {'source': source, 'system': system, 'targets': targets,
+                   'cached_before_build': sorted(cached), 'missing_before_build': sorted(missing),
+                   'unresolved_outputs': unknown, 'status': 'building'}
+        attempt_report.write_text(json.dumps(attempt, indent=2) + '\n')
+        started = time.monotonic()
+        try:
+            results = json.loads(output('nix', 'build', '--no-update-lock-file', '--json',
+                                        '--print-build-logs', '--cores', '4', '--max-jobs', '1',
+                                        '--out-link', str(roots / 'result'), *targets))
+        except subprocess.CalledProcessError as error:
+            attempt.update(status='failed', exit_code=error.returncode,
+                           build_seconds=time.monotonic() - started)
+            attempt_report.write_text(json.dumps(attempt, indent=2) + '\n')
+            raise
+        attempt.update(status='succeeded', build_seconds=time.monotonic() - started)
+        attempt_report.write_text(json.dumps(attempt, indent=2) + '\n')
         report.write_text(json.dumps({'source': source, 'system': system,
                                       'targets': targets, 'results': results}, indent=2) + '\n')
         message = f'Built the {system} package and all {len(checks)} checks at {source}.'
