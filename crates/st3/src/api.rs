@@ -4030,13 +4030,17 @@ fn remote_unavailable(host: &str) -> ApiError {
 
 /// A known dial-out owner syncs outward but has no inbound owner transport.
 fn remote_unavailable_for_owner(state: &AppState, host: &str) -> ApiError {
-    let dial_out = host.strip_prefix("host/").is_some_and(|name| {
-        state.store.fleet_view_sealed().is_ok_and(|view| {
-            view.members.iter().any(|member| {
-                member.name == name && member.state == "current" && member.mode == "dial-out"
+    let dial_out = if let Some(relay) = &state.client_relay {
+        relay.is_dial_out_owner(host)
+    } else {
+        host.strip_prefix("host/").is_some_and(|name| {
+            state.store.fleet_view_sealed().is_ok_and(|view| {
+                view.members.iter().any(|member| {
+                    member.name == name && member.state == "current" && member.mode == "dial-out"
+                })
             })
         })
-    });
+    };
     if dial_out {
         remote_read_error(
             host,

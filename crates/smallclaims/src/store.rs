@@ -3028,10 +3028,12 @@ pub const REPLICATION_SYNC_STALE_MS: u128 = 300_000;
 /// A peer counts as up for this long after its last exchange in either direction.
 pub const PEER_UP_MS: u128 = 90_000;
 
-/// Replicated up observations stop supporting routes after 90 seconds without a live exchange.
-pub const TRANSPORT_LINK_MAX_AGE_MS: u128 = 90_000;
-/// Successful exchanges refresh an unchanged up observation at most once every 30 seconds.
-pub const TRANSPORT_LINK_REFRESH_MS: u128 = 30_000;
+/// Nominal lifetime of replicated up evidence, with room for quiet sync and relay delays.
+pub const TRANSPORT_LINK_MAX_AGE_MS: u128 = 2 * 60 * 60 * 1_000;
+/// Refresh a stable up at most once per 15 minutes: at most 96 claims per directed link/day.
+pub const TRANSPORT_LINK_REFRESH_MS: u128 = 15 * 60 * 1_000;
+/// Allow bounded observer/reader clock skew; farther-future evidence is unusable.
+pub const TRANSPORT_LINK_CLOCK_SKEW_MS: u128 = 5 * 60 * 1_000;
 
 /// Healthy peers exchange at least once per 30-second quiet interval. Once this long has passed
 /// since the last exchange and an attempt since then failed, the peer is not up: it missed an
@@ -6221,8 +6223,11 @@ impl Store {
                 let observed_at = last_success_at
                     .map(u128::from)
                     .or_else(|| accepted_at.parse().ok());
-                if observed_at.is_some_and(|at| now.saturating_sub(at) < TRANSPORT_LINK_MAX_AGE_MS)
-                    && !dial_out(&observer)
+                if observed_at.is_some_and(|at| {
+                    at <= now.saturating_add(TRANSPORT_LINK_CLOCK_SKEW_MS)
+                        && now.saturating_sub(at)
+                            < TRANSPORT_LINK_MAX_AGE_MS + TRANSPORT_LINK_CLOCK_SKEW_MS
+                }) && !dial_out(&observer)
                     && !dial_out(observed)
                 {
                     links.push((observer, observed.to_owned()));
@@ -6271,8 +6276,10 @@ impl Store {
                 .or_else(|| accepted_at.parse().ok());
             body.pointer("/fields/status").and_then(Value::as_str) == Some(status)
                 && (status != "up"
-                    || observed_at
-                        .is_some_and(|at| now.saturating_sub(at) < TRANSPORT_LINK_REFRESH_MS))
+                    || observed_at.is_some_and(|at| {
+                        at <= now.saturating_add(TRANSPORT_LINK_CLOCK_SKEW_MS)
+                            && now.saturating_sub(at) < TRANSPORT_LINK_REFRESH_MS
+                    }))
         });
         if already_current {
             return Ok(());

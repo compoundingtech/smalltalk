@@ -23636,7 +23636,7 @@ mod fleet_admission_tests {
 
     #[test]
     fn transport_link_expiry_uses_original_success_and_latest_status() {
-        use smallclaims::store::TRANSPORT_LINK_MAX_AGE_MS;
+        use smallclaims::store::{TRANSPORT_LINK_CLOCK_SKEW_MS, TRANSPORT_LINK_MAX_AGE_MS};
         let observer = node("cedar", None, None);
         let receiver = node("birch", None, None);
         let success = 1_000_000_u128;
@@ -23647,13 +23647,17 @@ mod fleet_admission_tests {
         let expected = vec![("cedar".into(), "elm".into())];
         assert_eq!(
             receiver
-                .transport_links_at(success + TRANSPORT_LINK_MAX_AGE_MS - 1)
+                .transport_links_at(
+                    success + TRANSPORT_LINK_MAX_AGE_MS + TRANSPORT_LINK_CLOCK_SKEW_MS - 1
+                )
                 .unwrap(),
             expected
         );
         assert!(
             receiver
-                .transport_links_at(success + TRANSPORT_LINK_MAX_AGE_MS)
+                .transport_links_at(
+                    success + TRANSPORT_LINK_MAX_AGE_MS + TRANSPORT_LINK_CLOCK_SKEW_MS
+                )
                 .unwrap()
                 .is_empty()
         );
@@ -23696,7 +23700,7 @@ mod fleet_admission_tests {
 
     #[test]
     fn legacy_transport_links_expire_and_another_observer_cannot_suppress_refresh() {
-        use smallclaims::store::TRANSPORT_LINK_MAX_AGE_MS;
+        use smallclaims::store::{TRANSPORT_LINK_CLOCK_SKEW_MS, TRANSPORT_LINK_MAX_AGE_MS};
         let observer = node("cedar", None, None);
         let receiver = node("birch", None, None);
         let claim = append(
@@ -23709,13 +23713,17 @@ mod fleet_admission_tests {
         sync(&observer, &receiver);
         assert_eq!(
             receiver
-                .transport_links_at(accepted + TRANSPORT_LINK_MAX_AGE_MS - 1)
+                .transport_links_at(
+                    accepted + TRANSPORT_LINK_MAX_AGE_MS + TRANSPORT_LINK_CLOCK_SKEW_MS - 1
+                )
                 .unwrap(),
             vec![("cedar".into(), "elm".into())]
         );
         assert!(
             receiver
-                .transport_links_at(accepted + TRANSPORT_LINK_MAX_AGE_MS)
+                .transport_links_at(
+                    accepted + TRANSPORT_LINK_MAX_AGE_MS + TRANSPORT_LINK_CLOCK_SKEW_MS
+                )
                 .unwrap()
                 .is_empty()
         );
@@ -23728,6 +23736,154 @@ mod fleet_admission_tests {
                 ("birch".into(), "elm".into()),
                 ("cedar".into(), "elm".into())
             ]
+        );
+    }
+
+    #[test]
+    fn stable_transport_refresh_boundary_and_quiet_link_use_an_injected_clock() {
+        use smallclaims::store::{TRANSPORT_LINK_REFRESH_MS, set_thread_clock};
+        struct ResetClock;
+        impl Drop for ResetClock {
+            fn drop(&mut self) {
+                set_thread_clock(None);
+            }
+        }
+        let observer = node("cedar", None, None);
+        let receiver = node("birch", None, None);
+        let start = 2_000_000_000_000_u128;
+        let _reset = ResetClock;
+        let at = |time| {
+            set_thread_clock(Some(time));
+            observer.set_write_clock_at(time).unwrap();
+        };
+        at(start);
+        observer
+            .record_transport_observation("elm", "up", None, None)
+            .unwrap();
+        sync(&observer, &receiver);
+        // Quiet listening links remain available beyond the old 90-second cutoff, without
+        // generating refresh claims at each 30-60-second exchange.
+        for elapsed in [
+            30_000,
+            60_000,
+            90_000,
+            120_000,
+            TRANSPORT_LINK_REFRESH_MS - 1,
+        ] {
+            at(start + elapsed);
+            observer
+                .record_transport_observation("elm", "up", None, None)
+                .unwrap();
+            assert_eq!(
+                observer
+                    .claims_for("host/elm", Some("transport.observed"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                receiver.transport_links().unwrap(),
+                vec![("cedar".into(), "elm".into())]
+            );
+        }
+        at(start + TRANSPORT_LINK_REFRESH_MS);
+        observer
+            .record_transport_observation("elm", "up", None, None)
+            .unwrap();
+        assert_eq!(
+            observer
+                .claims_for("host/elm", Some("transport.observed"))
+                .unwrap()
+                .len(),
+            2
+        );
+        let refreshed = observer
+            .latest_claim("host/elm", Some("transport.observed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refreshed.body["fields"]["last_success_at"],
+            json!(start + TRANSPORT_LINK_REFRESH_MS)
+        );
+        observer
+            .record_transport_observation("elm", "up", None, None)
+            .unwrap();
+        assert_eq!(
+            observer
+                .claims_for("host/elm", Some("transport.observed"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn replicated_transport_links_tolerate_bounded_skew_and_reject_far_future_evidence() {
+        use smallclaims::store::{
+            TRANSPORT_LINK_CLOCK_SKEW_MS, TRANSPORT_LINK_MAX_AGE_MS, set_thread_clock,
+        };
+        struct ResetClock;
+        impl Drop for ResetClock {
+            fn drop(&mut self) {
+                set_thread_clock(None);
+            }
+        }
+        let _reset = ResetClock;
+        let read_at = 2_000_000_000_000_u128;
+        set_thread_clock(Some(read_at));
+        for success in [
+            read_at - TRANSPORT_LINK_CLOCK_SKEW_MS,
+            read_at + TRANSPORT_LINK_CLOCK_SKEW_MS,
+        ] {
+            let observer = node("cedar", None, None);
+            let receiver = node("birch", None, None);
+            observer.set_write_clock_at(read_at).unwrap();
+            observer
+                .record_transport_observation("elm", "up", None, Some(success))
+                .unwrap();
+            sync(&observer, &receiver);
+            assert_eq!(
+                receiver.transport_links_at(read_at).unwrap(),
+                vec![("cedar".into(), "elm".into())]
+            );
+            if success > read_at {
+                assert!(
+                    receiver.transport_links_at(read_at - 1).unwrap().is_empty(),
+                    "one millisecond past the skew allowance is rejected"
+                );
+            }
+            assert!(
+                receiver
+                    .transport_links_at(
+                        read_at + TRANSPORT_LINK_MAX_AGE_MS + 2 * TRANSPORT_LINK_CLOCK_SKEW_MS
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let future = node("cedar", None, None);
+        future.set_write_clock_at(read_at).unwrap();
+        future
+            .record_transport_observation(
+                "elm",
+                "up",
+                None,
+                Some(read_at + TRANSPORT_LINK_CLOCK_SKEW_MS + 60_000),
+            )
+            .unwrap();
+        assert!(
+            future.transport_links_at(read_at).unwrap().is_empty(),
+            "a far-future timestamp cannot keep a link up indefinitely"
+        );
+        set_thread_clock(Some(read_at + 1));
+        future.set_write_clock_at(read_at + 1).unwrap();
+        future
+            .record_transport_observation("elm", "up", None, None)
+            .unwrap();
+        assert_eq!(
+            future.transport_links_at(read_at).unwrap(),
+            vec![("cedar".into(), "elm".into())],
+            "a real exchange replaces unusable future evidence"
         );
     }
 

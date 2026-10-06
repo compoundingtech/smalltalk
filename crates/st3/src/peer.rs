@@ -228,6 +228,7 @@ impl std::error::Error for ClientReadRejected {}
 
 /// Up links as `(observer, observed)`, and when they were read.
 type ObservedLinks = (std::time::Instant, Arc<[(String, String)]>);
+type ObservedMembership = (std::time::Instant, Arc<FleetView>);
 
 /// A paired gateway uses this for bounded owner-local client operations. The peer worker
 /// authenticates both ends and the owner daemon rechecks the requested resource and fences.
@@ -246,6 +247,8 @@ pub struct ClientRelay {
     links: Option<Arc<Store>>,
     /// The links last read from that store, and when, so a busy gateway reads them rarely.
     observed: Arc<std::sync::Mutex<Option<ObservedLinks>>>,
+    /// Reuse sealed membership across per-item reachability checks for the same short TTL.
+    membership: Arc<std::sync::Mutex<Option<ObservedMembership>>>,
     fabric: Option<Fabric>,
     legacy: bool,
     /// When each owner last refused this node's reads as stale, for provenance.
@@ -269,16 +272,28 @@ pub struct ClientReadProvenance {
 }
 
 impl ClientRelay {
+    fn fleet_view(&self) -> Arc<FleetView> {
+        let Some(store) = &self.links else {
+            return Arc::default();
+        };
+        let mut cached = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((read_at, view)) = cached.as_ref()
+            && read_at.elapsed() < CLIENT_READ_LINKS_TTL
+        {
+            return view.clone();
+        }
+        let view = Arc::new(store.fleet_view_sealed().unwrap_or_default());
+        *cached = Some((std::time::Instant::now(), view.clone()));
+        view
+    }
+
     pub(crate) fn is_dial_out_owner(&self, host: &str) -> bool {
         host.strip_prefix("host/").is_some_and(|name| {
-            self.links.as_ref().is_some_and(|store| {
-                store.fleet_view_sealed().is_ok_and(|view| {
-                    view.members.iter().any(|member| {
-                        member.name == name
-                            && member.state == "current"
-                            && member.mode == "dial-out"
-                    })
-                })
+            self.fleet_view().members.iter().any(|member| {
+                member.name == name && member.state == "current" && member.mode == "dial-out"
             })
         })
     }
@@ -326,11 +341,7 @@ impl ClientRelay {
     /// peer, then the peers with the shortest observed path to it. With no observation of the
     /// target at all, every peer is worth a try. Nodes the read already passed are never chosen.
     fn next_hops(&self, target: &str, visited: &[String]) -> Vec<PeerConfig> {
-        let view = self
-            .links
-            .as_ref()
-            .and_then(|store| store.fleet_view_sealed().ok())
-            .unwrap_or_default();
+        let view = self.fleet_view();
         // Sync from a dial-out member supplies no reverse owner-RPC or PTY transport.
         // In particular, dropping its old links must not enable the unseen-owner fallback.
         if view.members.iter().any(|member| {
@@ -407,6 +418,7 @@ impl ClientRelay {
             links: None,
             legacy: config.fleet.as_ref().is_none_or(|file| file.legacy_peers),
             observed: Arc::default(),
+            membership: Arc::default(),
             fence_conflicts: Arc::default(),
             fabric: resolve_tool(
                 config

@@ -55,11 +55,40 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
         state.store.validate_replication_backlog().unwrap();
         state.store.project_replication_backlog().unwrap();
     }
-    let old_success = smallclaims::store::now_ms() - smallclaims::store::TRANSPORT_LINK_MAX_AGE_MS;
+    let old_success = smallclaims::store::now_ms()
+        - smallclaims::store::TRANSPORT_LINK_MAX_AGE_MS
+        - smallclaims::store::TRANSPORT_LINK_CLOCK_SKEW_MS;
     states[2]
         .store
         .record_transport_observation("birch", "up", None, Some(old_success))
         .unwrap();
+    states[2]
+        .store
+        .append_claim(&ClaimInput {
+            subject: "agent/fixture-seat".into(),
+            kind: "runtime.observed".into(),
+            actor: Some("agent/fixture-seat".into()),
+            fields: serde_json::from_value(serde_json::json!({
+                "runtime_id":"fern-seat", "incarnation_id":"fern:i1",
+                "status":"running", "terminal":true
+            }))
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+
+    states[2].store.append_claim(&ClaimInput {
+        subject: "message/fixture-attachment".into(), kind: "message.sent".into(),
+        actor: Some("person/avery".into()),
+        fields: serde_json::from_value(serde_json::json!({
+            "from":"person/avery", "to":"agent/fixture-seat", "content":"fixture", "status":"sent",
+            "attachments":[{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "media_type":"image/png", "size":1, "origin":"host/fern"}]
+        })).unwrap(),
+        evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+    }).unwrap();
 
     let sockets = std::array::from_fn::<_, 3, _>(|i| roots[i].path().join("st3.sock"));
     let mut servers = Vec::new();
@@ -160,6 +189,10 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
         );
         assert!(states[i].store.transport_links().unwrap().is_empty());
         let relay = make_relay(i);
+        assert!(
+            Arc::ptr_eq(&relay.fleet_view(), &relay.fleet_view()),
+            "per-item reachability reuses sealed membership"
+        );
         assert!(!relay.reaches("host/fern"));
         assert!(
             relay.next_hops("fern", &[]).is_empty(),
@@ -194,7 +227,7 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
         );
         let mut gateway = states[i].clone();
         gateway.client_relay = Some(relay.clone());
-        let response = crate::api::router(gateway)
+        let response = crate::api::router(gateway.clone())
             .oneshot(
                 Request::get("/v1/hosts/fern/agent-workspace?identity=agent%2Ffixture-seat")
                     .header("x-st3-person", "person/avery")
@@ -216,6 +249,51 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
                 .unwrap()
                 .contains("has no inbound route")
         );
+        for (method, path, body) in [
+            (
+                "GET",
+                "/v1/client/conversations/agent%2Ffixture-seat/changes",
+                "",
+            ),
+            (
+                "GET",
+                "/v1/client/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?message=message%2Ffixture-attachment",
+                "",
+            ),
+            (
+                "GET",
+                "/v1/client/terminals/terminal%2Fagent%2Ffixture-seat/screen",
+                "",
+            ),
+            (
+                "POST",
+                "/v1/client/terminals/terminal%2Fagent%2Ffixture-seat/raw-attachments",
+                r#"{"runtime_incarnation":"fern:i1","mode":"attach"}"#,
+            ),
+        ] {
+            let response = crate::api::router(gateway.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("x-st3-person", "person/avery")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let error: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {error}");
+            assert_eq!(
+                error["details"]["reason"], "dial-out-owner",
+                "{path}: {error}"
+            );
+            assert_eq!(error["details"]["hops"], 0);
+        }
         let listening = format!("host/{}", names[1 - i]);
         assert!(relay.reaches(&listening));
         relay.read(&listening, &request).await.unwrap();
@@ -227,9 +305,9 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
         .store
         .record_transport_observation("birch", "up", None, None)
         .unwrap();
-    for i in 0..2 {
+    for (i, state) in states.iter().enumerate().take(2) {
         replicate_fern(i).await;
-        assert!(states[i].store.transport_links().unwrap().is_empty());
+        assert!(state.store.transport_links().unwrap().is_empty());
         assert!(!make_relay(i).reaches("host/fern"));
     }
     // A real listening-peer receive still publishes fresh route evidence and deduplicates it.
@@ -290,6 +368,26 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
             .await
             .unwrap();
     }
+    // Published membership overrides a stale configured URL; correcting the owner mode
+    // becomes visible when the shared five-second membership cache expires.
+    let mut corrected = make_relay(0);
+    corrected.peers.push(PeerConfig {
+        name: "fern".into(),
+        url: peers[1].url.clone(),
+    });
+    assert!(!corrected.reaches("host/fern"));
+    states[2]
+        .store
+        .publish_fleet_endpoints("listening", &[], "test")
+        .unwrap();
+    replicate_fern(0).await;
+    assert!(!corrected.reaches("host/fern"));
+    corrected.membership.lock().unwrap().as_mut().unwrap().0 -= CLIENT_READ_LINKS_TTL;
+    assert!(corrected.reaches("host/fern"));
+    assert_eq!(
+        corrected.next_hops("fern", &[]).first().unwrap().name,
+        "fern"
+    );
     for server in servers {
         server.abort();
     }
