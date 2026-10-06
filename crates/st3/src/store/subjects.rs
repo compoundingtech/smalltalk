@@ -205,7 +205,8 @@ impl Store {
         let connection = self.readers.get();
         let seek = canonical::after_sql("boundary", "claims");
         let mut durable = connection.prepare(&canonical_sql(&format!(
-            "{CLAIM_COLUMNS} WHERE subject=?1 AND kind=?2 AND store_index<=?3 AND {ADMITTED}
+            "{CLAIM_COLUMNS} INDEXED BY claims_subject_kind_accepted_index
+             WHERE subject=?1 AND kind=?2 AND store_index<=?3 AND {ADMITTED}
              AND (?4 IS NULL OR EXISTS(SELECT 1 FROM claims boundary
                  WHERE boundary.id=?4 AND boundary.subject=?1 AND boundary.kind=?2 AND {seek}))
              ORDER BY CANONICAL_DESC(claims) LIMIT ?5"
@@ -226,7 +227,8 @@ impl Store {
         let connection = self.readers.get();
         let seek = canonical::after_sql("boundary", "claims");
         let mut query = connection.prepare(&canonical_sql(&format!(
-            "{CLAIM_COLUMNS} WHERE subject=?1 AND kind=?2 AND store_index<=?3 AND {ADMITTED}
+            "{CLAIM_COLUMNS} INDEXED BY claims_subject_kind_accepted_index
+             WHERE subject=?1 AND kind=?2 AND store_index<=?3 AND {ADMITTED}
              AND EXISTS(SELECT 1 FROM claims boundary WHERE boundary.id=?4 AND {seek})
              ORDER BY CANONICAL_DESC(claims) LIMIT ?5"
         )))?;
