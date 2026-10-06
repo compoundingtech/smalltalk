@@ -78,8 +78,10 @@ projection health remains a separate doctor check.
 `st service status` adds this readiness to the daemon service line, so a service manager's
 `active` or `running` state is not mistaken for API readiness. `st doctor --json` includes the
 local record as `startup`; during recovery it reports a failed startup check and exits nonzero.
-Command clients that normally announce outage retries instead return the startup phase promptly.
-Long-lived drivers retain their connect-outage retry behavior. Existing clients still get the
+Command clients that normally announce outage retries return a full-replay phase promptly after
+an unsuccessful connection attempt. In ordinary startup phases, they print the phase and keep
+waiting under `--daemon-wait`, so a brief restart can finish normally. Long-lived drivers retain
+their connect-outage retry behavior. Existing clients still get the
 kernel's immediate missing-socket/connection-refused error during recovery and keep their own
 retry policy; no early listener accepts requests it cannot yet answer.
 

@@ -71,6 +71,7 @@ pub struct DaemonUnreachable {
     phase: OutagePhase,
     waited: Option<Duration>,
     starting: bool,
+    full_replay: bool,
 }
 
 impl DaemonUnreachable {
@@ -81,6 +82,7 @@ impl DaemonUnreachable {
             phase: OutagePhase::Connect,
             waited: None,
             starting: false,
+            full_replay: false,
         }
     }
 
@@ -91,6 +93,7 @@ impl DaemonUnreachable {
             phase: OutagePhase::Response,
             waited: None,
             starting: false,
+            full_replay: false,
         }
     }
 
@@ -102,6 +105,7 @@ impl DaemonUnreachable {
         }
         let mut outage = Self::connect(socket.display().to_string(), startup.summary());
         outage.starting = true;
+        outage.full_replay = startup.full_replay();
         Some(outage)
     }
 
@@ -121,6 +125,10 @@ impl DaemonUnreachable {
     fn after(mut self, waited: Duration) -> Self {
         self.waited = Some(waited);
         self
+    }
+
+    pub fn full_replay(&self) -> bool {
+        self.full_replay
     }
 
     pub fn phase(&self) -> OutagePhase {
@@ -354,7 +362,7 @@ impl Client {
             let Some(outage) = daemon_unreachable(&error) else {
                 return Err(error);
             };
-            if outage.starting && self.announce_outage_wait {
+            if outage.full_replay && self.announce_outage_wait {
                 return Err(error);
             }
             let repeatable = outage.phase() == OutagePhase::Connect || method == "GET";
@@ -1609,15 +1617,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("st3.sock");
         drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let startup = Arc::new(crate::startup::Startup::begin(&socket).unwrap());
+        startup.phase("open-store");
+        let serving = Arc::clone(&startup);
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(400)).await;
             let _ = std::fs::remove_file(&server_socket);
-            crate::api::serve_unix(&server_socket, test_api())
-                .await
-                .unwrap();
+            crate::api::serve_unix_with_ready(&server_socket, test_api(), move || {
+                serving.serving()
+            })
+            .await
+            .unwrap();
         });
-        let client = Client::unix(&socket).with_outage_wait(Duration::from_secs(10), false);
+        let client = Client::unix(&socket).with_outage_wait(Duration::from_secs(10), true);
         let post: Value = client
             .post("/v1/test", &json!({"method": "post"}))
             .await

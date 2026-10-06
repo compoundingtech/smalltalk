@@ -1344,6 +1344,8 @@ async fn a_cli_command_waits_out_a_daemon_restart() {
     let mut daemon = Daemon::new(root);
     daemon.start().await;
     daemon.stop().await;
+    let startup = st3::startup::Startup::begin(&daemon.socket).unwrap();
+    startup.phase("open-store");
     let mut command = seat_command(root, &daemon.socket);
     command.env("ST3_DAEMON_WAIT", "20").args([
         "--json",
@@ -1355,6 +1357,7 @@ async fn a_cli_command_waits_out_a_daemon_restart() {
     let pending = tokio::task::spawn_blocking(move || command.output().unwrap());
     tokio::time::sleep(Duration::from_millis(1_000)).await;
     daemon.start().await;
+    startup.serving();
     let output = pending.await.unwrap();
     assert!(
         output.status.success(),
@@ -1362,11 +1365,44 @@ async fn a_cli_command_waits_out_a_daemon_restart() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("daemon starting · open-store"), "{stderr}");
+    let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cli_command_tries_a_bound_listener_before_refusing_startup() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    let startup = st3::startup::Startup::begin(&daemon.socket).unwrap();
+    startup.phase("full-replay/flush");
+    daemon.start().await;
+    // Deliberately leave the record at starting: the API has bound, while a second listener
+    // or the final readiness publication has not completed yet.
+    let output = seat_command(root, &daemon.socket)
+        .env("ST3_DAEMON_WAIT", "20")
+        .args([
+            "--json",
+            "work",
+            "ls",
+            "--as",
+            "agent/startup-listener-probe",
+        ])
+        .output()
+        .unwrap();
     assert!(
-        stderr.contains("it may be restarting; retrying for up to 20s"),
-        "{stderr}"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
     let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        st3::startup::read(&daemon.socket).unwrap().status,
+        "starting"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

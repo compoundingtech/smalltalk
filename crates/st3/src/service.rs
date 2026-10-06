@@ -290,6 +290,13 @@ pub fn reset(mut config: Config) -> Result<()> {
             Err(error) => return Err(error).context("erase the st socket"),
         }
     }
+    for path in crate::startup::paths(&config.socket) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("erase the startup readiness record"),
+        }
+    }
     if !config.client_gateway_socket.starts_with(&config.state_dir) {
         match fs::remove_file(&config.client_gateway_socket) {
             Ok(()) => {}

@@ -25,6 +25,10 @@ pub struct Readiness {
 }
 
 impl Readiness {
+    pub fn full_replay(&self) -> bool {
+        self.phase == "full-replay" || self.phase.starts_with("full-replay/")
+    }
+
     pub fn summary(&self) -> String {
         let mut message = format!("daemon {} · {}", self.status, self.phase);
         if let (Some(frontier), Some(target)) = (self.frontier, self.target) {
@@ -36,7 +40,7 @@ impl Readiness {
             ));
         }
         if self.status == "starting" {
-            message.push_str("; the API is not ready, retry after startup");
+            message.push_str("; the API is not ready");
         }
         message
     }
@@ -48,8 +52,41 @@ fn sibling(socket: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Private observations owned by the daemon at this socket, also removed by reset/uninstall.
+pub fn paths(socket: &Path) -> [PathBuf; 2] {
+    [
+        sibling(socket, ".readiness.json"),
+        sibling(socket, ".readiness.lock"),
+    ]
+}
+
+fn lock_query() -> libc::flock {
+    // OFD locks belong to this open file description, so a reader closing its own descriptor
+    // cannot release the daemon's lock. GETLK only queries; it never holds a competing lock.
+    let mut query: libc::flock = unsafe { std::mem::zeroed() };
+    query.l_type = libc::F_WRLCK as _;
+    query.l_whence = libc::SEEK_SET as _;
+    query
+}
+
 fn lock(file: &File) -> bool {
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    let mut query = lock_query();
+    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut query) == 0 }
+}
+
+fn writer_is_live(file: &File) -> bool {
+    let mut query = lock_query();
+    (unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &mut query) == 0 })
+        && query.l_type == libc::F_WRLCK as libc::c_short
+}
+
+fn process_is_live(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 /// A local reader uses the effective API socket, following its discovery link if present.
@@ -60,14 +97,14 @@ pub fn read(socket: &Path) -> Option<Readiness> {
         .read(true)
         .open(sibling(&socket, ".readiness.lock"))
         .ok()?;
-    if lock(&file) {
-        return None;
-    }
-    if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+    if !writer_is_live(&file) {
         return None;
     }
     let bytes = fs::read(sibling(&socket, ".readiness.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let report: Readiness = serde_json::from_slice(&bytes).ok()?;
+    // Between the new writer acquiring its lock and its first publication, JSON can still
+    // name a crashed predecessor. It is not this daemon's readiness.
+    (process_is_live(report.pid) && writer_is_live(&file)).then_some(report)
 }
 
 pub struct Startup {
@@ -94,6 +131,13 @@ impl Startup {
             "another daemon owns startup readiness at {}",
             socket.display()
         );
+        // Discard the previous publication before initializing this incarnation.
+        let path = sibling(socket, ".readiness.json");
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let status = Arc::new(RwLock::new(Readiness {
             status: "starting".into(),
             phase: "open-store".into(),
@@ -104,7 +148,7 @@ impl Startup {
             total: None,
         }));
         let startup = Self {
-            path: sibling(socket, ".readiness.json"),
+            path,
             _lock: file,
             status,
             warned: AtomicBool::new(false),
@@ -180,6 +224,64 @@ impl Drop for Startup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn liveness_queries_do_not_lock_out_a_starting_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("api.sock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(sibling(&socket, ".readiness.lock"))
+            .unwrap();
+        assert!(!writer_is_live(&file));
+        let startup = Startup::begin(&socket).unwrap();
+        for _ in 0..100 {
+            assert!(writer_is_live(&file));
+            assert!(read(&socket).is_some());
+        }
+        drop(file);
+        assert!(
+            read(&socket).is_some(),
+            "closing a reader cannot release the writer lock"
+        );
+        drop(startup);
+    }
+
+    #[test]
+    fn a_new_writer_cannot_validate_a_crashed_predecessors_json() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("api.sock");
+        let startup = Startup::begin(&socket).unwrap();
+        let mut stale = read(&socket).unwrap();
+        let mut predecessor = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        stale.pid = predecessor.id();
+        predecessor.wait().unwrap();
+        stale.status = "serving".into();
+        stale.phase = "ready".into();
+        let path = startup.path.clone();
+        drop(startup);
+        fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let new_writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(sibling(&socket, ".readiness.lock"))
+            .unwrap();
+        assert!(lock(&new_writer));
+        assert!(
+            read(&socket).is_none(),
+            "a held new lock does not make the old PID live"
+        );
+        drop(new_writer);
+        let restarted = Startup::begin(&socket).unwrap();
+        assert_eq!(read(&socket).unwrap().pid, std::process::id());
+        drop(restarted);
+    }
 
     #[test]
     fn readiness_requires_a_live_lock_and_a_second_writer_is_refused() {

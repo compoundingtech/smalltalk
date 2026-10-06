@@ -1278,6 +1278,7 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
         config.socket.clone(),
         config.client_gateway_socket.clone(),
     ];
+    paths.extend(st3::startup::paths(&config.socket));
     if st2_only_hooks {
         paths.push(st2_state);
     }
@@ -1328,7 +1329,9 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
     if !args.no_service && services_installed() {
         st3::service::stop_owned_runtimes(&config)?;
         st3::service::uninstall()?;
-    } else if client.get::<Value>("/v1/health").await.is_ok() {
+    } else if client.get::<Value>("/v1/health").await.is_ok()
+        || st3::startup::read(&config.socket).is_some()
+    {
         anyhow::bail!("stop st3 up and st3 replication-worker, then run st uninstall --yes again");
     }
     for path in &paths {
@@ -7853,8 +7856,21 @@ fn generated_client(endpoint: &Endpoint, person: Option<&str>) -> Result<Generat
             "client-v0 product commands require the trusted local Unix endpoint; remote clients must use a paired Fabric credential"
         );
     };
-    if let Some(outage) = st3::client::DaemonUnreachable::during_startup(socket) {
-        return Err(outage.into());
+    if let Some(startup) = st3::startup::read(socket)
+        && startup.status == "starting"
+        // A bound API can already answer before both listeners have published `serving`.
+        // Try the connection before interpreting an observation as an outage.
+        && std::os::unix::net::UnixStream::connect(socket).is_err()
+    {
+        if startup.full_replay() {
+            if let Some(outage) = st3::client::DaemonUnreachable::during_startup(socket)
+                && outage.full_replay()
+            {
+                return Err(outage.into());
+            }
+        } else {
+            eprintln!("st: {}", startup.summary());
+        }
     }
     Ok(person
         .map_or_else(

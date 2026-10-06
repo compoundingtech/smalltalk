@@ -128,6 +128,17 @@ fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
     assert!(!ordinary.status.success());
     assert!(String::from_utf8_lossy(&ordinary.stderr).contains("daemon starting"));
     assert!(String::from_utf8_lossy(&ordinary.stderr).contains("full-replay/base-claims"));
+    let started = Instant::now();
+    let generated = command(root)
+        .args(["work", "ls", "--as", "agent/replay-readiness-probe"])
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "generated CLI waited through replay"
+    );
+    assert!(!generated.status.success());
+    assert!(String::from_utf8_lossy(&generated.stderr).contains("full-replay/base-claims"));
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::PermissionsExt as _;
