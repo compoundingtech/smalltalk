@@ -4,6 +4,11 @@ A daemon that answers slowly is usually waiting, not computing: for the store's 
 one of its read connections, or for SQLite. The daemon can account for its own time so that a slow
 request names what it waited for and who held it.
 
+Person-ask reconciliation checks for retained `work.person-asked` claims on a read connection
+after importing legacy asks. When there are none, it skips the writer queue so an empty stage
+does not delay the rest of the reconcile pass behind unrelated writes. When asks exist, their
+owner checks and cancellation still run in the writer transaction.
+
 Set `ST3_PROFILE_DIR` to a directory in the daemon's environment, for example in a systemd drop-in
 for `st3.service`, and restart it. Without it the accounting is off, and each hook costs one atomic
 load.
