@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Choose Git worktrees when starting agents from stui or the phone, and show their requested branch.",
+  "replay": {
+    "status": "none",
+    "detail": "No additional replay or recovery trigger. Checkout metadata is read from existing agent declarations while serving projections; this change introduces no stored claim kind."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, columns, indexes, triggers or schema-version change. The additive client resource JSON fields are classified under compatibility."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule, digest or rules-version change, and no coordinated member-upgrade requirement added."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Agent resources add optional workspace and checkout repository/base/branch fields to Rust, Swift and TypeScript clients. Older daemons omit them and older clients can ignore them. Worktree launch requires a daemon supporting agent.create checkout parameters and host.repositories, introduced in #1237; upgrade that daemon before using these forms. Missing suggestions are shown as an error and a repository path can be typed. Current client fixtures cover present and absent metadata, and typed creation/projection and real Git worktree regressions pass. No pairing-scope or harness protocol change. Real mixed-build pairs and the physical-phone trial have not been exercised for this change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption beyond an ordinary daemon/client update. Restart-to-API and restart-to-health durations were not measured for this change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing declarations, workspaces and identities need no migration. Update the daemon and clients normally to expose the optional form fields; existing plain-directory launches remain available."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional database recovery or migration reversal. Swapping back the clients removes these form choices and labels; agent checkout declarations retain the daemon behavior already introduced in #1237."
+  }
+}
