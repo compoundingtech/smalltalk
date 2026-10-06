@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Construct full agent list cards only for the requested page.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Unfiltered agent pages freeze membership, ordering, host and queue metadata and reduce selected cards at the named store cut. Freshness/delivery/subagent overlays remain live. Unavailable historical membership returns the existing page-cursor-expired error. Response fields and cursor filtering remain unchanged; status-filtered lists keep full projected membership."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No added interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery change."
+  }
+}
