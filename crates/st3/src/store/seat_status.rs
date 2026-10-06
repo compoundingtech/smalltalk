@@ -491,16 +491,32 @@ mod tests {
         assert_eq!(blocked.ask.as_deref(), Some("permission"));
         assert_eq!(blocked.reason.as_deref(), Some("waitingOnApproval"));
 
-        store
+        let sparse = store
             .append_latest_observation(
                 &input(
                     "harness.observed",
                     json!({
                         "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 2) as u64,
-                        "blocked_on":null, "ask":null, "reason":null
+                        "reason":"stillWaiting"
                     }),
                 ),
                 at + 2,
+            )
+            .unwrap()
+            .0;
+        assert_eq!(sparse.body["fields"]["status_transition"], false);
+        assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().state, "blocked");
+
+        store
+            .append_latest_observation(
+                &input(
+                    "harness.observed",
+                    json!({
+                        "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 3) as u64,
+                        "blocked_on":null, "ask":null, "reason":null
+                    }),
+                ),
+                at + 3,
             )
             .unwrap();
         let resumed = store.current_harness("agent/cedar").unwrap().unwrap();
@@ -512,18 +528,18 @@ mod tests {
                 &input(
                     "harness.observed",
                     json!({
-                        "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 3) as u64,
+                        "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 4) as u64,
                         "blocked_on":"human", "ask":"question", "reason":"waitingOnUserInput"
                     }),
                 ),
-                at + 3,
+                at + 4,
             )
             .unwrap();
         assert_eq!(
             store.current_harness("agent/cedar").unwrap().unwrap().state,
             "working"
         );
-        let history = store.seat_status_history("agent/cedar", at + 4).unwrap();
+        let history = store.seat_status_history("agent/cedar", at + 5).unwrap();
         let states = history["items"]
             .as_array()
             .unwrap()
@@ -533,11 +549,11 @@ mod tests {
         assert_eq!(states, ["working", "blocked", "working"]);
 
         runtime(&store, "two");
-        observe(&store, "two", "working", at + 4, "working");
+        observe(&store, "two", "working", at + 5, "working");
         let current = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(current.incarnation_id, "two");
         assert_eq!(current.state, "working");
-        let history = store.seat_status_history("agent/cedar", at + 5).unwrap();
+        let history = store.seat_status_history("agent/cedar", at + 6).unwrap();
         let last = history["items"].as_array().unwrap().last().unwrap();
         assert_eq!(last["state"], "working");
         assert_eq!(last["runtime_incarnation"], "two");

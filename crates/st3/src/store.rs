@@ -18234,15 +18234,6 @@ fn publish_changed_harness_state_tx(
     input: &ClaimInput,
     now: u128,
 ) -> Result<Option<ClaimRecord>, St3Error> {
-    fn state_fields<'a>(
-        fields: impl IntoIterator<Item = (&'a String, &'a Value)>,
-    ) -> BTreeMap<&'a str, &'a Value> {
-        fields
-            .into_iter()
-            .filter(|(name, _)| !matches!(name.as_str(), "observed_at_ms" | "observed_since_ms" | "status_transition"))
-            .map(|(name, value)| (name.as_str(), value))
-            .collect()
-    }
     let latest = latest_harness_of_incarnation_tx(
         transaction,
         &input.subject,
@@ -18253,25 +18244,42 @@ fn publish_changed_harness_state_tx(
             .body
             .get("fields")
             .and_then(Value::as_object)
-            .is_some_and(|fields| state_fields(fields) == state_fields(&input.fields))
+            .is_some_and(|previous| {
+                input.fields.iter().all(|(name, value)| {
+                    matches!(name.as_str(), "observed_at_ms" | "observed_since_ms" | "status_transition")
+                        || previous.get(name) == Some(value)
+                })
+            })
     });
     // Refresh remote freshness at most once a minute, without manufacturing transitions.
     if unchanged && latest.as_ref().is_some_and(|claim| now.saturating_sub(claim.accepted_at_unix_ms) < 60_000) {
         return Ok(None);
     }
     let mut fields = input.fields.clone();
+    if let Some(previous) = latest.as_ref().and_then(|claim| claim.body.get("fields")) {
+        for name in ["blocked_on", "ask", "provider_auth"] {
+            if !fields.contains_key(name)
+                && let Some(value) = previous.get(name)
+            {
+                fields.insert(name.into(), value.clone());
+            }
+        }
+    }
     let observed_at = fields.get("observed_at_ms").and_then(Value::as_u64)
         .map_or(now, u128::from).min(now);
     let same_state = latest.as_ref().is_some_and(|claim| {
+        let previous = &claim.body["fields"];
+        let carried = |name: &str| fields.get(name).or_else(|| previous.get(name));
         claim.body["fields"]["state"] == fields["state"]
             && (seat_status::permission_blocked(
-                claim.body["fields"]["blocked_on"].as_str(),
-                claim.body["fields"]["ask"].as_str(),
+                previous["blocked_on"].as_str(),
+                previous["ask"].as_str(),
             ) == seat_status::permission_blocked(
-                fields.get("blocked_on").and_then(Value::as_str),
-                fields.get("ask").and_then(Value::as_str),
+                carried("blocked_on").and_then(Value::as_str),
+                carried("ask").and_then(Value::as_str),
             ))
-            && claim.body["fields"].get("provider_auth") == fields.get("provider_auth")
+            && previous.get("provider_auth").and_then(Value::as_bool)
+                == carried("provider_auth").and_then(Value::as_bool)
             && claim.body["fields"].get("incarnation_id") == fields.get("incarnation_id")
     });
     let since = if same_state {
