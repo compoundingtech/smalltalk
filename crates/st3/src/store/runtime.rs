@@ -159,6 +159,14 @@ impl Runtime for SmalltalkRuntime {
         replay_graph_from_nothing_tx(transaction)
     }
 
+    fn replay_from_nothing_with_progress(
+        &self,
+        transaction: &Transaction<'_>,
+        progress: &mut dyn FnMut(ReplayProgress),
+    ) -> Result<(), St3Error> {
+        replay_graph_from_nothing_with_progress_tx(transaction, progress)
+    }
+
     fn after_projection(&self, transaction: &Transaction<'_>) -> Result<(), St3Error> {
         custom::flush(transaction).map_err(internal)?;
         resources::flush(transaction).map_err(internal)?;

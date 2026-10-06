@@ -163,6 +163,8 @@ pub struct DaemonUnreachable {
     reason: String,
     phase: OutagePhase,
     waited: Option<Duration>,
+    starting: bool,
+    full_replay: bool,
 }
 
 impl DaemonUnreachable {
@@ -172,6 +174,8 @@ impl DaemonUnreachable {
             reason: reason.into(),
             phase: OutagePhase::Connect,
             waited: None,
+            starting: false,
+            full_replay: false,
         }
     }
 
@@ -181,10 +185,31 @@ impl DaemonUnreachable {
             reason: reason.into(),
             phase: OutagePhase::Response,
             waited: None,
+            starting: false,
+            full_replay: false,
         }
     }
 
+    /// A live local startup is a connect outage, with the phase available without an API call.
+    pub fn during_startup(socket: &Path) -> Option<Self> {
+        let startup = crate::startup::read(socket)?;
+        if startup.status != "starting" {
+            return None;
+        }
+        let mut outage = Self::connect(
+            socket.display().to_string(),
+            format!("{}; the API is not ready", startup.summary()),
+        );
+        outage.starting = true;
+        outage.full_replay = startup.full_replay();
+        Some(outage)
+    }
+
     fn connect_io(endpoint: impl Into<String>, error: &std::io::Error) -> Self {
+        let endpoint = endpoint.into();
+        if let Some(outage) = Self::during_startup(Path::new(&endpoint)) {
+            return outage;
+        }
         let reason = match error.kind() {
             std::io::ErrorKind::NotFound => "its socket does not exist".to_owned(),
             std::io::ErrorKind::ConnectionRefused => "connection refused".to_owned(),
@@ -198,6 +223,10 @@ impl DaemonUnreachable {
         self
     }
 
+    pub fn full_replay(&self) -> bool {
+        self.full_replay
+    }
+
     pub fn phase(&self) -> OutagePhase {
         self.phase
     }
@@ -208,6 +237,9 @@ impl DaemonUnreachable {
 
     /// A short present-tense summary without advice, for callers that say what they do next.
     pub fn summary(&self) -> String {
+        if self.starting {
+            return self.reason.clone();
+        }
         match self.phase {
             OutagePhase::Connect => format!(
                 "the st daemon at {} is not reachable ({}); it may be restarting",
@@ -491,6 +523,9 @@ impl Client {
             let Some(outage) = daemon_unreachable(&error) else {
                 return Err(error);
             };
+            if outage.full_replay && self.announce_outage_wait {
+                return Err(error);
+            }
             let repeatable = outage.phase() == OutagePhase::Connect || method == "GET";
             let waited = started.elapsed();
             if !repeatable || self.outage_wait.is_zero() {
@@ -1529,6 +1564,35 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn interactive_startup_fails_promptly_but_drivers_keep_a_connect_outage() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("api.sock");
+        let startup = crate::startup::Startup::begin(&socket).unwrap();
+        startup.phase("full-replay/resources");
+        let interactive = Client::unix(&socket).with_outage_wait(Duration::from_secs(600), true);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            interactive.get::<serde_json::Value>("/v1/health"),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let outage = daemon_unreachable(&error).unwrap();
+        assert_eq!(outage.phase(), OutagePhase::Connect);
+        assert!(outage.summary().contains("daemon starting"));
+        assert!(outage.summary().contains("full-replay/resources"));
+        let error = Client::unix(&socket)
+            .get::<serde_json::Value>("/v1/health")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            daemon_unreachable(&error).unwrap().phase(),
+            OutagePhase::Connect
+        );
+    }
+
     #[test]
     fn request_classes_have_distinct_bounded_deadlines() {
         let deadlines = ClientDeadlines::default();
@@ -1805,15 +1869,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("st3.sock");
         drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let startup = Arc::new(crate::startup::Startup::begin(&socket).unwrap());
+        startup.phase("open-store");
+        let serving = Arc::clone(&startup);
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(400)).await;
             let _ = std::fs::remove_file(&server_socket);
-            crate::api::serve_unix(&server_socket, test_api())
-                .await
-                .unwrap();
+            crate::api::serve_unix_with_ready(&server_socket, test_api(), move || {
+                serving.serving()
+            })
+            .await
+            .unwrap();
         });
-        let client = Client::unix(&socket).with_outage_wait(Duration::from_secs(10), false);
+        let client = Client::unix(&socket).with_outage_wait(Duration::from_secs(10), true);
         let post: Value = client
             .post("/v1/test", &json!({"method": "post"}))
             .await

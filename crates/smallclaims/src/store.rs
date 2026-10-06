@@ -49,7 +49,7 @@ pub mod principals;
 pub mod projection_digest;
 pub mod runtime;
 
-pub use runtime::{IncrementalProjection, Runtime};
+pub use runtime::{IncrementalProjection, ReplayProgress, Runtime};
 
 pub use canonical::{CANONICAL_ORDER, CANONICAL_ORDER_DESC, canonical_sql};
 pub use checkpoint::{
@@ -68,6 +68,16 @@ pub use checkpoint_agreement::{
     first_verifications, newest_seals, participants as checkpoint_participants, stable_checkpoints,
 };
 pub use checkpoint_trim::{CheckpointManifestNeed, TRIM_CHUNK_ENVELOPES, TrimFault};
+
+/// A committed projection frontier plus optional work inside its current transaction.
+#[derive(Clone, Copy, Debug)]
+pub struct ProjectionProgress {
+    pub phase: &'static str,
+    pub frontier: u64,
+    pub target: u64,
+    pub processed: Option<u64>,
+    pub total: Option<u64>,
+}
 
 /// Keep diagnostics on one bounded line even when an error code or caller phase is untrusted.
 fn full_replay_log_line(phase: &str, reason: &str, frontier: u64, target: u64) -> String {
@@ -5676,7 +5686,13 @@ impl Store {
 
     /// Identify the caller's phase in the always-on full-replay diagnostic.
     pub fn project_replication_backlog_in_phase(&self, phase: &str) -> Result<bool> {
-        self.project_replication_backlog_chunks(|| {}, || {}, phase, |line| eprintln!("{line}"))
+        self.project_replication_backlog_chunks(
+            || {},
+            || {},
+            phase,
+            |line| eprintln!("{line}"),
+            |_| {},
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -5685,7 +5701,22 @@ impl Store {
         phase: &str,
         log: impl FnMut(&str),
     ) -> Result<bool> {
-        self.project_replication_backlog_chunks(|| {}, || {}, phase, log)
+        self.project_replication_backlog_chunks(|| {}, || {}, phase, log, |_| {})
+    }
+
+    /// Publish bounded observations on the projection thread; observers must not read the store.
+    pub fn project_replication_backlog_with_progress(
+        &self,
+        phase: &str,
+        progress: impl FnMut(ProjectionProgress),
+    ) -> Result<bool> {
+        self.project_replication_backlog_chunks(
+            || {},
+            || {},
+            phase,
+            |line| eprintln!("{line}"),
+            progress,
+        )
     }
 
     /// Exercise reads and queued writes between committed projection chunks.
@@ -5696,6 +5727,7 @@ impl Store {
             || {},
             "replication",
             |line| eprintln!("{line}"),
+            |_| {},
         )
     }
 
@@ -5710,6 +5742,7 @@ impl Store {
             before_clear,
             "replication",
             |line| eprintln!("{line}"),
+            |_| {},
         )
     }
 
@@ -5719,6 +5752,7 @@ impl Store {
         mut before_clear: impl FnMut(),
         phase: &str,
         mut log: impl FnMut(&str),
+        mut progress: impl FnMut(ProjectionProgress),
     ) -> Result<bool> {
         let _projecting = self
             .projection
@@ -5753,6 +5787,13 @@ impl Store {
                     |row| row.get::<_, Option<u64>>(0),
                 )?
                 .unwrap_or(target.max(frontier));
+            progress(ProjectionProgress {
+                phase: "project-incremental",
+                frontier,
+                target,
+                processed: None,
+                total: None,
+            });
             let result = (|| -> Result<bool, St3Error> {
                 // An incremental projection that fails is rolled back and replaced by a full replay,
                 // which quarantines the claim it cannot project instead of failing the graph.
@@ -5795,7 +5836,16 @@ impl Store {
                     FULL_REPLAYS.with(|replays| replays.set(replays.get() + 1));
                     let _replay = crate::profile::span("projection/full-replay");
                     crate::profile::note("projection: full replay");
-                    self.runtime.replay_from_nothing(&transaction)?;
+                    self.runtime
+                        .replay_from_nothing_with_progress(&transaction, &mut |stage| {
+                            progress(ProjectionProgress {
+                                phase: stage.phase,
+                                frontier,
+                                target,
+                                processed: stage.processed,
+                                total: stage.total,
+                            });
+                        })?;
                 } else {
                     crate::profile::note("projection: incremental");
                 }
@@ -5819,6 +5869,13 @@ impl Store {
                     params![through, now_ms().to_string()],
                 )?;
                     transaction.commit()?;
+                    progress(ProjectionProgress {
+                        phase: "projection-committed",
+                        frontier: through,
+                        target,
+                        processed: None,
+                        total: None,
+                    });
                     // Snapshot while admission is excluded by the writer. Admission marks
                     // deferred before its commit, so sampling during one could otherwise
                     // mistake its not-yet-committed claims for an empty backlog.

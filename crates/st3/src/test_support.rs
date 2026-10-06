@@ -142,3 +142,25 @@ pub fn git() -> Command {
         ]);
     command
 }
+
+/// An isolated startup test can inspect the real daemon while its replay is in flight.
+#[cfg(feature = "test-support")]
+pub(crate) fn pause_startup_replay() {
+    if login_shell().is_none() {
+        return;
+    }
+    let Some(directory) = std::env::var_os("ST3_TEST_STARTUP_REPLAY_BARRIER") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    std::fs::write(directory.join("entered"), b"replay in progress")
+        .expect("publish replay barrier");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !directory.join("release").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup test did not release replay"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}

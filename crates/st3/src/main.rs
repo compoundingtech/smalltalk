@@ -12,7 +12,9 @@ use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand, V
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use st3::api::{AppState, fabric_router, router, serve_unix};
+#[cfg(test)]
+use st3::api::serve_unix;
+use st3::api::{AppState, fabric_router, router};
 use st3::client::{Client, Endpoint};
 use st3::config::{Config, PeerConfig, validate_unix_socket_path};
 use st3::model::{
@@ -1286,6 +1288,7 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
         config.socket.clone(),
         config.client_gateway_socket.clone(),
     ];
+    paths.extend(st3::startup::paths(&config.socket));
     if st2_only_hooks {
         paths.push(st2_state);
     }
@@ -1336,7 +1339,9 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
     if !args.no_service && services_installed() {
         st3::service::stop_owned_runtimes(&config)?;
         st3::service::uninstall()?;
-    } else if client.get::<Value>("/v1/health").await.is_ok() {
+    } else if client.get::<Value>("/v1/health").await.is_ok()
+        || st3::startup::read(&config.socket).is_some()
+    {
         anyhow::bail!("stop st3 up and st3 replication-worker, then run st uninstall --yes again");
     }
     for path in &paths {
@@ -5569,11 +5574,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
     validate_unix_socket_path(&config.socket, "--socket")?;
     validate_unix_socket_path(&config.client_gateway_socket, "--client-gateway-socket")?;
     fs::create_dir_all(&config.state_dir)?;
+    let startup = Arc::new(st3::startup::Startup::begin(&config.socket)?);
+    startup.phase("install-hooks");
     st3::hooks::ensure_installed(&st3::hooks::root(&config.state_dir)).context(
         "publishing this st binary's required lifecycle hook set before starting the daemon",
     )?;
     st3::profile::init_from_env();
     raise_open_file_limit();
+    startup.phase("open-store");
     let store = Arc::new(st3::profile::task("startup open-store", || {
         Store::open(&config.state_dir.join("claims.sqlite3"), &config.node)
     })?);
@@ -5591,20 +5599,27 @@ async fn run_up(args: UpArgs) -> Result<()> {
         )?))?;
     }
     store.use_key_directory(&keys)?;
+    startup.phase("judge-claims");
     st3::profile::task("startup judge-claims", || store.judge_claims(true))?;
+    startup.phase("validate-replication-backlog");
     let admission = st3::profile::task("startup validate-replication-backlog", || {
         store.validate_replication_backlog()
     })?;
+    startup.phase("apply-replication-repairs");
     st3::profile::task("startup apply-replication-repairs", || {
         store.apply_replication_repairs()
     })?;
+    startup.phase("settle-runs");
     for run in st3::profile::task("startup settle-runs", || {
         store.settle_runs_for_canonical_replay()
     })? {
         eprintln!("st: mission run `{run}` stays over as this node's graph showed it");
     }
     let projected = st3::profile::task("startup project-replication-backlog", || {
-        store.project_replication_backlog_in_phase("startup/project-replication-backlog")
+        store.project_replication_backlog_with_progress(
+            "startup/project-replication-backlog",
+            |progress| startup.progress(progress),
+        )
     })?;
     if !projected {
         eprintln!(
@@ -5617,6 +5632,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     if admission.invalid != 0 {
         eprintln!("st: replication has {} invalid records", admission.invalid);
     }
+    startup.phase("initialize-runtime");
     store.append_claim(&ClaimInput {
         subject: format!("daemon/{}", config.node),
         kind: "daemon.started".into(),
@@ -5779,11 +5795,6 @@ async fn run_up(args: UpArgs) -> Result<()> {
             .await;
         }
     });
-    eprintln!("st: local API listening at {}", config.socket.display());
-    eprintln!(
-        "st: paired client gateway listening at {}",
-        config.client_gateway_socket.display()
-    );
     let local_socket = config.socket.clone();
     let state_socket = config.state_dir.join("run/st3.sock");
     let client_gateway_socket = config.client_gateway_socket.clone();
@@ -5791,9 +5802,26 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::api::start_operation_report(&state);
     // Nor does the first session list wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
+    startup.phase("bind-listeners");
+    let bound = std::sync::atomic::AtomicUsize::new(0);
+    let ready = || {
+        if bound.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            startup.serving();
+            eprintln!("st: local API listening at {}", config.socket.display());
+            eprintln!(
+                "st: paired client gateway listening at {}",
+                config.client_gateway_socket.display()
+            );
+        }
+    };
     tokio::try_join!(
-        st3::api::serve_unix_bound(&local_socket, &state_socket, router(state.clone())),
-        serve_unix(&client_gateway_socket, fabric_router(state)),
+        st3::api::serve_unix_bound_with_ready(
+            &local_socket,
+            &state_socket,
+            router(state.clone()),
+            ready
+        ),
+        st3::api::serve_unix_with_ready(&client_gateway_socket, fabric_router(state), ready),
     )?;
     Ok(())
 }
@@ -8029,6 +8057,22 @@ fn generated_client(endpoint: &Endpoint, person: Option<&str>) -> Result<Generat
             "client-v0 product commands require the trusted local Unix endpoint; remote clients must use a paired Fabric credential"
         );
     };
+    if let Some(startup) = st3::startup::read(socket)
+        && startup.status == "starting"
+        // A bound API can already answer before both listeners have published `serving`.
+        // Try the connection before interpreting an observation as an outage.
+        && std::os::unix::net::UnixStream::connect(socket).is_err()
+    {
+        if startup.full_replay() {
+            if let Some(outage) = st3::client::DaemonUnreachable::during_startup(socket)
+                && outage.full_replay()
+            {
+                return Err(outage.into());
+            }
+        } else {
+            eprintln!("st: {}", startup.summary());
+        }
+    }
     Ok(person
         .map_or_else(
             || GeneratedClient::unix(socket),
@@ -10075,21 +10119,75 @@ fn render_performance(view: &Value) -> String {
     out
 }
 
+async fn doctor_request<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    path: &str,
+    readiness: Option<&st3::startup::Readiness>,
+    json_output: bool,
+) -> Result<T> {
+    match client.get(path).await {
+        Err(error)
+            if st3::client::daemon_unreachable(&error).is_some()
+                && readiness.is_some_and(|startup| startup.status == "starting") =>
+        {
+            let startup = readiness.expect("starting observation was checked");
+            if json_output {
+                print_value(
+                    &serde_json::json!({"status":"fail", "startup":startup,
+                    "checks":[{"status":"fail", "name":"startup", "message":startup.summary()}]}),
+                    true,
+                )?;
+            } else {
+                println!("fail\tstartup\t{}", startup.summary());
+            }
+            anyhow::bail!("the daemon is starting; the API is not ready");
+        }
+        outcome => outcome,
+    }
+}
+
 async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Result<()> {
+    let readiness = client.socket_path().and_then(st3::startup::read);
+
     if args.performance {
-        let report: Value = client.get("/v1/performance").await?;
+        let mut report: Value =
+            doctor_request(client, "/v1/performance", readiness.as_ref(), json_output).await?;
         if json_output {
+            if let Some(startup) = &readiness {
+                report["startup"] = serde_json::to_value(startup)?;
+            }
             return print_value(&report, true);
+        }
+        if let Some(startup) = &readiness {
+            let status = if startup.status == "starting" {
+                "info"
+            } else {
+                "pass"
+            };
+            println!("{status}\tstartup\t{}", startup.summary());
         }
         print!("{}", render_performance(&report));
         return Ok(());
     }
-    let report: DoctorReport = client.get("/v1/doctor").await?;
+    let report: DoctorReport =
+        doctor_request(client, "/v1/doctor", readiness.as_ref(), json_output).await?;
     if json_output {
-        print_value(&report, true)?;
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(startup) = &readiness {
+            value["startup"] = serde_json::to_value(startup)?;
+        }
+        print_value(&value, true)?;
     } else {
         if let Some(version) = &report.machine_version {
             println!("daemon\t{version}");
+        }
+        if let Some(startup) = &readiness {
+            let status = if startup.status == "starting" {
+                "info"
+            } else {
+                "pass"
+            };
+            println!("{status}\tstartup\t{}", startup.summary());
         }
         for check in &report.checks {
             println!("{}\t{}\t{}", check.status, check.name, check.message);
@@ -10995,7 +11093,15 @@ fn run_service(command: ServiceCommand, json_output: bool) -> Result<()> {
             st3::service::install(Config::load_with_fleet(config.as_deref())?)
         }
         ServiceCommand::Status => {
-            let report = st3::service::status()?;
+            let mut report = st3::service::status()?;
+            let config = Config::load_unvalidated(None)?;
+            if let Some(startup) = st3::startup::read(&config.client_socket()) {
+                for service in &mut report.services {
+                    if service.name == "st3.service" || service.name == "com.compoundingtech.st3" {
+                        service.state = format!("{} · {}", service.state, startup.summary());
+                    }
+                }
+            }
             if json_output {
                 print_value(&report, true)
             } else {

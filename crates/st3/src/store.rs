@@ -25429,23 +25429,60 @@ const REPLAYED_GRAPH_TABLES: [&str; 8] = [
 /// skipped a generation it had already projected, so it re-applied a terminal state that the
 /// generation had reopened. Two nodes holding the same claims then showed different graphs.
 fn replay_graph_from_nothing_tx(transaction: &Transaction<'_>) -> Result<(), St3Error> {
+    replay_graph_from_nothing_with_progress_tx(transaction, &mut |_| {})
+}
+
+fn replay_graph_from_nothing_with_progress_tx(
+    transaction: &Transaction<'_>,
+    progress: &mut dyn FnMut(ReplayProgress),
+) -> Result<(), St3Error> {
+    let mut stage = |phase| {
+        progress(ReplayProgress {
+            phase,
+            processed: None,
+            total: None,
+        })
+    };
+    stage("full-replay/clear");
     for table in REPLAYED_GRAPH_TABLES {
         transaction
             .execute(&format!("DELETE FROM {table}"), [])
             .map_err(internal)?;
     }
+    stage("full-replay/operations");
     rebuild_operations_tx(transaction).map_err(internal)?;
-    project_replicated_base_claims(transaction)?;
+    project_replicated_base_claims_with_progress(transaction, progress)?;
+    let mut stage = |phase| {
+        progress(ReplayProgress {
+            phase,
+            processed: None,
+            total: None,
+        })
+    };
+    stage("full-replay/mission-runs");
     project_replicated_mission_runs(transaction)?;
+    stage("full-replay/planning");
     rebuild_planning_tx(transaction).map_err(internal)?;
+    stage("full-replay/resources");
     resources::rebuild(transaction).map_err(internal)?;
+    stage("full-replay/glass-heads");
     glass_heads::rebuild(transaction).map_err(internal)?;
+    stage("full-replay/custom");
     custom::rebuild(transaction).map_err(internal)?;
+    stage("full-replay/arrangements");
     arrangements::rebuild(transaction).map_err(internal)?;
+    stage("full-replay/flush");
     Ok(())
 }
 
 fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), St3Error> {
+    project_replicated_base_claims_with_progress(transaction, &mut |_| {})
+}
+
+fn project_replicated_base_claims_with_progress(
+    transaction: &Transaction<'_>,
+    progress: &mut dyn FnMut(ReplayProgress),
+) -> Result<(), St3Error> {
     let mut statement = transaction
         .prepare(&canonical_sql(
             "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
@@ -25469,7 +25506,13 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
         .map_err(internal)?;
     drop(statement);
     clear_quarantined_claims_tx(transaction, "projection:base")?;
-    for claim in claims {
+    let total = claims.len() as u64;
+    progress(ReplayProgress {
+        phase: "full-replay/base-claims",
+        processed: Some(0),
+        total: Some(total),
+    });
+    for (position, claim) in claims.into_iter().enumerate() {
         insert_event(
             transaction,
             claim.store_index,
@@ -25493,6 +25536,14 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
             }
             Ok(())
         })?;
+        let processed = position as u64 + 1;
+        if processed.is_multiple_of(1000) || processed == total {
+            progress(ReplayProgress {
+                phase: "full-replay/base-claims",
+                processed: Some(processed),
+                total: Some(total),
+            });
+        }
     }
     owned_sets::project_tx(transaction)
 }
@@ -31585,6 +31636,72 @@ agent "test/empty" { command "true" }
         let before = store.index().unwrap();
         append("message/unseen", "message.read", json!({"status": "read"}));
         assert!(!store.claims_since_only_quiet_notifications(before).unwrap());
+    }
+
+    #[test]
+    fn replay_progress_reports_work_without_advancing_an_uncommitted_frontier() {
+        let store = Store::open_memory("node").unwrap();
+        store.project_replication_backlog().unwrap();
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for number in 0..2501 {
+                append_claim_record_tx(
+                    &transaction,
+                    "node",
+                    "agent/node.test",
+                    "harness.observed",
+                    None,
+                    &json!({"fields":{"state":"ready", "sequence":number}}),
+                    &[],
+                    None,
+                )
+                .unwrap();
+            }
+            transaction
+                .execute(
+                    "UPDATE projection_health SET status='stale' WHERE aggregate='graph'",
+                    [],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let target = store.index().unwrap();
+        let mut events = Vec::new();
+        assert!(
+            store
+                .project_replication_backlog_with_progress("test", |event| events.push(event))
+                .unwrap()
+        );
+        let claims = events
+            .iter()
+            .filter(|event| event.phase == "full-replay/base-claims")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            claims
+                .iter()
+                .map(|event| event.processed.unwrap())
+                .collect::<Vec<_>>(),
+            [0, 1000, 2000, 2501]
+        );
+        assert!(claims.iter().all(|event| event.frontier == 0
+            && event.target == target
+            && event.total == Some(2501)));
+        let committed = events.last().unwrap();
+        assert_eq!(committed.phase, "projection-committed");
+        assert_eq!(committed.frontier, target);
+        let digest = store
+            .replication_status(true, None, &[])
+            .unwrap()
+            .graph_digest;
+        store.replay_replication_graph().unwrap();
+        assert_eq!(
+            store
+                .replication_status(true, None, &[])
+                .unwrap()
+                .graph_digest,
+            digest
+        );
     }
 
     #[test]
