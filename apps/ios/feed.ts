@@ -42,7 +42,7 @@ export type ConversationHandlers = {
 
 type Client = Pick<St3Client, 'collectionStream' | 'terminalScreen' | 'terminalAttach' | 'terminalDetach'> & Partial<Pick<St3Client, 'capabilities'>>;
 /** How often a live socket is checked, and how long one check may take. */
-const PROBE_EVERY_MS = 10_000, PROBE_WAIT_MS = 5_000, QUIET_BEFORE_PROBE_MS = 20_000;
+const PROBE_EVERY_MS = 10_000, PROBE_WAIT_MS = 5_000, QUIET_BEFORE_PROBE_MS = 10_000;
 
 /** Whether st is asked anything: not while frames arrive, only once the stream has been quiet. */
 export function shouldProbe(lastFrameAt: number, now: number): boolean {
@@ -165,7 +165,7 @@ export class Feed {
   /**
    * A socket can stay open and silent while st is wedged or the network blackholed it, and the
    * app would say live with old data. Nothing is asked of st while the stream speaks: any frame
-   * is proof of life. Only once it has been quiet for 20 s is st asked something small; a slow
+   * is proof of life. Only once it has been quiet for 10 s is st asked something small; a slow
    * answer is asked again at once, and only two misses in a row drop the socket.
    */
   private startProbing(): void {

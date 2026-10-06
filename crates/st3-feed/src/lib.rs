@@ -30,11 +30,11 @@ use tokio::time::Instant;
 pub const WINDOW: usize = 200;
 
 /// How often the stream's own quiet time is looked at; nothing is sent to look.
-const QUIET_CHECK: Duration = Duration::from_secs(5);
+const QUIET_CHECK: Duration = Duration::from_secs(2);
 /// How long a stream may say nothing before it is pinged.
-const QUIET_BEFORE_PING: Duration = Duration::from_secs(20);
+const QUIET_BEFORE_PING: Duration = Duration::from_secs(10);
 /// How long after a ping its pong, or anything else, may take before the socket is dropped.
-const PONG_WAIT: Duration = Duration::from_secs(15);
+const PONG_WAIT: Duration = Duration::from_secs(8);
 
 /// The waits between attempts to reach st again, reset once st answers.
 const RETRY_DELAYS: [Duration; 5] = [
