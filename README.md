@@ -34,4 +34,24 @@ Platforms/status: Linux x86_64 and macOS Apple Silicon; fresh-Mac setup is not y
 
 [Contributing](docs/development.md#contributing) covers source builds, checks, and repository layout.
 
+## Web extension composition
+
+The extension boundary in `apps/fractal-web/src/extensions` separates application
+claims from build-injected panes, hosts and claims. The default composition is
+empty. `createExtensionRegistry` snapshots both ownership groups and passes the
+combined claims to the application's conflict validator before exposing them.
+Array mutation after initialization cannot register additional extensions.
+
+Build configuration can replace the local `build.ts` entry using
+`scripts/extension-build.mjs`. Selection happens before bundling; there is no
+runtime discovery or remote extension loader. Bundle checks inspect module
+provenance, emitted code and assets, including lazy chunks and source maps.
+
+With the web workspace dependencies installed, run:
+
+```sh
+node --test apps/fractal-web/src/extensions/registry.unit.test.ts
+node --test apps/fractal-web/src/extensions/build.integration.test.mjs
+```
+
 This repository also carries st2, the previous generation; see [its guide](README.st2.md).
